@@ -142,7 +142,10 @@ pub(crate) struct PoolProvider {
 }
 
 /// One pool account's fields the Overview section renders. Every other field
-/// shunt reports is ignored, and an absent optional field parses.
+/// shunt reports is ignored. `paused` defaults: shunt adds the key in v0.52.0,
+/// so a row from the v0.48.0 floor lacks it and must read as `false`
+/// (unpaused) instead of failing the whole listing; every `Option` field
+/// parses an absent key as `None` on its own.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct PoolAccount {
     pub(crate) name: String,
@@ -150,6 +153,7 @@ pub(crate) struct PoolAccount {
     pub(crate) near_quota: bool,
     pub(crate) cooldown_secs_remaining: Option<u64>,
     pub(crate) needs_relogin: bool,
+    #[serde(default)]
     pub(crate) paused: bool,
     pub(crate) disabled: bool,
     pub(crate) utilization_5h: Option<f64>,
@@ -374,21 +378,28 @@ const COMPLETION_EXCHANGE_TIMEOUT_SECS: u64 = 30;
 /// success, never a client give-up.
 const COMPLETE_RESPONSE_SECS: u64 = 40;
 
-/// The refresh route's response bound. shunt bounds nothing there:
-/// `token_refresh_client` carries no timeout (`src/auth/shared.rs` @8ed21d0)
-/// and every refresh queues on the process-global `REFRESH_LOCK`
-/// (`src/auth/claude/auth.rs:146` @8ed21d0), so a refresh past the pool read's
-/// 20 s is shunt still working, never a down gateway. 60 s leaves room for a
-/// slow token endpoint and a queue.
-const REFRESH_RESPONSE_SECS: u64 = 60;
+/// The refresh route's response bound. shunt bounds a claude refresh by
+/// nothing: `token_refresh_client` carries no timeout (`src/auth/shared.rs`
+/// @8ed21d0). An antigravity refresh (`force_refresh_if_access_token`,
+/// `src/auth/antigravity/auth.rs` @8ed21d0) sends and reads its token call at
+/// 30 s each (`CREDENTIAL_REQUEST_TIMEOUT`), waits up to 5 s for the
+/// credential file lock, and, for a stored login with no project id, then
+/// runs project discovery (2 x 30 s) and onboarding (2 x 30 s, then its polls
+/// under one `ONBOARD_POLL_DEADLINE` of 300 s) and takes the file lock again
+/// to merge the project id: about 490 s in all. Each family queues on its own
+/// process-global `REFRESH_LOCK` first, unbounded. So a refresh past the pool
+/// read's 20 s is shunt still working, never a down gateway: 600 s outlasts
+/// one whole antigravity refresh that meets no queue; a claude refresh has no
+/// bound to outlast.
+const REFRESH_RESPONSE_SECS: u64 = 600;
 
 /// The recovery poll request's response bound: one hung poll answers or
 /// refuses within 2 s, so it cannot eat the recovery budget.
 const POLL_REQUEST_SECS: u64 = 2;
 
-/// The lightest read-tier GET for the 401 recovery's poll: a pure route-tree
-/// snapshot with no account backfill or store scan (shunt `src/admin/mod.rs`
-/// `routes` @8ed21d0, present in the installed v0.52.0).
+/// The read-tier GET for the 401 recovery's poll: a pure route-tree snapshot
+/// with no account backfill or store scan (shunt `src/admin/mod.rs` `routes`
+/// @8ed21d0), present at the v0.48.0 floor.
 const READ_POLL_PATH: &str = "/admin/api/routes";
 
 /// How often the recovery re-polls: inside shunt's 400 ms reload debounce
@@ -417,8 +428,8 @@ enum AdminRoute {
 
 impl AdminRoute {
     /// The bound the route's handler needs: `complete` above shunt's own 30 s
-    /// exchange, `refresh` its own 60 s (shunt bounds nothing there), the poll
-    /// its own 2 s, everything else the pool read's 20 s.
+    /// exchange, `refresh` its own 600 s (past one whole antigravity refresh),
+    /// the poll its own 2 s, everything else the pool read's 20 s.
     fn response_bound(self) -> Duration {
         match self {
             AdminRoute::Complete => Duration::from_secs(COMPLETE_RESPONSE_SECS),
@@ -634,11 +645,23 @@ fn status_error(status: u16) -> ShuntAdminError {
     }
 }
 
+/// Map a mutation send's status to its typed error. A 403 is
+/// [`ShuntAdminError::ReadOnlyKey`] on the first send and on the retry alike,
+/// so the two arms cannot drift; every other non-200 status maps through
+/// [`status_error`]. 401 is the caller's (recovery, or
+/// [`ShuntAdminError::RestartRequired`]).
+fn mutation_status_error(status: u16) -> ShuntAdminError {
+    match status {
+        403 => ShuntAdminError::ReadOnlyKey,
+        other => status_error(other),
+    }
+}
+
 /// Send `send` once and, on a 401, recover the admin key and retry exactly
 /// once: rewrite the config through [`write_checked`], poll
-/// [`READ_POLL_PATH`] until the token is accepted, then re-send. A 403 is
-/// [`ShuntAdminError::ReadOnlyKey`] with no recovery; a second 401 (or a poll
-/// that never clears while clauth's entry is still present) is
+/// [`READ_POLL_PATH`] until the token is accepted, then re-send. A 403 on
+/// either send is [`ShuntAdminError::ReadOnlyKey`] with no recovery; a second
+/// 401 (or a poll that never clears while clauth's entry is still present) is
 /// [`ShuntAdminError::RestartRequired`].
 fn mutation_with_recovery(
     record: &GatewayRecord,
@@ -653,11 +676,10 @@ fn mutation_with_recovery(
             match send()? {
                 (200, body) => Ok(body),
                 (401, _) => Err(ShuntAdminError::RestartRequired.into()),
-                (status, _) => Err(status_error(status).into()),
+                (status, _) => Err(mutation_status_error(status).into()),
             }
         }
-        (403, _) => Err(ShuntAdminError::ReadOnlyKey.into()),
-        (status, _) => Err(status_error(status).into()),
+        (status, _) => Err(mutation_status_error(status).into()),
     }
 }
 
@@ -673,8 +695,8 @@ fn read_admin_entry(config: &Path) -> Result<(Vec<u8>, String, AdminNeed)> {
 }
 
 /// The 401 recovery: when clauth's admin entry is present, rewrite the adopted
-/// config's unchanged bytes through [`write_checked`], then poll the lightest
-/// read-tier route with the same token until it stops answering 401, bounded
+/// config's unchanged bytes through [`write_checked`], then poll a read-tier
+/// GET with the same token until it stops answering 401, bounded
 /// at [`RECOVERY_POLL_BUDGET`]. An absent entry is
 /// [`ShuntAdminError::AdminKeyMissing`] with no rewrite and no poll (a rewrite
 /// cannot reload a key the config does not carry); an unreadable entry is
