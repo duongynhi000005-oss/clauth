@@ -162,7 +162,7 @@ fn a_wide_glyph_active_name_keeps_the_status_indicator_whole() {
 
 #[test]
 fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
-    let fit = gauge_fit(100, 8, true);
+    let fit = gauge_fit(100, 8, Some(42.0));
     assert_eq!(
         fit,
         GaugeFit {
@@ -175,7 +175,7 @@ fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
 
 #[test]
 fn gauge_fit_shrinks_bar_first_before_name() {
-    let fit = gauge_fit(23, 8, true);
+    let fit = gauge_fit(23, 8, Some(42.0));
     assert_eq!(fit.name_w, 8, "name must stay full while bar still shrinks");
     assert_eq!(fit.bar_cells, 7, "bar must shrink first");
     assert!(fit.visible);
@@ -183,7 +183,7 @@ fn gauge_fit_shrinks_bar_first_before_name() {
 
 #[test]
 fn gauge_fit_drops_bar_entirely_before_touching_name() {
-    let fit = gauge_fit(18, 8, true);
+    let fit = gauge_fit(18, 8, Some(42.0));
     assert_eq!(fit.name_w, 8, "name must not shrink after bar drops");
     assert_eq!(fit.bar_cells, 0, "bar must drop before name trims");
     assert!(fit.visible);
@@ -191,7 +191,7 @@ fn gauge_fit_drops_bar_entirely_before_touching_name() {
 
 #[test]
 fn gauge_fit_truncates_name_only_after_bar_is_already_gone() {
-    let fit = gauge_fit(12, 8, true);
+    let fit = gauge_fit(12, 8, Some(42.0));
     assert_eq!(fit.bar_cells, 0);
     assert_eq!(fit.name_w, 7);
     assert!(fit.visible);
@@ -199,7 +199,7 @@ fn gauge_fit_truncates_name_only_after_bar_is_already_gone() {
 
 #[test]
 fn gauge_fit_drops_name_only_after_bar_is_already_gone() {
-    let fit = gauge_fit(7, 8, true);
+    let fit = gauge_fit(7, 8, Some(42.0));
     assert_eq!(fit.bar_cells, 0);
     assert_eq!(fit.name_w, 0);
     assert!(fit.visible, "the percent figure alone should still render");
@@ -207,13 +207,13 @@ fn gauge_fit_drops_name_only_after_bar_is_already_gone() {
 
 #[test]
 fn gauge_fit_hides_entirely_below_the_percent_width() {
-    let fit = gauge_fit(3, 8, true);
+    let fit = gauge_fit(3, 8, Some(42.0));
     assert_eq!(fit, GaugeFit::HIDDEN);
 }
 
 #[test]
 fn gauge_fit_provider_profile_never_shows_a_bar() {
-    let roomy = gauge_fit(100, 10, false);
+    let roomy = gauge_fit(100, 10, None);
     assert_eq!(
         roomy,
         GaugeFit {
@@ -223,11 +223,11 @@ fn gauge_fit_provider_profile_never_shows_a_bar() {
         }
     );
 
-    let tight = gauge_fit(9, 10, false);
+    let tight = gauge_fit(9, 10, None);
     assert_eq!(tight.bar_cells, 0);
     assert_eq!(tight.name_w, 8);
 
-    let dash_only = gauge_fit(1, 10, false);
+    let dash_only = gauge_fit(1, 10, None);
     assert_eq!(dash_only.name_w, 0);
     assert!(
         !dash_only.visible,
@@ -1207,5 +1207,31 @@ fn the_wide_glyph_active_names_desktop_rows_replace_the_pre_s9_clip() {
             expected,
             "row 1 for the cjk name at {w} cols"
         );
+    }
+}
+
+/// P1: the header gauge labels its reading with at most two nearest-rounded
+/// decimals, with and without its bar.
+#[test]
+fn the_header_gauge_label_keeps_two_rounded_decimals() {
+    for bar_cells in [10, 0] {
+        for (pct, want) in [
+            (73.42, "73.42%"),
+            (1.000_000_000_000_000_9, "1%"),
+            (99.999, "100%"),
+        ] {
+            let fit = GaugeFit {
+                name_w: 0,
+                bar_cells,
+                visible: true,
+            };
+            let spans = gauge_spans(fit, "", Some(pct), 0);
+            let labels: Vec<&str> = spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .filter(|c| c.ends_with('%'))
+                .collect();
+            assert_eq!(labels, [want], "{pct} with {bar_cells} bar cells");
+        }
     }
 }

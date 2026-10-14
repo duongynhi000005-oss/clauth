@@ -1559,6 +1559,7 @@ fn chain_row_switch_hint_rides_the_target_row() {
             last: 0,
             name_w: 8,
             gauge_w: GAUGE_W,
+            reading_w: 3,
             thr_w: 3,
             figure_inline: true,
             reason: None,
@@ -1608,6 +1609,7 @@ fn chain_row_renders_every_projected_hop_with_the_return_glyph() {
                 last: 0,
                 name_w: 8,
                 gauge_w: GAUGE_W,
+                reading_w: 3,
                 thr_w: 3,
                 figure_inline: true,
                 reason: None,
@@ -1729,6 +1731,7 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
             last: 0,
             name_w: 8,
             gauge_w: GAUGE_W,
+            reading_w: 3,
             thr_w: 3,
             figure_inline: true,
             reason: Some(BlockedReason::AuthBroken),
@@ -1764,6 +1767,7 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
                 last: 0,
                 name_w: 8,
                 gauge_w: GAUGE_W,
+                reading_w: 3,
                 thr_w: 3,
                 figure_inline: true,
                 reason: Some(BlockedReason::AuthBroken),
@@ -2024,23 +2028,29 @@ fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
 /// This inner width is 4 cells narrower than the terminal width the render
 /// smoke test sweeps: the accounts panel takes 2 border cells + 2 horizontal
 /// padding cells. Floors here therefore read 4 lower than that test's.
+/// Swept at the stock label budget and at two-decimal readings, which widen
+/// every usage tier.
 #[test]
 fn live_column_width_is_monotone_in_inner_width() {
-    for max_name in 8..=22 {
-        let mut prev = None;
-        for total in 30..=200 {
-            let width = live_column_width(max_name, total);
-            if let Some(prev_w) = prev
-                && width != prev_w
-            {
-                assert_eq!(
-                    (prev_w, width),
-                    (0, LIVE_W),
-                    "live column must only appear (0 -> LIVE_W), never drop or \
-                     flip, at name {max_name}, total {total} ({prev_w} -> {width})",
-                );
+    let decimals = LabelWidths { five: 6, seven: 6 };
+    for labels in [LabelWidths::default(), decimals] {
+        for max_name in 8..=22 {
+            let mut prev = None;
+            for total in 30..=200 {
+                let width = live_column_width(max_name, total, labels);
+                if let Some(prev_w) = prev
+                    && width != prev_w
+                {
+                    assert_eq!(
+                        (prev_w, width),
+                        (0, LIVE_W),
+                        "live column must only appear (0 -> LIVE_W), never drop or \
+                         flip, at name {max_name}, total {total}, labels {labels:?} \
+                         ({prev_w} -> {width})",
+                    );
+                }
+                prev = Some(width);
             }
-            prev = Some(width);
         }
     }
 }
@@ -2108,7 +2118,7 @@ fn a_long_chain_name_renders_whole_on_desktop() {
             .expect("the member row renders");
         assert_eq!(
             row,
-            " ╶ 1 abcdefghijklmnopqrstuvwxyz  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%"
+            " ╶ 1 abcdefghijklmnopqrstuvwxyz  ▰▱▱▱▱▱▱▱▱▱▱▱  10% / 95%"
         );
     }
 }
@@ -3843,7 +3853,7 @@ fn a_hybrids_overview_bar_shows_the_provider_percentage() {
     let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let text = line_text(&line);
     assert_eq!(
-        text, "  ● h             API                [█░░░░░░░░░]  10%      —              ",
+        text, "  ● h             API                [█░░░░░░░░░] 10%       —              ",
         "the hybrid's Overview row renders the provider percentage"
     );
 }
@@ -4020,7 +4030,7 @@ fn reviewer_r1_default_caption_names_the_next_member_for_a_healthy_burning_activ
     let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~8m",
+        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱    10% / 95%   ↲ ~8m",
         "the default-config caption names the member the walk lands on at the crossing"
     );
 }
@@ -4087,7 +4097,7 @@ fn the_projected_switch_skips_a_kick_rejected_member() {
     let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱  10% / 95%   ↲ ~6s",
         "the caption must name the clear member, not the kick-rejected one"
     );
 }
@@ -4139,7 +4149,7 @@ fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
     let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱  10% / 95%   ↲ ~6s",
         "the caption must prefer the fresh member over the dead-reading one"
     );
 }
@@ -4177,7 +4187,7 @@ fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
     let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
+        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱  10% / 95%   ↲ ~6s",
         "burn-aware with the default floor still projects the crossing"
     );
 }
@@ -4231,7 +4241,7 @@ fn the_projected_switch_skips_a_live_key_rejected_member() {
     let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱  10% / 95%   ↲ ~6s",
         "the caption skips the live key-rejected sibling and names the clear one"
     );
 }

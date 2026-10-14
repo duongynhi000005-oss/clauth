@@ -6,7 +6,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 use super::super::theme;
-use crate::format::account_tier;
+use crate::format::{account_tier, format_pct};
 use crate::profile::{AppState, ClockFormat, Profile, ResetDisplay};
 use crate::usage::{
     FetchStatus, ProfileActivity, UsageWindow, humanize_duration, iso_to_epoch_secs, now_epoch_secs,
@@ -159,10 +159,29 @@ pub(super) fn bar_string_with_cells(pct: f64, cells: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(cells - filled))
 }
 
-/// Cells the bar block occupies at the widest tier: `[` + 10 cells + `]` +
-/// ` 100%`. Whatever the reset suffix adds has to fit in the rest of the column,
-/// which is padded to a fixed width by the caller.
-const BAR_BLOCK_COLS: usize = 17;
+/// The widest whole reading, `100%`: the label budget every Overview usage tier
+/// is sized for. A longer label (`73.42%`) widens its column by the excess.
+pub(super) const PCT_LABEL_BUDGET: usize = 4;
+const BAR_CELLS: usize = 10;
+/// The bar's fill-cell floor: a column too narrow for it sheds the bar whole,
+/// brackets included, rather than squeezing the reading.
+const BAR_FLOOR: usize = 5;
+/// What the full bar block leaves its reset countdown before it renders one:
+/// ` (4h 59m)`, the widest 5h countdown.
+const RESET_ROOM: usize = 9;
+
+/// Cells a bar-tier column gives its bar once the reading's `label_w` and the
+/// bracket-and-gap chrome are paid: the one rail the dash and the reading span
+/// both right-align to.
+fn rail_cells(width: usize, label_w: usize) -> usize {
+    width.saturating_sub(3 + label_w).min(BAR_CELLS)
+}
+
+/// A window's reading as the bracketed bar prints it, so a column can size its
+/// label width off the same text its rows render.
+pub(super) fn window_label(window: &UsageWindow) -> String {
+    format_pct(window.utilization.clamp(0.0, 100.0))
+}
 
 /// Overview accounts rows only: `[███░░░]` with dim brackets around the bar.
 /// Brackets render in `dim`; filled/empty cells keep their semantic util color,
@@ -173,17 +192,21 @@ const BAR_BLOCK_COLS: usize = 17;
 /// `reset_style` colors the trailing ` (reset)` countdown (wide layout only) —
 /// pass the drain hue for a live window, `None` to keep it faint.
 /// All other bar sites use [`bar_string_with_cells`] directly (no brackets).
+/// `label_w` is the widest label the caller's column renders: the reading is
+/// left-padded to it so a column's `%` signs align.
 pub(super) fn window_summary_spans_bracketed(
     window: Option<&UsageWindow>,
     width: usize,
+    label_w: usize,
     include_bar: bool,
     reset_style: Option<Style>,
     fmt: ResetFmt,
     stale: bool,
 ) -> Vec<Span<'static>> {
-    window_summary_spans_bracketed_at(
+    bracketed_spans(
         window,
         width,
+        label_w,
         include_bar,
         reset_style,
         fmt,
@@ -192,8 +215,10 @@ pub(super) fn window_summary_spans_bracketed(
     )
 }
 
-/// [`window_summary_spans_bracketed`] against a caller-supplied clock so a
-/// test can pin the fixture and the render to one instant.
+/// [`window_summary_spans_bracketed`] for a lone cell (the label is its own
+/// column) against a caller-supplied clock, so a test can pin the fixture and
+/// the render to one instant.
+#[cfg(test)]
 pub(crate) fn window_summary_spans_bracketed_at(
     window: Option<&UsageWindow>,
     width: usize,
@@ -203,50 +228,67 @@ pub(crate) fn window_summary_spans_bracketed_at(
     stale: bool,
     now: i64,
 ) -> Vec<Span<'static>> {
+    bracketed_spans(window, width, 0, include_bar, reset_style, fmt, stale, now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bracketed_spans(
+    window: Option<&UsageWindow>,
+    width: usize,
+    label_w: usize,
+    include_bar: bool,
+    reset_style: Option<Style>,
+    fmt: ResetFmt,
+    stale: bool,
+    now: i64,
+) -> Vec<Span<'static>> {
+    // `[` + cells + `]` + ` ` + label: whether the bar's floor fits beside a
+    // label `label_w` wide.
+    let bar_fits = |label_w: usize| include_bar && width >= BAR_FLOOR + 3 + label_w;
     let Some(window) = window else {
-        return vec![Span::styled(NO_DATA.to_string(), theme::faint())];
+        // The dash sits on the reading rail: right-aligned to the reading
+        // span's width, so its right edge meets the readings' at every tier
+        // (the bar cells, brackets and gap included).
+        let dash = if bar_fits(label_w) {
+            format!(
+                "{NO_DATA:>right$}",
+                right = 3 + rail_cells(width, label_w) + label_w
+            )
+        } else {
+            format!("{NO_DATA:>label_w$}")
+        };
+        return vec![Span::styled(dash, theme::faint())];
     };
     let bracket = theme::dim();
     let pct = window.utilization.clamp(0.0, 100.0);
+    let label = window_label(window);
+    let label_w = label_w.max(label.len());
     let fill_style = if stale {
         theme::faint()
     } else {
         Style::default().fg(theme::util_color(pct))
     };
-
-    if include_bar && width >= 26 {
-        // [██████░░░░] XX% (reset)
-        let mut spans = vec![
-            Span::styled("[", bracket),
-            Span::styled(bar_string_with_cells(pct, 10), fill_style),
-            Span::styled("]", bracket),
-            Span::styled(format!(" {:>3.0}%", pct), fill_style),
-        ];
-        if let Some(secs) = reset_in_secs_at(window, now) {
-            let style = reset_style.unwrap_or_else(theme::faint);
-            spans.extend(reset_suffix_spans(secs, fmt, width, style));
-        }
-        spans
-    } else if include_bar && width >= 17 {
-        // [██████░░░░] XX%
-        vec![
-            Span::styled("[", bracket),
-            Span::styled(bar_string_with_cells(pct, 10), fill_style),
-            Span::styled("]", bracket),
-            Span::styled(format!(" {:>3.0}%", pct), fill_style),
-        ]
-    } else if include_bar && width >= 12 {
-        // [███░░░] XX%  — bar shrinks to fit
-        let bar_cells = width.saturating_sub(7).clamp(3, 7);
-        vec![
-            Span::styled("[", bracket),
-            Span::styled(bar_string_with_cells(pct, bar_cells), fill_style),
-            Span::styled("]", bracket),
-            Span::styled(format!(" {:>3.0}%", pct), fill_style),
-        ]
-    } else {
-        vec![Span::styled(format!("{pct:>3.0}%"), fill_style)]
+    // The label is the reading, so the reset countdown and then the bar cells
+    // give way before it is ever cut.
+    let block_w = |cells: usize| cells + 3 + label_w;
+    if !bar_fits(label_w) {
+        return vec![Span::styled(format!("{label:>label_w$}"), fill_style)];
     }
+    let cells = rail_cells(width, label_w);
+    let mut spans = vec![
+        Span::styled("[", bracket),
+        Span::styled(bar_string_with_cells(pct, cells), fill_style),
+        Span::styled("]", bracket),
+        Span::styled(format!(" {label:>label_w$}"), fill_style),
+    ];
+    let room = width.saturating_sub(block_w(BAR_CELLS));
+    if room >= RESET_ROOM
+        && let Some(secs) = reset_in_secs_at(window, now)
+    {
+        let style = reset_style.unwrap_or_else(theme::faint);
+        spans.extend(reset_suffix_spans(secs, fmt, room, style));
+    }
+    spans
 }
 
 /// True when the window's stored reset instant has already passed, so its
@@ -385,17 +427,18 @@ fn column_text(rel: &str, at: Option<&str>, display: ResetDisplay) -> String {
     }
 }
 
-/// The overview column's ` (…)` suffix, fitted to the column. A stamp too wide
-/// for what the bar block leaves degrades to the bare countdown rather than
-/// overflowing the row — the countdown itself is never fit-checked, so the
-/// stock relative form renders exactly as it did before the setting existed.
-fn reset_suffix(secs: i64, fmt: ResetFmt, width: usize) -> String {
+/// The overview column's ` (…)` suffix, fitted to the `room` the bar block
+/// leaves in the column. A stamp too wide for it degrades to the bare countdown
+/// rather than overflowing the row — the countdown itself is never fit-checked,
+/// so the stock relative form renders exactly as it did before the setting
+/// existed.
+fn reset_suffix(secs: i64, fmt: ResetFmt, room: usize) -> String {
     let bare = format!(" ({})", humanize_duration(secs));
     // Under `relative` this equals `bare`, so the fit check only ever strips a
     // clock — the stock form renders exactly as it did before the setting
     // existed, at every width.
     let full = format!(" ({})", reset_column(secs, fmt));
-    if BAR_BLOCK_COLS + full.chars().count() <= width {
+    if full.chars().count() <= room {
         full
     } else {
         bare
@@ -405,8 +448,8 @@ fn reset_suffix(secs: i64, fmt: ResetFmt, width: usize) -> String {
 /// [`reset_suffix`] as styled spans, keeping the `·` that joins a countdown to
 /// its stamp neutral. Only `both` mode produces one; every other shape (bare
 /// countdown, clock-only) has no separator and lands as a single span.
-fn reset_suffix_spans(secs: i64, fmt: ResetFmt, width: usize, style: Style) -> Vec<Span<'static>> {
-    let suffix = reset_suffix(secs, fmt, width);
+fn reset_suffix_spans(secs: i64, fmt: ResetFmt, room: usize, style: Style) -> Vec<Span<'static>> {
+    let suffix = reset_suffix(secs, fmt, room);
     match suffix.split_once(" · ") {
         Some((pre, post)) => vec![
             Span::styled(pre.to_string(), style),

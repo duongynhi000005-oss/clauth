@@ -33,6 +33,7 @@ use super::panes::{
     draw_scrollbar, draw_selector_list, master_detail, meta_line, picker_row, section_box,
     section_box_loading, section_box_verbatim,
 };
+use crate::format::format_pct;
 use crate::pricing::{HourTokens, PriceTable};
 use crate::tokens::{
     DaySummary, ModelTokens, PeriodDay, PeriodModel, TokenStats, bucket_activity, bucket_tokens,
@@ -1288,7 +1289,7 @@ fn total_lines(
         stats.total_in_out()
     };
     let cache_badge = Span::styled(
-        format!("{:.0}% cache hit", stats.cache_hit_ratio() * 100.0),
+        format!("{} cache hit", format_pct(stats.cache_hit_ratio() * 100.0)),
         Style::default().fg(theme::info_color()),
     );
     let tokens_left = vec![
@@ -1565,34 +1566,45 @@ fn comp_rows(
         .saturating_add(output)
         .saturating_add(cache_write)
         .saturating_add(cache_read);
-    let bar_w = w.saturating_sub(WIDE_KEY_W).saturating_sub(6).clamp(4, 28);
-    [
+    let rows = [
         ("input", input, theme::accent()),
         ("output", output, theme::success()),
         ("cache write", cache_write, theme::warning()),
         ("cache read", cache_read, theme::info()),
-    ]
-    .into_iter()
-    .map(|(label, value, fill)| {
-        let pct = if grand == 0 {
+    ];
+    // Each share left-pads to the widest the column renders so the `%` signs
+    // align on the rail.
+    let labels = rows.map(|(_, value, _)| {
+        format_pct(if grand == 0 {
             0.0
         } else {
             value as f64 / grand as f64 * 100.0
-        };
-        let mut left = vec![Span::styled(
-            format!("{label:<WIDE_KEY_W$}"),
-            theme::label(),
-        )];
-        left.extend(hbar(value, grand, bar_w, fill));
-        // Percentage anchored to the card's right edge (not the bar's end), so
-        // the column reads as one rail however wide the card gets.
-        lr(
-            left,
-            vec![Span::styled(format!("{pct:>3.0}%"), theme::dim())],
-            w,
-        )
-    })
-    .collect()
+        })
+    });
+    let label_w = labels.iter().map(String::len).max().unwrap_or_default();
+    // No floor: on a card too narrow for the bar, its cells give way before a
+    // share loses its `%`.
+    let bar_w = w.saturating_sub(WIDE_KEY_W + label_w + 2).min(28);
+    rows.into_iter()
+        .zip(labels)
+        .map(|((label, value, fill), pct_label)| {
+            let mut left = vec![Span::styled(
+                format!("{label:<WIDE_KEY_W$}"),
+                theme::label(),
+            )];
+            left.extend(hbar(value, grand, bar_w, fill));
+            // Percentage anchored to the card's right edge (not the bar's end), so
+            // the column reads as one rail however wide the card gets.
+            lr(
+                left,
+                vec![Span::styled(
+                    format!(" {pct_label:>label_w$}"),
+                    theme::dim(),
+                )],
+                w,
+            )
+        })
+        .collect()
 }
 
 fn hour_lines(hours: &[u64; 24], w: usize, h: usize) -> Vec<Line<'static>> {
@@ -1958,24 +1970,30 @@ fn draw_model_detail(
     } else {
         s.total()
     };
-    let share = if grand == 0 {
+    let share = format_pct(if grand == 0 {
         0.0
     } else {
         share_val as f64 / grand as f64 * 100.0
-    };
-    let mut share_line = hbar(share_val, grand, bar_w, theme::accent());
-    share_line.push(Span::styled(format!(" {share:>4.1}%"), theme::dim()));
-    lines.push(Line::from(share_line));
-
-    if m.split_complete {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("CACHE HIT", theme::label())));
+    });
+    let hit = m.split_complete.then(|| {
         let denom = s.cache_read + s.cache_create + s.input;
         let hit = if denom == 0 {
             0.0
         } else {
             s.cache_read as f64 / denom as f64
         };
+        (hit, format_pct(hit * 100.0))
+    });
+    // The two bars share one width, so their readings form a column: both
+    // left-pad to the wider so the `%` signs align.
+    let label_w = share.len().max(hit.as_ref().map_or(0, |(_, l)| l.len()));
+    let mut share_line = hbar(share_val, grand, bar_w, theme::accent());
+    share_line.push(Span::styled(format!(" {share:>label_w$}"), theme::dim()));
+    lines.push(Line::from(share_line));
+
+    if let Some((hit, hit_label)) = hit {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("CACHE HIT", theme::label())));
         let mut hit_line = hbar(
             (hit * 100.0) as u64,
             100,
@@ -1983,7 +2001,7 @@ fn draw_model_detail(
             Style::default().fg(theme::info_color()),
         );
         hit_line.push(Span::styled(
-            format!(" {:>3.0}%", hit * 100.0),
+            format!(" {hit_label:>label_w$}"),
             theme::dim(),
         ));
         lines.push(Line::from(hit_line));

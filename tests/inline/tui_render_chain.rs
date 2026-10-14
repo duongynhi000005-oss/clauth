@@ -1281,6 +1281,36 @@ fn canceled_member_shows_the_short_shared_label() {
     );
 }
 
+/// P1: a reason pill quoting a usage reading prints it with at most two
+/// nearest-rounded decimals, like the bar it summarizes.
+#[test]
+fn reason_pills_keep_two_rounded_decimals() {
+    let pill = |reason: BlockedReason| -> String {
+        reason_pill_spans(&reason, ResetFmt::default())
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    };
+    assert_eq!(
+        pill(BlockedReason::FiveHour {
+            pct: 73.42,
+            resets_in: None
+        }),
+        "[ 5h 73.42% ]"
+    );
+    assert_eq!(
+        pill(BlockedReason::WeeklySoft { pct: 99.999 }),
+        "[ weekly 100% ]  still serving"
+    );
+    assert_eq!(
+        pill(BlockedReason::ScopedSpent {
+            label: "7d fable".to_string(),
+            pct: 1.000_000_000_000_000_9
+        }),
+        "[ 7d fable 1% ]  other models ok"
+    );
+}
+
 // A member with headroom shows no pill — the card opens straight on `5h usage`
 // (chain position moved to the selector's `#n` rail, so the card no longer
 // restates it).
@@ -3112,8 +3142,6 @@ fn an_unmarked_selector_name_clamps_to_the_pane_edge() {
     );
 }
 
-/// One chain member `a`, the Fallback card focused on `rotate at`, its
-/// editor holding `draft`.
 fn threshold_app(draft: Option<&str>) -> (App, ReadingsSnapshot) {
     let (cfg, readings) = config_with(vec![profile("a", 95.0, 10.0, 7200)], Some("a"), vec!["a"]);
     let mut app = app_with_readings(cfg, &readings);
@@ -3275,4 +3303,318 @@ fn a_typed_fallback_row_keeps_its_caret_inside_on_a_narrow_pane() {
             );
         }
     }
+}
+
+/// The P1 readings: float residue that must print as a whole, two decimals
+/// that must not round to a fabricated whole, and a reading that rounds up.
+const P1_READINGS: [f64; 3] = [1.000_000_000_000_000_9, 73.42, 99.999];
+
+fn p1_card_app(threshold: f64) -> App {
+    let names = ["alpha", "bravo", "charlie"];
+    let profiles: Vec<(Profile, ReadingsSnapshot)> = names
+        .iter()
+        .zip(P1_READINGS)
+        .map(|(n, r)| profile(n, threshold, r, 2 * 3600 + 30 * 60 + 30))
+        .collect();
+    let (cfg, readings) = config_with(profiles, Some("alpha"), names.to_vec());
+    let mut app = app_with_readings(cfg, &readings);
+    app.tab = crate::tui::app::Tab::Fallback;
+    app
+}
+
+/// P1 verify matrix, Fallback card: the gauge figure (`… used`), the headroom
+/// (`… until rotate`) and the 5h pill print each reading with at most two
+/// rounded decimals. On a pane too narrow for the whole line the words give
+/// way (`…`) and never the reading or its `%`.
+#[test]
+fn the_member_card_keeps_two_rounded_decimals_at_every_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = p1_card_app(80.0);
+    let want: &[(usize, u16, &[&str])] = &[
+        (
+            0,
+            28,
+            &[
+                "│                 1% used  │",
+                "│                 79% unt… │",
+            ],
+        ),
+        (
+            1,
+            28,
+            &[
+                "│                 73.42% … │",
+                "│                 6.58% u… │",
+            ],
+        ),
+        (
+            2,
+            28,
+            &[
+                "│   [ 5h 100% ]  2h 30m    │",
+                "│                 100% us… │",
+                "│                 0% unti… │",
+            ],
+        ),
+        (
+            0,
+            45,
+            &[
+                "│ 5h usage        ░░░░░░░░░░░░░│░░  1% used │",
+                "│                 79% until rotate          │",
+            ],
+        ),
+        (
+            1,
+            45,
+            &[
+                "│ 5h usage        █████████░│░  73.42% used │",
+                "│                 6.58% until rotate        │",
+            ],
+        ),
+        (
+            2,
+            45,
+            &[
+                "│ status          [ 5h 100% ]  2h 30m       │",
+                "│ 5h usage        ███████████│██  100% used │",
+                "│                 0% until rotate           │",
+            ],
+        ),
+        (
+            0,
+            80,
+            &[
+                "│ ❯  #1 alpha          ││ 5h usage        ░░░░░░░░░░░░░░░░░░│░░░  1% used      │",
+                "│    #2 bravo          ││                 79% until rotate                     │",
+            ],
+        ),
+        (
+            1,
+            80,
+            &[
+                "│    #1 alpha          ││ 5h usage        ████████████████░░│░░░  73.42% used  │",
+                "│ ❯  #2 bravo          ││                 6.58% until rotate                   │",
+            ],
+        ),
+        (
+            2,
+            80,
+            &[
+                "│    #1 alpha          ││ status          [ 5h 100% ]  2h 30m                  │",
+                "│                      ││ 5h usage        ██████████████████│███  100% used    │",
+                "│                      ││                 0% until rotate                      │",
+            ],
+        ),
+    ];
+    for (cursor, w, rows) in want {
+        app.chain_cursor = *cursor;
+        let got: Vec<String> = render_chain(&app, *w, 30)
+            .into_iter()
+            .filter(|r| r.contains('%') && !r.contains("rotate at") && !r.contains("weekly at"))
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        assert_eq!(
+            got, *rows,
+            "card reading {} at {w} cols",
+            P1_READINGS[*cursor]
+        );
+    }
+}
+
+/// P1 verify matrix, Fallback pills: every member past a 1% line is blocked,
+/// so each reading quotes in its `5h` pill. Where the value column cannot hold
+/// the pill it drops under the `status` key, whole with its `%`.
+#[test]
+fn the_five_hour_pill_keeps_two_rounded_decimals_at_every_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = p1_card_app(1.0);
+    let want: &[(usize, u16, &str)] = &[
+        (0, 28, "│   [ 5h 1% ]  2h 30m     ┃│"),
+        (1, 28, "│   [ 5h 73.42% ]  2h 30m ┃│"),
+        (2, 28, "│   [ 5h 100% ]  2h 30m   ┃│"),
+        (0, 45, "│ status          [ 5h 1% ]  2h 30m         │"),
+        (1, 45, "│ status          [ 5h 73.42% ]  2h 30m     │"),
+        (2, 45, "│ status          [ 5h 100% ]  2h 30m       │"),
+        (
+            0,
+            80,
+            "│ ❯  #1 alpha        ◔ ││ status          [ 5h 1% ]  2h 30m                    │",
+        ),
+        (
+            1,
+            80,
+            "│    #1 alpha        ◔ ││ status          [ 5h 73.42% ]  2h 30m                │",
+        ),
+        (
+            2,
+            80,
+            "│    #1 alpha        ◔ ││ status          [ 5h 100% ]  2h 30m                  │",
+        ),
+    ];
+    for (cursor, w, row) in want {
+        app.chain_cursor = *cursor;
+        let rows: Vec<String> = render_chain(&app, *w, 30)
+            .into_iter()
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        // P1/R3: the pill sits under its `status` key when it drops.
+        let pill = rows
+            .iter()
+            .position(|r| r.contains("[ 5h"))
+            .expect("pill renders");
+        let before = rows[pill.saturating_sub(1)].as_str();
+        if *w == 28 {
+            assert!(
+                before.starts_with("│ status"),
+                "the dropped pill's status key row: {before:?}"
+            );
+        } else {
+            assert!(
+                rows[pill].contains("│ status"),
+                "the pill rides the status key row: {:?}",
+                rows[pill]
+            );
+        }
+        assert_eq!(
+            rows[pill], *row,
+            "pill reading {} at {w} cols",
+            P1_READINGS[*cursor]
+        );
+    }
+}
+
+/// A setting is not a reading: beside a 73.42% reading the card's `rotate at`
+/// and `weekly at` rows keep their whole-number spelling, at every width.
+#[test]
+fn thresholds_keep_their_own_spelling_beside_a_decimal_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = p1_card_app(80.0);
+    app.chain_cursor = 1;
+    let want: &[(u16, [&str; 2])] = &[
+        (
+            28,
+            [
+                "│   rotate at       80%    │",
+                "│   weekly at       98%    │",
+            ],
+        ),
+        (
+            45,
+            [
+                "│   rotate at       80%   default: 95%      │",
+                "│   weekly at       98%                     │",
+            ],
+        ),
+        (
+            80,
+            [
+                "│                      ││   rotate at       80%   default: 95%                 │",
+                "│                      ││   weekly at       98%                                │",
+            ],
+        ),
+    ];
+    for (w, rows) in want {
+        let got: Vec<String> = render_chain(&app, *w, 30)
+            .into_iter()
+            .filter(|r| r.contains("rotate at") || r.contains("weekly at"))
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        assert_eq!(got, *rows, "threshold rows beside 73.42% at {w} cols");
+    }
+}
+
+/// A `ScopedSpent` pill whose server-named label carries the reading: the
+/// fixture the P1 narrow-width pins use.
+fn p1_scoped_app(label: &str) -> App {
+    let (mut p, mut readings) = profile("alpha", 95.0, 20.0, 9030);
+    p.weekly_threshold = Some(50.0);
+    if let Some(u) = readings.usage.get_mut("alpha") {
+        u.seven_day = Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(reset_in(5 * 86_400)),
+        });
+        u.weekly_scoped = vec![crate::usage::ScopedWindow {
+            label: label.to_string(),
+            window: UsageWindow {
+                utilization: 73.42,
+                resets_at: Some(reset_in(5 * 86_400)),
+            },
+        }];
+    }
+    let (cfg, readings) = config_with(vec![(p, readings)], Some("alpha"), vec!["alpha"]);
+    let mut app = app_with_readings(cfg, &readings);
+    app.tab = crate::tui::app::Tab::Fallback;
+    app
+}
+
+/// P1/R2: a dropped pill too wide for its line cuts its label's name with the
+/// shared truncate — the reading and the closing ` ]` stay whole, at 28 and 29.
+#[test]
+fn a_dropped_scoped_pill_cuts_its_name_never_the_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let want: &[(&str, u16, &str)] = &[
+        ("7d sonnet 4.5", 28, "│   [ 7d sonnet … 73.42% ] │"),
+        ("7d opus 4.1 fast", 28, "│   [ 7d opus 4.… 73.42% ] │"),
+        ("7d sonnet 4.5", 29, "│   [ 7d sonnet 4… 73.42% ] │"),
+        ("7d opus 4.1 fast", 29, "│   [ 7d opus 4.1… 73.42% ] │"),
+    ];
+    for (label, w, row) in want {
+        let app = p1_scoped_app(label);
+        let rows: Vec<String> = render_chain(&app, *w, 30)
+            .into_iter()
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        let pill = rows
+            .iter()
+            .position(|r| r.contains("73.42%"))
+            .expect("pill renders");
+        // P1/R3: the dropped pill's `status` key row sits right above it.
+        assert!(
+            rows[pill - 1].starts_with("│ status"),
+            "the status key row above the dropped pill for {label:?} at {w}: {:?}",
+            rows[pill - 1]
+        );
+        assert_eq!(rows[pill], *row, "{label:?} at {w} cols");
+    }
+}
+
+/// P1/R4: a later pill dropped under the first keeps the `│ `-led line and no
+/// empty rail row appears between them.
+#[test]
+fn a_later_dropped_pill_gets_no_empty_rail_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut d, d_readings) = profile("bravo", 50.0, 73.42, 3600);
+    d.disabled = true;
+    let (cfg, readings) = config_with(
+        vec![profile("alpha", 95.0, 10.0, 3600), (d, d_readings)],
+        Some("alpha"),
+        vec!["alpha", "bravo"],
+    );
+    let mut app = app_with_readings(cfg, &readings);
+    app.tab = crate::tui::app::Tab::Fallback;
+    app.chain_cursor = 1;
+    let rows: Vec<String> = render_chain(&app, 28, 30)
+        .into_iter()
+        .map(|r| r.trim_end().to_string())
+        .collect();
+    let health = rows
+        .iter()
+        .position(|r| r.contains("73.42%"))
+        .expect("the health pill renders");
+    // The bridge rides the dropped pill's own line: the rows above it are the
+    // first pill's hint rail, never an empty rail row.
+    assert_eq!(
+        &rows[health - 1..=health],
+        &[
+            "│ │ setup tab             ┃│",
+            "│ │ [ 5h 73.42% ]  1h 0m  ┃│",
+        ],
+        "the later pill bridges the rail on its own line"
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r.contains("[ disabled ]")).count(),
+        1,
+        "the first pill stays on the key row"
+    );
 }

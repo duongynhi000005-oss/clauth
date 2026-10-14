@@ -207,7 +207,7 @@ fn brackets_stay_dim_regardless_of_fetch_state() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let w = cue_window(50.0);
     let spans =
-        window_summary_spans_bracketed(Some(&w), 17, true, None, ResetFmt::default(), false);
+        window_summary_spans_bracketed(Some(&w), 17, 0, true, None, ResetFmt::default(), false);
     assert_eq!(spans[0].content, "[");
     assert_eq!(spans[0].style.fg, theme::dim().fg);
     assert_eq!(spans[2].content, "]");
@@ -219,8 +219,9 @@ fn brackets_stay_dim_regardless_of_fetch_state() {
 #[test]
 fn no_data_dash_stays_faint() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let spans = window_summary_spans_bracketed(None, 17, true, None, ResetFmt::default(), false);
-    assert_eq!(spans[0].content, "—");
+    let spans = window_summary_spans_bracketed(None, 17, 0, true, None, ResetFmt::default(), false);
+    // 17 wide: the 10-cell bar + 2 brackets + 1 gap leave the 13-cell dash span.
+    assert_eq!(spans[0].content, "            —");
     assert_eq!(spans[0].style.fg, theme::faint().fg);
 }
 
@@ -419,9 +420,10 @@ fn clock_reset_suffix_degrades_when_the_column_is_too_narrow() {
         "a wide column carries both halves, got {roomy}"
     );
     assert_eq!(
-        reset_suffix(2400, fmt, 26),
+        reset_suffix(2400, fmt, 9),
         " (40m)",
-        "26 cells can't fit a stamp: fall back to the countdown"
+        "the 9 cells a 26-wide column leaves its bar block can't fit a stamp: \
+         fall back to the countdown"
     );
 }
 
@@ -549,7 +551,7 @@ fn overview_reset_middle_dot_stays_uncolored_in_both_mode() {
             clock: ClockFormat::H24,
         },
     ] {
-        let single = window_summary_spans_bracketed(Some(&w), 160, true, None, no_dot, false);
+        let single = window_summary_spans_bracketed(Some(&w), 160, 0, true, None, no_dot, false);
         assert!(
             !single.iter().any(|s| s.content == " · "),
             "no separator without a countdown+stamp pair"
@@ -610,9 +612,9 @@ fn stale_window_fades_only_fill_and_percent() {
     // a mutation that leaked `stale` into the reset color.
     let reset = Some(theme::warning());
     let live =
-        window_summary_spans_bracketed(Some(&w), 26, true, reset, ResetFmt::default(), false);
+        window_summary_spans_bracketed(Some(&w), 26, 0, true, reset, ResetFmt::default(), false);
     let stale =
-        window_summary_spans_bracketed(Some(&w), 26, true, reset, ResetFmt::default(), true);
+        window_summary_spans_bracketed(Some(&w), 26, 0, true, reset, ResetFmt::default(), true);
 
     // spans[0] = `[`, [1] = fill, [2] = `]`, [3] = ` XX%`, [4..] = reset suffix.
     assert_eq!(live[1].content, "█████░░░░░");
@@ -690,5 +692,40 @@ fn relative_age_switches_to_a_local_stamp_at_thirty_days() {
             dated, utc,
             "the arm rendered UTC digits, not local wall clock: {dated:?}"
         );
+    }
+}
+
+/// P1: the bracketed window bar labels its reading with at most two
+/// nearest-rounded decimals at every width branch: 73.42 never prints a
+/// fabricated `73%`, float residue never leaks, 99.999 rounds to `100%`.
+#[test]
+fn the_bracketed_bar_label_keeps_two_rounded_decimals() {
+    let cases = [
+        (73.42, "73.42%"),
+        (1.000_000_000_000_000_9, "1%"),
+        (99.999, "100%"),
+    ];
+    for width in [30, 20, 14, 8] {
+        for (utilization, want) in cases {
+            let window = UsageWindow {
+                utilization,
+                resets_at: None,
+            };
+            let spans = window_summary_spans_bracketed_at(
+                Some(&window),
+                width,
+                true,
+                None,
+                ResetFmt::default(),
+                false,
+                0,
+            );
+            let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(
+                text.split_whitespace().last(),
+                Some(want),
+                "{utilization} at width {width}: {text:?}"
+            );
+        }
     }
 }

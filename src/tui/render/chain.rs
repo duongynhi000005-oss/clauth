@@ -39,6 +39,7 @@ use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, parse_threshold,
     soonest_resume, spend_is_uncapped, spend_room, threshold_for, uncapped_spend_fix,
 };
+use crate::format::format_pct;
 use crate::profile::AppConfig;
 use crate::usage::{humanize_duration, switch_grade_kick_lifts};
 use chrono::Weekday;
@@ -489,17 +490,17 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
             (DIAG_BUDGET_SPENT.to_string(), theme::warning().bold(), None)
         }
         BlockedReason::FiveHour { pct, resets_in } => (
-            format!("5h {pct:.0}%"),
+            format!("5h {}", format_pct(*pct)),
             theme::warning().bold(),
             resets_in.as_ref().map(|s| reset_pill(*s, fmt)),
         ),
         BlockedReason::ScopedSpent { label, pct } => (
-            format!("{label} {pct:.0}%"),
+            format!("{label} {}", format_pct(*pct)),
             theme::warning().bold(),
             Some("other models ok".to_string()),
         ),
         BlockedReason::WeeklySoft { pct } => (
-            format!("weekly {pct:.0}%"),
+            format!("weekly {}", format_pct(*pct)),
             theme::warning().bold(),
             Some("still serving".to_string()),
         ),
@@ -620,9 +621,17 @@ fn live_session_lines(
 /// it. Both surfaces draw their glyph lines with the shared
 /// [`rail_hint_lines`], so the rail itself has exactly one implementation.
 fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Line<'static>> {
+    /// `[ label ]` is a pill's first three spans; any span after is its faint
+    /// qualifier (`reason_pill_spans`).
+    const PILL_SPANS: usize = 3;
+    const KEY_W: usize = DETAIL_KEY_W + DETAIL_KEY_GUTTER;
+    /// The dropped pill's indent: the rail glyph + 1 space, where the hint text
+    /// under it starts too.
+    const DROP_LEAD_W: usize = 2;
+    let cells = |spans: &[Span<'static>]| spans.iter().map(Span::width).sum::<usize>();
     let total = pills.len();
     let mut lines = Vec::with_capacity(total * 2);
-    for (i, (content, hint)) in pills.into_iter().enumerate() {
+    for (i, (mut content, hint)) in pills.into_iter().enumerate() {
         // Any row past the first implies 2+ pills, and the rail is still open
         // there because this row's own hint hasn't been emitted yet — so a
         // later row always bridges, never blank-pads.
@@ -637,9 +646,49 @@ fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Lin
                 theme::line(),
             )
         };
-        let mut spans = vec![key];
-        spans.extend(content);
-        lines.push(Line::from(spans));
+        // The reading is the last thing to give way: the qualifier drops
+        // first, then a pill too wide for the value column moves under the
+        // key, where its qualifier may fit again, and a label still too wide
+        // there cuts its name ahead of the reading. The reading holds while
+        // the dropped line keeps room for `[ <reading> ]`.
+        let pill_w = cells(&content[..PILL_SPANS.min(content.len())]);
+        if KEY_W + cells(&content) <= width {
+            lines.push(Line::from([vec![key], content].concat()));
+        } else if KEY_W + pill_w <= width {
+            content.truncate(PILL_SPANS);
+            lines.push(Line::from([vec![key], content].concat()));
+        } else {
+            // A later pill's key cell is only the rail bridge, which its own
+            // `│ `-led line already carries.
+            if i == 0 {
+                lines.push(Line::from(key));
+            }
+            if DROP_LEAD_W + cells(&content) > width {
+                content.truncate(PILL_SPANS);
+            }
+            let over = (DROP_LEAD_W + cells(&content)).saturating_sub(width);
+            if over > 0
+                && let Some(label) = content.get_mut(1)
+            {
+                let text = label.content.to_string();
+                if let Some((name, reading)) =
+                    text.rsplit_once(' ').filter(|(_, r)| r.ends_with('%'))
+                {
+                    let keep = Span::raw(name).width().saturating_sub(over);
+                    label.content = if keep == 0 {
+                        reading.to_string().into()
+                    } else {
+                        format!("{} {reading}", truncate(name, keep)).into()
+                    };
+                }
+            }
+            let lead = if i == 0 {
+                Span::raw(" ".repeat(DROP_LEAD_W))
+            } else {
+                Span::styled("│ ", theme::line())
+            };
+            lines.push(Line::from([vec![lead], content].concat()));
+        }
         lines.extend(rail_hint_lines(&hint, width, i + 1 < total));
     }
     lines
@@ -874,7 +923,7 @@ fn member_detail(
     // key and the figure leave, up to `GAUGE_W`, so on a narrow pane the bar
     // gives and the figure reads whole.
     let (figure, figure_style) = match pct {
-        Some(v) => (format!("{v:.0}% used"), theme::util(v)),
+        Some(v) => (format!("{} used", format_pct(v)), theme::util(v)),
         None => ("no data yet".to_string(), theme::faint()),
     };
     let key_w = DETAIL_KEY_W + DETAIL_KEY_GUTTER;
@@ -901,9 +950,12 @@ fn member_detail(
             width.saturating_sub(key_w).clamp(4, GAUGE_W),
         ));
         lines.push(Line::from(gauge_spans));
+        // The reading leads the line, so on a pane too narrow for the whole
+        // figure ` used` gives way first; the reading holds while the line
+        // keeps one cell past it (8 cells at 28 cols).
         lines.push(Line::from(vec![
             Span::raw(" ".repeat(key_w)),
-            Span::styled(figure, figure_style),
+            Span::styled(truncate(&figure, width.saturating_sub(key_w)), figure_style),
         ]));
     }
 
@@ -911,7 +963,7 @@ fn member_detail(
     // read as a deliberate gap on exactly the accounts that had nothing to say.
     if let Some(v) = pct {
         let hint = truncate(
-            &format!("{:.0}% until rotate", (threshold - v).max(0.0)),
+            &format!("{} until rotate", format_pct((threshold - v).max(0.0))),
             width.saturating_sub(key_w),
         );
         lines.push(Line::from(vec![

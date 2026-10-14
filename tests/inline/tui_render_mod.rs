@@ -3179,17 +3179,17 @@ fn the_five_hour_bar_sheds_before_clipping_its_figure() {
         (
             34,
             &[
-                "│ ❯   abcdefg…  —            12% │",
-                "│   ● cjk-日 …   —            49% │",
-                "│     emoji-…   —            63% │",
+                "│ ❯   abcdefg…  —           12%  │",
+                "│   ● cjk-日 …   —           49%  │",
+                "│     emoji-…   —           63%  │",
             ],
         ),
         (
             45,
             &[
-                "│ ❯   abcdefghij…  —           [█░░░░]  12% │",
-                "│   ● cjk-日 本 語 …  —           [██░░░]  49% │",
-                "│     emoji-🧭 ⚠️ …  —           [███░░]  63% │",
+                "│ ❯   abcdefghij…  —           [█░░░░░] 12% │",
+                "│   ● cjk-日 本 語 …  —           [███░░░] 49% │",
+                "│     emoji-🧭 ⚠️ …  —           [████░░] 63% │",
             ],
         ),
     ];
@@ -3207,25 +3207,25 @@ fn the_five_hour_bar_sheds_before_clipping_its_figure() {
     }
 }
 
-/// The chain threshold figure (`42 / 80%`) stays whole at every width: inline
-/// when it fits, on its own line when it doesn't, never an orphan `42 /`.
+/// The chain threshold figure (`42% / 80%`) stays whole at every width: inline
+/// when it fits, on its own line when it doesn't, never an orphan `42% /`.
 #[test]
 fn the_chain_threshold_figure_stays_whole_at_narrow_widths() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = s9_overview_app();
-    // The chain threshold figure (`49 / 80%`) stays whole at every width:
+    // The chain threshold figure (`49% / 80%`) stays whole at every width:
     // inline when it fits, on its own line when it doesn't, never an orphan
-    // `49 /`. Pinned whole-row (chain members + caption) at every width.
+    // `49% /`. Pinned whole-row (chain members + caption) at every width.
     let want: &[(u16, &[&str])] = &[
         (
             27,
             &[
                 "│  ╭ 1 cjk-…   ▰▰▰▰▰▰▱▱▱▱ │",
-                "│    49 / 80%             │",
+                "│   49% / 80%             │",
                 "│  │ 2 emoji…  ▰▰▰▰▰▰▰▰▱▱ │",
-                "│    63 / 80%             │",
+                "│   63% / 80%             │",
                 "│  ╰ 3 abcde…  ▰▰▱▱▱▱▱▱▱▱ │",
-                "│    12 / 80%             │",
+                "│   12% / 80%             │",
                 "│   [ stay ] on the       │",
                 "│   active                │",
                 "│   account when          │",
@@ -3236,11 +3236,11 @@ fn the_chain_threshold_figure_stays_whole_at_narrow_widths() {
             28,
             &[
                 "│  ╭ 1 cjk-…   ▰▰▰▰▰▰▰▱▱▱▱ │",
-                "│    49 / 80%              │",
+                "│   49% / 80%              │",
                 "│  │ 2 emoji…  ▰▰▰▰▰▰▰▰▰▱▱ │",
-                "│    63 / 80%              │",
+                "│   63% / 80%              │",
                 "│  ╰ 3 abcde…  ▰▰▱▱▱▱▱▱▱▱▱ │",
-                "│    12 / 80%              │",
+                "│   12% / 80%              │",
                 "│   [ stay ] on the active │",
                 "│   account when           │",
                 "│   all spent              │",
@@ -3249,9 +3249,9 @@ fn the_chain_threshold_figure_stays_whole_at_narrow_widths() {
         (
             34,
             &[
-                "│  ╭ 1 cjk-日 …   ▰▰▱▱   49 / 80% │",
-                "│  │ 2 emoji-…   ▰▰▰▱   63 / 80% │",
-                "│  ╰ 3 abcdefg…  ▰▱▱▱   12 / 80% │",
+                "│  ╭ 1 cjk-日 …   ▰▰▱▱  49% / 80% │",
+                "│  │ 2 emoji-…   ▰▰▰▱  63% / 80% │",
+                "│  ╰ 3 abcdefg…  ▰▱▱▱  12% / 80% │",
                 "│   [ stay ] on the active       │",
                 "│   account when all             │",
                 "│   spent                        │",
@@ -3260,9 +3260,9 @@ fn the_chain_threshold_figure_stays_whole_at_narrow_widths() {
         (
             45,
             &[
-                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン …  ▰▰▱▱   49 / 80% │",
-                "│  │ 2 emoji-🧭 ⚠️ -account   ▰▰▰▱   63 / 80% │",
-                "│  ╰ 3 abcdefghijklmnopqr…  ▰▱▱▱   12 / 80% │",
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン …  ▰▰▱▱  49% / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account   ▰▰▰▱  63% / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqr…  ▰▱▱▱  12% / 80% │",
                 "│   [ stay ] on the active account when all │",
                 "│   spent                                   │",
             ],
@@ -3305,7 +3305,7 @@ fn the_overview_name_column_desktop_rows_replace_the_pre_s9_clip() {
     assert_eq!(
         got,
         vec![
-            "│ ❯   abcdefghijklmnopqrstuvwxyz                            —                        [█░░░░░░░░░]  12%                 [█░░░░░░░░░]   8%                       │",
+            "│ ❯   abcdefghijklmnopqrstuvwxyz                            —                        [█░░░░░░░░░] 12%                  [█░░░░░░░░░]  8%                        │",
         ],
         "name column ascii row at 160 cols"
     );
@@ -3328,8 +3328,8 @@ fn the_overview_name_column_desktop_rows_measure_by_cells() {
     assert_eq!(
         got,
         vec![
-            "│   ● cjk-日 本 語 ア カ ウ ン ト                                   —                        [█████░░░░░]  49%                 [███░░░░░░░]  30%                       │",
-            "│     emoji-🧭 ⚠️ -account                                    —                        [██████░░░░]  63%                 [████░░░░░░]  40%                       │",
+            "│   ● cjk-日 本 語 ア カ ウ ン ト                                   —                        [█████░░░░░] 49%                  [███░░░░░░░] 30%                        │",
+            "│     emoji-🧭 ⚠️ -account                                    —                        [██████░░░░] 63%                  [████░░░░░░] 40%                        │",
         ],
         "name column wide rows at 160 cols"
     );
@@ -3350,7 +3350,7 @@ fn the_overview_accounts_ascii_row_desktop_matches_the_pre_s9_render() {
         .collect();
     assert_eq!(
         got,
-        vec!["│ ❯   abcdefghijklmno…      —                  [█░░░░░░░░░]  12%        8%     │"],
+        vec!["│ ❯   abcdefghijklmno…      —                  [█░░░░░░░░░] 12%        8%      │"],
         "ascii accounts row at 80 cols"
     );
 }
@@ -3371,7 +3371,7 @@ fn the_overview_accounts_wide_name_rows_desktop_replace_the_pre_s9_clip() {
     assert_eq!(
         got,
         vec![
-            "│   ● cjk-日 本 語 ア カ …       —                  [█████░░░░░]  49%       30%     │",
+            "│   ● cjk-日 本 語 ア カ …       —                  [█████░░░░░] 49%       30%      │",
         ],
         "accounts cjk wide-name row at 80 cols"
     );
@@ -3393,7 +3393,7 @@ fn the_overview_accounts_emoji_row_desktop_rows_measure_by_cells() {
         .collect();
     assert_eq!(
         got,
-        vec!["│     emoji-🧭 ⚠️ -acco…      —                  [██████░░░░]  63%       40%     │",],
+        vec!["│     emoji-🧭 ⚠️ -acco…      —                  [██████░░░░] 63%       40%      │",],
         "accounts emoji wide-name row at 80 cols"
     );
 }
@@ -3408,16 +3408,16 @@ fn the_fallback_chain_rows_desktop_match_the_pre_s9_render() {
         (
             80,
             &[
-                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱▱   49 / 80%                     │",
-                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱▱   12 / 80%                     │",
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱▱  49% / 80%                     │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱▱  12% / 80%                     │",
                 "│   [ stay ] on the active account when all spent                              │",
             ],
         ),
         (
             160,
             &[
-                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱▱   49 / 80%                                                                                                     │",
-                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱▱   12 / 80%                                                                                                     │",
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱▱  49% / 80%                                                                                                     │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱▱  12% / 80%                                                                                                     │",
                 "│   [ stay ] on the active account when all spent                                                                                                              │",
             ],
         ),
@@ -3454,11 +3454,11 @@ fn the_fallback_chain_emoji_row_desktop_rows_measure_by_cells() {
     let want: &[(u16, &str)] = &[
         (
             80,
-            "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱▱   63 / 80%                     │",
+            "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱▱  63% / 80%                     │",
         ),
         (
             160,
-            "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱▱   63 / 80%                                                                                                     │",
+            "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱▱  63% / 80%                                                                                                     │",
         ),
     ];
     for (w, expected) in want {
@@ -5988,36 +5988,36 @@ fn narrow_chain_names_keep_their_full_width_when_the_row_has_room() {
         (
             45u16,
             &[
-                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン …  ▰▰▱▱   49 / 80% │",
-                "│  │ 2 emoji-🧭 ⚠️ -account   ▰▰▰▱   63 / 80% │",
-                "│  ╰ 3 abcdefghijklmnopqr…  ▰▱▱▱   12 / 80% │",
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン …  ▰▰▱▱  49% / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account   ▰▰▰▱  63% / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqr…  ▰▱▱▱  12% / 80% │",
             ],
             "│   [ stay ] on the active account when all │",
         ),
         (
             58u16,
             &[
-                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▱▱▱▱   49 / 80% │",
-                "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▱▱   63 / 80% │",
-                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱   12 / 80% │",
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▱▱▱▱  49% / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▱▱  63% / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱  12% / 80% │",
             ],
             "│   [ stay ] on the active account when all spent        │",
         ),
         (
             59u16,
             &[
-                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱   49 / 80% │",
-                "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱   63 / 80% │",
-                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱   12 / 80% │",
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱  49% / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱  63% / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱  12% / 80% │",
             ],
             "│   [ stay ] on the active account when all spent         │",
         ),
         (
             60u16,
             &[
-                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱▱   49 / 80% │",
-                "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱▱   63 / 80% │",
-                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱▱   12 / 80% │",
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱▱  49% / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱▱  63% / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱▱  12% / 80% │",
             ],
             "│   [ stay ] on the active account when all spent          │",
         ),
@@ -6435,7 +6435,7 @@ fn the_tokens_total_badge_and_top_models_desktop_rows_replace_the_pre_s9_clip() 
         got,
         vec![
             "│ idle so far today              ││ tokens    0                   0% cache hit │",
-            "│ 日 本 語 モ デ ル  ████████░░░░░░░░░░░░░ 4.30M ││ output      ░░░░░░░░░░░░░░    0% │",
+            "│ 日 本 語 モ デ ル  ████████░░░░░░░░░░░░░ 4.30M ││ output      ░░░░░░░░░░░░░░░░  0% │",
         ],
         "tokens badge + top models at 80 cols"
     );
@@ -6999,7 +6999,7 @@ fn a_disabled_provider_accounts_cached_reading_shows_after_one_tick() {
     assert_eq!(
         overview_chain_row(&mut app),
         vec![
-            "│  ╶ 1 tp      ▰▰▰▰▰▰▰▰▰▰▰▰   97 / 95%   ⊖                                                         │"
+            "│  ╶ 1 tp      ▰▰▰▰▰▰▰▰▰▰▰▰  97% / 95%   ⊖                                                         │"
         ],
         "the Overview chain row shows the cached 5h figure"
     );
@@ -7053,7 +7053,7 @@ fn a_keyless_provider_member_claims_no_failed_check_after_one_tick() {
     assert_eq!(
         overview_chain_row(&mut app),
         vec![
-            "│  ╶ 1 tp      ▰▰▰▰▰▰▰▰▰▰▰▰   97 / 95%                                                             │"
+            "│  ╶ 1 tp      ▰▰▰▰▰▰▰▰▰▰▰▰  97% / 95%                                                             │"
         ],
         "the Overview chain row carries no `⋯`"
     );
@@ -7227,8 +7227,363 @@ fn a_reading_inserted_into_a_store_shows_in_the_next_draw() {
     assert_eq!(
         rows_with(&after, &["87%"]),
         vec![
-            "│ ❯ ● o              —                       [█████████░]  87% (1h 0m)        —                    │"
+            "│ ❯ ● o              —                       [█████████░] 87% (1h 0m)         —                    │"
         ],
         "the very next draw shows the store reading on the account row"
     );
+}
+
+/// The P1 readings: float residue that must print as a whole, two decimals
+/// that must not round to a fabricated whole, and a reading that rounds up.
+const P1_READINGS: [f64; 3] = [1.000_000_000_000_000_9, 73.42, 99.999];
+
+/// One Claude account per [`P1_READINGS`] entry (5h and 7d alike), all in the
+/// chain, `bravo` active, and a codex roster mirroring them, so every surface
+/// renders all three readings and its column of them.
+fn p1_readings_app() -> App {
+    let names = ["alpha", "bravo", "charlie"];
+    let profiles: Vec<Profile> = names.iter().map(|n| oauth(n, false)).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("bravo".into()),
+            profiles: names.iter().map(|n| (*n).into()).collect(),
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    for (n, r) in names.iter().zip(P1_READINGS) {
+        app.usage_store
+            .lock()
+            .unwrap()
+            .insert((*n).to_string(), oauth_usage(r, r));
+    }
+    app.codex_rows = names
+        .iter()
+        .zip(P1_READINGS)
+        .map(|(n, r)| {
+            let window = Some(crate::usage::UsageWindow {
+                utilization: r,
+                resets_at: None,
+            });
+            crate::tui::app::CodexRow {
+                name: format!("cx-{n}").as_str().into(),
+                active: false,
+                broken: false,
+                plan: Some("plus".into()),
+                five_hour: window.clone(),
+                seven_day: window,
+                resets: None,
+            }
+        })
+        .collect();
+    app
+}
+
+/// Every frame row below the header that prints a percentage, trailing blanks
+/// trimmed.
+fn pct_rows(frame: &str) -> Vec<String> {
+    frame
+        .lines()
+        .skip(3)
+        .filter(|l| l.contains('%'))
+        .map(|l| l.trim_end().to_string())
+        .collect()
+}
+
+/// P1 verify matrix, Overview: the Claude rows' bars, the codex band and the
+/// chain panel's figures print each reading with at most two rounded decimals,
+/// left-padded to their column's widest so the `%` signs align. At 34 cols (the
+/// width floor) the bar is gone and the name gives cells so the bare reading
+/// reads whole; at 28 the accounts table is under the floor (the 5h column
+/// drops whole, pinned by `the_five_hour_bar_sheds_before_clipping_its_figure`)
+/// and only the chain panel's figures print.
+#[test]
+fn overview_readings_keep_two_rounded_decimals_at_every_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+    let mut app = p1_readings_app();
+    app.tab = Tab::Overview;
+    let want: &[(u16, &[&str])] = &[
+        (
+            28,
+            &[
+                "│       1% / 80%           │",
+                "│   73.42% / 80%           │",
+                "│     100% / 80%           │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│ ❯   alpha   —               1% │",
+                "│   ● bravo   —           73.42% │",
+                "│     charl…  —             100% │",
+                "│     cx-al…  plus            1% │",
+                "│     cx-br…  plus        73.42% │",
+                "│     cx-ch…  plus          100% │",
+                "│       1% / 80%                 │",
+                "│   73.42% / 80%                 │",
+                "│     100% / 80%                 │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│ ❯   alpha     —           [░░░░░]     1%  │",
+                "│   ● bravo     —           [████░] 73.42%  │",
+                "│     charlie   —           [█████]   100%  │",
+                "│     cx-alpha  plus            1%          │",
+                "│     cx-bravo  plus        73.42%          │",
+                "│     cx-char…  plus          100%          │",
+                "│  ╭ 1 alpha    ▱▱▱▱▱▱▱▱▱▱▱▱      1% / 80%  │",
+                "│  │ 2 bravo    ▰▰▰▰▰▰▰▰▰▰▰▱  73.42% / 80%  │",
+                "│  ╰ 3 charlie  ▰▰▰▰▰▰▰▰▰▰▰▰    100% / 80%  │",
+            ],
+        ),
+        (
+            80,
+            &[
+                "│ ❯   alpha       —                 [░░░░░░░░░░]     1%        1%              │",
+                "│   ● bravo       —                 [███████░░░] 73.42%    73.42%              │",
+                "│     charlie     —                 [██████████]   100%      100%              │",
+                "│     cx-alpha    plus                  1%                     1%              │",
+                "│     cx-bravo    plus              73.42%                 73.42%              │",
+                "│     cx-char…    plus                100%                   100%              │",
+                "│  ╭ 1 alpha    ▱▱▱▱▱▱▱▱▱▱▱▱      1% / 80%                                     │",
+                "│  │ 2 bravo    ▰▰▰▰▰▰▰▰▰▰▰▱  73.42% / 80%                                     │",
+                "│  ╰ 3 charlie  ▰▰▰▰▰▰▰▰▰▰▰▰    100% / 80%                                     │",
+            ],
+        ),
+    ];
+    for (w, rows) in want {
+        assert_eq!(
+            pct_rows(&dump(&app, *w, 40)),
+            *rows,
+            "overview readings {P1_READINGS:?} at {w} cols"
+        );
+    }
+}
+
+/// P1 verify matrix, Usage: each window's eyebrow prints its reading with at
+/// most two rounded decimals, whole with its `%`, at every width.
+#[test]
+fn usage_bars_keep_two_rounded_decimals_at_every_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+    let mut app = p1_readings_app();
+    app.tab = Tab::Usage;
+    let want: &[(usize, u16, [&str; 2])] = &[
+        (
+            0,
+            28,
+            [
+                "│ 5h                    1% │",
+                "│ 7d                    1% │",
+            ],
+        ),
+        (
+            1,
+            28,
+            [
+                "│ 5h                73.42% │",
+                "│ 7d                73.42% │",
+            ],
+        ),
+        (
+            2,
+            28,
+            [
+                "│ 5h                  100% │",
+                "│ 7d                  100% │",
+            ],
+        ),
+        (
+            0,
+            45,
+            [
+                "│ 5h                                     1% │",
+                "│ 7d                                     1% │",
+            ],
+        ),
+        (
+            1,
+            45,
+            [
+                "│ 5h                                 73.42% │",
+                "│ 7d                                 73.42% │",
+            ],
+        ),
+        (
+            2,
+            45,
+            [
+                "│ 5h                                   100% │",
+                "│ 7d                                   100% │",
+            ],
+        ),
+        (
+            0,
+            80,
+            [
+                "│                      ││ 5h                                                1% │",
+                "│                      ││ 7d                                                1% │",
+            ],
+        ),
+        (
+            1,
+            80,
+            [
+                "│                      ││ 5h                                            73.42% │",
+                "│                      ││ 7d                                            73.42% │",
+            ],
+        ),
+        (
+            2,
+            80,
+            [
+                "│                      ││ 5h                                              100% │",
+                "│                      ││ 7d                                              100% │",
+            ],
+        ),
+    ];
+    for (cursor, w, rows) in want {
+        app.profile_cursor = *cursor;
+        assert_eq!(
+            pct_rows(&dump(&app, *w, 40)),
+            *rows,
+            "usage reading {} at {w} cols",
+            P1_READINGS[*cursor]
+        );
+    }
+}
+
+/// P1 verify matrix, header: the gauge prints the active account's reading
+/// with at most two rounded decimals, and where the row cannot hold it the
+/// gauge drops whole rather than cutting the figure.
+#[test]
+fn the_header_gauge_keeps_two_rounded_decimals_at_every_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+    let mut app = p1_readings_app();
+    app.tab = Tab::Tokens;
+    let want: &[(&str, u16, &str)] = &[
+        ("alpha", 28, "▝▜█████▛"),
+        ("bravo", 28, "▝▜█████▛"),
+        ("charlie", 28, "▝▜█████▛"),
+        ("alpha", 45, "▝▜█████▛▘ alpha 1%         ● status.claude.ai"),
+        ("bravo", 45, "▝▜█████▛▘ bravo 73.42%     ● status.claude.ai"),
+        (
+            "charlie",
+            45,
+            "▝▜█████▛▘ charlie 100%     ● status.claude.ai",
+        ),
+        (
+            "alpha",
+            80,
+            "▝▜█████▛▘ [ 0 live ] · alpha 1% [░░░░░░░░░░]                  ● status.claude.ai",
+        ),
+        (
+            "bravo",
+            80,
+            "▝▜█████▛▘ [ 0 live ] · bravo 73.42% [███████░░░]              ● status.claude.ai",
+        ),
+        (
+            "charlie",
+            80,
+            "▝▜█████▛▘ [ 0 live ] · charlie 100% [██████████]              ● status.claude.ai",
+        ),
+    ];
+    for (active, w, row) in want {
+        app.config().state.active_profile = Some((*active).into());
+        let frame = dump(&app, *w, 40);
+        assert_eq!(
+            frame.lines().nth(1).map(str::trim_end),
+            Some(*row),
+            "header gauge for {active} at {w} cols"
+        );
+    }
+}
+
+/// One account with a 73.42% reading and one whose 5h window is absent but
+/// 7d present, so the bare 5h column renders a reading beside a `—`.
+fn p1_dash_app() -> App {
+    let profiles = vec![oauth("alpha", false), oauth("bravo", false)];
+    let names = ["alpha", "bravo"];
+    let app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("bravo".into()),
+            profiles: names.iter().map(|n| (*n).into()).collect(),
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.usage_store.lock().unwrap().insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: None,
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 10.0,
+                resets_at: None,
+            }),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("bravo".to_string(), oauth_usage(73.42, 10.0));
+    app
+}
+
+#[test]
+fn the_bare_band_pads_the_no_data_dash_to_the_label_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+    let mut app = p1_dash_app();
+    app.tab = Tab::Overview;
+    let want: &[(u16, [&str; 2])] = &[
+        (
+            34,
+            [
+                "│ ❯   alpha   —                — │",
+                "│   ● bravo   —           73.42% │",
+            ],
+        ),
+        (
+            45,
+            [
+                "│ ❯   alpha     —                        —  │",
+                "│   ● bravo     —           [████░] 73.42%  │",
+            ],
+        ),
+        (
+            64,
+            [
+                "│ ❯   alpha      —                        —   10%              │",
+                "│   ● bravo      —           [████░] 73.42%   10%              │",
+            ],
+        ),
+        (
+            80,
+            [
+                "│ ❯   alpha        —                                   —     10%               │",
+                "│   ● bravo        —                 [███████░░░] 73.42%     10%               │",
+            ],
+        ),
+    ];
+    for (w, rows) in want {
+        let got: Vec<String> = dump(&app, *w, 40)
+            .lines()
+            .filter(|r| {
+                (r.contains("alpha") || r.contains("bravo")) && !r.contains("╭") && !r.contains("╰")
+            })
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        assert_eq!(
+            got, *rows,
+            "the no-window dash aligns with the reading at {w}"
+        );
+    }
 }

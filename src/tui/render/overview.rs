@@ -10,9 +10,9 @@ use super::super::app::{App, CodexRow, MainItemKind, ReadingsSnapshot};
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
-    NO_DATA, ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed, fixed_split,
-    grapheme_cells, is_past_reset, reset_resume, spinner_frame, spinner_style, truncate,
-    window_summary_spans_bracketed,
+    NO_DATA, PCT_LABEL_BUDGET, ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed,
+    fixed_split, grapheme_cells, is_past_reset, reset_resume, spinner_frame, spinner_style,
+    truncate, window_label, window_summary_spans_bracketed,
 };
 use super::header::pulse_name_spans;
 use super::panes::{
@@ -22,6 +22,7 @@ use super::panes::{
 use super::prose::{self, cmd_lit};
 use super::usage::{eta_left_secs, window_rate_unit};
 use crate::fallback::{BlockedReason, SwitchAction, blocked_reason, soonest_resume, threshold_for};
+use crate::format::format_pct;
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::providers::Provider;
 use crate::usage::{
@@ -253,6 +254,47 @@ struct OverviewWidths {
     /// Widest amount string (`"1.71"` of `"1.71 USD"`) across DeepSeek rows, so
     /// currencies align in the column. `0` when no DeepSeek balance is cached.
     deepseek_amount_w: usize,
+    claude_labels: LabelWidths,
+    codex_labels: LabelWidths,
+}
+
+/// The widest reading a band renders in each usage column. Every reading is
+/// left-padded to its band's widest so the `%` signs align, and a column
+/// widens by the excess of either band over [`PCT_LABEL_BUDGET`].
+#[derive(Debug, Clone, Copy, Default)]
+struct LabelWidths {
+    five: usize,
+    seven: usize,
+}
+
+impl LabelWidths {
+    fn of(labels: impl Iterator<Item = (Option<String>, Option<String>)>) -> Self {
+        labels.fold(Self::default(), |acc, (five, seven)| Self {
+            five: acc.five.max(five.map_or(0, |l| l.len())),
+            seven: acc.seven.max(seven.map_or(0, |l| l.len())),
+        })
+    }
+
+    fn widest(self, other: Self) -> Self {
+        Self {
+            five: self.five.max(other.five),
+            seven: self.seven.max(other.seven),
+        }
+    }
+
+    /// Cells each column's tiers grow by to hold a reading wider than `100%`.
+    fn excess(self) -> (usize, usize) {
+        (
+            self.five.saturating_sub(PCT_LABEL_BUDGET),
+            self.seven.saturating_sub(PCT_LABEL_BUDGET),
+        )
+    }
+}
+
+/// A codex row's reading. Unclamped, unlike the Claude bar's, so a reading past
+/// its cap prints as read.
+fn codex_label(window: &UsageWindow) -> String {
+    format_pct(window.utilization)
 }
 
 /// Width of the live-session column: its `live` header text, which is also the
@@ -267,11 +309,17 @@ const NAME_MAX: usize = 22;
 const KIND_MAX: usize = 16;
 /// Widest the 5h column reaches before the wall-clock stamp bonus.
 const FIVE_HOUR_MAX: usize = 26;
-/// Narrowest the 5h column ever reaches: `{:>3.0}%` alone (` 49%`), the bar
-/// (brackets included) shed rather than clipping the figure.
+/// Narrowest the 5h column ever reaches before a wider reading's excess: the
+/// bare `100%` alone, the bar (brackets included) shed rather than clipping the
+/// figure.
 const FIVE_HOUR_MIN: usize = 4;
+/// Narrowest an account name gets, and only once the 5h column is down to its
+/// bare reading: the chain panel's name floor.
+const NAME_READING_FLOOR: usize = 6;
 /// Widest the 7d column reaches before the wall-clock stamp bonus.
 const SEVEN_DAY_MAX: usize = 27;
+/// Narrowest 7d tier that holds its bar; the tier under it is the bare reading.
+const SEVEN_DAY_BAR: usize = 18;
 /// `total` at which the name clamp lets a name reach [`NAME_MAX`].
 const NAME_WIDE_AT: usize = 86;
 /// `total` at which the kind column reaches [`KIND_MAX`].
@@ -294,8 +342,34 @@ impl OverviewWidths {
             .max()
             .unwrap_or(8);
         let shows_clock = ResetFmt::from_state(&app.config().state).shows_clock();
-        let (mut name, kind, mut five_hour, mut seven_day) = overview_tiers(max_name, total);
-        let live = live_column_width(max_name, total);
+        let claude_labels = if app.harness_filter.shows_claude() {
+            LabelWidths::of(app.config().profiles.iter().map(|p| {
+                let (five, seven) = overview_windows(p, readings);
+                // A DeepSeek row's 5h cell holds its balance, not a reading.
+                let five = five.filter(|_| p.provider != Some(Provider::DeepSeek));
+                (
+                    five.as_ref().map(window_label),
+                    seven.as_ref().map(window_label),
+                )
+            }))
+        } else {
+            LabelWidths::default()
+        };
+        let codex_labels = if app.harness_filter.shows_codex() {
+            LabelWidths::of(app.codex_rows.iter().map(|r| {
+                (
+                    r.five_hour.as_ref().map(codex_label),
+                    r.seven_day.as_ref().map(codex_label),
+                )
+            }))
+        } else {
+            LabelWidths::default()
+        };
+        let labels = claude_labels.widest(codex_labels);
+        let (five_excess, seven_excess) = labels.excess();
+        let (mut name, kind, mut five_hour, mut seven_day) =
+            overview_tiers(max_name, total, labels);
+        let live = live_column_width(max_name, total, labels);
 
         if shows_clock {
             const CLOCK_COLS: usize = 10;
@@ -314,10 +388,10 @@ impl OverviewWidths {
                     fixed_overview_width(name, kind, five, seven, live, GAP_MIN) + TIMER_SLOT,
                 )
             };
-            if five_hour == FIVE_HOUR_MAX {
+            if five_hour == FIVE_HOUR_MAX + five_excess {
                 five_hour += CLOCK_COLS.min(slack(five_hour, seven_day));
             }
-            if seven_day == SEVEN_DAY_MAX {
+            if seven_day == SEVEN_DAY_MAX + seven_excess {
                 seven_day += CLOCK_COLS.min(slack(five_hour, seven_day));
             }
         }
@@ -361,14 +435,31 @@ impl OverviewWidths {
             live,
             gap,
             deepseek_amount_w,
+            claude_labels,
+            codex_labels,
         }
+    }
+
+    /// Whether the 7d column holds its bar: below that tier it is the bare
+    /// reading.
+    fn seven_day_bar(&self) -> bool {
+        let (_, seven_excess) = self.claude_labels.widest(self.codex_labels).excess();
+        self.seven_day >= SEVEN_DAY_BAR + seven_excess
     }
 }
 
 /// The four semantic column widths after the tier ladders and the shrink loop
 /// have settled at `total`. The wall-clock stamp bonus is applied by the
-/// caller after the live column is decided.
-fn overview_tiers(max_name: usize, total: usize) -> (usize, usize, usize, usize) {
+/// caller after the live column is decided. Every 5h/7d tier is sized for a
+/// `100%` reading and grows by the excess of the column's widest `labels`.
+fn overview_tiers(
+    max_name: usize,
+    total: usize,
+    labels: LabelWidths,
+) -> (usize, usize, usize, usize) {
+    let (five_excess, seven_excess) = labels.excess();
+    let five_tier = |t: usize| t + five_excess;
+    let seven_tier = |t: usize| t + seven_excess;
     let mut name = max_name.clamp(8, if total >= NAME_WIDE_AT { NAME_MAX } else { 16 });
     let mut kind = if total >= KIND_WIDE_AT {
         KIND_MAX
@@ -378,51 +469,62 @@ fn overview_tiers(max_name: usize, total: usize) -> (usize, usize, usize, usize)
         6
     };
     // 26 = [bar]+pct+reset, 17 = [bar]+pct only.
-    let mut five_hour = if total >= FIVE_HOUR_WIDE_AT {
+    let mut five_hour = five_tier(if total >= FIVE_HOUR_WIDE_AT {
         FIVE_HOUR_MAX
     } else if total >= 64 {
         17
     } else {
         12
-    };
+    });
     // One wider than 5h: `humanize_duration` hits 7 chars (`10h 20m`,
     // `23h 59m`) inside the 7d countdown's 10h–23h band, and the 26-cell
     // tier was sized for the 6-char ceiling. The bare-suffix fit check in
     // `reset_suffix` deliberately does not clamp the countdown itself, so
     // the column has to absorb the extra cell or it leaks into `live`.
     let mut seven_day = if total >= SEVEN_DAY_WIDE_AT {
-        SEVEN_DAY_MAX
+        seven_tier(SEVEN_DAY_MAX)
     } else if total >= 58 {
-        5
+        seven_tier(5)
     } else {
         0
     };
-    while fixed_overview_width(name, kind, five_hour, seven_day, 0, GAP_MIN) + TIMER_SLOT > total {
-        if seven_day > 26 {
+    let overflow = |name: usize, kind: usize, five_hour: usize, seven_day: usize| {
+        (fixed_overview_width(name, kind, five_hour, seven_day, 0, GAP_MIN) + TIMER_SLOT)
+            .saturating_sub(total)
+    };
+    while overflow(name, kind, five_hour, seven_day) > 0 {
+        if seven_day > seven_tier(26) {
             // Shed the 7d reset stamp's spare cell first (bar + `%` stay whole),
             // then the stamp itself, then the column — the transient signal
             // gives way before the persistent one, mirroring the 5h ladder.
-            seven_day = 26;
-        } else if seven_day > 18 {
-            seven_day = 18;
+            seven_day = seven_tier(26);
+        } else if seven_day > seven_tier(SEVEN_DAY_BAR) {
+            seven_day = seven_tier(SEVEN_DAY_BAR);
         } else if seven_day > 0 {
             seven_day = 0;
-        } else if five_hour > 17 {
-            five_hour = 17;
-        } else if five_hour > 12 {
-            five_hour = 12;
+        } else if five_hour > five_tier(17) {
+            five_hour = five_tier(17);
+        } else if five_hour > five_tier(12) {
+            five_hour = five_tier(12);
         } else if kind > 6 {
             kind = 6;
         } else if name > 8 {
             name -= 1;
-        } else if five_hour > FIVE_HOUR_MIN {
+        } else if five_hour > five_tier(FIVE_HOUR_MIN) {
             // Shed the bracketed bar (keep the `%` figure whole) before the
             // figure itself is ever clipped: `window_summary_spans_bracketed`
-            // renders `{:>3.0}%` alone below 12 cells.
-            five_hour = FIVE_HOUR_MIN;
+            // renders the bare reading alone below the bar's floor.
+            five_hour = five_tier(FIVE_HOUR_MIN);
         } else {
             break;
         }
+    }
+    // Still over at the bare rung (a reading wider than `100%` costs cells
+    // there too): the name gives them, but only where that makes the row fit
+    // with the name at its floor or wider.
+    let over = overflow(name, kind, five_hour, seven_day);
+    if over > 0 && name.saturating_sub(over) >= NAME_READING_FLOOR {
+        name -= over;
     }
 
     (name, kind, five_hour, seven_day)
@@ -443,9 +545,9 @@ fn overview_tiers(max_name: usize, total: usize) -> (usize, usize, usize, usize)
 /// every ladder has saturated the leftover slack grows 1:1 with width, so the
 /// predicate is monotone from there on and only the bounded stretch up to that
 /// saturation width needs scanning.
-fn live_column_width(max_name: usize, total: usize) -> usize {
+fn live_column_width(max_name: usize, total: usize, labels: LabelWidths) -> usize {
     let fits = |w: usize| {
-        let (name, kind, five_hour, seven_day) = overview_tiers(max_name, w);
+        let (name, kind, five_hour, seven_day) = overview_tiers(max_name, w, labels);
         fixed_overview_width(name, kind, five_hour, seven_day, LIVE_W, GAP_MIN) + TIMER_SLOT <= w
     };
     // Two quantities bound the scan: the largest ladder threshold (past it no
@@ -456,9 +558,15 @@ fn live_column_width(max_name: usize, total: usize) -> usize {
         .max(KIND_WIDE_AT)
         .max(FIVE_HOUR_WIDE_AT)
         .max(SEVEN_DAY_WIDE_AT);
-    let saturation =
-        fixed_overview_width(NAME_MAX, KIND_MAX, FIVE_HOUR_MAX, SEVEN_DAY_MAX, 0, GAP_MIN)
-            + TIMER_SLOT;
+    let (five_excess, seven_excess) = labels.excess();
+    let saturation = fixed_overview_width(
+        NAME_MAX,
+        KIND_MAX,
+        FIVE_HOUR_MAX + five_excess,
+        SEVEN_DAY_MAX + seven_excess,
+        0,
+        GAP_MIN,
+    ) + TIMER_SLOT;
     let ceiling = saturation.max(largest_ladder_at);
     if total >= ceiling {
         if fits(total) { LIVE_W } else { 0 }
@@ -550,16 +658,20 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> 
     // The usage cells take the claude row's lead-in (narrow gap + a blank
     // timer slot) and its left alignment, and the 7d cell drops with its
     // column, so a codex reading sits under `5h`/`7d` and never under `live`.
-    let cell = |window: Option<&crate::usage::UsageWindow>, w: usize| match window {
-        Some(win) => Span::styled(fixed(&format!("{:.0}%", win.utilization), w), theme::base()),
-        None => Span::styled(fixed(NO_DATA, w), theme::faint()),
+    let cell = |window: Option<&UsageWindow>, label_w: usize, w: usize| match window {
+        Some(win) => Span::styled(
+            fixed(&format!("{:>label_w$}", codex_label(win)), w),
+            theme::base(),
+        ),
+        None => Span::styled(fixed(&format!("{NO_DATA:>label_w$}"), w), theme::faint()),
     };
+    let labels = widths.codex_labels;
     spans.push(narrow_gap(widths));
     spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
-    spans.push(cell(row.five_hour.as_ref(), widths.five_hour));
+    spans.push(cell(row.five_hour.as_ref(), labels.five, widths.five_hour));
     if widths.seven_day > 0 {
         spans.push(gap(widths));
-        spans.push(cell(row.seven_day.as_ref(), widths.seven_day));
+        spans.push(cell(row.seven_day.as_ref(), labels.seven, widths.seven_day));
     }
     // The chip trails the columns — after the live slot's width, so a dim
     // reset count can never sit under `live` and read as a session count.
@@ -783,6 +895,7 @@ fn render_overview_row(
         flatten(window_summary_spans_bracketed(
             five_window.as_ref(),
             widths.five_hour,
+            widths.claude_labels.five,
             true,
             reset_style(LABEL_5H, five_window.as_ref()),
             reset_fmt,
@@ -798,7 +911,8 @@ fn render_overview_row(
         let seven_spans = flatten(window_summary_spans_bracketed(
             seven_window.as_ref(),
             widths.seven_day,
-            widths.seven_day >= 18,
+            widths.claude_labels.seven,
+            widths.seven_day_bar(),
             reset_style(LABEL_7D, seven_window.as_ref()),
             reset_fmt,
             seven_window.as_ref().is_some_and(is_past_reset),
@@ -1019,7 +1133,20 @@ fn fallback_flow_lines(
         .map(|p| format!("{:.0}", threshold_for(p)).len())
         .max()
         .unwrap_or(3);
-    let figure_w = thr_w + 9;
+    // Readings left-pad to the widest the chain renders, the no-data dash
+    // included, so their `%` signs stack the way the thresholds' do.
+    let reading_w = chain
+        .iter()
+        .map(|n| {
+            let pct = readings
+                .usage_of(n.as_str())
+                .and_then(|u| u.five_hour.as_ref())
+                .map(|w| w.utilization);
+            chain_reading(pct).map_or(NO_DATA.chars().count(), |l| l.len())
+        })
+        .max()
+        .unwrap_or(0);
+    let figure_w = 2 + reading_w + 3 + thr_w + 1;
     // The name reaches its full width where the row has the room — a long
     // email-style member name must not gain a `…` with free cells left. It
     // clamps only to what the row leaves after the rail (` ╭ `), the index,
@@ -1041,10 +1168,10 @@ fn fallback_flow_lines(
         )
     };
     // Exact-fit budget against chain_row's spans: ` ╭ `(3) + `N `(digits+1)
-    // + name(name_w+2), then the gauge, then the figure `  100`(5) + ` / 100%`
-    // (thr_w+4, 3-digit worst = 7). The gauge shrinks first; once even its
-    // 4-cell floor leaves no room, the figure drops to its own line instead of
-    // hard-wrapping an orphan `63 /`.
+    // + name(name_w+2), then the gauge, then the figure `  73.42%`
+    // (reading_w+2) + ` / 100%` (thr_w+4). The gauge shrinks first; once even
+    // its 4-cell floor leaves no room, the figure drops to its own line instead
+    // of hard-wrapping an orphan `63% /`.
     let head = 3 + idx_w + name_w + 2;
     let figure_inline = !narrow || width >= head + 4 + figure_w;
     let gauge_w = if !narrow {
@@ -1093,6 +1220,7 @@ fn fallback_flow_lines(
                     last,
                     name_w,
                     gauge_w,
+                    reading_w,
                     thr_w,
                     figure_inline,
                     reason,
@@ -1304,6 +1432,7 @@ struct ChainRowCtx {
     last: usize,
     name_w: usize,
     gauge_w: usize,
+    reading_w: usize,
     thr_w: usize,
     /// Whether the figure rides the base line; when false it drops to its own
     /// line so the `%` stays whole instead of hard-wrapping off the edge.
@@ -1314,12 +1443,18 @@ struct ChainRowCtx {
     pct: Option<f64>,
 }
 
+/// A chain member's 5h reading as its row's figure prints it.
+fn chain_reading(pct: Option<f64>) -> Option<String> {
+    pct.map(format_pct)
+}
+
 fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowCtx) -> ChainRow {
     let ChainRowCtx {
         index,
         last,
         name_w,
         gauge_w,
+        reading_w,
         thr_w,
         figure_inline,
         reason,
@@ -1358,10 +1493,10 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
             spans.extend(gauge_spans(pct, threshold, gauge_w));
             let (figure, figure_style) = match pct {
                 Some(v) => (
-                    format!("  {v:>3.0}"),
+                    format!("  {:>reading_w$}", format_pct(v)),
                     Style::default().fg(theme::util_color(v)),
                 ),
-                None => ("    —".to_string(), theme::faint()),
+                None => (format!("  {NO_DATA:>reading_w$}"), theme::faint()),
             };
             if figure_inline {
                 spans.push(Span::styled(figure, figure_style));
