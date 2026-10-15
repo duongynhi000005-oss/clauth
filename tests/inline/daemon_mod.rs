@@ -3418,8 +3418,8 @@ fn a_codex_member_reaching_the_codex_5h_line_queues_a_window_push() {
 }
 
 /// A failed codex roster read must not forget codex latches on a guess: the
-/// whole forget is skipped that tick, so the crossing stays latched and the
-/// restored roster re-reads silently.
+/// forget runs against the last codex roster read successfully, so the
+/// crossing stays latched and the restored roster re-reads silently.
 #[test]
 fn a_failed_codex_roster_read_does_not_forget_codex_latches() {
     let _home = HomeSandbox::new();
@@ -3428,8 +3428,8 @@ fn a_failed_codex_roster_read_does_not_forget_codex_latches() {
     crate::testutil::warm_codex_usage("cx", None, 95.0, 10.0);
 
     d.write_status();
-    // One tick where the codex roster cannot be read: the forget must be
-    // skipped wholesale, not run against a claude-only roster.
+    // One tick where the codex roster cannot be read: the forget must run
+    // against the cached codex roster, not a claude-only one.
     crate::testutil::write_codex_state("not toml [");
     d.write_status();
     crate::testutil::write_codex_state("profiles = [\"cx\"]\nfallback_chain = [\"cx\"]\n");
@@ -3440,6 +3440,115 @@ fn a_failed_codex_roster_read_does_not_forget_codex_latches() {
         [crate::push::Trigger::Window {
             profile: "cx".to_string()
         }]
+    );
+}
+
+/// A claude chain member deleted from the roster while past its line, then
+/// re-created past the line, queues a second window push even while
+/// `codex-profiles.toml` stays unparsable: the forget falls back to the last
+/// codex roster this daemon read successfully.
+#[test]
+fn a_claude_account_re_arms_its_window_push_while_the_codex_roster_is_broken() {
+    let _home = HomeSandbox::new();
+    let mut alpha = profile_with_creds("alpha", "at-a");
+    alpha.fallback_threshold = Some(90.0);
+    let mut config = persist(vec![alpha], Some("alpha"), 60_000);
+    config.state.fallback_chain = vec!["alpha".into()];
+    write_five_hour("alpha", 95.0);
+    // One tick with a readable codex roster so the daemon's last-good cache
+    // fills; from then on the file stays unparsable.
+    crate::testutil::write_codex_roster(&[]);
+    let mut d = daemon_for(config);
+    let (queue, inbox) = crate::push::queue_for_tests();
+    d.push = Some(queue);
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+
+    d.write_status();
+    crate::testutil::write_codex_state("not toml [");
+    // Deleted from the roster while the codex read fails: the forget must
+    // still drop its window latch.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+        cfg.state.fallback_chain.clear();
+    }
+    d.write_status();
+    // Re-created past the line, it queues a second push.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        let mut profile = profile_with_creds("alpha", "at-a");
+        profile.fallback_threshold = Some(90.0);
+        cfg.profiles = vec![profile];
+        cfg.state.profiles = vec!["alpha".into()];
+        cfg.state.fallback_chain = vec!["alpha".into()];
+    }
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [
+            crate::push::Trigger::Window {
+                profile: "alpha".to_string()
+            },
+            crate::push::Trigger::Window {
+                profile: "alpha".to_string()
+            },
+        ]
+    );
+}
+
+/// A daemon whose codex file was unparsable from its very first tick forgets
+/// against the claude roster alone (its codex cache is empty), so a claude
+/// account deleted and re-created past its line re-announces.
+#[test]
+fn a_claude_account_deleted_and_re_created_re_announces_while_the_codex_roster_was_never_read() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_state("not toml [");
+    let mut alpha = profile_with_creds("alpha", "at-a");
+    alpha.fallback_threshold = Some(90.0);
+    let mut config = persist(vec![alpha], Some("alpha"), 60_000);
+    config.state.fallback_chain = vec!["alpha".into()];
+    write_five_hour("alpha", 95.0);
+    let mut d = daemon_for(config);
+    let (queue, inbox) = crate::push::queue_for_tests();
+    d.push = Some(queue);
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+
+    d.write_status();
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+        cfg.state.fallback_chain.clear();
+    }
+    d.write_status();
+    {
+        let mut cfg = d.config.lock().expect("config");
+        let mut profile = profile_with_creds("alpha", "at-a");
+        profile.fallback_threshold = Some(90.0);
+        cfg.profiles = vec![profile];
+        cfg.state.profiles = vec!["alpha".into()];
+        cfg.state.fallback_chain = vec!["alpha".into()];
+    }
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [
+            crate::push::Trigger::Window {
+                profile: "alpha".to_string()
+            },
+            crate::push::Trigger::Window {
+                profile: "alpha".to_string()
+            },
+        ]
     );
 }
 

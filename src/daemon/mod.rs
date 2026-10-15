@@ -1098,6 +1098,11 @@ struct Daemon {
     push: Option<crate::push::Queue>,
     /// The account and window latches each published body moves.
     push_latches: crate::push::StatusLatches,
+    /// The last codex roster this daemon read successfully, in memory only;
+    /// empty until the first successful read. On a failed read it stands in
+    /// for the roster `queue_pushes` forgets against, so a failed read forgets
+    /// no codex names on a guess.
+    last_codex_roster: Vec<ProfileName>,
     /// Runs `bell_command`; a seam so tests record the ring instead.
     ring_bell: fn(&str, &str) -> anyhow::Result<()>,
     status_path: PathBuf,
@@ -1153,6 +1158,7 @@ impl Daemon {
             bells: crate::bell::BellLatch::default(),
             push: None,
             push_latches: crate::push::StatusLatches::default(),
+            last_codex_roster: Vec::new(),
             ring_bell: crate::bell::run_command,
             status_path,
             gateway: gateway::new_handle(),
@@ -1497,17 +1503,19 @@ impl Daemon {
         });
         // Forget against the ROSTER, not the published body: a disabled account
         // is hidden from the body but is still an account, so its latches must
-        // survive the hide. The whole forget runs only when the codex roster
-        // read succeeded this tick — a failed read must not forget any name on
-        // a guess (codex names in particular); the next good tick forgets them.
+        // survive the hide. The codex half is the last roster this daemon read
+        // successfully (in memory), so a failed read forgets no codex names on
+        // a guess.
         if let Some(codex) = codex {
-            let roster = config
-                .profiles
-                .iter()
-                .map(|profile| profile.name.as_str())
-                .chain(codex.profiles().iter().map(|name| name.as_str()));
-            self.push_latches.forget_absent(roster);
+            self.last_codex_roster.clear();
+            self.last_codex_roster.extend_from_slice(codex.profiles());
         }
+        let roster = config
+            .profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .chain(self.last_codex_roster.iter().map(|name| name.as_str()));
+        self.push_latches.forget_absent(roster);
         for trigger in self.push_latches.observe(readings) {
             queue.send(trigger);
         }
