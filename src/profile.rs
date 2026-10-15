@@ -1581,6 +1581,33 @@ impl ModelSettings {
             && self.fable.is_none()
             && self.subagent.is_none()
     }
+
+    /// The stored id for a row named by its settings key (`default`, `opus`,
+    /// `sonnet`, `haiku`, `fable`, `subagent`). `None` outside that set.
+    pub(crate) fn field(&self, row: &str) -> Option<&String> {
+        match row {
+            "default" => self.default.as_ref(),
+            "opus" => self.opus.as_ref(),
+            "sonnet" => self.sonnet.as_ref(),
+            "haiku" => self.haiku.as_ref(),
+            "fable" => self.fable.as_ref(),
+            "subagent" => self.subagent.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Set one row by settings key; an unknown key writes nothing.
+    pub(crate) fn set_field(&mut self, row: &str, value: Option<String>) {
+        match row {
+            "default" => self.default = value,
+            "opus" => self.opus = value,
+            "sonnet" => self.sonnet = value,
+            "haiku" => self.haiku = value,
+            "fable" => self.fable = value,
+            "subagent" => self.subagent = value,
+            _ => {}
+        }
+    }
 }
 
 /// Which Alibaba Model Studio front the console session belongs to. The two

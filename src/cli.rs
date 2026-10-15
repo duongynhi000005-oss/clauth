@@ -400,6 +400,15 @@ pub(crate) enum Command {
         disabled: bool,
     },
 
+    /// Built-in preset maintenance
+    ///
+    /// `clauth presets rebind` moves accounts onto the model ids the built-in
+    /// presets bind now.
+    Presets {
+        #[command(subcommand)]
+        cmd: PresetsCommand,
+    },
+
     /// Run the stdio MCP server (claude code launches this)
     Mcp,
 
@@ -665,6 +674,29 @@ impl LoginArgs {
     pub(crate) fn is_api_mode(&self) -> bool {
         self.base_url.is_some() || self.api_key.is_some()
     }
+}
+
+/// `clauth presets <cmd>`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum PresetsCommand {
+    /// Move accounts onto the model ids the built-in presets bind now
+    ///
+    /// Bare, it lists the rows that would move; `--yes` writes them. Only rows
+    /// that are empty or still hold an id an earlier release shipped move; a
+    /// row holding any other id stays.
+    Rebind(RebindArgs),
+}
+
+/// `clauth presets rebind`'s account selection and apply switch.
+#[derive(Args, Debug)]
+pub(crate) struct RebindArgs {
+    /// Only these accounts
+    #[arg(value_name = "ACCOUNT")]
+    pub(crate) accounts: Vec<String>,
+
+    /// Apply the listed changes
+    #[arg(long, short = 'y')]
+    pub(crate) yes: bool,
 }
 
 /// `clauth herdr <cmd>`: install and uninstall the plugin and its config wiring.

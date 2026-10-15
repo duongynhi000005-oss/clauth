@@ -2,9 +2,10 @@
 //! refusals that keep a built-in's slot the binary's alone.
 
 use super::{
-    delete_preset, is_builtin, list_presets, load_preset, preset_exists, presets_dir, save_preset,
+    RowMove, base_url_matches, delete_preset, is_builtin, list_presets, load_preset, preset_exists,
+    presets_dir, rebind_offers, save_preset,
 };
-use crate::profile::ModelSettings;
+use crate::profile::{AppConfig, AppState, ModelSettings, Profile};
 
 fn models(default: &str) -> ModelSettings {
     ModelSettings {
@@ -311,4 +312,208 @@ fn a_hand_written_file_cannot_shadow_a_builtins_slot() {
         Some("https://api.deepseek.com/anthropic"),
         "so does a load by name",
     );
+}
+
+// ── Re-bind offer engine ──────────────────────────────────────────────────────
+
+fn config_with(profiles: Vec<Profile>) -> AppConfig {
+    AppConfig {
+        state: AppState {
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    }
+}
+
+fn account(name: &str, base_url: &str, models: ModelSettings) -> Profile {
+    let mut p = Profile::new(name.to_string(), Some(base_url.to_string()), None);
+    p.models = models;
+    p
+}
+
+fn move_(row: &'static str, old: Option<&str>, new: Option<&str>) -> RowMove {
+    RowMove {
+        row,
+        old: old.map(str::to_string),
+        new: new.map(str::to_string),
+    }
+}
+
+/// The `(unset)` arm for a row with no stored id: `default` on a matching
+/// account becomes the opus alias, and the four empty tier rows take the new
+/// tier ids; `subagent` (whose bind is unset) is no change.
+#[test]
+fn a_former_id_and_every_empty_row_are_offered_the_new_binds() {
+    let m = ModelSettings {
+        default: Some("deepseek-chat".to_string()),
+        ..ModelSettings::default()
+    };
+    let config = config_with(vec![account(
+        "DS1",
+        "https://api.deepseek.com/anthropic",
+        m,
+    )]);
+
+    let offers = rebind_offers(&config);
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers[0].account, "DS1");
+    assert_eq!(
+        offers[0].rows,
+        [
+            move_("default", Some("deepseek-chat"), Some("opus")),
+            move_("opus", None, Some("deepseek-v4-pro[1m]")),
+            move_("sonnet", None, Some("deepseek-flash[1m]")),
+            move_("haiku", None, Some("deepseek-flash[1m]")),
+            move_("fable", None, Some("deepseek-v4-pro[1m]")),
+        ],
+    );
+}
+
+/// A fully empty matching account is offered every tier the bind fills, and
+/// nothing else.
+#[test]
+fn a_fully_empty_account_is_offered_every_filled_row() {
+    let config = config_with(vec![account(
+        "fresh",
+        "https://api.z.ai/api/anthropic",
+        ModelSettings::default(),
+    )]);
+
+    let offers = rebind_offers(&config);
+    assert_eq!(offers.len(), 1);
+    assert_eq!(
+        offers[0].rows,
+        [
+            move_("default", None, Some("opus")),
+            move_("opus", None, Some("glm-5.3[1m]")),
+            move_("sonnet", None, Some("glm-5.3-flash[1m]")),
+            move_("haiku", None, Some("glm-5.3-flash[1m]")),
+            move_("fable", None, Some("glm-5.3[1m]")),
+        ],
+    );
+}
+
+/// A custom id on a row is never touched, whatever it is; only the empty rows
+/// are offered.
+#[test]
+fn a_custom_id_row_is_untouched() {
+    let m = ModelSettings {
+        default: Some("nvidia/nemotron-3-ultra-550b-a55b:free[1m]".to_string()),
+        ..ModelSettings::default()
+    };
+    let config = config_with(vec![account("openrouter", "https://openrouter.ai/api", m)]);
+
+    let offers = rebind_offers(&config);
+    assert_eq!(offers.len(), 1);
+    assert_eq!(
+        offers[0].rows,
+        [
+            move_("opus", None, Some("~anthropic/claude-opus-latest[1m]")),
+            move_("sonnet", None, Some("~anthropic/claude-sonnet-latest[1m]")),
+            move_("haiku", None, Some("~anthropic/claude-haiku-latest")),
+            move_("fable", None, Some("~anthropic/claude-fable-latest[1m]")),
+        ],
+        "the custom default row is not among the moves",
+    );
+}
+
+/// A row already equal to its new value is no change — nothing to offer.
+#[test]
+fn a_row_already_on_its_new_value_is_no_change() {
+    let m = ModelSettings {
+        default: Some("opus".to_string()),
+        opus: Some("deepseek-v4-pro[1m]".to_string()),
+        sonnet: Some("deepseek-flash[1m]".to_string()),
+        haiku: Some("deepseek-flash[1m]".to_string()),
+        fable: Some("deepseek-v4-pro[1m]".to_string()),
+        ..ModelSettings::default()
+    };
+    let config = config_with(vec![account(
+        "current",
+        "https://api.deepseek.com/anthropic",
+        m,
+    )]);
+
+    assert!(rebind_offers(&config).is_empty());
+}
+
+/// A former id on a row the bind leaves unset is offered `(unset)`: the exact
+/// string match is per-row, so `deepseek-chat` on the `subagent` row moves.
+/// The whole row vec is pinned, so an extra move reds.
+#[test]
+fn a_former_id_on_a_row_the_bind_leaves_unset_is_offered_unset() {
+    let m = ModelSettings {
+        subagent: Some("deepseek-chat".to_string()),
+        ..ModelSettings::default()
+    };
+    let config = config_with(vec![account(
+        "DS1",
+        "https://api.deepseek.com/anthropic",
+        m,
+    )]);
+
+    let offers = rebind_offers(&config);
+    assert_eq!(offers.len(), 1);
+    assert_eq!(
+        offers[0].rows,
+        [
+            move_("default", None, Some("opus")),
+            move_("opus", None, Some("deepseek-v4-pro[1m]")),
+            move_("sonnet", None, Some("deepseek-flash[1m]")),
+            move_("haiku", None, Some("deepseek-flash[1m]")),
+            move_("fable", None, Some("deepseek-v4-pro[1m]")),
+            move_("subagent", Some("deepseek-chat"), None),
+        ],
+    );
+}
+
+/// An endpoint no built-in ships is never offered.
+#[test]
+fn an_account_on_another_endpoint_is_untouched() {
+    let config = config_with(vec![account(
+        "anthropic",
+        "https://api.anthropic.com",
+        ModelSettings::default(),
+    )]);
+    assert!(rebind_offers(&config).is_empty());
+}
+
+/// The endpoint predicate is the shared host matcher: case-insensitive on
+/// scheme + host, forgiving a trailing slash, and a different provider's
+/// endpoint never matches.
+#[test]
+fn a_trailing_slash_base_url_matches() {
+    assert!(base_url_matches(
+        "https://api.deepseek.com/anthropic/",
+        "https://api.deepseek.com/anthropic"
+    ));
+    assert!(
+        base_url_matches(
+            "https://API.deepseek.com/anthropic",
+            "https://api.deepseek.com/anthropic"
+        ),
+        "a mixed-case host matches"
+    );
+    assert!(
+        !base_url_matches(
+            "https://api.anthropic.com",
+            "https://api.deepseek.com/anthropic"
+        ),
+        "another provider never matches"
+    );
+    assert!(
+        !base_url_matches(
+            "https://api.deepseek.com",
+            "https://api.deepseek.com/anthropic"
+        ),
+        "a host-only account is a different endpoint"
+    );
+
+    let config = config_with(vec![account(
+        "DS1",
+        "https://api.deepseek.com/anthropic/",
+        ModelSettings::default(),
+    )]);
+    assert_eq!(rebind_offers(&config).len(), 1);
 }

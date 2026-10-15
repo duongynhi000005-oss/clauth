@@ -211,6 +211,9 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
             if let Some(Interrupted(signal)) = e.downcast_ref::<Interrupted>() {
                 return 128 + signal;
             }
+            if e.downcast_ref::<RebindFailuresReported>().is_some() {
+                return 1;
+            }
             // `errln!`, so a reader that walked away from `2>&1 | head` still
             // gets this code rather than the 101 `eprintln!` panicked with.
             errln!("Error: {e:?}");
@@ -325,6 +328,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
         Command::Proxy { cmd } => cmd_proxy(cmd),
+        Command::Presets { cmd } => cmd_presets(cmd),
         Command::Run { .. } => cmd_run(),
         Command::External(words) => cmd_external(&words),
     }
@@ -459,6 +463,227 @@ fn cmd_run() -> Result<()> {
         "`clauth run` isn't a command; for a headless delegate use \
          `clauth start <profile> -p \"<prompt>\"` (or the MCP `delegate` tool)"
     )
+}
+
+// ── `clauth presets rebind` ───────────────────────────────────────────────────
+
+/// The "nothing to move" line; exits 0.
+const REBIND_NOTHING: &str = "every account already uses the built-in preset models.";
+
+/// The aligned account-row-old→new body, one line per row, no summary.
+fn rebind_list_body(selected: &[crate::presets::AccountOffers]) -> String {
+    let acc_w = selected.iter().map(|o| o.account.len()).max().unwrap_or(0);
+    let row_w = selected
+        .iter()
+        .flat_map(|o| &o.rows)
+        .map(|m| m.row.len())
+        .max()
+        .unwrap_or(0);
+    let old_w = selected
+        .iter()
+        .flat_map(|o| &o.rows)
+        .map(|m| m.old_display().len())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for offer in selected {
+        for m in &offer.rows {
+            out.push_str(&format!(
+                "{:<acc_w$}  {:<row_w$}  {:<old_w$}  → {}\n",
+                offer.account,
+                m.row,
+                m.old_display(),
+                m.new_display(),
+            ));
+        }
+    }
+    out
+}
+
+/// The list mode's trailing hint; with names, it repeats them in the command.
+fn rebind_summary_line(rows: usize, accounts: usize, names: &[String]) -> String {
+    let suffix = if names.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", names.join(" "))
+    };
+    format!(
+        "{}. run `clauth presets rebind{suffix} --yes` to apply.",
+        crate::presets::rows_on_accounts(rows, accounts)
+    )
+}
+
+/// The `--yes` success line.
+fn rebind_applied_line(rows: usize, accounts: usize) -> String {
+    format!(
+        "moved {} onto the built-in preset models.",
+        crate::presets::rows_on_accounts(rows, accounts)
+    )
+}
+
+/// Resolve the named accounts against the roster and the offer list, in the
+/// order given, de-duplicated. Every name is validated before any write: an
+/// unknown name, a codex name, or one with nothing to move, bails by name.
+fn select_offers(
+    config: &AppConfig,
+    offers: Vec<crate::presets::AccountOffers>,
+    names: &[String],
+) -> Result<Vec<crate::presets::AccountOffers>> {
+    if names.is_empty() {
+        return Ok(offers);
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in names {
+        let canonical = match config.canonical_name(raw) {
+            Some(canonical) => canonical,
+            None => {
+                if let Some(codex) = codex_profiles::CodexState::load()?.canonical_name(raw) {
+                    anyhow::bail!("'{codex}' is a codex profile; presets rebind is claude-only");
+                }
+                anyhow::bail!("no account named '{raw}'");
+            }
+        };
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let offer = offers
+            .iter()
+            .find(|o| o.account == canonical)
+            .ok_or_else(|| anyhow::anyhow!("'{canonical}' has no model rows to move"))?
+            .clone();
+        out.push(offer);
+    }
+    Ok(out)
+}
+
+/// A `--yes` run with at least one failed account: the ruled moved line for the
+/// rows that wrote (empty when none), plus one failure per failed account in
+/// listed order (roster order on a bare run, argument order with names).
+/// [`cmd_presets`] prints the moved line to stdout, each failure
+/// to stderr, then exits 1.
+#[derive(Debug)]
+struct RebindPartial {
+    moved: String,
+    failures: Vec<String>,
+}
+
+impl std::fmt::Display for RebindPartial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.failures.join("\n"))
+    }
+}
+
+impl std::error::Error for RebindPartial {}
+
+/// The re-bind failure lines were already printed to stderr (one per failed
+/// account); [`exit_code`] maps this to exit 1 with no `Error:` line, the way
+/// [`HelpRendered`] maps to 2 after help already printed.
+#[derive(Debug)]
+struct RebindFailuresReported;
+
+impl std::fmt::Display for RebindFailuresReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("re-bind failures reported on stderr")
+    }
+}
+
+impl std::error::Error for RebindFailuresReported {}
+
+/// The whole output of one `presets rebind` run, after any `--yes` writes have
+/// landed: the exact stdout bytes as a `String`. Split out so a test drives the
+/// real command under a `HomeSandbox` and pins the bytes without capturing the
+/// process. Name validation happens before any write, so an error leaves the
+/// configs untouched. A `--yes` failure returns the ruled moved line plus one
+/// failure line per failed account inside a [`RebindPartial`]: the loop keeps
+/// going past a failed account, and rows saved before a live-settings failure
+/// still count as moved. A run that moved nothing prints the quiet line.
+fn run_presets_rebind(config: &mut AppConfig, accounts: &[String], yes: bool) -> Result<String> {
+    let offers = crate::presets::rebind_offers(config);
+    let selected = select_offers(config, offers, accounts)?;
+    if selected.is_empty() {
+        return Ok(format!("{REBIND_NOTHING}\n"));
+    }
+    if yes {
+        let mut rows = 0usize;
+        let mut moved_accounts = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        for offer in &selected {
+            let name = ProfileName::from(offer.account.clone());
+            match crate::actions::apply_rebind_account(config, &name, &offer.rows) {
+                Ok(applied) => {
+                    rows += applied;
+                    if applied > 0 {
+                        moved_accounts += 1;
+                    }
+                }
+                Err(error) => {
+                    let (applied, error) =
+                        match error.downcast::<crate::actions::RebindSavedBeforeFailure>() {
+                            Ok(saved) => (saved.applied, saved.error),
+                            Err(error) => (0, error),
+                        };
+                    rows += applied;
+                    if applied > 0 {
+                        moved_accounts += 1;
+                    }
+                    failures.push(format!("re-bind failed for '{}': {error:#}", offer.account));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            let moved = if rows > 0 {
+                format!("{}\n", rebind_applied_line(rows, moved_accounts))
+            } else {
+                String::new()
+            };
+            return Err(anyhow::Error::new(RebindPartial { moved, failures }));
+        }
+        if rows == 0 {
+            return Ok(format!("{REBIND_NOTHING}\n"));
+        }
+        Ok(format!("{}\n", rebind_applied_line(rows, moved_accounts)))
+    } else {
+        let rows = selected.iter().map(|o| o.rows.len()).sum::<usize>();
+        // Names appear in the hint only when the user named accounts;
+        // the bare invocation names none.
+        let hint_names: Vec<String> = if accounts.is_empty() {
+            Vec::new()
+        } else {
+            selected.iter().map(|o| o.account.clone()).collect()
+        };
+        Ok(format!(
+            "{}{}\n",
+            rebind_list_body(&selected),
+            rebind_summary_line(rows, selected.len(), &hint_names)
+        ))
+    }
+}
+
+fn cmd_presets(cmd: cli::PresetsCommand) -> Result<()> {
+    match cmd {
+        cli::PresetsCommand::Rebind(args) => {
+            let mut config = load_config()?;
+            match run_presets_rebind(&mut config, &args.accounts, args.yes) {
+                Ok(stdout) => {
+                    out!("{stdout}");
+                    Ok(())
+                }
+                Err(e) => match e.downcast::<RebindPartial>() {
+                    Ok(partial) => {
+                        if !partial.moved.is_empty() {
+                            out!("{}", partial.moved);
+                        }
+                        for line in &partial.failures {
+                            errln!("{line}");
+                        }
+                        Err(anyhow::Error::new(RebindFailuresReported))
+                    }
+                    Err(e) => Err(e),
+                },
+            }
+        }
+    }
 }
 
 // A bare word is a profile name. More than one word is nothing clauth

@@ -942,6 +942,81 @@ pub(crate) fn edit_profile_preset(
     })
 }
 
+/// An account re-bind whose rows were already saved to disk before the active
+/// account's live `settings.json` re-apply failed: the saved rows still count
+/// as moved, and the account still counts as failed. The caller downcasts this
+/// to recover both halves instead of losing the applied count with the error.
+#[derive(Debug)]
+pub(crate) struct RebindSavedBeforeFailure {
+    pub(crate) applied: usize,
+    pub(crate) error: anyhow::Error,
+}
+
+impl std::fmt::Display for RebindSavedBeforeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for RebindSavedBeforeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+/// Apply one account's re-bind moves through the per-account model write path.
+/// Each move lands only where the fresh on-disk row still holds the move's
+/// `old` (still empty for an empty-row offer), so a row a concurrent writer
+/// changed since the offer is skipped, never overwritten. Returns how many
+/// rows moved. Only the offered rows change; base_url, env, keys and every
+/// other model row stay byte-identical. A live-settings re-apply that fails
+/// after the save returns the saved count inside a [`RebindSavedBeforeFailure`].
+pub(crate) fn apply_rebind_account(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    moves: &[crate::presets::RowMove],
+) -> Result<usize> {
+    with_state_lock(|_held| {
+        if !load_app_state()?.profiles.iter().any(|n| n == name) {
+            bail!("profile not found");
+        }
+        let mut fresh = load_profile(name)?;
+        let mut applied = 0usize;
+        for m in moves {
+            if fresh.models.field(m.row).cloned() == m.old {
+                fresh.models.set_field(m.row, m.new.clone());
+                applied += 1;
+            }
+        }
+        if applied == 0 {
+            return Ok(0);
+        }
+        // A failed save must leave the in-memory account unchanged, so the disk
+        // write lands before the in-memory copy moves (`edit_profile_endpoint`'s
+        // snapshot-restore shape).
+        save_profile_config(&fresh)?;
+        if let Some(profile) = config.find_mut(name) {
+            profile.models = fresh.models.clone();
+        }
+        if config.is_active(name) {
+            let Some(profile) = config.find(name) else {
+                return Err(anyhow::Error::new(RebindSavedBeforeFailure {
+                    applied,
+                    error: anyhow::anyhow!("profile not found"),
+                }));
+            };
+            let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
+            if let Err(error) = apply_profile_to_claude_settings(profile, &prev_env_keys) {
+                return Err(anyhow::Error::new(RebindSavedBeforeFailure {
+                    applied,
+                    error,
+                }));
+            }
+        }
+        Ok(applied)
+    })
+}
+
 /// Persist a profile's custom env map (the Setup-tab field editor). Captures the
 /// OLD env keys first so a re-apply to the live `~/.claude/settings.json` strips
 /// any key the new map dropped — passing the new keys instead would leak a removed

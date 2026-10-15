@@ -114,6 +114,10 @@ struct PresetFile {
 struct Builtin {
     name: &'static str,
     base_url: &'static str,
+    /// Model ids this built-in shipped in an earlier release. A row holding one
+    /// of these (exact string equality) is offered the current bind for that
+    /// row; any other stored id stays.
+    former_ids: &'static [&'static str],
     binds: Binds,
 }
 
@@ -173,6 +177,7 @@ const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "DeepSeek",
         base_url: "https://api.deepseek.com/anthropic",
+        former_ids: &["deepseek-chat"],
         binds: Binds::Tiers {
             opus: "deepseek-v4-pro[1m]",
             sonnet: "deepseek-flash[1m]",
@@ -183,6 +188,7 @@ const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "Z.ai",
         base_url: "https://api.z.ai/api/anthropic",
+        former_ids: &["glm-5.2"],
         binds: Binds::Tiers {
             opus: "glm-5.3[1m]",
             sonnet: "glm-5.3-flash[1m]",
@@ -196,6 +202,7 @@ const BUILTINS: &[Builtin] = &[
         // `/v1/messages` lands on `/api/v1/messages` (openrouter.ai docs,
         // "Connect Claude to OpenRouter").
         base_url: "https://openrouter.ai/api",
+        former_ids: &["openrouter/auto"],
         // OpenRouter serves the real Claude models, so each tier binds its own
         // family's moving `-latest` alias instead of a pro/flash pair; the same
         // guide marks only the fable, opus and sonnet aliases `[1m]`-capable.
@@ -214,6 +221,7 @@ const BUILTINS: &[Builtin] = &[
         // account and endpoint; only the international one ships, matching what
         // `providers::minimax` claims.
         base_url: "https://api.minimax.io/anthropic",
+        former_ids: &["MiniMax-M3"],
         // The fast model is sold on the M Plan alone: a pay-as-you-go key
         // fails on sonnet and haiku until those two rows are re-pointed.
         binds: Binds::Tiers {
@@ -226,21 +234,25 @@ const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "Qwen-TokenPlan-Intl",
         base_url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+        former_ids: &[],
         binds: Binds::Every("qwen3.8-max"),
     },
     Builtin {
         name: "Qwen-TokenPlan-CN",
         base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+        former_ids: &[],
         binds: Binds::Every("qwen3.8-max"),
     },
     Builtin {
         name: "Qwen-CodingPlan-Intl",
         base_url: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
+        former_ids: &[],
         binds: Binds::Every("qwen3-coder-plus"),
     },
     Builtin {
         name: "Qwen-CodingPlan-CN",
         base_url: "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+        former_ids: &[],
         binds: Binds::Every("qwen3-coder-plus"),
     },
 ];
@@ -378,6 +390,110 @@ pub(crate) fn delete_preset(name: &str) -> Result<()> {
     }
     std::fs::remove_file(&path)?;
     Ok(())
+}
+
+// ── Re-bind offer engine ──────────────────────────────────────────────────────
+
+/// The model rows the offer walks, in render order (`default` is the account's
+/// `model` setting; `subagent` the `CLAUDE_CODE_SUBAGENT_MODEL` row).
+pub(crate) const MODEL_ROWS: [&str; 6] =
+    ["default", "opus", "sonnet", "haiku", "fable", "subagent"];
+
+/// The `(unset)` marker for a row with no stored id, on both the old and the
+/// new side.
+const UNSET: &str = "(unset)";
+
+/// One row a built-in's bind fills: `None` renders `(unset)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowMove {
+    pub(crate) row: &'static str,
+    pub(crate) old: Option<String>,
+    pub(crate) new: Option<String>,
+}
+
+impl RowMove {
+    pub(crate) fn old_display(&self) -> &str {
+        self.old.as_deref().unwrap_or(UNSET)
+    }
+
+    pub(crate) fn new_display(&self) -> &str {
+        self.new.as_deref().unwrap_or(UNSET)
+    }
+}
+
+/// Every row one account is offered, in [`MODEL_ROWS`] order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountOffers {
+    pub(crate) account: String,
+    pub(crate) rows: Vec<RowMove>,
+}
+
+/// `a` and `b` name the same endpoint: the crate's shared host predicate
+/// (`providers::url_matches_host`), case-insensitive on scheme + host and
+/// forgiving a trailing slash. It also admits a longer path under `b` (e.g.
+/// `…/anthropic/v1`), which still points at that built-in's endpoint.
+pub(crate) fn base_url_matches(a: &str, b: &str) -> bool {
+    crate::providers::url_matches_host(a, b)
+}
+
+/// The per-account offer, in roster order: every account whose `base_url`
+/// matches a built-in, with one [`RowMove`] per row that is empty or still
+/// holds a former id of that built-in. A row holding any other id is untouched,
+/// and a row already equal to its new value is no change.
+pub(crate) fn rebind_offers(config: &crate::profile::AppConfig) -> Vec<AccountOffers> {
+    let mut out = Vec::new();
+    for profile in &config.profiles {
+        let Some(base) = profile.base_url.as_deref() else {
+            continue;
+        };
+        let Some(builtin) = BUILTINS.iter().find(|b| base_url_matches(base, b.base_url)) else {
+            continue;
+        };
+        let binds = builtin.binds.models();
+        let mut rows = Vec::new();
+        for row in MODEL_ROWS {
+            let old = profile.models.field(row).cloned();
+            let new = binds.field(row).cloned();
+            if old == new {
+                continue;
+            }
+            match &old {
+                None => {
+                    if new.is_some() {
+                        rows.push(RowMove {
+                            row,
+                            old: None,
+                            new,
+                        });
+                    }
+                }
+                Some(old_id) => {
+                    if builtin.former_ids.contains(&old_id.as_str()) {
+                        rows.push(RowMove {
+                            row,
+                            old: Some(old_id.clone()),
+                            new,
+                        });
+                    }
+                }
+            }
+        }
+        if !rows.is_empty() {
+            out.push(AccountOffers {
+                account: profile.name.to_string(),
+                rows,
+            });
+        }
+    }
+    out
+}
+
+/// `N row(s) on M account(s)`, singular-aware — the one phrase the TUI toast
+/// and the CLI's two count lines share.
+pub(crate) fn rows_on_accounts(rows: usize, accounts: usize) -> String {
+    let row_word = if rows == 1 { "row" } else { "rows" };
+    let acct_word = if accounts == 1 { "account" } else { "accounts" };
+    format!("{rows} {row_word} on {accounts} {acct_word}")
 }
 
 #[cfg(test)]

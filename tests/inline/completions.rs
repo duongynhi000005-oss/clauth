@@ -1197,3 +1197,44 @@ fn codex_completion_names_are_the_codex_roster() {
         vec!["cx".to_string(), "cy".to_string()]
     );
 }
+
+/// `clauth presets rebind` completes account names and the `--yes`/`-y` flags
+/// in all three shells: each shell's rebind branch pinned as one exact
+/// multi-line block (gate line plus body), fish `-y` included.
+#[test]
+fn every_shell_completes_presets_rebind() {
+    assert!(
+        BASH.contains(
+            r#"    elif [ "${COMP_WORDS[1]}" = "presets" ] && [ "${COMP_WORDS[2]}" = "rebind" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "presets" ] && [ "${COMP_WORDS[2]}" = "rebind" ]; then
+        local profiles
+        profiles=$(clauth __complete 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
+"#
+        ),
+        "bash gates the rebind flags and the profile list under presets as one block",
+    );
+
+    assert!(
+        ZSH.contains(
+            r#"    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == presets && "${words[3]}" == rebind ]]; then
+        local -a profiles
+        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        _describe 'profile' profiles
+        _values 'flag' '--yes[apply the listed changes]' '-y[apply the listed changes]'
+"#
+        ),
+        "zsh completes the rebind profiles and flags as one block",
+    );
+
+    assert!(
+        FISH.contains(
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a "(__clauth_profiles)" -d "Only these accounts"
+complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a --yes -d "Apply the listed changes"
+complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a -y -d "Apply the listed changes"
+"#
+        ),
+        "fish completes the rebind profiles and flags as one block, -y included",
+    );
+}

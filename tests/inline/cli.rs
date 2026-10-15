@@ -4672,3 +4672,502 @@ mod static_token_landers {
         assert!(!dir.join("credentials.json.staged").exists());
     }
 }
+
+// ── `clauth presets rebind` ──────────────────────────────────────────────────
+
+#[test]
+fn presets_rebind_parses_with_accounts_and_yes() {
+    match command(&["presets", "rebind", "D1", "DS1", "--yes"]) {
+        Command::Presets { cmd } => match cmd {
+            crate::cli::PresetsCommand::Rebind(args) => {
+                assert_eq!(args.accounts, ["D1", "DS1"]);
+                assert!(args.yes);
+            }
+        },
+        other => panic!("expected presets, got {other:?}"),
+    }
+}
+
+#[test]
+fn presets_rebind_parses_bare() {
+    match command(&["presets", "rebind"]) {
+        Command::Presets { cmd } => match cmd {
+            crate::cli::PresetsCommand::Rebind(args) => {
+                assert!(args.accounts.is_empty());
+                assert!(!args.yes);
+            }
+        },
+        other => panic!("expected presets, got {other:?}"),
+    }
+}
+
+/// Seed two DeepSeek accounts — `D0` empty, `DS1` holding its former id on
+/// `default` — plus the state, so `run_presets_rebind` can be driven against
+/// real profile files.
+fn seed_rebind_profiles(home: &crate::testutil::HomeSandbox) {
+    use crate::profile::{AppState, Profile};
+    let _ = home;
+    let mut ds1 = Profile::new(
+        "DS1".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    ds1.models.default = Some("deepseek-chat".to_string());
+    let d0 = Profile::new(
+        "D0".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    for p in [&d0, &ds1] {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![d0.name.clone(), ds1.name.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+}
+
+/// Seed three DeepSeek accounts — `D0` and `D2` empty, `DS1` holding its
+/// former id on `default` — plus the state, so a mid-list failure still leaves
+/// a later account to move.
+fn seed_rebind_profiles_three(home: &crate::testutil::HomeSandbox) {
+    use crate::profile::{AppState, Profile};
+    let _ = home;
+    let mut ds1 = Profile::new(
+        "DS1".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    ds1.models.default = Some("deepseek-chat".to_string());
+    let d0 = Profile::new(
+        "D0".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    let d2 = Profile::new(
+        "D2".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    for p in [&d0, &ds1, &d2] {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![d0.name.clone(), ds1.name.clone(), d2.name.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+}
+
+/// The bare list drives `run_presets_rebind` (what `cmd_presets` calls) and
+/// pins its whole stdout: the aligned body and the approved name-less hint.
+#[test]
+fn the_bare_rebind_list_pins_its_stdout_and_writes_nothing() {
+    use crate::profile::load_config;
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    let out = run_presets_rebind(&mut config, &[], false).expect("run");
+    assert_eq!(
+        out,
+        "D0   default  (unset)        → opus\n\
+         D0   opus     (unset)        → deepseek-v4-pro[1m]\n\
+         D0   sonnet   (unset)        → deepseek-flash[1m]\n\
+         D0   haiku    (unset)        → deepseek-flash[1m]\n\
+         D0   fable    (unset)        → deepseek-v4-pro[1m]\n\
+         DS1  default  deepseek-chat  → opus\n\
+         DS1  opus     (unset)        → deepseek-v4-pro[1m]\n\
+         DS1  sonnet   (unset)        → deepseek-flash[1m]\n\
+         DS1  haiku    (unset)        → deepseek-flash[1m]\n\
+         DS1  fable    (unset)        → deepseek-v4-pro[1m]\n\
+         10 rows on 2 accounts. run `clauth presets rebind --yes` to apply.\n",
+    );
+
+    // A bare list must not write: the config files are untouched.
+    let after = load_config().expect("after");
+    let d0 = after
+        .find(&crate::profile::ProfileName::from("D0"))
+        .expect("D0");
+    assert!(d0.models.default.is_none(), "bare list wrote nothing");
+    let ds1 = after
+        .find(&crate::profile::ProfileName::from("DS1"))
+        .expect("DS1");
+    assert_eq!(
+        ds1.models.default.as_deref(),
+        Some("deepseek-chat"),
+        "bare list left the former id",
+    );
+}
+
+/// A named-subset list repeats the names in the hint.
+#[test]
+fn a_named_rebind_list_repeats_only_the_names() {
+    use crate::profile::load_config;
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    let out = run_presets_rebind(&mut config, &["D0".to_string()], false).expect("run");
+    assert_eq!(
+        out,
+        "D0  default  (unset)  → opus\n\
+         D0  opus     (unset)  → deepseek-v4-pro[1m]\n\
+         D0  sonnet   (unset)  → deepseek-flash[1m]\n\
+         D0  haiku    (unset)  → deepseek-flash[1m]\n\
+         D0  fable    (unset)  → deepseek-v4-pro[1m]\n\
+         5 rows on 1 account. run `clauth presets rebind D0 --yes` to apply.\n",
+    );
+}
+
+/// `--yes` writes the offered rows and pins the exact success line.
+#[test]
+fn the_yes_rebind_writes_and_pins_its_stdout() {
+    use crate::profile::load_config;
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    let out = run_presets_rebind(&mut config, &[], true).expect("run");
+    assert_eq!(
+        out,
+        "moved 10 rows on 2 accounts onto the built-in preset models.\n",
+    );
+
+    let after = load_config().expect("after");
+    let d0 = after
+        .find(&crate::profile::ProfileName::from("D0"))
+        .expect("D0");
+    assert_eq!(d0.models.default.as_deref(), Some("opus"));
+    assert_eq!(d0.models.opus.as_deref(), Some("deepseek-v4-pro[1m]"));
+    let ds1 = after
+        .find(&crate::profile::ProfileName::from("DS1"))
+        .expect("DS1");
+    assert_eq!(ds1.models.default.as_deref(), Some("opus"));
+}
+
+/// The hint and apply lines, singular-aware, pinned by equality.
+#[test]
+fn the_rebind_summary_and_applied_lines_are_pinned() {
+    assert_eq!(
+        rebind_summary_line(61, 13, &[]),
+        "61 rows on 13 accounts. run `clauth presets rebind --yes` to apply."
+    );
+    assert_eq!(
+        rebind_summary_line(3, 2, &["D1".to_string(), "DS1".to_string()]),
+        "3 rows on 2 accounts. run `clauth presets rebind D1 DS1 --yes` to apply."
+    );
+    assert_eq!(
+        rebind_applied_line(1, 1),
+        "moved 1 row on 1 account onto the built-in preset models."
+    );
+    assert_eq!(
+        rebind_applied_line(61, 13),
+        "moved 61 rows on 13 accounts onto the built-in preset models."
+    );
+    assert_eq!(
+        REBIND_NOTHING,
+        "every account already uses the built-in preset models."
+    );
+}
+
+/// Unknown names, codex names, and names with nothing to move each bail by
+/// name, and every name is validated before any write.
+#[test]
+fn select_offers_errors_by_name() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::testutil::HomeSandbox;
+    // The codex check reads the codex roster, so the home must be sandboxed.
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["a".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("a".to_string(), None, None)],
+    };
+    let offers = crate::presets::rebind_offers(&config);
+    assert!(offers.is_empty(), "a has no endpoint, so nothing to move");
+
+    let err = select_offers(&config, offers.clone(), &["nope".to_string()]).expect_err("unknown");
+    assert_eq!(err.to_string(), "no account named 'nope'");
+
+    let err = select_offers(&config, offers, &["a".to_string()]).expect_err("nothing to move");
+    assert_eq!(err.to_string(), "'a' has no model rows to move");
+}
+
+/// A codex name is refused as what it is, not as missing, with exit 1.
+#[test]
+fn select_offers_refuses_a_codex_name() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::testutil::write_codex_roster;
+    let _home = crate::testutil::HomeSandbox::new();
+    write_codex_roster(&["gpt1"]);
+
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["a".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("a".to_string(), None, None)],
+    };
+    let offers = crate::presets::rebind_offers(&config);
+    let err = select_offers(&config, offers, &["gpt1".to_string()]).expect_err("codex");
+    assert_eq!(
+        err.to_string(),
+        "'gpt1' is a codex profile; presets rebind is claude-only"
+    );
+}
+
+/// Nothing to do: the whole command prints the quiet line and exits 0.
+#[test]
+fn the_rebind_nothing_to_do_line_is_driven() {
+    use crate::profile::{AppState, Profile, load_config};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&Profile::new("a".to_string(), None, None)).expect("save");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![crate::profile::ProfileName::from("a")],
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut config = load_config().expect("config");
+    let out = run_presets_rebind(&mut config, &[], false).expect("run");
+    assert_eq!(
+        out,
+        "every account already uses the built-in preset models.\n"
+    );
+}
+
+/// `--yes` writes only the offered rows through the per-account model write
+/// path, leaving base_url, api key and env byte-identical.
+#[test]
+fn yes_writes_only_the_offered_rows_and_nothing_else() {
+    use crate::profile::{
+        AppState, ModelSettings, Profile, load_config, save_app_state, save_profile,
+    };
+    use crate::testutil::HomeSandbox;
+
+    let _home = HomeSandbox::new();
+    let mut d0 = Profile::new(
+        "D0".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-key".to_string()),
+    );
+    d0.models = ModelSettings::default();
+    d0.env.insert("KEEP".to_string(), "v".to_string());
+    save_profile(&d0).expect("save D0");
+    save_app_state(&AppState {
+        profiles: vec![d0.name.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut config = load_config().expect("before");
+    let offers = crate::presets::rebind_offers(&config);
+    assert_eq!(offers.len(), 1);
+    for offer in &offers {
+        let name = crate::profile::ProfileName::from(offer.account.clone());
+        crate::actions::apply_rebind_account(&mut config, &name, &offer.rows).expect("apply");
+    }
+
+    let after = load_config().expect("after");
+    let p = after
+        .find(&crate::profile::ProfileName::from("D0"))
+        .expect("D0");
+    assert_eq!(
+        p.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic")
+    );
+    assert_eq!(p.api_key.as_deref(), Some("sk-key"));
+    assert_eq!(p.env.get("KEEP").map(String::as_str), Some("v"));
+    assert_eq!(p.models.default.as_deref(), Some("opus"));
+    assert_eq!(p.models.opus.as_deref(), Some("deepseek-v4-pro[1m]"));
+    assert_eq!(p.models.sonnet.as_deref(), Some("deepseek-flash[1m]"));
+    assert_eq!(p.models.haiku.as_deref(), Some("deepseek-flash[1m]"));
+    assert_eq!(p.models.fable.as_deref(), Some("deepseek-v4-pro[1m]"));
+    assert_eq!(p.models.subagent, None);
+}
+
+/// A `--yes` failure partway keeps going: the moved line counts every account
+/// that wrote (before and after the failure), then one failure line names the
+/// account. The fault drops `DS1` from the roster between the list and the
+/// apply, so `D0` (first) and `D2` (later) move and `DS1` fails on the fresh
+/// state read — no sleep, no seam.
+#[test]
+fn a_yes_failure_partway_reports_the_moved_rows_then_the_account() {
+    use crate::profile::{AppState, ProfileName, load_config, save_app_state};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles_three(&_home);
+
+    let mut config = load_config().expect("config");
+    // Drop DS1 from the on-disk roster after the offer list was computed from
+    // the in-memory config; apply re-reads the state, so D0 and D2 move while
+    // DS1 fails.
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("D0"), ProfileName::from("D2")],
+        ..AppState::default()
+    })
+    .expect("drop DS1");
+
+    let err = run_presets_rebind(&mut config, &[], true).expect_err("DS1 dropped mid-run");
+    let partial = err.downcast::<RebindPartial>().expect("partial");
+    assert_eq!(
+        partial.failures,
+        ["re-bind failed for 'DS1': profile not found"],
+        "the failure names the account",
+    );
+    assert_eq!(
+        partial.moved, "moved 10 rows on 2 accounts onto the built-in preset models.\n",
+        "the rows D0 and D2 moved are reported",
+    );
+    let after = load_config().expect("after");
+    assert_eq!(
+        after
+            .find(&ProfileName::from("D2"))
+            .expect("D2")
+            .models
+            .default
+            .as_deref(),
+        Some("opus"),
+        "D2 moved after the failure",
+    );
+}
+
+/// A `--yes` run where every account fails prints no moved line, and one
+/// failure line per failed account in roster order.
+#[test]
+fn a_yes_failure_on_the_first_account_prints_no_moved_line() {
+    use crate::profile::{AppState, save_app_state};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    save_app_state(&AppState::default()).expect("empty roster");
+
+    let err = run_presets_rebind(&mut config, &[], true).expect_err("all accounts dropped");
+    let partial = err.downcast::<RebindPartial>().expect("partial");
+    assert_eq!(
+        partial.failures,
+        [
+            "re-bind failed for 'D0': profile not found",
+            "re-bind failed for 'DS1': profile not found",
+        ],
+        "one failure line per failed account, in roster order",
+    );
+    assert_eq!(partial.moved, "", "no rows moved, so no moved line");
+}
+
+/// The CLI failure keeps the whole cause chain: a profile whose `config.toml`
+/// is a directory fails with the OS reason, not just the outer context. The
+/// later account still moves (keep-going).
+#[test]
+fn the_cli_failure_keeps_the_cause_chain() {
+    use crate::profile::{ProfileName, load_config};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    // Replace D0's config.toml with a directory: the fresh read in the apply
+    // fails with "Is a directory".
+    let cfg_path = crate::profile::profile_dir(&ProfileName::from("D0"))
+        .expect("profile dir")
+        .join("config.toml");
+    std::fs::remove_file(&cfg_path).expect("remove config.toml");
+    std::fs::create_dir(&cfg_path).expect("directory at config.toml");
+
+    let err = run_presets_rebind(&mut config, &[], true).expect_err("D0 unreadable");
+    let partial = err.downcast::<RebindPartial>().expect("partial");
+    assert_eq!(
+        partial.failures,
+        ["re-bind failed for 'D0': failed to read D0/config.toml: Is a directory (os error 21)"],
+        "the failure keeps the OS cause",
+    );
+    assert_eq!(
+        partial.moved, "moved 5 rows on 1 account onto the built-in preset models.\n",
+        "DS1 still moved after D0 failed",
+    );
+}
+
+/// Rows saved to disk before a live-settings re-apply failure still count as
+/// moved: the active account's rows appear in the moved line AND the account
+/// appears in the failure line.
+#[test]
+fn rows_saved_before_a_settings_failure_still_count_as_moved() {
+    use crate::profile::{AppState, ProfileName, load_config, save_app_state};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+    // Make D0 the active account, then a directory at the live settings.json
+    // fails its re-apply AFTER the config save.
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("D0")),
+        profiles: vec![ProfileName::from("D0"), ProfileName::from("DS1")],
+        ..AppState::default()
+    })
+    .expect("state");
+    let settings = _home.home().join(".claude").join("settings.json");
+    std::fs::create_dir_all(settings.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::create_dir(&settings).expect("directory at settings.json");
+
+    let mut config = load_config().expect("config");
+    let err = run_presets_rebind(&mut config, &[], true).expect_err("settings re-apply fails");
+    let partial = err.downcast::<RebindPartial>().expect("partial");
+    assert_eq!(
+        partial.moved, "moved 10 rows on 2 accounts onto the built-in preset models.\n",
+        "D0's saved rows and DS1's rows both count as moved",
+    );
+    assert_eq!(
+        partial.failures,
+        [format!(
+            "re-bind failed for 'D0': failed to read {}: Is a directory (os error 21)",
+            settings.display()
+        )],
+        "the failure names D0 with the settings cause",
+    );
+}
+
+/// `--yes` when every offered row was already changed between the offer and the
+/// apply prints the quiet line and exits 0 (nothing moved).
+#[test]
+fn the_yes_rebind_that_moved_nothing_prints_the_quiet_line() {
+    use crate::profile::{Profile, save_profile};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    let filled = crate::profile::ModelSettings {
+        default: Some("opus".to_string()),
+        opus: Some("deepseek-v4-pro[1m]".to_string()),
+        sonnet: Some("deepseek-flash[1m]".to_string()),
+        haiku: Some("deepseek-flash[1m]".to_string()),
+        fable: Some("deepseek-v4-pro[1m]".to_string()),
+        subagent: None,
+    };
+    // A concurrent writer fills every offered row before the apply re-reads the
+    // fresh profile, so every move is skipped.
+    for name in ["D0", "DS1"] {
+        let mut p = Profile::new(
+            name.to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        );
+        p.models = filled.clone();
+        save_profile(&p).expect("concurrent write");
+    }
+
+    let out = run_presets_rebind(&mut config, &[], true).expect("run");
+    assert_eq!(
+        out, "every account already uses the built-in preset models.\n",
+        "nothing moved, so the quiet line exits 0",
+    );
+}
