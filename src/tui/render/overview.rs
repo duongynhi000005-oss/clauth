@@ -33,6 +33,9 @@ use std::collections::HashSet;
 
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
 const TIMER_SLOT: usize = 5;
+/// The amber mark an unpolled row that draws a cached reading carries in its
+/// countdown slot — "these figures are last-known, not current".
+const NOT_CURRENT_MARK: &str = "⋯";
 /// Rows the accounts table keeps before the chain panel may claim any space —
 /// it is the scrollable, interactive list, so it wins the vertical budget.
 const ACCOUNTS_MIN: u16 = 7;
@@ -719,16 +722,40 @@ fn render_overview_row(
     } else {
         Span::raw("  ")
     };
-    // A disabled account is filtered out of the scheduler's polling set
-    // (`AppConfig::enabled_profiles`), so its `next_refresh_per_profile` entry is
-    // frozen at whatever was published before it was disabled: the countdown
-    // ticks to zero and then sits there claiming a refresh that will never run.
-    // Blank the slot rather than lie, keeping its width so no column shifts. The
-    // spinner goes too — nothing can be in flight for a profile nothing polls.
-    let timer_span = if disabled {
+    // The not-current mark needs the row's windows up front (and DeepSeek reads
+    // its balance instead), so decide "draws a reading" here rather than after
+    // the bars are built.
+    let (five_window, seven_window) = overview_windows(profile, readings);
+    let not_current = !crate::usage::any_fetch_leg_polls(profile)
+        && draws_a_reading(
+            profile,
+            readings,
+            five_window.as_ref(),
+            seven_window.as_ref(),
+            widths,
+        );
+    let inner = TIMER_SLOT - 1;
+    let timer_span = if not_current {
+        // An unpolled row drawing a cached reading carries the amber `⋯` where a
+        // polled row would count down to its next refresh: the figures beside it
+        // are last-known, and no fetch leg currently refreshes them (a re-enable,
+        // a login or a key puts the profile back on a list). Styled directly
+        // rather than through `hue`, so a disabled row keeps this one hue while
+        // every other span still flattens to dim.
+        Span::styled(
+            format!("{:>inner$} ", NOT_CURRENT_MARK, inner = inner),
+            theme::warning(),
+        )
+    } else if disabled {
+        // A disabled account is filtered out of the scheduler's polling set
+        // (`AppConfig::enabled_profiles`), and `publish_countdowns` republishes
+        // the `next_refresh_per_profile` map from the work-list snapshots on
+        // every tick, so its entry is dropped rather than left to tick to zero.
+        // With no reading to mark stale, blank the slot rather than claim a
+        // countdown, keeping its width so no column shifts. The spinner goes too —
+        // nothing can be in flight for a profile nothing polls.
         Span::raw(" ".repeat(TIMER_SLOT))
     } else {
-        let inner = TIMER_SLOT - 1;
         let activity = app
             .activity
             .lock()
@@ -857,7 +884,6 @@ fn render_overview_row(
     // OAuth windows come from `usage`; an api-key/provider profile carries
     // `usage` only when it was seeded from its provider windows, and where it
     // is absent the 5h/7d windows are synthesized from the matching bars.
-    let (five_window, seven_window) = overview_windows(profile, readings);
     // Drain-color each reset countdown by the window's burn rate — see
     // `drain_rate` for where that rate comes from per window.
     let reset_style = |label, window: Option<&UsageWindow>| {
@@ -1061,6 +1087,29 @@ fn overview_windows(
         })
     };
     (window_for(LABEL_5H), window_for(LABEL_7D))
+}
+
+/// Whether this row draws a cached reading: a 5h window, a 7d window in a row
+/// whose 7d column is present (`widths.seven_day > 0`), or a non-empty DeepSeek
+/// balance. A row drawing only dashes has no figure to mark stale, so it gets no
+/// not-current mark. Decided from what the row draws, not from the snapshot
+/// alone: a third-party row can carry stats with no bars, a 7d-only window
+/// draws nothing where the 7d column was dropped, and a DeepSeek row draws its
+/// balance where the window columns would sit.
+fn draws_a_reading(
+    profile: &Profile,
+    readings: &ReadingsSnapshot,
+    five_window: Option<&UsageWindow>,
+    seven_window: Option<&UsageWindow>,
+    widths: &OverviewWidths,
+) -> bool {
+    if profile.provider == Some(Provider::DeepSeek) {
+        readings
+            .stats_of(&profile.name)
+            .is_some_and(|s| !deepseek_balances_to_show(s).is_empty())
+    } else {
+        five_window.is_some() || (widths.seven_day > 0 && seven_window.is_some())
+    }
 }
 
 fn gap(widths: &OverviewWidths) -> Span<'static> {

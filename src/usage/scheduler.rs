@@ -2896,13 +2896,23 @@ pub(crate) fn collect_third_party_seed_names(config: &crate::profile::AppConfig)
         .collect()
 }
 
-/// One profile's third-party entry, or `None` when its provider has no usable
-/// credential. The single construction site: the work list above filters it by
-/// disabled-ness, and [`profile_credential_fingerprint`] takes its fingerprint,
-/// so the identity the scheduler suppresses on and the identity a persisted
-/// record is keyed by can never be two different things.
+/// Whether the third-party entry constructor builds an entry for `p` — the
+/// credential test [`third_party_credentialed`] plus the endpoint-shape test (a
+/// recognised provider, or a generic endpoint whose `base_url` names a
+/// discovery target). Hoisted so [`any_fetch_leg_polls`] reads the same
+/// membership rule without building the [`ThirdPartyEntry`] just to drop it.
+fn third_party_pollable(p: &crate::profile::Profile) -> bool {
+    third_party_credentialed(p) && (p.provider.is_some() || p.base_url.is_some())
+}
+
+/// One profile's third-party entry, or `None` when [`third_party_pollable`] is
+/// false (no usable credential, or no endpoint shape to fetch). The single
+/// construction site: the work list above filters it by disabled-ness, and
+/// [`profile_credential_fingerprint`] takes its fingerprint, so the identity the
+/// scheduler suppresses on and the identity a persisted record is keyed by can
+/// never be two different things.
 fn third_party_entry_for(p: &crate::profile::Profile) -> Option<ThirdPartyEntry> {
-    if !third_party_credentialed(p) {
+    if !third_party_pollable(p) {
         return None;
     }
     let target = if let Some(provider) = p.provider {
@@ -2967,6 +2977,23 @@ pub(crate) fn third_party_credentialed(p: &crate::profile::Profile) -> bool {
 /// no walk or banner reads it as a current reading.
 pub(crate) fn reading_is_polled(p: &crate::profile::Profile) -> bool {
     !p.usage_cache_is_third_party() || (!p.is_disabled() && third_party_credentialed(p))
+}
+
+/// Whether either fetch leg's work list holds this profile — the question the
+/// Overview's not-current `⋯` mark answers. The OAuth leg ([`collect_tokens`])
+/// admits every enabled profile carrying a login pair; the third-party leg
+/// ([`collect_third_party_entries`]) admits every enabled profile its one entry
+/// constructor builds an entry for. Both skip a disabled profile, and a profile
+/// on neither list is one no fetch leg currently refreshes (a re-enable, a login
+/// or a key puts it back on a list).
+pub(crate) fn any_fetch_leg_polls(p: &crate::profile::Profile) -> bool {
+    !p.is_disabled()
+        && (p
+            .credentials
+            .as_ref()
+            .and_then(|c| c.claude_ai_oauth.as_ref())
+            .is_some()
+            || third_party_pollable(p))
 }
 
 /// The third-party names whose reading an automatic walk may read: the polled

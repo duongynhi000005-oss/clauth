@@ -322,7 +322,19 @@ fn oauth_profile(
             bell_threshold: None,
             disabled: false,
             console: None,
-            credentials: None,
+            // A login puts the demo account on the OAuth fetch leg, so the
+            // Overview counts down to its refresh instead of marking its bars
+            // as a cached reading nothing polls.
+            credentials: Some(crate::profile::ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "demo".into(),
+                    refresh_token: None,
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: Some(plan_type.into()),
+                    ..crate::profile::OAuthToken::default_extra()
+                }),
+            }),
             provider: None,
         },
         Some(usage),
@@ -668,6 +680,16 @@ fn headless_showcase_renders() {
         overview.contains("work"),
         "second profile row renders in the overview list"
     );
+    // The demo's Claude Code accounts are logged in, so no row marks its bars
+    // as a cached reading nothing polls (the README screenshot shows these).
+    for name in ["personal", "work", "side-project"] {
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let row = rows
+            .iter()
+            .find(|r| r.contains(name))
+            .unwrap_or_else(|| panic!("the {name} row renders"));
+        assert!(!row.contains('⋯'), "{name} is polled, not marked: {row}");
+    }
     // Tab-bar labels render (lowercase, un-truncated at 120w); `setup`/`config`
     // are tab-only words on the overview surface, so finding them proves the bar.
     assert!(

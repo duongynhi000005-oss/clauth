@@ -9,10 +9,10 @@ use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 use super::{
     ActivityStore, ClaudeRollingPacing, EpochMs, FetchLeg, FetchStamp, LastFetchedAt, LegKey,
     ProfileActivity, RESET_ANCHOR_GRACE_MS, SuppressedAuthExpiredStore, ThirdPartyEntry,
-    ThirdPartyFetcher, TokenEntry, anchor_post_reset_oauth, clear_activity, clear_orphaned_forced,
-    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, fetch_third_party_due,
-    filter_suppressed, generic_slot_deferral, mark_activity, memoized_identity, partition_due,
-    should_anchor_fetch, window_lapsed,
+    ThirdPartyFetcher, TokenEntry, anchor_post_reset_oauth, any_fetch_leg_polls, clear_activity,
+    clear_orphaned_forced, collect_oauth_seed_names, collect_third_party_entries, collect_tokens,
+    fetch_third_party_due, filter_suppressed, generic_slot_deferral, mark_activity,
+    memoized_identity, partition_due, should_anchor_fetch, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -229,6 +229,107 @@ fn collect_third_party_entries_skips_an_empty_key_profile() {
         !names.contains(&"space"),
         "a whitespace-key account must never enter the poll work list: {names:?}"
     );
+}
+
+/// `any_fetch_leg_polls` must answer exactly "is this profile on either fetch
+/// leg's work list" — [`collect_tokens`] ∪ [`collect_third_party_entries`] —
+/// across every profile shape the two membership rules distinguish. A predicate
+/// that restates the rule instead of sharing it drifts silently: an OAuth arm
+/// dropping its login test, a third-party arm reading `third_party_credentialed`
+/// alone (missing the endpoint-shape test), or either arm ignoring disabled-ness.
+#[test]
+fn any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes() {
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let deepseek = "https://api.deepseek.com/anthropic";
+    let alibaba = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let generic = "https://api.example.com/anthropic";
+
+    // One enabled profile per shape. The endpoint-shape axis (recognised
+    // provider vs generic `base_url` vs neither) is what separates the typed,
+    // generic and plain-key third-party shapes.
+    let enabled = vec![
+        oauth_profile_disabled("oauth-login", false),
+        Profile::new("oauth-logged-out".to_string(), None, None),
+        {
+            let mut p = oauth_profile_disabled("hybrid-login-key", false);
+            p.base_url = Some(deepseek.to_string());
+            p.api_key = Some("sk-hybrid".to_string());
+            p.provider = crate::providers::Provider::from_base_url(deepseek);
+            p
+        },
+        Profile::new(
+            "typed-key".to_string(),
+            Some(deepseek.to_string()),
+            Some("sk-typed".to_string()),
+        ),
+        Profile::new(
+            "typed-keyless".to_string(),
+            Some(deepseek.to_string()),
+            None,
+        ),
+        Profile::new(
+            "typed-blank-key".to_string(),
+            Some(deepseek.to_string()),
+            Some("  \t ".to_string()),
+        ),
+        Profile::new(
+            "alibaba-console".to_string(),
+            Some(alibaba.to_string()),
+            None,
+        ),
+        Profile::new(
+            "generic-key".to_string(),
+            Some(generic.to_string()),
+            Some("sk-generic".to_string()),
+        ),
+        Profile::new(
+            "generic-keyless".to_string(),
+            Some(generic.to_string()),
+            None,
+        ),
+        Profile::new(
+            "plain-key-no-base-url".to_string(),
+            None,
+            Some("sk-plain".to_string()),
+        ),
+    ];
+
+    // A disabled copy of every shape: no work list admits a disabled profile.
+    let disabled: Vec<Profile> = enabled
+        .iter()
+        .map(|p| {
+            let mut d = p.clone();
+            d.name = crate::profile::ProfileName::from(format!("{}-disabled", p.name.as_str()));
+            d.disabled = true;
+            d
+        })
+        .collect();
+
+    let all: Vec<Profile> = enabled.into_iter().chain(disabled).collect();
+    let cfg = AppConfig {
+        state: AppState::default(),
+        profiles: all.clone(),
+    };
+    let oauth_members: HashSet<String> = collect_tokens(&cfg)
+        .into_iter()
+        .map(|e| e.name.to_string())
+        .collect();
+    let tp_members: HashSet<String> = collect_third_party_entries(&cfg.profiles)
+        .into_iter()
+        .map(|e| e.name.to_string())
+        .collect();
+
+    for p in &all {
+        let on_a_work_list =
+            oauth_members.contains(p.name.as_str()) || tp_members.contains(p.name.as_str());
+        assert_eq!(
+            any_fetch_leg_polls(p),
+            on_a_work_list,
+            "any_fetch_leg_polls({}) disagrees with the work lists",
+            p.name.as_str(),
+        );
+    }
 }
 
 /// Every profile uses the same fixed `REFRESH_INTERVAL_MS` cadence: a

@@ -3116,11 +3116,17 @@ fn s9_overview_app() -> App {
     ];
     // ASCII first so the cursor lands on it, CJK active, emoji third — the
     // same order the accounts table renders them in.
-    let profiles = vec![
+    let mut profiles = vec![
         oauth(names[2], false),
         oauth(names[0], true),
         oauth(names[1], false),
     ];
+    // These rows pin a blank countdown slot, so the profiles must read as
+    // POLLED: a credential-less OAuth row drawing a reading now carries the
+    // amber not-current `⋯` mark in that slot instead.
+    for p in &mut profiles {
+        p.credentials = Some(hybrid_creds());
+    }
     let profile_names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let mut app = App::new(AppConfig {
         state: AppState {
@@ -7191,7 +7197,10 @@ fn an_aged_cache_shows_the_stale_pill_after_one_tick() {
 fn a_reading_inserted_into_a_store_shows_in_the_next_draw() {
     use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let _home = crate::testutil::HomeSandbox::new();
-    let p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("o"));
+    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("o"));
+    // A login pair puts `o` on the OAuth leg's work list, so its row pins a
+    // blank countdown slot rather than the amber not-current `⋯` mark.
+    p.credentials = Some(hybrid_creds());
     let config = AppConfig {
         state: AppState {
             active_profile: Some("o".into()),
@@ -7242,7 +7251,16 @@ const P1_READINGS: [f64; 3] = [1.000_000_000_000_000_9, 73.42, 99.999];
 /// renders all three readings and its column of them.
 fn p1_readings_app() -> App {
     let names = ["alpha", "bravo", "charlie"];
-    let profiles: Vec<Profile> = names.iter().map(|n| oauth(n, false)).collect();
+    // Logged in, so each row counts down to a refresh instead of carrying the
+    // not-current mark of a cached reading nothing polls.
+    let profiles: Vec<Profile> = names
+        .iter()
+        .map(|n| {
+            let mut p = oauth(n, false);
+            p.credentials = Some(hybrid_creds());
+            p
+        })
+        .collect();
     let mut app = App::new(AppConfig {
         state: AppState {
             active_profile: Some("bravo".into()),
@@ -7508,8 +7526,16 @@ fn the_header_gauge_keeps_two_rounded_decimals_at_every_width() {
 /// One account with a 73.42% reading and one whose 5h window is absent but
 /// 7d present, so the bare 5h column renders a reading beside a `—`.
 fn p1_dash_app() -> App {
-    let profiles = vec![oauth("alpha", false), oauth("bravo", false)];
     let names = ["alpha", "bravo"];
+    // Logged in, so neither row carries the not-current mark.
+    let profiles: Vec<Profile> = names
+        .iter()
+        .map(|n| {
+            let mut p = oauth(n, false);
+            p.credentials = Some(hybrid_creds());
+            p
+        })
+        .collect();
     let app = App::new(AppConfig {
         state: AppState {
             active_profile: Some("bravo".into()),

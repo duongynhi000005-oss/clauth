@@ -761,7 +761,10 @@ fn long_lived_token_expired_marks() {
 fn cached_row_colors_countdown_amber_and_underlines_nothing() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let (a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    // A login puts the account on the OAuth leg's work list; a logged-out one
+    // carries the not-current mark in this slot instead of a countdown.
+    a.credentials = Some(oauth_creds());
     a_readings
         .fetch_status
         .insert("a".to_string(), FetchStatus::Cached);
@@ -797,7 +800,8 @@ fn cached_row_colors_countdown_amber_and_underlines_nothing() {
 fn failed_row_colors_countdown_red() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let (a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
     a_readings
         .fetch_status
         .insert("a".to_string(), FetchStatus::Failed);
@@ -1123,15 +1127,18 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
             .iter()
             .filter(|s| !s.content.trim().is_empty())
             .filter(|s| s.style.fg.is_some() && s.style.fg != theme::dim().fg)
-            .map(|s| s.content.to_string())
+            .map(|s| s.content.trim().to_string())
             .collect()
     };
 
+    // The one hue a disabled row keeps is the not-current mark: it exists to say
+    // the dim figures beside it are a cached reading, so flattening it would
+    // erase the only cue that they are not current.
     let disabled_line = render_overview_row(&app, 0, &widths, false, true, &readings);
     assert_eq!(
         non_dim(&disabled_line),
-        Vec::<String>::new(),
-        "every colored span on a disabled row must flatten to dim"
+        vec![NOT_CURRENT_MARK.to_string()],
+        "every colored span on a disabled row flattens to dim but the not-current mark"
     );
 
     // The control row must still carry hue, or the assertion above is vacuous.
@@ -1361,14 +1368,15 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
 }
 
 /// A disabled account is never polled, so its refresh countdown would tick to
-/// zero and then claim a refresh forever. The slot renders blank — at full
+/// zero and then claim a refresh forever. The slot shows no countdown — at full
 /// width, so no column downstream shifts.
 #[test]
-fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
+fn disabled_row_claims_no_refresh_at_full_width() {
     let _home = crate::testutil::HomeSandbox::new();
     let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
-    let (b, b_readings) = profile("b", 95.0, 10.0, 3600);
+    let (mut b, b_readings) = profile("b", 95.0, 10.0, 3600);
+    b.credentials = Some(oauth_creds());
     let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
     let app = App::new(config);
     // Both profiles carry a live countdown in the shared map.
@@ -1418,6 +1426,368 @@ fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
         text(&disabled_line).chars().count(),
         text(&enabled_line).chars().count(),
         "blanking the timer must not collapse the slot"
+    );
+}
+
+// ── not-current mark: an unpolled row drawing a cached reading ────────────
+
+/// The glyph an unpolled row that draws a cached reading carries in its
+/// countdown slot.
+const NOT_CURRENT_MARK: &str = "⋯";
+
+/// The spans on a row whose trimmed content is the not-current mark.
+fn mark_spans(line: &Line<'static>) -> Vec<Span<'static>> {
+    line.spans
+        .iter()
+        .filter(|s| s.content.trim() == NOT_CURRENT_MARK)
+        .cloned()
+        .collect()
+}
+
+/// A refresh countdown matched by shape (a digit followed by `s`); see
+/// `disabled_row_claims_no_refresh_at_full_width` for why never by value.
+fn has_refresh_countdown(line: &Line<'static>) -> bool {
+    line_text(line)
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_digit() && w[1] == b's')
+}
+
+/// A Z.ai account with no api key and cached 5h/7d bars, named `tp`: no fetch
+/// leg's work list holds a keyless provider account, so its bars are the last
+/// reading clauth cached.
+fn keyless_provider_profile() -> (Profile, ReadingsSnapshot) {
+    let (mut p, readings) = third_party_profile(40.0, 20.0);
+    p.base_url = Some("https://api.z.ai/api/anthropic".into());
+    p.api_key = None;
+    p.provider = Some(crate::providers::Provider::Zai);
+    (p, readings)
+}
+
+/// Every way an account falls off both fetch legs' work lists while its row
+/// still draws a reading: disabled (OAuth bars, DeepSeek balance), keyless
+/// provider, logged-out OAuth. Each carries one amber `⋯` where the countdown
+/// sits, at both theme tiers, and keeps the row's width. A polled sibling with
+/// a scheduled refresh keeps its countdown and gets no mark.
+#[test]
+fn an_unpolled_row_drawing_a_reading_carries_an_amber_not_current_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut disabled_oauth, disabled_oauth_readings) = profile("a", 95.0, 10.0, 3600);
+    disabled_oauth.disabled = true;
+    disabled_oauth.credentials = Some(oauth_creds());
+    // `profile` builds a credential-less OAuth account: logged out.
+    let logged_out = profile("c", 95.0, 10.0, 3600);
+    let (mut disabled_deepseek, disabled_deepseek_readings) = deepseek_profile("d", &["1.71 USD"]);
+    disabled_deepseek.disabled = true;
+    let (mut polled, polled_readings) = profile("p", 95.0, 10.0, 3600);
+    polled.credentials = Some(oauth_creds());
+    let (config, readings) = config_with(
+        vec![
+            (disabled_oauth, disabled_oauth_readings),
+            keyless_provider_profile(),
+            logged_out,
+            (disabled_deepseek, disabled_deepseek_readings),
+            (polled, polled_readings),
+        ],
+        None,
+        vec![],
+    );
+    let unpolled = [
+        (0, "disabled oauth"),
+        (1, "keyless provider"),
+        (2, "logged-out oauth"),
+        (3, "disabled deepseek balance"),
+    ];
+    let polled_idx = 4;
+
+    let mut mark_fg_per_tier = Vec::new();
+    for tier in [theme::Tier::Full, theme::Tier::Compatible] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let app = App::new(config.clone());
+        // Every row holds a scheduled refresh in the shared map, so only the
+        // work-list rule can keep a countdown off the unpolled rows.
+        if let Ok(mut m) = app.next_refresh_per_profile.lock() {
+            for name in ["a", "c", "p"] {
+                m.insert(
+                    FetchLeg::OAuth.key(ProfileName::from(name)),
+                    now_ms() + 42_000,
+                );
+            }
+            for name in ["tp", "d"] {
+                m.insert(
+                    FetchLeg::ThirdParty.key(ProfileName::from(name)),
+                    now_ms() + 42_000,
+                );
+            }
+        }
+        let widths = OverviewWidths::new(110, &app, &readings);
+        let row = |idx: usize| render_overview_row(&app, idx, &widths, false, true, &readings);
+
+        let control = row(polled_idx);
+        assert!(
+            has_refresh_countdown(&control),
+            "control ({tier:?}): the polled row shows its countdown: {}",
+            line_text(&control)
+        );
+        assert!(
+            mark_spans(&control).is_empty(),
+            "a polled row carries no not-current mark ({tier:?}): {}",
+            line_text(&control)
+        );
+
+        for (idx, what) in unpolled {
+            let line = row(idx);
+            let marks = mark_spans(&line);
+            assert_eq!(
+                marks.len(),
+                1,
+                "a {what} row drawing a reading carries one `⋯` ({tier:?}): {}",
+                line_text(&line)
+            );
+            assert_eq!(
+                marks[0].style.fg,
+                Some(theme::warning_color()),
+                "the {what} row's `⋯` is amber ({tier:?})"
+            );
+            assert!(
+                !has_refresh_countdown(&line),
+                "the {what} row claims no refresh ({tier:?}): {}",
+                line_text(&line)
+            );
+            assert_eq!(
+                line.width(),
+                control.width(),
+                "the {what} row's mark keeps the slot's width in cells ({tier:?})"
+            );
+        }
+        mark_fg_per_tier.push(theme::warning_color());
+    }
+    assert_ne!(
+        mark_fg_per_tier[0], mark_fg_per_tier[1],
+        "control: the two tier pins resolve different colors, so both legs ran"
+    );
+}
+
+/// The mark says the figures beside it are old; a row with nothing cached has
+/// no figures, so its slot stays blank however unpolled the account is. A
+/// polled account whose first refresh is not scheduled yet gets no mark either:
+/// a leg will fetch it.
+#[test]
+fn a_row_with_no_reading_or_a_polled_account_gets_no_not_current_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (mut disabled_empty, _) = profile("a", 95.0, 10.0, 3600);
+    disabled_empty.disabled = true;
+    disabled_empty.credentials = Some(oauth_creds());
+    let (keyless_empty, _) = keyless_provider_profile();
+    let (logged_out_empty, _) = profile("c", 95.0, 10.0, 3600);
+    let (mut polled_unscheduled, polled_readings) = profile("p", 95.0, 10.0, 3600);
+    polled_unscheduled.credentials = Some(oauth_creds());
+    let (config, readings) = config_with(
+        vec![
+            (disabled_empty, ReadingsSnapshot::default()),
+            (keyless_empty, ReadingsSnapshot::default()),
+            (logged_out_empty, ReadingsSnapshot::default()),
+            (polled_unscheduled, polled_readings),
+        ],
+        None,
+        vec![],
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(110, &app, &readings);
+    for (idx, what) in [
+        (0, "disabled oauth with nothing cached"),
+        (1, "keyless provider with nothing cached"),
+        (2, "logged-out oauth with nothing cached"),
+        (
+            3,
+            "polled oauth with a reading and no refresh scheduled yet",
+        ),
+    ] {
+        let line = render_overview_row(&app, idx, &widths, false, true, &readings);
+        assert!(
+            mark_spans(&line).is_empty(),
+            "a {what} row carries no `⋯`: {}",
+            line_text(&line)
+        );
+    }
+    // Fixture control: the polled row really draws its reading, so its missing
+    // mark is the work-list rule and not an empty row.
+    let polled_line = render_overview_row(&app, 3, &widths, false, true, &readings);
+    assert!(
+        line_text(&polled_line).contains("10%"),
+        "control: the polled row draws its 5h reading: {}",
+        line_text(&polled_line)
+    );
+}
+
+/// "Draws a reading" means what the row draws at this width: a pane too narrow
+/// for the 7d column hides a 7d-only reading, so that row is dashes and keeps a
+/// blank slot; the same row at full width draws its 7d bar and carries the mark.
+#[test]
+fn a_narrow_pane_hiding_the_7d_column_leaves_a_7d_only_row_unmarked() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (logged_out, _) = profile("s7", 95.0, 10.0, 3600);
+    let seven_only = UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(reset_in(3 * 86_400)),
+        }),
+        ..UsageInfo::default()
+    };
+    let (config, readings) = config_with(
+        vec![(
+            logged_out,
+            snap_with_usage(ReadingsSnapshot::default(), "s7", seven_only),
+        )],
+        None,
+        vec![],
+    );
+    let app = App::new(config);
+
+    let narrow = OverviewWidths::new(50, &app, &readings);
+    assert_eq!(
+        narrow.seven_day, 0,
+        "fixture control: 50 cells drop the 7d column"
+    );
+    let narrow_line = render_overview_row(&app, 0, &narrow, false, true, &readings);
+    assert!(
+        mark_spans(&narrow_line).is_empty(),
+        "a row whose only reading sits in a hidden column draws dashes, so no `⋯`: {}",
+        line_text(&narrow_line)
+    );
+
+    let wide = OverviewWidths::new(110, &app, &readings);
+    assert!(
+        wide.seven_day > 0,
+        "fixture control: 110 cells keep the 7d column"
+    );
+    let wide_line = render_overview_row(&app, 0, &wide, false, true, &readings);
+    assert_eq!(
+        mark_spans(&wide_line).len(),
+        1,
+        "control: the same row drawing its 7d bar carries the mark: {}",
+        line_text(&wide_line)
+    );
+
+    // Every 7d tier the shrink loop can pick, the narrowest (`%` only) and the
+    // bar without its reset included: whenever the column draws, its figure is
+    // on the row and the mark is beside it; whenever it is gone, no mark.
+    let mut tiers_seen = std::collections::BTreeSet::new();
+    for width in 40..=120u16 {
+        let widths = OverviewWidths::new(width, &app, &readings);
+        let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+        let marks = mark_spans(&line).len();
+        if widths.seven_day > 0 {
+            tiers_seen.insert(widths.seven_day);
+            assert!(
+                line_text(&line).contains("30%"),
+                "fixture control at {width} cells: the 7d column draws its figure: {}",
+                line_text(&line)
+            );
+            assert_eq!(marks, 1, "{width} cells draw the 7d figure, so one `⋯`");
+        } else {
+            assert_eq!(marks, 0, "{width} cells hide the 7d column, so no `⋯`");
+        }
+    }
+    assert!(
+        tiers_seen.len() >= 2,
+        "fixture control: the sweep crosses a narrow 7d tier and the full one: {tiers_seen:?}"
+    );
+}
+
+/// A row's snapshot entry is not a drawn reading: an unpolled provider account
+/// whose cached stats hold rows but no 5h/7d bars draws dashes (no `⋯`), and an
+/// unpolled DeepSeek account whose stats hold no balance row draws `—` in its
+/// balance cell (no `⋯`). Each sits beside its drawing twin as the control.
+#[test]
+fn an_unpolled_row_with_stats_but_nothing_drawn_gets_no_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (keyless, mut keyless_readings) = keyless_provider_profile();
+    if let Some(stats) = keyless_readings.third_party.get_mut("tp") {
+        stats.bars.clear();
+        stats.rows.push(crate::providers::StatRow {
+            label: "credits".into(),
+            value: "12.00 USD".into(),
+            kind: crate::providers::StatRowKind::Body,
+        });
+    }
+    let (mut ds_empty, ds_empty_readings) = deepseek_profile("d0", &[]);
+    ds_empty.disabled = true;
+    let (mut ds_balance, ds_balance_readings) = deepseek_profile("d1", &["1.71 USD"]);
+    ds_balance.disabled = true;
+    let (config, readings) = config_with(
+        vec![
+            (keyless, keyless_readings),
+            (ds_empty, ds_empty_readings),
+            (ds_balance, ds_balance_readings),
+        ],
+        None,
+        vec![],
+    );
+    assert!(
+        readings
+            .third_party
+            .get("tp")
+            .is_some_and(|s| s.bars.is_empty()),
+        "fixture control: the keyless row holds stats with no bars"
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(110, &app, &readings);
+    let row = |idx: usize| render_overview_row(&app, idx, &widths, false, true, &readings);
+
+    for (idx, what) in [
+        (0, "keyless provider with stats and no bars"),
+        (1, "disabled deepseek with no balance row"),
+    ] {
+        let line = row(idx);
+        assert!(
+            mark_spans(&line).is_empty(),
+            "a {what} draws no figure, so no `⋯`: {}",
+            line_text(&line)
+        );
+    }
+    assert_eq!(
+        mark_spans(&row(2)).len(),
+        1,
+        "control: a disabled deepseek drawing its balance carries the mark: {}",
+        line_text(&row(2))
+    );
+}
+
+/// The third-party leg admits only a profile its entry constructor builds an
+/// entry for: a plain api key with no endpoint and no provider is on neither
+/// fetch leg, so a cached OAuth reading on its row (left from a login it no
+/// longer holds) is marked. A key alone is not the leg's membership rule.
+#[test]
+fn a_key_with_no_endpoint_is_unpolled_and_its_cached_reading_is_marked() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (mut keyed, keyed_readings) = profile("k", 95.0, 10.0, 3600);
+    keyed.api_key = Some("sk-fixture".into());
+    let (mut polled, polled_readings) = profile("p", 95.0, 10.0, 3600);
+    polled.credentials = Some(oauth_creds());
+    let (config, readings) = config_with(
+        vec![(keyed, keyed_readings), (polled, polled_readings)],
+        None,
+        vec![],
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(110, &app, &readings);
+    let keyed_line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    assert_eq!(
+        mark_spans(&keyed_line).len(),
+        1,
+        "a key with no endpoint fetches nothing, so its drawn reading is marked: {}",
+        line_text(&keyed_line)
+    );
+    let polled_line = render_overview_row(&app, 1, &widths, false, true, &readings);
+    assert!(
+        mark_spans(&polled_line).is_empty(),
+        "control: a logged-in sibling is polled: {}",
+        line_text(&polled_line)
     );
 }
 
@@ -1508,11 +1878,13 @@ fn disabled_and_past_reset_row_stays_fully_dim() {
         .iter()
         .filter(|s| !s.content.trim().is_empty())
         .filter(|s| s.style.fg.is_some() && s.style.fg != theme::dim().fg)
-        .map(|s| s.content.to_string())
+        .map(|s| s.content.trim().to_string())
         .collect();
+    // The not-current mark is the one span a disabled row keeps in color: it is
+    // what says the dim figures are a cached reading.
     assert_eq!(
         non_dim,
-        Vec::<String>::new(),
+        vec![NOT_CURRENT_MARK.to_string()],
         "a disabled row's bar must flatten fully to dim, not stay half-faint"
     );
 }
