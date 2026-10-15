@@ -566,10 +566,49 @@ fn the_digest_changes_when_a_bind_changes() {
     assert_eq!(one.len(), 64);
 }
 
+/// A release that only adds a former id must reopen the confirm for an
+/// account that dismissed it, so `former_ids` feeds the digest too.
+#[test]
+fn the_digest_changes_when_only_a_former_id_changes() {
+    let with = |former_ids: &'static [&'static str]| {
+        digest_of_builtins(&[Builtin {
+            name: "X",
+            base_url: "https://a",
+            former_ids,
+            binds: Binds::Tiers {
+                opus: "big",
+                sonnet: "fast",
+                haiku: "fast",
+                fable: "big",
+            },
+        }])
+    };
+    assert_ne!(
+        with(&[]),
+        with(&["old"]),
+        "adding a former id must change the digest"
+    );
+    assert_ne!(
+        with(&["old"]),
+        with(&["old", "older"]),
+        "a second former id must change the digest"
+    );
+    assert_ne!(
+        with(&["old"]),
+        with(&["new"]),
+        "replacing a former id must change the digest"
+    );
+    assert_ne!(
+        with(&["ab", "c"]),
+        with(&["a", "bc"]),
+        "moving an id boundary must change the digest"
+    );
+}
+
 #[test]
 fn the_shipped_binds_digest_is_a_stable_literal() {
     assert_eq!(
         builtin_binds_digest(),
-        "014e3cdb43c71ebdb6d4eaff468cffd8fcc2b8cba1933b6f1c1a03878909540c"
+        "a4d733b2c7d56df95eb0b28c09bb944be7504fb274f86357295e26a1d53609c0"
     );
 }

@@ -513,9 +513,12 @@ pub(crate) fn group_offers(offers: Vec<AccountOffers>) -> Vec<RebindBlock> {
     blocks
 }
 
-/// SHA-256 (hex) of the shipped bind table: each built-in's name, base_url and
-/// resolved models. Changes exactly when a bind changes, so a stored digest
-/// stands for "this release's binds were already offered".
+/// SHA-256 (hex) of the shipped bind table: each built-in's name, base_url,
+/// resolved models and former ids. Changes whenever the table's names,
+/// endpoints, binds or former ids change (their order included), so a stored
+/// digest stands for "this release's binds were already offered" — a release
+/// that only adds a former id reopens the confirm for an account that
+/// dismissed it.
 pub(crate) fn builtin_binds_digest() -> String {
     digest_of_builtins(BUILTINS)
 }
@@ -537,6 +540,14 @@ fn digest_of_builtins(builtins: &[Builtin]) -> String {
             if let Some(value) = binds.field(row) {
                 hasher.update(value.as_bytes());
             }
+            hasher.update([0u8]);
+        }
+        // The `0` after each id keeps `["ab", "c"]` and `["a", "bc"]` apart; the
+        // count prefix keeps a list's last id from reading as the start of the
+        // next built-in's name.
+        hasher.update((builtin.former_ids.len() as u64).to_le_bytes());
+        for id in builtin.former_ids {
+            hasher.update(id.as_bytes());
             hasher.update([0u8]);
         }
     }

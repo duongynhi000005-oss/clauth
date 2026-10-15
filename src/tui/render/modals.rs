@@ -661,7 +661,7 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
             theme::body(),
         )),
         Line::from(Span::styled(
-            "this release binds newer model ids. rows that hold an id an earlier release shipped, or are empty, take the new one; ids you set stay.",
+            "these accounts are on a built-in preset's endpoint. rows that are empty or hold an id an earlier release shipped take the preset's current value; ids you set stay.",
             theme::dim(),
         )),
         Line::from(""),
