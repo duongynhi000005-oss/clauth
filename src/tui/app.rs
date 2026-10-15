@@ -64,12 +64,13 @@ use crate::tui::render::{ListView, follow_scroll_offset, truncate};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile,
-    OpResult, OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff,
-    PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue, StartupReceiver,
-    StartupSender, StartupSignal, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken,
-    ThirdPartyList, ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList,
-    UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
+    ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, MemoryStores,
+    NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
+    PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue,
+    StartupReceiver, StartupSender, StartupSignal, StatusStore, SuppressedAuthExpiredStore,
+    ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyStreaks,
+    ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, WeeklyResetKicks, any_busy,
+    apply_pending_forgets, bootstrap_fetch, bootstrap_third_party, clear_activity,
     collect_oauth_seed_names, collect_third_party_entries, collect_third_party_seed_names,
     collect_tokens, is_idle, mark_activity, now_ms, spawn_refresher, switch_gate_in_flight,
     windows_maxed,
@@ -3877,6 +3878,11 @@ pub(crate) struct App {
     pub(crate) third_party_status: ThirdPartyStatusStore,
     pub(crate) third_party_streaks: ThirdPartyStreaks,
     pub(crate) third_party_broken: ThirdPartyBroken,
+    /// Scheduler-only stores held here so `forget_memory` can reach the whole
+    /// process's name-keyed state from the UI thread (the refresh thread shares
+    /// the same `Arc`s).
+    pub(crate) weekly_reset_kicks: WeeklyResetKicks,
+    pub(crate) suppressed_auth_expired: SuppressedAuthExpiredStore,
     /// The #74 degraded cue per profile, written each tick by `apply_usage`
     /// (it reads the DISK cache age) and read by the per-frame snapshot. A
     /// plain map, not a ranked store: written and read only on the UI thread.
@@ -4285,6 +4291,8 @@ struct WorkerHandles {
     third_party_status: ThirdPartyStatusStore,
     third_party_streaks: ThirdPartyStreaks,
     third_party_broken: ThirdPartyBroken,
+    weekly_reset_kicks: WeeklyResetKicks,
+    suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
     bootstrap_active: Arc<AtomicBool>,
@@ -4315,6 +4323,8 @@ impl WorkerHandles {
             third_party_status: Arc::clone(&app.third_party_status),
             third_party_streaks: Arc::clone(&app.third_party_streaks),
             third_party_broken: Arc::clone(&app.third_party_broken),
+            weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+            suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
             shutting_down: Arc::clone(&app.shutting_down),
             fetch_lease: Arc::clone(&app.fetch_lease),
             bootstrap_active: Arc::clone(&app.bootstrap_active),
@@ -4384,6 +4394,9 @@ impl ReadingsSnapshot {
 
 impl App {
     pub(crate) fn new(config: AppConfig) -> Self {
+        // This process holds reading stores, so change sites record their
+        // forgets here and the per-site drains + `on_tick` apply them.
+        crate::usage::register_memory_stores();
         let usage_store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
         let usage_status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
         let usage_tokens: TokenList = Arc::new(RankedMutex::new(collect_tokens(&config)));
@@ -4408,6 +4421,9 @@ impl App {
         let third_party_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_streaks: ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_broken: ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::new()));
+        let weekly_reset_kicks: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+        let suppressed_auth_expired: SuppressedAuthExpiredStore =
+            Arc::new(RankedMutex::new(HashMap::new()));
         // Seed the live mirror from the durable verdict so a fingerprint-bound
         // key rejection survives a restart (see `durable_key_rejected_seed`).
         if let Ok(mut broken) = third_party_broken.lock() {
@@ -4547,6 +4563,8 @@ impl App {
             third_party_status,
             third_party_streaks,
             third_party_broken,
+            weekly_reset_kicks,
+            suppressed_auth_expired,
             stale_cues: HashMap::new(),
             broken_verdict_mtimes: HashMap::new(),
             last_broken_verdict_sync: None,
@@ -5187,11 +5205,8 @@ impl App {
     /// Bundle scheduler `Arc`s and launch the background refresher.
     fn start_scheduler(&self) {
         let h = WorkerHandles::from_app(self);
-        // Session-scoped suppressed-auth-expired set: rebuilt fresh each TUI launch,
-        // dropped on exit. Purely scheduler-internal — the App never touches it
-        // (manual refresh clears suppression via the shared forced queue).
-        let suppressed_auth_expired: SuppressedAuthExpiredStore =
-            Arc::new(RankedMutex::new(HashMap::new()));
+        // Both scheduler-only stores are held by the App so `forget_memory` can
+        // reach them from the UI thread; the refresh thread shares the same `Arc`s.
         spawn_refresher(
             h.config,
             h.usage_tokens,
@@ -5204,6 +5219,7 @@ impl App {
             h.poll_streaks,
             h.kick_blocks,
             h.auto_start_queue,
+            h.weekly_reset_kicks,
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,
@@ -5212,7 +5228,7 @@ impl App {
             h.third_party_status,
             h.third_party_streaks,
             h.third_party_broken,
-            suppressed_auth_expired,
+            h.suppressed_auth_expired,
             h.shutting_down,
             // Single-fetcher lease (#27): the TUI competes for `usage-fetch.lock`
             // like any instance, standing its refresher down while another holds
@@ -5225,6 +5241,34 @@ impl App {
             // (`spawn_refresher` builds its own state under `cfg!(test)`).
             true,
         );
+    }
+
+    /// Bundle the reading stores `forget_memory` clears, cloning every `Arc` so
+    /// the UI thread reaches the same maps the refresh thread shares.
+    fn memory_stores(&self) -> MemoryStores {
+        MemoryStores {
+            usage: Arc::clone(&self.usage_store),
+            usage_status: Arc::clone(&self.usage_status),
+            last_fetched: Arc::clone(&self.last_fetched),
+            next_refresh: Arc::clone(&self.next_refresh_per_profile),
+            poll_streaks: Arc::clone(&self.poll_streaks),
+            kick_blocks: Arc::clone(&self.kick_blocks),
+            weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
+            auto_start_queue: Arc::clone(&self.auto_start_queue),
+            third_party_usage: Arc::clone(&self.third_party_usage_store),
+            third_party_status: Arc::clone(&self.third_party_status),
+            third_party_streaks: Arc::clone(&self.third_party_streaks),
+            third_party_broken: Arc::clone(&self.third_party_broken),
+            suppressed: Arc::clone(&self.suppressed_auth_expired),
+            interval_ms: Arc::clone(&self.refresh_interval),
+        }
+    }
+
+    /// Drain the forgets a change site noted and apply each to memory. Called
+    /// after a change site returns, with no config guard held (the stores rank
+    /// BELOW `Config`).
+    fn apply_forgets(&self) {
+        apply_pending_forgets(&self.memory_stores());
     }
 
     /// Build the per-frame readings snapshot. The picker's per-name
@@ -10000,12 +10044,12 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
         } => {
             app.services.shunt_save = None;
             // A repointed credential retires the old provider's verdict pill
-            // and throttle streak — the shared clear every credential-replacing
-            // path runs (the `commit_endpoint` precedent), and the token
-            // collection re-reads so the fetch leg schedules the re-keyed
-            // profile's first fetch same-frame.
+            // and throttle streak — the identity-conditional drain every
+            // credential-replacing path runs (the `commit_endpoint` precedent),
+            // and the token collection re-reads so the fetch leg schedules the
+            // re-keyed profile's first fetch same-frame.
             app.refresh_tokens();
-            clear_profile_status_chrome(app, &ProfileName::from(profile.as_str()));
+            app.apply_forgets();
             if require {
                 // The require flow's pick: no `uses the gateway` toast and no
                 // token-row focus — the card reads that it waits for the
@@ -18000,6 +18044,7 @@ fn commit_rename(app: &mut App) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
+            app.apply_forgets();
             app.last_reload_fp = reload_fingerprint();
             if let Some(d) = app.config_draft.as_mut() {
                 d.editing_name = Some(new.clone());
@@ -18010,33 +18055,6 @@ fn commit_rename(app: &mut App) {
         }
         Err(e) => app.toast(ToastKind::Danger, format!("rename failed\n{e}")),
     }
-}
-
-/// Drop one profile's name-keyed fetch-status + streak chrome — the shared
-/// clear every credential-replacing path runs: a repaired or repointed
-/// credential retires the old provider's verdicts, so the next frame
-/// must read no stale `[ key rejected ]` pill and the throttler attribution
-/// cannot accuse the new endpoint with the old provider's streak. The OAuth
-/// fetch status joins them because the render merges it over the third-party
-/// one — either left standing would still read as the stale verdict. The
-/// store clears only: the per-frame snapshot derives its readings from these
-/// stores on the next frame, so no handle write is needed.
-fn clear_profile_status_chrome(app: &App, name: &ProfileName) {
-    // Read through a poisoned lock: a skip would leave the stale verdict
-    // behind, and the per-frame snapshot reads these stores back next frame,
-    // so a clear that silently no-ops strands the pill it was meant to retire.
-    app.third_party_status
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(name.as_str());
-    app.third_party_streaks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(name.as_str());
-    app.usage_status
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(name.as_str());
 }
 
 fn commit_endpoint(app: &mut App) {
@@ -18065,7 +18083,7 @@ fn commit_endpoint(app: &mut App) {
             // rejection verdict reads the AppConfig profile fingerprint, never
             // this list, so a stale entry cannot keep the name key-rejected.
             app.refresh_tokens();
-            clear_profile_status_chrome(app, &name);
+            app.apply_forgets();
             // Reseed from the saved profile (API key may have been dropped).
             let (base, key) = {
                 let cfg = app.config();
@@ -18213,6 +18231,7 @@ fn commit_new_account(app: &mut App) {
     };
     match result {
         Ok(()) => {
+            app.apply_forgets();
             if mint_discarded {
                 app.toast(
                     ToastKind::Info,
@@ -18330,6 +18349,7 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
+            app.apply_forgets();
             app.last_reload_fp = reload_fingerprint();
             app.refresh_unsaved_live_login();
             app.config_focus = ConfigFocus::Profiles;
@@ -18704,10 +18724,11 @@ fn apply_preset_to(
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            // A repoint retires the old provider's verdicts — the shared
-            // clear keeps its streak from accusing the new endpoint.
+            // A repoint retires the old provider's verdicts — the drain
+            // forgets the changed halves, keeping the old streak from accusing
+            // the new endpoint.
             if repointed {
-                clear_profile_status_chrome(app, &name);
+                app.apply_forgets();
             }
             app.last_reload_fp = reload_fingerprint();
             if app.config_draft.is_some() {
@@ -18789,6 +18810,7 @@ fn duplicate_profile_into(app: &mut App, source: &ProfileName, new_name: &Profil
     match result {
         Ok(()) => {
             app.refresh_tokens();
+            app.apply_forgets();
             app.last_reload_fp = reload_fingerprint();
             let idx = app
                 .config()
@@ -19261,7 +19283,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
-                    clear_profile_status_chrome(app, &name);
+                    app.apply_forgets();
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(
@@ -19309,7 +19331,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
-                    clear_profile_status_chrome(app, &name);
+                    app.apply_forgets();
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(
@@ -19439,8 +19461,8 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             let name = ProfileName::from(name);
             let result = {
                 let mut cfg = app.config();
-                // OAuth accounts drop the token via the shared clearer; API
-                // accounts drop only the api key, keeping the base-url shell.
+                // OAuth accounts drop the whole login; API accounts drop only
+                // the api key, keeping the base-url shell.
                 let is_oauth = cfg.find(&name).map(|p| p.login_is_oauth()).unwrap_or(true);
                 if is_oauth {
                     clear_profile_credentials(&mut cfg, &name)
@@ -19453,8 +19475,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     app.refresh_tokens();
                     // No leg ever fetches a keyless profile, so a stale
                     // `[ key rejected ]` verdict would render forever — the
-                    // shared clear retires it with the credential.
-                    clear_profile_status_chrome(app, &name);
+                    // drain forgets the changed provider half with the
+                    // credential.
+                    app.apply_forgets();
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("logged out of '{name}'"));
@@ -19665,27 +19688,34 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
 fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) {
     match choice {
         DivergenceChoice::Overwrite => {
-            let snapshot_result = {
+            let oauth_moved = {
                 let mut cfg = app.config();
                 force_snapshot_active_credentials(&mut cfg)
             };
-            if let Err(e) = snapshot_result {
-                app.toast(ToastKind::Danger, format!("overwrite failed\n{e}"));
-                return;
+            let oauth_moved = match oauth_moved {
+                Ok(oauth_moved) => oauth_moved,
+                Err(e) => {
+                    app.toast(ToastKind::Danger, format!("overwrite failed\n{e}"));
+                    return;
+                }
+            };
+            if oauth_moved {
+                // The overwrite captured a live login that may be a DIFFERENT
+                // account: expire the clock so the next `/profile` read re-seeds
+                // the anchor, the way `overwrite_captured_profile` does. A
+                // snapshot of the account's own bytes forgets nothing and keeps
+                // its stamp.
+                crate::usage::expire_profile_ttl(&ProfileName::from(active));
             }
-            // The overwrite captured a live login that may be a DIFFERENT
-            // account: expire the clock so the next `/profile` read re-seeds the
-            // anchor, the way `overwrite_captured_profile` does.
-            crate::usage::expire_profile_ttl(&ProfileName::from(active));
             if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
                 app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
                 return;
             }
             app.refresh_tokens();
             // The live login replaced the stored credential, so the old
-            // credential's verdicts must not survive it — the shared clear,
-            // not a wait for the next OAuth fetch.
-            clear_profile_status_chrome(app, &ProfileName::from(active));
+            // credential's verdicts must not survive it — the drain forgets the
+            // halves whose identity changed, not a wait for the next OAuth fetch.
+            app.apply_forgets();
             // AUTH-1: the fresh login is the documented recovery for a revoked
             // chain, so a standing auth_broken quarantine is stale — same lift
             // every sibling fresh-login path runs.
@@ -20001,6 +20031,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
+                    app.apply_forgets();
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("captured '{name}'"));
@@ -20321,7 +20352,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            clear_profile_status_chrome(app, &ProfileName::from(session.name.clone()));
+            app.apply_forgets();
             app.last_reload_fp = reload_fingerprint();
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
@@ -20386,9 +20417,9 @@ fn apply_console_login(
             // `store_console_login` drops the cache the old one filled, so ask
             // for the figures the new one can actually read. The stale
             // `console login expired` verdict goes with the old session via
-            // the shared clear — it must not survive until the queued fetch.
+            // the drain — it must not survive until the queued fetch.
             app.refresh_tokens();
-            clear_profile_status_chrome(app, &name);
+            app.apply_forgets();
             app.manual_refresh_one(&name);
             // The window is the surprising part and the CLI's own summary leads
             // with it: the 48h runs from the aliyun browser sign-in, so a login
@@ -20406,6 +20437,10 @@ fn apply_console_login(
 
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
+    // Safety net: any change site that noted a forget without an immediate
+    // drain still forgets before the next frame reads the stores. The per-site
+    // drains keep this a no-op on the paths that drain synchronously.
+    app.apply_forgets();
 
     while let Ok(ev) = app.update_results.try_recv() {
         match ev {

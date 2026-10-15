@@ -53,6 +53,27 @@ fn ctx_with_live(
     ApiContext::for_tests(config, status_path, Some(live), panes::absent_probe())
 }
 
+/// A context over `config` that also holds `stores` as the daemon's memory
+/// stores, so a REST change path drains the forgets its change site noted.
+fn ctx_with_stores(
+    config: ConfigHandle,
+    stores: crate::usage::MemoryStores,
+) -> std::sync::Arc<ApiContext> {
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let status_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("status.json");
+    ApiContext::new(
+        config,
+        status_path,
+        None,
+        Some(stores),
+        panes::absent_probe(),
+        std::sync::Arc::new(|| None),
+        super::super::terminal::unspawnable_terminal(),
+    )
+}
+
 /// The id every templated session row is driven with: the transcript stem
 /// `tests/fixtures/sessions/history.jsonl` is stored under, which is also the
 /// `agent_session` id the `w1N:p19` fixture pane carries.
@@ -2771,6 +2792,84 @@ fn switch_relinks_and_reports_the_previous_account() {
             .as_deref(),
         Some("beta"),
         "the switch must land in state, not just in the response"
+    );
+}
+
+/// N2: the REST `POST /api/v1/switch` overwrite path applies the forget its
+/// change site noted, through a context that holds the daemon's memory stores.
+/// Removing the apply (the round-2 M4 mutant) ships green, so this pins it.
+#[test]
+fn switch_overwrite_applies_the_displaced_reading_forget() {
+    let _home = HomeSandbox::new();
+    let config = seeded_config();
+    // Overwrite default: the diverged live slot below takes the reconcile
+    // (overwrite) path, whose force-snapshot notes the outgoing forget.
+    {
+        let mut cfg = config.lock().expect("config");
+        cfg.state.default_divergence = Some(DivergenceChoice::Overwrite);
+        save_app_state(&cfg.state).expect("save state");
+    }
+    // A genuine unsaved re-login: a regular live file whose login differs from
+    // alpha's stored one, while alpha itself stores creds (so it is not a
+    // first-login adopt but a real divergence the overwrite resolves).
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir ~/.claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&crate::testutil::creds("at-live")).expect("serialize live"),
+    )
+    .expect("write the diverged live slot");
+
+    // Register so the change site's note lands, and give the stores a reading
+    // the switch's forget must clear.
+    crate::usage::register_memory_stores();
+    let stores = crate::usage::MemoryStores::empty_for_test();
+    stores.usage.lock().expect("usage").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            }),
+            ..Default::default()
+        },
+    );
+    stores
+        .usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+    // `MemoryStores` is not Clone: keep assertions on the same inner Arcs the
+    // context will drain.
+    let usage = std::sync::Arc::clone(&stores.usage);
+    let usage_status = std::sync::Arc::clone(&stores.usage_status);
+
+    let ctx = ctx_with_stores(std::sync::Arc::clone(&config), stores);
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+    assert!(
+        !usage.lock().expect("usage").contains_key("alpha"),
+        "the displaced account's reading is forgotten through the REST switch"
+    );
+    assert!(
+        !usage_status
+            .lock()
+            .expect("usage_status")
+            .contains_key("alpha"),
+        "the displaced account's status is forgotten through the REST switch"
     );
 }
 

@@ -464,6 +464,134 @@ fn drain_pending_switch_executes_when_idle_and_clean() {
     );
 }
 
+/// R2 daemon leg: a change site the daemon tick runs — the adopt of a first
+/// login during a switch — forgets the displaced OAuth reading right after the
+/// switch's locks drop, the same call the TUI makes.
+#[test]
+fn a_daemon_switch_adopt_forgets_the_displaced_reading() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            blank_profile(&crate::profile::ProfileName::from("alpha")),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    // The live slot holds a login the credential-less alpha never stored: a
+    // first login the switch adopts (and forgets the old reading for).
+    diverge_active("at-live");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            }),
+            ..Default::default()
+        },
+    );
+    daemon
+        .usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "the switch executed"
+    );
+    assert!(
+        !daemon
+            .usage_store
+            .lock()
+            .expect("usage_store")
+            .contains_key("alpha"),
+        "the adopted account's reading is forgotten in the daemon"
+    );
+    assert!(
+        !daemon
+            .usage_status
+            .lock()
+            .expect("usage_status")
+            .contains_key("alpha"),
+        "the adopted account's status is forgotten in the daemon"
+    );
+}
+
+/// N1: a daemon switch whose install fails AFTER the adopt captured the live
+/// login still forgets the adopted reading — the Err arm applies what the
+/// change site noted before it failed.
+#[test]
+fn a_failed_daemon_switch_still_forgets_the_adopted_reading() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            blank_profile(&crate::profile::ProfileName::from("alpha")),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    diverge_active("at-live");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            }),
+            ..Default::default()
+        },
+    );
+    daemon
+        .usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+
+    // Fail the switch's finish half after the adopt captured the live login: a
+    // directory at ~/.claude/settings.json refuses the merge-read inside
+    // `apply_profile_to_claude_settings`, deterministic and root-safe.
+    let settings = claude_dir().expect("claude dir").join("settings.json");
+    std::fs::create_dir_all(&settings).expect("settings.json as dir");
+
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "the switch failed whole, the active marker is unmoved"
+    );
+    assert!(
+        !daemon
+            .usage_store
+            .lock()
+            .expect("usage_store")
+            .contains_key("alpha"),
+        "the adopted account's reading is forgotten even though the switch failed"
+    );
+    assert!(
+        !daemon
+            .usage_status
+            .lock()
+            .expect("usage_status")
+            .contains_key("alpha"),
+        "the adopted account's status is forgotten even though the switch failed"
+    );
+}
+
 /// A re-login landing while the drain's gate refreshes the target, into a
 /// login that is itself expiring: the switch defers for a retry, and the log
 /// line carries the login-change sentence, never "refresh failed".

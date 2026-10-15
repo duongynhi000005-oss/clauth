@@ -8935,6 +8935,7 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         Arc::clone(&kick_blocks),
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(vec![])),
@@ -9481,6 +9482,7 @@ fn spawn_refresher_prunes_stale_history_before_returning() {
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         crate::usage::new_auto_start_queue_state(),
+        Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -15023,4 +15025,344 @@ fn the_catch_up_waits_on_the_flock_without_holding_the_config_lock() {
         "the config lock stayed held across the catch-up's flock wait"
     );
     assert_eq!(chain_store_refresh(name).as_deref(), Some("rt-mid"));
+}
+
+/// A19: a startup seed racing a change — the epoch moved between its disk read
+/// and its store write — writes nothing, so a forget cannot be undone by a
+/// stale seed the change's own re-seed raced.
+#[test]
+fn a_startup_seed_racing_a_change_writes_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = crate::profile::Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "access-A".to_string(),
+            refresh_token: Some("refresh-A".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, crate::profile_cache::USAGE_CACHE_FILE, &info);
+
+    let store: crate::usage::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: crate::usage::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: crate::usage::LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // Pose a change landing between the seed's disk read and its store write.
+    super::set_oauth_seed_pre_write_hook(|n| {
+        crate::usage::bump_epoch_for_test(n, crate::usage::Half::OAuth);
+    });
+
+    crate::usage::bootstrap_fetch(
+        &store,
+        &status,
+        &last_fetched,
+        &["acct".to_string()],
+        REFRESH_INTERVAL_MS,
+    );
+
+    assert!(
+        !store.lock().unwrap().contains_key("acct"),
+        "the seed writes no reading once the epoch moved"
+    );
+    assert!(
+        !status.lock().unwrap().contains_key("acct"),
+        "the seed writes no status once the epoch moved"
+    );
+    assert!(
+        !last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&FetchLeg::OAuth.key(name.clone())),
+        "the seed writes no cadence stamp once the epoch moved"
+    );
+}
+
+/// A seed holds the epoch guard from its compare through its store, status and
+/// cadence writes, so a forget cannot bump the epoch between the check and the
+/// write.
+#[test]
+fn a_seed_holds_the_epoch_guard_through_its_writes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = crate::profile::Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "access-A".to_string(),
+            refresh_token: Some("refresh-A".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, crate::profile_cache::USAGE_CACHE_FILE, &info);
+
+    let store: crate::usage::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: crate::usage::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: crate::usage::LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    super::set_oauth_seed_post_compare_hook(move |_| {
+        reached_tx.send(()).expect("signal the park");
+        release_rx.recv().expect("release the seed");
+    });
+
+    let store2 = Arc::clone(&store);
+    let status2 = Arc::clone(&status);
+    let lf2 = Arc::clone(&last_fetched);
+    let name2 = name.clone();
+    let seed = std::thread::spawn(move || {
+        super::try_seed_cache(
+            &store2,
+            &status2,
+            &lf2,
+            &name2,
+            crate::usage::now_ms(),
+            REFRESH_INTERVAL_MS,
+        )
+    });
+
+    reached_rx.recv().expect("the seed reaches its compare");
+    struct ReleaseOnDrop(std::sync::mpsc::Sender<()>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    {
+        // Panic-safe release: if the assertion fails, the seed still unparks.
+        let _release = ReleaseOnDrop(release_tx);
+        assert!(
+            crate::usage::try_lock_epoch_for_test().is_none(),
+            "the seed holds the epoch guard across its store write"
+        );
+    }
+    let seeded = seed.join().expect("the seed finishes");
+    assert!(seeded, "the seed wrote the reading");
+    assert!(
+        store.lock().unwrap().contains_key("acct"),
+        "the reading landed under the held guard"
+    );
+}
+
+/// A19 provider half: the third-party startup seed writes nothing once its
+/// epoch moved between the disk read and the store write.
+#[test]
+fn a_third_party_startup_seed_racing_a_change_writes_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("tp");
+    let profile = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("key".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["tp"]);
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+
+    let store: crate::usage::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: crate::usage::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: crate::usage::LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    super::set_third_party_seed_pre_write_hook(|n| {
+        crate::usage::bump_epoch_for_test(n, crate::usage::Half::ThirdParty);
+    });
+    let work = crate::usage::collect_third_party_entries(&[profile]);
+
+    crate::usage::bootstrap_third_party(
+        &store,
+        &status,
+        &last_fetched,
+        &["tp".to_string()],
+        &work,
+        REFRESH_INTERVAL_MS,
+    );
+
+    assert!(
+        !store.lock().unwrap().contains_key("tp"),
+        "the third-party seed writes no reading once the epoch moved"
+    );
+    assert!(
+        !status.lock().unwrap().contains_key("tp"),
+        "the third-party seed writes no status once the epoch moved"
+    );
+    assert!(
+        !last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&FetchLeg::ThirdParty.key(name.clone())),
+        "the third-party seed writes no cadence stamp once the epoch moved"
+    );
+}
+
+/// A third-party seed holds the epoch guard from its compare through its store,
+/// status and cadence writes — the provider-half twin of the OAuth hold test.
+#[test]
+fn a_third_party_seed_holds_the_epoch_guard_through_its_writes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("tp");
+    let profile = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("key".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["tp"]);
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+
+    let store: crate::usage::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: crate::usage::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: crate::usage::LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    super::set_third_party_seed_post_compare_hook(move |_| {
+        reached_tx.send(()).expect("signal the park");
+        release_rx.recv().expect("release the seed");
+    });
+
+    let store2 = Arc::clone(&store);
+    let status2 = Arc::clone(&status);
+    let lf2 = Arc::clone(&last_fetched);
+    let name2 = name.clone();
+    let seed = std::thread::spawn(move || {
+        super::seed_third_party_name(
+            &store2,
+            &status2,
+            &lf2,
+            &name2,
+            true,
+            crate::usage::now_ms(),
+            REFRESH_INTERVAL_MS,
+        );
+    });
+
+    reached_rx.recv().expect("the seed reaches its compare");
+    struct ReleaseOnDrop(std::sync::mpsc::Sender<()>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    {
+        let _release = ReleaseOnDrop(release_tx);
+        assert!(
+            crate::usage::try_lock_epoch_for_test().is_none(),
+            "the third-party seed holds the epoch guard across its store write"
+        );
+    }
+    seed.join().expect("the seed finishes");
+    assert!(
+        store.lock().unwrap().contains_key("tp"),
+        "the reading landed under the held guard"
+    );
+    assert!(
+        status.lock().unwrap().contains_key("tp"),
+        "the status landed under the held guard"
+    );
+}
+
+/// A codex seed holds the epoch guard from its compare through its store and
+/// status writes — the codex-half twin of the OAuth hold test.
+#[test]
+fn a_codex_seed_holds_the_epoch_guard_through_its_writes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("cx");
+    crate::testutil::write_codex_roster(&["cx"]);
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, crate::profile_cache::USAGE_CACHE_FILE, &info);
+
+    let store: crate::usage::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: crate::usage::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    super::set_codex_seed_post_compare_hook(move |_| {
+        reached_tx.send(()).expect("signal the park");
+        release_rx.recv().expect("release the seed");
+    });
+
+    let store2 = Arc::clone(&store);
+    let status2 = Arc::clone(&status);
+    let name2 = name.clone();
+    let seed = std::thread::spawn(move || {
+        super::seed_codex_name(
+            &store2,
+            &status2,
+            &name2,
+            crate::usage::now_ms(),
+            REFRESH_INTERVAL_MS,
+        );
+    });
+
+    reached_rx.recv().expect("the seed reaches its compare");
+    struct ReleaseOnDrop(std::sync::mpsc::Sender<()>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    {
+        let _release = ReleaseOnDrop(release_tx);
+        assert!(
+            crate::usage::try_lock_epoch_for_test().is_none(),
+            "the codex seed holds the epoch guard across its store write"
+        );
+    }
+    seed.join().expect("the seed finishes");
+    assert!(
+        store.lock().unwrap().contains_key("cx"),
+        "the reading landed under the held guard"
+    );
+    assert!(
+        status.lock().unwrap().contains_key("cx"),
+        "the status landed under the held guard"
+    );
 }

@@ -117,6 +117,12 @@ impl Drop for HomeSandbox {
         // joinable handle at all (e.g. `tokio::task::spawn_blocking`).
         crate::tui::join_test_workers();
         join_background_tasks();
+        // Clear the process-global forget queue, its registered-stores flag and
+        // the seed hooks: a change site that noted a forget under THIS sandbox
+        // must not leak it into the next test's drain (the suite is one
+        // process), and a failing assertion must not leave a seed hook armed.
+        crate::usage::reset_pending_forgets_for_test();
+        crate::usage::clear_seed_hooks_for_test();
         crate::profile::clear_home_override();
         // Restore the user's own value, after the joins above for the same
         // reason the home override is cleared there: a still-running worker that

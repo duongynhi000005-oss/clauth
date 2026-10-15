@@ -1131,11 +1131,11 @@ pub(crate) fn expire_profile_ttl(name: &ProfileName) {
     remove_profile_cache(name, PROFILE_FETCHED_CACHE_FILE);
 }
 
-/// Drop `name`'s in-memory memo while leaving the durable stamp in place — what
-/// a process restart looks like to [`take_profile_fetch`], which is the whole
-/// point of the durable half and can't otherwise be exercised in one process.
-#[cfg(test)]
-fn forget_profile_memo(name: &ProfileName) {
+/// Drop `name`'s in-memory memo while leaving the durable stamp in place —
+/// `forget_memory`'s memory-only arm. The durable stamp is `forget_disk(OAuth)`'s
+/// to remove; clearing it here would delete a stamp a refresher just wrote for
+/// the new login.
+pub(crate) fn forget_profile_memo(name: &ProfileName) {
     if let Ok(mut m) = PROFILE_FETCHED.lock() {
         m.remove(name.as_str());
     }

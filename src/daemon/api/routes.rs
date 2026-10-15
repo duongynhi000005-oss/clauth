@@ -325,6 +325,10 @@ pub(crate) struct ApiContext {
     /// where there is no scheduler to ask — the tests that exercise a route
     /// without a daemon behind it.
     pub(crate) live: Option<crate::daemon::LiveStores>,
+    /// The reading stores, when a daemon built this context: the REST switch
+    /// drains the forgets its change site noted right after the locks drop.
+    /// `None` in tests that exercise a route without a daemon behind it.
+    pub(crate) memory_stores: Option<crate::usage::MemoryStores>,
     /// The seam every bounded herdr call goes through (the pane route, the
     /// terminal bridge's snapshot, the agent routes); see [`super::panes`].
     pub(crate) herdr_probe: PaneProbe,
@@ -345,6 +349,7 @@ impl ApiContext {
         config: ConfigHandle,
         status_path: PathBuf,
         live: Option<crate::daemon::LiveStores>,
+        memory_stores: Option<crate::usage::MemoryStores>,
         herdr_probe: PaneProbe,
         herdr: HerdrSeam,
         terminal_spawn: super::terminal::TerminalSpawn,
@@ -354,6 +359,7 @@ impl ApiContext {
             status_path,
             switch_gate: RankedMutex::new(()),
             live,
+            memory_stores,
             herdr_probe,
             herdr,
             terminal_spawn,
@@ -374,6 +380,7 @@ impl ApiContext {
             config,
             status_path,
             live,
+            None,
             herdr_probe,
             Arc::new(|| None),
             super::terminal::unspawnable_terminal(),
@@ -847,6 +854,12 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
                 "clauth api: device '{}' switched to '{active}'",
                 caller.device_for_log()
             );
+            // The reconcile's adopt noted the displaced account's forgets;
+            // apply them now that the switch's state flock and config guard
+            // dropped, before the republish so the feed reflects the forget.
+            if let Some(stores) = &ctx.memory_stores {
+                crate::usage::apply_pending_forgets(stores);
+            }
             republish(ctx);
             Response::serialize(
                 200,
@@ -858,6 +871,12 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
             )
         }
         Err(e) => {
+            // The reconcile's snapshot may have noted a forget before the
+            // failure; apply it so a half-switched capture does not leave the
+            // old reading in the daemon's stores.
+            if let Some(stores) = &ctx.memory_stores {
+                crate::usage::apply_pending_forgets(stores);
+            }
             // The chain (`{:#}`, every context anyhow carries) goes to
             // daemon.log, the surface the operator owns — bounded like every
             // logline is; the body keeps only what the closed set reflects. A

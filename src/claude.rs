@@ -11,6 +11,10 @@ use crate::profile::{
     AppConfig, ClaudeCredentials, Profile, ProfileName, atomic_write, atomic_write_600, claude_dir,
     profile_dir, read_json_file, save_profile,
 };
+use crate::usage::{
+    ForgetPlan, OAuthIdentity, forget_disk_plan, note_forget_plan, oauth_changed,
+    read_before_identities, throughput_identity,
+};
 
 pub(crate) fn claude_credentials_path() -> Result<PathBuf> {
     Ok(claude_dir()?.join(".credentials.json"))
@@ -3325,7 +3329,7 @@ fn snapshot_active_credentials_unchecked(
     active: &ProfileName,
     held: &StateLockHeld,
     remove_anchor: bool,
-) -> Result<()> {
+) -> Result<bool> {
     // CLA-SPLIT: a profile whose live slot holds its static session token carries
     // nothing to snapshot, and capturing the live file into `profile.credentials`
     // would clobber the clauth-private usage OAuth pair. The guard lives at this
@@ -3342,7 +3346,7 @@ fn snapshot_active_credentials_unchecked(
     // live login IS the sidecar's ([`sync_live_extra_into`]).
     if has_session_token(active) {
         sync_live_extra_into_install_source(active);
-        return Ok(());
+        return Ok(false);
     }
     // Fresh, not just the in-memory active marker: the active profile may have
     // been deleted or renamed out-of-process since this caller's config was
@@ -3351,7 +3355,7 @@ fn snapshot_active_credentials_unchecked(
     // on-disk list before writing. Callers run this under the state flock, so
     // the read is stable.
     if !crate::profile::is_configured(active)? {
-        return Ok(());
+        return Ok(false);
     }
     let credentials = read_claude_credentials()?;
     // Only a real live login is captured. A logged-out shell (blank tokens) OR an
@@ -3362,35 +3366,62 @@ fn snapshot_active_credentials_unchecked(
     // switch, reconcile_startup's default_divergence, adopt), so the invariant
     // belongs here, not in each caller.
     let Some(credentials) = credentials else {
-        return Ok(());
+        return Ok(false);
     };
     if live_login_is_empty(&credentials) {
-        return Ok(());
+        return Ok(false);
     }
     let Some(profile) = config.find_mut(active) else {
-        return Ok(());
+        return Ok(false);
     };
-    if remove_anchor {
-        // An install that reads the login off disk proves no uuid: remove the old
-        // anchor BEFORE the store write, so a later failure in this hold (the
-        // relink, the settings write) never leaves the old account's identity
-        // vouching for the freshly captured login. The non-force LinkedTo
-        // snapshot passes `false` — its bytes are the store's own, so the anchor
-        // stays.
+    // An install that reads the login off disk proves no uuid, so its anchor is
+    // removed: the OAuth identity moves to an unanchored new token — a change
+    // (a same-account Unproven re-login forgets once). The non-force LinkedTo
+    // snapshot passes `false`: its bytes are the store's own, so nothing is
+    // forgotten.
+    let plan = if remove_anchor {
+        let before = read_before_identities(active);
+        let after_oauth = OAuthIdentity::for_values(None, credentials.access_token());
+        // A hybrid's delegates still run on the key, so its throughput record
+        // survives; a pure OAuth spawn's record follows the login's identity.
+        let after_throughput = throughput_identity(
+            &after_oauth,
+            before.base_url.as_deref(),
+            before.api_key.as_deref(),
+            before.env_token.as_deref(),
+        );
+        let plan = ForgetPlan {
+            oauth: oauth_changed(&before.oauth, &after_oauth),
+            throughput: before.throughput != after_throughput,
+            ..ForgetPlan::default()
+        };
+        // forget_disk FIRST, before the identity writes (the anchor removal and
+        // the store write).
+        forget_disk_plan(active, plan);
         crate::profile_cache::remove_profile_cache(
             active,
             crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         );
         crate::oauth::retire_unreadable_spent_record(active);
-    }
+        Some(plan)
+    } else {
+        None
+    };
     profile.set_credentials(Some(credentials), held);
     save_profile(profile)?;
+    let oauth_changed = match plan {
+        Some(plan) => {
+            note_forget_plan(active, plan);
+            plan.oauth
+        }
+        None => false,
+    };
     // The capture above models the login alone, so a key only the live
     // file holds (a `/design-login`) would be dropped here and gone with
     // the relink that follows: sync it into the store the login was just
     // captured into.
     sync_live_extra_into_install_source(active);
-    Ok(())
+    Ok(oauth_changed)
 }
 
 /// With `preserve_non_login_keys` on, sync the live file's non-login keys into
@@ -3413,10 +3444,12 @@ pub(crate) fn sync_live_extra_into_install_source(name: &ProfileName) {
 }
 
 /// Snapshot the live `.credentials.json` into the active profile unconditionally.
-pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
+/// Returns whether the OAuth half's stored identity changed, so a caller can
+/// expire the `/profile` clock only when it did.
+pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Result<bool> {
     with_state_lock(|held| {
         let Some(active) = config.state.active_profile.as_ref().cloned() else {
-            return Ok(());
+            return Ok(false);
         };
         // The snapshot reads the live login off disk, so its uuid is unproven:
         // the shared sink removes the anchor before the store write.

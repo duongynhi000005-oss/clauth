@@ -584,6 +584,32 @@ pub(crate) fn queue_failures(
         .unwrap_or(0)
 }
 
+/// Drop `name`'s elected-kick failure streak — `forget_memory`'s OAuth arm. A
+/// 429 streak under a re-logged credential must not follow the new account into
+/// the next election; the anchor ([`AutoStartQueue::last_open_at`]) is
+/// deliberately NOT touched, since it records the queue's most recent window
+/// open, never one member's health.
+pub(crate) fn forget_election_failures(state: &AutoStartQueueState, name: &ProfileName) {
+    if let Ok(mut queue) = state.lock() {
+        queue.failures.remove(name);
+    }
+}
+
+/// Move `old`'s elected-kick failure streak to `new` — `forget_memory_rename`'s
+/// arm. The streak is the old credential's 429 history and travels with the
+/// name, the anchor stays untouched for the same reason as above.
+pub(crate) fn move_election_failures(
+    state: &AutoStartQueueState,
+    old: &ProfileName,
+    new: &ProfileName,
+) {
+    if let Ok(mut queue) = state.lock()
+        && let Some(failures) = queue.failures.remove(old)
+    {
+        queue.failures.insert(new.clone(), failures);
+    }
+}
+
 /// Best-effort earliest moment the queue may open its next window: `anchor`
 /// plus the gap for a queue of `n`. `None` without an anchor, which reads as
 /// "due now".

@@ -3255,7 +3255,7 @@ fn console_config(cred: Option<&ConsoleCredential>) -> ConsoleConfig {
 /// [`stored_usage_cache_is_third_party`], [`stored_provider`] and
 /// [`stored_endpoint`]'s managed half, which answer the same question without
 /// the side effects.
-fn effective_base_url(
+pub(crate) fn effective_base_url(
     configured: Option<String>,
     has_credentials: bool,
     api_key: Option<&str>,
@@ -3277,9 +3277,20 @@ fn effective_base_url(
 /// two load-side predicates that count it ([`effective_base_url`] and
 /// [`usage_cache_is_third_party`]).
 fn env_has_inference_token(env: &BTreeMap<String, String>) -> bool {
+    inference_env_token(env).is_some()
+}
+
+/// The inference auth token an account's `[env]` map carries, read the same way
+/// [`env_has_inference_token`] reads it: the first of
+/// `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` that is non-empty once trimmed.
+/// One value-shaped spelling beside the bool so the throughput identity (which
+/// digests the token) and the boolean predicate cannot drift apart on which
+/// keys count.
+pub(crate) fn inference_env_token(env: &BTreeMap<String, String>) -> Option<String> {
     ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
         .iter()
-        .any(|k| env.get(*k).map(|v| v.trim()).is_some_and(|v| !v.is_empty()))
+        .find_map(|k| env.get(*k).map(|v| v.trim()).filter(|v| !v.is_empty()))
+        .map(str::to_string)
 }
 
 /// Whether an account's usage figures live in `third_party_cache.json` rather
@@ -3488,6 +3499,49 @@ pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
         Some(url) => StoredEndpoint::Custom(url),
         None => StoredEndpoint::Anthropic,
     }
+}
+
+/// The identity-relevant endpoint fields of `name`'s stored `config.toml`, read
+/// lock-free (deliberately not through [`load_profile`], which recovers a staged
+/// rotation and takes the state flock): the effective managed base_url, the api
+/// key, the normalized console credential, and the raw env map (the throughput
+/// identity reads the inference env token). `None` when the config cannot be
+/// read or parsed — an unreadable config proves no identity, and the reader
+/// falls back to the shape every lock-free reader already takes.
+pub(crate) struct StoredEndpointIdentity {
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) console: Option<ConsoleCredential>,
+    pub(crate) env: BTreeMap<String, String>,
+}
+
+/// Whether `name`'s `credentials.json` exists — the credential-presence bit the
+/// throughput identity's effective-base_url guard reads. Exposed so the change
+/// sites' AFTER computation reads the same stored fact the BEFORE read did,
+/// never an in-memory `Profile` a caller may hold stale.
+pub(crate) fn stored_credentials_file_exists(name: &ProfileName) -> bool {
+    profile_credentials_path(name).is_ok_and(|p| p.exists())
+}
+
+/// [`StoredEndpointIdentity`] for `name`, off ONE read of its `config.toml`,
+/// the same lock-free shape [`stored_endpoint`] / [`stored_provider`] use.
+pub(crate) fn stored_endpoint_identity(name: &ProfileName) -> Option<StoredEndpointIdentity> {
+    let config_path = profile_config_path(name).ok()?;
+    let raw = std::fs::read_to_string(&config_path).ok()?;
+    let config = toml::from_str::<ProfileConfig>(&raw).ok()?;
+    let has_credentials = stored_credentials_file_exists(name);
+    let base_url = effective_base_url(
+        config.base_url,
+        has_credentials,
+        config.api_key.as_deref(),
+        &config.env,
+    );
+    Some(StoredEndpointIdentity {
+        base_url,
+        api_key: config.api_key,
+        console: console_credential(&config.console),
+        env: config.env,
+    })
 }
 
 pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {

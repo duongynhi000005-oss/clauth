@@ -3042,8 +3042,8 @@ fn commit_endpoint_clears_the_edited_profiles_stale_status_chrome() {
     {
         let m = app.usage_status.lock().unwrap();
         assert!(
-            !m.contains_key("zai"),
-            "the OAuth-side status goes with the repaired credential"
+            m.contains_key("zai"),
+            "the OAuth-side status stays: a key edit forgets only the provider half (A2)"
         );
     }
     {
@@ -3204,8 +3204,10 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
         super::ConfirmAction::CaptureOverwrite(
             Box::new(crate::actions::CaptureSnapshot {
                 credentials: None,
-                base_url: None,
-                api_key: None,
+                // A real overwrite carries the freshly captured endpoint: the
+                // key changes, so the provider half forgets.
+                base_url: Some("https://api.z.ai/api/anthropic".to_string()),
+                api_key: Some("new-key".to_string()),
                 anchor: crate::actions::AnchorAction::Unproven,
             }),
             "zai".to_string(),
@@ -3230,8 +3232,8 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
     {
         let m = app.usage_status.lock().unwrap();
         assert!(
-            !m.contains_key("zai"),
-            "the OAuth-side status goes with the overwritten credential"
+            m.contains_key("zai"),
+            "the OAuth-side status stays: the overwrite forgot only the provider half (A2)"
         );
     }
     app.apply_usage();
@@ -3240,6 +3242,73 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
         None,
         "the next frame shows no stale chrome after an overwrite"
     );
+}
+
+/// R13: an overwrite on the preserve path (credentials, base_url and api_key
+/// all omitted, so the stored endpoint and key are kept) keeps the provider
+/// verdict, status and streak — the identity did not change, so nothing
+/// forgets.
+#[test]
+fn a_preserve_path_overwrite_keeps_the_provider_verdict() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::AuthExpired);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), 9);
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            Box::new(crate::actions::CaptureSnapshot {
+                credentials: None,
+                base_url: None,
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+            }),
+            "zai".to_string(),
+            false,
+        ),
+    );
+
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert_eq!(
+            m.get("zai"),
+            Some(&FetchStatus::AuthExpired),
+            "the provider verdict survives a preserve-path overwrite"
+        );
+    }
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert_eq!(
+            m.get("zai"),
+            Some(&9),
+            "the provider streak survives a preserve-path overwrite"
+        );
+    }
 }
 
 /// R3-F1: the sync's insert branch runs the seed's own shape gate. A
@@ -3416,8 +3485,8 @@ fn a_blanked_key_clears_the_stale_status_chrome() {
     {
         let m = app.usage_status.lock().unwrap();
         assert!(
-            !m.contains_key("zai"),
-            "the OAuth-side status goes with the blanked credential"
+            m.contains_key("zai"),
+            "the OAuth-side status stays: a blanked key forgets only the provider half (A2)"
         );
     }
     app.apply_usage();
@@ -3563,8 +3632,8 @@ fn a_poisoned_status_clear_still_retires_the_frames_verdict() {
     {
         let m = app.usage_status.lock().unwrap();
         assert!(
-            !m.contains_key("api"),
-            "the OAuth-side status entry goes with the re-key"
+            m.contains_key("api"),
+            "the OAuth-side status entry stays: a re-key forgets only the provider half (A2)"
         );
     }
     {
@@ -29410,8 +29479,8 @@ fn a_token_add_mints_and_points_the_profile_and_leaks_the_token_nowhere() {
         "the dead-key status goes with the repointed credential"
     );
     assert!(
-        !app.usage_status.lock().unwrap().contains_key("alice"),
-        "the OAuth-side status goes with the repointed credential"
+        app.usage_status.lock().unwrap().contains_key("alice"),
+        "the OAuth-side status stays: the repoint forgot only the provider half (A2)"
     );
     assert!(
         !app.third_party_streaks

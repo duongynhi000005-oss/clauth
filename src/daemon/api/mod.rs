@@ -229,6 +229,7 @@ pub(crate) fn serve_prepared(
     config: ConfigHandle,
     status_path: PathBuf,
     live: super::LiveStores,
+    memory_stores: crate::usage::MemoryStores,
 ) -> Result<()> {
     let Prepared { listen, tls_config } = prepared;
     let listener = TcpListener::bind(listen)
@@ -239,6 +240,7 @@ pub(crate) fn serve_prepared(
         config,
         status_path,
         Some(live),
+        Some(memory_stores),
         panes::real_probe(),
         events::production_herdr_resolver(),
         terminal::real_terminal_spawn(),

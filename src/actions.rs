@@ -27,6 +27,11 @@ use crate::profile::{
 use crate::providers::Provider;
 use crate::runtime::RotationGuard;
 use crate::spinner::Spinner;
+use crate::usage::{
+    ForgetPlan, Half, OAuthIdentity, forget_disk, forget_disk_plan, note_forget, note_forget_plan,
+    note_rename, oauth_changed, read_before_identities, read_codex_identity, third_party_identity,
+    throughput_for_endpoint, throughput_identity,
+};
 
 /// ASCII alphanumeric + `-_.@+`, not leading-dot, not empty. `@`/`+` let an
 /// account be named after its email; both are path-separator-free so the name
@@ -348,24 +353,25 @@ pub(crate) fn switch_profile_reconciled(config: &ConfigHandle, name: &ProfileNam
         reason = "config mutex poisoning is unrecoverable"
     )]
     let mut guard = config.lock().expect("config mutex poisoned");
-    let (changed, outgoing) = with_state_lock(|held| {
+    let (changed, outgoing, oauth_changed) = with_state_lock(|held| {
         let config = &mut *guard;
         ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
-            return Ok((false, None));
+            return Ok((false, None, false));
         }
         let outgoing = config.state.active_profile.as_ref().cloned();
-        force_snapshot_active_credentials(config)?;
+        let oauth_changed = force_snapshot_active_credentials(config)?;
         force_link_profile_credentials(name)?;
         finish_switch(config, name, held)?;
-        Ok((true, outgoing))
+        Ok((true, outgoing, oauth_changed))
     })?;
     drop(guard);
     if changed {
         // The reconcile captured a live login that may be a DIFFERENT account:
         // expire the outgoing profile's `/profile` clock (ranked below the flock,
-        // so after the hold), the way `overwrite_captured_profile` does.
-        if let Some(out) = outgoing {
+        // so after the hold) only when its OAuth identity moved — a snapshot of
+        // the outgoing's own bytes forgets nothing and must keep its stamp.
+        if oauth_changed && let Some(out) = outgoing {
             crate::usage::expire_profile_ttl(&out);
         }
         crate::daemon::publish_status(config);
@@ -741,24 +747,21 @@ pub(crate) fn edit_profile_endpoint(
     api_key: Option<String>,
 ) -> Result<()> {
     with_state_lock(|_held| {
+        let before = read_before_identities(name);
         let profile = config.find_mut(name).context("profile not found")?;
         // A failed save must leave the in-memory profile matching disk: the
         // next write would otherwise persist a change the error said did not
         // happen.
         let snapshot = profile.clone();
-        let old_api_key = profile.api_key.clone();
         profile.base_url = base_url;
         profile.api_key = api_key;
         // Re-derive the provider — the in-memory config is authoritative until
         // the next disk reload, so a stale value here would keep (or block)
-        // third-party fetches against the wrong endpoint. Also clear when only the
-        // api key changed for the same provider (rotated key — old stats are stale).
+        // third-party fetches against the wrong endpoint.
         let provider = profile
             .base_url
             .as_deref()
             .and_then(crate::providers::Provider::from_base_url);
-        let drop_cache =
-            provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key);
         // The console session is a FOURTH credential and it means nothing off
         // Alibaba: left behind, an endpoint move parks a live Model Studio
         // session on a profile that no longer talks to Model Studio, and every
@@ -770,25 +773,34 @@ pub(crate) fn edit_profile_endpoint(
             profile.console = None;
         }
         profile.provider = provider;
+        // The changed halves, from the values about to be written. The OAuth
+        // half is untouched; only the third-party and throughput identities can
+        // move. forget_disk runs BEFORE the identity write (the save) so a
+        // reloading process re-seeds nothing stale off the old cache.
+        let after_third_party = third_party_identity(
+            provider,
+            profile.api_key.as_deref(),
+            profile.console.as_ref(),
+            profile.base_url.as_deref(),
+        );
+        let after_throughput = throughput_for_endpoint(
+            &before.oauth,
+            profile.base_url.as_deref(),
+            before.has_credentials,
+            profile.api_key.as_deref(),
+            &profile.env,
+        );
+        let plan = ForgetPlan {
+            third_party: before.third_party != after_third_party,
+            throughput: before.throughput != after_throughput,
+            ..ForgetPlan::default()
+        };
+        forget_disk_plan(name, plan);
         if let Err(e) = save_profile_config(profile) {
             *profile = snapshot;
             return Err(e);
         }
-        if drop_cache {
-            // The disk cache holds the same stale figures, and
-            // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
-            // a daemon boot/standby promotion, or the stood-down TUI's
-            // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
-            // the reseed; a LIVE process's in-memory provider-store entry
-            // survives until the profile's next fetch (≤ one interval; until
-            // restart if the edit left it no fetch leg) — no cross-process
-            // clear exists. Only after the save lands: a failed save restores
-            // the in-memory profile, so it must leave the cache as it was too.
-            crate::profile_cache::remove_profile_cache(
-                name,
-                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-            );
-        }
+        note_forget_plan(name, plan);
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;
@@ -819,13 +831,24 @@ pub(crate) fn store_console_login(
     console: ConsoleCredential,
 ) -> Result<()> {
     with_state_lock(|_held| {
+        let before = read_before_identities(name);
         let profile = config.find_mut(name).context("profile not found")?;
         profile.console = Some(console);
-        save_profile_config(profile)?;
-        crate::profile_cache::remove_profile_cache(
-            name,
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        // The console session is Alibaba's usage credential alone; the key the
+        // delegates run on is untouched, so only the third-party half can move.
+        let after = third_party_identity(
+            profile.provider,
+            profile.api_key.as_deref(),
+            profile.console.as_ref(),
+            profile.base_url.as_deref(),
         );
+        let plan = ForgetPlan {
+            third_party: before.third_party != after,
+            ..ForgetPlan::default()
+        };
+        forget_disk_plan(name, plan);
+        save_profile_config(profile)?;
+        note_forget_plan(name, plan);
         Ok(())
     })
 }
@@ -905,6 +928,7 @@ pub(crate) fn edit_profile_preset(
     models: ModelSettings,
 ) -> Result<()> {
     with_state_lock(|_held| {
+        let before = read_before_identities(name);
         let profile = config.find_mut(name).context("profile not found")?;
         profile.base_url = base_url;
         profile.models = models;
@@ -916,22 +940,28 @@ pub(crate) fn edit_profile_preset(
             .base_url
             .as_deref()
             .and_then(Provider::from_base_url);
-        if provider != profile.provider {
-            // The disk cache holds the same stale figures, and
-            // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
-            // a daemon boot/standby promotion, or the stood-down TUI's
-            // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
-            // the reseed; a LIVE process's in-memory provider-store entry
-            // survives until the profile's next fetch (≤ one interval; until
-            // restart if the edit left it no fetch leg) — no cross-process
-            // clear exists.
-            crate::profile_cache::remove_profile_cache(
-                name,
-                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-            );
-        }
         profile.provider = provider;
+        let after_third_party = third_party_identity(
+            provider,
+            profile.api_key.as_deref(),
+            profile.console.as_ref(),
+            profile.base_url.as_deref(),
+        );
+        let after_throughput = throughput_for_endpoint(
+            &before.oauth,
+            profile.base_url.as_deref(),
+            before.has_credentials,
+            profile.api_key.as_deref(),
+            &profile.env,
+        );
+        let plan = ForgetPlan {
+            third_party: before.third_party != after_third_party,
+            throughput: before.throughput != after_throughput,
+            ..ForgetPlan::default()
+        };
+        forget_disk_plan(name, plan);
         save_profile_config(profile)?;
+        note_forget_plan(name, plan);
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;
@@ -1038,12 +1068,28 @@ pub(crate) fn edit_profile_env(
     env: BTreeMap<String, String>,
 ) -> Result<()> {
     with_state_lock(|_held| {
+        let before = read_before_identities(name);
         let profile = config.find_mut(name).context("profile not found")?;
         // Snapshot before overwrite — a removed key is only stripped from live
         // settings when it appears in `prev` but not in the new `profile.env`.
         let old_env_keys: Vec<String> = profile.env.keys().cloned().collect();
         profile.env = env;
+        // Only the throughput identity reads the env (its token is what a
+        // delegate spawn sends when no key is set); the usage halves never do.
+        let after_throughput = throughput_for_endpoint(
+            &before.oauth,
+            profile.base_url.as_deref(),
+            before.has_credentials,
+            profile.api_key.as_deref(),
+            &profile.env,
+        );
+        let plan = ForgetPlan {
+            throughput: before.throughput != after_throughput,
+            ..ForgetPlan::default()
+        };
+        forget_disk_plan(name, plan);
         save_profile_config(profile)?;
+        note_forget_plan(name, plan);
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;
@@ -1209,6 +1255,11 @@ pub(crate) fn rename_profile(
         config.rename_all_occurrences(old, new, held);
 
         save_app_state(&config.state)?;
+        // The dir move carried every disk cache to `new`; only the memory
+        // entries need moving (the TUI drains the note after its config guard
+        // drops). Noted after the record move lands so a failed rename notes
+        // nothing.
+        note_rename(old, new);
 
         if was_active {
             link_profile_credentials(new)?;
@@ -1289,6 +1340,17 @@ pub(crate) fn delete_profile(
         }
         config.remove(name, held);
         save_app_state(&config.state)?;
+        // Delete forgets BOTH halves: `remove_dir_all` swept every disk cache
+        // (throughput included), so only the memory entries need noting — the
+        // TUI drains them after its config guard drops.
+        note_forget_plan(
+            name,
+            ForgetPlan {
+                oauth: true,
+                third_party: true,
+                ..ForgetPlan::default()
+            },
+        );
         Ok(())
     })?;
     // `remove_dir_all` took the durable stamp with it; the memo would outlive the
@@ -1433,6 +1495,10 @@ pub(crate) fn delete_codex_profile(
             })?;
         }
         state.remove_profile(name);
+        // The dir removal swept the shared `usage_cache.json` and the auth
+        // store; note the codex half so the TUI drops the name's shared store
+        // entry and poll-cadence memo after its config guard drops.
+        note_forget(&owned, Half::Codex);
         Ok(detached)
     })
 }
@@ -1681,7 +1747,21 @@ fn write_codex_profile_store(
     name: &str,
     raw: &[u8],
 ) -> Result<std::path::PathBuf> {
-    let dir = profile_dir(&ProfileName::from(name))?;
+    let profile_name = ProfileName::from(name);
+    // The codex identity is the `auth.json` account id. A re-auth refuses a
+    // different account (`refuse_codex_account_swap`), so only a fresh capture
+    // moves it — and the forget is then a no-op over a store with no entry.
+    let before = read_codex_identity(&profile_name);
+    let after = crate::codex_auth::CodexAuth::parse(raw)
+        .ok()
+        .and_then(|a| a.account_id().map(str::to_string));
+    if before != after {
+        // forget_disk FIRST, before the identity write (the auth.json save), so
+        // a reloading process that re-seeds from disk after the write finds the
+        // old account's shared reading already gone.
+        forget_disk(&profile_name, Half::Codex);
+    }
+    let dir = profile_dir(&profile_name)?;
     crate::profile::mkdir_700(&dir)
         .with_context(|| format!("failed to create {}", dir.display()))?;
     let store = dir.join("auth.json");
@@ -1693,6 +1773,12 @@ fn write_codex_profile_store(
             .with_context(|| format!("failed to write {}", config_path.display()))?;
     }
     state.add_profile(name);
+    // The codex reading shares `usage_cache.json` with the OAuth half; the
+    // account change already dropped that cache above, so the re-seed this
+    // memory forget runs finds nothing to bring back.
+    if before != after {
+        note_forget(&profile_name, Half::Codex);
+    }
     // Seed the last-known-good belt from this fresh, well-formed chain and
     // retire any stale no-replay memo and quarantine verdict: a capture/login
     // is an out-of-band store write, and without this the belt could later
@@ -1956,7 +2042,9 @@ pub(crate) fn duplicate_profile(
     source: &ProfileName,
     name: String,
 ) -> Result<()> {
+    let new_name = ProfileName::from(name.clone());
     with_state_lock(|_held| {
+        let before = read_before_identities(&new_name);
         let src = config.find(source).context("profile not found")?;
         let mut profile = Profile::new(name, src.base_url.clone(), src.api_key.clone());
         profile.auto_start = src.auto_start;
@@ -1969,7 +2057,37 @@ pub(crate) fn duplicate_profile(
         profile.check_scoped = src.check_scoped;
         profile.bell_threshold = src.bell_threshold;
         profile.disabled = src.disabled;
+        // A fresh name holds no login: the duplicate's identity is its endpoint
+        // (and the env token the delegates run on). Every half whose identity
+        // moves forgets — a reused name (delete-then-recreate) drops its old
+        // reading instead of inheriting it.
+        let after_oauth = OAuthIdentity::for_values(None, None);
+        let provider = profile
+            .base_url
+            .as_deref()
+            .and_then(Provider::from_base_url);
+        let after_third_party = third_party_identity(
+            provider,
+            profile.api_key.as_deref(),
+            None,
+            profile.base_url.as_deref(),
+        );
+        let after_throughput = throughput_for_endpoint(
+            &after_oauth,
+            profile.base_url.as_deref(),
+            false,
+            profile.api_key.as_deref(),
+            &profile.env,
+        );
+        let plan = ForgetPlan {
+            oauth: oauth_changed(&before.oauth, &after_oauth),
+            third_party: before.third_party != after_third_party,
+            throughput: before.throughput != after_throughput,
+            ..ForgetPlan::default()
+        };
+        forget_disk_plan(&new_name, plan);
         save_profile(&profile)?;
+        note_forget_plan(&new_name, plan);
         config.add(profile);
         save_app_state(&config.state)
     })
@@ -2189,6 +2307,30 @@ pub(crate) fn capture_into_profile(
     let name = ProfileName::from(name);
     let seed_name = name.clone();
     with_state_lock(|held| {
+        let before = read_before_identities(&name);
+        // The changed halves, from the login + endpoint about to be written. The
+        // name may have held a stale anchor, cache or reading (a crash before
+        // the record landed, a delete-then-recreate): every half whose identity
+        // moves forgets, and forget_disk runs before the identity writes.
+        let after_anchor = match &anchor {
+            AnchorAction::Proven(uuid) => Some(uuid),
+            _ => None,
+        };
+        let after_token = credentials.as_ref().and_then(|c| c.access_token());
+        let after_oauth = OAuthIdentity::for_values(after_anchor, after_token);
+        let provider = base_url.as_deref().and_then(Provider::from_base_url);
+        let after_third_party =
+            third_party_identity(provider, api_key.as_deref(), None, base_url.as_deref());
+        let after_throughput =
+            throughput_identity(&after_oauth, base_url.as_deref(), api_key.as_deref(), None);
+        let plan = ForgetPlan {
+            oauth: oauth_changed(&before.oauth, &after_oauth),
+            third_party: before.third_party != after_third_party,
+            throughput: before.throughput != after_throughput,
+            ..ForgetPlan::default()
+        };
+        forget_disk_plan(&name, plan);
+
         let mut profile = Profile::new(name.to_string(), base_url, api_key);
         profile.models = trimmed_models(models);
         // A fresh profile can sit on an orphan dir holding a stale anchor (a
@@ -2201,6 +2343,7 @@ pub(crate) fn capture_into_profile(
         crate::oauth::retire_unreadable_spent_record(&name);
         profile.set_credentials(credentials, held);
         save_profile(&profile)?;
+        note_forget_plan(&name, plan);
         config.add(profile);
         // AUTH-1: a fresh login/capture clears any stale auth-broken quarantine
         // for this name (e.g. a delete-then-relogin of a revoked account).
@@ -2223,15 +2366,16 @@ pub(crate) fn capture_into_profile(
             let profile = config.find(&name).context("profile not found")?;
             apply_profile_to_claude_settings(profile, &stale_env_keys)?;
         }
-        save_app_state(&config.state)
+        let saved = save_app_state(&config.state);
+        // A proven install writes its anchor inside its hold, after the state
+        // write registered the profile (the anchor write requires it) and
+        // before the hold ends, so a same-account re-login in another process
+        // never reads anchored -> unanchored.
+        if let AnchorAction::Proven(uuid) = &anchor {
+            crate::usage::seed_login_anchor(&seed_name, Some(uuid));
+        }
+        saved
     })?;
-    // Only once the credentials are committed, and only here — no caller seeds
-    // its own anchor, so no caller can forget to. The old anchor (if any orphan
-    // dir held one) is already gone from the in-hold removal; a proven uuid
-    // re-anchors now.
-    if let AnchorAction::Proven(uuid) = &anchor {
-        crate::usage::seed_login_anchor(&seed_name, Some(uuid));
-    }
     Ok(())
 }
 
@@ -2250,6 +2394,17 @@ pub(crate) fn create_profile_from_login(
     let name = ProfileName::from(name);
     let seed_name = name.clone();
     with_state_lock(|held| {
+        let before = read_before_identities(&name);
+        let after_token = credentials.access_token();
+        let after_oauth = OAuthIdentity::for_values(account_uuid.as_ref(), after_token);
+        let plan = ForgetPlan {
+            oauth: oauth_changed(&before.oauth, &after_oauth),
+            third_party: before.third_party.is_some(),
+            throughput: before.throughput != throughput_identity(&after_oauth, None, None, None),
+            ..ForgetPlan::default()
+        };
+        forget_disk_plan(&name, plan);
+
         let mut profile = Profile::new(name.to_string(), None, None);
         profile.models = trimmed_models(models);
         // Same orphan-dir guard as `capture_into_profile`: remove any stale
@@ -2261,6 +2416,7 @@ pub(crate) fn create_profile_from_login(
         crate::oauth::retire_unreadable_spent_record(&name);
         profile.set_credentials(Some(credentials), held);
         save_profile(&profile)?;
+        note_forget_plan(&name, plan);
         config.add(profile);
 
         if config.state.active_profile.is_none() {
@@ -2278,11 +2434,14 @@ pub(crate) fn create_profile_from_login(
             let profile = config.find(&name).context("profile not found")?;
             apply_profile_to_claude_settings(profile, &stale_env_keys)?;
         }
-        save_app_state(&config.state)
+        let saved = save_app_state(&config.state);
+        // The draft parked the login's uuid until `create account` fixed the
+        // name; this is that name. A proven install writes its anchor inside
+        // its hold, after the state write registered the profile (the anchor
+        // write requires it).
+        crate::usage::seed_login_anchor(&seed_name, account_uuid.as_ref());
+        saved
     })?;
-    // The draft parked the login's uuid until `create account` fixed the name;
-    // this is that name, so the anchor lands here rather than at the call site.
-    crate::usage::seed_login_anchor(&seed_name, account_uuid.as_ref());
     Ok(())
 }
 
@@ -2341,20 +2500,16 @@ fn rollback_first_account_create(
 /// and `fallback_chain`, which both index by name already, so the target
 /// simply keeps its chain position, env, model settings, and `auto_start`.
 /// `usage_history.jsonl` is a persisted log, not a cache, and is left alone;
-/// the per-profile fetch caches (`usage_cache.json`, `third_party_cache.json`,
-/// `throughput_cache.json`) are dropped unconditionally, because a swapped
-/// credential set can be a different account entirely and stale numbers under
-/// it are the worse failure. On the preserve path (endpoint + key kept) the
-/// third-party half describes the CURRENT account and is dropped anyway: the
-/// provider bar refills on the next scheduler tick, while the throughput
-/// history only rebuilds from later delegate runs — a real cost, taken over a
-/// wrong-account read on the paths where the credential DID change. The
-/// `/profile` TTL clock describes the old account too and is expired for the
-/// same reason — otherwise the swapped-in account's tier stays unfetched (and,
-/// with `usage_cache.json` just dropped, unrendered) for up to an hour. A
-/// snapshot carrying a proven identity (an interactive login's probe) re-anchors
-/// the profile here, on the commit — the confirm-gated relogin parks the snapshot
-/// in a modal, so the anchor can only be seeded by whoever finally commits it.
+/// each half's fetch caches are dropped only when that half's stored identity
+/// actually changed (a proven same-account re-login forgets nothing), never
+/// unconditionally. The `/profile` TTL clock describes the old account too, so
+/// it is expired only when the OAuth half changed — a proven same-account
+/// re-login keeps the stamp and its memo — otherwise the swapped-in account's
+/// tier stays unfetched (and, with `usage_cache.json` just dropped, unrendered)
+/// for up to an hour. A snapshot carrying a proven identity (an interactive
+/// login's probe) re-anchors the profile here, on the commit — the confirm-gated
+/// relogin parks the snapshot in a modal, so the anchor can only be seeded by
+/// whoever finally commits it.
 pub(crate) fn overwrite_captured_profile(
     config: &mut AppConfig,
     name: &ProfileName,
@@ -2370,7 +2525,9 @@ pub(crate) fn overwrite_captured_profile(
     // login install: the anchor stays exactly as found. Every other overwrite
     // installs a login that may be a different account.
     let installs_login = !matches!(anchor, AnchorAction::Unchanged);
+    let mut oauth_moved = false;
     with_state_lock(|held| {
+        let before = read_before_identities(name);
         let was_active = config.is_active(name);
         let profile = config
             .find_mut(name)
@@ -2407,37 +2564,62 @@ pub(crate) fn overwrite_captured_profile(
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
         profile.base_url = base_url;
         profile.api_key = api_key;
-        if installs_login {
-            // Remove the old anchor BEFORE the store write, inside the same hold
-            // that commits the credentials: a later failure in this hold (the
-            // relink, the settings write) leaves the profile unanchored, never
-            // on the account the overwrite just displaced. A proven uuid
-            // re-anchors after the hold.
-            crate::profile_cache::remove_profile_cache(
-                name,
-                crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
-            );
-        }
-        profile.set_credentials(credentials, held);
         profile.provider = provider;
         // Same rule as `edit_profile_endpoint`: a reauth replaces the credential
         // set, and the console session is one of them.
         if provider != Some(Provider::Alibaba) {
             profile.console = None;
         }
+        // The changed halves, from the values about to be written. The OAuth
+        // identity follows the anchor action: a proven re-login re-anchors the
+        // SAME uuid (so a same-account re-login forgets nothing), an unproven
+        // install removes the anchor while a login stays, and an api re-key
+        // carries the anchor unchanged.
+        let after_anchor = match &anchor {
+            AnchorAction::Proven(uuid) => Some(uuid),
+            AnchorAction::Unproven => None,
+            AnchorAction::Unchanged => before.oauth.anchor.as_ref(),
+        };
+        let after_token = credentials.as_ref().and_then(|c| c.access_token());
+        let after_oauth = OAuthIdentity::for_values(after_anchor, after_token);
+        let after_third_party = third_party_identity(
+            provider,
+            profile.api_key.as_deref(),
+            profile.console.as_ref(),
+            profile.base_url.as_deref(),
+        );
+        let after_throughput = throughput_for_endpoint(
+            &after_oauth,
+            profile.base_url.as_deref(),
+            credentials.is_some(),
+            profile.api_key.as_deref(),
+            &profile.env,
+        );
+        let plan = ForgetPlan {
+            oauth: oauth_changed(&before.oauth, &after_oauth),
+            third_party: before.third_party != after_third_party,
+            throughput: before.throughput != after_throughput,
+            ..ForgetPlan::default()
+        };
+        oauth_moved = plan.oauth;
+        // forget_disk FIRST, before any identity write (the anchor removal and
+        // the store write), so a reloading process re-seeds nothing stale.
+        forget_disk_plan(name, plan);
+        if installs_login {
+            // Remove the old anchor BEFORE the store write, inside the same hold
+            // that commits the credentials: a later failure in this hold (the
+            // relink, the settings write) leaves the profile unanchored, never
+            // on the account the overwrite just displaced. A proven uuid
+            // re-anchors at the end of this same hold.
+            crate::profile_cache::remove_profile_cache(
+                name,
+                crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            );
+        }
+        profile.set_credentials(credentials, held);
         crate::oauth::retire_unreadable_spent_record(&profile.name);
         save_profile(profile)?;
-
-        for file in [
-            crate::profile_cache::USAGE_CACHE_FILE,
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-            // Inert once the credential changes, but this profile may now be a
-            // different account entirely — drop it with the rest.
-            crate::profile_cache::THIRD_PARTY_AUTH_FILE,
-            crate::throughput::THROUGHPUT_CACHE_FILE,
-        ] {
-            crate::profile_cache::remove_profile_cache(name, file);
-        }
+        note_forget_plan(name, plan);
 
         // A disabled profile's creds are still captured above (the operator
         // asked for that), but it must never become the active account this
@@ -2502,20 +2684,22 @@ pub(crate) fn overwrite_captured_profile(
         // the documented recovery for a revoked login — clear its quarantine.
         // Pinned by `reauth_overwrite_clears_broken_flag`.
         config.set_auth_broken(name, false);
-        save_app_state(&config.state)
+        let saved = save_app_state(&config.state);
+        // A proven install writes its anchor inside its hold, after the state
+        // write (and the store write above), so a same-account re-login in
+        // another process never reads anchored -> unanchored.
+        if let AnchorAction::Proven(uuid) = &anchor {
+            crate::usage::seed_login_anchor(name, Some(uuid));
+        }
+        saved
     })?;
     // Outside the closure — see `rename_profile` on the rank order. Skipped when
     // the swap fails, which is imprecise rather than atomic: a failure after
     // `save_profile` leaves the new credentials on disk under the old account's
-    // stamp. Bounded either way — an unexpired stamp lapses within the hour, and a
-    // tick racing the gap between the flock release and this expire spends the
-    // stale stamp once or loses a fresh one and re-pulls once.
-    crate::usage::expire_profile_ttl(name);
-    // The old anchor is already gone (removed before `save_profile` inside the
-    // hold). A proven uuid re-anchors now, after the commit; an unproven or
-    // unchanged one has nothing left to do.
-    if let AnchorAction::Proven(uuid) = &anchor {
-        crate::usage::seed_login_anchor(name, Some(uuid));
+    // stamp. Only when the OAuth half actually changed: a proven same-account
+    // re-login keeps the stamp and its memo.
+    if oauth_moved {
+        crate::usage::expire_profile_ttl(name);
     }
     Ok(())
 }
@@ -2527,28 +2711,35 @@ pub(crate) fn overwrite_captured_profile(
 /// profile can't be meaningfully active, and the honest state is "no active".
 pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
     with_state_lock(|held| {
+        let before = read_before_identities(name);
         let was_active = config.is_active(name);
         let profile = config
             .find_mut(name)
             .with_context(|| format!("profile '{name}' not found"))?;
+        // The OAuth half forgets; the provider half is this profile's own and
+        // stays (a hybrid's OAuth log out keeps the provider reading). The
+        // throughput record survives when the delegates still run on the key.
+        let after_oauth = OAuthIdentity::for_values(None, None);
+        let after_throughput = throughput_identity(
+            &after_oauth,
+            before.base_url.as_deref(),
+            before.api_key.as_deref(),
+            before.env_token.as_deref(),
+        );
+        let plan = ForgetPlan {
+            oauth: oauth_changed(&before.oauth, &after_oauth),
+            throughput: before.throughput != after_throughput,
+            ..ForgetPlan::default()
+        };
         profile.set_credentials(None, held);
         crate::oauth::retire_unreadable_spent_record(name);
+        forget_disk_plan(name, plan);
         save_profile(profile)?;
         // Drop any legacy `.pending` rotation sidecar too: with credentials.json gone,
         // `recover_pending_credentials` would treat the sidecar as a failed commit
         // and resurrect the just-deleted login on next load.
         crate::profile::clear_staged_credentials(name);
-
-        for file in [
-            crate::profile_cache::USAGE_CACHE_FILE,
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-            // Inert once the credential changes, but this profile may now be a
-            // different account entirely — drop it with the rest.
-            crate::profile_cache::THIRD_PARTY_AUTH_FILE,
-            crate::throughput::THROUGHPUT_CACHE_FILE,
-        ] {
-            crate::profile_cache::remove_profile_cache(name, file);
-        }
+        note_forget_plan(name, plan);
 
         if was_active {
             clear_claude_credentials()?;
@@ -2559,9 +2750,9 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
     })?;
     // The dropped login's TTL clock is the old account's; a re-login into this
     // shell must pull its own tier now, not an hour from now. Outside the closure
-    // — see `rename_profile` on the rank order. Skipped when the logout fails,
-    // which `clear_claude_credentials` makes imprecise rather than atomic: the
-    // stored credentials are already gone by then, with the stamp left to lapse.
+    // — see `rename_profile` on the rank order. The durable stamp is already
+    // gone (`forget_disk`), so this clears the memo the CLI (which never drains
+    // `forget_memory`) would otherwise leave behind.
     crate::usage::expire_profile_ttl(name);
     Ok(())
 }
@@ -2576,17 +2767,11 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
 pub(crate) fn clear_profile_api_key(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
         let base_url = config.find(name).and_then(|p| p.base_url.clone());
-        edit_profile_endpoint(config, name, base_url, None)?;
-        // The endpoint editor clears the in-memory stats; also drop the on-disk
-        // third-party cache so a stale copy can't resurface on reload (no key left
-        // to refresh it).
-        if let Some(path) = crate::profile_cache::profile_cache_path(
-            name,
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-        ) {
-            let _ = std::fs::remove_file(path);
-        }
-        Ok(())
+        // The endpoint editor drops the stale third-party cache (and the
+        // throughput record, whose identity the now-keyless endpoint changed)
+        // through `forget_disk` — the explicit file remove it used to carry is
+        // folded in there.
+        edit_profile_endpoint(config, name, base_url, None)
     })
 }
 

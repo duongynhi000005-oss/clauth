@@ -59,9 +59,9 @@ use crate::usage::{
     ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile,
     PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore,
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
-    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, bootstrap_fetch,
-    bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries, collect_tokens,
-    spawn_refresher,
+    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, WeeklyResetKicks,
+    bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries,
+    collect_tokens, spawn_refresher,
 };
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
@@ -473,6 +473,7 @@ pub(crate) fn serve(
             Arc::clone(&daemon.config),
             daemon.status_path.clone(),
             daemon.live_stores(),
+            daemon.memory_stores(),
         )?;
     }
 
@@ -1063,6 +1064,11 @@ struct Daemon {
     third_party_status: ThirdPartyStatusStore,
     third_party_streaks: ThirdPartyStreaks,
     third_party_broken: ThirdPartyBroken,
+    /// Scheduler-only stores held on `self` so `forget_memory` can reach the
+    /// whole process's name-keyed state from the main thread and the REST API
+    /// (the refresh thread shares the same `Arc`s), the way the TUI holds them.
+    weekly_reset_kicks: WeeklyResetKicks,
+    suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     /// Last-seen reload fingerprint (`profiles.toml` mtime + per-account
     /// config.toml count/newest-mtime) — drives external-change reload. Bumped to
@@ -1099,6 +1105,9 @@ struct Daemon {
 
 impl Daemon {
     fn new(config: AppConfig, status_path: PathBuf) -> Self {
+        // This process holds reading stores, so change sites record their
+        // forgets here and the tick + REST handlers drain them.
+        crate::usage::register_memory_stores();
         let usage_tokens: TokenList = Arc::new(RankedMutex::new(collect_tokens(&config)));
         let third_party_tokens: ThirdPartyList = Arc::new(RankedMutex::new(
             collect_third_party_entries(&config.profiles),
@@ -1124,6 +1133,8 @@ impl Daemon {
             third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+            weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+            suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
             // Never set by the daemon: process exit IS its shutdown (a
             // supervisor restarts crashes; the singleton flock releases on
             // exit). The flag exists for `spawn_refresher`'s contract — its
@@ -1202,10 +1213,10 @@ impl Daemon {
     }
 
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the
-    /// TUI's `start_scheduler` makes). The suppressed-auth-expired set is daemon-local.
+    /// TUI's `start_scheduler` makes). The two scheduler-only stores live on
+    /// `self` so `forget_memory` can reach them from the main thread and the
+    /// REST API; the refresh thread shares the same `Arc`s.
     fn spawn_scheduler(&self) {
-        let suppressed_auth_expired: SuppressedAuthExpiredStore =
-            Arc::new(RankedMutex::new(HashMap::new()));
         spawn_refresher(
             Arc::clone(&self.config),
             Arc::clone(&self.usage_tokens),
@@ -1218,6 +1229,7 @@ impl Daemon {
             Arc::clone(&self.poll_streaks),
             Arc::clone(&self.kick_blocks),
             Arc::clone(&self.auto_start_queue),
+            Arc::clone(&self.weekly_reset_kicks),
             Arc::clone(&self.pending_switch),
             Arc::clone(&self.pending_switch_off),
             Arc::clone(&self.refetch_queue),
@@ -1226,7 +1238,7 @@ impl Daemon {
             Arc::clone(&self.third_party_status),
             Arc::clone(&self.third_party_streaks),
             Arc::clone(&self.third_party_broken),
-            suppressed_auth_expired,
+            Arc::clone(&self.suppressed_auth_expired),
             Arc::clone(&self.shutting_down),
             // Single-fetcher lease (#27): the daemon competes for `usage-fetch.lock`
             // like any instance. It normally boots first (launchd) and wins the
@@ -1346,6 +1358,35 @@ impl Daemon {
             gateway: Arc::clone(&self.gateway),
             proxies: Arc::clone(&self.proxies),
         }
+    }
+
+    /// Bundle the reading stores `forget_memory` clears, cloning every `Arc` so
+    /// the main thread and the REST API reach the same maps the refresh thread
+    /// shares.
+    fn memory_stores(&self) -> crate::usage::MemoryStores {
+        crate::usage::MemoryStores {
+            usage: Arc::clone(&self.usage_store),
+            usage_status: Arc::clone(&self.usage_status),
+            last_fetched: Arc::clone(&self.last_fetched),
+            next_refresh: Arc::clone(&self.next_refresh_per_profile),
+            poll_streaks: Arc::clone(&self.poll_streaks),
+            kick_blocks: Arc::clone(&self.kick_blocks),
+            weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
+            auto_start_queue: Arc::clone(&self.auto_start_queue),
+            third_party_usage: Arc::clone(&self.third_party_usage_store),
+            third_party_status: Arc::clone(&self.third_party_status),
+            third_party_streaks: Arc::clone(&self.third_party_streaks),
+            third_party_broken: Arc::clone(&self.third_party_broken),
+            suppressed: Arc::clone(&self.suppressed_auth_expired),
+            interval_ms: Arc::clone(&self.refresh_interval),
+        }
+    }
+
+    /// Drain the forgets a change site noted and apply each to memory. Called
+    /// right after a change site's state-flock and config guard drop, the same
+    /// call the TUI makes.
+    fn apply_forgets(&self) {
+        crate::usage::apply_pending_forgets(&self.memory_stores());
     }
 
     /// Snapshot the live freshness/countdown stores — each snapshot's lock is
