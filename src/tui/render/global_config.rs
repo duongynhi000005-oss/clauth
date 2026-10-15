@@ -34,9 +34,10 @@ use super::super::app::{
     parse_weekly_pct,
 };
 use super::super::theme::{self, Tier};
+use super::format::truncate;
 use super::panes::{
-    cycle_row_lines, draw_scrolled_lines, head_cols, help_tooltip_lines, highlight_row,
-    invalid_tooltip_lines, key_cell, label_style, section_box, value_caret,
+    MIN_VALUE_W, cycle_row_lines, draw_scrolled_lines, head_cols, help_tooltip_lines,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, section_box, value_caret,
 };
 
 /// Width of the key column: the longest keys (`allow extra usage` /
@@ -154,10 +155,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Some(input) => {
                 // The native terminal cursor owns the caret; the row renders plain
                 // (no highlight) with the edit gutter + sunken field, like the chain
-                // threshold editor. x = "✎ " (2) + key block + pre-caret cols.
-                let cx = inner
-                    .x
-                    .saturating_add((2 + KEY_W + KEY_GUTTER + head_cols(input)) as u16);
+                // threshold editor. x = the row's gutter and key cell as rendered
+                // ([`edit_lead`] narrows the key on a narrow pane) + the caret's
+                // cell in the value window.
+                let lead: usize = row_lines
+                    .first()
+                    .map_or(0, |line| line.spans.iter().take(2).map(Span::width).sum());
+                let cx = inner.x.saturating_add((lead + head_cols(input)) as u16);
                 caret = Some((cx, lines.len()));
                 lines.extend(row_lines);
                 lines.extend(tip_lines);
@@ -450,15 +454,15 @@ fn detail_row(
             cycle_row(arrow, "home tab", &options, selected, width)
         }
         GlobalConfigRow::RefreshInterval => match editing {
-            Some(input) => vec![refresh_edit_line(arrow, input)],
+            Some(input) => vec![refresh_edit_line(arrow, input, width)],
             None => refresh_cycle_lines(arrow, refresh_interval_ms, selected, width),
         },
         GlobalConfigRow::ContextNudge => match editing {
-            Some(input) => vec![context_nudge_edit_line(arrow, input)],
+            Some(input) => vec![context_nudge_edit_line(arrow, input, width)],
             None => context_nudge_cycle_lines(arrow, context_nudge_tokens, selected, width),
         },
         GlobalConfigRow::WeeklyThreshold => match editing {
-            Some(input) => vec![weekly_edit_line(arrow, input)],
+            Some(input) => vec![weekly_edit_line(arrow, input, width)],
             None => weekly_cycle_lines(arrow, weekly_pct, selected, width),
         },
         GlobalConfigRow::DivergenceDefault => cycle_row(
@@ -638,13 +642,10 @@ fn refresh_cycle_lines(
 /// The `refresh` row mid-edit: edit gutter + `refresh` key block + the typed
 /// buffer (DANGER when out of range) + ` s` unit. The terminal cursor owns the
 /// caret, so the buffer renders with uniform styling — no simulated block cursor.
-fn refresh_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
+fn refresh_edit_line(arrow: Span<'static>, input: &InputState, width: usize) -> Line<'static> {
     let invalid = parse_refresh_secs(input.trimmed()).is_none();
-    let mut spans = vec![
-        arrow,
-        Span::styled(key_cell("refresh", KEY_W, KEY_GUTTER), label_style(true)),
-    ];
-    spans.extend(value_caret(input, invalid));
+    let (mut spans, room) = edit_lead(arrow, "refresh", width, " s");
+    spans.extend(value_caret(input, invalid, room));
     let unit_style = if invalid {
         theme::danger()
     } else {
@@ -717,16 +718,14 @@ fn context_nudge_cycle_lines(
 /// a trailing `k` lives inside the buffer — so no unit span rides the field.
 /// The terminal cursor owns the caret, so the buffer renders with uniform
 /// styling — no simulated block cursor.
-fn context_nudge_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
+fn context_nudge_edit_line(
+    arrow: Span<'static>,
+    input: &InputState,
+    width: usize,
+) -> Line<'static> {
     let invalid = parse_context_nudge_tokens(input.trimmed()).is_none();
-    let mut spans = vec![
-        arrow,
-        Span::styled(
-            key_cell("context nudge", KEY_W, KEY_GUTTER),
-            label_style(true),
-        ),
-    ];
-    spans.extend(value_caret(input, invalid));
+    let (mut spans, room) = edit_lead(arrow, "context nudge", width, "");
+    spans.extend(value_caret(input, invalid, room));
     Line::from(spans)
 }
 
@@ -779,16 +778,10 @@ fn weekly_cycle_lines(
 
 /// The `weekly limit` row mid-edit: edit gutter + key block + typed buffer
 /// (DANGER when out of range) + ` %` unit. Mirrors `refresh_edit_line`.
-fn weekly_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
+fn weekly_edit_line(arrow: Span<'static>, input: &InputState, width: usize) -> Line<'static> {
     let invalid = parse_weekly_pct(input.trimmed()).is_none();
-    let mut spans = vec![
-        arrow,
-        Span::styled(
-            key_cell("weekly limit", KEY_W, KEY_GUTTER),
-            label_style(true),
-        ),
-    ];
-    spans.extend(value_caret(input, invalid));
+    let (mut spans, room) = edit_lead(arrow, "weekly limit", width, " %");
+    spans.extend(value_caret(input, invalid, room));
     let unit_style = if invalid {
         theme::danger()
     } else {
@@ -796,6 +789,28 @@ fn weekly_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
     };
     spans.push(Span::styled(" %", unit_style));
     Line::from(spans)
+}
+
+/// A mid-edit row's edit gutter and key cell, and the cells left for its typed
+/// buffer before the trailing `unit`. On a narrow pane the key column narrows
+/// and the label truncates (`…`, the Setup `field_key_cell` clamp's shape), so
+/// the buffer keeps [`MIN_VALUE_W`] cells and the caret stays inside.
+fn edit_lead(
+    arrow: Span<'static>,
+    key: &str,
+    width: usize,
+    unit: &str,
+) -> (Vec<Span<'static>>, usize) {
+    let key_w = KEY_W.min(width.saturating_sub(2 + KEY_GUTTER + MIN_VALUE_W + unit.len()));
+    let room = width.saturating_sub(2 + key_w + KEY_GUTTER + unit.len());
+    let lead = vec![
+        arrow,
+        Span::styled(
+            key_cell(&truncate(key, key_w), key_w, KEY_GUTTER),
+            label_style(true),
+        ),
+    ];
+    (lead, room)
 }
 
 /// Sub-line under the weekly field while typing: the valid range, in DANGER

@@ -3437,6 +3437,49 @@ fn the_note_slot_renders_the_draft_and_parks_the_caret_on_it() {
     assert_eq!(caret.y, 2, "border + draft row one");
 }
 
+/// S10: a draft line wider than the slot scrolls sideways with the caret: End
+/// sits inside the slot with the line's two-cell rocket whole before it, and
+/// one ← lands on the rocket without moving a drawn cell of the row.
+#[test]
+fn a_note_line_wider_than_the_slot_scrolls_with_its_caret() {
+    use crate::testutil::{draw_caret, right_border, symbol_at};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut buf = NoteBuffer::new(&format!("{}🚀", "m".repeat(60)));
+    let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
+
+    let (end, screen) = draw_caret(&mut term, |f| draw_note_slot(f, f.area(), &buf));
+    let border = right_border(&screen, end.y);
+    assert!(
+        end.x + 2 <= border,
+        "End stays inside the slot ({end:?}, border {border})"
+    );
+    assert_eq!(
+        symbol_at(&screen, end.x - 2, end.y),
+        "🚀",
+        "the rocket draws whole before End"
+    );
+    let end_row = crate::testutil::buffer_rows(&screen)[end.y as usize].clone();
+
+    buf.left();
+    let (left, screen) = draw_caret(&mut term, |f| draw_note_slot(f, f.area(), &buf));
+    assert_eq!(
+        left,
+        ratatui::layout::Position::new(end.x - 2, end.y),
+        "one left steps over the rocket's two cells"
+    );
+    assert_eq!(
+        symbol_at(&screen, left.x, left.y),
+        "🚀",
+        "the caret sits on it"
+    );
+    assert_eq!(
+        crate::testutil::buffer_rows(&screen)[left.y as usize],
+        end_row,
+        "a move inside the window leaves the row alone"
+    );
+}
+
 /// Past 8 draft rows (or a short slot) the draft scrolls cursor-first.
 #[test]
 fn the_note_slot_scrolls_the_draft_to_keep_the_caret_visible() {

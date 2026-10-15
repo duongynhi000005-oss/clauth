@@ -18,8 +18,9 @@ use super::format::{
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
-    draw_profile_selector, draw_scrollbar, edit_slot_block, empty_state, key_cell, master_detail,
-    pill, rail_hint_lines, scroll_offset, section_box, section_box_verbatim, wrap_words,
+    cells_window, draw_profile_selector, draw_scrollbar, edit_slot_block, empty_state,
+    follow_window, grapheme_cells_before, key_cell, master_detail, pill, rail_hint_lines,
+    scroll_offset, section_box, section_box_verbatim, wrap_words,
 };
 use super::prose::{self, cmd, cmd_lit, key_lit};
 use crate::format::{account_tier, format_pct};
@@ -1883,21 +1884,36 @@ const NOTE_SLOT_MAX_ROWS: usize = 8;
 
 /// The note editor's docked slot: a `╭─ ✎ ───╮` sub-block, LINE_STRONG border,
 /// the draft inside, the native cursor at the caret, and the draft scrolling
-/// cursor-first once it passes [`NOTE_SLOT_MAX_ROWS`]. Wide chars are counted
-/// at their display width so the caret lands on the cell they occupy.
+/// cursor-first once it passes [`NOTE_SLOT_MAX_ROWS`]. The caret is measured
+/// in display cells; a line wider than the slot scrolls the draft sideways
+/// with the caret ([`follow_window`]), every row through the same window.
 fn draw_note_slot(frame: &mut Frame<'_>, area: Rect, buf: &NoteBuffer) {
     let block = edit_slot_block();
     let slot_inner = block.inner(area);
     frame.render_widget(block, area);
+    let (crow, caret_byte) = buf.caret();
+    let width = slot_inner.width as usize;
+    let (cells, caret) = grapheme_cells_before(buf.line(crow), caret_byte);
+    let start = follow_window(&cells, caret, buf.offset.get(), width, 0);
+    buf.offset.set(start);
+    let ccol = cells
+        .iter()
+        .take(caret)
+        .sum::<usize>()
+        .saturating_sub(start);
     let empty = buf.row_count() == 1 && buf.line(0).is_empty();
     let lines: Vec<Line<'static>> = if empty {
         vec![Line::from(Span::styled("add a note…", theme::faint()))]
     } else {
         (0..buf.row_count())
-            .map(|i| Line::from(Span::styled(buf.line(i).to_string(), theme::body())))
+            .map(|i| {
+                Line::from(Span::styled(
+                    cells_window(buf.line(i), start, width),
+                    theme::body(),
+                ))
+            })
             .collect()
     };
-    let (crow, ccol) = buf.cursor_pos();
     let viewport = slot_inner.height as usize;
     let total = lines.len();
     let offset = scroll_offset(total, viewport, (crow, crow + 1));

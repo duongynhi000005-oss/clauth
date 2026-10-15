@@ -3111,3 +3111,168 @@ fn an_unmarked_selector_name_clamps_to_the_pane_edge() {
         ],
     );
 }
+
+/// One chain member `a`, the Fallback card focused on `rotate at`, its
+/// editor holding `draft`.
+fn threshold_app(draft: Option<&str>) -> (App, ReadingsSnapshot) {
+    let (cfg, readings) = config_with(vec![profile("a", 95.0, 10.0, 7200)], Some("a"), vec!["a"]);
+    let mut app = app_with_readings(cfg, &readings);
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Threshold)
+        .expect("the rotate-at row is listed");
+    app.fallback_edit = draft.map(|d| crate::tui::app::MemberEdit {
+        member: "a".into(),
+        state: CardEdit::Threshold(InputState::new(d)),
+    });
+    (app, readings)
+}
+
+fn threshold_draft(app: &mut App) -> &mut InputState {
+    match app.fallback_edit.as_mut().map(|e| &mut e.state) {
+        Some(CardEdit::Threshold(input)) => input,
+        _ => panic!("the rotate-at editor is open"),
+    }
+}
+
+/// S10: a threshold buffer wider than the card's value column scrolls inside
+/// its row on a narrow card: End keeps the caret inside the pane right after
+/// the last digit, one ← moves it one cell and leaves the row alone, Home shows
+/// the first digit again.
+#[test]
+fn an_over_wide_threshold_buffer_scrolls_inside_its_row() {
+    use crate::testutil::{draw_caret, right_border, symbol_at};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, readings) = threshold_app(Some("1234567890123456"));
+    let mut term = Terminal::new(TestBackend::new(34, 40)).unwrap();
+
+    let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &readings));
+    let border = right_border(&buf, end.y);
+    assert!(
+        end.x + 2 <= border,
+        "End stays inside the field ({end:?}, border {border})"
+    );
+    assert_eq!(
+        symbol_at(&buf, end.x - 1, end.y),
+        "6",
+        "End follows the last digit"
+    );
+    let end_row = crate::testutil::buffer_rows(&buf)[end.y as usize].clone();
+
+    threshold_draft(&mut app).left();
+    let (left, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &readings));
+    assert_eq!(
+        left,
+        ratatui::layout::Position::new(end.x - 1, end.y),
+        "one left moves one cell"
+    );
+    assert_eq!(
+        crate::testutil::buffer_rows(&buf)[left.y as usize],
+        end_row,
+        "a move inside the window leaves the row alone"
+    );
+
+    threshold_draft(&mut app).home();
+    let (home, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &readings));
+    assert_eq!(home.y, end.y, "Home stays on the field row");
+    assert_eq!(
+        symbol_at(&buf, home.x, home.y),
+        "1",
+        "Home sits on the first digit"
+    );
+}
+
+/// S10 (cloudy's range rule, 2026-10-14): typing in `rotate at` swaps its
+/// hint for the one-line `0-100 %` range, and the rows below move up by
+/// exactly the difference (the hint takes 3 lines at 34 columns, 2 at 45 and
+/// 80).
+#[test]
+fn the_threshold_editor_swaps_its_hint_for_its_range_while_typing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (w, delta) in [(34u16, -2isize), (45, -1), (80, -1)] {
+        let frame = |app: &App, readings: &ReadingsSnapshot| {
+            let mut term = Terminal::new(TestBackend::new(w, 60)).unwrap();
+            term.draw(|f| super::draw(f, f.area(), app, readings))
+                .unwrap();
+            crate::testutil::buffer_rows(term.backend().buffer())
+        };
+        let (resting_app, resting_readings) = threshold_app(None);
+        let (editing_app, editing_readings) = threshold_app(Some("80"));
+        let resting = frame(&resting_app, &resting_readings);
+        let editing = frame(&editing_app, &editing_readings);
+        let at = |rows: &[String], label: &str| {
+            rows.iter()
+                .position(|r| r.contains(label))
+                .unwrap_or_else(|| panic!("[{w}] {label} renders:\n{}", rows.join("\n")))
+        };
+        let field = at(&resting, "rotate at");
+        assert!(
+            editing[field + 1].contains("└ 0-100 %"),
+            "[{w}] the range tooltip sits under the edit line:\n{}",
+            editing.join("\n")
+        );
+        crate::testutil::assert_rows_below_shift(
+            &resting,
+            &editing,
+            field,
+            at(&resting, "weekly at"),
+            delta,
+            4,
+            &w.to_string(),
+        );
+    }
+}
+
+/// The Fallback card with `row`'s typed editor holding `draft` (the member
+/// whose card is open: `a`).
+fn member_typed_app(row: FallbackRow, draft: &str) -> (App, ReadingsSnapshot) {
+    let state = match row {
+        FallbackRow::Threshold => CardEdit::Threshold(InputState::new(draft)),
+        FallbackRow::MaxSpend => CardEdit::MaxSpend(InputState::new(draft)),
+        FallbackRow::WeeklyAt => CardEdit::Weekly(InputState::new(draft)),
+        _ => panic!("the row has no typed editor"),
+    };
+    let (cfg, readings) = config_with(vec![profile("a", 95.0, 10.0, 7200)], Some("a"), vec!["a"]);
+    let mut app = app_with_readings(cfg, &readings);
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == row)
+        .expect("the row is listed");
+    app.fallback_edit = Some(crate::tui::app::MemberEdit {
+        member: "a".into(),
+        state,
+    });
+    (app, readings)
+}
+
+/// S10: a typed Fallback-card row keeps its caret inside the pane on a narrow
+/// terminal: the value column clamps and the key truncates (`…`) below
+/// `MIN_VALUE_W` + the unit.
+#[test]
+fn a_typed_fallback_row_keeps_its_caret_inside_on_a_narrow_pane() {
+    use crate::testutil::{draw_caret, right_border, symbol_at};
+    let _home = crate::testutil::HomeSandbox::new();
+    for (row, value, last) in [
+        (FallbackRow::Threshold, "80", '0'),
+        (FallbackRow::MaxSpend, "3.0", '0'),
+        (FallbackRow::WeeklyAt, "95", '5'),
+    ] {
+        for w in [16u16, 18, 20, 22, 28, 34] {
+            let (app, readings) = member_typed_app(row, value);
+            let mut term = Terminal::new(TestBackend::new(w, 100)).unwrap();
+            let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &readings));
+            let border = right_border(&buf, end.y);
+            assert!(
+                end.x + 2 <= border,
+                "[{row:?} {w}] End stays inside the field ({end:?}, border {border})"
+            );
+            assert_eq!(
+                symbol_at(&buf, end.x - 1, end.y),
+                last.to_string(),
+                "[{row:?} {w}] End follows the last typed char"
+            );
+        }
+    }
+}

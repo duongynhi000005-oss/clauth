@@ -39,6 +39,119 @@ fn delete_word_respects_caret_position() {
     assert_eq!(input.value, "foo bar");
 }
 
+/// S10: the field editor steps and deletes by whole grapheme: a two-cell
+/// emoji, a combining sequence and a ZWJ sequence are each one step, and a
+/// control char stays a step of its own.
+#[test]
+fn the_field_editor_never_splits_a_grapheme() {
+    for (cluster, name) in [
+        ("🚀", "wide"),
+        ("e\u{301}", "combining"),
+        ("👩\u{200d}💻", "ZWJ"),
+    ] {
+        let mut input = InputState::new(&format!("a{cluster}b"));
+        input.left();
+        assert_eq!(
+            input.cursor,
+            1 + cluster.len(),
+            "{name}: one left steps over `b`"
+        );
+        input.left();
+        assert_eq!(
+            input.cursor, 1,
+            "{name}: the next steps over the whole cluster"
+        );
+        input.right();
+        assert_eq!(
+            input.cursor,
+            1 + cluster.len(),
+            "{name}: one right steps back over it"
+        );
+        input.backspace();
+        assert_eq!(
+            (input.value.as_str(), input.cursor),
+            ("ab", 1),
+            "{name}: backspace removes the cluster whole"
+        );
+
+        let mut input = InputState::new(&format!("a{cluster}b"));
+        input.home();
+        input.right();
+        input.delete();
+        assert_eq!(
+            (input.value.as_str(), input.cursor),
+            ("ab", 1),
+            "{name}: delete removes the cluster whole"
+        );
+    }
+
+    let mut tab = InputState::new("x\ty");
+    tab.left();
+    tab.backspace();
+    assert_eq!(
+        (tab.value.as_str(), tab.cursor),
+        ("xy", 1),
+        "a control char is a step of its own"
+    );
+}
+
+/// S10: typing and `⌃w` keep the caret on a grapheme boundary: a base char
+/// typed before a combining mark joins it, and the caret lands after the
+/// joined grapheme; a word deletion whose space carries a combining mark
+/// keeps that grapheme whole.
+#[test]
+fn the_field_editor_snaps_insert_and_delete_word_to_graphemes() {
+    let mut input = InputState::new("\u{301}x");
+    input.home();
+    input.insert('e');
+    assert_eq!(
+        (input.value.as_str(), input.cursor),
+        ("e\u{301}x", 3),
+        "the caret steps past the joined `é`"
+    );
+
+    let mut input = InputState::new("ab \u{301}cd");
+    input.delete_word();
+    assert_eq!(
+        (input.value.as_str(), input.cursor),
+        ("ab \u{301}", 5),
+        "⌃w keeps the space-and-mark grapheme whole"
+    );
+}
+
+/// S10: the note editor steps and deletes by whole grapheme too.
+#[test]
+fn the_note_editor_never_splits_a_grapheme() {
+    for (cluster, name) in [
+        ("🚀", "wide"),
+        ("e\u{301}", "combining"),
+        ("👩\u{200d}💻", "ZWJ"),
+    ] {
+        let mut buf = super::NoteBuffer::new(&format!("a{cluster}b"));
+        buf.left();
+        buf.left();
+        buf.insert_char('|');
+        assert_eq!(
+            buf.text(),
+            format!("a|{cluster}b"),
+            "{name}: two lefts land before the whole cluster"
+        );
+        buf.right();
+        buf.backspace();
+        assert_eq!(
+            buf.text(),
+            "a|b",
+            "{name}: backspace removes the cluster whole"
+        );
+
+        let mut buf = super::NoteBuffer::new(&format!("a{cluster}b"));
+        buf.home();
+        buf.right();
+        buf.delete();
+        assert_eq!(buf.text(), "ab", "{name}: delete removes the cluster whole");
+    }
+}
+
 #[test]
 fn parse_threshold_accepts_in_range_only() {
     assert_eq!(parse_threshold("0"), Some(0.0));

@@ -8397,3 +8397,445 @@ fn the_bind_suffix_budgets_a_lam_alef_value_by_drawn_cells() {
         rows.join("\n")
     );
 }
+
+/// S10: a typed shunt value wider than its field scrolls inside its row: End
+/// keeps the caret inside the pane with the last grapheme (a two-cell rocket)
+/// whole before it, and one ← lands on the rocket without moving any drawn
+/// cell of the row.
+#[test]
+fn an_over_wide_typed_shunt_value_scrolls_inside_its_row() {
+    use crate::testutil::{draw_caret, right_border, symbol_at};
+    use crate::tui::app::{
+        InputState, ServicesFocus, ShuntFieldEdit, ShuntFieldEditState, ShuntFieldKey,
+        ShuntFocusLine, UpstreamFieldKind,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![UpstreamView {
+        name: Some(w("a")),
+        provider: None,
+        kind: None,
+        base_url: None,
+        auth: None,
+        effort: None,
+        service_tier: None,
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    }]);
+    let key = ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    };
+    let mut app = config_view_app(view, expanded);
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(key.clone())));
+    app.services.shunt_field_edit = Some(ShuntFieldEditState {
+        key,
+        edit: ShuntFieldEdit::Typed {
+            input: InputState::new(&format!("{}🚀", "x".repeat(150))),
+            saved: None,
+        },
+        refusal: None,
+    });
+    let step_left =
+        |app: &mut App| match app.services.shunt_field_edit.as_mut().map(|s| &mut s.edit) {
+            Some(ShuntFieldEdit::Typed { input, .. }) => input.left(),
+            _ => panic!("the typed editor is open"),
+        };
+    let mut term = Terminal::new(TestBackend::new(W, 60)).unwrap();
+
+    let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+    let border = right_border(&buf, end.y);
+    assert!(
+        end.x + 2 <= border,
+        "End stays inside the field ({end:?}, border {border})"
+    );
+    assert_eq!(
+        symbol_at(&buf, end.x - 2, end.y),
+        "🚀",
+        "the rocket draws whole before End"
+    );
+    let end_row = crate::testutil::buffer_rows(&buf)[end.y as usize].clone();
+
+    step_left(&mut app);
+    let (left, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+    assert_eq!(
+        left,
+        ratatui::layout::Position::new(end.x - 2, end.y),
+        "one left steps over the rocket's two cells"
+    );
+    assert_eq!(
+        symbol_at(&buf, left.x, left.y),
+        "🚀",
+        "the caret sits on it"
+    );
+    assert_eq!(
+        crate::testutil::buffer_rows(&buf)[left.y as usize],
+        end_row,
+        "a move inside the window leaves the row alone"
+    );
+}
+
+/// One herdr-options frame at 100 x 60, tall enough that the form never
+/// scrolls, so frames compare row for row.
+fn herdr_frame(app: &App) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(W, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// S10 (cloudy's range rule, 2026-10-14): `tag refresh` has no hint at rest;
+/// typing adds its one-line range under the row and the rows below move down
+/// by exactly that line, with no blank line held at rest.
+#[test]
+fn the_herdr_tag_refresh_editor_adds_its_range_line_below_the_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app(healthy_config());
+    app.services.herdr_options_cursor = 2;
+    let resting = herdr_frame(&app);
+    app.services.herdr_tag_draft = Some(crate::tui::app::InputState::new("5"));
+    let editing = herdr_frame(&app);
+    let at = |rows: &[String], label: &str| {
+        rows.iter()
+            .position(|r| r.contains(label))
+            .unwrap_or_else(|| panic!("{label} renders:\n{}", rows.join("\n")))
+    };
+    let field = at(&resting, "tag refresh");
+    let below = at(&resting, "border label");
+    assert_eq!(below, field + 1, "no line sits under the row at rest");
+    assert!(
+        editing[field + 1].contains("└ min is 1 s"),
+        "the range line sits under the edit line:\n{}",
+        editing.join("\n")
+    );
+    crate::testutil::assert_rows_below_shift(&resting, &editing, field, below, 1, 3, "herdr");
+}
+
+/// S10: a tag-refresh buffer wider than its field scrolls inside the row: End
+/// keeps the caret inside the pane right after the last digit, one ← moves it
+/// one cell and leaves the row alone, Home shows the first digit again.
+#[test]
+fn an_over_wide_tag_refresh_buffer_scrolls_inside_its_row() {
+    use crate::testutil::{draw_caret, right_border, symbol_at};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app(healthy_config());
+    app.services.herdr_options_cursor = 2;
+    app.services.herdr_tag_draft = Some(crate::tui::app::InputState::new(&"1234567890".repeat(12)));
+    fn draft(app: &mut App) -> &mut crate::tui::app::InputState {
+        app.services
+            .herdr_tag_draft
+            .as_mut()
+            .expect("the editor is open")
+    }
+    let mut term = Terminal::new(TestBackend::new(W, 60)).unwrap();
+
+    let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+    let border = right_border(&buf, end.y);
+    assert!(
+        end.x + 2 <= border,
+        "End stays inside the field ({end:?}, border {border})"
+    );
+    assert_eq!(
+        symbol_at(&buf, end.x - 1, end.y),
+        "0",
+        "End follows the last digit"
+    );
+    let end_row = crate::testutil::buffer_rows(&buf)[end.y as usize].clone();
+
+    draft(&mut app).left();
+    let (left, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+    assert_eq!(
+        left,
+        ratatui::layout::Position::new(end.x - 1, end.y),
+        "one left moves one cell"
+    );
+    assert_eq!(
+        crate::testutil::buffer_rows(&buf)[left.y as usize],
+        end_row,
+        "a move inside the window leaves the row alone"
+    );
+
+    draft(&mut app).home();
+    let (home, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+    assert_eq!(home.y, end.y, "Home stays on the field row");
+    assert_eq!(
+        symbol_at(&buf, home.x, home.y),
+        "1",
+        "Home sits on the first digit"
+    );
+}
+
+/// S10 (cloudy's ruling, 2026-10-14: let rows move): opening the custom-value
+/// editor on a wrapped cycle row (`provider`'s run takes three lines at 100
+/// columns) collapses it to the one edit line, and the rows below move up by
+/// exactly two, with no blank or tinted line held in their place.
+#[test]
+fn a_typed_editor_on_a_wrapped_cycle_row_moves_the_rows_below_up() {
+    use crate::tui::app::{
+        InputState, ServicesFocus, ShuntFieldEdit, ShuntFieldEditState, ShuntFieldKey,
+        ShuntFocusLine, UpstreamFieldKind,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![UpstreamView {
+        name: Some(w("a")),
+        provider: Some(w("cursor")),
+        kind: None,
+        base_url: None,
+        auth: None,
+        effort: None,
+        service_tier: None,
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    }]);
+    let key = ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Provider,
+    };
+    let mut app = config_view_app(view, expanded);
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(key.clone())));
+    let frame = |app: &App| {
+        let mut term = Terminal::new(TestBackend::new(W, 60)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    let resting = frame(&app);
+    app.services.shunt_field_edit = Some(ShuntFieldEditState {
+        key,
+        edit: ShuntFieldEdit::Typed {
+            input: InputState::new("cursor"),
+            saved: Some("cursor".to_string()),
+        },
+        refusal: None,
+    });
+    let editing = frame(&app);
+    let at = |rows: &[String], label: &str| {
+        rows.iter()
+            .position(|r| r.contains(label))
+            .unwrap_or_else(|| panic!("{label} renders:\n{}", rows.join("\n")))
+    };
+    let field = at(&resting, "❯   provider");
+    let below = at(&resting, "kind");
+    assert_eq!(below, field + 3, "the run wraps:\n{}", resting.join("\n"));
+    crate::testutil::assert_rows_below_shift(&resting, &editing, field, below, -2, 3, "shunt");
+}
+
+/// S10: a typed shunt field keeps its caret inside the pane on a narrow
+/// terminal: the value column clamps to `MIN_VALUE_W` below the pane width.
+#[test]
+fn a_typed_shunt_field_keeps_its_caret_inside_on_a_narrow_pane() {
+    use crate::testutil::{draw_caret, right_border, symbol_at};
+    use crate::tui::app::{
+        InputState, ServicesFocus, ShuntFieldEdit, ShuntFieldEditState, ShuntFieldKey,
+        ShuntFocusLine, UpstreamFieldKind,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![UpstreamView {
+        name: Some(w("a")),
+        provider: None,
+        kind: None,
+        base_url: None,
+        auth: None,
+        effort: None,
+        service_tier: None,
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    }]);
+    let key = ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    };
+    for w in [16u16, 18, 20, 22, 28, 34] {
+        let mut app = config_view_app(view.clone(), expanded.clone());
+        app.services.focus = ServicesFocus::Detail;
+        app.services
+            .set_shunt_focus(Some(ShuntFocusLine::Field(key.clone())));
+        app.services.shunt_field_edit = Some(ShuntFieldEditState {
+            key: key.clone(),
+            edit: ShuntFieldEdit::Typed {
+                input: InputState::new("hi"),
+                saved: None,
+            },
+            refusal: None,
+        });
+        let mut term = Terminal::new(TestBackend::new(w, 100)).unwrap();
+        let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+        let border = right_border(&buf, end.y);
+        assert!(
+            end.x + 2 <= border,
+            "[{w}] End stays inside the field ({end:?}, border {border})"
+        );
+        assert_eq!(
+            symbol_at(&buf, end.x - 1, end.y),
+            "i",
+            "[{w}] End follows the last typed char"
+        );
+    }
+}
+
+/// S10: a typed herdr `tag refresh` field keeps its caret inside the pane on
+/// a narrow terminal: the label column clamps and the label truncates below
+/// `MIN_VALUE_W` + the ` s` unit.
+#[test]
+fn a_typed_herdr_tag_refresh_keeps_its_caret_inside_on_a_narrow_pane() {
+    use crate::testutil::{draw_caret, right_border, symbol_at};
+    let _home = crate::testutil::HomeSandbox::new();
+    for w in [16u16, 18, 20, 22, 28, 34] {
+        let mut app = herdr_options_app(healthy_config());
+        app.services.herdr_options_cursor = 2;
+        app.services.herdr_tag_draft = Some(crate::tui::app::InputState::new("5"));
+        let mut term = Terminal::new(TestBackend::new(w, 100)).unwrap();
+        let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+        let border = right_border(&buf, end.y);
+        assert!(
+            end.x + 2 <= border,
+            "[{w}] End stays inside the field ({end:?}, border {border})"
+        );
+        assert_eq!(
+            symbol_at(&buf, end.x - 1, end.y),
+            "5",
+            "[{w}] End follows the last digit"
+        );
+    }
+}
+
+/// S10: the resting herdr rows keep their r2 bytes at terminal 28-29: only the
+/// tag-refresh editor budgets its ` s` unit, so the `delegate row text` label
+/// stays whole at the narrow-stack layout's interior 26.
+#[test]
+fn the_resting_herdr_rows_keep_their_full_labels_at_28_cols() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for w in [28u16, 29] {
+        let mut app = herdr_options_app(healthy_config());
+        app.services.herdr_options_cursor = 5;
+        let mut term = Terminal::new(TestBackend::new(w, 100)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let row = rows
+            .iter()
+            .find(|r| r.contains("delegate row text"))
+            .unwrap_or_else(|| panic!("[{w}] the delegate row renders:\n{}", rows.join("\n")));
+        assert!(
+            !row.contains("delegate row t…"),
+            "[{w}] the label truncates:\n{row}"
+        );
+        let label_at = row
+            .find("delegate row text")
+            .expect("the full label renders");
+        assert_eq!(
+            &row[label_at + "delegate row text".len()..label_at + "delegate row text".len() + 2],
+            "  ",
+            "[{w}] the value opens at the label's 2-cell gap (r2 bytes):\n{row}"
+        );
+    }
+}
+
+/// S10: the typed shunt form keeps the resting label gap and escapes the label
+/// like the resting `config_key`: the value opens at the lead with the 2-cell
+/// gutter at every width, and a control char in a provider-name label renders
+/// as its `\u{…}` form, never raw.
+#[test]
+fn a_typed_shunt_field_keeps_the_label_gap_and_escapes_it() {
+    use crate::tui::app::{
+        InputState, ModelFieldKind, ServicesFocus, ShuntFieldEdit, ShuntFieldEditState,
+        ShuntFieldKey, ShuntFocusLine,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.models = vec![ModelView {
+        id: Some(w("m")),
+        display_name: None,
+        upstream_model: Some(vec![("a\tb".to_string(), w("claude-opus"))]),
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Model {
+        id: "m".into(),
+        occurrence: 0,
+    }]);
+    let key = ShuntFieldKey::Model {
+        id: "m".into(),
+        occurrence: 0,
+        field: ModelFieldKind::UpstreamModel("a\tb".to_string()),
+    };
+    for w in [16u16, 28, 45] {
+        let mut app = config_view_app(view.clone(), expanded.clone());
+        app.services.focus = ServicesFocus::Detail;
+        app.services
+            .set_shunt_focus(Some(ShuntFocusLine::Field(key.clone())));
+        app.services.shunt_field_edit = Some(ShuntFieldEditState {
+            key: key.clone(),
+            edit: ShuntFieldEdit::Typed {
+                input: InputState::new("hi"),
+                saved: None,
+            },
+            refusal: None,
+        });
+        let mut term = Terminal::new(TestBackend::new(w, 60)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let row = rows
+            .iter()
+            .find(|r| r.contains('✎'))
+            .unwrap_or_else(|| panic!("[{w}] the typed row renders:\n{}", rows.join("\n")));
+        let at = row.find("hi").unwrap_or(usize::MAX);
+        assert_eq!(
+            &row[at.saturating_sub(2)..at],
+            "  ",
+            "[{w}] a 2-cell gap opens the value:\n{row}"
+        );
+        assert!(!row.contains('\t'), "[{w}] a raw tab renders:\n{row}");
+        if w >= 28 {
+            assert!(
+                row.contains("a\\tb"),
+                "[{w}] the label escapes to its `\\t` form:\n{row}"
+            );
+        }
+    }
+}
+
+/// S10: the RESTING `tag refresh` row keeps its full label at 16-24 cols (the
+/// ` s` budget applies only while its editor is open); the `5s` value clips at
+/// the pane edge, never the label.
+#[test]
+fn the_resting_tag_refresh_row_keeps_its_full_label_on_narrow_panes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for w in [16u16, 20, 24, 28] {
+        let mut app = herdr_options_app(healthy_config());
+        app.services.herdr_options_cursor = 2;
+        assert!(app.services.herdr_tag_draft.is_none(), "the row rests");
+        let mut term = Terminal::new(TestBackend::new(w, 100)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let expect = if w == 16 { "tag refres" } else { "tag refresh" };
+        let row = rows.iter().find(|r| r.contains(expect)).unwrap_or_else(|| {
+            panic!(
+                "[{w}] the resting label renders whole:\n{}",
+                rows.join("\n")
+            )
+        });
+        assert!(
+            !row.contains("t…"),
+            "[{w}] the resting label never truncates:\n{row}"
+        );
+        if w >= 20 {
+            let label_at = row.find("tag refresh").expect("the full label renders");
+            assert_eq!(
+                &row[label_at + "tag refresh".len()..label_at + "tag refresh".len() + 2],
+                "  ",
+                "[{w}] the value opens at the label's 2-cell gap:\n{row}"
+            );
+        }
+    }
+}

@@ -1603,6 +1603,286 @@ fn capture_name_caret_follows_edit_position() {
     );
 }
 
+/// An app holding one `CaptureName` modal whose field reads `value`.
+fn capture_name_app(value: &str) -> App {
+    use crate::actions::CaptureSnapshot;
+    use crate::tui::app::{CaptureNameForm, InputState, Modal};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.modals.push(Modal::CaptureName(CaptureNameForm {
+        snapshot: Box::new(CaptureSnapshot {
+            credentials: None,
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+        }),
+        input: InputState::new(value),
+        from_divergence: false,
+    }));
+    app
+}
+
+/// Runs `edit` on the open `CaptureName` field.
+fn edit_capture_name(app: &mut App, edit: impl FnOnce(&mut crate::tui::app::InputState)) {
+    match app.modals.last_mut() {
+        Some(crate::tui::app::Modal::CaptureName(form)) => edit(&mut form.input),
+        _ => panic!("a capture-name modal is open"),
+    }
+}
+
+/// Draws `app`; returns the native caret and the buffer it sits in.
+fn caret_frame(
+    term: &mut Terminal<TestBackend>,
+    app: &App,
+) -> (ratatui::layout::Position, ratatui::buffer::Buffer) {
+    term.draw(|f| super::draw(f, app)).unwrap();
+    let caret = term.get_cursor_position().unwrap();
+    (caret, term.backend().buffer().clone())
+}
+
+fn cell_at(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> String {
+    buf[(x, y)].symbol().to_string()
+}
+
+fn row_cells(buf: &ratatui::buffer::Buffer, y: u16) -> Vec<String> {
+    (0..buf.area.width).map(|x| cell_at(buf, x, y)).collect()
+}
+
+/// The modal's right border column on row `y`: the last `│` in the row.
+fn modal_right_border(buf: &ratatui::buffer::Buffer, y: u16) -> u16 {
+    (0..buf.area.width)
+        .rev()
+        .find(|&x| buf[(x, y)].symbol() == "│")
+        .expect("the caret row is inside the modal")
+}
+
+/// S10: the caret column is measured in display cells over whole graphemes.
+/// `a🚀b` draws `a` in one cell, the rocket in two, `b` in one, so the caret
+/// before `b` sits on `b`'s cell and the caret at End one cell past it. A char
+/// count puts both one cell early (on the rocket's trailing half, on `b`).
+#[test]
+fn a_capture_name_caret_lands_on_grapheme_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = capture_name_app("a🚀b");
+    let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+
+    edit_capture_name(&mut app, |i| i.home());
+    let (home, buf) = caret_frame(&mut term, &app);
+    assert_eq!(cell_at(&buf, home.x, home.y), "a", "Home sits on `a`");
+
+    edit_capture_name(&mut app, |i| i.right());
+    let (one, buf) = caret_frame(&mut term, &app);
+    assert_eq!(one.y, home.y, "the caret stays on the field row");
+    assert_eq!(
+        cell_at(&buf, one.x, one.y),
+        "🚀",
+        "one right sits on the rocket"
+    );
+
+    edit_capture_name(&mut app, |i| i.right());
+    let (two, buf) = caret_frame(&mut term, &app);
+    assert_eq!(two.x, home.x + 3, "the rocket is two cells wide");
+    assert_eq!(cell_at(&buf, two.x, two.y), "b", "two rights sit on `b`");
+
+    edit_capture_name(&mut app, |i| i.end());
+    let (end, buf) = caret_frame(&mut term, &app);
+    assert_eq!(end.x, home.x + 4, "End sits one cell past `b`");
+    assert_eq!(cell_at(&buf, end.x - 1, end.y), "b", "End follows `b`");
+}
+
+/// S10: a value wider than its field scrolls horizontally: the caret stays on
+/// the field row inside the modal, the grapheme it edits draws whole beside
+/// it, and a caret move inside the visible window leaves the window alone.
+#[test]
+fn an_over_wide_capture_name_keeps_the_edited_grapheme_in_view() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = capture_name_app(&format!("A{}Z", "m".repeat(118)));
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+
+    let (end, buf) = caret_frame(&mut term, &app);
+    let border = modal_right_border(&buf, end.y);
+    assert!(
+        end.x < border,
+        "End stays inside the modal ({end:?}, border {border})"
+    );
+    assert_eq!(
+        cell_at(&buf, end.x - 1, end.y),
+        "Z",
+        "End sits right after `Z`"
+    );
+    let end_row = row_cells(&buf, end.y);
+
+    edit_capture_name(&mut app, |i| i.left());
+    let (left, buf) = caret_frame(&mut term, &app);
+    assert_eq!(
+        left,
+        ratatui::layout::Position::new(end.x - 1, end.y),
+        "one left moves one cell"
+    );
+    assert_eq!(cell_at(&buf, left.x, left.y), "Z", "the caret sits on `Z`");
+    assert_eq!(
+        row_cells(&buf, left.y),
+        end_row,
+        "a move inside the window leaves the window alone"
+    );
+
+    edit_capture_name(&mut app, |i| i.home());
+    let (home, buf) = caret_frame(&mut term, &app);
+    assert!(
+        home.x < modal_right_border(&buf, home.y),
+        "Home stays inside the modal"
+    );
+    assert_eq!(cell_at(&buf, home.x, home.y), "A", "Home sits on `A`");
+
+    let app = capture_name_app(&format!("{}🚀", "m".repeat(119)));
+    let (end, buf) = caret_frame(&mut term, &app);
+    assert!(
+        end.x < modal_right_border(&buf, end.y),
+        "End stays inside the modal"
+    );
+    assert_eq!(
+        cell_at(&buf, end.x - 2, end.y),
+        "🚀",
+        "the last grapheme draws whole"
+    );
+}
+
+/// S10: at 45 cols the capture blurb wraps, so the name field is no longer
+/// the modal's third line; the caret follows the row that draws the field.
+#[test]
+fn a_wrapped_capture_name_blurb_keeps_the_caret_on_the_name_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = capture_name_app("alice");
+    let mut term = Terminal::new(TestBackend::new(45, 24)).unwrap();
+    let (caret, buf) = caret_frame(&mut term, &app);
+    let rows = crate::testutil::buffer_rows(&buf);
+    let name_row = rows
+        .iter()
+        .position(|r| r.contains("name alice"))
+        .unwrap_or_else(|| panic!("the field renders:\n{}", rows.join("\n")));
+    assert_eq!(
+        caret.y as usize,
+        name_row,
+        "the caret sits on the name row:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(
+        cell_at(&buf, caret.x - 1, caret.y),
+        "e",
+        "End sits right after `alice`"
+    );
+}
+
+/// An app holding one Setup-menu name prompt whose field reads `value`.
+fn name_prompt_app(value: &str) -> App {
+    use crate::tui::app::{InputState, Modal, NamePromptAction, NamePromptForm};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.modals.push(Modal::NamePrompt(NamePromptForm {
+        input: InputState::new(value),
+        action: NamePromptAction::DuplicateProfile("src".to_string()),
+    }));
+    app
+}
+
+/// S10: the name prompt shares the capture prompt's field: its caret lands on
+/// grapheme cells (`a🚀b`: `a` one cell, the rocket two, `b` one), and an
+/// over-wide name scrolls inside the modal with End right after its last
+/// letter.
+#[test]
+fn the_name_prompt_caret_lands_on_grapheme_cells_and_scrolls() {
+    use crate::tui::app::{InputState, Modal};
+    let _home = crate::testutil::HomeSandbox::new();
+    let edit = |app: &mut App, step: fn(&mut InputState)| match app.modals.last_mut() {
+        Some(Modal::NamePrompt(form)) => step(&mut form.input),
+        _ => panic!("a name prompt is open"),
+    };
+    let mut app = name_prompt_app("a🚀b");
+    let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+    edit(&mut app, InputState::home);
+    let (home, buf) = caret_frame(&mut term, &app);
+    assert_eq!(cell_at(&buf, home.x, home.y), "a", "Home sits on `a`");
+    edit(&mut app, InputState::end);
+    let (end, buf) = caret_frame(&mut term, &app);
+    assert_eq!(
+        end,
+        ratatui::layout::Position::new(home.x + 4, home.y),
+        "End sits one cell past `b`"
+    );
+    assert_eq!(cell_at(&buf, end.x - 1, end.y), "b", "End follows `b`");
+
+    let app = name_prompt_app(&format!("A{}Z", "m".repeat(118)));
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    let (end, buf) = caret_frame(&mut term, &app);
+    let border = modal_right_border(&buf, end.y);
+    assert!(
+        end.x < border,
+        "End stays inside the modal ({end:?}, border {border})"
+    );
+    assert_eq!(
+        cell_at(&buf, end.x - 1, end.y),
+        "Z",
+        "End sits right after `Z`"
+    );
+}
+
+/// S10: the login code field scrolls with its caret: End draws the tail's
+/// two-cell rocket whole right before the caret, on the field row inside the
+/// modal, and one ← lands on the rocket without moving a drawn cell of the row.
+#[test]
+fn the_login_code_field_scrolls_with_its_caret() {
+    use crate::tui::app::{InputState, Modal, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    let (session, _rx) = paste_session();
+    app.login = Some(session);
+    app.modals.push(Modal::Login);
+    session_field(
+        &mut app,
+        Some(InputState::new(&format!("{}🚀", "X".repeat(90)))),
+    );
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    let (end, buf) = caret_frame(&mut term, &app);
+    let border = modal_right_border(&buf, end.y);
+    assert!(
+        end.x < border,
+        "End stays inside the modal ({end:?}, border {border})"
+    );
+    assert_eq!(
+        cell_at(&buf, end.x - 2, end.y),
+        "🚀",
+        "the rocket draws whole before End"
+    );
+    let end_row = row_cells(&buf, end.y);
+
+    app.login
+        .as_mut()
+        .and_then(|s| s.paste_field.as_mut())
+        .expect("the code field is open")
+        .left();
+    let (left, buf) = caret_frame(&mut term, &app);
+    assert_eq!(
+        left,
+        ratatui::layout::Position::new(end.x - 2, end.y),
+        "one left steps over the rocket's two cells"
+    );
+    assert_eq!(cell_at(&buf, left.x, left.y), "🚀", "the caret sits on it");
+    assert_eq!(
+        row_cells(&buf, left.y),
+        end_row,
+        "a move inside the window leaves the row alone"
+    );
+}
+
 #[test]
 fn status_selected_row_tint_spans_both_lines() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -3554,8 +3834,9 @@ fn the_code_field_shows_the_typed_text_and_the_placeholder() {
     );
     assert_eq!(footer_of(&out), footer);
 
-    // A real `code#state` is a few hundred bytes and wraps inside an 80-column
-    // modal: the caret folds onto the wrapped row, right after the tail.
+    // A real `code#state` is a few hundred bytes, wider than an 80-column
+    // modal: the value scrolls inside its own row, the tail in view right
+    // before the caret, never wrapping onto a row below.
     let long = format!("{}#TAIL", "X".repeat(90));
     session_field(&mut app, Some(InputState::new(&long)));
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -3567,11 +3848,11 @@ fn the_code_field_shows_the_typed_text_and_the_placeholder() {
     let tail_row = out
         .lines()
         .position(|l| l.contains("#TAIL"))
-        .expect("the wrapped tail renders");
+        .expect("the tail renders");
     let head_row = row_of(&out, "✎ code X");
-    assert!(
-        tail_row > head_row,
-        "the value wraps past its first row:\n{out}"
+    assert_eq!(
+        tail_row, head_row,
+        "the value scrolls inside its row:\n{out}"
     );
     let tail_line = out.lines().nth(tail_row).unwrap_or("");
     let tail_end = tail_line
@@ -3582,7 +3863,7 @@ fn the_code_field_shows_the_typed_text_and_the_placeholder() {
     assert_eq!(
         (usize::from(caret.x), usize::from(caret.y)),
         (tail_end, tail_row),
-        "the native caret folds onto the wrapped row, after the tail:\n{out}"
+        "the native caret sits on the field row, after the tail:\n{out}"
     );
 
     session_stage(&mut app, LoginStage::ExchangingCode(LoginMethod::Browser));

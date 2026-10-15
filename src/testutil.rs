@@ -1540,6 +1540,70 @@ pub(crate) fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
         .collect()
 }
 
+/// Draw one frame through `draw`: the native caret it placed and the buffer.
+pub(crate) fn draw_caret(
+    term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    draw: impl FnOnce(&mut ratatui::Frame<'_>),
+) -> (ratatui::layout::Position, ratatui::buffer::Buffer) {
+    term.draw(draw).expect("draw a frame");
+    let caret = term.get_cursor_position().expect("read the caret");
+    (caret, term.backend().buffer().clone())
+}
+
+/// The symbol a rendered buffer holds at `(x, y)`.
+pub(crate) fn symbol_at(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> String {
+    buf[(x, y)].symbol().to_string()
+}
+
+/// The column of the rightmost `│` on row `y`: the pane border a field's
+/// value area ends two cells short of (its right padding between).
+pub(crate) fn right_border(buf: &ratatui::buffer::Buffer, y: u16) -> u16 {
+    (0..buf.area.width)
+        .rev()
+        .find(|&x| buf[(x, y)].symbol() == "│")
+        .expect("the row has a right border")
+}
+
+/// Pins an edit frame against its resting frame when an edited row's block
+/// changes height: every row above `field` matches whole, and the `count`
+/// rows from `below` (the first row under the block at rest) match whole
+/// `delta` rows lower in the edit frame (higher when `delta` is negative).
+pub(crate) fn assert_rows_below_shift(
+    resting: &[String],
+    editing: &[String],
+    field: usize,
+    below: usize,
+    delta: isize,
+    count: usize,
+    case: &str,
+) {
+    let frames = || {
+        format!(
+            "resting:\n{}\nediting:\n{}",
+            resting.join("\n"),
+            editing.join("\n")
+        )
+    };
+    assert_eq!(
+        editing[..field],
+        resting[..field],
+        "[{case}] the rows above the field hold still\n{}",
+        frames()
+    );
+    for k in 0..count {
+        let at = below + k;
+        let moved = at
+            .checked_add_signed(delta)
+            .expect("the shifted row is on the frame");
+        assert_eq!(
+            editing[moved],
+            resting[at],
+            "[{case}] resting row {at} sits at row {moved} while editing\n{}",
+            frames()
+        );
+    }
+}
+
 /// The cells of the first occurrence of `needle` in a rendered buffer, matched
 /// cell by cell (one narrow glyph per cell), so a multibyte glyph earlier on
 /// the row cannot shift the column the way a byte offset would.

@@ -40,7 +40,7 @@ use super::format::{fixed, grapheme_cells, middle_truncate, spinner_frame, trunc
 use super::header::pulse_name_spans;
 use super::modals::danger_button;
 use super::panes::{
-    bold_when, chunk_graphemes, cycle_row_lines, draw_following_list, draw_scrollbar,
+    MIN_VALUE_W, bold_when, chunk_graphemes, cycle_row_lines, draw_following_list, draw_scrollbar,
     draw_scrolled_lines, draw_scrolled_lines_with_footnote, empty_state, empty_state_lines,
     footnote_lines, footnote_split, head_cols, help_tooltip_lines, help_tooltip_lines_at,
     highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, section_box,
@@ -527,7 +527,7 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
 
     // The field whose typed editor is open, for the native cursor (published
     // only when its row is in view).
-    let mut edit_caret: Option<(usize, usize)> = None;
+    let mut edit_caret: Option<(usize, usize, usize)> = None;
     if let Some(idx) = focus_stop {
         let focus = &check.shunt_focus[idx];
         let rendered = stop_rendered.get(idx).copied();
@@ -548,7 +548,6 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
                 let Some(view) = config_view(app) else {
                     unreachable!("a field stop renders only over a read config");
                 };
-                let caret = field_row_caret(app, key);
                 // Replace every rendered line of the focused field with its
                 // selected render, each tinted across the full width: a wrapped
                 // cycle run keeps the focus bracket and the `BG_HOVER` tint on
@@ -556,6 +555,7 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
                 // the field's own row and stay untinted, like every other
                 // tooltip in the app.
                 let rows = field_row_lines(view, key, detail_focused, app, width);
+                let caret = field_row_caret(app, key, width);
                 let refusal = app
                     .services
                     .shunt_field_edit
@@ -563,8 +563,8 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
                     .filter(|s| s.key == *key)
                     .is_some_and(|s| s.refusal.is_some());
                 if let Some(rendered) = rendered {
-                    if let Some(caret) = caret {
-                        edit_caret = Some((rendered, caret));
+                    if let Some((lead, caret)) = caret {
+                        edit_caret = Some((rendered, lead, caret));
                     }
                     for (i, row) in rows.into_iter().enumerate() {
                         if rendered + i < lines.len() {
@@ -656,13 +656,13 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
     draw_scrollbar(frame, inner, total, scroll as usize, viewport);
 
     // The native terminal cursor at the typed editor's caret (the Setup
-    // editor's rule): the value column plus the caret's char column, on the
-    // row's visible line.
-    if let Some((row, caret)) = edit_caret
+    // editor's rule): the value column plus the caret's cell in the value
+    // window, on the row's visible line.
+    if let Some((row, lead, caret)) = edit_caret
         && let Some(visible) = row.checked_sub(scroll as usize).filter(|v| *v < viewport)
     {
         frame.set_cursor_position((
-            inner.x.saturating_add((CONFIG_VALUE_COL + caret) as u16),
+            inner.x.saturating_add((lead + caret) as u16),
             inner.y.saturating_add(visible as u16),
         ));
     }
@@ -1351,6 +1351,43 @@ const CONFIG_VALUE_COL: usize = 20;
 /// The fixed gap between a padded label and its value.
 const CONFIG_KEY_GUTTER: usize = 2;
 
+/// Where a typed field's value opens: [`CONFIG_VALUE_COL`], or, on a pane
+/// narrower than it plus the value floor, a clamped column (the Config tab's
+/// `edit_lead` clamp shape).
+fn typed_field_lead(width: usize) -> usize {
+    CONFIG_VALUE_COL.min(width.saturating_sub(MIN_VALUE_W))
+}
+
+/// The typed editor's label under the clamped [`typed_field_lead`]: the
+/// drawn text (leading pad + escaped label, truncated and padded to keep the
+/// `CONFIG_KEY_GUTTER` gap before the value) and its cell width — the one
+/// derivation the row and its caret both use.
+fn typed_field_label(label: &str, indent: usize, lead_w: usize) -> (String, usize) {
+    let (pad, budget) = if lead_w > indent + CONFIG_KEY_GUTTER + 1 {
+        (
+            indent.saturating_sub(CARET_GUTTER),
+            lead_w - indent - CONFIG_KEY_GUTTER,
+        )
+    } else {
+        (0, lead_w.saturating_sub(CARET_GUTTER + CONFIG_KEY_GUTTER))
+    };
+    let text = format!(
+        "{}{}",
+        " ".repeat(pad),
+        key_cell(
+            &truncate(&escape_control(label), budget),
+            budget,
+            CONFIG_KEY_GUTTER
+        )
+    );
+    let width = Span::raw(&text).width();
+    (text, width)
+}
+
+fn typed_field_label_width(label: &str, indent: usize, lead_w: usize) -> usize {
+    typed_field_label(label, indent, lead_w).1
+}
+
 /// A label padded so its value opens at [`CONFIG_VALUE_COL`], trailing `…` when
 /// it overruns its slot. `indent` is the column the label starts at.
 fn config_key(label: &str, indent: usize) -> String {
@@ -1465,10 +1502,10 @@ fn field_lead(key: &ShuntFieldKey, selected: bool, app: &App) -> Span<'static> {
     }
 }
 
-/// The typed editor's caret char column in the value (the native cursor), when
-/// the field's typed editor is open; `None` for a pending pick, a saving field
-/// (the row shows the spinner, not `✎`), or no editor.
-fn field_row_caret(app: &App, key: &ShuntFieldKey) -> Option<usize> {
+/// The typed editor's lead and its caret cell within the value window
+/// ([`field_row_lines`] draws the field with the same [`typed_field_lead`]),
+/// for the native cursor.
+fn field_row_caret(app: &App, key: &ShuntFieldKey, width: usize) -> Option<(usize, usize)> {
     let state = app.services.shunt_field_edit.as_ref()?;
     if state.key != *key {
         return None;
@@ -1477,7 +1514,15 @@ fn field_row_caret(app: &App, key: &ShuntFieldKey) -> Option<usize> {
         return None;
     }
     match &state.edit {
-        ShuntFieldEdit::Typed { input, .. } => Some(head_cols(input)),
+        ShuntFieldEdit::Typed { input, .. } => Some((
+            CARET_GUTTER
+                + typed_field_label_width(
+                    &field_label(key),
+                    field_indent(key),
+                    typed_field_lead(width),
+                ),
+            head_cols(input),
+        )),
         ShuntFieldEdit::Pick { .. } => None,
     }
 }
@@ -1512,11 +1557,24 @@ fn field_row_lines(
         .filter(|s| s.key == *key);
     let saving = app.services.saving(&ShuntSaveKey::Field(key.clone()));
     let value = shunt_field_value(view, &app.services.shunt_drafts, key).flatten();
-    let room = width.saturating_sub(CONFIG_VALUE_COL);
+    let typed = matches!(
+        edit_state.map(|s| &s.edit),
+        Some(ShuntFieldEdit::Typed { .. })
+    );
+    // The saving row keeps the resting column: the checked value trails the
+    // full label, the editor's narrow-pane clamp never reaches it.
+    let field_lead_w = if typed && !saving {
+        typed_field_lead(width)
+    } else {
+        CONFIG_VALUE_COL
+    };
+    let room = width.saturating_sub(field_lead_w);
 
-    let lead = || {
-        vec![
-            field_lead(key, selected, app),
+    let label_span = || {
+        if typed && !saving {
+            let (text, _) = typed_field_label(&label, indent, field_lead_w);
+            Span::styled(text, label_style(selected))
+        } else {
             Span::styled(
                 // The caret slot already covers the gutter's first two cells:
                 // the label opens at `indent` (2 server, 4 entry).
@@ -1526,9 +1584,11 @@ fn field_row_lines(
                     config_key(&label, indent)
                 ),
                 label_style(selected),
-            ),
-        ]
+            )
+        }
     };
+
+    let lead = || vec![field_lead(key, selected, app), label_span()];
 
     // While a save runs the row shows the saving state — the spinner (already
     // in the caret slot), the value being saved under the shimmer crest and a
@@ -1556,7 +1616,7 @@ fn field_row_lines(
         match &edit.edit {
             ShuntFieldEdit::Typed { input, .. } => {
                 let mut spans = lead();
-                spans.extend(value_caret(input, edit.refusal.is_some()));
+                spans.extend(value_caret(input, edit.refusal.is_some(), room));
                 let mut rows = vec![Line::from(spans)];
                 if let Some(refusal) = &edit.refusal {
                     rows.extend(invalid_tooltip_lines(refusal, width));
@@ -2026,10 +2086,11 @@ fn draw_herdr_detail(
         match row_editing {
             Some(input) => {
                 // The edit row renders plain (no highlight) with the edit
-                // gutter; the native terminal cursor owns the caret. x = "✎ "
-                // (2) + label + the 2-space value gap + pre-caret cols.
+                // gutter; the native terminal cursor owns the caret, at the
+                // value column plus the caret's cell in the value window.
                 let cx = inner.x.saturating_add(
-                    (2 + row.label().chars().count() + 2 + head_cols(input)) as u16,
+                    (option_value_col(*row, inner.width as usize, option_unit(*row))
+                        + head_cols(input)) as u16,
                 );
                 caret = Some((cx, lines.len()));
                 lines.extend(row_lines);
@@ -2109,7 +2170,19 @@ fn option_row(
     } else {
         label_style(selected)
     };
-    let mut spans = vec![arrow, Span::styled(format!("{}  ", row.label()), key_style)];
+    let unit = if editing.is_some() {
+        option_unit(row)
+    } else {
+        ""
+    };
+    let col = option_value_col(row, width, unit);
+    let label = if col < 2 + Span::raw(row.label()).width() + 2 {
+        let budget = col.saturating_sub(2 + 2);
+        format!("{}  ", truncate(row.label(), budget))
+    } else {
+        format!("{}  ", row.label())
+    };
+    let mut spans = vec![arrow, Span::styled(label, key_style)];
     match row {
         HerdrOption::PopupWidth => {
             let popup = settings.popup_width;
@@ -2125,7 +2198,10 @@ fn option_row(
         HerdrOption::TagRefresh => match editing {
             Some(input) => {
                 let invalid = parse_herdr_tag_secs(input.trimmed()).is_none();
-                spans.extend(value_caret(input, invalid));
+                let room = width.saturating_sub(
+                    option_value_col(row, width, option_unit(row)) + option_unit(row).len(),
+                );
+                spans.extend(value_caret(input, invalid, room));
                 let unit_style = if invalid {
                     theme::danger()
                 } else {
@@ -2192,6 +2268,31 @@ fn tag_refresh_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'stat
         invalid_tooltip_lines(RANGE, width)
     } else {
         help_tooltip_lines(RANGE, width)
+    }
+}
+
+/// Where a herdr-options row's value opens: past the caret gutter, the label
+/// and its 2-space gap ([`option_row`]'s ragged layout), clamped on a pane
+/// narrower than it plus the value floor and the row's `unit` — ` s` for the
+/// tag refresh, the one herdr row whose value carries a unit (the label
+/// truncates there).
+fn option_value_col(row: HerdrOption, width: usize, unit: &str) -> usize {
+    let full = 2 + Span::raw(row.label()).width() + 2;
+    if unit.is_empty() {
+        full
+    } else {
+        full.min(width.saturating_sub(MIN_VALUE_W + unit.len()))
+    }
+}
+
+fn option_unit(row: HerdrOption) -> &'static str {
+    match row {
+        HerdrOption::TagRefresh => " s",
+        HerdrOption::PopupWidth
+        | HerdrOption::PaneTag
+        | HerdrOption::BorderLabel
+        | HerdrOption::DelegateDot
+        | HerdrOption::DelegateRowText => "",
     }
 }
 

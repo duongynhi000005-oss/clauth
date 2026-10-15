@@ -29,10 +29,10 @@ use super::global_config::reminder_text;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
     DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
-    bold_when, cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list, head_cols,
-    help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
-    name_color, pill, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
-    wrap_words,
+    MIN_VALUE_W, bold_when, cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list,
+    head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style,
+    master_detail, name_color, pill, rail_hint_lines, section_box, section_box_verbatim,
+    select_line, value_caret, wrap_words,
 };
 use super::prose::{cmd, key};
 use crate::fallback::{
@@ -414,8 +414,15 @@ fn draw_chain_detail(
         && at >= scroll
         && at - scroll < inner.height as usize
     {
-        // x = the value column + unit + cols before caret.
-        let prefix_cols = VALUE_COL + unit_cols + head_cols(draft);
+        // x = the (clamped) value column + unit + the caret's cell in the
+        // value window.
+        let unit = if row == FallbackRow::MaxSpend {
+            "$"
+        } else {
+            " %"
+        };
+        let prefix_cols =
+            typed_value_col(inner.width as usize, unit) + unit_cols + head_cols(draft);
         let cx = inner.x.saturating_add(prefix_cols as u16);
         let cy = inner.y.saturating_add((at - scroll) as u16);
         frame.set_cursor_position((cx, cy));
@@ -1253,6 +1260,21 @@ struct MemberRow<'a> {
     armed_remove: bool,
 }
 
+/// Where a typed value opens on the card: the full [`VALUE_COL`], or, on a
+/// pane narrower than it plus the value floor, a clamped column whose key cell
+/// truncates (`…`) — the Setup clamp's shape. `unit` is the suffix or prefix
+/// the field carries beside its buffer.
+fn typed_value_col(width: usize, unit: &str) -> usize {
+    VALUE_COL.min(width.saturating_sub(MIN_VALUE_W + unit.len()))
+}
+
+/// The key cell for a typed row at clamped column `col`, truncating the key
+/// when the full cell would overrun it.
+fn typed_key_cell(key: &str, col: usize) -> String {
+    let budget = col.saturating_sub(2 + DETAIL_KEY_GUTTER);
+    key_cell(&truncate(key, budget), budget, DETAIL_KEY_GUTTER)
+}
+
 /// One FALLBACK_ROWS row's own lines, tooltip excluded: one line, except the
 /// `preferred days` row, which wraps at rest and while its picker is open.
 fn detail_row(
@@ -1298,7 +1320,11 @@ fn detail_row(
                     // Invalid typed value renders in DANGER (the gutter `└ invalid input`
                     // tooltip carries the reason); valid keeps body styling.
                     let invalid = parse_threshold(input.trimmed()).is_none();
-                    spans.extend(value_caret(input, invalid));
+                    let col = typed_value_col(width, " %");
+                    let room = width.saturating_sub(col + " %".len());
+                    spans[1] =
+                        Span::styled(typed_key_cell("rotate at", col), label_style(selected));
+                    spans.extend(value_caret(input, invalid, room));
                     let pct_style = if invalid {
                         theme::danger()
                     } else {
@@ -1360,7 +1386,11 @@ fn detail_row(
             match editing {
                 Some(input) => {
                     let invalid = parse_weekly_override(input.trimmed()).is_none();
-                    spans.extend(value_caret(input, invalid));
+                    let col = typed_value_col(width, " %");
+                    let room = width.saturating_sub(col + " %".len());
+                    spans[1] =
+                        Span::styled(typed_key_cell("weekly at", col), label_style(selected));
+                    spans.extend(value_caret(input, invalid, room));
                     let pct_style = if invalid {
                         theme::danger()
                     } else {
@@ -1478,7 +1508,11 @@ fn detail_row(
                             theme::faint()
                         },
                     ));
-                    spans.extend(value_caret(input, invalid));
+                    let col = typed_value_col(width, "$");
+                    let room = width.saturating_sub(col + "$".len());
+                    spans[1] =
+                        Span::styled(typed_key_cell("max spend", col), label_style(selected));
+                    spans.extend(value_caret(input, invalid, room));
                 }
                 None if max_spend > 0.0 => {
                     let value_style = if dimmed {

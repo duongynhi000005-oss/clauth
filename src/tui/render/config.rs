@@ -18,7 +18,7 @@ use super::super::app::{
 use super::super::theme;
 use super::format::{middle_truncate, truncate};
 use super::panes::{
-    DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, bold_when, cycle_row_lines,
+    DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, MIN_VALUE_W, bold_when, cycle_row_lines,
     draw_scrolled_lines, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
     invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, picker_row, pill,
     section_box, section_box_verbatim, value_caret,
@@ -551,7 +551,7 @@ fn draw_settings_rows(
     // (optional status + type + optional email + optional provider + optional
     // session + blank),
     // so the row loop's base index is simply what has been pushed so far.
-    let mut edit_caret: Option<(u16, InputState, ConfigRow)> = None;
+    let mut edit_caret: Option<(u16, std::borrow::Cow<'_, InputState>, usize)> = None;
     let mut line_idx: u16 = lines.len() as u16;
 
     // Start + end of the focused row's block (row plus its tooltip lines), so a
@@ -573,20 +573,24 @@ fn draw_settings_rows(
             &input,
             inner.width as usize,
         );
-        // The tooltip this row carries when focused: its range tooltip while
-        // editing the bell threshold, else its behaviour hint.
+        // The tooltip this row carries when focused: its behaviour hint, kept
+        // while a text field edits; the bell threshold, a numeric row, swaps
+        // in its range tooltip while typing.
         let tip_lines: Vec<Line<'static>> = if is_editing && *row == ConfigRow::BellThreshold {
             alert_range_tooltip(&input, inner.width as usize)
-        } else if !is_editing {
+        } else {
             row_hint(*row, snap)
                 .map(|text| help_tooltip_lines(&text, inner.width as usize))
                 .unwrap_or_default()
-        } else {
-            Vec::new()
         };
         let tip_len = tip_lines.len() as u16;
         if is_editing {
-            edit_caret = Some((line_idx, input, *row));
+            // The value opens after the row's first two spans: the gutter and
+            // the key cell as rendered, which a narrow pane clamps.
+            let lead = row_lines
+                .first()
+                .map_or(0, |line| line.spans.iter().take(2).map(Span::width).sum());
+            edit_caret = Some((line_idx, input, lead));
         }
         starts.push(line_idx as usize);
         if selected || is_editing {
@@ -625,40 +629,30 @@ fn draw_settings_rows(
     let offset = draw_scrolled_lines(frame, inner, lines, focus, Some(&app.setup_detail_offset));
 
     // Position the native terminal cursor at the caret when a text/model field is active.
-    if let Some((ly, input, row)) = edit_caret
+    if let Some((ly, input, lead)) = edit_caret
         && let Some(visible) = (ly as usize)
             .checked_sub(offset)
             .filter(|v| *v < inner.height as usize)
     {
-        // x = "❯ " (2) + label block (row_label_cols: DETAIL_KEY_W+gutter, or key+gutter for a long env key) + caret cols
-        let prefix_cols = 2 + row_label_cols(row, snap) + head_cols(&input);
-        let cx = inner.x.saturating_add(prefix_cols as u16);
+        let cx = inner.x.saturating_add((lead + head_cols(&input)) as u16);
         let cy = inner.y.saturating_add(visible as u16);
         frame.set_cursor_position((cx, cy));
     }
 }
 
-/// Width of a row's label block (caret excluded) for native-cursor placement:
-/// the shared key-cell width (`max(DETAIL_KEY_W, key.len()) + DETAIL_KEY_GUTTER`), mirroring
-/// [`kv_field`] so the caret lands right after the gap.
-fn row_label_cols(row: ConfigRow, snap: &Snap) -> usize {
-    match row {
-        ConfigRow::EnvEntry(i) => {
-            let key_len = snap.env.get(i).map(|(k, _)| k.chars().count()).unwrap_or(0);
-            DETAIL_KEY_W.max(key_len) + DETAIL_KEY_GUTTER
-        }
-        _ => DETAIL_KEY_W + DETAIL_KEY_GUTTER,
-    }
-}
-
-/// The edit buffer for a row: the live draft buffer when present, else a
-/// throwaway `InputState` seeded from the read-only [`Snap`]. Toggle/action rows
-/// have no buffer and resolve to an empty one (never rendered as a field).
-fn row_input(draft: Option<&ConfigDraft>, snap: &Snap, row: ConfigRow) -> InputState {
-    draft
-        .and_then(|d| d.field(row))
-        .cloned()
-        .unwrap_or_else(|| InputState::new(snap_value(snap, row)))
+/// The edit buffer for a row: the live draft buffer when present (borrowed, so
+/// its scroll window persists across frames), else a throwaway `InputState`
+/// seeded from the read-only [`Snap`]. Toggle/action rows have no buffer and
+/// resolve to an empty one (never rendered as a field).
+fn row_input<'a>(
+    draft: Option<&'a ConfigDraft>,
+    snap: &Snap,
+    row: ConfigRow,
+) -> std::borrow::Cow<'a, InputState> {
+    draft.and_then(|d| d.field(row)).map_or_else(
+        || std::borrow::Cow::Owned(InputState::new(snap_value(snap, row))),
+        std::borrow::Cow::Borrowed,
+    )
 }
 
 fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
@@ -959,14 +953,10 @@ fn detail_row(
         // unit trails the native caret: the `rotate at` editor's shape.
         ConfigRow::BellThreshold if editing => {
             let invalid = crate::tui::app::parse_bell_threshold(input.trimmed()).is_none();
-            let mut spans = vec![
-                arrow,
-                Span::styled(
-                    key_cell("alert at", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
-                    label_style(selected),
-                ),
-            ];
-            spans.extend(value_caret(input, invalid));
+            let key = field_key_cell("alert at", width, MIN_VALUE_W + " %".len());
+            let room = width.saturating_sub(2 + Span::raw(&key).width() + " %".len());
+            let mut spans = vec![arrow, Span::styled(key, label_style(selected))];
+            spans.extend(value_caret(input, invalid, room));
             spans.push(Span::styled(
                 " %",
                 if invalid {
@@ -1074,6 +1064,22 @@ fn detail_row(
     vec![line]
 }
 
+/// The key cell a Setup field row renders. A long env-key label widens the
+/// cell past DETAIL_KEY_W (`key_cell` pads to the key's own width), so the
+/// value column opens after the RENDERED key — measured, never the constant. A
+/// key wider than the pane clamps with `…` like any value, never a mid-word
+/// cut, and past where it would leave `reserve` cells after it: an edited
+/// field keeps room for its value and caret.
+fn field_key_cell(key: &str, width: usize, reserve: usize) -> String {
+    let full_key = key_cell(key, DETAIL_KEY_W, DETAIL_KEY_GUTTER);
+    if Span::raw(&full_key).width() > width.saturating_sub(2 + reserve) {
+        let budget = width.saturating_sub(2 + DETAIL_KEY_GUTTER + reserve);
+        format!("{}{}", truncate(key, budget), " ".repeat(DETAIL_KEY_GUTTER))
+    } else {
+        full_key
+    }
+}
+
 /// One form row's key + value line(s). `middle` picks middle-ellipsis for the
 /// value (a URL row) instead of the trailing-ellipsis default.
 #[expect(
@@ -1090,25 +1096,15 @@ fn kv_field(
     middle: bool,
     width: usize,
 ) -> Vec<Line<'static>> {
-    // A long env-key label widens the key cell past DETAIL_KEY_W (`key_cell`
-    // pads to the key's own width), so the value column opens after the
-    // RENDERED key — measured, never the constant. A key wider than the pane
-    // clamps with `…` like any value, never a mid-word cut.
-    let full_key = key_cell(key, DETAIL_KEY_W, DETAIL_KEY_GUTTER);
-    let key_cell_span = if Span::raw(&full_key).width() > width.saturating_sub(2) {
-        let budget = width.saturating_sub(2 + DETAIL_KEY_GUTTER);
-        format!("{}{}", truncate(key, budget), " ".repeat(DETAIL_KEY_GUTTER))
-    } else {
-        full_key
-    };
+    let key_cell_span = field_key_cell(key, width, if editing { MIN_VALUE_W } else { 0 });
     let lead = 2 + Span::raw(&key_cell_span).width();
     let value_w = width.saturating_sub(lead);
     let mut spans = vec![arrow, Span::styled(key_cell_span, label_style(focused))];
     if editing || mask_value || input.value.is_empty() {
-        spans.extend(value_spans(input, editing, mask_value));
+        spans.extend(value_spans(input, editing, mask_value, value_w));
         return vec![Line::from(spans)];
     }
-    if value_w >= 4 {
+    if value_w >= MIN_VALUE_W {
         let value = if middle {
             middle_truncate(&input.value, value_w)
         } else {
@@ -1156,29 +1152,26 @@ fn env_key_is_secret(key: &str) -> bool {
         .any(|needle| upper.contains(needle))
 }
 
-fn value_spans(input: &InputState, editing: bool, mask_value: bool) -> Vec<Span<'static>> {
-    if !editing {
-        if input.value.is_empty() {
-            return vec![Span::styled("—", theme::faint())];
-        }
-        let display = if mask_value {
-            "••••••••".to_string()
-        } else {
-            input.value.clone()
-        };
-        return vec![Span::styled(display, theme::accent())];
+/// A field row's value: the shared editor body ([`value_caret`]) scrolled
+/// inside `value_w` cells while editing, else the value, its mask or `—`.
+fn value_spans(
+    input: &InputState,
+    editing: bool,
+    mask_value: bool,
+    value_w: usize,
+) -> Vec<Span<'static>> {
+    if editing {
+        return value_caret(input, false, value_w);
     }
-    // In edit mode the terminal cursor (set via frame.set_cursor_position) owns
-    // the caret glyph — no simulated block highlight needed. Control-escaped
-    // like [`value_caret`], so the shared `head_cols` escaped column count
-    // stays aligned with the body it feeds.
-    let body = Style::default()
-        .fg(theme::text_color())
-        .bg(theme::bg_sunken());
-    vec![Span::styled(
-        crate::tui::app::escape_control(&input.value),
-        body,
-    )]
+    if input.value.is_empty() {
+        return vec![Span::styled("—", theme::faint())];
+    }
+    let display = if mask_value {
+        "••••••••".to_string()
+    } else {
+        input.value.clone()
+    };
+    vec![Span::styled(display, theme::accent())]
 }
 
 /// The `model` row at rest. A custom id (set via ⏎) matches no preset, so it

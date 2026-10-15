@@ -1557,7 +1557,7 @@ fn the_alert_editor_names_its_range_and_turns_danger_on_a_refused_buffer() {
 #[test]
 fn a_control_character_value_renders_escaped_in_the_setup_editor() {
     let input = InputState::new("x\ty");
-    let spans = value_spans(&input, true, false);
+    let spans = value_spans(&input, true, false, 80);
     let body: String = spans.iter().map(|s| s.content.as_ref()).collect();
     assert_eq!(
         body, "x\\ty",
@@ -1815,5 +1815,284 @@ fn the_mint_armed_key_row_desktop_rows_match_the_pre_s9_render() {
     for (w, expected) in want {
         let got = mint_key_rows(&app, *w);
         assert_eq!(got, *expected, "mint key row at {w} cols");
+    }
+}
+
+/// S10: entering and leaving edit on a hint-bearing Setup field moves no
+/// other row. The selected `base url` row keeps its hint line while editing,
+/// so every frame row but the field's own and the footer's matches the
+/// resting frame, and leaving edit restores the resting frame whole.
+#[test]
+fn a_setup_field_keeps_its_hint_line_through_edit_entry_and_exit() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState};
+    use crate::tui::app::Tab;
+    let mut draft = crate::tui::app::build_draft_new();
+    draft.base_url = InputState::new("https://api.example.com");
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+    app.config_action_cursor = crate::tui::app::config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::BaseUrl)
+        .expect("the new-account form lists base url");
+
+    let (w, h) = (100u16, 30u16);
+    let frame = |app: &App| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|fr| crate::tui::render::draw(fr, app)).unwrap();
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    let set_active = |app: &mut App, row: Option<ConfigRow>| {
+        app.config_draft.as_mut().expect("a draft is open").active = row;
+    };
+
+    let resting = frame(&app);
+    let field_row = resting
+        .iter()
+        .position(|r| r.contains("base url"))
+        .unwrap_or_else(|| panic!("base url renders:\n{}", resting.join("\n")));
+    assert!(
+        resting[field_row + 1].contains("└ "),
+        "the selected field's hint sits under it:\n{}",
+        resting.join("\n")
+    );
+
+    set_active(&mut app, Some(ConfigRow::BaseUrl));
+    let editing = frame(&app);
+    let footer = h as usize - 1;
+    for (i, (rest, edit)) in resting.iter().zip(&editing).enumerate() {
+        if i == field_row || i == footer {
+            continue;
+        }
+        assert_eq!(
+            edit,
+            rest,
+            "row {i} holds still on edit entry\nresting:\n{}\nediting:\n{}",
+            resting.join("\n"),
+            editing.join("\n")
+        );
+    }
+
+    set_active(&mut app, None);
+    assert_eq!(
+        frame(&app),
+        resting,
+        "leaving edit restores the resting frame"
+    );
+}
+
+/// The `+ new` form with `base url` holding `value`, focused and editing.
+fn editing_base_url(value: &str) -> App {
+    use crate::profile::{AppConfig, AppState};
+    let mut draft = crate::tui::app::build_draft_new();
+    draft.base_url = InputState::new(value);
+    draft.active = Some(ConfigRow::BaseUrl);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = crate::tui::app::Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+    app.config_action_cursor = crate::tui::app::config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::BaseUrl)
+        .expect("the new-account form lists base url");
+    app
+}
+
+/// S10: an over-wide `base url` scrolls inside its row. At End the caret sits
+/// inside the pane with the last grapheme (a two-cell rocket) whole before it,
+/// down to 20 columns where the key cell clamps; one ← (the real key) lands on
+/// the rocket and moves no drawn cell of the row (the window follows the
+/// caret, never pins it); Home shows the value's start again.
+#[test]
+fn an_over_wide_setup_field_scrolls_inside_its_row() {
+    use crate::testutil::{draw_caret, key, right_border, symbol_at};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let value = format!("https://api.example.com/{}🚀", "v1/".repeat(30));
+    for w in [20u16, 22, 24, 25, 28, 45, 80] {
+        let mut app = editing_base_url(&value);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 30)).unwrap();
+        let draw = |f: &mut ratatui::Frame<'_>, app: &App| crate::tui::render::draw(f, app);
+
+        let (end, buf) = draw_caret(&mut term, |f| draw(f, &app));
+        let border = right_border(&buf, end.y);
+        assert!(
+            end.x + 2 <= border,
+            "[{w}] End stays inside the field ({end:?}, border {border})"
+        );
+        assert_eq!(
+            symbol_at(&buf, end.x - 2, end.y),
+            "🚀",
+            "[{w}] the rocket draws whole before End"
+        );
+        let end_row = crate::testutil::buffer_rows(&buf)[end.y as usize].clone();
+
+        crate::tui::app::handle_key(&mut app, key(KeyCode::Left));
+        let (left, buf) = draw_caret(&mut term, |f| draw(f, &app));
+        assert_eq!(
+            left,
+            ratatui::layout::Position::new(end.x - 2, end.y),
+            "[{w}] one left steps over the rocket's two cells"
+        );
+        assert_eq!(
+            symbol_at(&buf, left.x, left.y),
+            "🚀",
+            "[{w}] the caret sits on it"
+        );
+        assert_eq!(
+            crate::testutil::buffer_rows(&buf)[left.y as usize],
+            end_row,
+            "[{w}] a move inside the window leaves the row alone"
+        );
+
+        crate::tui::app::handle_key(&mut app, key(KeyCode::Home));
+        let (home, buf) = draw_caret(&mut term, |f| draw(f, &app));
+        assert_eq!(home.y, end.y, "[{w}] Home stays on the field row");
+        assert_eq!(
+            symbol_at(&buf, home.x, home.y),
+            "h",
+            "[{w}] Home sits on `h`"
+        );
+        assert!(
+            home.x + 2 <= right_border(&buf, home.y),
+            "[{w}] Home stays inside the field"
+        );
+    }
+}
+
+/// S10 (cloudy's range rule, 2026-10-14): typing in `alert at` swaps the
+/// row's hint for its range tooltip, and the rows below move by exactly the
+/// height difference (the alert-off hint takes 3 / 2 / 1 lines, the range
+/// 2 / 1 / 1 at 28 / 45 / 80 columns); leaving edit restores the resting
+/// frame.
+#[test]
+fn the_alert_editor_swaps_its_hint_for_its_range_while_typing() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let cases: [(u16, isize, &[&str]); 3] = [
+        (28, -1, &[" └ 0-100 % · empty turns", "   it off"]),
+        (45, -1, &[" └ 0-100 % · empty turns it off"]),
+        (80, 0, &[" └ 0-100 % · empty turns it off"]),
+    ];
+    for (w, delta, range) in cases {
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![crate::profile::Profile::new("a".to_string(), None, None)],
+        });
+        app.tab = crate::tui::app::Tab::Setup;
+        app.profile_cursor = 0;
+        crate::tui::app::handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            app.config_draft.is_some(),
+            "↵ descends into the account card"
+        );
+        app.config_action_cursor = crate::tui::app::config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::BellThreshold)
+            .expect("the alert row is listed");
+        let frame = |app: &App| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 60)).unwrap();
+            term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+            crate::testutil::buffer_rows(term.backend().buffer())
+        };
+        let at = |rows: &[String], label: &str| {
+            rows.iter()
+                .position(|r| r.contains(label))
+                .unwrap_or_else(|| panic!("[{w}] {label} renders:\n{}", rows.join("\n")))
+        };
+
+        let resting = frame(&app);
+        let field = at(&resting, "alert at");
+        crate::tui::app::handle_key(&mut app, key(KeyCode::Enter));
+        let editing = frame(&app);
+        crate::testutil::assert_rows_below_shift(
+            &resting,
+            &editing,
+            field,
+            at(&resting, "base url"),
+            delta,
+            4,
+            &w.to_string(),
+        );
+        // The range lines from the column before the `└` leader to the pane's
+        // right border.
+        let lead = editing[field + 1]
+            .chars()
+            .position(|c| c == '└')
+            .unwrap_or_else(|| {
+                panic!("[{w}] the range line leads with └:\n{}", editing.join("\n"))
+            });
+        for (k, want) in range.iter().enumerate() {
+            let cells: Vec<char> = editing[field + 1 + k].chars().collect();
+            let text: String = cells[lead - 1..cells.len() - 1].iter().collect();
+            assert_eq!(
+                text.trim_end(),
+                *want,
+                "[{w}] range line {k} under the field"
+            );
+        }
+        crate::tui::app::handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(
+            frame(&app),
+            resting,
+            "[{w}] leaving edit restores the resting frame"
+        );
+    }
+}
+
+/// S10: the `alert at` editor keeps its typed value and caret inside the
+/// field on a narrow pane: its key cell clamps like the other Setup fields',
+/// leaving room for `95` and the ` %` unit.
+#[test]
+fn the_alert_editor_caret_stays_inside_the_field_on_a_narrow_pane() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::testutil::{draw_caret, key, right_border, symbol_at};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    for w in [20u16, 22, 24, 25, 28] {
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![crate::profile::Profile::new("a".to_string(), None, None)],
+        });
+        app.tab = crate::tui::app::Tab::Setup;
+        app.profile_cursor = 0;
+        crate::tui::app::handle_key(&mut app, key(KeyCode::Enter));
+        app.config_action_cursor = crate::tui::app::config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::BellThreshold)
+            .expect("the alert row is listed");
+        for code in [KeyCode::Enter, KeyCode::Char('9'), KeyCode::Char('5')] {
+            crate::tui::app::handle_key(&mut app, key(code));
+        }
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 60)).unwrap();
+        let (end, buf) = draw_caret(&mut term, |f| crate::tui::render::draw(f, &app));
+        let border = right_border(&buf, end.y);
+        assert!(
+            end.x + 2 <= border,
+            "[{w}] End stays inside the field ({end:?}, border {border})"
+        );
+        assert_eq!(
+            symbol_at(&buf, end.x - 1, end.y),
+            "5",
+            "[{w}] End follows `95`"
+        );
+        assert_eq!(
+            symbol_at(&buf, end.x + 1, end.y),
+            "%",
+            "[{w}] the unit trails the caret"
+        );
     }
 }

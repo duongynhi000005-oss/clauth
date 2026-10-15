@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use chrono::Weekday;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::style::Style;
+use ratatui::text::Span;
 
 use crate::actions::{
     CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_into_profile,
@@ -78,8 +80,12 @@ use crate::usage::{
 #[derive(Debug, Clone)]
 pub(crate) struct InputState {
     pub(crate) value: String,
-    /// Caret position in UTF-8 byte offset. Always falls on a char boundary.
+    /// Caret position in UTF-8 byte offset. Always falls on a grapheme boundary.
     pub(crate) cursor: usize,
+    /// The horizontal window's persisted cell offset (a grapheme boundary),
+    /// read and written at draw like the pane scroll offsets — see
+    /// `render::panes::field_window`.
+    pub(crate) offset: std::cell::Cell<usize>,
 }
 
 impl InputState {
@@ -87,59 +93,50 @@ impl InputState {
         Self {
             value: initial.to_string(),
             cursor: initial.len(),
+            offset: std::cell::Cell::new(0),
         }
     }
 
+    /// Insert `ch` at the caret. A char that joins the grapheme after it (a
+    /// base char typed before a combining mark) carries the caret past the
+    /// whole joined grapheme.
     pub(crate) fn insert(&mut self, ch: char) {
         self.value.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
+        self.cursor = snap_to_grapheme(&self.value, self.cursor + ch.len_utf8());
     }
 
     pub(crate) fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let prev = self.value[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let prev = self.prev_grapheme();
         self.value.replace_range(prev..self.cursor, "");
-        self.cursor = prev;
+        self.cursor = snap_to_grapheme(&self.value, prev);
     }
 
     pub(crate) fn delete(&mut self) {
-        if self.cursor >= self.value.len() {
-            return;
-        }
-        let next = self.value[self.cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(i, _)| self.cursor + i)
-            .unwrap_or(self.value.len());
+        let next = self.next_grapheme();
         self.value.replace_range(self.cursor..next, "");
+        self.cursor = snap_to_grapheme(&self.value, self.cursor);
     }
 
     pub(crate) fn left(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        self.cursor = self.value[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        self.cursor = self.prev_grapheme();
     }
 
     pub(crate) fn right(&mut self) {
-        if self.cursor >= self.value.len() {
-            return;
-        }
-        self.cursor = self.value[self.cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(i, _)| self.cursor + i)
-            .unwrap_or(self.value.len());
+        self.cursor = self.next_grapheme();
+    }
+
+    fn prev_grapheme(&self) -> usize {
+        grapheme_bounds(&self.value)
+            .into_iter()
+            .rfind(|b| *b < self.cursor)
+            .unwrap_or_default()
+    }
+
+    fn next_grapheme(&self) -> usize {
+        grapheme_bounds(&self.value)
+            .into_iter()
+            .find(|b| *b > self.cursor)
+            .unwrap_or(self.value.len())
     }
 
     /// Delete the word (run of non-spaces, plus any trailing spaces) left of the
@@ -150,7 +147,7 @@ impl InputState {
         }
         let head = &self.value[..self.cursor];
         let trimmed = head.trim_end_matches(' ');
-        let start = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let start = snap_to_grapheme(head, trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0));
         self.value.replace_range(start..self.cursor, "");
         self.cursor = start;
     }
@@ -173,16 +170,50 @@ impl InputState {
     }
 }
 
+/// The byte offsets of `s`'s grapheme boundaries, ascending, `0` through
+/// `s.len()`: the steps an editor's caret takes. The segmenter is ratatui's
+/// (`styled_graphemes`, the one the buffer draws with), which drops control
+/// graphemes; a control char always stands alone as a grapheme, so each one
+/// is a step of its own here and only the runs between them are segmented. A
+/// CR LF pair, one grapheme to the segmenter, steps as two.
+pub(crate) fn grapheme_bounds(s: &str) -> Vec<usize> {
+    let mut bounds = vec![0];
+    let mut at = 0;
+    for run in s.split_inclusive(char::is_control) {
+        let text = run.strip_suffix(char::is_control).unwrap_or(run);
+        for g in Span::raw(text).styled_graphemes(Style::default()) {
+            at += g.symbol.len();
+            bounds.push(at);
+        }
+        if text.len() < run.len() {
+            at += run.len() - text.len();
+            bounds.push(at);
+        }
+    }
+    bounds
+}
+
+/// The first grapheme boundary of `s` at or after byte `at`.
+fn snap_to_grapheme(s: &str, at: usize) -> usize {
+    grapheme_bounds(s)
+        .into_iter()
+        .find(|b| *b >= at)
+        .unwrap_or(s.len())
+}
+
 // ── Note editor ───────────────────────────────────────────────────────────────
 
 /// The note editor's multi-line draft. The stored text is `lines` joined by
-/// `\n`; the caret is `(row, col)` in char columns, converted to display cells
-/// at render (a wide char takes two cells).
+/// `\n`; the caret is `(row, col)`, `col` counting the graphemes before it, so
+/// it always sits on a grapheme boundary.
 #[derive(Debug, Clone)]
 pub(crate) struct NoteBuffer {
     lines: Vec<String>,
     row: usize,
     col: usize,
+    /// The slot's horizontal window start in cells, read and written at draw
+    /// like the panes' scroll offsets.
+    pub(crate) offset: std::cell::Cell<usize>,
 }
 
 impl NoteBuffer {
@@ -193,8 +224,13 @@ impl NoteBuffer {
             text.split('\n').map(str::to_string).collect()
         };
         let row = lines.len() - 1;
-        let col = lines[row].chars().count();
-        Self { lines, row, col }
+        let col = grapheme_bounds(&lines[row]).len() - 1;
+        Self {
+            lines,
+            row,
+            col,
+            offset: std::cell::Cell::new(0),
+        }
     }
 
     pub(crate) fn text(&self) -> String {
@@ -209,14 +245,14 @@ impl NoteBuffer {
         &self.lines[index]
     }
 
-    /// Caret row and DISPLAY column (wide chars count two cells), for the
-    /// native cursor position.
-    pub(crate) fn cursor_pos(&self) -> (usize, usize) {
-        (self.row, display_col(&self.lines[self.row], self.col))
+    /// The caret's row and its byte offset in that row's line, for the native
+    /// cursor position.
+    pub(crate) fn caret(&self) -> (usize, usize) {
+        (self.row, self.cursor_byte())
     }
 
     fn line_len(&self) -> usize {
-        self.lines[self.row].chars().count()
+        grapheme_bounds(&self.lines[self.row]).len() - 1
     }
 
     fn clamp_col(&mut self) {
@@ -225,16 +261,26 @@ impl NoteBuffer {
 
     fn cursor_byte(&self) -> usize {
         let line = &self.lines[self.row];
-        line.char_indices()
-            .nth(self.col)
-            .map(|(i, _)| i)
+        grapheme_bounds(line)
+            .get(self.col)
+            .copied()
             .unwrap_or(line.len())
+    }
+
+    /// Put the caret on the first grapheme boundary of its line at or after
+    /// byte `at`.
+    fn set_cursor_byte(&mut self, at: usize) {
+        let bounds = grapheme_bounds(&self.lines[self.row]);
+        self.col = bounds
+            .iter()
+            .position(|b| *b >= at)
+            .unwrap_or(bounds.len() - 1);
     }
 
     pub(crate) fn insert_char(&mut self, ch: char) {
         let at = self.cursor_byte();
         self.lines[self.row].insert(at, ch);
-        self.col += 1;
+        self.set_cursor_byte(at + ch.len_utf8());
     }
 
     pub(crate) fn insert_newline(&mut self) {
@@ -247,36 +293,35 @@ impl NoteBuffer {
 
     pub(crate) fn backspace(&mut self) {
         if self.col > 0 {
-            let prev = self.lines[self.row]
-                .char_indices()
-                .nth(self.col - 1)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
             let at = self.cursor_byte();
+            let prev = grapheme_bounds(&self.lines[self.row])
+                .into_iter()
+                .rfind(|b| *b < at)
+                .unwrap_or_default();
             self.lines[self.row].replace_range(prev..at, "");
-            self.col -= 1;
+            self.set_cursor_byte(prev);
         } else if self.row > 0 {
             let line = self.lines.remove(self.row);
             self.row -= 1;
-            self.col = self.line_len();
+            let seam = self.lines[self.row].len();
             self.lines[self.row].push_str(&line);
+            self.set_cursor_byte(seam);
         }
     }
 
     pub(crate) fn delete(&mut self) {
+        let at = self.cursor_byte();
         if self.col < self.line_len() {
-            let at = self.cursor_byte();
-            let line = &self.lines[self.row];
-            let next = line[at..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| at + i)
-                .unwrap_or(line.len());
+            let next = grapheme_bounds(&self.lines[self.row])
+                .into_iter()
+                .find(|b| *b > at)
+                .unwrap_or(self.lines[self.row].len());
             self.lines[self.row].replace_range(at..next, "");
         } else if self.row + 1 < self.lines.len() {
             let next = self.lines.remove(self.row + 1);
             self.lines[self.row].push_str(&next);
         }
+        self.set_cursor_byte(at);
     }
 
     pub(crate) fn left(&mut self) {
@@ -326,51 +371,15 @@ impl NoteBuffer {
             self.backspace();
             return;
         }
-        let chars: Vec<char> = self.lines[self.row].chars().collect();
-        let mut start = self.col;
-        while start > 0 && chars[start - 1].is_whitespace() {
-            start -= 1;
-        }
-        while start > 0 && !chars[start - 1].is_whitespace() {
-            start -= 1;
-        }
-        let from_byte = chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>();
         let at = self.cursor_byte();
-        self.lines[self.row].replace_range(from_byte..at, "");
-        self.col = start;
-    }
-}
-
-/// Display width of the first `cols` chars of a line: wide (CJK/fullwidth/
-/// emoji-range) chars take two cells, everything else one. The usage pane's
-/// rows are ASCII-bound; the editor's caret is what must land right on the
-/// lines that are not.
-fn display_col(line: &str, cols: usize) -> usize {
-    line.chars().take(cols).map(char_display_width).sum()
-}
-
-fn char_display_width(c: char) -> usize {
-    let u = c as u32;
-    if matches!(u,
-        0x1100..=0x115F
-            | 0x2E80..=0x303E
-            | 0x3041..=0x33FF
-            | 0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xA000..=0xA4CF
-            | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF
-            | 0xFE10..=0xFE19
-            | 0xFE30..=0xFE6F
-            | 0xFF00..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x1F300..=0x1F64F
-            | 0x1F900..=0x1F9FF
-            | 0x20000..=0x3FFFD,
-    ) {
-        2
-    } else {
-        1
+        let head = self.lines[self.row][..at].trim_end();
+        let start = head
+            .char_indices()
+            .rfind(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let start = snap_to_grapheme(&self.lines[self.row], start);
+        self.lines[self.row].replace_range(start..at, "");
+        self.set_cursor_byte(start);
     }
 }
 
