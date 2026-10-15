@@ -1418,7 +1418,8 @@ impl Daemon {
             cfg.clone()
         };
         // `false`: hide disabled accounts by default, matching `status_oneshot`.
-        let body = build_status(&cfg_snap, interval, Some(&live), false);
+        let (body, codex) =
+            status_json::build_status_with_codex(&cfg_snap, interval, Some(&live), false);
         match serde_json::to_vec_pretty(&body) {
             Ok(json) => {
                 if let Err(e) = atomic_write_600(&self.status_path, &json) {
@@ -1427,8 +1428,12 @@ impl Daemon {
             }
             Err(e) => logline!("clauth daemon: failed to serialize status.json: {e}"),
         }
-        self.ring_bells(&body.profiles, cfg_snap.state.bell_command.as_deref());
-        self.queue_pushes(&cfg_snap, &body.profiles);
+        self.ring_bells(
+            &cfg_snap.profiles,
+            &body.profiles,
+            cfg_snap.state.bell_command.as_deref(),
+        );
+        self.queue_pushes(&cfg_snap, &body.profiles, codex.as_ref());
     }
 
     /// Hand the push sender what this body changed: an account entering a
@@ -1441,19 +1446,21 @@ impl Daemon {
     /// switches it at (`fallback::snapshot_codex_chain`: the default 5h
     /// threshold, the codex weekly line). Nothing is queued while the API is
     /// off.
-    fn queue_pushes(&mut self, config: &AppConfig, entries: &[status_json::ProfileEntry]) {
+    fn queue_pushes(
+        &mut self,
+        config: &AppConfig,
+        entries: &[status_json::ProfileEntry],
+        codex: Option<&crate::codex_profiles::CodexState>,
+    ) {
         let Some(queue) = &self.push else { return };
         let fresh_status = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
         let auth_expired = status_json::fetch_status_str(crate::usage::FetchStatus::AuthExpired);
         let chain_weekly = config.state.weekly_switch_threshold_pct();
-        let codex = entries
-            .iter()
-            .any(|entry| entry.harness == crate::harness::Harness::Codex.as_str())
-            .then(|| crate::codex_profiles::CodexState::load().unwrap_or_default());
-        let codex_member = |name: &crate::profile::ProfileName| {
-            codex
-                .as_ref()
-                .filter(|codex| codex.fallback_chain().contains(name))
+        let codex_member = |entry: &status_json::ProfileEntry| {
+            codex.filter(|codex| {
+                entry.harness == crate::harness::Harness::Codex.as_str()
+                    && codex.fallback_chain().contains(&entry.name)
+            })
         };
         let util = |entry: &status_json::ProfileEntry, label: &str| {
             entry
@@ -1471,9 +1478,7 @@ impl Daemon {
                     .fallback
                     .as_ref()
                     .map(|fallback| fallback.threshold)
-                    .or_else(|| {
-                        codex_member(&entry.name).map(|_| crate::fallback::DEFAULT_THRESHOLD)
-                    }),
+                    .or_else(|| codex_member(entry).map(|_| crate::fallback::DEFAULT_THRESHOLD)),
                 util: util(entry, crate::usage::LABEL_5H),
             },
             seven_day: crate::push::WindowReading {
@@ -1483,13 +1488,26 @@ impl Daemon {
                     .and(config.find(&entry.name))
                     .map(|profile| crate::fallback::member_weekly_line(profile, chain_weekly))
                     .or_else(|| {
-                        codex_member(&entry.name)
+                        codex_member(entry)
                             .map(crate::codex_profiles::CodexState::weekly_switch_threshold_pct)
                     }),
                 util: util(entry, crate::usage::LABEL_7D),
             },
             fresh: !entry.stale && entry.fetch_status.as_deref() == Some(fresh_status),
         });
+        // Forget against the ROSTER, not the published body: a disabled account
+        // is hidden from the body but is still an account, so its latches must
+        // survive the hide. The whole forget runs only when the codex roster
+        // read succeeded this tick — a failed read must not forget any name on
+        // a guess (codex names in particular); the next good tick forgets them.
+        if let Some(codex) = codex {
+            let roster = config
+                .profiles
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .chain(codex.profiles().iter().map(|name| name.as_str()));
+            self.push_latches.forget_absent(roster);
+        }
         for trigger in self.push_latches.observe(readings) {
             queue.send(trigger);
         }
@@ -1499,9 +1517,21 @@ impl Daemon {
     /// published so the bell and the feed never disagree. With no
     /// `bell_command` the latch is left as it is,
     /// so setting one mid-crossing does not re-announce a bell already rung.
-    fn ring_bells(&mut self, entries: &[status_json::ProfileEntry], command: Option<&str>) {
+    fn ring_bells(
+        &mut self,
+        roster: &[crate::profile::Profile],
+        entries: &[status_json::ProfileEntry],
+        command: Option<&str>,
+    ) {
         let Some(command) = command else { return };
         let fresh_status = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
+        // Forget against the ROSTER, not the published body: a disabled account
+        // is hidden from the body but is still an account, so its standing bell
+        // must not re-arm when it comes back into view. Only a deleted account
+        // forgets. Codex has no `bell_threshold`, so the claude roster is the
+        // whole bell population.
+        let present: HashSet<&str> = roster.iter().map(|profile| profile.name.as_str()).collect();
+        self.bells.forget_absent(&present);
         for entry in entries {
             let fresh = !entry.stale && entry.fetch_status.as_deref() == Some(fresh_status);
             let util = entry

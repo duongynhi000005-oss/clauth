@@ -708,33 +708,50 @@ pub(crate) fn build_status(
     live: Option<&LiveSignals>,
     include_disabled: bool,
 ) -> StatusBody {
+    build_status_with_codex(config, interval_ms, live, include_disabled).0
+}
+
+/// [`build_status`] that also hands back the codex state it read, so the one
+/// daemon tick that both publishes the body and judges its pushes reads the
+/// roster once rather than twice (two reads can disagree mid-tick). `None` when
+/// the read failed: the body still publishes an empty codex roster, but the
+/// caller must not forget codex names on a guess that tick.
+pub(crate) fn build_status_with_codex(
+    config: &AppConfig,
+    interval_ms: u64,
+    live: Option<&LiveSignals>,
+    include_disabled: bool,
+) -> (StatusBody, Option<crate::codex_profiles::CodexState>) {
     let mut profiles = build_profile_entries(config, interval_ms, live, include_disabled);
     // One read feeds both the entries and the slots below, so a load error
     // publishes an empty roster AND empty slots rather than a body whose two
     // halves describe different files.
-    let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    let codex = crate::codex_profiles::CodexState::load().ok();
+    let fallback = crate::codex_profiles::CodexState::default();
+    let body_codex = codex.as_ref().unwrap_or(&fallback);
     // Appended, never interleaved: a reader that predates codex takes the
     // prefix it always took.
-    profiles.extend(build_codex_entries(&codex, interval_ms));
+    profiles.extend(build_codex_entries(body_codex, interval_ms));
     // Stamped after the entries build (each entry reads its own clock) so
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();
 
-    StatusBody {
+    let body = StatusBody {
         schema: SCHEMA_VERSION,
         generated_at: iso_from_ms(now),
         active_profile: config.state.active_profile.as_deref().map(str::to_string),
         pending_switch: live.and_then(|s| s.pending_switch).map(str::to_string),
         wrap_off: config.state.switch_off_when_spent,
-        active_codex_profile: codex.active_profile().map(|n| n.as_str().to_string()),
-        codex_fallback_chain: codex.fallback_chain().to_vec(),
-        codex_wrap_off: codex.switch_off_when_spent(),
+        active_codex_profile: body_codex.active_profile().map(|n| n.as_str().to_string()),
+        codex_fallback_chain: body_codex.fallback_chain().to_vec(),
+        codex_wrap_off: body_codex.switch_off_when_spent(),
         refresh_interval_ms: interval_ms,
         clauth_version: env!("CARGO_PKG_VERSION").to_string(),
         gateway: Some(slot_or_record(live.and_then(|s| s.gateway))),
         proxies: super::proxies::entries(live.and_then(|s| s.proxies)),
         profiles,
-    }
+    };
+    (body, codex)
 }
 
 #[cfg(test)]

@@ -13,9 +13,9 @@
 //! daemon's tick nor the herdr follower ever waits on a push service. A push
 //! goes only to a row whose device the device list still holds under the
 //! pairing that registered it, whose endpoint still passes the push-host
-//! allowlist at send, and whose event set names the event; a global cap bounds
-//! the outbound rate whatever the triggers do. The payload is the event kind
-//! and the account name, nothing else.
+//! allowlist at send, and whose event set names the event; each event kind's
+//! own cap bounds the outbound rate whatever the triggers do. The payload is
+//! the event kind and the account name, nothing else.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
@@ -42,10 +42,10 @@ const JWT_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
 /// The aes128gcm record size the header declares. The payload is a few dozen
 /// bytes, so one record always holds it.
 const RECORD_SIZE: u32 = 4096;
-/// The outbound cap: at most this many POSTs per [`CAP_WINDOW`], across every
-/// device and event. A flapping agent or a churn of account states can mint
-/// pushes faster than a phone is worth waking, and a push service throttles a
-/// sender that floods it.
+/// The outbound cap: at most this many POSTs per [`CAP_WINDOW`] per event
+/// kind, across every device. A flapping agent or a churn of account states can
+/// mint pushes faster than a phone is worth waking, and a push service
+/// throttles a sender that floods it.
 const CAP_POSTS: usize = 30;
 const CAP_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// One POST's whole budget, connect to last body byte.
@@ -148,10 +148,6 @@ impl StatusLatches {
         readings: impl IntoIterator<Item = Reading<'a>>,
     ) -> Vec<Trigger> {
         let readings: Vec<Reading<'a>> = readings.into_iter().collect();
-        // An account that left the body is forgotten, so one re-created under
-        // its name and failing from its first body still announces.
-        self.failing
-            .retain(|name| readings.iter().any(|reading| reading.name == name));
         let mut fired = Vec::new();
         for reading in &readings {
             if !reading.failing {
@@ -182,6 +178,18 @@ impl StatusLatches {
             }
         }
         fired
+    }
+
+    /// Forget every latch entry — `failing` plus both window latches — whose
+    /// account is not in `roster`, so an account deleted and re-created under
+    /// the same name announces again. Callers pass the ROSTER (the full account
+    /// set), never the published body: a disabled account is hidden from the
+    /// body but is still an account, so its latches must survive the hide.
+    pub(crate) fn forget_absent<'a>(&mut self, roster: impl IntoIterator<Item = &'a str>) {
+        let roster: HashSet<&str> = roster.into_iter().collect();
+        self.failing.retain(|name| roster.contains(name.as_str()));
+        self.five_hour.forget_absent(&roster);
+        self.seven_day.forget_absent(&roster);
     }
 }
 
@@ -359,11 +367,18 @@ impl std::fmt::Debug for Post {
 /// test drives the whole delivery with no listener.
 pub(crate) type Transport = fn(&Post) -> std::result::Result<u16, &'static str>;
 
-/// The real transport: the crate's shared HTTP agent, bounded per request,
-/// https only, no redirect followed (`max_redirects(0)` hands a 3xx back as
-/// its status), TLS verification as the agent has it, on.
+/// The real transport: the crate's shared HTTP agent, bounded per request.
 pub(crate) fn ureq_transport(post: &Post) -> std::result::Result<u16, &'static str> {
-    let mut request = crate::usage::http_agent().post(&post.url);
+    send_with_agent(crate::usage::http_agent(), post)
+}
+
+/// The one request-config path, shared by production and the no-redirect test:
+/// `agent` supplies the transport and its trust store (production's shared one,
+/// a test's loopback-trusting one). https only, no redirect followed
+/// (`max_redirects(0)` hands a 3xx back as its status), TLS verification as the
+/// agent has it, on.
+fn send_with_agent(agent: &ureq::Agent, post: &Post) -> std::result::Result<u16, &'static str> {
+    let mut request = agent.post(&post.url);
     for (name, value) in &post.headers {
         request = request.header(*name, value);
     }
@@ -392,8 +407,10 @@ fn failure_kind(e: &ureq::Error) -> &'static str {
     }
 }
 
-/// The outbound cap's sliding window.
+/// One event kind's outbound cap: a sliding window of its own, so a flood of
+/// one kind leaves the other kinds' budgets untouched.
 pub(crate) struct RateCap {
+    kind: PushEvent,
     sent: VecDeque<Instant>,
     limit: usize,
     window: Duration,
@@ -402,8 +419,9 @@ pub(crate) struct RateCap {
 }
 
 impl RateCap {
-    pub(crate) fn new(limit: usize, window: Duration) -> Self {
+    pub(crate) fn new(kind: PushEvent, limit: usize, window: Duration) -> Self {
         Self {
+            kind,
             sent: VecDeque::new(),
             limit,
             window,
@@ -424,10 +442,12 @@ impl RateCap {
             if !self.noted {
                 self.noted = true;
                 logline!(
-                    "clauth push: {} pushes in the last {} minutes; dropping pushes until the \
-                     rate falls",
+                    "clauth push: {} {} pushes in the last {} minutes; dropping {} pushes until \
+                     the rate falls",
                     self.limit,
-                    self.window.as_secs() / 60
+                    self.kind.as_str(),
+                    self.window.as_secs() / 60,
+                    self.kind.as_str()
                 );
             }
             return false;
@@ -443,15 +463,33 @@ pub(crate) struct Sender {
     transport: Transport,
     /// Resolves a blocked pane to the profile it spends.
     herdr_probe: PaneProbe,
-    cap: RateCap,
+    blocked: RateCap,
+    account: RateCap,
+    window: RateCap,
 }
 
 impl Sender {
-    pub(crate) fn new(transport: Transport, herdr_probe: PaneProbe, cap: RateCap) -> Self {
+    pub(crate) fn new(
+        transport: Transport,
+        herdr_probe: PaneProbe,
+        posts: usize,
+        window: Duration,
+    ) -> Self {
         Self {
             transport,
             herdr_probe,
-            cap,
+            blocked: RateCap::new(PushEvent::Blocked, posts, window),
+            account: RateCap::new(PushEvent::Account, posts, window),
+            window: RateCap::new(PushEvent::Window, posts, window),
+        }
+    }
+
+    /// The trigger's kind's own cap.
+    fn cap_mut(&mut self, event: PushEvent) -> &mut RateCap {
+        match event {
+            PushEvent::Blocked => &mut self.blocked,
+            PushEvent::Account => &mut self.account,
+            PushEvent::Window => &mut self.window,
         }
     }
 
@@ -516,7 +554,7 @@ impl Sender {
                 return;
             }
         };
-        if !self.cap.admit(Instant::now()) {
+        if !self.cap_mut(trigger.event()).admit(Instant::now()) {
             return;
         }
         match (self.transport)(&post) {
@@ -606,11 +644,7 @@ impl Queue {
 /// Start the sending thread for the daemon's life.
 pub(crate) fn spawn(herdr_probe: PaneProbe) -> Result<Queue> {
     let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
-    let sender = Sender::new(
-        ureq_transport,
-        herdr_probe,
-        RateCap::new(CAP_POSTS, CAP_WINDOW),
-    );
+    let sender = Sender::new(ureq_transport, herdr_probe, CAP_POSTS, CAP_WINDOW);
     std::thread::Builder::new()
         .name("clauth-push".to_string())
         .spawn(move || run(sender, &rx))

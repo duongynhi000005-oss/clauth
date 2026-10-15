@@ -199,7 +199,8 @@ mod delivery {
         Sender::new(
             recording,
             crate::daemon::api::panes::absent_probe(),
-            RateCap::new(30, Duration::from_secs(600)),
+            30,
+            Duration::from_secs(600),
         )
     }
 
@@ -349,7 +350,7 @@ mod delivery {
             _ => crate::daemon::api::panes::HerdrProbeOut::Ran(None),
         }
         });
-        let mut sender = Sender::new(recording, probe, RateCap::new(30, Duration::from_secs(600)));
+        let mut sender = Sender::new(recording, probe, 30, Duration::from_secs(600));
 
         sender.deliver(&Trigger::Blocked {
             pane_id: "w1:p2".to_string(),
@@ -474,7 +475,7 @@ mod delivery {
 
     #[test]
     fn the_outbound_cap_admits_its_limit_per_window() {
-        let mut cap = RateCap::new(2, Duration::from_secs(60));
+        let mut cap = RateCap::new(PushEvent::Account, 2, Duration::from_secs(60));
         let t0 = Instant::now();
 
         let admitted = [
@@ -534,7 +535,8 @@ mod delivery {
         let mut sender = Sender::new(
             recording,
             crate::daemon::api::panes::absent_probe(),
-            RateCap::new(2, Duration::from_secs(600)),
+            2,
+            Duration::from_secs(600),
         );
 
         for _ in 0..3 {
@@ -544,6 +546,66 @@ mod delivery {
         }
 
         assert_eq!(taken().len(), 2);
+    }
+
+    #[test]
+    fn a_flood_of_one_kind_leaves_every_other_kind_its_own_budget() {
+        let _home = HomeSandbox::new();
+        let ctx = ctx();
+        subscribe(
+            &ctx,
+            OTHER_TOKEN,
+            PHONE_ENDPOINT,
+            r#"["blocked","account","window"]"#,
+        );
+        let mut sender = Sender::new(
+            recording,
+            crate::daemon::api::panes::absent_probe(),
+            2,
+            Duration::from_secs(600),
+        );
+        let lines = crate::logline::LogLines::new();
+        let _capture = lines.capture_here();
+
+        let mut posted = Vec::new();
+        for (trigger, rounds) in [
+            // A flapping pane, a churning account, then one window crossing.
+            (
+                Trigger::Blocked {
+                    pane_id: "w1:p2".to_string(),
+                },
+                3,
+            ),
+            (
+                Trigger::Account {
+                    profile: "alpha".to_string(),
+                },
+                3,
+            ),
+            (
+                Trigger::Window {
+                    profile: "alpha".to_string(),
+                },
+                1,
+            ),
+        ] {
+            for _ in 0..rounds {
+                sender.deliver(&trigger);
+            }
+            posted.push(taken().len());
+        }
+
+        assert_eq!(posted, [2, 2, 1], "each kind spends its own cap");
+        assert_eq!(
+            lines.snapshot(),
+            [
+                "clauth push: 2 blocked pushes in the last 10 minutes; dropping blocked pushes \
+                 until the rate falls",
+                "clauth push: 2 account pushes in the last 10 minutes; dropping account pushes \
+                 until the rate falls",
+            ],
+            "a full cap names its kind, once per stretch"
+        );
     }
 }
 
@@ -605,18 +667,65 @@ fn both_windows_crossing_in_one_body_push_once() {
     );
 }
 
-#[test]
-fn an_account_gone_from_the_body_announces_again_when_it_returns_failing() {
-    let mut latches = StatusLatches::default();
-    let failing = || [reading("alpha", true, 10.0, true)];
+/// An account failing and past both window lines, and a second one past its
+/// weekly line only.
+fn standing() -> [Reading<'static>; 2] {
+    [
+        Reading {
+            seven_day: WindowReading {
+                line: Some(80.0),
+                util: Some(85.0),
+            },
+            ..reading("alpha", true, 95.0, true)
+        },
+        Reading {
+            seven_day: WindowReading {
+                line: Some(80.0),
+                util: Some(85.0),
+            },
+            ..reading("beta", false, 10.0, true)
+        },
+    ]
+}
 
-    let fired = [
-        latches.observe(failing()).len(),
-        latches.observe([]).len(),
-        latches.observe(failing()).len(),
+#[test]
+fn a_deleted_account_announces_each_standing_trigger_again_when_it_returns() {
+    let mut latches = StatusLatches::default();
+    let expected = vec![
+        Trigger::Account {
+            profile: "alpha".to_string(),
+        },
+        Trigger::Window {
+            profile: "alpha".to_string(),
+        },
+        Trigger::Window {
+            profile: "beta".to_string(),
+        },
     ];
 
-    assert_eq!(fired, [1, 0, 1]);
+    let first = latches.observe(standing());
+    // Both deleted from the roster, then re-created under the same names.
+    latches.forget_absent([]);
+    let returned = latches.observe(standing());
+
+    assert_eq!((first, returned), (expected.clone(), expected));
+}
+
+#[test]
+fn a_disabled_account_keeps_its_latches_while_it_is_off_the_body() {
+    let mut latches = StatusLatches::default();
+
+    let fired = [
+        latches.observe(standing()).len(),
+        {
+            // Disabled: still in the roster, gone from the published body.
+            latches.forget_absent(["alpha", "beta"]);
+            latches.observe([]).len()
+        },
+        latches.observe(standing()).len(),
+    ];
+
+    assert_eq!(fired, [3, 0, 0]);
 }
 
 #[test]
@@ -727,4 +836,95 @@ fn the_shared_agent_verifies_tls() {
             .tls_config()
             .disable_verification()
     );
+}
+
+/// The transport hands a 3xx back as its status and never follows it: the
+/// request runs through the SAME `send_with_agent` production calls, only the
+/// agent's trust store differs (it trusts the repo's generated CA), and the
+/// `Location` target is an https bound-but-deaf listener that a follow would
+/// TCP-connect into before timing out, so nothing reaching it goes unseen.
+#[cfg(unix)]
+#[test]
+fn the_transport_returns_a_redirect_status_without_following_it() {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some((paths, ca_crt)) =
+        crate::daemon::api::tests::generate_chain(dir.path()).expect("fixture")
+    else {
+        eprintln!(
+            "SKIPPED the_transport_returns_a_redirect_status_without_following_it: \
+             openssl is not usable here"
+        );
+        return;
+    };
+    let server_tls = crate::daemon::api::tls::server_config_from(&paths).expect("server config");
+    let (deaf, _) = crate::testutil::deaf_listener();
+    let deaf_port = deaf.local_addr().expect("addr").port();
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let port = listener.local_addr().expect("addr").port();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            // Non-blocking accept polled against a deadline: a client that never
+            // connects must fail the test, not hang the scope join in `accept`.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let stream = loop {
+                if Instant::now() > deadline {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
+            let conn = rustls::ServerConnection::new(server_tls).expect("server conn");
+            let mut tls = rustls::StreamOwned::new(conn, stream);
+            let mut buf = [0u8; 4096];
+            let mut seen = 0;
+            while !buf[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
+                match tls.read(&mut buf[seen..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen += n,
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: https://localhost:{deaf_port}/moved\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            tls.write_all(response.as_bytes()).expect("write 301");
+            let _ = tls.flush();
+        });
+
+        let ca_pem = std::fs::read(&ca_crt).expect("read ca");
+        let cert = ureq::tls::Certificate::from_pem(&ca_pem).expect("parse ca");
+        let tls_config = ureq::tls::TlsConfig::builder()
+            .root_certs(ureq::tls::RootCerts::new_with_certs(&[cert]))
+            .build();
+        let agent = ureq::Agent::config_builder()
+            .tls_config(tls_config)
+            .build()
+            .new_agent();
+
+        let answer = send_with_agent(
+            &agent,
+            &Post {
+                url: format!("https://localhost:{port}/push"),
+                headers: Vec::new(),
+                body: b"x".to_vec(),
+            },
+        );
+
+        crate::testutil::assert_nothing_sent(&deaf);
+        assert_eq!(answer, Ok(301), "the 3xx is handed back, never followed");
+    });
 }

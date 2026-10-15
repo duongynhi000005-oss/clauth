@@ -2856,6 +2856,204 @@ fn falling_below_re_arms_the_headless_bell() {
 }
 
 #[test]
+fn an_account_deleted_from_the_roster_re_arms_the_headless_bell() {
+    let _home = HomeSandbox::new();
+    let mut d = bell_daemon(
+        "alpha",
+        90.0,
+        95.0,
+        crate::usage::FetchStatus::Fresh,
+        Some("notify-send %s"),
+    );
+    d.write_status();
+    // Deleted from the roster: the bell forgets it.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+    }
+    d.write_status();
+    // Re-created past the line, it rings again.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        let mut profile = profile_with_creds("alpha", "at-bell");
+        profile.bell_threshold = Some(90.0);
+        cfg.profiles = vec![profile];
+        cfg.state.profiles = vec!["alpha".into()];
+    }
+    d.write_status();
+    assert_eq!(
+        rung(),
+        [
+            (
+                "notify-send %s".to_string(),
+                "alert: alpha at 95%".to_string()
+            ),
+            (
+                "notify-send %s".to_string(),
+                "alert: alpha at 95%".to_string()
+            ),
+        ]
+    );
+}
+
+/// A disabled account is hidden from the body but still on the roster, so its
+/// standing bell must survive the hide: re-enabling it still past the line
+/// rings nothing new. The ringing account is non-active, since the active
+/// profile stays in the body even disabled.
+#[test]
+fn a_disabled_account_keeps_its_headless_bell_while_off_the_body() {
+    let _home = HomeSandbox::new();
+    RUNG.with(|r| r.borrow_mut().clear());
+    let mut alpha = profile_with_creds("alpha", "at-a");
+    alpha.bell_threshold = Some(90.0);
+    let mut beta = profile_with_creds("beta", "at-b");
+    beta.bell_threshold = Some(90.0);
+    let mut config = persist(vec![alpha, beta], Some("alpha"), 60_000);
+    config.state.bell_command = Some("notify-send %s".to_string());
+    write_five_hour("alpha", 10.0);
+    write_five_hour("beta", 95.0);
+    let mut d = daemon_for(config);
+    d.ring_bell = record_ring;
+    for name in ["alpha", "beta"] {
+        d.usage_status
+            .lock()
+            .expect("usage_status")
+            .insert(name.to_string(), crate::usage::FetchStatus::Fresh);
+    }
+    d.write_status();
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == "beta")
+            .expect("beta")
+            .disabled = true;
+    }
+    d.write_status();
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == "beta")
+            .expect("beta")
+            .disabled = false;
+    }
+    d.write_status();
+    assert_eq!(
+        rung(),
+        [(
+            "notify-send %s".to_string(),
+            "alert: beta at 95%".to_string()
+        )]
+    );
+}
+
+/// The same roster semantics for the window push: a disabled account keeps its
+/// window latch while off the body, so re-enabling it still past the line
+/// queues no second push. The crossing account is non-active, since the active
+/// profile stays in the body even disabled.
+#[test]
+fn a_disabled_account_keeps_its_window_latch_while_off_the_body() {
+    let _home = HomeSandbox::new();
+    let mut alpha = profile_with_creds("alpha", "at-a");
+    alpha.fallback_threshold = Some(90.0);
+    let mut beta = profile_with_creds("beta", "at-b");
+    beta.fallback_threshold = Some(90.0);
+    let mut config = persist(vec![alpha, beta], Some("alpha"), 60_000);
+    config.state.fallback_chain = vec!["beta".into()];
+    write_five_hour("alpha", 10.0);
+    write_five_hour("beta", 95.0);
+    let mut d = daemon_for(config);
+    let (queue, inbox) = crate::push::queue_for_tests();
+    d.push = Some(queue);
+    for name in ["alpha", "beta"] {
+        d.usage_status
+            .lock()
+            .expect("usage_status")
+            .insert(name.to_string(), crate::usage::FetchStatus::Fresh);
+    }
+    d.write_status();
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Window {
+            profile: "beta".to_string()
+        }]
+    );
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == "beta")
+            .expect("beta")
+            .disabled = true;
+    }
+    d.write_status();
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == "beta")
+            .expect("beta")
+            .disabled = false;
+    }
+    d.write_status();
+    assert_eq!(inbox.try_iter().collect::<Vec<_>>(), []);
+}
+
+/// A claude chain member deleted from the roster while past its line, then
+/// re-created past the line, queues a second window push: the roster forget in
+/// `queue_pushes` is what dropped its latch in between.
+#[test]
+fn an_account_deleted_from_the_roster_re_arms_its_window_push() {
+    let _home = HomeSandbox::new();
+    let mut alpha = profile_with_creds("alpha", "at-a");
+    alpha.fallback_threshold = Some(90.0);
+    let mut config = persist(vec![alpha], Some("alpha"), 60_000);
+    config.state.fallback_chain = vec!["alpha".into()];
+    write_five_hour("alpha", 95.0);
+    let mut d = daemon_for(config);
+    let (queue, inbox) = crate::push::queue_for_tests();
+    d.push = Some(queue);
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+
+    d.write_status();
+    // Deleted from the roster: the forget drops its window latch.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+        cfg.state.fallback_chain.clear();
+    }
+    d.write_status();
+    // Re-created past the line, it queues a second push.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        let mut profile = profile_with_creds("alpha", "at-a");
+        profile.fallback_threshold = Some(90.0);
+        cfg.profiles = vec![profile];
+        cfg.state.profiles = vec!["alpha".into()];
+        cfg.state.fallback_chain = vec!["alpha".into()];
+    }
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [
+            crate::push::Trigger::Window {
+                profile: "alpha".to_string()
+            },
+            crate::push::Trigger::Window {
+                profile: "alpha".to_string()
+            },
+        ]
+    );
+}
+
+#[test]
 fn a_cached_reading_neither_rings_nor_clears_the_headless_bell() {
     let _home = HomeSandbox::new();
     let mut d = bell_daemon(
@@ -3163,61 +3361,20 @@ fn a_seven_day_window_reaching_the_weekly_line_queues_one_push_across_ticks() {
     );
 }
 
-/// A codex roster entry as `build_codex_entries` publishes one: no claude
-/// `fallback` object, its 5h window at `five_hour`, its 7d at `seven_day`.
-fn codex_entry(name: &str, five_hour: f64, seven_day: f64) -> super::status_json::ProfileEntry {
-    super::status_json::ProfileEntry {
-        name: name.into(),
-        active: false,
-        rolling_token: false,
-        provider: "openai".to_string(),
-        base_url: None,
-        tier: None,
-        harness: crate::harness::Harness::Codex.as_str().to_string(),
-        has_live_session: false,
-        auth_status: "ok".to_string(),
-        fetch_status: Some("Fresh".to_string()),
-        stale: false,
-        fetched_at: None,
-        next_refresh_at: None,
-        auto_start: false,
-        auto_start_queue: None,
-        bell_threshold: None,
-        fallback: None,
-        windows: vec![
-            crate::profile_json::Window {
-                label: crate::usage::LABEL_5H.to_string(),
-                utilization_pct: five_hour,
-                resets_at: None,
-            },
-            crate::profile_json::Window {
-                label: crate::usage::LABEL_7D.to_string(),
-                utilization_pct: seven_day,
-                resets_at: None,
-            },
-        ],
-        third_party: None,
-    }
-}
-
 /// A codex chain member's 7d window is judged at the codex chain's own
-/// weekly line; off that chain it is judged at none.
+/// weekly line; off that chain it is judged at none. The entries come from
+/// `build_status`'s own output over a sandboxed codex cache, never hand-built.
 #[test]
 fn a_codex_member_crossing_the_codex_weekly_line_queues_a_window_push() {
     let _home = HomeSandbox::new();
     let (mut d, inbox) = push_daemon("alpha", 10.0, crate::usage::FetchStatus::Fresh, |_, _| {});
-    let config = d.config.lock().expect("config").clone();
-
     crate::testutil::write_codex_state(
         "profiles = [\"cx\", \"off\"]\nfallback_chain = [\"cx\"]\nweekly_switch_threshold = 80.0\n",
     );
-    d.queue_pushes(
-        &config,
-        &[
-            codex_entry("cx", 10.0, 85.0),
-            codex_entry("off", 99.0, 99.0),
-        ],
-    );
+    crate::testutil::warm_codex_usage("cx", None, 10.0, 85.0);
+    crate::testutil::warm_codex_usage("off", None, 99.0, 99.0);
+
+    d.write_status();
 
     assert_eq!(
         inbox.try_iter().collect::<Vec<_>>(),
@@ -3233,21 +3390,76 @@ fn a_codex_member_crossing_the_codex_weekly_line_queues_a_window_push() {
 fn a_codex_member_reaching_the_codex_5h_line_queues_a_window_push() {
     let _home = HomeSandbox::new();
     let (mut d, inbox) = push_daemon("alpha", 10.0, crate::usage::FetchStatus::Fresh, |_, _| {});
-    let config = d.config.lock().expect("config").clone();
     crate::testutil::write_codex_state("profiles = [\"cx\"]\nfallback_chain = [\"cx\"]\n");
+    crate::testutil::warm_codex_usage("cx", None, 94.0, 10.0);
 
-    d.queue_pushes(&config, &[codex_entry("cx", 94.0, 10.0)]);
+    d.write_status();
     let below = inbox.try_iter().collect::<Vec<_>>();
-    d.queue_pushes(&config, &[codex_entry("cx", 95.0, 10.0)]);
+
+    crate::testutil::warm_codex_usage("cx", None, 95.0, 10.0);
+    d.write_status();
     let at = inbox.try_iter().collect::<Vec<_>>();
 
+    // A third tick still past the line queues nothing: the roster forget that
+    // kept `cx` on its latch is what silences the standing crossing.
+    d.write_status();
+    let still = inbox.try_iter().collect::<Vec<_>>();
+
     assert_eq!(
-        (below, at),
+        (below, at, still),
         (
             Vec::new(),
             vec![crate::push::Trigger::Window {
                 profile: "cx".to_string()
-            }]
+            }],
+            Vec::new(),
         )
     );
+}
+
+/// A failed codex roster read must not forget codex latches on a guess: the
+/// whole forget is skipped that tick, so the crossing stays latched and the
+/// restored roster re-reads silently.
+#[test]
+fn a_failed_codex_roster_read_does_not_forget_codex_latches() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon("alpha", 10.0, crate::usage::FetchStatus::Fresh, |_, _| {});
+    crate::testutil::write_codex_state("profiles = [\"cx\"]\nfallback_chain = [\"cx\"]\n");
+    crate::testutil::warm_codex_usage("cx", None, 95.0, 10.0);
+
+    d.write_status();
+    // One tick where the codex roster cannot be read: the forget must be
+    // skipped wholesale, not run against a claude-only roster.
+    crate::testutil::write_codex_state("not toml [");
+    d.write_status();
+    crate::testutil::write_codex_state("profiles = [\"cx\"]\nfallback_chain = [\"cx\"]\n");
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Window {
+            profile: "cx".to_string()
+        }]
+    );
+}
+
+/// A codex chain that names a claude profile is not a codex membership: the
+/// harness check keeps the claude entry off the codex line, so nothing queues.
+#[test]
+fn a_codex_chain_naming_a_claude_profile_queues_nothing_for_it() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon(
+        "alpha",
+        95.0,
+        crate::usage::FetchStatus::Fresh,
+        |_, config| {
+            config.state.fallback_chain.clear();
+        },
+    );
+    crate::testutil::write_codex_state("profiles = []\nfallback_chain = [\"alpha\"]\n");
+
+    d.write_status();
+    d.write_status();
+
+    assert_eq!(inbox.try_iter().collect::<Vec<_>>(), []);
 }

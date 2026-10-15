@@ -1211,6 +1211,33 @@ pub(crate) fn write_codex_roster(names: &[&str]) {
     write_codex_state(&format!("profiles = [{list}]\n"));
 }
 
+/// Warm codex `name`'s usage cache in the shape the codex leg writes: the plan
+/// in `codex_plan` (when `plan` is `Some`), never `tier`. The codex roster must
+/// already hold `name` — `warm_usage` would put it on the claude roster instead.
+pub(crate) fn warm_codex_usage(name: &str, plan: Option<&str>, five_h: f64, seven_d: f64) {
+    let usage = crate::usage::UsageInfo {
+        plan: plan.map(|plan| crate::usage::PlanInfo {
+            codex_plan: Some(plan.to_string()),
+            ..crate::usage::PlanInfo::default()
+        }),
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: five_h,
+            resets_at: None,
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: seven_d,
+            resets_at: None,
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+}
+
 /// Another clauth process inside its state-flock hold: a second open file
 /// description of the lock file, flocked. Call under a [`HomeSandbox`]; drop it
 /// to release.

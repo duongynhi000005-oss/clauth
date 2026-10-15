@@ -5410,6 +5410,13 @@ impl App {
             (bells, history_names, wallet_names, stale_map)
         };
         self.stale_cues = stale_map;
+        // `bells` is the full profile set this pass observed, so an account
+        // deleted while ringing forgets and re-arms if re-created past the line.
+        {
+            let present: HashSet<&str> =
+                bells.iter().map(|(name, _, _, _)| name.as_str()).collect();
+            self.bell_fired.forget_absent(&present);
+        }
         for (name, threshold, util, fresh) in bells {
             if let Some(message) = self.bell_fired.observe(&name, threshold, util, fresh) {
                 self.toast(ToastKind::Warning, message);

@@ -13783,6 +13783,41 @@ fn apply_usage_fresh_status_fires_bell_and_never_writes_history() {
     );
 }
 
+/// `apply_usage` sees the full profile set each tick, so an account deleted
+/// while ringing forgets its bell and re-arms if re-created past the line.
+#[test]
+fn an_account_gone_from_the_overview_re_arms_its_bell() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _) = gate_app(&_home, FetchStatus::Fresh);
+
+    app.apply_usage();
+    assert!(
+        app.bell_fired.is_ringing(GATE_PROFILE),
+        "Fresh + util over threshold must ring the bell",
+    );
+
+    // The overview no longer holds the account: the bell forgets it.
+    {
+        let mut cfg = app.config();
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+    }
+    app.apply_usage();
+    assert!(!app.bell_fired.is_ringing(GATE_PROFILE));
+
+    // Re-created past the line, it rings again.
+    {
+        let mut cfg = app.config();
+        let mut profile =
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from(GATE_PROFILE));
+        profile.bell_threshold = Some(GATE_THRESHOLD);
+        cfg.profiles = vec![profile];
+        cfg.state.profiles = vec![crate::profile::ProfileName::from(GATE_PROFILE)];
+    }
+    app.apply_usage();
+    assert!(app.bell_fired.is_ringing(GATE_PROFILE));
+}
+
 /// The wallet series' TUI wiring, end to end on disk: `App::new` loads it at
 /// bootstrap, and `apply_usage` re-reads it when the file's content moves —
 /// the carrier the usage tab's balance-row clause and the overview's drains
