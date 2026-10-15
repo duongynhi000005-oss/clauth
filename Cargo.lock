@@ -374,6 +374,7 @@ dependencies = [
  "os_info",
  "ratatui",
  "regex",
+ "ring",
  "rmcp",
  "rpassword",
  "rustls",

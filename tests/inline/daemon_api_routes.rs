@@ -418,6 +418,10 @@ fn the_route_table_is_exactly_this() {
             ("HEAD", "/gateway", Access::View),
             ("GET", "/proxies", Access::View),
             ("HEAD", "/proxies", Access::View),
+            ("GET", "/push/key", Access::View),
+            ("HEAD", "/push/key", Access::View),
+            ("PUT", "/push/subscription", Access::View),
+            ("DELETE", "/push/subscription", Access::View),
         ]
     );
 }
@@ -487,6 +491,10 @@ fn the_template_matcher_binds_one_segment_decoded_and_nothing_else() {
 
 // -------------------------------------------------------------- openapi
 
+/// A subscription the push routes accept: RFC 8291's example browser keys on
+/// an allowed push host.
+const PUSH_SUBSCRIPTION: &str = r#"{"endpoint":"https://fcm.googleapis.com/fcm/send/abc","keys":{"p256dh":"BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4","auth":"BTBZMqHH6r4Tts7J_aSIgg"}}"#;
+
 /// The operation the document emits for one table row.
 fn doc_operation<'a>(
     doc: &'a utoipa::openapi::OpenApi,
@@ -497,6 +505,8 @@ fn doc_operation<'a>(
         "GET" => utoipa::openapi::path::HttpMethod::Get,
         "HEAD" => utoipa::openapi::path::HttpMethod::Head,
         "POST" => utoipa::openapi::path::HttpMethod::Post,
+        "PUT" => utoipa::openapi::path::HttpMethod::Put,
+        "DELETE" => utoipa::openapi::path::HttpMethod::Delete,
         _ => return None,
     };
     doc.paths
@@ -1543,6 +1553,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/panes/{id}/keys"),
         ("GET", "/gateway"),
         ("GET", "/proxies"),
+        ("GET", "/push/key"),
+        ("PUT", "/push/subscription"),
+        ("DELETE", "/push/subscription"),
     ] {
         let resp = call(&ctx, &req(method, &concrete(path), None, ""));
         check_answer(&doc, method, path, 401, &resp, &mut driven, &mut produced);
@@ -1596,6 +1609,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/panes/{id}/keys"),
         ("GET", "/gateway"),
         ("GET", "/proxies"),
+        ("GET", "/push/key"),
+        ("PUT", "/push/subscription"),
+        ("DELETE", "/push/subscription"),
     ] {
         let body = if method == "POST" {
             r#"{"profile":"beta"}"#
@@ -1824,6 +1840,19 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         );
         check_answer(&doc, "POST", path, 503, &resp, &mut driven, &mut produced);
     }
+    // The push routes take the same flock: a subscription write or drop, and
+    // the key's first mint (nothing above has minted it yet).
+    for (method, path, body) in [
+        ("GET", "/push/key", ""),
+        ("PUT", "/push/subscription", PUSH_SUBSCRIPTION),
+        ("DELETE", "/push/subscription", ""),
+    ] {
+        let resp = call(
+            &ctx,
+            &req(method, &format!("{API_PREFIX}{path}"), Some(TOKEN), body),
+        );
+        check_answer(&doc, method, path, 503, &resp, &mut driven, &mut produced);
+    }
     let pair_locked = call(&ctx, &req("POST", "/api/v1/pair", None, &pair_body2));
     check_answer(
         &doc,
@@ -1836,6 +1865,33 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     );
     crate::lock::set_state_lock_timeout_override(None);
     drop(holder);
+
+    // The push routes past the flock: the key, a registration and its
+    // refusals, a drop, and a drop with nothing left to drop.
+    let off_allowlist =
+        PUSH_SUBSCRIPTION.replace("https://fcm.googleapis.com", "https://evil.example");
+    for (method, path, body, status) in [
+        ("GET", "/push/key", "", 200),
+        ("PUT", "/push/subscription", PUSH_SUBSCRIPTION, 200),
+        ("PUT", "/push/subscription", "{}", 400),
+        ("PUT", "/push/subscription", off_allowlist.as_str(), 400),
+        ("DELETE", "/push/subscription", "", 200),
+        ("DELETE", "/push/subscription", "", 404),
+    ] {
+        let resp = call(
+            &ctx,
+            &req(method, &format!("{API_PREFIX}{path}"), Some(TOKEN), body),
+        );
+        check_answer(
+            &doc,
+            method,
+            path,
+            status,
+            &resp,
+            &mut driven,
+            &mut produced,
+        );
+    }
 
     // A second switch while one is in flight answers 409 switch_in_progress,
     // the gate held the way a_second_concurrent_switch_is_refused_immediately
@@ -2020,6 +2076,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/panes/{id}/keys"),
         ("GET", "/gateway"),
         ("GET", "/proxies"),
+        ("GET", "/push/key"),
+        ("PUT", "/push/subscription"),
+        ("DELETE", "/push/subscription"),
     ] {
         let body = if method == "POST" {
             r#"{"profile":"beta"}"#
@@ -2234,8 +2293,9 @@ fn a_view_device_is_refused_every_control_route() {
 }
 
 /// Every view row answers 200 to a view device with an empty query: an empty
-/// store lists zero sessions, and the one templated view row pages the
-/// fixture transcript seeded under [`FIXTURE_ID`].
+/// store lists zero sessions, the one templated view row pages the fixture
+/// transcript seeded under [`FIXTURE_ID`], and the push subscription's PUT
+/// carries a subscription its DELETE then drops.
 #[test]
 fn a_view_device_reads_every_view_route() {
     let _home = HomeSandbox::new();
@@ -2243,9 +2303,14 @@ fn a_view_device_reads_every_view_route() {
     seed_device("phone", Tier::View, OTHER_TOKEN);
     seed_history_transcript();
     for route in ROUTES.iter().filter(|route| route.access == Access::View) {
+        let body = if route.method == "PUT" {
+            PUSH_SUBSCRIPTION
+        } else {
+            ""
+        };
         let resp = call(
             &ctx,
-            &req(route.method, &route_path(route), Some(OTHER_TOKEN), ""),
+            &req(route.method, &route_path(route), Some(OTHER_TOKEN), body),
         );
         assert_eq!(resp.status, 200, "{} {}", route.method, route.path);
     }

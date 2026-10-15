@@ -35,6 +35,7 @@ pub(crate) mod http;
 pub(crate) mod pairing;
 pub(crate) mod panes;
 pub(crate) mod proxies;
+pub(crate) mod push;
 pub(crate) mod routes;
 pub(crate) mod sessions;
 pub(crate) mod terminal;
