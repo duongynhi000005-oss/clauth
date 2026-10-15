@@ -212,7 +212,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `preferred` | bool | `false` | the home account clauth returns to once it is clear |
 | `preferred_days` | string array | `[]` | weekdays this account is home, in local time; claims those days against every account, while `preferred` keeps the days no list claims |
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
-| `bell_threshold` | float | none | 5h % at which the TUI shows an alert toast and the daemon runs `bell_command`: once per crossing, again only after usage falls back below. The Setup tab's `alert at` row edits it |
+| `bell_threshold` | float | none | 5h % at which the TUI shows an alert toast and the daemon runs `bell_command`: once per crossing, again only after usage falls back below or the account is deleted and re-created. The Setup tab's `alert at` row edits it |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `clauth rolling-token`, cleared by `clauth static-token` (bare or `--clear`) |
 | `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active |
 | `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent` |
@@ -245,6 +245,8 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   status.json              # the daemon's published snapshot (see Daemon)
   devices.json             # devices paired with the REST API: name, tier, sessions grant, a SHA-256 of each token (0600)
   pairing.json             # the waiting pairing code's SHA-256 while `clauth devices pair` runs (0600)
+  push-vapid-key.der       # the daemon's VAPID signing key (P-256 PKCS#8), minted once on first use (0600)
+  push-subscriptions.json  # one push subscription row per device: endpoint, p256dh, auth, the event set (0600)
   tls.json                 # REST API certificate directory, written on the first `--listen` start
   session_profiles.json    # which account each Claude Code session ran on
   token_ledger.json        # the per-day token ledger behind the Tokens tab
