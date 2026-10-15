@@ -5077,18 +5077,21 @@ fn the_cli_failure_keeps_the_cause_chain() {
 
     let mut config = load_config().expect("config");
     // Replace D0's config.toml with a directory: the fresh read in the apply
-    // fails with "Is a directory".
+    // fails with the platform's own reason for reading a directory.
     let cfg_path = crate::profile::profile_dir(&ProfileName::from("D0"))
         .expect("profile dir")
         .join("config.toml");
     std::fs::remove_file(&cfg_path).expect("remove config.toml");
     std::fs::create_dir(&cfg_path).expect("directory at config.toml");
+    let os_cause = crate::testutil::directory_read_error(&cfg_path);
 
     let err = run_presets_rebind(&mut config, &[], true).expect_err("D0 unreadable");
     let partial = err.downcast::<RebindPartial>().expect("partial");
     assert_eq!(
         partial.failures,
-        ["re-bind failed for 'D0': failed to read D0/config.toml: Is a directory (os error 21)"],
+        [format!(
+            "re-bind failed for 'D0': failed to read D0/config.toml: {os_cause}"
+        )],
         "the failure keeps the OS cause",
     );
     assert_eq!(
@@ -5117,6 +5120,7 @@ fn rows_saved_before_a_settings_failure_still_count_as_moved() {
     let settings = _home.home().join(".claude").join("settings.json");
     std::fs::create_dir_all(settings.parent().expect("parent")).expect("mkdir .claude");
     std::fs::create_dir(&settings).expect("directory at settings.json");
+    let os_cause = crate::testutil::directory_read_error(&settings);
 
     let mut config = load_config().expect("config");
     let err = run_presets_rebind(&mut config, &[], true).expect_err("settings re-apply fails");
@@ -5128,7 +5132,7 @@ fn rows_saved_before_a_settings_failure_still_count_as_moved() {
     assert_eq!(
         partial.failures,
         [format!(
-            "re-bind failed for 'D0': failed to read {}: Is a directory (os error 21)",
+            "re-bind failed for 'D0': failed to read {}: {os_cause}",
             settings.display()
         )],
         "the failure names D0 with the settings cause",

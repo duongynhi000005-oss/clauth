@@ -33652,6 +33652,7 @@ fn rebind_settings_failure_after_the_save_still_toasts_the_moved_rows() {
     let settings = _home.home().join(".claude").join("settings.json");
     std::fs::create_dir_all(settings.parent().expect("parent")).expect("mkdir .claude");
     std::fs::create_dir(&settings).expect("directory at settings.json");
+    let os_cause = crate::testutil::directory_read_error(&settings);
 
     let mut app = App::new(AppConfig {
         state: AppState {
@@ -33665,7 +33666,7 @@ fn rebind_settings_failure_after_the_save_still_toasts_the_moved_rows() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert!(app.modals.is_empty());
     let err_line = format!(
-        "re-bind failed for 'D1'\nfailed to read {}: Is a directory (os error 21)",
+        "re-bind failed for 'D1'\nfailed to read {}: {os_cause}",
         settings.display()
     );
     assert_eq!(

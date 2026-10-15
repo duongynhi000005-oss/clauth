@@ -1440,6 +1440,15 @@ pub(crate) fn write_adopted_record(
     record
 }
 
+/// The platform's own reason for reading `dir` as a file ("Is a directory" on
+/// unix, "Access is denied." on Windows), for a fixture that plants a
+/// directory where the code under test reads one and pins the OS cause.
+pub(crate) fn directory_read_error(dir: &Path) -> String {
+    std::fs::read_to_string(dir)
+        .expect_err("a directory does not read")
+        .to_string()
+}
+
 /// Overwrite a file's modification time — for cache-staleness / tie-break tests.
 ///
 /// The open retries while Windows reports a sharing violation: an open landing
