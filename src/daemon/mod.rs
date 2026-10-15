@@ -475,6 +475,7 @@ pub(crate) fn serve(
             daemon.live_stores(),
             daemon.memory_stores(),
         )?;
+        daemon.push = api::start_push();
     }
 
     // After the listener, the last start step that can fail, so a start that
@@ -1093,6 +1094,10 @@ struct Daemon {
     day_claim_notices: Vec<String>,
     /// The headless bell's latch over the published `profiles[]` figures.
     bells: crate::bell::BellLatch,
+    /// The push sender's inbox, while the REST API serves; `None` otherwise.
+    push: Option<crate::push::Queue>,
+    /// The account and window latches each published body moves.
+    push_latches: crate::push::StatusLatches,
     /// Runs `bell_command`; a seam so tests record the ring instead.
     ring_bell: fn(&str, &str) -> anyhow::Result<()>,
     status_path: PathBuf,
@@ -1146,6 +1151,8 @@ impl Daemon {
             switch_failure_logs: 0,
             day_claim_notices: Vec::new(),
             bells: crate::bell::BellLatch::default(),
+            push: None,
+            push_latches: crate::push::StatusLatches::default(),
             ring_bell: crate::bell::run_command,
             status_path,
             gateway: gateway::new_handle(),
@@ -1421,6 +1428,71 @@ impl Daemon {
             Err(e) => logline!("clauth daemon: failed to serialize status.json: {e}"),
         }
         self.ring_bells(&body.profiles, cfg_snap.state.bell_command.as_deref());
+        self.queue_pushes(&cfg_snap, &body.profiles);
+    }
+
+    /// Hand the push sender what this body changed: an account entering a
+    /// failed login or key state (`broken`: a refresh rejected as revoked or
+    /// invalid; `AuthExpired`: a provider rejected the usage credential; an
+    /// `expired` access token only waits for its rotation), and a chain
+    /// member's window reaching the line the chain switches it at, on a fresh
+    /// reading, the bell's own rule: the 5h window at its `threshold`, the 7d
+    /// at its weekly line; a codex chain member at the lines the codex chain
+    /// switches it at (`fallback::snapshot_codex_chain`: the default 5h
+    /// threshold, the codex weekly line). Nothing is queued while the API is
+    /// off.
+    fn queue_pushes(&mut self, config: &AppConfig, entries: &[status_json::ProfileEntry]) {
+        let Some(queue) = &self.push else { return };
+        let fresh_status = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
+        let auth_expired = status_json::fetch_status_str(crate::usage::FetchStatus::AuthExpired);
+        let chain_weekly = config.state.weekly_switch_threshold_pct();
+        let codex = entries
+            .iter()
+            .any(|entry| entry.harness == crate::harness::Harness::Codex.as_str())
+            .then(|| crate::codex_profiles::CodexState::load().unwrap_or_default());
+        let codex_member = |name: &crate::profile::ProfileName| {
+            codex
+                .as_ref()
+                .filter(|codex| codex.fallback_chain().contains(name))
+        };
+        let util = |entry: &status_json::ProfileEntry, label: &str| {
+            entry
+                .windows
+                .iter()
+                .find(|w| w.label == label)
+                .map(|w| w.utilization_pct)
+        };
+        let readings = entries.iter().map(|entry| crate::push::Reading {
+            name: entry.name.as_str(),
+            failing: entry.auth_status == "broken"
+                || entry.fetch_status.as_deref() == Some(auth_expired),
+            five_hour: crate::push::WindowReading {
+                line: entry
+                    .fallback
+                    .as_ref()
+                    .map(|fallback| fallback.threshold)
+                    .or_else(|| {
+                        codex_member(&entry.name).map(|_| crate::fallback::DEFAULT_THRESHOLD)
+                    }),
+                util: util(entry, crate::usage::LABEL_5H),
+            },
+            seven_day: crate::push::WindowReading {
+                line: entry
+                    .fallback
+                    .as_ref()
+                    .and(config.find(&entry.name))
+                    .map(|profile| crate::fallback::member_weekly_line(profile, chain_weekly))
+                    .or_else(|| {
+                        codex_member(&entry.name)
+                            .map(crate::codex_profiles::CodexState::weekly_switch_threshold_pct)
+                    }),
+                util: util(entry, crate::usage::LABEL_7D),
+            },
+            fresh: !entry.stale && entry.fetch_status.as_deref() == Some(fresh_status),
+        });
+        for trigger in self.push_latches.observe(readings) {
+            queue.send(trigger);
+        }
     }
 
     /// The headless half of the 5h bell, judged on the figures this tick just

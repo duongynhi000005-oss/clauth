@@ -72,6 +72,15 @@ impl PushEvent {
     /// The set a device gets when it names none.
     const DEFAULT: [Self; 2] = [Self::Blocked, Self::Account];
 
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "blocked" => Some(Self::Blocked),
+            "account" => Some(Self::Account),
+            "window" => Some(Self::Window),
+            _ => None,
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Blocked => "blocked",
@@ -116,6 +125,15 @@ impl VapidKey {
     /// base64url: what a browser's `applicationServerKey` takes.
     pub(crate) fn public_key_b64(&self) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.pair.public_key().as_ref())
+    }
+
+    /// An ES256 signature over `message`, as the fixed 64-byte `r || s` a
+    /// JWT carries.
+    pub(crate) fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
+        self.pair
+            .sign(&SystemRandom::new(), message)
+            .map(|signature| signature.as_ref().to_vec())
+            .map_err(|_| anyhow!("the VAPID signature failed"))
     }
 }
 
@@ -176,7 +194,7 @@ pub(crate) struct Subscription {
     pub(crate) device: String,
     /// [`super::devices::Device::pairing_id`] of the pairing that registered the row, so a
     /// device re-paired under the same name never inherits it.
-    pub(crate) pairing: String,
+    pairing: String,
     pub(crate) endpoint: String,
     /// The browser's P-256 public key, unpadded base64url.
     pub(crate) p256dh: String,
@@ -198,6 +216,15 @@ impl std::fmt::Debug for Subscription {
             .field("device", &self.device)
             .field("events", &self.events)
             .finish_non_exhaustive()
+    }
+}
+
+impl Subscription {
+    /// Whether this row asked for `event`.
+    fn wants(&self, event: PushEvent) -> bool {
+        self.events
+            .iter()
+            .any(|name| PushEvent::parse(name) == Some(event))
     }
 }
 
@@ -288,6 +315,55 @@ pub(crate) fn drop_device(held: &StateLockHeld, device: &str) -> Result<bool> {
     Ok(had_row)
 }
 
+/// The rows a push for `event` goes to: each row that asked for it and whose
+/// device the device list still holds under the pairing that registered it.
+/// Read per push, like the device list per request, so a revoke or a drop
+/// reaches the next push.
+pub(crate) fn deliverable(event: PushEvent) -> Result<Vec<Subscription>> {
+    let pairings = held_pairings()?;
+    Ok(read_store()?
+        .subscriptions
+        .into_iter()
+        .filter(|row| row.wants(event) && pairings.contains(&row.pairing))
+        .collect())
+}
+
+/// What [`drop_if_endpoint`] found for the device.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Dropped {
+    /// Its row named the endpoint, and went.
+    Row,
+    /// Its row names another endpoint now, and stays.
+    Replaced,
+    /// It holds no row.
+    NoRow,
+}
+
+/// Drop `device`'s row if it still names `endpoint`: a push service
+/// answering 404 or 410 retires that endpoint, never one the device
+/// registered since. Like every write, it drops the rows whose pairing the
+/// device list no longer holds.
+pub(crate) fn drop_if_endpoint(device: &str, endpoint: &str) -> Result<Dropped> {
+    with_state_lock(|held| {
+        let mut store = read_store()?;
+        let found = match store.index_of(device) {
+            None => Dropped::NoRow,
+            Some(index) if store.subscriptions[index].endpoint == endpoint => Dropped::Row,
+            Some(_) => Dropped::Replaced,
+        };
+        let gone = found == Dropped::Row;
+        let pairings = held_pairings()?;
+        let before = store.subscriptions.len();
+        store.subscriptions.retain(|row| {
+            !(gone && row.device.eq_ignore_ascii_case(device)) && pairings.contains(&row.pairing)
+        });
+        if store.subscriptions.len() != before {
+            write_store(held, &store)?;
+        }
+        Ok(found)
+    })
+}
+
 /// A revoke removed the device, but its push row could not be dropped. The
 /// device is gone either way; the row stays behind inert, since no push goes
 /// to a row whose pairing the device list no longer holds.
@@ -313,55 +389,54 @@ impl std::fmt::Display for SubscriptionLeft {
 
 impl std::error::Error for SubscriptionLeft {}
 
-/// Whether `endpoint` may receive a push: an https URL with no userinfo, on
-/// the default port, whose host is exactly one of [`PUSH_HOSTS`]. Parsed by
-/// the same `Uri` the outbound client sends through, so the host judged here
-/// is the host a POST would reach.
-pub(crate) fn endpoint_allowed(endpoint: &str) -> bool {
-    let Ok(uri) = endpoint.parse::<ureq::http::Uri>() else {
-        return false;
-    };
+/// The push service's origin (`https://<host>`) when `endpoint` may receive
+/// a push: an https URL with no userinfo, on the default port, whose host is
+/// exactly one of [`PUSH_HOSTS`]; `None` for anything else. Parsed by the
+/// same `Uri` the outbound client sends through, so the host judged here is
+/// the host a POST would reach, and the origin a VAPID token names is that
+/// same host.
+pub(crate) fn allowed_origin(endpoint: &str) -> Option<String> {
+    let uri = endpoint.parse::<ureq::http::Uri>().ok()?;
     if !uri
         .scheme_str()
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
     {
-        return false;
+        return None;
     }
-    let Some(authority) = uri.authority() else {
-        return false;
-    };
+    let authority = uri.authority()?;
     // `Authority::host` keeps only what follows the LAST `@`, so a userinfo
     // part would otherwise be judged on the host it hides behind.
     if authority.as_str().contains('@') || !matches!(authority.port_u16(), None | Some(443)) {
-        return false;
+        return None;
     }
     PUSH_HOSTS
         .iter()
-        .any(|host| authority.host().eq_ignore_ascii_case(host))
+        .find(|host| authority.host().eq_ignore_ascii_case(host))
+        .map(|host| format!("https://{host}"))
 }
 
 /// Whether `bytes` is an uncompressed point on P-256, judged by the ECDH a
 /// push runs against it: a point the sender could never encrypt to is refused
 /// at registration rather than failing every push silently.
-fn is_p256_point(bytes: &[u8]) -> bool {
+/// `Err` only for a CSPRNG failure minting the probe key, which is this
+/// host's fault and never the client's.
+fn is_p256_point(bytes: &[u8]) -> Result<bool> {
     if bytes.len() != 65 || bytes.first() != Some(&0x04) {
-        return false;
+        return Ok(false);
     }
-    let Ok(probe) =
+    let probe =
         agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &SystemRandom::new())
-    else {
-        return false;
-    };
-    agreement::agree_ephemeral(
+            .map_err(|_| anyhow!("CSPRNG failure minting the point-check key"))?;
+    Ok(agreement::agree_ephemeral(
         probe,
         &agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, bytes),
         |_| (),
     )
-    .is_ok()
+    .is_ok())
 }
 
 /// Unpadded (or padded) base64url, decoded; `None` when it is neither.
-fn decode_b64url(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_b64url(text: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(text.trim_end_matches('='))
         .ok()
@@ -467,7 +542,7 @@ pub(crate) fn key(_: &ApiContext, _: &Request, caller: &Caller<'_>) -> Response 
         (status = 401, description = "no bearer, or one matching no paired device, the device's pairing included when a revoke lands while the subscription waits on the state flock (`unauthorized`)", body = ErrorBody),
         (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
-        (status = 500, description = "the device list or the subscription list does not read, or the write failed (`internal`)", body = ErrorBody)
+        (status = 500, description = "the device list or the subscription list does not read, the key check could not run, or the write failed (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
 )]
@@ -479,7 +554,7 @@ pub(crate) fn subscribe(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> R
     let Ok(body) = serde_json::from_slice::<PushSubscriptionBody>(&req.body) else {
         return Response::error(400, "bad_request");
     };
-    if !endpoint_allowed(&body.endpoint) {
+    if allowed_origin(&body.endpoint).is_none() {
         return Response::refused(400, "push_endpoint_not_allowed", &endpoint_refused());
     }
     let p256dh = decode_b64url(&body.keys.p256dh);
@@ -487,8 +562,10 @@ pub(crate) fn subscribe(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> R
     let (Some(p256dh), Some(auth)) = (p256dh, auth) else {
         return Response::error(400, "bad_request");
     };
-    if !is_p256_point(&p256dh) || auth.len() != 16 {
-        return Response::error(400, "bad_request");
+    match is_p256_point(&p256dh) {
+        Ok(true) if auth.len() == 16 => {}
+        Ok(_) => return Response::error(400, "bad_request"),
+        Err(e) => return failed(caller, "push subscription key check", &e),
     }
     let events = canonical(body.events.unwrap_or_else(|| PushEvent::DEFAULT.to_vec()));
     let row = Subscription {
@@ -541,7 +618,7 @@ pub(crate) fn subscribe(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> R
     path = "/api/v1/push/subscription",
     responses(
         (status = 200, description = "the device's subscription is dropped", body = PushSubscriptionDropped),
-        (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
+        (status = 401, description = "no bearer, or one matching no paired device, the device's pairing included when a revoke lands while the drop waits on the state flock (`unauthorized`)", body = ErrorBody),
         (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 404, description = "the device holds no subscription (`no_push_subscription`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
@@ -554,15 +631,26 @@ pub(crate) fn unsubscribe(_: &ApiContext, _: &Request, caller: &Caller<'_>) -> R
     let Some(device) = caller.device else {
         return Response::error(500, "internal");
     };
-    match with_state_lock(|held| drop_device(held, &device.name)) {
-        Ok(true) => {
+    // The pairing is checked again under the hold, as the PUT's is: an old
+    // pairing's DELETE that waited out a revoke and re-pair must not drop the
+    // new pairing's row.
+    let pairing = device.pairing_id();
+    let dropped = with_state_lock(|held| {
+        if !held_pairings()?.contains(&pairing) {
+            return Ok(None);
+        }
+        drop_device(held, &device.name).map(Some)
+    });
+    match dropped {
+        Ok(None) => Response::unauthorized(),
+        Ok(Some(true)) => {
             logline!(
                 "clauth api: device '{}' dropped its push subscription",
                 caller.device_for_log()
             );
             Response::serialize(200, &PushSubscriptionDropped { ok: true })
         }
-        Ok(false) => Response::error(404, "no_push_subscription"),
+        Ok(Some(false)) => Response::error(404, "no_push_subscription"),
         Err(e) => failed(caller, "push subscription drop", &e),
     }
 }

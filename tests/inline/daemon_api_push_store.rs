@@ -410,3 +410,105 @@ fn a_put_from_a_pairing_revoked_since_it_authenticated_writes_nothing() {
     );
     assert!(read_store().expect("store").subscriptions.is_empty());
 }
+
+/// Pose the row a failed revoke leaves: `device`'s row under a pairing the
+/// device list no longer holds.
+fn orphan(device: &str) {
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join(STORE_FILE);
+    let mut store: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("store")).expect("store json");
+    for row in store["subscriptions"].as_array_mut().expect("rows") {
+        if row["device"] == device {
+            row["pairing"] = "a-pairing-no-device-holds".into();
+        }
+    }
+    std::fs::write(&path, serde_json::to_vec(&store).expect("encode")).expect("write store");
+}
+
+fn devices_with_rows() -> Vec<String> {
+    read_store()
+        .expect("store")
+        .subscriptions
+        .into_iter()
+        .map(|row| row.device)
+        .collect()
+}
+
+/// Every write keeps only rows whose pairing the device list still holds, so
+/// a row a failed revoke left goes with the next PUT or DELETE.
+#[test]
+fn a_write_drops_rows_whose_pairing_the_device_list_no_longer_holds() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx();
+    seed_device("tablet", Tier::View, TABLET_TOKEN);
+    let put_as = |token: &str| {
+        call(
+            &ctx,
+            &req(
+                "PUT",
+                "/api/v1/push/subscription",
+                Some(token),
+                &subscription(&endpoint(), P256DH, AUTH),
+            ),
+        )
+        .status
+    };
+    assert_eq!([put_as(OTHER_TOKEN), put_as(TABLET_TOKEN)], [200, 200]);
+
+    orphan("phone");
+    assert_eq!(put_as(TABLET_TOKEN), 200);
+    let after_put = devices_with_rows();
+
+    assert_eq!(put_as(OTHER_TOKEN), 200);
+    orphan("tablet");
+    assert_eq!(delete_as(&ctx, OTHER_TOKEN), 200);
+    let after_delete = devices_with_rows();
+
+    assert_eq!(
+        (after_put, after_delete),
+        (vec!["tablet".to_string()], Vec::<String>::new())
+    );
+}
+
+/// A DELETE from a pairing revoked since it authenticated drops nothing,
+/// whatever row the name holds now.
+#[test]
+fn a_delete_from_a_pairing_revoked_since_it_authenticated_drops_nothing() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx();
+    let old = devices::authenticate(Some(OTHER_TOKEN))
+        .expect("the device list reads")
+        .expect("the phone authenticates");
+    devices::revoke("phone").expect("revoke the phone");
+    seed_device("phone", Tier::View, TABLET_TOKEN);
+    assert_eq!(
+        call(
+            &ctx,
+            &req(
+                "PUT",
+                "/api/v1/push/subscription",
+                Some(TABLET_TOKEN),
+                &subscription(&endpoint(), P256DH, AUTH),
+            ),
+        )
+        .status,
+        200
+    );
+
+    let resp = unsubscribe(
+        &ctx,
+        &req("DELETE", "/api/v1/push/subscription", Some(OTHER_TOKEN), ""),
+        &crate::daemon::api::routes::Caller {
+            peer: peer(),
+            device: Some(&old),
+            target: None,
+        },
+    );
+
+    assert_eq!(
+        (resp.status, devices_with_rows()),
+        (401, vec!["phone".to_string()])
+    );
+}

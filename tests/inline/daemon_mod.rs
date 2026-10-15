@@ -3012,3 +3012,242 @@ fn an_aged_reading_under_a_fresh_status_does_not_ring() {
     d.write_status();
     assert_eq!(rung(), []);
 }
+
+// ── push triggers ────────────────────────────────────────────────────────────
+
+/// A daemon over one chain member `name` at line 90 reading `util` 5h under a
+/// live `status`, its push inbox handed back to read.
+fn push_daemon(
+    name: &str,
+    util: f64,
+    status: crate::usage::FetchStatus,
+    shape: impl FnOnce(&mut Profile, &mut AppConfig),
+) -> (Daemon, std::sync::mpsc::Receiver<crate::push::Trigger>) {
+    let mut profile = profile_with_creds(name, "at-push");
+    profile.fallback_threshold = Some(90.0);
+    let mut config = persist(vec![profile.clone()], Some(name), 60_000);
+    config.state.fallback_chain = vec![name.into()];
+    shape(&mut profile, &mut config);
+    config.profiles = vec![profile];
+    write_five_hour(name, util);
+    let mut d = daemon_for(config);
+    let (queue, inbox) = crate::push::queue_for_tests();
+    d.push = Some(queue);
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert(name.to_string(), status);
+    (d, inbox)
+}
+
+#[test]
+fn a_window_reaching_the_chain_line_queues_one_push_across_ticks() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon("alpha", 95.0, crate::usage::FetchStatus::Fresh, |_, _| {});
+
+    d.write_status();
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Window {
+            profile: "alpha".to_string()
+        }]
+    );
+}
+
+#[test]
+fn a_broken_login_queues_one_account_push_across_ticks() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon(
+        "alpha",
+        10.0,
+        crate::usage::FetchStatus::Fresh,
+        |_, config| {
+            config.state.auth_broken.push("alpha".into());
+        },
+    );
+
+    d.write_status();
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Account {
+            profile: "alpha".to_string()
+        }]
+    );
+}
+
+#[test]
+fn a_rejected_usage_credential_queues_an_account_push() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon(
+        "alpha",
+        10.0,
+        crate::usage::FetchStatus::AuthExpired,
+        |_, _| {},
+    );
+
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Account {
+            profile: "alpha".to_string()
+        }]
+    );
+}
+
+#[test]
+fn an_expired_access_token_waiting_on_its_rotation_queues_nothing() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon(
+        "alpha",
+        10.0,
+        crate::usage::FetchStatus::Fresh,
+        |profile, _| {
+            if let Some(token) = profile
+                .credentials
+                .as_mut()
+                .and_then(|creds| creds.claude_ai_oauth.as_mut())
+            {
+                token.expires_at = Some(1);
+            }
+        },
+    );
+
+    d.write_status();
+
+    assert_eq!(inbox.try_iter().collect::<Vec<_>>(), []);
+}
+
+#[test]
+fn a_seven_day_window_reaching_the_weekly_line_queues_one_push_across_ticks() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon(
+        "alpha",
+        10.0,
+        crate::usage::FetchStatus::Fresh,
+        |profile, _| {
+            profile.weekly_threshold = Some(80.0);
+        },
+    );
+    let resets_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let usage = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(resets_at.clone()),
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: 85.0,
+            resets_at: Some(resets_at),
+        }),
+        fetched_at: Some(now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("alpha"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+
+    d.write_status();
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Window {
+            profile: "alpha".to_string()
+        }]
+    );
+}
+
+/// A codex roster entry as `build_codex_entries` publishes one: no claude
+/// `fallback` object, its 5h window at `five_hour`, its 7d at `seven_day`.
+fn codex_entry(name: &str, five_hour: f64, seven_day: f64) -> super::status_json::ProfileEntry {
+    super::status_json::ProfileEntry {
+        name: name.into(),
+        active: false,
+        rolling_token: false,
+        provider: "openai".to_string(),
+        base_url: None,
+        tier: None,
+        harness: crate::harness::Harness::Codex.as_str().to_string(),
+        has_live_session: false,
+        auth_status: "ok".to_string(),
+        fetch_status: Some("Fresh".to_string()),
+        stale: false,
+        fetched_at: None,
+        next_refresh_at: None,
+        auto_start: false,
+        auto_start_queue: None,
+        bell_threshold: None,
+        fallback: None,
+        windows: vec![
+            crate::profile_json::Window {
+                label: crate::usage::LABEL_5H.to_string(),
+                utilization_pct: five_hour,
+                resets_at: None,
+            },
+            crate::profile_json::Window {
+                label: crate::usage::LABEL_7D.to_string(),
+                utilization_pct: seven_day,
+                resets_at: None,
+            },
+        ],
+        third_party: None,
+    }
+}
+
+/// A codex chain member's 7d window is judged at the codex chain's own
+/// weekly line; off that chain it is judged at none.
+#[test]
+fn a_codex_member_crossing_the_codex_weekly_line_queues_a_window_push() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon("alpha", 10.0, crate::usage::FetchStatus::Fresh, |_, _| {});
+    let config = d.config.lock().expect("config").clone();
+
+    crate::testutil::write_codex_state(
+        "profiles = [\"cx\", \"off\"]\nfallback_chain = [\"cx\"]\nweekly_switch_threshold = 80.0\n",
+    );
+    d.queue_pushes(
+        &config,
+        &[
+            codex_entry("cx", 10.0, 85.0),
+            codex_entry("off", 99.0, 99.0),
+        ],
+    );
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Window {
+            profile: "cx".to_string()
+        }]
+    );
+}
+
+/// A codex chain member's 5h window is judged at the 5h line the codex chain
+/// switches every member at (95, `fallback::DEFAULT_THRESHOLD`).
+#[test]
+fn a_codex_member_reaching_the_codex_5h_line_queues_a_window_push() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon("alpha", 10.0, crate::usage::FetchStatus::Fresh, |_, _| {});
+    let config = d.config.lock().expect("config").clone();
+    crate::testutil::write_codex_state("profiles = [\"cx\"]\nfallback_chain = [\"cx\"]\n");
+
+    d.queue_pushes(&config, &[codex_entry("cx", 94.0, 10.0)]);
+    let below = inbox.try_iter().collect::<Vec<_>>();
+    d.queue_pushes(&config, &[codex_entry("cx", 95.0, 10.0)]);
+    let at = inbox.try_iter().collect::<Vec<_>>();
+
+    assert_eq!(
+        (below, at),
+        (
+            Vec::new(),
+            vec![crate::push::Trigger::Window {
+                profile: "cx".to_string()
+            }]
+        )
+    );
+}
