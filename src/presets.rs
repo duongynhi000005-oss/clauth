@@ -428,6 +428,14 @@ pub(crate) struct AccountOffers {
     pub(crate) rows: Vec<RowMove>,
 }
 
+/// Accounts whose change sets are identical share one block: the shared rows
+/// once, then one toggle line per account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RebindBlock {
+    pub(crate) rows: Vec<RowMove>,
+    pub(crate) accounts: Vec<String>,
+}
+
 /// `a` and `b` name the same endpoint: the crate's shared host predicate
 /// (`providers::url_matches_host`), case-insensitive on scheme + host and
 /// forgiving a trailing slash. It also admits a longer path under `b` (e.g.
@@ -486,6 +494,57 @@ pub(crate) fn rebind_offers(config: &crate::profile::AppConfig) -> Vec<AccountOf
         }
     }
     out
+}
+
+/// Group offers whose row change sets are identical, preserving first-seen
+/// order for both the blocks and the accounts inside them.
+pub(crate) fn group_offers(offers: Vec<AccountOffers>) -> Vec<RebindBlock> {
+    let mut blocks: Vec<RebindBlock> = Vec::new();
+    for offer in offers {
+        if let Some(block) = blocks.iter_mut().find(|b| b.rows == offer.rows) {
+            block.accounts.push(offer.account);
+        } else {
+            blocks.push(RebindBlock {
+                rows: offer.rows,
+                accounts: vec![offer.account],
+            });
+        }
+    }
+    blocks
+}
+
+/// SHA-256 (hex) of the shipped bind table: each built-in's name, base_url and
+/// resolved models. Changes exactly when a bind changes, so a stored digest
+/// stands for "this release's binds were already offered".
+pub(crate) fn builtin_binds_digest() -> String {
+    digest_of_builtins(BUILTINS)
+}
+
+/// The digest over a specific table — split out so a test can pin that two
+/// literal tables differ without recomputing the shipped one.
+fn digest_of_builtins(builtins: &[Builtin]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    for builtin in builtins {
+        hasher.update(builtin.name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(builtin.base_url.as_bytes());
+        hasher.update([0u8]);
+        let binds = builtin.binds.models();
+        for row in MODEL_ROWS {
+            hasher.update(row.as_bytes());
+            hasher.update([0u8]);
+            if let Some(value) = binds.field(row) {
+                hasher.update(value.as_bytes());
+            }
+            hasher.update([0u8]);
+        }
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// `N row(s) on M account(s)`, singular-aware — the one phrase the TUI toast

@@ -6584,7 +6584,13 @@ fn the_fallback_selector_row_desktop_replaces_the_pre_s9_clip() {
 /// profile, `Clean`, a banner-only divergence) — so a first-paint pin covers
 /// the seed's real entry point, never a hand-built config the seed skips.
 fn startup_app_from_disk() -> App {
-    let config = crate::profile::load_config().expect("load config off disk");
+    let mut config = crate::profile::load_config().expect("load config off disk");
+    // The current binds count as offered unless the saved state says
+    // otherwise, so the startup re-bind confirm stays closed.
+    config
+        .state
+        .preset_binds_offered
+        .get_or_insert_with(crate::presets::builtin_binds_digest);
     let mut app = App::new(config);
     crate::tui::app::reconcile_startup(&mut app);
     app
@@ -7084,6 +7090,8 @@ fn the_queue_chip_drops_a_hybrid_canceled_only_in_the_oauth_store() {
         state: AppState {
             fallback_chain: vec!["hy".into(), "b".into()],
             auto_start_queue: true,
+            // `hy` sits on a built-in's endpoint: keep the re-bind confirm closed.
+            preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
             ..AppState::default()
         },
         profiles: vec![hy, b],

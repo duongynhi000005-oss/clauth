@@ -771,25 +771,54 @@ pub(crate) fn follow_scroll_offset(
     focus: (usize, usize),
     prior: usize,
 ) -> usize {
+    follow_scroll_offset_with(total, viewport, focus, prior, false)
+}
+
+/// Tail-priority variant for the re-bind confirm's first account: when the
+/// focus range (the block head..the cursor's toggle) is taller than the
+/// viewport, the toggle — the end — stays visible instead of the head, so
+/// `space` always flips a visible account.
+pub(crate) fn follow_scroll_offset_tail(
+    total: usize,
+    viewport: usize,
+    focus: (usize, usize),
+    prior: usize,
+) -> usize {
+    follow_scroll_offset_with(total, viewport, focus, prior, true)
+}
+
+fn follow_scroll_offset_with(
+    total: usize,
+    viewport: usize,
+    focus: (usize, usize),
+    prior: usize,
+    tail_wins: bool,
+) -> usize {
     if viewport == 0 || total <= viewport {
         return 0;
     }
     let max = total - viewport;
     let offset = prior.min(max);
     let pad = SCROLL_PAD.min(viewport.saturating_sub(1) / 2);
-    let minimum = focus.1.saturating_sub(viewport).min(focus.0);
-    let maximum = focus.0.min(max);
-    if focus.0 < offset.saturating_add(pad) {
-        focus.0.saturating_sub(pad).max(minimum).min(maximum)
-    } else if focus.1.saturating_add(pad) > offset.saturating_add(viewport) {
-        focus
-            .1
-            .saturating_add(pad)
-            .saturating_sub(viewport)
-            .max(minimum)
-            .min(maximum)
+    let minimum = if tail_wins {
+        focus.1.saturating_sub(viewport)
     } else {
-        offset.clamp(minimum, maximum)
+        focus.1.saturating_sub(viewport).min(focus.0)
+    };
+    let maximum = focus.0.min(max);
+    let clamp = |x: usize| {
+        if tail_wins {
+            x.min(maximum).max(minimum)
+        } else {
+            x.max(minimum).min(maximum)
+        }
+    };
+    if focus.0 < offset.saturating_add(pad) {
+        clamp(focus.0.saturating_sub(pad))
+    } else if focus.1.saturating_add(pad) > offset.saturating_add(viewport) {
+        clamp(focus.1.saturating_add(pad).saturating_sub(viewport))
+    } else {
+        clamp(offset)
     }
 }
 

@@ -1017,6 +1017,17 @@ pub(crate) fn apply_rebind_account(
     })
 }
 
+/// Store the built-in bind-table digest the TUI offered, under the state flock:
+/// fresh-state read-modify-write, so a concurrent state writer is never
+/// clobbered. The CLI never reaches this.
+pub(crate) fn store_preset_binds_offered(digest: String) -> Result<()> {
+    with_state_lock(|_held| {
+        let mut state = load_app_state()?;
+        state.preset_binds_offered = Some(digest);
+        save_app_state(&state)
+    })
+}
+
 /// Persist a profile's custom env map (the Setup-tab field editor). Captures the
 /// OLD env keys first so a re-apply to the live `~/.claude/settings.json` strips
 /// any key the new map dropped — passing the new keys instead would leak a removed

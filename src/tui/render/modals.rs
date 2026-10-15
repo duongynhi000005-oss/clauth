@@ -13,7 +13,7 @@ use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
     DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
     LoginStage, Modal, NamePromptForm, PresetApplyButton, PresetApplyForm, PresetPickerForm,
-    StatusFocus, Tab, TokenPickerForm, TokenView, token_model_count,
+    RebindForm, StatusFocus, Tab, TokenPickerForm, TokenView, token_model_count,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -22,8 +22,8 @@ use super::overview::switch_mark;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
     DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, META_RULE_MIN, bold_when,
-    draw_scrollbar, draw_scrolled_lines, field_window, follow_scroll_offset, head_cols, key_cell,
-    meta_line, right_meta_fits, title_label,
+    draw_scrollbar, draw_scrolled_lines, field_window, follow_scroll_offset,
+    follow_scroll_offset_tail, head_cols, key_cell, meta_line, right_meta_fits, title_label,
 };
 use super::prose::{self, cmd_lit, key_lit};
 use crate::fallback::BlockedReason;
@@ -43,6 +43,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
         Modal::Login => draw_login_progress(frame, area, app),
         Modal::CheckOutput(body) => draw_check_output(frame, area, body, app),
+        Modal::Rebind(form) => draw_rebind(frame, area, form),
     }
 }
 
@@ -174,7 +175,7 @@ fn draw_modal_focused(
         title,
         lines,
         0,
-        Some((focus, follow.saved)),
+        Some((focus, follow.saved, FocusEnd::Head)),
         None,
     );
     follow.viewport.set(d.viewport as usize);
@@ -255,13 +256,23 @@ struct ModalGeometry<'a> {
     total: &'a std::cell::Cell<usize>,
 }
 
+/// Which end of a focus range stays visible when it is taller than the
+/// viewport: every option list keeps its head (the row's start); the re-bind
+/// confirm keeps its tail (the cursor's toggle line), so `space` always flips
+/// a visible account.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusEnd {
+    Head,
+    Tail,
+}
+
 fn draw_modal_scrolled(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
     lines: Vec<Line<'_>>,
     scroll: u16,
-    focus: Option<(std::ops::Range<usize>, &std::cell::Cell<usize>)>,
+    focus: Option<(std::ops::Range<usize>, &std::cell::Cell<usize>, FocusEnd)>,
     extra: Option<ModalExtra<'_>>,
 ) -> ModalDraw {
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
@@ -291,10 +302,10 @@ fn draw_modal_scrolled(
             }
             caret_row = Some((rows.len(), lead + head_cols(input)));
         }
-        if focus.as_ref().is_some_and(|(range, _)| range.start == i) {
+        if focus.as_ref().is_some_and(|(range, _, _)| range.start == i) {
             focus_rows.0 = rows.len();
         }
-        if focus.as_ref().is_some_and(|(range, _)| range.end == i) {
+        if focus.as_ref().is_some_and(|(range, _, _)| range.end == i) {
             focus_rows.1 = rows.len();
         }
         line_starts.push(rows.len());
@@ -302,7 +313,7 @@ fn draw_modal_scrolled(
     }
     if focus
         .as_ref()
-        .is_some_and(|(range, _)| range.end >= line_count)
+        .is_some_and(|(range, _, _)| range.end >= line_count)
     {
         focus_rows.1 = rows.len();
     }
@@ -336,8 +347,13 @@ fn draw_modal_scrolled(
     } else {
         lines.len().saturating_sub(viewport).min(u16::MAX as usize) as u16
     };
-    let scroll = if let Some((_, saved)) = focus {
-        let offset = follow_scroll_offset(lines.len(), viewport, focus_rows, saved.get());
+    let scroll = if let Some((_, saved, end)) = focus {
+        let offset = match end {
+            FocusEnd::Head => follow_scroll_offset(lines.len(), viewport, focus_rows, saved.get()),
+            FocusEnd::Tail => {
+                follow_scroll_offset_tail(lines.len(), viewport, focus_rows, saved.get())
+            }
+        };
         saved.set(offset);
         offset
     } else {
@@ -617,6 +633,120 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     );
     state.scroll.max_scroll.set(d.max_scroll);
     state.scroll.viewport.set(d.viewport);
+}
+
+/// The startup re-bind confirm: grouped account moves, one toggle line per
+/// account, and a `not now` / `apply` button pair. The view follows the cursor
+/// and the render publishes each account toggle's line geometry for the page
+/// keys, the same follow/paging shape the other choice menus use.
+fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
+    let row_w = form
+        .blocks
+        .iter()
+        .flat_map(|b| &b.rows)
+        .map(|m| m.row.len())
+        .max()
+        .unwrap_or(0);
+    let old_w = form
+        .blocks
+        .iter()
+        .flat_map(|b| &b.rows)
+        .map(|m| m.old_display().len())
+        .max()
+        .unwrap_or(0);
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled(
+            "move accounts onto the new preset models?",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "this release binds newer model ids. rows that hold an id an earlier release shipped, or are empty, take the new one; ids you set stay.",
+            theme::dim(),
+        )),
+        Line::from(""),
+    ];
+
+    // The pre-chunk line index of each account toggle, in flat order, plus each
+    // block's first line: the first account's focus reaches back to it so the
+    // block's change set (and, for block 0, the confirm's message) stays on
+    // screen when the cursor returns to it.
+    let mut toggle_lines: Vec<usize> = Vec::new();
+    let mut block_starts: Vec<usize> = Vec::new();
+    let mut flat = 0usize;
+    for (bi, block) in form.blocks.iter().enumerate() {
+        block_starts.push(if bi == 0 { 0 } else { lines.len() });
+        for m in &block.rows {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {:<row_w$}  {:<old_w$}  → {}",
+                    m.row,
+                    m.old_display(),
+                    m.new_display(),
+                ),
+                theme::dim(),
+            )));
+        }
+        for (ai, account) in block.accounts.iter().enumerate() {
+            toggle_lines.push(lines.len());
+            let selected = flat == form.cursor;
+            let arrow = if selected {
+                Span::styled("\u{276f} ", theme::accent())
+            } else {
+                Span::raw("  ")
+            };
+            let toggle = if form.checked[bi][ai] {
+                Span::styled(theme::toggle_on().to_string(), theme::accent())
+            } else {
+                Span::styled(theme::toggle_off().to_string(), theme::faint())
+            };
+            let name_style = if selected {
+                theme::accent()
+            } else {
+                theme::dim()
+            };
+            lines.push(Line::from(vec![
+                arrow,
+                toggle,
+                Span::raw(" "),
+                Span::styled(account.clone(), name_style),
+            ]));
+            flat += 1;
+        }
+        lines.push(Line::from(""));
+    }
+
+    let buttons = Line::from(vec![
+        modal_button(" not now ", !form.choice),
+        Span::raw("   "),
+        modal_button(" apply ", form.choice),
+    ])
+    .alignment(Alignment::Right);
+
+    let focus = form.account_at(form.cursor).and_then(|(bi, ai)| {
+        toggle_lines.get(form.cursor).map(|&line| {
+            let start = if ai == 0 { block_starts[bi] } else { line };
+            (start..line + 1, &form.scroll, FocusEnd::Tail)
+        })
+    });
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        "CONFIRM",
+        lines,
+        0,
+        focus,
+        Some(ModalExtra::Buttons(buttons)),
+    );
+    form.viewport.set(d.viewport as usize);
+    form.total.set(d.total);
+    let starts: Vec<usize> = toggle_lines
+        .iter()
+        .map(|&line| d.line_starts[line])
+        .collect();
+    let block_ends: Vec<usize> = starts.iter().map(|start| start + 1).collect();
+    form.starts.replace(starts);
+    form.block_ends.replace(block_ends);
 }
 
 fn choice_buttons(

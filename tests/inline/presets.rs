@@ -2,7 +2,8 @@
 //! refusals that keep a built-in's slot the binary's alone.
 
 use super::{
-    RowMove, base_url_matches, delete_preset, is_builtin, list_presets, load_preset, preset_exists,
+    Binds, Builtin, RowMove, base_url_matches, builtin_binds_digest, delete_preset,
+    digest_of_builtins, group_offers, is_builtin, list_presets, load_preset, preset_exists,
     presets_dir, rebind_offers, save_preset,
 };
 use crate::profile::{AppConfig, AppState, ModelSettings, Profile};
@@ -516,4 +517,59 @@ fn a_trailing_slash_base_url_matches() {
         ModelSettings::default(),
     )]);
     assert_eq!(rebind_offers(&config).len(), 1);
+}
+
+/// Accounts whose change sets are byte-identical share a block; a differing
+/// one splits into its own, preserving first-seen order.
+#[test]
+fn identical_change_sets_share_a_block_and_a_differing_one_splits() {
+    let ds_a = account(
+        "a",
+        "https://api.deepseek.com/anthropic",
+        ModelSettings::default(),
+    );
+    let ds_b = account(
+        "b",
+        "https://api.deepseek.com/anthropic",
+        ModelSettings::default(),
+    );
+    let z = account(
+        "z",
+        "https://api.z.ai/api/anthropic",
+        ModelSettings::default(),
+    );
+    let blocks = group_offers(rebind_offers(&config_with(vec![ds_a, ds_b, z])));
+
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].accounts, ["a", "b"]);
+    assert_eq!(blocks[1].accounts, ["z"]);
+    assert_ne!(blocks[0].rows, blocks[1].rows);
+}
+
+/// Two literal tables hash differently, and the shipped table's digest is a
+/// stable 64-hex pin — never recomputed from the code under test.
+#[test]
+fn the_digest_changes_when_a_bind_changes() {
+    let one = digest_of_builtins(&[Builtin {
+        name: "X",
+        base_url: "https://a",
+        former_ids: &[],
+        binds: Binds::Every("m1"),
+    }]);
+    let two = digest_of_builtins(&[Builtin {
+        name: "X",
+        base_url: "https://a",
+        former_ids: &[],
+        binds: Binds::Every("m2"),
+    }]);
+    assert_ne!(one, two, "a bind change must change the digest");
+    assert_eq!(one.len(), 64);
+}
+
+#[test]
+fn the_shipped_binds_digest_is_a_stable_literal() {
+    assert_eq!(
+        builtin_binds_digest(),
+        "014e3cdb43c71ebdb6d4eaff468cffd8fcc2b8cba1933b6f1c1a03878909540c"
+    );
 }

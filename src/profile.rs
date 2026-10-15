@@ -1043,6 +1043,11 @@ pub(crate) struct AppState {
     /// block on the next save; an explicit `auto_update = false` serializes.
     #[serde(default, skip_serializing_if = "update_is_default")]
     pub(crate) update: UpdateSettings,
+    /// The built-in bind-table digest the TUI last offered to move accounts
+    /// onto. `None` = never offered, so the next TUI launch with a non-empty
+    /// offer list re-offers. The CLI never reads or writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) preset_binds_offered: Option<String>,
 }
 
 fn herdr_is_default(herdr: &HerdrSettings) -> bool {
@@ -1267,6 +1272,7 @@ impl Default for AppState {
             herdr: HerdrSettings::default(),
             serve: ServeSettings::default(),
             update: UpdateSettings::default(),
+            preset_binds_offered: None,
         }
     }
 }

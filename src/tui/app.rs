@@ -1099,6 +1099,64 @@ pub(crate) enum ConfirmAction {
     },
 }
 
+/// The startup re-bind confirm: move accounts whose endpoint matches a
+/// built-in preset onto that preset's current model ids. Accounts sharing one
+/// change set sit in one block (the rows once, then a toggle line per account).
+#[derive(Debug, Clone)]
+pub(crate) struct RebindForm {
+    /// Blocks in first-seen order; each holds its shared rows + account names.
+    pub(crate) blocks: Vec<crate::presets::RebindBlock>,
+    /// Per-block per-account checked state, parallel to `blocks`.
+    pub(crate) checked: Vec<Vec<bool>>,
+    /// Flat toggle-line index the cursor sits on, across blocks in render order.
+    pub(crate) cursor: usize,
+    /// Highlighted button: false = `not now`, true = `apply`.
+    pub(crate) choice: bool,
+    /// Followable body scroll offset, published and followed by the render.
+    pub(crate) scroll: std::cell::Cell<usize>,
+    /// Published by the last render: the chunked start line of each account
+    /// toggle (flat order), its one-line block end, the total line count and the
+    /// viewport, so the page keys move the cursor the way the other choice
+    /// menus do.
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    /// The digest this offer stands for; stored on either exit.
+    pub(crate) digest: String,
+}
+
+impl RebindForm {
+    pub(crate) fn account_count(&self) -> usize {
+        self.blocks.iter().map(|b| b.accounts.len()).sum()
+    }
+
+    /// Map a flat toggle-line index to `(block, account)`.
+    pub(crate) fn account_at(&self, idx: usize) -> Option<(usize, usize)> {
+        let mut remaining = idx;
+        for (bi, block) in self.blocks.iter().enumerate() {
+            if remaining < block.accounts.len() {
+                return Some((bi, remaining));
+            }
+            remaining -= block.accounts.len();
+        }
+        None
+    }
+
+    /// The `(name, rows)` moves for every checked account, in render order.
+    pub(crate) fn checked_moves(&self) -> Vec<(String, Vec<crate::presets::RowMove>)> {
+        let mut out = Vec::new();
+        for (block, checked) in self.blocks.iter().zip(&self.checked) {
+            for (account, &on) in block.accounts.iter().zip(checked) {
+                if on {
+                    out.push((account.clone(), block.rows.clone()));
+                }
+            }
+        }
+        out
+    }
+}
+
 /// One-field name prompt shared by the Setup menu's two naming actions. The
 /// variant carries what the typed name is FOR, so the modal itself stays a plain
 /// input and every validation rule lives in the handler that consumes it.
@@ -1564,6 +1622,9 @@ pub(crate) enum Modal {
     /// Read-only scrollable text modal for the shunt card's `check output`:
     /// the masked stderr of the last failed check.
     CheckOutput(String),
+    /// Startup re-bind confirm: move matching accounts onto the built-in
+    /// presets' current ids.
+    Rebind(RebindForm),
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -4632,7 +4693,46 @@ impl App {
             last_codex_rows_refresh: Some(Instant::now()),
         };
         app.refresh_unsaved_live_login();
+        let rebind_form = {
+            let config = app.config();
+            Self::startup_rebind_form(&config)
+        };
+        if let Some(form) = rebind_form {
+            app.open_modal(Modal::Rebind(form));
+        }
         app
+    }
+
+    /// The first-launch re-bind offer: open a confirm only when some account
+    /// has rows to move AND this release's bind-table digest was not yet
+    /// offered (an absent digest counts as not offered). Pure — the caller
+    /// decides when to push the modal.
+    fn startup_rebind_form(config: &AppConfig) -> Option<RebindForm> {
+        let offers = crate::presets::rebind_offers(config);
+        if offers.is_empty() {
+            return None;
+        }
+        let digest = crate::presets::builtin_binds_digest();
+        if config.state.preset_binds_offered.as_deref() == Some(digest.as_str()) {
+            return None;
+        }
+        let blocks = crate::presets::group_offers(offers);
+        let checked = blocks
+            .iter()
+            .map(|b| vec![true; b.accounts.len()])
+            .collect();
+        Some(RebindForm {
+            blocks,
+            checked,
+            cursor: 0,
+            choice: false,
+            scroll: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            digest,
+        })
     }
 
     /// The `ThirdPartyBroken` seed read off the durable per-credential verdict:
@@ -4677,7 +4777,10 @@ impl App {
     /// under the cursor with its detail pane descended; construction marks the
     /// landing done in `[herdr] first_landing_done` — once, forever. Every other
     /// launch — a plain TUI, and herdr after the first — opens the top-level
-    /// `home_tab` (default overview); the herdr header tag is unaffected. The
+    /// `home_tab` (default overview); the herdr header tag is unaffected. A modal
+    /// already open at construction (the startup re-bind confirm) also takes the
+    /// non-landing arm and leaves `first_landing_done` UNSET, so the next herdr
+    /// launch still lands. The
     /// first landing's recompute starts the herdr probe on its worker, so the
     /// first paint never waits on its three subprocesses; the pending intent
     /// lands on the herdr row by label in the recompute that adopts the probe,
@@ -4687,7 +4790,8 @@ impl App {
     /// intent, so focus is never stolen once the user has acted.
     pub(crate) fn with_herdr_mode(mut self, herdr_mode: bool) -> Self {
         self.herdr_mode = herdr_mode;
-        let first_landing = herdr_mode && !self.config().state.herdr.first_landing_done;
+        let first_landing =
+            herdr_mode && !self.config().state.herdr.first_landing_done && self.modals.is_empty();
         if first_landing {
             self.tab = Tab::Services;
             // Land on the herdr row by label once its probe resolves.
@@ -5776,6 +5880,14 @@ impl KeyOwner {
     /// detail focus).
     pub(crate) fn claims(self, app: &App, code: KeyCode) -> bool {
         if self == Self::DayPicker && matches!(code, KeyCode::Char('?' | 'x')) {
+            return false;
+        }
+        // `?` falls through from the re-bind confirm so the footer derives
+        // `? help` and the key opens the help modal above it.
+        if self == Self::Modal
+            && matches!(app.modals.last(), Some(Modal::Rebind(_)))
+            && matches!(code, KeyCode::Char('?'))
+        {
             return false;
         }
         if self == Self::ShuntField
@@ -15093,6 +15205,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
         Modal::Login => handle_login_modal_key(app, key),
+        Modal::Rebind(_) => handle_rebind_key(app, key),
     }
 }
 
@@ -18905,6 +19018,174 @@ fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Keys on the re-bind confirm. `↑`/`↓` walk the account toggle lines, `space`
+/// flips the one under the cursor, `←`/`→` pick the button, `PageUp`/`PageDown`
+/// page the cursor through the published geometry. `⏎` runs the highlighted
+/// button; `esc`/`q` are `not now`.
+fn handle_rebind_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::Rebind(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let total = form.account_count();
+    match key.code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+            form.choice = !form.choice;
+        }
+        KeyCode::Up => {
+            if total > 0 {
+                form.cursor = (form.cursor + total - 1) % total;
+            }
+        }
+        KeyCode::Down => {
+            if total > 0 {
+                form.cursor = (form.cursor + 1) % total;
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some((bi, ai)) = form.account_at(form.cursor) {
+                form.checked[bi][ai] = !form.checked[bi][ai];
+            }
+        }
+        KeyCode::PageUp => {
+            let next = {
+                let starts = form.starts.borrow();
+                let block_ends = form.block_ends.borrow();
+                page_up_cursor_by_rows(
+                    form.cursor,
+                    &starts,
+                    &block_ends,
+                    &[],
+                    form.viewport.get(),
+                    form.scroll.get(),
+                    form.total.get(),
+                )
+            };
+            form.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let next = {
+                let starts = form.starts.borrow();
+                let block_ends = form.block_ends.borrow();
+                page_down_cursor_by_rows(
+                    form.cursor,
+                    &starts,
+                    &block_ends,
+                    form.viewport.get(),
+                    form.scroll.get(),
+                    form.total.get(),
+                )
+            };
+            form.cursor = next;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            let form = form.clone();
+            app.modals.pop();
+            store_rebind_digest(app, &form.digest);
+        }
+        KeyCode::Enter => {
+            let apply = form.choice;
+            let form = form.clone();
+            app.modals.pop();
+            if apply {
+                apply_rebind(app, form);
+            } else {
+                store_rebind_digest(app, &form.digest);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Store the current digest and mirror it into the in-memory state, so a later
+/// in-TUI `save_app_state` never writes it back absent. A failed store raises
+/// the house `save failed` toast and leaves memory unset — the confirm re-offers
+/// next launch.
+fn store_rebind_digest(app: &mut App, digest: &str) {
+    match crate::actions::store_preset_binds_offered(digest.to_string()) {
+        Ok(()) => {
+            let mut cfg = app.config();
+            cfg.state.preset_binds_offered = Some(digest.to_string());
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+    }
+}
+
+/// Write the checked accounts through the per-account model write path. The
+/// digest is stored only when every checked account wrote; a failure is a
+/// danger toast naming the account. On a partial failure the moved toast (if
+/// any rows moved) precedes the failure toasts, mirroring the CLI's order.
+/// `apply` with every account unchecked behaves exactly like `not now`: the
+/// digest is stored and nothing is toasted.
+fn apply_rebind(app: &mut App, form: RebindForm) {
+    let moves = form.checked_moves();
+    if moves.is_empty() {
+        store_rebind_digest(app, &form.digest);
+        return;
+    }
+    let (rows, moved_accounts, failed) = {
+        let mut cfg = app.config();
+        let mut rows = 0usize;
+        let mut moved_accounts = 0usize;
+        let mut failed: Vec<(String, String)> = Vec::new();
+        for (name, mvs) in &moves {
+            let pname = ProfileName::from(name.clone());
+            match crate::actions::apply_rebind_account(&mut cfg, &pname, mvs) {
+                Ok(applied) => {
+                    rows += applied;
+                    if applied > 0 {
+                        moved_accounts += 1;
+                    }
+                }
+                Err(e) => {
+                    let (applied, err) =
+                        match e.downcast::<crate::actions::RebindSavedBeforeFailure>() {
+                            Ok(saved) => (saved.applied, saved.error),
+                            Err(e) => (0, e),
+                        };
+                    rows += applied;
+                    if applied > 0 {
+                        moved_accounts += 1;
+                    }
+                    failed.push((name.clone(), format!("{err:#}")));
+                }
+            }
+        }
+        (rows, moved_accounts, failed)
+    };
+    if failed.is_empty() {
+        store_rebind_digest(app, &form.digest);
+        if rows == 0 {
+            return;
+        }
+        app.toast(
+            ToastKind::Success,
+            format!(
+                "moved {} onto the built-in preset models",
+                crate::presets::rows_on_accounts(rows, moved_accounts)
+            ),
+        );
+        app.last_reload_fp = reload_fingerprint();
+    } else {
+        // The rows that did move are reported first, then each failure.
+        if rows > 0 {
+            app.toast(
+                ToastKind::Success,
+                format!(
+                    "moved {} onto the built-in preset models",
+                    crate::presets::rows_on_accounts(rows, moved_accounts)
+                ),
+            );
+            app.last_reload_fp = reload_fingerprint();
+        }
+        for (name, err) in failed {
+            app.toast(
+                ToastKind::Danger,
+                format!("re-bind failed for '{name}'\n{err}"),
+            );
+        }
+    }
+}
+
 /// Run `crate::herdr::heal` with the knob the state now holds and surface the
 /// outcome: success, non-empty refusal notes (warning), or failure (danger).
 /// Shared by the heal fix and the `delegate row text` options row — the knob
@@ -20576,13 +20857,23 @@ fn drain_op_results(app: &mut App) {
     }
 }
 
+/// Whether a modal other than the startup re-bind confirm holds the tick: the
+/// confirm never blocks the switch gates, the wrap-off drain, the divergence
+/// poll or bootstrap — a Divergence prompt those raise stacks ABOVE the
+/// confirm. Every other modal keeps the pre-confirm gate, so no prompt stacks
+/// under one. Callers: [`drain_switch_gates`], [`drain_pending_switch_off`],
+/// [`poll_credentials_divergence`], [`maybe_spawn_bootstrap`].
+fn blocking_modal_open(app: &App) -> bool {
+    app.modals.iter().any(|m| !matches!(m, Modal::Rebind(_)))
+}
+
 /// Complete switches whose off-thread AUTH-1 gate answered: clear the pending
 /// mark, then relink (`Ready`/`Refreshed`) or refuse with the login hint
 /// (`Broken`) / a retry hint (`Transient`). Mirrors `drain_pending_switch_off`'s
 /// modal guard — completion can raise the Divergence prompt, which must not
 /// stack under an open modal.
 fn drain_switch_gates(app: &mut App) {
-    if !app.modals.is_empty() {
+    if blocking_modal_open(app) {
         return;
     }
     while let Ok(SwitchGateResult { name, gate }) = app.switch_gates.try_recv() {
@@ -20613,7 +20904,7 @@ fn drain_switch_gates(app: &mut App) {
 /// may raise a Divergence prompt; consuming the flag while one is open would
 /// let the scheduler re-set it and stack duplicates.
 fn drain_pending_switch_off(app: &mut App) {
-    if !app.modals.is_empty() {
+    if blocking_modal_open(app) {
         return;
     }
     let switch_off_pending = app
@@ -20646,7 +20937,11 @@ fn drain_startup_signals(app: &mut App) {
 
 /// Spawn bootstrap once reconcile is done and no modal is open.
 fn maybe_spawn_bootstrap(app: &mut App) {
-    if app.bootstrap_started || !app.reconcile_done || !app.modals.is_empty() {
+    // The startup re-bind confirm never blocks bootstrap: usage seeding, the
+    // scheduler and the startup auto-switch must run even while the confirm
+    // waits on a key. Every other modal keeps the pre-diff gate.
+    let blocking_modal = blocking_modal_open(app);
+    if app.bootstrap_started || !app.reconcile_done || blocking_modal {
         return;
     }
     app.bootstrap_started = true;
@@ -20681,7 +20976,7 @@ fn poll_credentials_divergence(app: &mut App) {
     }
     app.last_divergence_check = Some(Instant::now());
 
-    if !app.modals.is_empty() {
+    if blocking_modal_open(app) {
         return;
     }
     // The reload fingerprint never stats the live credentials file, so a login

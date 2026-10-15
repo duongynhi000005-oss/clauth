@@ -2653,6 +2653,9 @@ fn app_with(profiles: Vec<crate::profile::Profile>) -> App {
     App::new(AppConfig {
         state: AppState {
             profiles: names,
+            // The shared fixture pre-marks the current binds offered, so the
+            // startup re-bind confirm stays closed unless a test means it.
+            preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
             ..AppState::default()
         },
         profiles,
@@ -8753,7 +8756,14 @@ fn startup_from_disk(
             );
         }
     }
-    App::new(crate::profile::load_config().expect("load config off disk"))
+    let mut config = crate::profile::load_config().expect("load config off disk");
+    // Like `app_with`: the current binds count as offered unless the test's
+    // own state says otherwise, so the startup re-bind confirm stays closed.
+    config
+        .state
+        .preset_binds_offered
+        .get_or_insert_with(crate::presets::builtin_binds_digest);
+    App::new(config)
 }
 
 /// The picked 5h figure the frame reads for `name`.
@@ -18400,6 +18410,34 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
         crate::profile::reload_fingerprint(),
         "the first landing adopts its own marker write, so the first tick \
          does not re-read the config as an external change"
+    );
+}
+
+/// A herdr-mode FIRST launch while the startup re-bind confirm is open takes
+/// the non-landing arm: the confirm stays on top, the home tab opens, the
+/// landing intent is NOT armed, and `first_landing_done` stays unset so the
+/// next herdr launch still lands.
+#[test]
+fn a_herdr_first_launch_under_the_rebind_confirm_defers_the_landing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = rebind_app(None, rebind_fixture()).with_herdr_mode(true);
+
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the re-bind confirm is open",
+    );
+    assert!(
+        !app.services.land_on_herdr,
+        "the landing is not armed under the confirm",
+    );
+    assert_eq!(
+        app.tab,
+        super::Tab::Overview,
+        "the home tab opens, not Services",
+    );
+    assert!(
+        !app.config().state.herdr.first_landing_done,
+        "first_landing_done stays unset, so the next herdr launch lands",
     );
 }
 
@@ -32893,4 +32931,758 @@ fn bootstrap_one_shot_stands_down_when_another_instance_holds_the_fetch_lease() 
         "a non-fetcher must not run the startup switch"
     );
     assert!(toast_bodies(&app).is_empty(), "no switch means no toast");
+}
+
+// ── re-bind confirm ──────────────────────────────────────────────────────────
+
+use super::{
+    Modal, SwitchGateResult, drain_pending_switch_off, drain_switch_gates, handle_key,
+    maybe_spawn_bootstrap, open_divergence_modal,
+};
+
+fn rebind_app(offered: Option<String>, profiles: Vec<Profile>) -> App {
+    App::new(AppConfig {
+        state: AppState {
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            preset_binds_offered: offered,
+            ..AppState::default()
+        },
+        profiles,
+    })
+}
+
+fn deepseek_account(name: &str, default: Option<&str>) -> Profile {
+    let mut p = Profile::new(
+        name.to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    p.models.default = default.map(str::to_string);
+    p
+}
+
+/// Two identical empty DeepSeek accounts (one block) + one holding a former id
+/// on `default` (a second block): two blocks, two accounts in one, both a
+/// former-id row and empty rows.
+fn rebind_fixture() -> Vec<Profile> {
+    vec![
+        deepseek_account("D1", None),
+        deepseek_account("D2", None),
+        deepseek_account("DS1", Some("deepseek-chat")),
+    ]
+}
+
+#[test]
+fn the_rebind_confirm_opens_on_first_startup_with_the_grouped_blocks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = rebind_app(None, rebind_fixture());
+    let Some(Modal::Rebind(form)) = app.modals.first() else {
+        panic!("the re-bind confirm must open on first startup");
+    };
+    // Two blocks: D1+D2 share one change set, DS1's former-id row splits it off.
+    assert_eq!(form.blocks.len(), 2);
+    assert_eq!(form.blocks[0].accounts, ["D1", "D2"]);
+    assert_eq!(form.blocks[1].accounts, ["DS1"]);
+    assert_eq!(
+        form.blocks[0].rows.first().map(|m| m.row),
+        Some("default"),
+        "the empty-row block opens with default",
+    );
+    assert_eq!(
+        form.blocks[1].rows.first().map(|m| m.old.as_deref()),
+        Some(Some("deepseek-chat")),
+        "the former-id block carries deepseek-chat on default",
+    );
+    // Every account starts checked.
+    assert_eq!(form.checked, vec![vec![true, true], vec![true]]);
+    assert!(!form.choice, "not now starts focused");
+}
+
+#[test]
+fn the_rebind_confirm_stays_closed_when_the_digest_matches() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let digest = crate::presets::builtin_binds_digest();
+    let app = rebind_app(Some(digest), rebind_fixture());
+    assert!(
+        app.modals.is_empty(),
+        "an already-offered release stays quiet"
+    );
+}
+
+#[test]
+fn the_rebind_confirm_never_opens_with_nothing_to_move() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = rebind_app(
+        None,
+        vec![Profile::new("anthropic".to_string(), None, None)],
+    );
+    assert!(app.modals.is_empty());
+}
+
+#[test]
+fn rebind_space_flips_the_account_under_the_cursor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    let Modal::Rebind(form) = app.modals.last().expect("modal") else {
+        panic!("re-bind modal expected");
+    };
+    assert!(!form.checked[0][0], "D1 flipped off");
+    assert!(form.checked[0][1], "D2 untouched");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    let Modal::Rebind(form) = app.modals.last().expect("modal") else {
+        panic!("re-bind modal expected");
+    };
+    assert!(!form.checked[0][1], "D2 flipped off");
+}
+
+#[test]
+fn rebind_up_down_walk_the_toggle_lines_with_wraparound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    let cursor = |app: &App| match app.modals.last() {
+        Some(Modal::Rebind(form)) => form.cursor,
+        other => panic!("expected re-bind modal, got {other:?}"),
+    };
+    assert_eq!(cursor(&app), 0);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(cursor(&app), 1);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(cursor(&app), 2);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(cursor(&app), 0, "down wraps at the end");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(cursor(&app), 2, "up wraps at the start");
+}
+
+#[test]
+fn rebind_not_now_writes_nothing_and_stores_the_digest() {
+    use crate::profile::{load_app_state, load_config};
+    let _home = crate::testutil::HomeSandbox::new();
+    for p in rebind_fixture() {
+        crate::profile::save_profile(&p).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: rebind_fixture().iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    // `not now` (the default button), then `esc`, then `q` — each stores the
+    // digest and writes no account.
+    for key in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')] {
+        crate::profile::save_app_state(&AppState {
+            profiles: rebind_fixture().iter().map(|p| p.name.clone()).collect(),
+            ..AppState::default()
+        })
+        .expect("reset state");
+        let mut app = rebind_app(None, rebind_fixture());
+        handle_key(&mut app, crate::testutil::key(key));
+        assert!(app.modals.is_empty(), "the modal closes on {key:?}");
+        assert_eq!(
+            load_app_state()
+                .expect("state")
+                .preset_binds_offered
+                .as_deref(),
+            Some(crate::presets::builtin_binds_digest().as_str()),
+            "{key:?} stores the current digest",
+        );
+    }
+    let config = load_config().expect("config");
+    let d1 = config
+        .find(&crate::profile::ProfileName::from("D1"))
+        .expect("D1");
+    assert!(d1.models.default.is_none(), "not now leaves D1 empty");
+    let ds1 = config
+        .find(&crate::profile::ProfileName::from("DS1"))
+        .expect("DS1");
+    assert_eq!(
+        ds1.models.default.as_deref(),
+        Some("deepseek-chat"),
+        "not now leaves the former id in place",
+    );
+}
+
+#[test]
+fn rebind_apply_writes_only_checked_accounts_and_stores_the_digest() {
+    use crate::profile::{ProfileName, load_app_state, load_config};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles = rebind_fixture();
+    for p in &profiles {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut app = rebind_app(None, profiles);
+    // Uncheck D1 (cursor is already on it), then arrow to apply and press it.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right)); // highlight apply
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty());
+
+    let config = load_config().expect("config");
+    let d1 = config.find(&ProfileName::from("D1")).expect("D1");
+    assert!(d1.models.default.is_none(), "unchecked D1 stays empty");
+    let d2 = config.find(&ProfileName::from("D2")).expect("D2");
+    assert_eq!(
+        d2.models.default.as_deref(),
+        Some("opus"),
+        "checked D2 moved"
+    );
+    assert_eq!(d2.models.opus.as_deref(), Some("deepseek-v4-pro[1m]"));
+    let ds1 = config.find(&ProfileName::from("DS1")).expect("DS1");
+    assert_eq!(
+        ds1.models.default.as_deref(),
+        Some("opus"),
+        "DS1's former id moved"
+    );
+    assert_eq!(
+        load_app_state()
+            .expect("state")
+            .preset_binds_offered
+            .as_deref(),
+        Some(crate::presets::builtin_binds_digest().as_str()),
+        "apply stores the digest after every checked account wrote",
+    );
+    // The in-memory state mirrors the digest too (F2): a later in-TUI state
+    // save must not write it back absent.
+    assert_eq!(
+        app.config().state.preset_binds_offered.as_deref(),
+        Some(crate::presets::builtin_binds_digest().as_str()),
+        "the in-memory state carries the digest",
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        ["moved 10 rows on 2 accounts onto the built-in preset models"],
+        "the apply toast is the approved copy",
+    );
+}
+
+/// `apply` with every account unchecked behaves exactly like `not now`: the
+/// digest is stored and nothing is toasted.
+#[test]
+fn rebind_apply_with_nothing_checked_is_not_now() {
+    use crate::profile::load_app_state;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::profile::save_app_state(&AppState {
+        profiles: rebind_fixture().iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut app = rebind_app(None, rebind_fixture());
+    // Uncheck all three accounts (D1, D2 in block 0; DS1 in block 1).
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty());
+    assert!(
+        toast_bodies(&app).is_empty(),
+        "apply with nothing checked toasts nothing",
+    );
+    assert_eq!(
+        load_app_state()
+            .expect("state")
+            .preset_binds_offered
+            .as_deref(),
+        Some(crate::presets::builtin_binds_digest().as_str()),
+        "the digest is stored like not now",
+    );
+}
+
+#[test]
+fn a_divergence_prompt_raised_at_startup_sits_above_the_rebind_confirm() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    open_divergence_modal(&mut app, "D1");
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Divergence(_))),
+        "the divergence prompt owns the keyboard",
+    );
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the re-bind confirm stays beneath",
+    );
+}
+
+/// A stored digest that is not the current one reopens the confirm (the latch's
+/// `stored != current` arm).
+#[test]
+fn a_stale_stored_digest_reopens_the_confirm() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = rebind_app(Some("0".repeat(64)), rebind_fixture());
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "a stale digest must re-offer",
+    );
+}
+
+/// The startup confirm never holds bootstrap: the gate exempts the re-bind
+/// modal, so usage seeding and the scheduler start while it waits.
+#[test]
+fn the_startup_confirm_does_not_hold_bootstrap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    app.reconcile_done = true;
+    maybe_spawn_bootstrap(&mut app);
+    assert!(
+        app.bootstrap_started,
+        "bootstrap starts while the re-bind confirm is open",
+    );
+}
+
+/// A row changed to a custom id after the offer survives the apply: the move is
+/// skipped because the fresh row no longer holds the move's `old`.
+#[test]
+fn a_custom_id_written_after_the_offer_survives_the_apply() {
+    use crate::profile::{ModelSettings, ProfileName, load_config};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = deepseek_account("D1", None);
+    crate::profile::save_profile(&profile).expect("save");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let config = load_config().expect("config");
+    let offers = crate::presets::rebind_offers(&config);
+    assert_eq!(offers.len(), 1);
+
+    // Another process sets the offered `default` row to a custom id.
+    profile.models = ModelSettings {
+        default: Some("my-custom".to_string()),
+        ..ModelSettings::default()
+    };
+    crate::profile::save_profile(&profile).expect("concurrent write");
+
+    let mut config = load_config().expect("config");
+    let applied = crate::actions::apply_rebind_account(
+        &mut config,
+        &ProfileName::from("D1"),
+        &offers[0].rows,
+    )
+    .expect("apply");
+    let after = load_config().expect("after");
+    let d1 = after.find(&ProfileName::from("D1")).expect("D1");
+    assert_eq!(
+        d1.models.default.as_deref(),
+        Some("my-custom"),
+        "the custom id survives; only rows still empty moved",
+    );
+    assert_eq!(
+        d1.models.opus.as_deref(),
+        Some("deepseek-v4-pro[1m]"),
+        "the still-empty opus row moved",
+    );
+    // default was skipped; the four tier rows applied.
+    assert_eq!(applied, 4);
+}
+
+/// The page keys move the cursor through the geometry the render published
+/// (not a bare scroll), so `space` always flips a visible account. 25 accounts
+/// at 100×24, drawn before every key the way `run_loop` does: the first
+/// PageDown lands mid-list, the second reaches the last account, PageUp comes
+/// back mid-list.
+#[test]
+fn rebind_page_keys_move_the_cursor_through_the_published_geometry() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles: Vec<Profile> = (0..25)
+        .map(|i| deepseek_account(&format!("a{i:02}"), None))
+        .collect();
+    let mut app = rebind_app(None, profiles);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("backend");
+    let draw = |term: &mut ratatui::Terminal<ratatui::backend::TestBackend>, app: &App| {
+        term.draw(|f| crate::tui::render::draw(f, app))
+            .expect("draw");
+    };
+    let cursor = |app: &App| match app.modals.last() {
+        Some(Modal::Rebind(form)) => form.cursor,
+        other => panic!("expected re-bind modal, got {other:?}"),
+    };
+    draw(&mut term, &app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(cursor(&app), 13, "first page down lands mid-list");
+    draw(&mut term, &app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        cursor(&app),
+        24,
+        "second page down lands on the last account"
+    );
+    draw(&mut term, &app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+    assert_eq!(cursor(&app), 11, "page up lands mid-list");
+}
+
+/// The startup confirm never holds the wrap-off drain: a pending switch-off
+/// drains under the confirm; a non-Rebind modal still holds it.
+#[test]
+fn the_startup_confirm_does_not_hold_the_wrap_off_drain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the re-bind confirm is open before the drain runs",
+    );
+    *app.pending_switch_off.lock().expect("flag") = true;
+    drain_pending_switch_off(&mut app);
+    assert!(
+        !*app.pending_switch_off.lock().expect("flag"),
+        "the wrap-off drained under the confirm",
+    );
+
+    let mut held = rebind_app(None, rebind_fixture());
+    held.open_modal(Modal::Help);
+    *held.pending_switch_off.lock().expect("flag") = true;
+    drain_pending_switch_off(&mut held);
+    assert!(
+        *held.pending_switch_off.lock().expect("flag"),
+        "a non-Rebind modal holds the drain",
+    );
+}
+
+/// With only the confirm open, a divergence the wrap-off drain finds raises its
+/// prompt ABOVE the confirm; a non-Rebind modal keeps the drain waiting.
+#[test]
+fn the_startup_confirm_lets_a_divergence_prompt_open_on_top() {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut work = deepseek_account("work", None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("profile");
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work")],
+        ..AppState::default()
+    })
+    .expect("state");
+    write_live_creds(&creds_ra("rt-live", "at-1"));
+
+    let build = || {
+        App::new(AppConfig {
+            state: AppState {
+                active_profile: Some(ProfileName::from("work")),
+                profiles: vec![ProfileName::from("work")],
+                ..AppState::default()
+            },
+            profiles: vec![work.clone()],
+        })
+    };
+
+    let mut app = build();
+    assert!(matches!(app.modals.first(), Some(Modal::Rebind(_))));
+    *app.pending_switch_off.lock().expect("flag") = true;
+    drain_pending_switch_off(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Divergence(_))),
+        "the divergence prompt opened above the confirm",
+    );
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the confirm stays beneath",
+    );
+
+    let mut held = build();
+    held.open_modal(Modal::Help);
+    *held.pending_switch_off.lock().expect("flag") = true;
+    drain_pending_switch_off(&mut held);
+    assert!(
+        *held.pending_switch_off.lock().expect("flag"),
+        "a non-Rebind modal keeps the drain waiting",
+    );
+    assert!(
+        matches!(held.modals.last(), Some(Modal::Help)),
+        "no prompt raised under a non-Rebind modal",
+    );
+}
+
+/// `apply` with every offered row already changed (nothing moved) behaves like
+/// `not now`: no toast, the digest stored.
+#[test]
+fn rebind_apply_that_moved_nothing_is_not_now() {
+    use crate::profile::{ModelSettings, load_app_state, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    for p in rebind_fixture() {
+        save_profile(&p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        profiles: rebind_fixture().iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut app = rebind_app(None, rebind_fixture());
+    // A concurrent writer fills every offered row before the apply.
+    let filled = ModelSettings {
+        default: Some("opus".to_string()),
+        opus: Some("deepseek-v4-pro[1m]".to_string()),
+        sonnet: Some("deepseek-flash[1m]".to_string()),
+        haiku: Some("deepseek-flash[1m]".to_string()),
+        fable: Some("deepseek-v4-pro[1m]".to_string()),
+        subagent: None,
+    };
+    for name in ["D1", "D2", "DS1"] {
+        let mut p = deepseek_account(name, None);
+        p.models = filled.clone();
+        save_profile(&p).expect("concurrent write");
+    }
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right)); // highlight apply
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty());
+    assert!(
+        toast_bodies(&app).is_empty(),
+        "nothing moved toasts nothing",
+    );
+    assert_eq!(
+        load_app_state()
+            .expect("state")
+            .preset_binds_offered
+            .as_deref(),
+        Some(crate::presets::builtin_binds_digest().as_str()),
+        "the digest is stored like not now",
+    );
+}
+
+/// A failed digest store raises the house `save failed` danger toast and leaves
+/// the in-memory digest unset, so the confirm re-offers next launch.
+#[test]
+fn rebind_failed_digest_store_toasts_and_leaves_memory_unset() {
+    use crate::profile::{FailAppStateSave, load_app_state, save_app_state};
+    let _home = crate::testutil::HomeSandbox::new();
+    save_app_state(&AppState {
+        profiles: rebind_fixture().iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut app = rebind_app(None, rebind_fixture());
+    let _fail = FailAppStateSave::new(&_home);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // not now
+    assert!(app.modals.is_empty(), "the confirm closes");
+    assert_eq!(
+        app.config().state.preset_binds_offered.as_deref(),
+        None,
+        "the failed store leaves the in-memory digest unset",
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        ["save failed\nfailed to write profiles.toml: Permission denied (os error 13)"],
+        "the danger toast is the house failed-write copy",
+    );
+    assert_eq!(
+        load_app_state()
+            .expect("state")
+            .preset_binds_offered
+            .as_deref(),
+        None,
+        "the on-disk digest stays unset",
+    );
+}
+
+/// A failing account write toasts the moved rows BEFORE the ruled
+/// `re-bind failed for '<account>'` danger toast naming the account.
+#[test]
+fn rebind_failed_account_write_toasts_the_ruled_copy() {
+    use crate::profile::{ProfileName, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    for p in rebind_fixture() {
+        save_profile(&p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        profiles: rebind_fixture().iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut app = rebind_app(None, rebind_fixture());
+    // Drop D2 from the roster after the confirm opened: its apply fails while
+    // D1 and DS1 move.
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("D1"), ProfileName::from("DS1")],
+        ..AppState::default()
+    })
+    .expect("drop D2");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right)); // highlight apply
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty());
+    assert_eq!(
+        toast_bodies(&app),
+        [
+            "moved 10 rows on 2 accounts onto the built-in preset models",
+            "re-bind failed for 'D2'\nprofile not found",
+        ],
+        "the moved toast precedes the failure toast",
+    );
+}
+
+/// `apply` where every checked account fails toasts only the danger lines: no
+/// moved toast, since no rows moved. Two accounts, so the moved toast would be
+/// visible (under the toast capacity) if it fired.
+#[test]
+fn rebind_apply_with_every_account_failing_toasts_no_moved_line() {
+    use crate::profile::{save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles = vec![deepseek_account("D1", None), deepseek_account("D2", None)];
+    for p in &profiles {
+        save_profile(p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut app = rebind_app(None, profiles);
+    // Drop every account from the roster after the confirm opened: all fail.
+    save_app_state(&AppState::default()).expect("empty roster");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right)); // highlight apply
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty());
+    assert_eq!(
+        toast_bodies(&app),
+        [
+            "re-bind failed for 'D1'\nprofile not found",
+            "re-bind failed for 'D2'\nprofile not found",
+        ],
+        "every account fails, so no moved toast, only the danger lines",
+    );
+}
+
+/// The active account's rows saved before a live-settings re-apply failure
+/// count as moved: the moved toast counts them, then the failure toast names
+/// the account.
+#[test]
+fn rebind_settings_failure_after_the_save_still_toasts_the_moved_rows() {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles = rebind_fixture();
+    for p in &profiles {
+        save_profile(p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("D1")),
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+    let settings = _home.home().join(".claude").join("settings.json");
+    std::fs::create_dir_all(settings.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::create_dir(&settings).expect("directory at settings.json");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(ProfileName::from("D1")),
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right)); // highlight apply
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty());
+    let err_line = format!(
+        "re-bind failed for 'D1'\nfailed to read {}: Is a directory (os error 21)",
+        settings.display()
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        [
+            "moved 15 rows on 3 accounts onto the built-in preset models",
+            err_line.as_str(),
+        ],
+        "the moved toast counts D1's saved rows, then the failure names D1",
+    );
+}
+
+/// The startup confirm never holds the divergence poll: one poll updates the
+/// banner under the confirm; a non-Rebind modal keeps it waiting.
+#[test]
+fn the_startup_confirm_does_not_hold_the_divergence_poll() {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut work = deepseek_account("work", None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("profile");
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work")],
+        ..AppState::default()
+    })
+    .expect("state");
+    write_live_creds(&creds_ra("rt-live", "at-1"));
+
+    let build = || {
+        App::new(AppConfig {
+            state: AppState {
+                active_profile: Some(ProfileName::from("work")),
+                profiles: vec![ProfileName::from("work")],
+                ..AppState::default()
+            },
+            profiles: vec![work.clone()],
+        })
+    };
+
+    let mut app = build();
+    assert!(matches!(app.modals.first(), Some(Modal::Rebind(_))));
+    force_poll(&mut app);
+    assert!(
+        app.divergence_pending.is_some(),
+        "the poll ran under the confirm",
+    );
+
+    let mut held = build();
+    held.open_modal(Modal::Help);
+    force_poll(&mut held);
+    assert!(
+        held.divergence_pending.is_none(),
+        "a non-Rebind modal holds the poll",
+    );
+}
+
+/// The startup confirm never holds the switch-gate drain: a queued gate drains
+/// under the confirm; a non-Rebind modal keeps it waiting.
+#[test]
+fn the_startup_confirm_does_not_hold_the_switch_gates() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    app.switch_gate_tx
+        .send(SwitchGateResult {
+            name: crate::profile::ProfileName::from("D1"),
+            gate: crate::oauth::AuthGate::Broken,
+        })
+        .expect("queue");
+    drain_switch_gates(&mut app);
+    assert!(
+        app.switch_gates.try_recv().is_err(),
+        "the gate drained under the confirm",
+    );
+
+    let mut held = rebind_app(None, rebind_fixture());
+    held.open_modal(Modal::Help);
+    held.switch_gate_tx
+        .send(SwitchGateResult {
+            name: crate::profile::ProfileName::from("D1"),
+            gate: crate::oauth::AuthGate::Broken,
+        })
+        .expect("queue");
+    drain_switch_gates(&mut held);
+    assert!(
+        held.switch_gates.try_recv().is_ok(),
+        "a non-Rebind modal holds the gate",
+    );
 }
