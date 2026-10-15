@@ -72,6 +72,7 @@ clauth list           # account table with cached usage, no network
 | `clauth disable <profile>` | `--yes` | hide it from auto-switch, polling, and the status feed; files stay |
 | `clauth enable <profile>` | | put a disabled profile back |
 | `clauth limit-reset <profile>` | `--list`, `--yes` | spend one of a codex account's banked usage-limit resets; `--list` shows them and spends nothing ([Codex](Codex#use-a-usage-limit-reset)) |
+| `clauth presets rebind [account…]` | `--yes` | list the model rows a built-in preset would fill: empty, or still on an id an earlier release shipped; `--yes` moves them ([Configuration](Configuration#presets)) |
 | `clauth which` | `--json` | print the profile owning the loaded credentials; inside a `clauth start` codex session, that codex profile |
 | `clauth list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches; codex accounts follow in their own `CODEX` section, which `--all` leaves alone |
 | `clauth jobs` | `--json` | what the delegates are doing: account, elapsed, last output, live runs first; `--json` also carries each run's `session_id`, the handle `delegate({session_id})` takes after a crash, and whether the run was isolated, which is what decides whether that id is a handle at all |
