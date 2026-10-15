@@ -380,6 +380,7 @@ fn is_loopback_url_on(url: &str, port: u16) -> bool {
 enum Method {
     Get,
     Post,
+    Put,
     Patch,
     Delete,
 }
@@ -389,6 +390,7 @@ impl Method {
         match self {
             Self::Get => "GET",
             Self::Post => "POST",
+            Self::Put => "PUT",
             Self::Patch => "PATCH",
             Self::Delete => "DELETE",
         }
@@ -469,6 +471,7 @@ fn send(
         Method::Get => with_headers!(agent.get(url)).call()?,
         Method::Delete => with_headers!(agent.delete(url)).call()?,
         Method::Post => with_headers!(agent.post(url)).send(body.unwrap_or(""))?,
+        Method::Put => with_headers!(agent.put(url)).send(body.unwrap_or(""))?,
         Method::Patch => with_headers!(agent.patch(url)).send(body.unwrap_or(""))?,
     };
     let header = |name: &str| {
@@ -665,9 +668,10 @@ struct ActionDecl {
 
 struct SettingDecl {
     key: String,
-    /// A `null` default: the setting may hold no value, so `null` is a valid
-    /// current value.
-    nullable: bool,
+    /// The declared `default`, `None` when the declaration omits the key. A
+    /// present `null` default means the setting may hold no value, so `null`
+    /// is a valid current value; an absent default marks nothing.
+    default: Option<Value>,
     account_scope: bool,
     typ: String,
     options: Vec<Value>,
@@ -688,6 +692,13 @@ impl SettingDecl {
             "string" => v.is_string(),
             _ => false,
         }
+    }
+
+    /// Whether a `null` current value is valid: the declaration carries an
+    /// explicit `null` default. An absent default marks nothing, so `null` is
+    /// not admitted for it.
+    fn nullable(&self) -> bool {
+        self.default.as_ref().is_some_and(Value::is_null)
     }
 
     /// A valid value other than `current`, for the destructive run's
@@ -808,6 +819,7 @@ fn check_expecting(
     let usage = c.usage(&declared, &accounts.views);
     c.config(&declared);
     c.missing_ids(&declared);
+    c.method_and_cap();
     c.login_flow(None);
     c.events(&declared);
     c.inference_routes(&declared);
@@ -1131,15 +1143,39 @@ impl Checker<'_> {
                 anyhow::bail!("nothing answers at {}; is the proxy running?", self.base)
             }
             Err(e) => {
-                self.violation(
-                    ROUTE,
-                    format!(
-                        "an answer inside the daemon probe's bounds ({} s to connect, {} s to answer)",
-                        crate::gateway::HEALTH_CONNECT_SECS,
-                        crate::gateway::HEALTH_RESPONSE_SECS
+                // A timeout is what the daemon's own probe reports a wedged
+                // proxy as, so only it keeps the bounds wording; every other
+                // transport failure names its own kind instead of a time bound
+                // it never hit.
+                let (expected, got) = match &e {
+                    ureq::Error::Timeout(_) => (
+                        format!(
+                            "an answer inside the daemon probe's bounds ({} s to connect, {} s to answer)",
+                            crate::gateway::HEALTH_CONNECT_SECS,
+                            crate::gateway::HEALTH_RESPONSE_SECS
+                        ),
+                        format!("no answer ({e})"),
                     ),
-                    format!("no answer ({e})"),
-                );
+                    ureq::Error::Protocol(_) => (
+                        "bytes that are HTTP".to_string(),
+                        format!("bytes that are not HTTP ({e})"),
+                    ),
+                    ureq::Error::Io(io)
+                        if matches!(
+                            io.kind(),
+                            std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        (
+                            "a whole answer".to_string(),
+                            format!("the connection closed early ({e})"),
+                        )
+                    }
+                    _ => ("an answer".to_string(), format!("no answer ({e})")),
+                };
+                self.violation(ROUTE, expected, got);
                 return Ok(None);
             }
         };
@@ -1489,9 +1525,10 @@ impl Checker<'_> {
         };
         self.opt(route, s, at, "inactive_hint", Kind::Str);
         self.opt(route, s, at, "restart", Kind::Bool);
+        let default = s.get("default").cloned();
         let decl = SettingDecl {
             key: key?,
-            nullable: s.get("default").is_some_and(Value::is_null),
+            default,
             account_scope: scope? == "account",
             typ: typ?,
             options,
@@ -1553,7 +1590,7 @@ impl Checker<'_> {
                         "undeclared".to_string(),
                     );
                 }
-                Some(decl) if !(decl.admits(value) || (value.is_null() && decl.nullable)) => {
+                Some(decl) if !(decl.admits(value) || (value.is_null() && decl.nullable())) => {
                     self.violation(
                         route,
                         format!("{path}: a valid {} value", decl.typ),
@@ -1561,6 +1598,23 @@ impl Checker<'_> {
                     );
                 }
                 Some(_) => {}
+            }
+        }
+        // Every declared setting's current value is rendered (account card,
+        // config view), so a missing one is a departure whichever scope it is
+        // declared at.
+        for decl in declared
+            .settings
+            .iter()
+            .filter(|s| s.account_scope == account_scope)
+        {
+            self.report.checks += 1;
+            if values.get(&decl.key).is_none() {
+                self.violation(
+                    route,
+                    format!("{}: the setting's current value", join(at, &decl.key)),
+                    "nothing".to_string(),
+                );
             }
         }
     }
@@ -1639,23 +1693,7 @@ impl Checker<'_> {
         }
         let settings = self.req(route, account, at, "settings", Kind::Obj).cloned();
         if let Some(settings) = &settings {
-            let settings_at = join(at, "settings");
-            self.settings_values(route, settings, &settings_at, declared, true);
-            // The card renders every account setting's current value, and the
-            // destructive run restores from it.
-            for decl in declared.settings.iter().filter(|s| s.account_scope) {
-                self.report.checks += 1;
-                if settings.get(&decl.key).is_none() {
-                    self.violation(
-                        route,
-                        format!(
-                            "{}: the setting's current value",
-                            join(&settings_at, &decl.key)
-                        ),
-                        "nothing".to_string(),
-                    );
-                }
-            }
+            self.settings_values(route, settings, &join(at, "settings"), declared, true);
         }
         Some(AccountView {
             id: id?,
@@ -1998,6 +2036,25 @@ impl Checker<'_> {
         }
     }
 
+    /// A known control path under a method it does not serve answers 405, and
+    /// a control body over the core's 4096-byte cap answers 413. Both aim at a
+    /// path that opens nothing, so a conformant proxy stays untouched.
+    fn method_and_cap(&mut self) {
+        let route = format!("PUT {CONTROL}/accounts");
+        let answer = self.admin_call(&route, Method::Put, "/accounts", None);
+        self.control_error(&route, answer, 405, "method_not_allowed", None);
+
+        let route = format!("PATCH {CONTROL}/accounts/{{id}} (oversized body)");
+        let body = json!({"settings": one("pad", json!("x".repeat(5000)))});
+        let answer = self.admin_call(
+            &route,
+            Method::Patch,
+            &format!("/accounts/{MISSING_ID}"),
+            Some(&body),
+        );
+        self.control_error(&route, answer, 413, "payload_too_large", None);
+    }
+
     /// Start one login flow (a re-bind of `account` when given), read it back,
     /// cancel it, and see it gone. A flow the proxy opened under any answer is
     /// cancelled, so no run leaves one polling upstream. The flow's
@@ -2039,14 +2096,33 @@ impl Checker<'_> {
                     self.poll_hints(&read, &view);
                 }
             }
+            // A paste is sent only when the flow is POSITIVELY poll-only:
+            // `modes` is a non-empty array of only "poll". Any other shape
+            // leaves the flow's doors unknown, and a paste into a paste-taking
+            // flow reaches upstream, so it is never sent.
+            let poll_only = body
+                .as_ref()
+                .and_then(|body| body.get("modes"))
+                .and_then(Value::as_array)
+                .is_some_and(|modes| {
+                    !modes.is_empty() && modes.iter().all(|m| m.as_str() == Some("poll"))
+                });
+            if poll_only {
+                let paste = format!("POST {CONTROL}/accounts/login/{{flow}} (paste)");
+                let answer = self.admin_call(
+                    &paste,
+                    Method::Post,
+                    &path,
+                    Some(&json!({"code": "zz-check-paste"})),
+                );
+                self.control_error(&paste, answer, 409, "flow_not_paste", None);
+            }
         }
         let cancel = format!("DELETE {CONTROL}/accounts/login/{{flow}}");
         if let Some(answer) = self.admin_call(&cancel, Method::Delete, &path, None) {
             self.status(&cancel, &answer, 204);
         }
-        if started {
-            self.cancelled(&path);
-        }
+        self.cancelled(&path);
     }
 
     fn flow_start(&mut self, route: &str, body: &Value) {
@@ -2080,12 +2156,16 @@ impl Checker<'_> {
     }
 
     /// Cancel a flow a refusal should never have opened; the refusal's own
-    /// status already names that departure.
+    /// status already names that departure. The cancel is itself checked, and
+    /// the flow read back as gone, so a proxy that keeps either is caught.
     fn cancel_stray(&mut self, flow: Option<String>) {
         if let Some(flow) = flow {
             let cancel = format!("DELETE {CONTROL}/accounts/login/{{flow}} (stray flow)");
             let path = format!("/accounts/login/{flow}");
-            self.admin_call(&cancel, Method::Delete, &path, None);
+            if let Some(answer) = self.admin_call(&cancel, Method::Delete, &path, None) {
+                self.status(&cancel, &answer, 204);
+            }
+            self.cancelled(&path);
         }
     }
 
@@ -2309,24 +2389,68 @@ impl Checker<'_> {
                 self.skip(format!("setting {}: no other valid value to set", decl.key));
                 continue;
             };
-            for (value, label) in [(&alt, "set"), (&original, "restore")] {
-                let route = format!("PATCH {CONTROL}/accounts/{{id}} ({label} {})", decl.key);
-                let answer = self.admin_call(
-                    &route,
-                    Method::Patch,
-                    path,
-                    Some(&json!({"settings": one(&decl.key, value.clone())})),
-                );
-                if let Some(body) = self.expect_json(&route, answer, 200) {
-                    self.equals(
-                        &route,
-                        body.get("settings").and_then(|s| s.get(&decl.key)),
-                        &format!("settings.{}", decl.key),
-                        value,
-                    );
+            self.patch_setting(path, &decl.key, &alt, "set");
+            // `null` resets a key to its default. The reset starts from a value
+            // other than the default, so a proxy that keeps the value is caught;
+            // where the value just set IS the default, set another value first.
+            // A declaration with no `default` has nothing to reset to, so the
+            // reset leg is skipped; the set and restore still run.
+            if let Some(default) = decl.default.clone() {
+                if !same(&alt, &default) {
+                    self.reset_setting(path, &decl.key, &default);
+                } else if let Some(from) = decl.alternative(&default) {
+                    self.patch_setting(path, &decl.key, &from, "set");
+                    self.reset_setting(path, &decl.key, &default);
+                } else {
+                    self.skip(format!(
+                        "setting {}: no value other than the default to reset from",
+                        decl.key
+                    ));
                 }
+            } else {
+                self.skip(format!("setting {}: no default to reset to", decl.key));
             }
+            self.patch_setting(path, &decl.key, &original, "restore");
             current.insert(decl.key.clone(), original);
+        }
+    }
+
+    /// `PATCH /accounts/{id}` setting `key` to `value`, read back equal.
+    fn patch_setting(&mut self, path: &str, key: &str, value: &Value, label: &str) {
+        let route = format!("PATCH {CONTROL}/accounts/{{id}} ({label} {key})");
+        let answer = self.admin_call(
+            &route,
+            Method::Patch,
+            path,
+            Some(&json!({"settings": one(key, value.clone())})),
+        );
+        if let Some(body) = self.expect_json(&route, answer, 200) {
+            self.equals(
+                &route,
+                body.get("settings").and_then(|s| s.get(key)),
+                &format!("settings.{key}"),
+                value,
+            );
+        }
+    }
+
+    /// `PATCH /accounts/{id}` with `key: null`, read back at its declared
+    /// `default`.
+    fn reset_setting(&mut self, path: &str, key: &str, default: &Value) {
+        let route = format!("PATCH {CONTROL}/accounts/{{id}} (reset {key})");
+        let answer = self.admin_call(
+            &route,
+            Method::Patch,
+            path,
+            Some(&json!({"settings": one(key, Value::Null)})),
+        );
+        if let Some(body) = self.expect_json(&route, answer, 200) {
+            self.equals(
+                &route,
+                body.get("settings").and_then(|s| s.get(key)),
+                &format!("settings.{key}"),
+                default,
+            );
         }
     }
 

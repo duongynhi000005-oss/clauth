@@ -790,7 +790,8 @@ pub(crate) enum ProxyCommand {
     /// route, what the contract expects, what the proxy answered), exiting 1
     /// when there is any. Safe on a live proxy: mutating routes are only aimed
     /// at an account id no proxy holds, and the one login flow it starts is
-    /// cancelled. It does send one real inference request on the key's account.
+    /// cancelled (a flow that takes no pastes first gets one, which it must
+    /// refuse). It does send one real inference request on the key's account.
     Check {
         /// The proxy's base URL, like http://127.0.0.1:9101, or the service of
         /// a proxy registered with `clauth proxy enable`, like zcode.
@@ -804,11 +805,12 @@ pub(crate) enum ProxyCommand {
         /// proxy's is the key of the one profile whose base_url is its bind.
         #[arg(long, value_name = "PATH")]
         key_file: Option<PathBuf>,
-        /// Also run the mutating routes for real on this account: change and
-        /// restore each setting it can, run each action, re-mint its key, then delete
-        /// it. Requires --key-file holding this account's key, in both forms:
-        /// a registered proxy's profile key is never used for it. Meant for a
-        /// proxy's CI against a stub upstream.
+        /// Also run the mutating routes for real on this account: change each
+        /// setting it can, reset it to its default with null, restore it, run
+        /// each action, re-mint its key, then delete it. Requires --key-file
+        /// holding this account's key, in both forms: a registered proxy's
+        /// profile key is never used for it. Meant for a proxy's CI against a
+        /// stub upstream.
         #[arg(long, value_name = "ACCOUNT")]
         destructive: Option<String>,
     },
