@@ -812,6 +812,14 @@ impl SecretToken {
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }
+
+    /// A token the caller already read and validated with the acceptance rule
+    /// it owns (e.g. [`crate::proxy_check::read_admin_token`]): wraps that same
+    /// read's value, so no second read of the file can hand back a different,
+    /// unvalidated token.
+    pub(crate) fn from_validated(token: String) -> Self {
+        Self(token)
+    }
 }
 
 impl std::fmt::Debug for SecretToken {

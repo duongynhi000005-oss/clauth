@@ -1238,3 +1238,52 @@ complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_s
         "fish completes the rebind profiles and flags as one block, -y included",
     );
 }
+
+/// The fish `proxy` guard runs under fish itself, never only as script text:
+/// once `proxy` is on the command line, fish stops offering the profile names
+/// the profile verbs share with `proxy enable`. Skipped with a printed reason
+/// where fish is not on PATH, unless `CLAUTH_REQUIRE_SHELL_LINT=1` demands it.
+#[cfg(unix)]
+#[test]
+fn fish_runs_the_proxy_guard() {
+    if std::process::Command::new("fish")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        let strict = std::env::var("CLAUTH_REQUIRE_SHELL_LINT").as_deref() == Ok("1");
+        assert!(
+            !strict,
+            "fish is not installed, but CLAUTH_REQUIRE_SHELL_LINT=1 demands it"
+        );
+        println!(
+            "skipping: fish is not on PATH, so the proxy guard is pinned by its script text alone"
+        );
+        return;
+    }
+    // Stub the profile shellout so the offer is observable without a built
+    // clauth binary, then ask fish what the real script completes.
+    let script = format!(
+        "{}\nfunction __clauth_profiles; echo STUB_PROFILE; end\n",
+        FISH.as_str()
+    );
+    let complete = |line: &str| {
+        String::from_utf8_lossy(
+            &std::process::Command::new("fish")
+                .args(["-c", &format!("{script}\ncomplete -C {line:?}")])
+                .output()
+                .expect("run fish")
+                .stdout,
+        )
+        .to_string()
+    };
+    assert!(
+        complete("clauth enable ").contains("STUB_PROFILE"),
+        "fish offers the profile under `clauth enable`, the positive control"
+    );
+    let under_proxy = complete("clauth proxy enable ");
+    assert!(
+        !under_proxy.contains("STUB_PROFILE"),
+        "fish offers no profile under `clauth proxy enable`: {under_proxy:?}"
+    );
+}

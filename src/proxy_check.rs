@@ -113,16 +113,10 @@ pub(crate) fn read_secret_file(path: &Path, what: &str) -> Result<Secret> {
         }
     };
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let open_to_others = std::fs::metadata(path)
-            .map(|meta| meta.permissions().mode() & 0o077 != 0)
-            .unwrap_or(true);
-        if open_to_others {
-            return Err(crate::usage_error(format!(
-                "{what} file {path:?} is accessible by other users; run `chmod 600` on it"
-            )));
-        }
+    if secret_file_open_to_others(path) {
+        return Err(crate::usage_error(format!(
+            "{what} file {path:?} is accessible by other users; run `chmod 600` on it"
+        )));
     }
     let value = text.trim_end_matches(['\n', '\r']);
     if value.is_empty() {
@@ -134,6 +128,60 @@ pub(crate) fn read_secret_file(path: &Path, what: &str) -> Result<Secret> {
         )));
     }
     Ok(Secret(value.to_string()))
+}
+
+/// Whether a credential file's mode lets other users read it; `true` also
+/// when the file cannot be inspected, so the refusal names `chmod 600` there
+/// too. The one check behind both the reader's refusal and the admin-token
+/// rule's choice of fix.
+#[cfg(unix)]
+pub(crate) fn secret_file_open_to_others(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o077 != 0)
+        .unwrap_or(true)
+}
+
+/// Windows has no owner-only file mode to check.
+#[cfg(not(unix))]
+pub(crate) fn secret_file_open_to_others(_path: &Path) -> bool {
+    false
+}
+
+/// The one acceptance rule for a proxy's admin token, shared by `enable`
+/// (through `crate::proxy::ensure_proxy_token`) and `clauth proxy check
+/// <service>`: the reader's rule above plus the [`crate::gateway::MIN_ADMIN_KEY_LEN`]
+/// floor. A refusal names its fix — `chmod 600` for a file other users can
+/// read, else delete the file so clauth mints a new one.
+pub(crate) fn read_admin_token(path: &Path) -> Result<Secret> {
+    let secret = read_secret_file(path, "admin token").map_err(|e| {
+        // A file only its owner can reach that the owner still cannot read has
+        // the owner-read bit off; `chmod 600` restores it, where deleting it
+        // would throw the token away.
+        #[cfg(unix)]
+        let unreadable = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(path)
+                .map(|meta| meta.permissions().mode() & 0o400 == 0)
+                .unwrap_or(false)
+        };
+        #[cfg(not(unix))]
+        let unreadable = false;
+        if secret_file_open_to_others(path) {
+            e
+        } else if unreadable {
+            crate::usage_error(format!("{e:#}; run `chmod 600` on it"))
+        } else {
+            crate::usage_error(format!("{e:#}; delete the file and clauth mints a new one"))
+        }
+    })?;
+    if secret.expose().len() < crate::gateway::MIN_ADMIN_KEY_LEN {
+        return Err(crate::usage_error(format!(
+            "admin token file {path:?} is shorter than {} characters; delete the file and clauth mints a new one",
+            crate::gateway::MIN_ADMIN_KEY_LEN
+        )));
+    }
+    Ok(secret)
 }
 
 // ── the report ──────────────────────────────────────────────────────────────
@@ -278,10 +326,19 @@ pub(crate) fn resolve_target(
             "expected a proxy's base URL, like http://127.0.0.1:9101, or the service of a proxy registered with `clauth proxy enable`, like zcode; got {target:?}"
         )));
     };
-    let Some(row) = crate::proxy::Registry::load()?.get(&service).cloned() else {
+    let registry = crate::proxy::Registry::load()?;
+    // A refused row is never run and never checked: refuse before any token
+    // or profile read, with the one text a write refuses with.
+    if let Some(reason) = registry.misconfigured_reason(service.as_str()) {
+        return Err(crate::proxy::misconfigured_error(reason)?);
+    }
+    let Some(row) = registry.get(&service).cloned() else {
         return Err(crate::proxy::not_registered(&service));
     };
     let admin = match admin_file {
+        // The explicit file is the user's own: read it with the plain reader,
+        // whose rule names no mint advice — clauth mints only
+        // `admin_token_path(service)`, never a file the user handed over.
         Some(path) => read_secret_file(path, "admin token")?,
         None => {
             let path = crate::proxy::admin_token_path(&service)?;
@@ -294,7 +351,7 @@ pub(crate) fn resolve_target(
                     service.as_str()
                 )));
             }
-            read_secret_file(&path, "admin token")?
+            read_admin_token(&path)?
         }
     };
     let key = match key_file {

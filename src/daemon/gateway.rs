@@ -1193,6 +1193,12 @@ impl<K: Supervised> Supervisor<K> {
         let (prepared, addr, port, log) = match self.kind.prepare(&record, memo, &self.cancel) {
             Ok(prepared) => prepared,
             Err(e) => {
+                // A stop asked for while the prepare ran kills and reaps its
+                // child; the round ends there — no publish, no log — so the
+                // slot keeps what the shutdown is about to write.
+                if self.cancel.load(Ordering::Acquire) {
+                    return None;
+                }
                 let (slot, hold) = self.kind.prepare_refusal(&record, &e);
                 if self.slot.reason() != slot.reason() {
                     logline!("clauth daemon: cannot start {}: {e:#}", self.kind.name());
@@ -1410,6 +1416,13 @@ impl<K: Supervised> Supervisor<K> {
     /// test uses it to pose the orphan a later daemon meets.
     pub(crate) fn abandon(&mut self) -> Option<Child> {
         self.child.take().map(|running| running.child)
+    }
+
+    /// Whether the prepare memo is unset, for the memoization pin: a kind that
+    /// does not memoize must never leave a prepared value in the supervisor.
+    #[cfg(all(test, unix))]
+    pub(crate) fn prepared_memo_is_none(&self) -> bool {
+        self.prepared_memo.is_none()
     }
 
     /// Kill and reap the child, for a test's teardown.
@@ -2570,9 +2583,7 @@ pub(crate) struct SupervisorThread<K: Supervised> {
     /// sets it, so a blocking prepare (a proxy's bounded `manifest` read) is
     /// killed and reaped instead of waiting its bound out.
     cancel: Arc<AtomicBool>,
-    /// How the shutdown's log lines name the child; read on the unix stop
-    /// path alone.
-    #[cfg(unix)]
+    /// How the shutdown's log lines name the child.
     name: String,
 }
 
@@ -2611,7 +2622,6 @@ pub(crate) fn start_kind<K: Supervised>(
 ) -> Result<SupervisorThread<K>> {
     let cancel = Arc::new(AtomicBool::new(false));
     let supervisor = Supervisor::build_with_cancel(kind.clone(), handle, Arc::clone(&cancel));
-    #[cfg(unix)]
     let name = kind.name();
     let (commands, inbox) = mpsc::channel::<RunMessage<K>>();
     let probe_sender = commands.clone();
@@ -2623,7 +2633,6 @@ pub(crate) fn start_kind<K: Supervised>(
         commands: Some(commands),
         thread: Some(thread),
         cancel,
-        #[cfg(unix)]
         name,
     })
 }
@@ -2807,7 +2816,6 @@ impl<K: Supervised> SupervisorThread<K> {
     /// stuck) or ended in a panic; a child then left running is named by its
     /// child marker, the next daemon start finishes the stop, and the cause is
     /// logged.
-    #[cfg(unix)]
     pub(crate) fn shutdown(mut self, budget: Duration) -> bool {
         match self.stop(budget) {
             StopOutcome::Stopped => true,

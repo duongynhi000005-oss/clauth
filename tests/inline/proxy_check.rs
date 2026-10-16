@@ -1333,6 +1333,127 @@ fn an_unregistered_service_is_refused_naming_enable() {
     );
 }
 
+/// A refused row is refused by `check <service>` before any profile read,
+/// with the one text a write refuses with.
+#[test]
+fn a_check_of_a_refused_row_refuses_naming_the_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    register(&[("zcode", 9101)]);
+    let path = crate::proxy::registry_path().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        format!("{text}\n[qwen]\nport = 65000\nenabeld = true\n"),
+    )
+    .unwrap();
+
+    let err = resolve_target("qwen", None, None, no_profiles)
+        .err()
+        .expect("refused");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "invalid proxy registry {}: row \"qwen\": unknown key \"enabeld\"",
+            path.display()
+        )
+    );
+}
+
+/// A hand-set admin token under the floor is refused by `check <service>`
+/// with the same reason `enable` gives: the one rule both call.
+#[cfg(unix)]
+#[test]
+fn a_short_admin_token_is_refused_by_check_naming_the_same_reason() {
+    let _home = crate::testutil::HomeSandbox::new();
+    register(&[("zcode", 9101)]);
+    let zcode = crate::proxy::Service::parse("zcode").unwrap();
+    let path = crate::proxy::admin_token_path(&zcode).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "short\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let err = resolve_target("zcode", None, None, no_profiles)
+        .err()
+        .expect("refused");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "admin token file {:?} is shorter than 32 characters; delete the file and clauth mints a new one",
+            path
+        )
+    );
+}
+
+/// `check <service> --admin-token-file <own file>` reads the user's own file
+/// with the plain reader: a file holding a space is refused by the reader's
+/// own message, never the mint advice that belongs to clauth's token file
+/// (clauth mints only `admin_token_path(service)`, never the file handed over).
+#[test]
+fn an_explicit_admin_token_file_is_read_with_the_plain_reader() {
+    let _home = crate::testutil::HomeSandbox::new();
+    register(&[("zcode", 9101)]);
+    let dir = tempfile::tempdir().unwrap();
+    let admin = secret_file(dir.path(), "my-token", "adm has a space\n", 0o600);
+    let key = secret_file(dir.path(), "key", &format!("{KEY}\n"), 0o600);
+
+    let err = resolve_target("zcode", Some(&admin), Some(&key), no_profiles)
+        .err()
+        .expect("refused");
+
+    assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
+    assert_eq!(
+        err.to_string(),
+        format!("admin token file {admin:?} holds whitespace or control characters"),
+        "the reader's own message, never the mint advice"
+    );
+}
+
+/// clauth's own token file failing with `PermissionDenied` (owner-read off)
+/// names `chmod 600` as the fix, never the delete advice that would throw the
+/// token away.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_admin_token_names_chmod_600_as_the_fix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = secret_file(dir.path(), "t", "x", 0o000);
+
+    let err = read_admin_token(&path).unwrap_err();
+
+    assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
+    assert_eq!(
+        err.to_string(),
+        format!("cannot read admin token file {path:?} (permission denied); run `chmod 600` on it")
+    );
+}
+
+/// Every `read_admin_token` refusal is a usage error, so `enable` and
+/// `check <service>` exit 2 on bad input the way `read_secret_file`'s other
+/// refusals do.
+#[cfg(unix)]
+#[test]
+fn every_read_admin_token_refusal_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, text, mode) in [
+        ("empty", "\n", 0o600),
+        ("space", "adm has a space\n", 0o600),
+        ("short", "short\n", 0o600),
+        ("mode", "adm-0123456789abcdef0123456789abcdef\n", 0o644),
+        ("unreadable", "x", 0o000),
+    ] {
+        let path = secret_file(dir.path(), name, text, mode);
+        let err = read_admin_token(&path).unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::UsageError>().is_some(),
+            "{name}: {err:#}"
+        );
+    }
+}
+
 /// The service form: the bind from the row, the token from its file, and
 /// the key of the one profile whose base_url is the bind, whatever loopback
 /// spelling or trailing slash it carries; another port, `https` or a path
