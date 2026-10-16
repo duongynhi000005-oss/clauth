@@ -82,7 +82,7 @@ pub(crate) enum Command {
     /// endpoint and api key are left untouched.
     ///
     /// Starting an Alibaba account from nothing therefore takes two steps: give
-    /// it a Model Studio endpoint first (a Qwen preset on the Setup tab, or
+    /// it an Alibaba endpoint first (the Qwen preset on the Setup tab, or
     /// --base-url here), then run a bare login on that name. Which console a
     /// session is captured from is read off the endpoint, so a name with no
     /// endpoint yet has no console to open.

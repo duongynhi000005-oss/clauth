@@ -3801,7 +3801,7 @@ fn a_preset_apply_clears_the_old_providers_streak() {
     super::apply_preset_to(
         &mut app,
         &super::PresetTarget::from("zai"),
-        "DeepSeek",
+        &crate::presets::load_preset("DeepSeek").expect("ships in the binary"),
         crate::presets::Leftover::Keep,
         &["base url"],
         &[],
@@ -3872,7 +3872,7 @@ fn a_preset_apply_keeping_the_endpoint_keeps_the_providers_streak() {
     super::apply_preset_to(
         &mut app,
         &super::PresetTarget::from("zai"),
-        "models-only",
+        &crate::presets::load_preset("models-only").expect("the saved preset"),
         crate::presets::Leftover::Keep,
         &[],
         &["base url"],
@@ -15149,6 +15149,132 @@ fn apply_preset_on_new_row_stamps_the_draft_buffers() {
     );
 }
 
+/// Picking the saved `qwen` row — a file in the built-in `Qwen`'s slot — applies
+/// the file's endpoint + models, never the built-in's; `d` on the same row opens
+/// the delete confirm naming the file's stem.
+#[test]
+fn a_saved_file_in_a_builtins_slot_applies_the_file_and_opens_its_delete_confirm() {
+    use super::{
+        ActionMenuAction, ConfirmAction, Modal, Tab, dispatch_action_menu_action, handle_key,
+    };
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let dir = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("presets");
+    std::fs::create_dir_all(&dir).expect("presets dir");
+    std::fs::write(
+        dir.join("qwen.json"),
+        r#"{"base_url":"https://mine.test","models":{"default":"my-model"}}"#,
+    )
+    .expect("a file saved under the name before the built-in shipped");
+
+    let pick = crate::presets::list_presets()
+        .iter()
+        .position(|p| !p.builtin && p.name == "qwen")
+        .expect("the saved row lists beside the built-in");
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    for _ in 0..pick {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    let acct = app
+        .config()
+        .find(&crate::profile::ProfileName::from("acct"))
+        .expect("account still there")
+        .clone();
+    assert_eq!(
+        acct.base_url.as_deref(),
+        Some("https://mine.test"),
+        "the saved row applied the file's endpoint, not the built-in's"
+    );
+    assert_eq!(acct.models.default.as_deref(), Some("my-model"));
+    assert_eq!(
+        acct.models.opus.as_deref(),
+        None,
+        "the file leaves the tiers unset; the built-in would have filled them"
+    );
+
+    // `d` on the same row opens the delete confirm naming the file's stem.
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    for _ in 0..pick {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('d')));
+    let Some(Modal::Confirm(state)) = app.modals.last() else {
+        panic!("the delete confirm opens");
+    };
+    assert_eq!(state.message.as_str(), "delete preset 'qwen'?");
+    assert!(
+        matches!(&state.on_confirm, ConfirmAction::DeletePreset(n) if n.name == "qwen"),
+        "the confirm deletes the file's stem, not the built-in"
+    );
+}
+
+/// `d` on a saved preset whose file vanishes before the confirm is answered
+/// toasts the apply path's gone message and deletes nothing: a name-only delete
+/// would resolve `load_preset("qwen")` to the built-in and report it unremovable.
+#[test]
+fn delete_confirm_on_a_vanished_saved_preset_reports_it_gone() {
+    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let dir = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("presets");
+    std::fs::create_dir_all(&dir).expect("presets dir");
+    let file = dir.join("qwen.json");
+    std::fs::write(
+        &file,
+        r#"{"base_url":"https://mine.test","models":{"default":"my-model"}}"#,
+    )
+    .expect("a saved file in the built-in's name");
+
+    let pick = crate::presets::list_presets()
+        .iter()
+        .position(|p| !p.builtin && p.name == "qwen")
+        .expect("the saved row lists beside the built-in");
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    for _ in 0..pick {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('d')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Confirm(_))),
+        "the delete confirm opens"
+    );
+
+    std::fs::remove_file(&file).expect("the saved file vanishes before the confirm is answered");
+
+    // `y` flips the default-no choice; enter runs the confirm.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('y')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert_eq!(
+        app.toasts
+            .iter()
+            .map(|t| (t.kind, t.body.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(super::ToastKind::Danger, "preset 'qwen' is gone")],
+        "exactly one danger toast, the apply path's gone message"
+    );
+}
+
 /// The `+ new` draft's seven buffers, endpoint first, in the Setup rows' order.
 fn draft_buffers(app: &super::App) -> [String; 7] {
     let d = app.config_draft.as_ref().expect("draft still mounted");
@@ -16117,7 +16243,7 @@ fn d_on_a_builtin_keeps_the_picker_on_a_custom_pops_it() {
     if let Some(Modal::Confirm(state)) = app.modals.last() {
         assert!(matches!(
             state.on_confirm,
-            ConfirmAction::DeletePreset(ref n) if n == "mine"
+            ConfirmAction::DeletePreset(ref n) if n.name == "mine"
         ));
     }
 }

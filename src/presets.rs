@@ -121,53 +121,29 @@ struct Builtin {
     binds: Binds,
 }
 
-/// How a built-in fills the account's model block.
-enum Binds {
-    /// One id per Claude tier. `default` becomes the `opus` alias, so the main
-    /// model follows the opus bind and a model release touches tier rows only;
-    /// `subagent` stays unset, so a subagent's own tier pick resolves through
-    /// that tier's bind. A `[1m]` suffix makes Claude Code size the context
-    /// window at 1M, so it rides only an id whose endpoint takes that much.
-    Tiers {
-        opus: &'static str,
-        sonnet: &'static str,
-        haiku: &'static str,
-        fable: &'static str,
-    },
-    /// One id on `default`, every tier and the subagent row. Alibaba's
-    /// `POST /apps/anthropic/v1/messages` answers `400 InvalidParameter "Model
-    /// not exist."` to `claude-sonnet-4-5` and `claude-haiku-4-5-20251001`
-    /// (measured 2026-08-11 against `token-plan.ap-southeast-1`), so a row left
-    /// unset is a hard failure there; Alibaba's own `bl config agent --agent
-    /// claude-code` writes every row for the same reason.
-    Every(&'static str),
+/// How a built-in fills the account's model block: one id per Claude tier.
+/// `default` becomes the `opus` alias, so the main model follows the opus bind
+/// and a model release touches tier rows only; `subagent` stays unset, so a
+/// subagent's own tier pick resolves through that tier's bind. A `[1m]` suffix
+/// makes Claude Code size the context window at 1M, so it rides only an id
+/// whose endpoint takes that much.
+struct Binds {
+    opus: &'static str,
+    sonnet: &'static str,
+    haiku: &'static str,
+    fable: &'static str,
 }
 
 impl Binds {
     fn models(&self) -> ModelSettings {
         let id = |s: &str| Some(s.to_string());
-        match *self {
-            Binds::Tiers {
-                opus,
-                sonnet,
-                haiku,
-                fable,
-            } => ModelSettings {
-                default: id("opus"),
-                opus: id(opus),
-                sonnet: id(sonnet),
-                haiku: id(haiku),
-                fable: id(fable),
-                subagent: None,
-            },
-            Binds::Every(model) => ModelSettings {
-                default: id(model),
-                opus: id(model),
-                sonnet: id(model),
-                haiku: id(model),
-                fable: id(model),
-                subagent: id(model),
-            },
+        ModelSettings {
+            default: id("opus"),
+            opus: id(self.opus),
+            sonnet: id(self.sonnet),
+            haiku: id(self.haiku),
+            fable: id(self.fable),
+            subagent: None,
         }
     }
 }
@@ -178,7 +154,7 @@ const BUILTINS: &[Builtin] = &[
         name: "DeepSeek",
         base_url: "https://api.deepseek.com/anthropic",
         former_ids: &["deepseek-chat"],
-        binds: Binds::Tiers {
+        binds: Binds {
             opus: "deepseek-v4-pro[1m]",
             sonnet: "deepseek-flash[1m]",
             haiku: "deepseek-flash[1m]",
@@ -189,7 +165,7 @@ const BUILTINS: &[Builtin] = &[
         name: "Z.ai",
         base_url: "https://api.z.ai/api/anthropic",
         former_ids: &["glm-5.2"],
-        binds: Binds::Tiers {
+        binds: Binds {
             opus: "glm-5.3[1m]",
             sonnet: "glm-5.3-flash[1m]",
             haiku: "glm-5.3-flash[1m]",
@@ -206,7 +182,7 @@ const BUILTINS: &[Builtin] = &[
         // OpenRouter serves the real Claude models, so each tier binds its own
         // family's moving `-latest` alias instead of a pro/flash pair; the same
         // guide marks only the fable, opus and sonnet aliases `[1m]`-capable.
-        binds: Binds::Tiers {
+        binds: Binds {
             opus: "~anthropic/claude-opus-latest[1m]",
             sonnet: "~anthropic/claude-sonnet-latest[1m]",
             haiku: "~anthropic/claude-haiku-latest",
@@ -224,7 +200,7 @@ const BUILTINS: &[Builtin] = &[
         former_ids: &["MiniMax-M3"],
         // The fast model is sold on the M Plan alone: a pay-as-you-go key
         // fails on sonnet and haiku until those two rows are re-pointed.
-        binds: Binds::Tiers {
+        binds: Binds {
             opus: "MiniMax-M3[1m]",
             sonnet: "MiniMax-M3.1-Flash-Preview[1m]",
             haiku: "MiniMax-M3.1-Flash-Preview[1m]",
@@ -232,28 +208,18 @@ const BUILTINS: &[Builtin] = &[
         },
     },
     Builtin {
-        name: "Qwen-TokenPlan-Intl",
-        base_url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
-        former_ids: &[],
-        binds: Binds::Every("qwen3.8-max"),
-    },
-    Builtin {
-        name: "Qwen-TokenPlan-CN",
-        base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
-        former_ids: &[],
-        binds: Binds::Every("qwen3.8-max"),
-    },
-    Builtin {
-        name: "Qwen-CodingPlan-Intl",
-        base_url: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
-        former_ids: &[],
-        binds: Binds::Every("qwen3-coder-plus"),
-    },
-    Builtin {
-        name: "Qwen-CodingPlan-CN",
-        base_url: "https://coding.dashscope.aliyuncs.com/apps/anthropic",
-        former_ids: &[],
-        binds: Binds::Every("qwen3-coder-plus"),
+        name: "Qwen",
+        // Qwen Cloud serves Token Plan for every region from one host, which
+        // answered `400 "Model not exist."` to `claude-sonnet-5-5` (measured
+        // 2026-10-13), so every tier binds a Qwen id.
+        base_url: "https://token-plan.maas.qwencloudapi.com/apps/anthropic",
+        former_ids: &["qwen3.8-max", "qwen3-coder-plus"],
+        binds: Binds {
+            opus: "qwen3.8-max[1m]",
+            sonnet: "qwen3.8-flash[1m]",
+            haiku: "qwen3.8-flash[1m]",
+            fable: "qwen3.8-max[1m]",
+        },
     },
 ];
 
@@ -269,8 +235,8 @@ fn builtins() -> Vec<Preset> {
         .collect()
 }
 
-/// Whether `name` collides with a built-in. Case-insensitive: a
-/// case-folding filesystem would let `deepseek.json` shadow the built-in's slot
+/// Whether `name` collides with a built-in, case-insensitive: the built-in owns
+/// its name, and a case-folding filesystem would read `qwen.json` as that name
 /// on one host and not another, so the refusal can't depend on spelling.
 pub(crate) fn is_builtin(name: &str) -> bool {
     BUILTINS
@@ -310,12 +276,16 @@ pub(crate) fn list_presets() -> Vec<Preset> {
         let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        // A built-in's slot is never readable from disk: the binary's copy is
-        // the only definition, so a stray file with that stem stays invisible
-        // instead of quietly shadowing it.
-        if is_builtin(name) {
+        // Apply and delete reach the file through `preset_path`, which trims the
+        // name and refuses one outside the preset charset; a row they could
+        // never open, or would open as another file, is skipped like an
+        // unparseable one.
+        if crate::actions::validate_name_chars(name).ok() != Some(name) {
             continue;
         }
+        // A file whose stem matches a built-in's name still lists as the user's
+        // own saved preset: the built-in keeps its name, the file keeps its
+        // stem, and neither replaces the other.
         let Ok(file) = read_json_file::<PresetFile>(&path) else {
             continue;
         };
@@ -340,6 +310,14 @@ pub(crate) fn load_preset(name: &str) -> Option<Preset> {
     {
         return Some(p);
     }
+    load_saved_preset(trimmed)
+}
+
+/// The disk half of [`load_preset`]: reads only the file, never the built-ins.
+/// A built-in's name with no file on disk is `None`, so this is how the saved
+/// `qwen` beside the built-in `Qwen` is told apart from it.
+pub(crate) fn load_saved_preset(name: &str) -> Option<Preset> {
+    let trimmed = name.trim();
     let path = preset_path(trimmed).ok()?;
     let file = read_json_file::<PresetFile>(&path).ok()?;
     Some(Preset {
@@ -357,8 +335,8 @@ pub(crate) fn preset_exists(name: &str) -> bool {
 }
 
 /// Write `name` to disk, replacing any custom preset already there. Refuses a
-/// built-in name outright — the binary's copy is the definition, so a file in
-/// that slot would be written and then never read.
+/// built-in name outright — the built-in owns that name, and a fresh save under
+/// it would add a second row beside the shipped one, never replace it.
 pub(crate) fn save_preset(
     name: &str,
     base_url: &Option<String>,
@@ -381,15 +359,17 @@ pub(crate) fn save_preset(
 
 pub(crate) fn delete_preset(name: &str) -> Result<()> {
     let trimmed = name.trim();
+    let path = preset_path(trimmed)?;
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+        return Ok(());
+    }
+    // No file at the name's path: it is either a built-in (whose copy ships in
+    // the binary and can't be deleted) or unknown.
     if is_builtin(trimmed) {
         bail!("'{trimmed}' is a built-in preset and cannot be deleted");
     }
-    let path = preset_path(trimmed)?;
-    if !path.exists() {
-        bail!("no preset named '{trimmed}'");
-    }
-    std::fs::remove_file(&path)?;
-    Ok(())
+    bail!("no preset named '{trimmed}'");
 }
 
 // ── Re-bind offer engine ──────────────────────────────────────────────────────

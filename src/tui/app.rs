@@ -950,7 +950,10 @@ impl std::fmt::Display for PresetTarget {
 #[derive(Debug, Clone)]
 pub(crate) struct PresetApplyForm {
     pub(crate) target: PresetTarget,
-    pub(crate) preset: String,
+    /// The picked row, `builtin` included, so the apply re-reads the store the
+    /// row came from — the saved `qwen` beside the built-in `Qwen` stays the
+    /// file, never the binary's copy.
+    pub(crate) preset: crate::presets::Preset,
     /// The confirm's first line, naming the preset and its target.
     pub(crate) message: String,
     /// Fields whose value the preset's own replaces, in Setup row order.
@@ -1011,11 +1014,13 @@ pub(crate) enum ConfirmAction {
     /// name. `(preset name, source account)` — confirming re-saves over it.
     OverwritePreset(String, String),
     /// Setup menu `apply preset`: the target already carries values the preset
-    /// would replace. `(target, preset name, the fields the confirm names)` —
-    /// the preset is re-read at apply, and a diff that moved since asks again.
-    ApplyPresetOver(PresetTarget, String, Vec<&'static str>),
-    /// Preset picker `d`: drop a custom preset from disk.
-    DeletePreset(String),
+    /// would replace. `(target, the picked preset, the fields the confirm
+    /// names)` — the preset is re-read at apply, and a diff that moved since
+    /// asks again.
+    ApplyPresetOver(PresetTarget, crate::presets::Preset, Vec<&'static str>),
+    /// Preset picker `d`: drop a custom preset from disk. Carries the picked
+    /// row's whole preset so the confirm re-reads the store that row came from.
+    DeletePreset(crate::presets::Preset),
     /// Info-only modal: an action the user asked for is refused for a reason
     /// they should read (rotating a macOS profile whose running session holds
     /// its login in a Keychain entry clauth cannot write). Confirming just
@@ -18420,6 +18425,14 @@ fn prompt_duplicate_profile(app: &mut App) {
     }));
 }
 
+/// The answer to deleting a built-in preset: it has no file to drop.
+fn toast_builtin_preset(app: &mut App, name: &str) {
+    app.toast(
+        ToastKind::Info,
+        format!("'{name}' is built in and always available"),
+    );
+}
+
 /// `save as preset`: ask for the preset name.
 fn prompt_save_preset(app: &mut App) {
     let Some((name, _, _)) = focused_account(app) else {
@@ -18586,10 +18599,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 return;
             };
             if preset.builtin {
-                app.toast(
-                    ToastKind::Info,
-                    format!("'{}' is built in and always available", preset.name),
-                );
+                toast_builtin_preset(app, &preset.name);
                 return;
             }
             app.modals.pop();
@@ -18598,7 +18608,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 detail: Some("accounts already stamped from it are untouched.".to_string()),
                 choice: false,
                 scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::DeletePreset(preset.name),
+                on_confirm: ConfirmAction::DeletePreset(preset),
             }));
         }
         KeyCode::Enter => {
@@ -18648,7 +18658,7 @@ fn offer_preset_apply(app: &mut App, target: PresetTarget, preset: &crate::prese
     if !leaves.is_empty() {
         app.open_modal(Modal::PresetApply(PresetApplyForm {
             target,
-            preset: preset.name.clone(),
+            preset: preset.clone(),
             message,
             replaces,
             leaves,
@@ -18661,13 +18671,13 @@ fn offer_preset_apply(app: &mut App, target: PresetTarget, preset: &crate::prese
             detail: Some(format!("replaces {}.", replaces.join(", "))),
             choice: false,
             scroll: ConfirmScroll::default(),
-            on_confirm: ConfirmAction::ApplyPresetOver(target, preset.name.clone(), replaces),
+            on_confirm: ConfirmAction::ApplyPresetOver(target, preset.clone(), replaces),
         }));
     } else {
         apply_preset_to(
             app,
             &target,
-            &preset.name,
+            preset,
             crate::presets::Leftover::Keep,
             &[],
             &[],
@@ -18687,20 +18697,32 @@ fn offer_preset_apply(app: &mut App, target: PresetTarget, preset: &crate::prese
 /// `+ new` the result lands in the draft's input buffers and is committed when
 /// the create form fires.
 ///
-/// The preset is re-read here rather than carried from the picker: a confirm can
-/// sit open across an edit to the store, and what the user confirmed was a NAME.
-/// The account's own api key is preserved — a template names an endpoint, never
-/// the credential for one.
+/// The picked row's `builtin` identity travels with it, so the re-read hits the
+/// store that row came from: the saved `qwen` beside the built-in `Qwen`
+/// re-reads the file, never the binary's copy, and a confirm can sit open
+/// across an edit to the store. The account's own api key is preserved — a
+/// template names an endpoint, never the credential for one.
 fn apply_preset_to(
     app: &mut App,
     target: &PresetTarget,
-    preset: &str,
+    preset: &crate::presets::Preset,
     leftover: crate::presets::Leftover,
     replaces: &[&'static str],
     leaves: &[&'static str],
 ) {
-    let Some(preset) = crate::presets::load_preset(preset) else {
-        app.toast(ToastKind::Danger, format!("preset '{preset}' is gone"));
+    // Re-read the store the picked row came from, never a second lookup by name
+    // alone: `load_preset("qwen")` answers the built-in, so the saved row must
+    // resolve through the disk-only loader.
+    let loaded = if preset.builtin {
+        crate::presets::load_preset(&preset.name)
+    } else {
+        crate::presets::load_saved_preset(&preset.name)
+    };
+    let Some(preset) = loaded else {
+        app.toast(
+            ToastKind::Danger,
+            format!("preset '{}' is gone", preset.name),
+        );
         return;
     };
     let Some((base_url, models)) = preset_target_block(app, target) else {
@@ -19516,10 +19538,31 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 &[],
             );
         }
-        ConfirmAction::DeletePreset(preset) => match crate::presets::delete_preset(&preset) {
-            Ok(()) => app.toast(ToastKind::Success, format!("deleted preset '{preset}'")),
-            Err(e) => app.toast(ToastKind::Danger, format!("delete preset failed\n{e}")),
-        },
+        ConfirmAction::DeletePreset(preset) => {
+            // A built-in has no file to drop; `delete_preset` by its name would
+            // reach a saved file spelled the same.
+            if preset.builtin {
+                toast_builtin_preset(app, &preset.name);
+                return;
+            }
+            // Re-read the saved file, like `apply_preset_to`: one that vanished
+            // since the confirm opened toasts the same gone message and deletes
+            // nothing.
+            let Some(loaded) = crate::presets::load_saved_preset(&preset.name) else {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("preset '{}' is gone", preset.name),
+                );
+                return;
+            };
+            match crate::presets::delete_preset(&loaded.name) {
+                Ok(()) => app.toast(
+                    ToastKind::Success,
+                    format!("deleted preset '{}'", loaded.name),
+                ),
+                Err(e) => app.toast(ToastKind::Danger, format!("delete preset failed\n{e}")),
+            }
+        }
         ConfirmAction::AdoptConfig(path) => {
             app.services
                 .shunt_action

@@ -3,8 +3,8 @@
 
 use super::{
     Binds, Builtin, RowMove, base_url_matches, builtin_binds_digest, delete_preset,
-    digest_of_builtins, group_offers, is_builtin, list_presets, load_preset, preset_exists,
-    presets_dir, rebind_offers, save_preset,
+    digest_of_builtins, group_offers, is_builtin, list_presets, load_preset, load_saved_preset,
+    preset_exists, presets_dir, rebind_offers, save_preset,
 };
 use crate::profile::{AppConfig, AppState, ModelSettings, Profile};
 
@@ -16,16 +16,7 @@ fn models(default: &str) -> ModelSettings {
 }
 
 /// The shipped names in menu order, so a table change lands in one place.
-const BUILTIN_NAMES: [&str; 8] = [
-    "DeepSeek",
-    "Z.ai",
-    "OpenRouter",
-    "MiniMax",
-    "Qwen-TokenPlan-Intl",
-    "Qwen-TokenPlan-CN",
-    "Qwen-CodingPlan-Intl",
-    "Qwen-CodingPlan-CN",
-];
+const BUILTIN_NAMES: [&str; 5] = ["DeepSeek", "Z.ai", "OpenRouter", "MiniMax", "Qwen"];
 
 fn names(presets: &[super::Preset]) -> Vec<&str> {
     presets.iter().map(|p| p.name.as_str()).collect()
@@ -96,6 +87,16 @@ fn the_builtins_ship_with_their_endpoint_and_every_tier_bound() {
                 "MiniMax-M3[1m]",
             ),
         ),
+        (
+            &listed[4],
+            "https://token-plan.maas.qwencloudapi.com/apps/anthropic",
+            binds(
+                "qwen3.8-max[1m]",
+                "qwen3.8-flash[1m]",
+                "qwen3.8-flash[1m]",
+                "qwen3.8-max[1m]",
+            ),
+        ),
     ] {
         assert_eq!(
             preset.base_url.as_deref(),
@@ -104,57 +105,6 @@ fn the_builtins_ship_with_their_endpoint_and_every_tier_bound() {
             preset.name
         );
         assert_eq!(preset.models, models, "{}", preset.name);
-    }
-}
-
-/// Alibaba's endpoints answer `400 "Model not exist."` for any Claude model id,
-/// so the alias an uncovered tier resolves to is a hard failure there rather
-/// than a degraded route. Every alibaba preset therefore writes its one model to
-/// `default`, each alias AND the subagent row, where the presets above leave the
-/// subagent row unset.
-#[test]
-fn an_alibaba_preset_pins_every_alias_and_the_subagent_row() {
-    let _home = crate::testutil::HomeSandbox::new();
-
-    for (name, base_url, model) in [
-        (
-            "Qwen-TokenPlan-Intl",
-            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
-            "qwen3.8-max",
-        ),
-        (
-            "Qwen-TokenPlan-CN",
-            "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
-            "qwen3.8-max",
-        ),
-        (
-            "Qwen-CodingPlan-Intl",
-            "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
-            "qwen3-coder-plus",
-        ),
-        (
-            "Qwen-CodingPlan-CN",
-            "https://coding.dashscope.aliyuncs.com/apps/anthropic",
-            "qwen3-coder-plus",
-        ),
-    ] {
-        let p = load_preset(name).unwrap_or_else(|| panic!("{name} ships in the binary"));
-        assert_eq!(p.base_url.as_deref(), Some(base_url), "{name} endpoint");
-        let m = &p.models;
-        for (field, got) in [
-            ("default", &m.default),
-            ("opus", &m.opus),
-            ("sonnet", &m.sonnet),
-            ("haiku", &m.haiku),
-            ("fable", &m.fable),
-            ("subagent", &m.subagent),
-        ] {
-            assert_eq!(
-                got.as_deref(),
-                Some(model),
-                "{name} leaves `{field}` free to resolve to a Claude id the endpoint rejects",
-            );
-        }
     }
 }
 
@@ -262,6 +212,25 @@ fn delete_drops_the_file_and_then_reports_the_miss() {
     );
 }
 
+/// A file whose stem no preset name can spell is skipped like an unparseable
+/// one: apply and delete validate (and trim) the name, so an inner space would
+/// offer a row that only ever answers "gone", and a trailing one (`good .json`)
+/// a row that loads and deletes `good.json` instead.
+#[test]
+fn a_file_no_preset_name_can_spell_is_not_listed() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    save_preset("good", &None, &models("m")).expect("save");
+    let dir = presets_dir().expect("presets dir");
+    std::fs::write(dir.join("my preset.json"), r#"{"models":{}}"#).expect("hand-named file");
+    std::fs::write(dir.join("good .json"), r#"{"models":{}}"#).expect("hand-named file");
+
+    assert_eq!(
+        names(&list_presets()),
+        [BUILTIN_NAMES.as_slice(), ["good"].as_slice()].concat(),
+    );
+}
+
 /// One unparseable file must not hide the rest of the store from the picker.
 #[test]
 fn an_unparseable_preset_is_skipped_not_fatal() {
@@ -277,41 +246,98 @@ fn an_unparseable_preset_is_skipped_not_fatal() {
     );
 }
 
-/// `save_preset` refuses a built-in's name, so a file in that slot can only be
-/// hand-written — and it must not shadow the binary's copy. Both surfaces read
-/// the built-in: the list shows one `DeepSeek` carrying the shipped endpoint,
-/// and a load by that name never reaches the file.
+/// A file whose stem matches a built-in's name (a preset a user saved before a
+/// release shipped a built-in under that name, `qwen.json` beside `Qwen`) is
+/// still the user's: it lists among the saved presets under its own stem,
+/// loads and deletes as a saved preset, and never replaces the built-in, whose
+/// entry keeps the shipped endpoint and stays undeletable.
 #[test]
-fn a_hand_written_file_cannot_shadow_a_builtins_slot() {
+fn a_saved_file_in_a_builtins_slot_lists_beside_it_and_never_replaces_it() {
     let _home = crate::testutil::HomeSandbox::new();
 
     save_preset("anchor", &None, &models("m")).expect("seed the dir");
     let dir = presets_dir().expect("presets dir");
     std::fs::write(
-        dir.join("DeepSeek.json"),
-        r#"{"base_url":"https://evil.test","models":{"default":"pwned"}}"#,
+        dir.join("qwen.json"),
+        r#"{"base_url":"https://mine.test","models":{"default":"my-model"}}"#,
     )
-    .expect("hand-write into the built-in's slot");
+    .expect("a file saved under the name before the built-in shipped");
 
     let listed = list_presets();
     assert_eq!(
-        listed.iter().filter(|p| p.name == "DeepSeek").count(),
-        1,
-        "the shadow file does not add a second entry",
+        listed
+            .iter()
+            .map(|p| (p.name.as_str(), p.builtin))
+            .collect::<Vec<_>>(),
+        [
+            ("DeepSeek", true),
+            ("Z.ai", true),
+            ("OpenRouter", true),
+            ("MiniMax", true),
+            ("Qwen", true),
+            ("anchor", false),
+            ("qwen", false),
+        ],
+        "the file lists among the saved presets, after the built-ins",
     );
-    let deepseek = listed
+    let builtin = listed
         .iter()
-        .find(|p| p.name == "DeepSeek")
+        .find(|p| p.builtin && p.name == "Qwen")
         .expect("built-in listed");
     assert_eq!(
-        deepseek.base_url.as_deref(),
-        Some("https://api.deepseek.com/anthropic"),
-        "the list reads the binary's copy, not the file",
+        builtin.base_url.as_deref(),
+        Some("https://token-plan.maas.qwencloudapi.com/apps/anthropic"),
+        "the built-in entry reads the binary's copy, not the file",
+    );
+    let saved = listed
+        .iter()
+        .find(|p| !p.builtin && p.name == "qwen")
+        .expect("saved entry listed");
+    assert_eq!(saved.base_url.as_deref(), Some("https://mine.test"));
+    assert_eq!(saved.models, models("my-model"));
+
+    assert_eq!(
+        load_preset("qwen").expect("loads").base_url.as_deref(),
+        Some("https://token-plan.maas.qwencloudapi.com/apps/anthropic"),
+        "a load by name still answers with the built-in",
+    );
+    let file = load_saved_preset("qwen").expect("the saved file loads");
+    assert_eq!(file.base_url.as_deref(), Some("https://mine.test"));
+    assert!(!file.builtin);
+
+    delete_preset("qwen").expect("the saved file deletes");
+    assert!(
+        !dir.join("qwen.json").exists(),
+        "delete removed the user's file"
     );
     assert_eq!(
-        load_preset("DeepSeek").expect("loads").base_url.as_deref(),
-        Some("https://api.deepseek.com/anthropic"),
-        "so does a load by name",
+        names(&list_presets()),
+        [BUILTIN_NAMES.as_slice(), ["anchor"].as_slice()].concat(),
+        "the built-in survives the delete",
+    );
+    let err = delete_preset("Qwen").expect_err("no file left: the built-in refuses");
+    assert!(
+        err.to_string().contains("built-in"),
+        "the refusal names why: {err}"
+    );
+}
+
+/// `load_saved_preset` reads only the disk: a built-in name with no file is
+/// `None`, an ordinary saved preset loads as `load_preset` does.
+#[test]
+fn load_saved_preset_reads_only_the_file() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    assert!(load_saved_preset("DeepSeek").is_none());
+    save_preset("mine", &None, &models("m")).expect("save");
+    assert_eq!(
+        load_saved_preset("mine"),
+        Some(super::Preset {
+            name: "mine".to_string(),
+            base_url: None,
+            models: models("m"),
+            builtin: false,
+        }),
     );
 }
 
@@ -367,6 +393,61 @@ fn a_former_id_and_every_empty_row_are_offered_the_new_binds() {
             move_("sonnet", None, Some("deepseek-flash[1m]")),
             move_("haiku", None, Some("deepseek-flash[1m]")),
             move_("fable", None, Some("deepseek-v4-pro[1m]")),
+        ],
+    );
+}
+
+/// A Qwen Cloud account still holding what the four retired Model Studio
+/// presets wrote (one id on every row, the subagent row included) is offered
+/// the Qwen preset's tier binds, and its subagent row the preset's unset value;
+/// an account whose rows hold ids no earlier release shipped (`qwen3.8-max[1m]`, the
+/// `qwen` account's own spelling) keeps them and is offered only its empty rows.
+#[test]
+fn the_retired_qwen_ids_are_offered_the_qwen_cloud_binds() {
+    let url = "https://token-plan.maas.qwencloudapi.com/apps/anthropic";
+    let every = |id: &str| ModelSettings {
+        default: Some(id.to_string()),
+        opus: Some(id.to_string()),
+        sonnet: Some(id.to_string()),
+        haiku: Some(id.to_string()),
+        fable: Some(id.to_string()),
+        subagent: Some(id.to_string()),
+    };
+    let own = ModelSettings {
+        opus: Some("qwen3.8-max[1m]".to_string()),
+        sonnet: Some("qwen3.8-max[1m]".to_string()),
+        haiku: Some("qwen3.8-max[1m]".to_string()),
+        subagent: Some("qwen3.8-max[1m]".to_string()),
+        ..ModelSettings::default()
+    };
+    let config = config_with(vec![
+        account("token", url, every("qwen3.8-max")),
+        account("coding", url, every("qwen3-coder-plus")),
+        account("own", url, own),
+    ]);
+
+    let offers = rebind_offers(&config);
+    let moved = |old: &str| {
+        [
+            move_("default", Some(old), Some("opus")),
+            move_("opus", Some(old), Some("qwen3.8-max[1m]")),
+            move_("sonnet", Some(old), Some("qwen3.8-flash[1m]")),
+            move_("haiku", Some(old), Some("qwen3.8-flash[1m]")),
+            move_("fable", Some(old), Some("qwen3.8-max[1m]")),
+            move_("subagent", Some(old), None),
+        ]
+    };
+    assert_eq!(offers.len(), 3);
+    assert_eq!(offers[0].account, "token");
+    assert_eq!(offers[0].rows, moved("qwen3.8-max"));
+    assert_eq!(offers[1].account, "coding");
+    assert_eq!(offers[1].rows, moved("qwen3-coder-plus"));
+    assert_eq!(offers[2].account, "own");
+    assert_eq!(
+        offers[2].rows,
+        [
+            move_("default", None, Some("opus")),
+            move_("fable", None, Some("qwen3.8-max[1m]")),
         ],
     );
 }
@@ -550,18 +631,21 @@ fn identical_change_sets_share_a_block_and_a_differing_one_splits() {
 /// stable 64-hex pin — never recomputed from the code under test.
 #[test]
 fn the_digest_changes_when_a_bind_changes() {
-    let one = digest_of_builtins(&[Builtin {
-        name: "X",
-        base_url: "https://a",
-        former_ids: &[],
-        binds: Binds::Every("m1"),
-    }]);
-    let two = digest_of_builtins(&[Builtin {
-        name: "X",
-        base_url: "https://a",
-        former_ids: &[],
-        binds: Binds::Every("m2"),
-    }]);
+    let with = |opus: &'static str| {
+        digest_of_builtins(&[Builtin {
+            name: "X",
+            base_url: "https://a",
+            former_ids: &[],
+            binds: Binds {
+                opus,
+                sonnet: "fast",
+                haiku: "fast",
+                fable: "big",
+            },
+        }])
+    };
+    let one = with("m1");
+    let two = with("m2");
     assert_ne!(one, two, "a bind change must change the digest");
     assert_eq!(one.len(), 64);
 }
@@ -575,7 +659,7 @@ fn the_digest_changes_when_only_a_former_id_changes() {
             name: "X",
             base_url: "https://a",
             former_ids,
-            binds: Binds::Tiers {
+            binds: Binds {
                 opus: "big",
                 sonnet: "fast",
                 haiku: "fast",
@@ -609,6 +693,6 @@ fn the_digest_changes_when_only_a_former_id_changes() {
 fn the_shipped_binds_digest_is_a_stable_literal() {
     assert_eq!(
         builtin_binds_digest(),
-        "a4d733b2c7d56df95eb0b28c09bb944be7504fb274f86357295e26a1d53609c0"
+        "2903a49cd2ef4476f104b8bd169e0a29475727ce7505914b8bd7f1e4f3de3585"
     );
 }
