@@ -74,7 +74,7 @@ pub(crate) fn is_stale_at(home: &Path) -> bool {
 /// root is that it must not depend on HOME, TMPDIR or CODEX_HOME).
 #[cfg(unix)]
 fn answers(socket: &Path) -> bool {
-    std::fs::canonicalize(socket)
+    crate::canonical::identity(socket)
         .and_then(std::os::unix::net::UnixStream::connect)
         .is_ok()
 }

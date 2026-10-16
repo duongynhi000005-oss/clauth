@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 //! The gateway engine: the record and token file, discovery in shunt's order,
 //! bind resolution, the env file, the version floor and `/health`, the admin
 //! edit behind its `shunt check` gate, and the store move. Every test holds a
@@ -109,17 +109,6 @@ fn the_record_refuses_a_config_it_cannot_edit_in_place() {
     }
 }
 
-/// `path` as `std::fs::canonicalize` resolves it, less a `\\?\` verbatim
-/// prefix: the plain drive path a Windows canonical path stands for (a no-op
-/// elsewhere, where canonicalize never adds one).
-fn plain_canonical(path: &Path) -> String {
-    let resolved = fs::canonicalize(path).expect("canonical");
-    let resolved = resolved.to_str().expect("utf-8 path").to_string();
-    resolved
-        .strip_prefix(r"\\?\")
-        .map_or(resolved.clone(), str::to_string)
-}
-
 /// Windows canonicalizes to a `\\?\C:\…` verbatim path, which the record, the
 /// `status.json` slot, the card and every error would then show; the record
 /// holds the plain path that verbatim form stands for.
@@ -127,8 +116,8 @@ fn plain_canonical(path: &Path) -> String {
 fn an_adopted_record_holds_the_plain_config_path() {
     let home = HomeSandbox::new();
     let record = adopted(&home);
-    let plain = plain_canonical(&home.home().join("etc").join("shunt.toml"));
-    assert_eq!(record.config().to_str(), Some(plain.as_str()));
+    let plain = crate::testutil::plain_path(&home.home().join("etc").join("shunt.toml"));
+    assert_eq!(record.config(), plain);
 }
 
 /// A record an older clauth wrote holds the verbatim form; it loads as the
@@ -148,10 +137,7 @@ fn a_record_holding_a_verbatim_config_path_loads_plain() {
     let path = record_path().expect("record path");
     write(&path, &format!("config = {}\n", toml_edit::value(verbatim)));
     let record = GatewayRecord::load().expect("load").expect("a record");
-    assert_eq!(
-        record.config().to_str(),
-        Some(plain_canonical(&config).as_str())
-    );
+    assert_eq!(record.config(), crate::testutil::plain_path(&config));
 }
 
 /// An adopt refuses a config the gateway could never run: on top of the
@@ -166,7 +152,7 @@ fn an_adopt_refuses_a_config_that_does_not_parse() {
         adoptable_record(config.clone())
             .expect("adoptable")
             .config(),
-        dunce::canonicalize(&config).expect("canonical")
+        crate::testutil::plain_path(&config)
     );
 
     write(&config, "a = 1\n[server\n");

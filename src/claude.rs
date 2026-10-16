@@ -1058,7 +1058,7 @@ pub(crate) fn classify_link_at(link: &Path, expected: &Path) -> Result<LinkState
 }
 
 fn paths_equivalent(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+    match (crate::canonical::identity(a), crate::canonical::identity(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }

@@ -1744,7 +1744,7 @@ fn sign_out_saving_at(
 pub(crate) fn keychain_service_for_config_dir(config_dir: &Path) -> Result<String> {
     // Canonicalize: CC resolves symlinks before hashing, and a relative path
     // would produce a different hash than the absolute one CC computes.
-    let canonical = std::fs::canonicalize(config_dir).with_context(|| {
+    let canonical = crate::canonical::identity(config_dir).with_context(|| {
         format!(
             "failed to canonicalize config dir: {}",
             config_dir.display()

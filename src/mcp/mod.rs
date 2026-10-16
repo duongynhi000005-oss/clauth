@@ -3483,9 +3483,9 @@ fn resolve_resume_workspace(session_id: &str) -> std::result::Result<std::path::
 /// sides are canonicalized: one spelling of a path is not the same string as
 /// another spelling of it.
 fn check_resume_cwd(given: &str, workspace: &std::path::Path) -> std::result::Result<(), String> {
-    let given_real = std::fs::canonicalize(given)
+    let given_real = crate::canonical::identity(given)
         .map_err(|e| format!("cwd '{given}' cannot be resolved: {e}"))?;
-    let workspace_real = std::fs::canonicalize(workspace).map_err(|e| {
+    let workspace_real = crate::canonical::identity(workspace).map_err(|e| {
         format!(
             "workspace '{}' cannot be resolved: {e}",
             workspace.display()
@@ -4284,7 +4284,7 @@ fn prompt_is_path(prompt: &str, cwd: Option<&str>) -> bool {
 fn read_prompt_path(cwd: Option<&str>, raw: &str) -> std::result::Result<String, String> {
     let path = std::path::Path::new(raw);
     if path.is_absolute() {
-        let real = std::fs::canonicalize(path).map_err(|e| {
+        let real = crate::canonical::identity(path).map_err(|e| {
             format!("prompt `{raw}` does not resolve: {e}; check the path or pass text")
         })?;
         return read_resolved_prompt(&real, raw);
@@ -4344,16 +4344,16 @@ fn read_prompt_file(cwd: Option<&str>, rel: &str) -> std::result::Result<String,
         Some(dir) => std::path::PathBuf::from(dir),
         None => std::env::current_dir().map_err(|e| format!("cwd cannot be resolved: {e}"))?,
     };
-    let base_real = std::fs::canonicalize(&base)
+    let base_real = crate::canonical::identity(&base)
         .map_err(|e| format!("cwd '{}' cannot be resolved: {e}", base.display()))?;
     let candidate = normalize_join(&base_real, rel)?;
     // Re-check immediately before the read: canonicalize resolves any symlink, so
     // a link pointing outside `cwd` fails the starts_with check, and the resolved
     // path is the file opened below. A miss names the path, the cwd and the fix.
-    let real = std::fs::canonicalize(&candidate).map_err(|e| {
+    let real = crate::canonical::identity(&candidate).map_err(|e| {
         format!(
             "prompt `{rel}` does not resolve under cwd '{}': {e}; check the path, or pass the prompt as text",
-            base_real.display()
+            crate::canonical::display(&base_real).display()
         )
     })?;
     if !real.starts_with(&base_real) {

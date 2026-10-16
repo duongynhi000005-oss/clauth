@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 //! The config editor's engine: the view, every edit kind on every list shape
 //! as a full candidate text, the comment-ownership refusals, the
 //! verification, and the landing through the checked write path. Every test

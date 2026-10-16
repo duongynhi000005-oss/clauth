@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 //! The gateway supervisor: the slot's closed state set, the record-only slot a
 //! body builds without a supervisor, and the state machine stepped by hand
 //! with an injected clock over a stub `shunt` in a `HomeSandbox`. The stub is
@@ -426,13 +426,9 @@ fn the_slot_names_the_plain_config_path() {
         Ok(())
     })
     .expect("save");
-    let resolved = fs::canonicalize(&config).expect("canonical");
-    let resolved = resolved.to_str().expect("utf-8 path").to_string();
-    let plain = resolved
-        .strip_prefix(r"\\?\")
-        .map_or(resolved.clone(), str::to_string);
+    let plain = crate::testutil::plain_path(&config);
 
-    assert_eq!(unsupervised_slot().config.as_deref(), Some(plain.as_str()));
+    assert_eq!(unsupervised_slot().config.as_deref(), plain.to_str());
 }
 
 /// The gateway's log stays under the daemon's size cap on the supervisor's

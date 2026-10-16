@@ -1123,7 +1123,7 @@ pub(crate) fn live_namespaced_keychain_services() -> Result<BTreeSet<String>> {
             if !is_runtime_dir_name(name) {
                 continue;
             }
-            match child.path().canonicalize() {
+            match crate::canonical::identity(child.path()) {
                 Ok(canonical) => {
                     live.insert(crate::claude::namespaced_keychain_service(&canonical));
                 }
@@ -1642,10 +1642,11 @@ pub(crate) mod namespaced_keychain_ledger {
         session: &SessionId,
         persist: impl FnOnce(&Owners) -> Result<()>,
     ) -> Result<OwnedKeychainWrite> {
-        let service =
-            crate::claude::namespaced_keychain_service(&runtime.canonicalize().with_context(
-                || format!("failed to canonicalize config dir: {}", runtime.display()),
-            )?);
+        let service = crate::claude::namespaced_keychain_service(
+            &crate::canonical::identity(runtime).with_context(|| {
+                format!("failed to canonicalize config dir: {}", runtime.display())
+            })?,
+        );
         record_with(&service, profile, session, persist)?;
         Ok(OwnedKeychainWrite { service })
     }
@@ -4656,7 +4657,10 @@ pub(crate) fn cwd_is_real_home(dir: &Path) -> bool {
     let Ok(home) = home_dir() else {
         return false;
     };
-    match (dir.canonicalize(), home.canonicalize()) {
+    match (
+        crate::canonical::identity(dir),
+        crate::canonical::identity(&home),
+    ) {
         (Ok(a), Ok(b)) => a == b,
         _ => dir == home,
     }
@@ -6245,7 +6249,7 @@ fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
         .into_iter()
         .collect();
     // The one `canonicalize` this walk pays for: every entry below inherits it.
-    let root_key = claude_home.canonicalize().ok();
+    let root_key = crate::canonical::identity(claude_home).ok();
     let mut classes = AliasClasses::default();
     for name in union_children(claude_home, runtime) {
         if name.to_str().is_some_and(|n| skip_top.contains(n)) {
@@ -6379,7 +6383,7 @@ fn child_key(
     a_meta: Option<&std::fs::Metadata>,
 ) -> Option<PathBuf> {
     if a_meta.is_some_and(|m| m.file_type().is_symlink()) {
-        return a.canonicalize().ok();
+        return crate::canonical::identity(a).ok();
     }
     let name = a.file_name()?;
     Some(parent_key?.join(name))
@@ -6577,7 +6581,9 @@ fn merge_path(
 /// re-creates it as a regular file.
 fn write_target(p: &Path) -> PathBuf {
     match p.symlink_metadata() {
-        Ok(m) if m.file_type().is_symlink() => p.canonicalize().unwrap_or_else(|_| p.to_path_buf()),
+        Ok(m) if m.file_type().is_symlink() => {
+            crate::canonical::plain(p).unwrap_or_else(|_| p.to_path_buf())
+        }
         _ => p.to_path_buf(),
     }
 }

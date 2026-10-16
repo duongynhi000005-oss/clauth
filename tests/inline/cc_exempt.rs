@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
 use super::*;
 
@@ -47,25 +47,6 @@ fn project_key_hashes_the_unsanitized_input() {
         project_key(&input),
         format!("-home-u-{}-rj2eld", "-".repeat(192))
     );
-}
-
-#[test]
-fn a_windows_verbatim_prefix_is_dropped_before_keying() {
-    // `canonicalize` on Windows answers `\\?\C:\...`; Claude Code keys the
-    // plain `C:\...` spelling, so `C--Users-u-repo`, never `----C--...`.
-    assert_eq!(
-        without_verbatim_prefix(r"\\?\C:\Users\u\repo"),
-        r"C:\Users\u\repo"
-    );
-    assert_eq!(
-        project_key(&without_verbatim_prefix(r"\\?\C:\Users\u\repo")),
-        "C--Users-u-repo"
-    );
-    assert_eq!(
-        without_verbatim_prefix(r"\\?\UNC\srv\share\repo"),
-        r"\\srv\share\repo"
-    );
-    assert_eq!(without_verbatim_prefix("/home/u/repo"), "/home/u/repo");
 }
 
 // ── memory base ──────────────────────────────────────────────────────────────
@@ -328,7 +309,9 @@ struct Layout {
 fn layout(link_projects: bool) -> Layout {
     let home = crate::testutil::HomeSandbox::new();
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
+    // Claude Code's spelling, so `memory_dir` and `store` expect what the
+    // settings file carries on Windows too.
+    let root = crate::testutil::node_path(tmp.path());
     let store = root.join("claude").join("projects");
     fs::create_dir_all(&store).unwrap();
     let runtime = root.join("runtime");
@@ -706,7 +689,7 @@ fn a_project_tier_claude_code_skips_at_home_does_not_suppress_ours() {
     // At the real `$HOME` the spawn gets `--setting-sources user`, so the
     // `<cwd>/.claude` project tier is never read; its key cannot count.
     let l = layout(true);
-    let home = l.home.home().canonicalize().unwrap();
+    let home = crate::testutil::node_path(l.home.home());
     fs::create_dir_all(home.join(".claude")).unwrap();
     fs::write(
         home.join(".claude/settings.json"),

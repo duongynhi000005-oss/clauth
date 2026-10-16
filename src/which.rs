@@ -328,7 +328,10 @@ fn session_auth_for(
 /// `cwd_is_real_home` shape); a side that cannot resolve falls back to the
 /// plain compare.
 fn dir_is_claude_dir(dir: &Path, claude_dir: &Path) -> bool {
-    match (dir.canonicalize(), claude_dir.canonicalize()) {
+    match (
+        crate::canonical::identity(dir),
+        crate::canonical::identity(claude_dir),
+    ) {
         (Ok(a), Ok(b)) => a == b,
         _ => dir == claude_dir,
     }

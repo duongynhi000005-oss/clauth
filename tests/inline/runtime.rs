@@ -1,4 +1,5 @@
 #![allow(unsafe_code)]
+#![allow(clippy::disallowed_methods)]
 use super::*;
 use std::fs;
 use std::time::{Duration, SystemTime};
@@ -432,6 +433,19 @@ fn pose_dir_link(link: &Path, target: &Path) {
          symlink_metadata, which is the misclassification under test",
         link.display()
     );
+}
+
+/// A linked entry is written through to its target, and that target path
+/// reaches `copy_file`'s error text: it is the plain spelling, never std's
+/// `\\?\` verbatim form on Windows.
+#[test]
+fn a_linked_write_target_is_its_target_in_plain_spelling() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("target");
+    fs::create_dir_all(&target).expect("target dir");
+    let link = tmp.path().join("link");
+    pose_dir_link(&link, &target);
+    assert_eq!(write_target(&link), crate::testutil::plain_path(&target));
 }
 
 /// A directory LINK in `~/.claude` (a skill linked at a plugin dir) must recurse

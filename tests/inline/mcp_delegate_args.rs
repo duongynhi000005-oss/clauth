@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 #![allow(unsafe_code)]
 
 //! Guard coverage for `delegate`'s merged `prompt` (text or a path, validated
@@ -167,6 +167,25 @@ fn work_dir(home: &std::path::Path) -> std::path::PathBuf {
     let dir = home.join("work");
     std::fs::create_dir_all(&dir).expect("create work dir");
     dir
+}
+
+/// A prompt path that does not resolve names the cwd in its plain spelling:
+/// on Windows the resolved base is a `\\?\` verbatim path, which the refusal
+/// would otherwise show.
+#[test]
+fn a_missing_prompt_names_the_cwd_in_its_plain_spelling() {
+    let home = HomeSandbox::new();
+    let cwd = crate::testutil::plain_path(&work_dir(home.home()));
+    let err = super::read_prompt_file(Some(cwd.to_str().unwrap()), "absent.txt")
+        .expect_err("absent prompt");
+    let os = std::fs::canonicalize(cwd.join("absent.txt")).expect_err("absent file");
+    assert_eq!(
+        err,
+        format!(
+            "prompt `absent.txt` does not resolve under cwd '{}': {os}; check the path, or pass the prompt as text",
+            cwd.display()
+        )
+    );
 }
 
 // ── prompt: one arg, two ways ────────────────────────────────────────────────

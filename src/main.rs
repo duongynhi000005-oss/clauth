@@ -1,6 +1,7 @@
 mod actions;
 mod alibaba_login;
 mod bell;
+mod canonical;
 mod cc_exempt;
 mod claude;
 mod claude_json;

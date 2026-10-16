@@ -369,15 +369,11 @@ fn the_shunt_card_names_the_plain_config_path() {
         Ok(())
     })
     .expect("save");
-    let resolved = std::fs::canonicalize(&config).expect("canonical");
-    let resolved = resolved.to_str().expect("utf-8 path").to_string();
-    let plain = resolved
-        .strip_prefix(r"\\?\")
-        .map_or(resolved.clone(), str::to_string);
+    let plain = crate::testutil::plain_path(&config);
 
     let slot = crate::daemon::gateway::unsupervised_slot();
     let card = crate::tui::app::shunt_check(&slot, false, None);
-    let line = format!("config: {plain}");
+    let line = format!("config: {}", plain.display());
     assert!(
         card.detail.contains(&line),
         "the card reads {line:?}: {:?}",

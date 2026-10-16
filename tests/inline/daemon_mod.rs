@@ -1,5 +1,5 @@
 #![allow(unsafe_code)]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 //! Characterization of the daemon's per-tick work (`Daemon::tick` and the
 //! drains extracted to `src/daemon/tick.rs`) — the top reliability path.
 //!

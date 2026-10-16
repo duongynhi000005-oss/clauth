@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 //! The per-proxy supervisor over the generic machine: one stub proxy runs
 //! healthy and restarts alone, a disabled or missing-binary row runs nothing,
 //! a foreign answerer and a contract-major mismatch are refused by name, and a

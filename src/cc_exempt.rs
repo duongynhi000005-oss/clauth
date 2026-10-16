@@ -84,25 +84,12 @@ fn base36(mut n: i64) -> String {
     digits.into_iter().rev().collect()
 }
 
-/// `p` without a Windows `\\?\` verbatim prefix: `std::fs::canonicalize` on
-/// Windows answers `\\?\C:\...`, while Claude Code keys the plain `C:\...`
-/// spelling. `\\?\UNC\server\share` becomes `\\server\share`.
-fn without_verbatim_prefix(p: &str) -> String {
-    if let Some(rest) = p.strip_prefix("\\\\?\\UNC\\") {
-        format!("\\\\{rest}")
-    } else if let Some(rest) = p.strip_prefix("\\\\?\\") {
-        rest.to_string()
-    } else {
-        p.to_string()
-    }
-}
-
 /// The directory Claude Code keys auto memory on for a session started in
 /// `cwd`: the nearest ancestor with a `.git` (dir or file), resolved through
 /// Claude Code's `kr` to a linked worktree's common dir, else that root, else
 /// the canonicalized `cwd`.
 pub(crate) fn memory_base(cwd: &Path) -> PathBuf {
-    let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let canonical = crate::canonical::identity(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let mut dir = canonical.clone();
     loop {
         let git = dir.join(".git");
@@ -163,7 +150,7 @@ fn kr(e: &Path) -> PathBuf {
 /// a path that does not exist (a stale back-pointer) stays as spelled. Used
 /// only by the back-pointer equality, where CC's `wr` realpaths both sides.
 fn realpath(p: &Path) -> PathBuf {
-    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+    crate::canonical::identity(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Whether the common dir's basename is `.git` (a normal repo's git dir), the
@@ -273,8 +260,8 @@ pub(crate) fn apply_spawn_settings(
         command.args(passthrough);
         return None;
     };
-    let needs_injection = without_verbatim_prefix(&literal.to_string_lossy())
-        != without_verbatim_prefix(&real.to_string_lossy());
+    let needs_injection = crate::canonical::claude_code_spelling(&literal.to_string_lossy())
+        != crate::canonical::claude_code_spelling(&real.to_string_lossy());
     if !needs_injection {
         command.args(passthrough);
         return None;
@@ -333,9 +320,11 @@ pub(crate) fn apply_spawn_settings(
             .is_some_and(|v| valid_project_dir_name(&v));
     }
     if !suppressed {
-        let store = without_verbatim_prefix(&real.to_string_lossy());
+        let store = crate::canonical::claude_code_spelling(&real.to_string_lossy());
         let base = memory_base(cwd);
-        let key = project_key(&without_verbatim_prefix(&base.to_string_lossy()));
+        let key = project_key(&crate::canonical::claude_code_spelling(
+            &base.to_string_lossy(),
+        ));
         settings.insert(
             "autoMemoryDirectory".to_string(),
             Value::String(
@@ -394,10 +383,14 @@ pub(crate) fn apply_spawn_settings(
 /// Code has created `projects`).
 fn resolve_projects(config_dir: &Path) -> Option<PathBuf> {
     let literal = config_dir.join("projects");
-    if let Ok(real) = literal.canonicalize() {
+    if let Ok(real) = crate::canonical::identity(&literal) {
         return Some(real);
     }
-    Some(config_dir.canonicalize().ok()?.join("projects"))
+    Some(
+        crate::canonical::identity(config_dir)
+            .ok()?
+            .join("projects"),
+    )
 }
 
 /// Split `passthrough` into the last user `--settings` value (folded in) and
@@ -586,9 +579,9 @@ pub(crate) fn read_hook_verdict(payload: &str) -> Option<String> {
     if !file.is_absolute() {
         return None;
     }
-    let file = file.canonicalize().ok()?;
+    let file = crate::canonical::identity(file).ok()?;
     let results_dir = transcript.parent()?.join(sid).join("tool-results");
-    let results_dir = results_dir.canonicalize().ok()?;
+    let results_dir = crate::canonical::identity(&results_dir).ok()?;
     if file.starts_with(results_dir.as_path()) {
         Some(READ_ALLOW.to_string())
     } else {

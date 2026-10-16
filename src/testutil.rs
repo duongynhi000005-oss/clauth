@@ -34,6 +34,38 @@ pub(crate) fn rs_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// `path` canonicalized and spelled as a plain path is shown or handed to
+/// another program to open, derived from dunce's rule rather than by calling
+/// it: on Windows a `\\?\X:\…` verbatim path drops `\\?\` while the whole
+/// verbatim string is at most 260 UTF-16 units; a longer one and a
+/// `\\?\UNC\…` one keep it. (dunce also keeps a path holding a reserved DOS
+/// name; no test builds one.) Elsewhere canonicalize adds no prefix.
+pub(crate) fn plain_path(path: &Path) -> PathBuf {
+    let resolved = crate::canonical::identity(path).expect("canonical");
+    let text = resolved.to_str().expect("utf-8 path");
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with(r"UNC\") && text.encode_utf16().count() <= 260 => {
+            PathBuf::from(rest)
+        }
+        _ => resolved,
+    }
+}
+
+/// `path` canonicalized and spelled as Claude Code keys its project dirs on
+/// Windows: `\\?\` dropped at any length, `\\?\UNC\server\…` as
+/// `\\server\…`. Elsewhere canonicalize adds no prefix.
+pub(crate) fn node_path(path: &Path) -> PathBuf {
+    let resolved = crate::canonical::identity(path).expect("canonical");
+    let text = resolved.to_str().expect("utf-8 path");
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        resolved
+    }
+}
+
 /// RAII home sandbox: acquires `HOME_TEST_LOCK` and redirects `home_dir()` into
 /// a tempdir for its lifetime, clearing the override on drop (even on panic).
 /// Required for any test that writes into the per-profile tree or creates

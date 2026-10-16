@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! The managed gateway under a real `clauth daemon`: a boot with an adopted
 //! config runs exactly one gateway and publishes it healthy, SIGTERM stops it
 //! before the daemon dies of that signal, and a `--standby` daemon runs none

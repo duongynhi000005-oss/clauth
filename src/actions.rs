@@ -1202,10 +1202,9 @@ pub(crate) fn rename_profile(
         // (`d3` -> `D3`) resolves to ONE directory on a case-insensitive
         // filesystem (the macOS default), so same-inode pairs are exempt.
         if old_dir.exists() && new_dir.exists() {
-            let same_dir = old_dir
-                .canonicalize()
+            let same_dir = crate::canonical::identity(&old_dir)
                 .ok()
-                .zip(new_dir.canonicalize().ok())
+                .zip(crate::canonical::identity(&new_dir).ok())
                 .is_some_and(|(a, b)| a == b);
             if !same_dir {
                 bail!(
