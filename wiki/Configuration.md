@@ -309,6 +309,8 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
       runtime-isolated-<sid>/
       sessions-<sid>/      # that session's PID file, flock-held while it runs
       sessions-isolated-<sid>/
+      spawn-settings-<sid>.json # that session's --settings (auto-memory dir, Read hook, any --settings you passed), removed at exit
+      spawn-settings-isolated-<sid>.json
     cx/                    # a codex profile (see Codex)
       config.toml          # harness = "codex", plus hooks_json
       auth.json            # the ChatGPT token chain; ~/.codex/auth.json links here after a capture

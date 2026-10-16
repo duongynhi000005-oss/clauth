@@ -97,7 +97,11 @@ clauth list           # account table with cached usage, no network
 
 ### Rules worth knowing
 
-- **`start` argument order.** clauth's own flags go before the profile name. Anything clauth does not recognize is forwarded to `claude` verbatim, leading hyphens included. Use `--` for a spelling both programs own, like `--help`.
+- **`start` argument order.** clauth's own flags go before the profile name. Anything clauth does not recognize is forwarded to `claude` verbatim, leading hyphens included, except a `--settings` value, which clauth merges into the settings it passes itself. Use `--` for a spelling both programs own, like `--help`.
+- **Auto memory and `Read` of tool results don't prompt.** Claude Code checks both the written and the resolved path, and a shared session's config dir links into `~/.claude`, so the resolved one falls outside the dirs it exempts.
+  - `start` and `delegate` point `autoMemoryDirectory` at the linked-to dir, and add a `Read` hook that allows only the session's own tool results. Grep and Glob on them still prompt.
+  - A memory directory you set yourself, in any settings file or `--settings`, wins.
+  - Plan files and user-scope agent memory still prompt until Claude Code checks those paths through the link.
 - **`start --with-fallback`** hands the session its own fallback chain. Refused by name when combined with `--isolated`, on Windows without symlink privilege, or for a non-OAuth account.
   - Also refused for an account outside the chain, when the chain has no other member, or when no `clauth daemon` is running.
 - **`start --auto`** picks the account instead of you naming one: the first fallback-chain member with headroom for the models the session will run ([Auto-switch](Auto-Switch#choosing-where-a-session-starts)).
