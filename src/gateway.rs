@@ -148,7 +148,8 @@ impl GatewayRecord {
         }
         let mut record: Self = read_toml_file(&path)?;
         // A record an older clauth wrote holds Windows' verbatim `\\?\` form;
-        // load it as the plain path every surface shows.
+        // load it by the rule a fresh adoption follows (plain wherever a plain
+        // form exists).
         record.config = dunce::simplified(&record.config).to_path_buf();
         check_record(&record)
             .with_context(|| format!("invalid gateway record {}", path.display()))?;
