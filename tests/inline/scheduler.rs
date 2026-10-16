@@ -15064,8 +15064,8 @@ fn a_startup_seed_racing_a_change_writes_nothing() {
     let last_fetched: crate::usage::LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
 
     // Pose a change landing between the seed's disk read and its store write.
-    super::set_oauth_seed_pre_write_hook(|n| {
-        crate::usage::bump_epoch_for_test(n, crate::usage::Half::OAuth);
+    super::set_seed_hook(super::SeedPhase::PreWrite, crate::usage::Half::OAuth, |n| {
+        crate::usage::bump_epoch(n, crate::usage::Half::OAuth);
     });
 
     crate::usage::bootstrap_fetch(
@@ -15131,10 +15131,15 @@ fn a_seed_holds_the_epoch_guard_through_its_writes() {
 
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    super::set_oauth_seed_post_compare_hook(move |_| {
-        reached_tx.send(()).expect("signal the park");
-        release_rx.recv().expect("release the seed");
-    });
+    let release_rx = std::sync::Mutex::new(release_rx);
+    super::set_seed_hook(
+        super::SeedPhase::PostCompare,
+        crate::usage::Half::OAuth,
+        move |_| {
+            reached_tx.send(()).expect("signal the park");
+            release_rx.lock().unwrap().recv().expect("release the seed");
+        },
+    );
 
     let store2 = Arc::clone(&store);
     let status2 = Arc::clone(&status);
@@ -15198,9 +15203,13 @@ fn a_third_party_startup_seed_racing_a_change_writes_nothing() {
     let status: crate::usage::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: crate::usage::LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
 
-    super::set_third_party_seed_pre_write_hook(|n| {
-        crate::usage::bump_epoch_for_test(n, crate::usage::Half::ThirdParty);
-    });
+    super::set_seed_hook(
+        super::SeedPhase::PreWrite,
+        crate::usage::Half::ThirdParty,
+        |n| {
+            crate::usage::bump_epoch(n, crate::usage::Half::ThirdParty);
+        },
+    );
     let work = crate::usage::collect_third_party_entries(&[profile]);
 
     crate::usage::bootstrap_third_party(
@@ -15255,10 +15264,15 @@ fn a_third_party_seed_holds_the_epoch_guard_through_its_writes() {
 
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    super::set_third_party_seed_post_compare_hook(move |_| {
-        reached_tx.send(()).expect("signal the park");
-        release_rx.recv().expect("release the seed");
-    });
+    let release_rx = std::sync::Mutex::new(release_rx);
+    super::set_seed_hook(
+        super::SeedPhase::PostCompare,
+        crate::usage::Half::ThirdParty,
+        move |_| {
+            reached_tx.send(()).expect("signal the park");
+            release_rx.lock().unwrap().recv().expect("release the seed");
+        },
+    );
 
     let store2 = Arc::clone(&store);
     let status2 = Arc::clone(&status);
@@ -15324,10 +15338,15 @@ fn a_codex_seed_holds_the_epoch_guard_through_its_writes() {
 
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    super::set_codex_seed_post_compare_hook(move |_| {
-        reached_tx.send(()).expect("signal the park");
-        release_rx.recv().expect("release the seed");
-    });
+    let release_rx = std::sync::Mutex::new(release_rx);
+    super::set_seed_hook(
+        super::SeedPhase::PostCompare,
+        crate::usage::Half::Codex,
+        move |_| {
+            reached_tx.send(()).expect("signal the park");
+            release_rx.lock().unwrap().recv().expect("release the seed");
+        },
+    );
 
     let store2 = Arc::clone(&store);
     let status2 = Arc::clone(&status);

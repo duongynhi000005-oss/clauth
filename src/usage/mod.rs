@@ -110,12 +110,10 @@ pub(crate) use fetch::{clear_usage_endpoint_override, set_usage_endpoint_overrid
 pub(crate) use fetch::take_profile_fetch;
 
 pub(crate) use forget::{
-    ForgetPlan, Half, MemoryStores, OAuthIdentity, apply_pending_forgets, epoch_guard, epoch_value,
-    forget_disk, forget_disk_plan, note_forget, note_forget_plan, note_rename, oauth_changed,
-    read_before_identities, read_codex_identity, register_memory_stores, third_party_identity,
-    throughput_for_endpoint, throughput_identity,
+    ForgetPlan, Half, MemoryStores, OAuthIdentity, apply_pending_forgets, endpoint_identity_plan,
+    epoch_guard_if_current, epoch_value, forget_disk, forget_disk_plan, note_forget,
+    note_forget_plan, note_rename, oauth_changed, read_before_identities, read_codex_identity,
+    register_memory_stores, third_party_identity, throughput_for_endpoint, throughput_identity,
 };
 #[cfg(test)]
-pub(crate) use forget::{
-    bump_epoch_for_test, reset_pending_forgets_for_test, try_lock_epoch_for_test,
-};
+pub(crate) use forget::{bump_epoch, reset_pending_forgets_for_test, try_lock_epoch_for_test};

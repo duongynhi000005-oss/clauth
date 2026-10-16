@@ -5444,8 +5444,7 @@ fn dead_key_clause(name: &str) -> String {
 /// stale verdict stops applying on its own (`profile_cache.rs`'s contract).
 fn record_dead_key(name: &ProfileName, fp: u64) {
     // The balance-marker drop is `forget_disk`'s third-party arm; the
-    // fingerprint-bound verdict write stays here (it is a fetch-landing
-    // concern, not a forget concern).
+    // fingerprint-bound verdict write stays here (a fetch-landing concern).
     crate::usage::forget_disk(name, crate::usage::Half::ThirdParty);
     write_auth_expired(name, fp);
 }

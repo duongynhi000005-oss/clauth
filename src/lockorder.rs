@@ -121,14 +121,9 @@ pub(crate) mod rank {
         /// the HTTP round trip; ranked just inside `Rotation` because the
         /// post-rotation retry reserves a slot while the rotation flock is held.
         UsageThrottle = 150;
-        /// Per-process credential-forget epoch (`usage::forget::EPOCH`), keyed by
-        /// `(name, half)` and monotonic, never removed. `forget_memory` bumps it
-        /// after the config lock drops and then clears + re-seeds the reading
-        /// stores (ranks 200-350), and every startup seed reads it before its
-        /// disk read and holds it across its store writes — so it has to sit
-        /// OUTERMOST of the reading locks it gates. Placed in the free slot
-        /// below `LastFetched` rather than above `Config`: holding it across the
-        /// store writes (which rank 200-350) must stay ascending.
+        /// Per-process forget epoch (`(name, half)`, monotonic, never removed):
+        /// the seeds hold it from compare through their store writes (ranks
+        /// 200-350), so it must sit OUTERMOST of every reading lock it gates.
         Epoch = 160;
         LastFetched = 200;
         /// Per-profile poll-health streaks (consecutive 429s, consecutive
@@ -257,11 +252,9 @@ pub(crate) mod rank {
         /// unranked mutex, `profile::HOME_OVERRIDE`, which every `home_dir()`
         /// takes and releases with nothing under it.
         McpDigest = 1800;
-        /// Process-global queue of credential-forgets a change site noted for a
-        /// store-holding process (the TUI or the daemon) to apply to memory
-        /// after its config guard drops (`usage::forget::PENDING_FORGETS`). A
-        /// leaf: recorded inside the state flock (rank 500, so it must rank
-        /// higher) and drained with no ranked lock held.
+        /// Process-global queue of forgets a change site noted
+        /// (`usage::forget::PENDING_FORGETS`): recorded inside the state flock
+        /// (rank 500), drained with no ranked lock held.
         ForgetQueue = 1805;
         /// The managed gateway's published slot (`daemon::gateway`): the
         /// supervisor thread replaces it, the status writer and

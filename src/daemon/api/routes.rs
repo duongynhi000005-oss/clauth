@@ -359,7 +359,6 @@ pub(crate) struct ApiContext {
     pub(crate) live: Option<crate::daemon::LiveStores>,
     /// The reading stores, when a daemon built this context: the REST switch
     /// drains the forgets its change site noted right after the locks drop.
-    /// `None` in tests that exercise a route without a daemon behind it.
     pub(crate) memory_stores: Option<crate::usage::MemoryStores>,
     /// The seam every bounded herdr call goes through (the pane route, the
     /// terminal bridge's snapshot, the agent routes); see [`super::panes`].
@@ -886,9 +885,8 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
                 "clauth api: device '{}' switched to '{active}'",
                 caller.device_for_log()
             );
-            // The reconcile's adopt noted the displaced account's forgets;
-            // apply them now that the switch's state flock and config guard
-            // dropped, before the republish so the feed reflects the forget.
+            // Apply now that the state flock and config guard dropped, before
+            // the republish so the feed reflects the forget.
             if let Some(stores) = &ctx.memory_stores {
                 crate::usage::apply_pending_forgets(stores);
             }
@@ -903,9 +901,8 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
             )
         }
         Err(e) => {
-            // The reconcile's snapshot may have noted a forget before the
-            // failure; apply it so a half-switched capture does not leave the
-            // old reading in the daemon's stores.
+            // Apply so a half-switched capture does not leave the old reading
+            // in the daemon's stores.
             if let Some(stores) = &ctx.memory_stores {
                 crate::usage::apply_pending_forgets(stores);
             }

@@ -1066,8 +1066,7 @@ struct Daemon {
     third_party_streaks: ThirdPartyStreaks,
     third_party_broken: ThirdPartyBroken,
     /// Scheduler-only stores held on `self` so `forget_memory` can reach the
-    /// whole process's name-keyed state from the main thread and the REST API
-    /// (the refresh thread shares the same `Arc`s), the way the TUI holds them.
+    /// whole process's name-keyed state.
     weekly_reset_kicks: WeeklyResetKicks,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
@@ -1226,9 +1225,7 @@ impl Daemon {
     }
 
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the
-    /// TUI's `start_scheduler` makes). The two scheduler-only stores live on
-    /// `self` so `forget_memory` can reach them from the main thread and the
-    /// REST API; the refresh thread shares the same `Arc`s.
+    /// TUI's `start_scheduler` makes).
     fn spawn_scheduler(&self) {
         spawn_refresher(
             Arc::clone(&self.config),
@@ -1373,9 +1370,7 @@ impl Daemon {
         }
     }
 
-    /// Bundle the reading stores `forget_memory` clears, cloning every `Arc` so
-    /// the main thread and the REST API reach the same maps the refresh thread
-    /// shares.
+    /// Bundle the reading stores `forget_memory` clears, cloning every `Arc`.
     fn memory_stores(&self) -> crate::usage::MemoryStores {
         crate::usage::MemoryStores {
             usage: Arc::clone(&self.usage_store),
@@ -1395,9 +1390,8 @@ impl Daemon {
         }
     }
 
-    /// Drain the forgets a change site noted and apply each to memory. Called
-    /// right after a change site's state-flock and config guard drop, the same
-    /// call the TUI makes.
+    /// Drain the forgets a change site noted and apply each to memory, right
+    /// after the state-flock and config guard drop.
     fn apply_forgets(&self) {
         crate::usage::apply_pending_forgets(&self.memory_stores());
     }

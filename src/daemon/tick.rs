@@ -54,10 +54,9 @@ impl super::Daemon {
         // heartbeat in time. The gates below skip the next drain once the
         // window or this deadline is spent.
         let deadline = Instant::now() + super::WATCHDOG_DEADLINE.saturating_sub(super::TICK);
-        // Safety net: any change site that noted a forget without an immediate
-        // drain still forgets before this tick's status write reads the stores.
-        // The per-site drains keep this a no-op on the paths that drain
-        // synchronously.
+        // Safety net: a forget noted without an immediate drain still lands
+        // before this tick's status write; the per-site drains keep this a
+        // no-op.
         self.apply_forgets();
         self.reload_if_changed();
         self.log_day_claim_notices();
@@ -381,8 +380,7 @@ impl super::Daemon {
         match result {
             Ok((fp, returning, changed)) => {
                 self.rebuild_tokens();
-                // The switch's adopt noted the displaced account's forgets;
-                // apply them now that the state flock and config guard dropped.
+                // Apply now that the state flock and config guard dropped.
                 self.apply_forgets();
                 self.last_reload_fp = fp;
                 self.switch_backoff = None;
@@ -399,9 +397,8 @@ impl super::Daemon {
                 }
             }
             Err(e) => {
-                // The switch's adopt may have noted a forget before the failure;
-                // apply it so a half-switched capture does not leave the old
-                // reading in the daemon's stores until a later successful switch.
+                // Apply so a half-switched capture does not leave the old
+                // reading in the daemon's stores.
                 self.apply_forgets();
                 self.fail_switch(&decision, now, &format!("switch failed: {e}"));
             }
@@ -497,8 +494,7 @@ impl super::Daemon {
         match result {
             Ok((fp, changed)) => {
                 self.rebuild_tokens();
-                // The switch-off's adopt noted the displaced account's forgets;
-                // apply them now that the state flock and config guard dropped.
+                // Apply now that the state flock and config guard dropped.
                 self.apply_forgets();
                 self.last_reload_fp = fp;
                 logline!("clauth daemon: switched off: all accounts spent");
@@ -507,9 +503,8 @@ impl super::Daemon {
                 }
             }
             Err(e) => {
-                // The switch-off's snapshot may have noted a forget before the
-                // failure; apply it so the dropped login's reading does not
-                // survive in the daemon's stores.
+                // Apply so the dropped login's reading does not survive in the
+                // daemon's stores.
                 self.apply_forgets();
                 logline!("clauth daemon: switch-off failed: {e}");
             }

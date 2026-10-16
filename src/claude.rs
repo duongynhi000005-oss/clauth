@@ -3374,11 +3374,9 @@ fn snapshot_active_credentials_unchecked(
     let Some(profile) = config.find_mut(active) else {
         return Ok(false);
     };
-    // An install that reads the login off disk proves no uuid, so its anchor is
-    // removed: the OAuth identity moves to an unanchored new token — a change
-    // (a same-account Unproven re-login forgets once). The non-force LinkedTo
-    // snapshot passes `false`: its bytes are the store's own, so nothing is
-    // forgotten.
+    // A disk-read login proves no uuid, so an anchored profile's identity moves
+    // (an Unproven re-login forgets once); the non-force LinkedTo snapshot's
+    // bytes are the store's own, so nothing is forgotten.
     let plan = if remove_anchor {
         let before = read_before_identities(active);
         let after_oauth = OAuthIdentity::for_values(None, credentials.access_token());
@@ -3395,8 +3393,6 @@ fn snapshot_active_credentials_unchecked(
             throughput: before.throughput != after_throughput,
             ..ForgetPlan::default()
         };
-        // forget_disk FIRST, before the identity writes (the anchor removal and
-        // the store write).
         forget_disk_plan(active, plan);
         crate::profile_cache::remove_profile_cache(
             active,

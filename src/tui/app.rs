@@ -3884,8 +3884,7 @@ pub(crate) struct App {
     pub(crate) third_party_streaks: ThirdPartyStreaks,
     pub(crate) third_party_broken: ThirdPartyBroken,
     /// Scheduler-only stores held here so `forget_memory` can reach the whole
-    /// process's name-keyed state from the UI thread (the refresh thread shares
-    /// the same `Arc`s).
+    /// process's name-keyed state.
     pub(crate) weekly_reset_kicks: WeeklyResetKicks,
     pub(crate) suppressed_auth_expired: SuppressedAuthExpiredStore,
     /// The #74 degraded cue per profile, written each tick by `apply_usage`
@@ -5210,8 +5209,6 @@ impl App {
     /// Bundle scheduler `Arc`s and launch the background refresher.
     fn start_scheduler(&self) {
         let h = WorkerHandles::from_app(self);
-        // Both scheduler-only stores are held by the App so `forget_memory` can
-        // reach them from the UI thread; the refresh thread shares the same `Arc`s.
         spawn_refresher(
             h.config,
             h.usage_tokens,
@@ -5269,9 +5266,8 @@ impl App {
         }
     }
 
-    /// Drain the forgets a change site noted and apply each to memory. Called
-    /// after a change site returns, with no config guard held (the stores rank
-    /// BELOW `Config`).
+    /// Drain the forgets a change site noted and apply each to memory, with no
+    /// config guard held (the stores rank BELOW `Config`).
     fn apply_forgets(&self) {
         apply_pending_forgets(&self.memory_stores());
     }
@@ -19750,11 +19746,9 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 }
             };
             if oauth_moved {
-                // The overwrite captured a live login that may be a DIFFERENT
-                // account: expire the clock so the next `/profile` read re-seeds
-                // the anchor, the way `overwrite_captured_profile` does. A
-                // snapshot of the account's own bytes forgets nothing and keeps
-                // its stamp.
+                // A force snapshot removes the anchor, so an anchored profile
+                // forgets once and its `/profile` clock expires; only an
+                // unanchored snapshot of the same token forgets nothing.
                 crate::usage::expire_profile_ttl(&ProfileName::from(active));
             }
             if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
@@ -20487,9 +20481,8 @@ fn apply_console_login(
 
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
-    // Safety net: any change site that noted a forget without an immediate
-    // drain still forgets before the next frame reads the stores. The per-site
-    // drains keep this a no-op on the paths that drain synchronously.
+    // Safety net: a forget noted without an immediate drain still lands before
+    // the next frame reads the stores; the per-site drains keep this a no-op.
     app.apply_forgets();
 
     while let Ok(ev) = app.update_results.try_recv() {

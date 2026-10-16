@@ -21,16 +21,16 @@ use crate::oauth;
 use crate::out::{out, outln};
 use crate::profile::{
     AccountId, AppConfig, ClaudeCredentials, ConfigHandle, ConsoleCredential, DivergenceChoice,
-    ModelSettings, Profile, ProfileName, load_app_state, load_profile, profile_dir, save_app_state,
-    save_profile, save_profile_config,
+    ModelSettings, Profile, ProfileName, StoredEndpointIdentity, load_app_state, load_profile,
+    profile_dir, save_app_state, save_profile, save_profile_config,
 };
 use crate::providers::Provider;
 use crate::runtime::RotationGuard;
 use crate::spinner::Spinner;
 use crate::usage::{
-    ForgetPlan, Half, OAuthIdentity, forget_disk, forget_disk_plan, note_forget, note_forget_plan,
-    note_rename, oauth_changed, read_before_identities, read_codex_identity, third_party_identity,
-    throughput_for_endpoint, throughput_identity,
+    ForgetPlan, Half, OAuthIdentity, endpoint_identity_plan, forget_disk, forget_disk_plan,
+    note_forget, note_forget_plan, note_rename, oauth_changed, read_before_identities,
+    read_codex_identity, third_party_identity, throughput_for_endpoint, throughput_identity,
 };
 
 /// ASCII alphanumeric + `-_.@+`, not leading-dot, not empty. `@`/`+` let an
@@ -369,8 +369,7 @@ pub(crate) fn switch_profile_reconciled(config: &ConfigHandle, name: &ProfileNam
     if changed {
         // The reconcile captured a live login that may be a DIFFERENT account:
         // expire the outgoing profile's `/profile` clock (ranked below the flock,
-        // so after the hold) only when its OAuth identity moved — a snapshot of
-        // the outgoing's own bytes forgets nothing and must keep its stamp.
+        // so after the hold), the way `overwrite_captured_profile` does.
         if oauth_changed && let Some(out) = outgoing {
             crate::usage::expire_profile_ttl(&out);
         }
@@ -773,28 +772,17 @@ pub(crate) fn edit_profile_endpoint(
             profile.console = None;
         }
         profile.provider = provider;
-        // The changed halves, from the values about to be written. The OAuth
-        // half is untouched; only the third-party and throughput identities can
-        // move. forget_disk runs BEFORE the identity write (the save) so a
-        // reloading process re-seeds nothing stale off the old cache.
-        let after_third_party = third_party_identity(
-            provider,
-            profile.api_key.as_deref(),
-            profile.console.as_ref(),
-            profile.base_url.as_deref(),
-        );
-        let after_throughput = throughput_for_endpoint(
+        let plan = endpoint_identity_plan(
+            &before,
             &before.oauth,
-            profile.base_url.as_deref(),
+            &StoredEndpointIdentity {
+                base_url: profile.base_url.clone(),
+                api_key: profile.api_key.clone(),
+                console: profile.console.clone(),
+                env: profile.env.clone(),
+            },
             before.has_credentials,
-            profile.api_key.as_deref(),
-            &profile.env,
         );
-        let plan = ForgetPlan {
-            third_party: before.third_party != after_third_party,
-            throughput: before.throughput != after_throughput,
-            ..ForgetPlan::default()
-        };
         forget_disk_plan(name, plan);
         if let Err(e) = save_profile_config(profile) {
             *profile = snapshot;
@@ -834,8 +822,6 @@ pub(crate) fn store_console_login(
         let before = read_before_identities(name);
         let profile = config.find_mut(name).context("profile not found")?;
         profile.console = Some(console);
-        // The console session is Alibaba's usage credential alone; the key the
-        // delegates run on is untouched, so only the third-party half can move.
         let after = third_party_identity(
             profile.provider,
             profile.api_key.as_deref(),
@@ -941,24 +927,17 @@ pub(crate) fn edit_profile_preset(
             .as_deref()
             .and_then(Provider::from_base_url);
         profile.provider = provider;
-        let after_third_party = third_party_identity(
-            provider,
-            profile.api_key.as_deref(),
-            profile.console.as_ref(),
-            profile.base_url.as_deref(),
-        );
-        let after_throughput = throughput_for_endpoint(
+        let plan = endpoint_identity_plan(
+            &before,
             &before.oauth,
-            profile.base_url.as_deref(),
+            &StoredEndpointIdentity {
+                base_url: profile.base_url.clone(),
+                api_key: profile.api_key.clone(),
+                console: profile.console.clone(),
+                env: profile.env.clone(),
+            },
             before.has_credentials,
-            profile.api_key.as_deref(),
-            &profile.env,
         );
-        let plan = ForgetPlan {
-            third_party: before.third_party != after_third_party,
-            throughput: before.throughput != after_throughput,
-            ..ForgetPlan::default()
-        };
         forget_disk_plan(name, plan);
         save_profile_config(profile)?;
         note_forget_plan(name, plan);
@@ -1074,8 +1053,6 @@ pub(crate) fn edit_profile_env(
         // settings when it appears in `prev` but not in the new `profile.env`.
         let old_env_keys: Vec<String> = profile.env.keys().cloned().collect();
         profile.env = env;
-        // Only the throughput identity reads the env (its token is what a
-        // delegate spawn sends when no key is set); the usage halves never do.
         let after_throughput = throughput_for_endpoint(
             &before.oauth,
             profile.base_url.as_deref(),
@@ -1255,10 +1232,8 @@ pub(crate) fn rename_profile(
         config.rename_all_occurrences(old, new, held);
 
         save_app_state(&config.state)?;
-        // The dir move carried every disk cache to `new`; only the memory
-        // entries need moving (the TUI drains the note after its config guard
-        // drops). Noted after the record move lands so a failed rename notes
-        // nothing.
+        // The dir move carried every disk cache to `new`; note after the record
+        // move lands so a failed rename notes nothing.
         note_rename(old, new);
 
         if was_active {
@@ -1340,9 +1315,8 @@ pub(crate) fn delete_profile(
         }
         config.remove(name, held);
         save_app_state(&config.state)?;
-        // Delete forgets BOTH halves: `remove_dir_all` swept every disk cache
-        // (throughput included), so only the memory entries need noting — the
-        // TUI drains them after its config guard drops.
+        // `remove_dir_all` swept every disk cache; only the memory entries need
+        // noting.
         note_forget_plan(
             name,
             ForgetPlan {
@@ -1496,8 +1470,7 @@ pub(crate) fn delete_codex_profile(
         }
         state.remove_profile(name);
         // The dir removal swept the shared `usage_cache.json` and the auth
-        // store; note the codex half so the TUI drops the name's shared store
-        // entry and poll-cadence memo after its config guard drops.
+        // store; only the memory entry needs noting.
         note_forget(&owned, Half::Codex);
         Ok(detached)
     })
@@ -1748,17 +1721,13 @@ fn write_codex_profile_store(
     raw: &[u8],
 ) -> Result<std::path::PathBuf> {
     let profile_name = ProfileName::from(name);
-    // The codex identity is the `auth.json` account id. A re-auth refuses a
-    // different account (`refuse_codex_account_swap`), so only a fresh capture
-    // moves it — and the forget is then a no-op over a store with no entry.
+    // `refuse_codex_account_swap` blocks a different account on re-auth, so only
+    // a fresh capture moves the codex identity.
     let before = read_codex_identity(&profile_name);
     let after = crate::codex_auth::CodexAuth::parse(raw)
         .ok()
         .and_then(|a| a.account_id().map(str::to_string));
     if before != after {
-        // forget_disk FIRST, before the identity write (the auth.json save), so
-        // a reloading process that re-seeds from disk after the write finds the
-        // old account's shared reading already gone.
         forget_disk(&profile_name, Half::Codex);
     }
     let dir = profile_dir(&profile_name)?;
@@ -1773,9 +1742,8 @@ fn write_codex_profile_store(
             .with_context(|| format!("failed to write {}", config_path.display()))?;
     }
     state.add_profile(name);
-    // The codex reading shares `usage_cache.json` with the OAuth half; the
-    // account change already dropped that cache above, so the re-seed this
-    // memory forget runs finds nothing to bring back.
+    // The account change already dropped the shared cache above, so the re-seed
+    // finds nothing.
     if before != after {
         note_forget(&profile_name, Half::Codex);
     }
@@ -2057,34 +2025,20 @@ pub(crate) fn duplicate_profile(
         profile.check_scoped = src.check_scoped;
         profile.bell_threshold = src.bell_threshold;
         profile.disabled = src.disabled;
-        // A fresh name holds no login: the duplicate's identity is its endpoint
-        // (and the env token the delegates run on). Every half whose identity
-        // moves forgets — a reused name (delete-then-recreate) drops its old
-        // reading instead of inheriting it.
+        // A fresh name holds no login; a reused name (delete-then-recreate)
+        // drops its old reading instead of inheriting it.
         let after_oauth = OAuthIdentity::for_values(None, None);
-        let provider = profile
-            .base_url
-            .as_deref()
-            .and_then(Provider::from_base_url);
-        let after_third_party = third_party_identity(
-            provider,
-            profile.api_key.as_deref(),
-            None,
-            profile.base_url.as_deref(),
-        );
-        let after_throughput = throughput_for_endpoint(
+        let plan = endpoint_identity_plan(
+            &before,
             &after_oauth,
-            profile.base_url.as_deref(),
+            &StoredEndpointIdentity {
+                base_url: profile.base_url.clone(),
+                api_key: profile.api_key.clone(),
+                console: None,
+                env: profile.env.clone(),
+            },
             false,
-            profile.api_key.as_deref(),
-            &profile.env,
         );
-        let plan = ForgetPlan {
-            oauth: oauth_changed(&before.oauth, &after_oauth),
-            third_party: before.third_party != after_third_party,
-            throughput: before.throughput != after_throughput,
-            ..ForgetPlan::default()
-        };
         forget_disk_plan(&new_name, plan);
         save_profile(&profile)?;
         note_forget_plan(&new_name, plan);
@@ -2308,10 +2262,9 @@ pub(crate) fn capture_into_profile(
     let seed_name = name.clone();
     with_state_lock(|held| {
         let before = read_before_identities(&name);
-        // The changed halves, from the login + endpoint about to be written. The
-        // name may have held a stale anchor, cache or reading (a crash before
+        // The name may hold a stale anchor, cache or reading (a crash before
         // the record landed, a delete-then-recreate): every half whose identity
-        // moves forgets, and forget_disk runs before the identity writes.
+        // moves forgets.
         let after_anchor = match &anchor {
             AnchorAction::Proven(uuid) => Some(uuid),
             _ => None,
@@ -2436,9 +2389,7 @@ pub(crate) fn create_profile_from_login(
         }
         let saved = save_app_state(&config.state);
         // The draft parked the login's uuid until `create account` fixed the
-        // name; this is that name. A proven install writes its anchor inside
-        // its hold, after the state write registered the profile (the anchor
-        // write requires it).
+        // name.
         crate::usage::seed_login_anchor(&seed_name, account_uuid.as_ref());
         saved
     })?;
@@ -2582,28 +2533,18 @@ pub(crate) fn overwrite_captured_profile(
         };
         let after_token = credentials.as_ref().and_then(|c| c.access_token());
         let after_oauth = OAuthIdentity::for_values(after_anchor, after_token);
-        let after_third_party = third_party_identity(
-            provider,
-            profile.api_key.as_deref(),
-            profile.console.as_ref(),
-            profile.base_url.as_deref(),
-        );
-        let after_throughput = throughput_for_endpoint(
+        let plan = endpoint_identity_plan(
+            &before,
             &after_oauth,
-            profile.base_url.as_deref(),
+            &StoredEndpointIdentity {
+                base_url: profile.base_url.clone(),
+                api_key: profile.api_key.clone(),
+                console: profile.console.clone(),
+                env: profile.env.clone(),
+            },
             credentials.is_some(),
-            profile.api_key.as_deref(),
-            &profile.env,
         );
-        let plan = ForgetPlan {
-            oauth: oauth_changed(&before.oauth, &after_oauth),
-            third_party: before.third_party != after_third_party,
-            throughput: before.throughput != after_throughput,
-            ..ForgetPlan::default()
-        };
         oauth_moved = plan.oauth;
-        // forget_disk FIRST, before any identity write (the anchor removal and
-        // the store write), so a reloading process re-seeds nothing stale.
         forget_disk_plan(name, plan);
         if installs_login {
             // Remove the old anchor BEFORE the store write, inside the same hold
@@ -2685,9 +2626,6 @@ pub(crate) fn overwrite_captured_profile(
         // Pinned by `reauth_overwrite_clears_broken_flag`.
         config.set_auth_broken(name, false);
         let saved = save_app_state(&config.state);
-        // A proven install writes its anchor inside its hold, after the state
-        // write (and the store write above), so a same-account re-login in
-        // another process never reads anchored -> unanchored.
         if let AnchorAction::Proven(uuid) = &anchor {
             crate::usage::seed_login_anchor(name, Some(uuid));
         }
@@ -2767,10 +2705,6 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
 pub(crate) fn clear_profile_api_key(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
         let base_url = config.find(name).and_then(|p| p.base_url.clone());
-        // The endpoint editor drops the stale third-party cache (and the
-        // throughput record, whose identity the now-keyless endpoint changed)
-        // through `forget_disk` — the explicit file remove it used to carry is
-        // folded in there.
         edit_profile_endpoint(config, name, base_url, None)
     })
 }

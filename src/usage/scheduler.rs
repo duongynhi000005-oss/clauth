@@ -2786,59 +2786,52 @@ fn oauth_seed_clock(name: &ProfileName) -> Option<u64> {
 /// read and its store write, posing a change landing in that window. Same shape
 /// as `codex_auth::set_pre_reread_hook`.
 #[cfg(test)]
-type SeedHook = Box<dyn Fn(&ProfileName) + Send>;
+type SeedHook = Arc<dyn Fn(&ProfileName) + Send + Sync>;
 
 #[cfg(test)]
-static OAUTH_SEED_PRE_WRITE_HOOK: std::sync::Mutex<Option<SeedHook>> = std::sync::Mutex::new(None);
-#[cfg(test)]
-static OAUTH_SEED_POST_COMPARE_HOOK: std::sync::Mutex<Option<SeedHook>> =
-    std::sync::Mutex::new(None);
-#[cfg(test)]
-static THIRD_PARTY_SEED_PRE_WRITE_HOOK: std::sync::Mutex<Option<SeedHook>> =
-    std::sync::Mutex::new(None);
-#[cfg(test)]
-static THIRD_PARTY_SEED_POST_COMPARE_HOOK: std::sync::Mutex<Option<SeedHook>> =
-    std::sync::Mutex::new(None);
-#[cfg(test)]
-static CODEX_SEED_POST_COMPARE_HOOK: std::sync::Mutex<Option<SeedHook>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-pub(crate) fn set_oauth_seed_pre_write_hook<F: Fn(&ProfileName) + Send + 'static>(hook: F) {
-    *OAUTH_SEED_PRE_WRITE_HOOK.lock().unwrap() = Some(Box::new(hook));
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SeedPhase {
+    PreWrite,
+    PostCompare,
 }
 
 #[cfg(test)]
-pub(crate) fn set_oauth_seed_post_compare_hook<F: Fn(&ProfileName) + Send + 'static>(hook: F) {
-    *OAUTH_SEED_POST_COMPARE_HOOK.lock().unwrap() = Some(Box::new(hook));
-}
+static SEED_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(SeedPhase, crate::usage::Half), SeedHook>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 #[cfg(test)]
-pub(crate) fn set_third_party_seed_pre_write_hook<F: Fn(&ProfileName) + Send + 'static>(hook: F) {
-    *THIRD_PARTY_SEED_PRE_WRITE_HOOK.lock().unwrap() = Some(Box::new(hook));
-}
-
-#[cfg(test)]
-pub(crate) fn set_third_party_seed_post_compare_hook<F: Fn(&ProfileName) + Send + 'static>(
+fn set_seed_hook<F: Fn(&ProfileName) + Send + Sync + 'static>(
+    phase: SeedPhase,
+    half: crate::usage::Half,
     hook: F,
 ) {
-    *THIRD_PARTY_SEED_POST_COMPARE_HOOK.lock().unwrap() = Some(Box::new(hook));
+    SEED_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((phase, half), Arc::new(hook));
 }
 
 #[cfg(test)]
-pub(crate) fn set_codex_seed_post_compare_hook<F: Fn(&ProfileName) + Send + 'static>(hook: F) {
-    *CODEX_SEED_POST_COMPARE_HOOK.lock().unwrap() = Some(Box::new(hook));
+fn run_seed_hook(slot: (SeedPhase, crate::usage::Half), name: &ProfileName) {
+    let hook = SEED_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&slot)
+        .cloned();
+    if let Some(hook) = hook {
+        hook(name);
+    }
 }
 
 /// Test seam: clear every seed hook, so a failing assertion cannot leave one
 /// installed for the next test. Called from `HomeSandbox::drop`.
 #[cfg(test)]
 pub(crate) fn clear_seed_hooks_for_test() {
-    *OAUTH_SEED_PRE_WRITE_HOOK.lock().unwrap() = None;
-    *OAUTH_SEED_POST_COMPARE_HOOK.lock().unwrap() = None;
-    *THIRD_PARTY_SEED_PRE_WRITE_HOOK.lock().unwrap() = None;
-    *THIRD_PARTY_SEED_POST_COMPARE_HOOK.lock().unwrap() = None;
-    *CODEX_SEED_POST_COMPARE_HOOK.lock().unwrap() = None;
+    SEED_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 pub(crate) fn try_seed_cache(
@@ -2849,10 +2842,6 @@ pub(crate) fn try_seed_cache(
     now: u64,
     interval_ms: u64,
 ) -> bool {
-    // Epoch gate: capture the epoch BEFORE the disk read, then hold the epoch
-    // guard from the write-side compare through the inserts, so a forget cannot
-    // bump the epoch between the check and the write and resurrect the stale
-    // reading the forget just dropped.
     let epoch = crate::usage::epoch_value(name, crate::usage::Half::OAuth);
     let Some((info, clock, fetch_status)) =
         load_cache_seed(name, interval_ms, now, oauth_seed_clock, |n| {
@@ -2862,22 +2851,13 @@ pub(crate) fn try_seed_cache(
         return false;
     };
     #[cfg(test)]
-    if let Some(hook) = OAUTH_SEED_PRE_WRITE_HOOK.lock().unwrap().as_ref() {
-        hook(name);
-    }
-    let guard = crate::usage::epoch_guard();
-    if guard
-        .get(&(name.to_string(), crate::usage::Half::OAuth))
-        .copied()
-        .unwrap_or(0)
-        != epoch
-    {
+    run_seed_hook((SeedPhase::PreWrite, crate::usage::Half::OAuth), name);
+    let Some(_guard) = crate::usage::epoch_guard_if_current(name, crate::usage::Half::OAuth, epoch)
+    else {
         return false;
-    }
+    };
     #[cfg(test)]
-    if let Some(hook) = OAUTH_SEED_POST_COMPARE_HOOK.lock().unwrap().as_ref() {
-        hook(name);
-    }
+    run_seed_hook((SeedPhase::PostCompare, crate::usage::Half::OAuth), name);
     if let Ok(mut s) = store.lock() {
         s.insert(name.to_string(), info);
     }
@@ -2926,14 +2906,9 @@ pub(crate) fn bootstrap_third_party(
     }
 }
 
-/// Seed one third-party name from `third_party_cache.json` — the per-name read
-/// `bootstrap_third_party` loops and `forget_memory` re-seeds with. The reading
-/// always lands; a status and a `last_fetched` stamp follow only when
-/// `scheduled` (the name is in the fetch work list — nothing polls a disabled
-/// or keyless name, so a status would claim a poll outcome that never happened).
-/// Epoch-gated like [`try_seed_cache`]: capture the epoch before the disk read,
-/// hold the guard from the compare through the writes.
-#[allow(clippy::too_many_arguments)]
+/// Seed one third-party name from `third_party_cache.json` —
+/// `bootstrap_third_party`'s loop and `forget_memory`'s re-seed. Epoch-gated
+/// like [`try_seed_cache`].
 pub(crate) fn seed_third_party_name(
     store: &ThirdPartyUsageStore,
     status: &ThirdPartyStatusStore,
@@ -2953,22 +2928,17 @@ pub(crate) fn seed_third_party_name(
         return;
     };
     #[cfg(test)]
-    if let Some(hook) = THIRD_PARTY_SEED_PRE_WRITE_HOOK.lock().unwrap().as_ref() {
-        hook(name);
-    }
-    let guard = crate::usage::epoch_guard();
-    if guard
-        .get(&(name.to_string(), crate::usage::Half::ThirdParty))
-        .copied()
-        .unwrap_or(0)
-        != epoch
-    {
+    run_seed_hook((SeedPhase::PreWrite, crate::usage::Half::ThirdParty), name);
+    let Some(_guard) =
+        crate::usage::epoch_guard_if_current(name, crate::usage::Half::ThirdParty, epoch)
+    else {
         return;
-    }
+    };
     #[cfg(test)]
-    if let Some(hook) = THIRD_PARTY_SEED_POST_COMPARE_HOOK.lock().unwrap().as_ref() {
-        hook(name);
-    }
+    run_seed_hook(
+        (SeedPhase::PostCompare, crate::usage::Half::ThirdParty),
+        name,
+    );
     if let Ok(mut s) = store.lock() {
         s.insert(name.to_string(), stats);
     }
@@ -2987,11 +2957,9 @@ pub(crate) fn seed_third_party_name(
     }
 }
 
-/// Seed one codex name from the shared `usage_cache.json` — `forget_memory`'s
-/// codex arm re-seeds with it. The codex reading shares the cache and the
-/// `usage`/`usage_status` entries with a same-name claude profile, so the
-/// re-seed restores whatever the cache holds; it writes no cadence leg (the
-/// codex cadence memo is `CODEX_POLLED_AT`). Epoch-gated like [`try_seed_cache`].
+/// Seed one codex name from the shared `usage_cache.json`; the re-seed restores
+/// whatever the cache holds and writes no cadence leg. Epoch-gated like
+/// [`try_seed_cache`].
 pub(crate) fn seed_codex_name(
     store: &UsageStore,
     status: &StatusStore,
@@ -3007,19 +2975,12 @@ pub(crate) fn seed_codex_name(
     else {
         return;
     };
-    let guard = crate::usage::epoch_guard();
-    if guard
-        .get(&(name.to_string(), crate::usage::Half::Codex))
-        .copied()
-        .unwrap_or(0)
-        != epoch
-    {
+    let Some(_guard) = crate::usage::epoch_guard_if_current(name, crate::usage::Half::Codex, epoch)
+    else {
         return;
-    }
+    };
     #[cfg(test)]
-    if let Some(hook) = CODEX_SEED_POST_COMPARE_HOOK.lock().unwrap().as_ref() {
-        hook(name);
-    }
+    run_seed_hook((SeedPhase::PostCompare, crate::usage::Half::Codex), name);
     if let Ok(mut s) = store.lock() {
         s.insert(name.to_string(), info);
     }
@@ -3118,7 +3079,16 @@ pub(crate) fn profile_credential_fingerprint(p: &crate::profile::Profile) -> Opt
 /// Disabled-ness is deliberately not part of it: that is a separate axis, and
 /// both callers already handle it themselves.
 pub(crate) fn third_party_credentialed(p: &crate::profile::Profile) -> bool {
-    match p.provider {
+    third_party_credentialed_fields(p.provider, p.api_key.as_deref())
+}
+
+/// The same credential test spelled off raw fields, so `third_party_identity`
+/// and `third_party_credentialed` read one rule.
+pub(crate) fn third_party_credentialed_fields(
+    provider: Option<crate::providers::Provider>,
+    api_key: Option<&str>,
+) -> bool {
+    match provider {
         // Alibaba's quota surface cannot read the api key (`providers::alibaba`),
         // so a console-only profile is fetchable and a keyless one must still be
         // scheduled — its fetch reports the missing session as `AuthExpired`,
@@ -3127,11 +3097,7 @@ pub(crate) fn third_party_credentialed(p: &crate::profile::Profile) -> bool {
         // An empty or whitespace-only key is no credential (matches the load
         // boundary's `has_usable_key`): it authenticates nothing, so treating it
         // as `Some` would schedule a run that cannot work.
-        _ => p
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|k| !k.is_empty()),
+        _ => api_key.is_some_and(|k| !k.trim().is_empty()),
     }
 }
 
@@ -4150,9 +4116,9 @@ const CODEX_USAGE_ORIGIN: &str = "chatgpt.com";
 static CODEX_POLLED_AT: std::sync::Mutex<Option<HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
-/// Drop `name` from the codex poll-cadence memo — `forget_memory`'s codex arm.
-/// A codex re-login changes the account, so the new chain must poll promptly
-/// rather than wait out the old account's cadence slot.
+/// Drop `name` from the codex poll-cadence memo — `forget_memory`'s codex arm:
+/// the new account polls promptly instead of waiting out the old account's
+/// cadence slot.
 pub(crate) fn forget_codex_polled(name: &str) {
     if let Ok(mut guard) = CODEX_POLLED_AT.lock()
         && let Some(seen) = guard.as_mut()

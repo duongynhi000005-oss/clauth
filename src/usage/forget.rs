@@ -1,19 +1,9 @@
-//! Credential-identity reads and the two-layer forget a credential change runs.
+//! Stored identity per half and the two-layer forget a change site runs.
 //!
-//! Each change site compares the STORED identity of each half before and after
-//! the change, drops that half's disk caches inside its state-flock hold
-//! (before the identity writes), and records the half for `forget_memory`,
-//! which a process that holds reading stores (the TUI and the daemon) applies
-//! right after its config guard drops (the reading stores rank BELOW `Config`,
-//! so the clears cannot run while it is held). A process with no stores — the
-//! CLI, the MCP server — records nothing, so its queue cannot grow. The
-//! per-process epoch gates the startup seeds so a seed racing a change writes
-//! nothing once the epoch moved.
-//!
-//! Identity is always read from the stored files through one raw-file function
-//! per half — never from an in-memory `Profile`, which a caller may hold stale.
-//! The "changed" answer is spelled once per half and applied at every site,
-//! never a literal compare of two identity values.
+//! Identity is always read from the stored files, never an in-memory `Profile`;
+//! the changed answer is spelled once per half. The memory clears rank BELOW
+//! `Config`, so they run after the config guard drops; the per-process epoch
+//! gates the startup seeds.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,7 +11,8 @@ use std::sync::{Arc, LazyLock};
 
 use crate::lockorder::{RankedMutex, rank};
 use crate::profile::{
-    AccountId, ConsoleCredential, ProfileName, stored_access_token, stored_endpoint_identity,
+    AccountId, ConsoleCredential, ProfileName, StoredEndpointIdentity, stored_access_token,
+    stored_endpoint_identity,
 };
 use crate::profile_cache::{
     ACCOUNT_ID_CACHE_FILE, KICK_BLOCK_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE,
@@ -33,12 +24,12 @@ use super::scheduler::{
     KickBlocks, LastFetchedAt, NextRefreshPerProfile, PollStreaks, StatusStore,
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyStatusStore, ThirdPartyStreaks,
     ThirdPartyUsageStore, UsageStore, WeeklyResetKicks, forget_codex_polled, seed_codex_name,
-    seed_third_party_name, try_seed_cache,
+    seed_third_party_name, third_party_credentialed_fields, try_seed_cache,
 };
 use super::{AutoStartQueueState, FetchLeg, forget_profile_memo, now_ms};
 
-/// One half of a profile's credential identity. `Throughput` has no in-memory
-/// store of its own — `forget_memory` skips it — but rides `forget_disk`.
+/// One half of a profile's credential identity. `Throughput` has no memory
+/// store — `forget_memory` skips it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Half {
     OAuth,
@@ -57,19 +48,8 @@ pub(crate) struct ForgetPlan {
 }
 
 impl ForgetPlan {
-    /// The memory-relevant halves, in a fixed order (throughput has no memory).
-    fn memory_halves(self) -> impl Iterator<Item = Half> {
-        [Half::OAuth, Half::ThirdParty, Half::Codex]
-            .into_iter()
-            .filter(move |h| match h {
-                Half::OAuth => self.oauth,
-                Half::ThirdParty => self.third_party,
-                Half::Codex => self.codex,
-                Half::Throughput => false,
-            })
-    }
-
-    fn all_halves(self) -> impl Iterator<Item = Half> {
+    /// The flagged halves, in a fixed order.
+    fn changed_halves(self) -> impl Iterator<Item = Half> {
         [Half::OAuth, Half::ThirdParty, Half::Codex, Half::Throughput]
             .into_iter()
             .filter(move |h| match h {
@@ -82,9 +62,9 @@ impl ForgetPlan {
 }
 
 /// SHA-256 over length-delimited fields, head-truncated to a u64 — the same
-/// explicit-encoding shape the third-party credential fingerprint uses, so no
-/// two field splits can collide. A collision costs one profile one extra (or
-/// one missed) forget, never a wrong identity on disk.
+/// shape as the third-party fingerprint, so no two field splits collide. A
+/// collision costs one extra or one missed forget, never a wrong identity on
+/// disk.
 fn digest_fields(fields: &[&[u8]]) -> u64 {
     use sha2::{Digest as _, Sha256};
     let mut hasher = Sha256::new();
@@ -98,9 +78,8 @@ fn digest_fields(fields: &[&[u8]]) -> u64 {
     u64::from_le_bytes(head)
 }
 
-/// The stored-token digest the OAuth identity carries: SHA-256 of the access
-/// token alone (the token is the only stored credential a `/profile` read is
-/// evidence about).
+/// SHA-256 of the access token alone — the only stored credential a `/profile`
+/// read is evidence about.
 fn stored_token_digest(access_token: &str) -> u64 {
     digest_fields(&[access_token.as_bytes()])
 }
@@ -115,19 +94,14 @@ pub(crate) struct OAuthIdentity {
 }
 
 impl OAuthIdentity {
-    /// The identity of the values a change site is about to write. `anchor` is
-    /// the anchor the site will leave on disk (already accounting for the
-    /// in-hold remove / re-seed); `stored_token` is the access token the new
-    /// credentials file will hold.
+    /// The identity of the values about to be written: the anchor the site
+    /// leaves on disk and the new credentials file's token.
     pub(crate) fn for_values(anchor: Option<&AccountId>, stored_token: Option<&str>) -> Self {
         match stored_token {
             Some(token) => Self {
                 anchor: anchor.filter(|u| !u.trim().is_empty()).cloned(),
                 stored: Some(stored_token_digest(token)),
             },
-            // No stored login can carry an anchor: a stale anchor left by a log
-            // out reads as "unanchored without a login", never as "anchored
-            // without one", which the changed predicate has no arm for.
             None => Self {
                 anchor: None,
                 stored: None,
@@ -136,9 +110,8 @@ impl OAuthIdentity {
     }
 }
 
-/// Read `name`'s stored OAuth identity from the raw files: the anchor
-/// (`account_id.json`) and the stored access token (`credentials.json`, through
-/// [`stored_access_token`], which never touches `load_profile`).
+/// Read `name`'s stored OAuth identity from the raw files (`account_id.json`,
+/// `credentials.json`).
 pub(crate) fn read_oauth_identity(name: &ProfileName) -> OAuthIdentity {
     let stored = stored_access_token(name).map(|t| stored_token_digest(&t));
     let Some(stored) = stored else {
@@ -196,13 +169,7 @@ pub(crate) fn third_party_identity(
     console: Option<&ConsoleCredential>,
     base_url: Option<&str>,
 ) -> Option<u64> {
-    // `third_party_credentialed` spelled off the raw fields: Alibaba is
-    // fetchable even keyless; every other provider needs a non-empty key.
-    let credentialed = match provider {
-        Some(Provider::Alibaba) => true,
-        _ => api_key.is_some_and(|k| !k.trim().is_empty()),
-    };
-    if !credentialed {
+    if !third_party_credentialed_fields(provider, api_key) {
         return None;
     }
     match provider {
@@ -266,10 +233,8 @@ pub(crate) fn throughput_identity(
     }
 }
 
-/// Every stored identity a change site compares, read once before the hold. The
-/// endpoint fields ride along so the site computes the AFTER throughput
-/// identity (which mixes the OAuth identity with the endpoint the delegates run
-/// on) from the same sources the BEFORE identity read.
+/// Every stored identity a change site compares; the endpoint fields ride
+/// along so the AFTER computation reads the same sources as the BEFORE.
 #[derive(Debug, Clone)]
 pub(crate) struct BeforeIdentities {
     pub(crate) oauth: OAuthIdentity,
@@ -278,10 +243,6 @@ pub(crate) struct BeforeIdentities {
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
     pub(crate) env_token: Option<String>,
-    /// Whether `credentials.json` exists, read off the stored file — the
-    /// credential-presence bit the throughput identity's effective-base_url
-    /// guard reads. The AFTER computation uses this stored fact, never an
-    /// in-memory `Profile` a caller may hold stale.
     pub(crate) has_credentials: bool,
 }
 
@@ -325,12 +286,9 @@ pub(crate) fn read_before_identities(name: &ProfileName) -> BeforeIdentities {
     }
 }
 
-/// The throughput identity a change site is about to write: the (unchanged)
-/// OAuth identity mixed with the endpoint fields being written. `base_url` is
-/// the RAW managed field — the effective base_url is derived the same way
-/// `load_profile` derives it (the OAuth-bearer leak guard drops a managed url
-/// an OAuth profile carries no key or env token for), so the site and the
-/// reload agree on what the delegates will actually run on.
+/// The throughput identity a change site is about to write. `base_url` is the
+/// RAW managed field — the effective base_url is derived like `load_profile`
+/// does, so the site and the reload agree on what the delegates run on.
 pub(crate) fn throughput_for_endpoint(
     oauth: &OAuthIdentity,
     base_url: Option<&str>,
@@ -348,11 +306,43 @@ pub(crate) fn throughput_for_endpoint(
     throughput_identity(oauth, effective.as_deref(), api_key, env_token.as_deref())
 }
 
-/// The per-process credential-forget epoch: monotonic per `(name, half)`, never
-/// removed, so a delete-then-recreate cannot reuse a value and a stale in-flight
-/// write can never match again. Ranked at [`rank::Epoch`] (160), outermost of
-/// every reading store it gates.
-/// The epoch map's shape, factored out so the ranked-mutex type stays readable.
+/// The changed halves for an endpoint write: the third-party and throughput
+/// identities of the values about to be written. `endpoint.base_url` is the RAW
+/// managed field, what [`throughput_for_endpoint`] needs. `oauth` is the AFTER
+/// identity (`before.oauth` when the OAuth half is untouched).
+pub(crate) fn endpoint_identity_plan(
+    before: &BeforeIdentities,
+    oauth: &OAuthIdentity,
+    endpoint: &StoredEndpointIdentity,
+    has_credentials: bool,
+) -> ForgetPlan {
+    let provider = endpoint
+        .base_url
+        .as_deref()
+        .and_then(Provider::from_base_url);
+    let third_party = third_party_identity(
+        provider,
+        endpoint.api_key.as_deref(),
+        endpoint.console.as_ref(),
+        endpoint.base_url.as_deref(),
+    );
+    let throughput = throughput_for_endpoint(
+        oauth,
+        endpoint.base_url.as_deref(),
+        has_credentials,
+        endpoint.api_key.as_deref(),
+        &endpoint.env,
+    );
+    ForgetPlan {
+        oauth: oauth_changed(&before.oauth, oauth),
+        third_party: before.third_party != third_party,
+        throughput: before.throughput != throughput,
+        ..ForgetPlan::default()
+    }
+}
+
+/// The per-process forget epoch: monotonic per `(name, half)`, never removed,
+/// so a delete-then-recreate cannot reuse a value. Ranked [`rank::Epoch`] (160).
 type EpochMap = HashMap<(String, Half), u64>;
 
 static EPOCH: LazyLock<RankedMutex<EpochMap, rank::Epoch>> =
@@ -368,28 +358,30 @@ pub(crate) fn epoch_value(name: &ProfileName, half: Half) -> u64 {
         .unwrap_or(0)
 }
 
-/// Acquire the epoch guard, held from a seed's compare through its store,
-/// status and cadence writes so a forget cannot bump the epoch between the
-/// check and the write. The store locks (ranks 200-350) sit above [`rank::Epoch`],
-/// so holding it across them stays ascending.
-pub(crate) fn epoch_guard() -> crate::lockorder::RankedGuard<'static, EpochMap> {
+/// Acquire the epoch guard, held from a seed's compare through its writes so a
+/// forget cannot bump the epoch between check and write.
+fn epoch_guard() -> crate::lockorder::RankedGuard<'static, EpochMap> {
     EPOCH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn bump_epoch(name: &ProfileName, half: Half) {
+/// Compare `(name, half)`'s epoch under the guard and return it held when it is
+/// still `epoch`, so the caller keeps it through its writes.
+pub(crate) fn epoch_guard_if_current(
+    name: &ProfileName,
+    half: Half,
+    epoch: u64,
+) -> Option<crate::lockorder::RankedGuard<'static, EpochMap>> {
+    let guard = epoch_guard();
+    (guard.get(&(name.to_string(), half)).copied().unwrap_or(0) == epoch).then_some(guard)
+}
+
+pub(crate) fn bump_epoch(name: &ProfileName, half: Half) {
     if let Ok(mut m) = EPOCH.lock() {
         let e = m.entry((name.to_string(), half)).or_insert(0);
         *e = e.wrapping_add(1);
     }
-}
-
-/// Test seam: bump `(name, half)`'s epoch directly, posing a change landing
-/// between a seed's epoch capture and its store write.
-#[cfg(test)]
-pub(crate) fn bump_epoch_for_test(name: &ProfileName, half: Half) {
-    bump_epoch(name, half);
 }
 
 /// Test seam: try to acquire the epoch guard, returning `None` while a seed
@@ -411,18 +403,14 @@ pub(crate) fn forget_disk(name: &ProfileName, half: Half) {
             remove_profile_cache(name, KICK_BLOCK_CACHE_FILE);
         }
         Half::ThirdParty => {
-            // The balance-marker cache alone. The durable dead-key verdict
-            // (`third_party_auth.json`) is fingerprint-bound: an old key's
-            // verdict never matches a new key, and a failed save that keeps the
-            // still-stored key must keep its dead verdict too.
+            // `third_party_auth.json` stays: its dead-key verdict is
+            // fingerprint-bound, so a failed save that keeps the stored key
+            // must keep its verdict.
             remove_profile_cache(name, THIRD_PARTY_CACHE_FILE);
         }
         Half::Codex => {
-            // The codex reading shares `usage_cache.json` with the OAuth half
-            // (pre-existing). An account change must drop the old account's
-            // reading now; a same-name claude profile's reading refills on its
-            // next fetch, and a same-name pair is already excluded from the
-            // identity checks.
+            // The codex reading shares `usage_cache.json` with the OAuth half;
+            // an account change must drop the old account's reading now.
             remove_profile_cache(name, USAGE_CACHE_FILE);
         }
         Half::Throughput => {
@@ -431,34 +419,31 @@ pub(crate) fn forget_disk(name: &ProfileName, half: Half) {
     }
 }
 
-/// A memory forget a change site noted for the TUI to apply once its config
-/// guard drops. `Rename` moves entries rather than dropping them — the disk
-/// half already moved with the directory.
+/// A memory forget a change site noted for a store-holding process to apply
+/// once its config guard drops. `Rename` moves entries — the disk half already
+/// moved with the directory.
 enum PendingAction {
     Forget(ProfileName, Half),
     Rename(ProfileName, ProfileName),
 }
 
-/// Forgets a change site noted for a store-holding process (the TUI, the
-/// daemon) to apply to memory. Process-global; a process that never registers
-/// stores (the CLI, the MCP server) notes nothing, so its queue cannot grow.
+/// Forgets a change site noted for a store-holding process to apply to memory.
+/// Process-global.
 static PENDING_FORGETS: LazyLock<RankedMutex<Vec<PendingAction>, rank::ForgetQueue>> =
     LazyLock::new(|| RankedMutex::new(Vec::new()));
 
-/// Whether THIS process built reading stores and so drains the pending queue.
-/// Set once by the TUI and the daemon when they build their stores; never set
-/// by the CLI or the MCP server, which hold no stores to forget.
+/// Whether THIS process built reading stores (and so drains the pending queue).
+/// The CLI and the MCP server never drain the queue, so a process without
+/// stores records nothing.
 static STORES_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Mark that this process holds reading stores and will drain the pending
-/// forgets. A change site's `note_forget` is a no-op until this runs, so a
-/// process with no stores records nothing and its queue never grows.
+/// forgets.
 pub(crate) fn register_memory_stores() {
     STORES_REGISTERED.store(true, Ordering::Release);
 }
 
-/// Record that `name`'s `half` changed and must be forgotten in memory. Called
-/// inside the change site's hold after the identity writes land.
+/// Record that `name`'s `half` changed. Called after the identity writes land.
 pub(crate) fn note_forget(name: &ProfileName, half: Half) {
     if !STORES_REGISTERED.load(Ordering::Acquire) {
         return;
@@ -468,8 +453,7 @@ pub(crate) fn note_forget(name: &ProfileName, half: Half) {
     }
 }
 
-/// Record that `old` was renamed to `new` and its memory entries must move.
-/// Called inside the rename's hold after the record move lands.
+/// Record that `old` was renamed to `new`. Called after the record move lands.
 pub(crate) fn note_rename(old: &ProfileName, new: &ProfileName) {
     if !STORES_REGISTERED.load(Ordering::Acquire) {
         return;
@@ -490,9 +474,7 @@ pub(crate) fn reset_pending_forgets_for_test() {
     STORES_REGISTERED.store(false, Ordering::Release);
 }
 
-/// The stores `forget_memory` clears, cloned by a store-holding process (the
-/// TUI's `App` or the daemon; the scheduler-only members ride along so the
-/// forget reaches the whole process).
+/// The stores `forget_memory` clears, cloned by a store-holding process.
 pub(crate) struct MemoryStores {
     pub(crate) usage: UsageStore,
     pub(crate) usage_status: StatusStore,
@@ -536,13 +518,10 @@ impl MemoryStores {
     }
 }
 
-/// Forget `name`'s `half` in THIS process's memory: bump the epoch, clear every
-/// name-keyed entry the half owns, then re-seed the reading from disk (so a
-/// seed another process wrote survives — the re-seed finds nothing when
-/// `forget_disk` just removed the cache). Memory only: the durable `/profile`
-/// stamp is `forget_disk(OAuth)`'s to remove, never this clear's. Runs with no
-/// ranked lock held (the stores rank BELOW `Config`, whose guard the caller
-/// must have dropped).
+/// Bump the epoch, clear the half's name-keyed entries, then re-seed from disk
+/// (a seed another process wrote survives). Memory only — the durable
+/// `/profile` stamp is `forget_disk(OAuth)`'s. Runs with no ranked lock held
+/// (the stores rank BELOW `Config`).
 pub(crate) fn forget_memory(stores: &MemoryStores, name: &ProfileName, half: Half) {
     bump_epoch(name, half);
     clear_memory(stores, name, half);
@@ -571,10 +550,8 @@ pub(crate) fn forget_memory(stores: &MemoryStores, name: &ProfileName, half: Hal
             );
         }
         Half::Codex => {
-            // The codex reading shares `usage_cache.json` and the `usage` /
-            // `usage_status` entries with a same-name claude profile, so
-            // re-seed from that cache: a claude reading comes back from its own
-            // cache instead of staying blank until its next fetch.
+            // Re-seed from the shared cache: a same-name claude profile's
+            // reading comes back instead of staying blank until its next fetch.
             seed_codex_name(&stores.usage, &stores.usage_status, name, now, interval_ms);
         }
         Half::Throughput => {}
@@ -584,36 +561,12 @@ pub(crate) fn forget_memory(stores: &MemoryStores, name: &ProfileName, half: Hal
 fn clear_memory(stores: &MemoryStores, name: &ProfileName, half: Half) {
     match half {
         Half::OAuth => {
-            stores
-                .usage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(name.as_str());
-            stores
-                .usage_status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(name.as_str());
-            stores
-                .poll_streaks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(name.as_str());
-            stores
-                .last_fetched
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&FetchLeg::OAuth.key(name.clone()));
-            stores
-                .next_refresh
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&FetchLeg::OAuth.key(name.clone()));
-            stores
-                .kick_blocks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(name.as_str());
+            remove_name_entry(&stores.usage, name);
+            remove_name_entry(&stores.usage_status, name);
+            remove_name_entry(&stores.poll_streaks, name);
+            remove_leg_entry(&stores.last_fetched, name, FetchLeg::OAuth);
+            remove_leg_entry(&stores.next_refresh, name, FetchLeg::OAuth);
+            remove_name_entry(&stores.kick_blocks, name);
             stores
                 .weekly_reset_kicks
                 .lock()
@@ -623,53 +576,17 @@ fn clear_memory(stores: &MemoryStores, name: &ProfileName, half: Half) {
             forget_profile_memo(name);
         }
         Half::ThirdParty => {
-            stores
-                .third_party_usage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(name.as_str());
-            stores
-                .third_party_status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(name.as_str());
-            stores
-                .third_party_streaks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(name.as_str());
-            stores
-                .third_party_broken
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(name.as_str());
-            stores
-                .last_fetched
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&FetchLeg::ThirdParty.key(name.clone()));
-            stores
-                .next_refresh
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&FetchLeg::ThirdParty.key(name.clone()));
-            stores
-                .suppressed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(name.as_str());
+            remove_name_entry(&stores.third_party_usage, name);
+            remove_name_entry(&stores.third_party_status, name);
+            remove_name_entry(&stores.third_party_streaks, name);
+            remove_name_entry(&stores.third_party_broken, name);
+            remove_leg_entry(&stores.last_fetched, name, FetchLeg::ThirdParty);
+            remove_leg_entry(&stores.next_refresh, name, FetchLeg::ThirdParty);
+            remove_name_entry(&stores.suppressed, name);
         }
         Half::Codex => {
-            stores
-                .usage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(name.as_str());
-            stores
-                .usage_status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(name.as_str());
+            remove_name_entry(&stores.usage, name);
+            remove_name_entry(&stores.usage_status, name);
             forget_codex_polled(name.as_str());
         }
         Half::Throughput => {}
@@ -693,9 +610,8 @@ pub(crate) fn apply_pending_forgets(stores: &MemoryStores) {
     }
 }
 
-/// Move `old`'s in-memory entries to `new` after a rename (its disk caches
-/// already moved with the directory), and bump the OLD name's epochs so a
-/// stale in-flight landing or seed under the old name writes nothing.
+/// Move `old`'s in-memory entries to `new` and bump the OLD name's epochs so a
+/// stale in-flight landing or seed writes nothing.
 pub(crate) fn forget_memory_rename(stores: &MemoryStores, old: &ProfileName, new: &ProfileName) {
     bump_epoch(old, Half::OAuth);
     bump_epoch(old, Half::ThirdParty);
@@ -711,13 +627,7 @@ pub(crate) fn forget_memory_rename(stores: &MemoryStores, old: &ProfileName, new
     move_name_entry(&stores.suppressed, old, new);
     move_leg_entries(&stores.last_fetched, old, new);
     move_leg_entries(&stores.next_refresh, old, new);
-    let mut set = stores
-        .weekly_reset_kicks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if set.remove(old) {
-        set.insert(new.clone());
-    }
+    move_name_set(&stores.weekly_reset_kicks, old, new);
     super::move_election_failures(&stores.auto_start_queue, old, new);
     // The durable `/profile` stamp rode the directory to `new`; only the old
     // name's memo is left, so `new` re-reads the moved stamp fresh.
@@ -752,22 +662,48 @@ fn move_leg_entries<T, R: crate::lockorder::Rank>(
     }
 }
 
-/// The halves `forget_disk` and `note_forget` must run for, in disk-first order.
-/// Split from [`ForgetPlan`] so a change site drives both loops off one value.
-fn disk_halves(plan: ForgetPlan) -> impl Iterator<Item = Half> {
-    plan.all_halves()
+fn move_name_set<R: crate::lockorder::Rank>(
+    set: &RankedMutex<std::collections::HashSet<ProfileName>, R>,
+    old: &ProfileName,
+    new: &ProfileName,
+) {
+    let mut s = set
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if s.remove(old) {
+        s.insert(new.clone());
+    }
+}
+
+fn remove_name_entry<T, R: crate::lockorder::Rank>(
+    map: &RankedMutex<HashMap<String, T>, R>,
+    name: &ProfileName,
+) {
+    map.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name.as_str());
+}
+
+fn remove_leg_entry<T, R: crate::lockorder::Rank>(
+    map: &RankedMutex<HashMap<super::LegKey, T>, R>,
+    name: &ProfileName,
+    leg: FetchLeg,
+) {
+    map.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&leg.key(name.clone()));
 }
 
 /// Forget the changed halves' DISK caches, before the identity writes land.
 pub(crate) fn forget_disk_plan(name: &ProfileName, plan: ForgetPlan) {
-    for half in disk_halves(plan) {
+    for half in plan.changed_halves() {
         forget_disk(name, half);
     }
 }
 
 /// Note the changed halves for `forget_memory`, after the identity writes land.
 pub(crate) fn note_forget_plan(name: &ProfileName, plan: ForgetPlan) {
-    for half in plan.memory_halves() {
+    for half in plan.changed_halves().filter(|h| *h != Half::Throughput) {
         note_forget(name, half);
     }
 }

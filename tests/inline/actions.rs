@@ -9244,6 +9244,60 @@ fn a_rename_bumps_the_old_names_epochs() {
     );
 }
 
+/// The `weekly_reset_kicks` entry rides a rename (old -> new) and drops when the
+/// OAuth half forgets.
+#[test]
+fn a_rename_moves_and_a_forget_clears_the_weekly_reset_kicks_entry() {
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("old");
+    let profile = hybrid_profile(
+        "old",
+        "access-A",
+        "https://api.z.ai/api/anthropic",
+        Some("key"),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["old"]);
+    let stores = empty_memory_stores();
+    stores
+        .weekly_reset_kicks
+        .lock()
+        .unwrap()
+        .insert(name.clone());
+
+    let mut config = inactive_config(profile);
+    let rotation = crate::actions::rotation_guard_for_mutation(&name).expect("rotation guard");
+    rename_profile(&mut config, &name, &ProfileName::from("new"), &rotation).expect("rename");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        !stores.weekly_reset_kicks.lock().unwrap().contains(&name),
+        "the old name's weekly_reset_kicks entry moves with the rename"
+    );
+    assert!(
+        stores
+            .weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&ProfileName::from("new")),
+        "the new name holds the moved weekly_reset_kicks entry"
+    );
+
+    clear_profile_credentials(&mut config, &ProfileName::from("new")).expect("clear");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        !stores
+            .weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&ProfileName::from("new")),
+        "an OAuth forget drops the weekly_reset_kicks entry"
+    );
+}
+
 /// A sibling's undrained forget must not leak into this test's drain: the
 /// pending queue and the registered-stores flag reset with the home sandbox.
 #[test]
