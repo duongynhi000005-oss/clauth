@@ -503,6 +503,12 @@ pub(crate) enum Command {
     #[command(hide = true)]
     SelfHeal,
 
+    /// The `PreToolUse` `Read` hook `clauth start` and `delegate` inject: read
+    /// the hook payload on stdin and allow a read of the session's own tool
+    /// result that resolves through the runtime's `projects` link.
+    #[command(hide = true)]
+    HookReadExempt,
+
     /// Not a command. Kept only to redirect anyone who guesses it.
     #[command(hide = true)]
     Run {
@@ -558,7 +564,8 @@ pub(crate) struct StartArgs {
     /// Profile to launch under.
     #[arg(required_unless_present = "auto")]
     pub(crate) profile: Option<String>,
-    /// Args handed to `claude` verbatim.
+    /// Args handed to `claude` as given, except a `--settings` value, which
+    /// clauth merges into the settings it passes itself.
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,

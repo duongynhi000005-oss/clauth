@@ -2337,6 +2337,49 @@ pub(crate) fn tmp_sibling(path: &Path) -> PathBuf {
     ))
 }
 
+/// Read a regular file with a hard byte ceiling: stat before open (a FIFO is
+/// refused instead of freezing the open), re-check the opened handle, and
+/// bound the read with `take(cap + 1)`. Returns the UTF-8 text or a plain
+/// detail string (an io error's own Display, "not a regular file", or the cap
+/// refusal) — callers render their own copy around it. Shared by the MCP
+/// prompt reader and the cc-exemption settings reader.
+pub(crate) fn read_capped_file(path: &Path, cap: u64) -> std::result::Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let size = meta.len();
+    if size > cap {
+        return Err(format!("{size} bytes over the {cap} byte cap"));
+    }
+    read_validated_handle(file, cap)
+}
+
+/// Read an already-opened, type-checked handle with a hard byte ceiling. A
+/// file can grow past the cap between a size check and the read; `take` bounds
+/// the read to cap + 1, and a read that actually hit the bound is refused
+/// instead of silently truncating. Invalid UTF-8 is refused at the byte
+/// offset, never lossily decoded.
+pub(crate) fn read_validated_handle(
+    file: std::fs::File,
+    cap: u64,
+) -> std::result::Result<String, String> {
+    let mut reader = std::io::Read::take(file, cap + 1);
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut buf).map_err(|e| e.to_string())?;
+    if buf.len() > cap as usize {
+        return Err(format!("grew past the {cap} byte cap during the read"));
+    }
+    let text = std::str::from_utf8(&buf)
+        .map_err(|e| format!("invalid UTF-8 at byte offset {}", e.valid_up_to()))?;
+    Ok(text.to_string())
+}
+
 pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {

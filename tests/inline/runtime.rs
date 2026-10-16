@@ -5223,6 +5223,109 @@ fn gc_collects_a_dead_per_session_pair_and_spares_a_held_one() {
     });
 }
 
+/// A crash (or a teardown that could not take the state lock) strands a
+/// session's per-spawn `--settings` file, which can hold a folded user `env`
+/// token. GC collects it with the dead session, a stray one with no session at
+/// all, and spares a held session's.
+#[test]
+fn gc_collects_a_dead_sessions_spawn_settings_file_and_spares_a_held_ones() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+
+        let dead_runtime = profiles.join("ssdead").join("runtime-4343-0");
+        let dead_sessions = profiles.join("ssdead").join("sessions-4343-0");
+        fs::create_dir_all(&dead_runtime).expect("mkdir runtime");
+        fs::create_dir_all(&dead_sessions).expect("mkdir sessions");
+        fs::write(dead_sessions.join("4343-0"), b"").expect("dead marker");
+        let dead_file = spawn_settings_file(&dead_runtime, "4343-0");
+        fs::write(&dead_file, b"{}").expect("dead settings file");
+
+        let stray_file =
+            spawn_settings_file(&profiles.join("ssstray").join("runtime-5151-0"), "5151-0");
+        fs::create_dir_all(stray_file.parent().expect("profile dir")).expect("mkdir profile");
+        fs::write(&stray_file, b"{}").expect("stray settings file");
+
+        let held_runtime = profiles.join("sslive").join("runtime-778-3");
+        let held_sessions = profiles.join("sslive").join("sessions-778-3");
+        fs::create_dir_all(&held_runtime).expect("mkdir held runtime");
+        fs::create_dir_all(&held_sessions).expect("mkdir held sessions");
+        let marker = open_pid_file(&held_sessions.join("778-3")).expect("open held marker");
+        marker.lock().expect("lock held marker");
+        let held_file = spawn_settings_file(&held_runtime, "778-3");
+        fs::write(&held_file, b"{}").expect("held settings file");
+
+        // The other two marker layouts: an isolated session keys its marker
+        // `sessions-isolated-<sid>/<sid>`, a fake-mode shared one the bare
+        // `sessions/<sid>` beside the one shared `runtime` dir.
+        let iso_sessions = profiles.join("ssiso").join("sessions-isolated-779-1");
+        fs::create_dir_all(&iso_sessions).expect("mkdir isolated sessions");
+        let iso_marker = open_pid_file(&iso_sessions.join("779-1")).expect("open isolated marker");
+        iso_marker.lock().expect("lock isolated marker");
+        let iso_file = spawn_settings_file(
+            &profiles.join("ssiso").join("runtime-isolated-779-1"),
+            "779-1",
+        );
+        fs::write(&iso_file, b"{}").expect("isolated settings file");
+
+        let fake_sessions = profiles.join("ssfake").join("sessions");
+        fs::create_dir_all(&fake_sessions).expect("mkdir fake sessions");
+        let fake_marker = open_pid_file(&fake_sessions.join("780-2")).expect("open fake marker");
+        fake_marker.lock().expect("lock fake marker");
+        let fake_file = spawn_settings_file(&profiles.join("ssfake").join("runtime"), "780-2");
+        fs::write(&fake_file, b"{}").expect("fake-mode settings file");
+
+        // The same two layouts, crashed: markers present but unlocked.
+        let dead_iso_sessions = profiles.join("ssiso").join("sessions-isolated-881-1");
+        fs::create_dir_all(&dead_iso_sessions).expect("mkdir dead isolated sessions");
+        fs::write(dead_iso_sessions.join("881-1"), b"").expect("dead isolated marker");
+        let dead_iso_file = spawn_settings_file(
+            &profiles.join("ssiso").join("runtime-isolated-881-1"),
+            "881-1",
+        );
+        fs::write(&dead_iso_file, b"{}").expect("dead isolated settings file");
+        fs::write(fake_sessions.join("882-2"), b"").expect("dead fake-mode marker");
+        let dead_fake_file = spawn_settings_file(&profiles.join("ssfake").join("runtime"), "882-2");
+        fs::write(&dead_fake_file, b"{}").expect("dead fake-mode settings file");
+
+        gc_stale_runtimes();
+
+        for (file, flavor) in [
+            (&dead_iso_file, "isolated"),
+            (&dead_fake_file, "fake-mode shared"),
+        ] {
+            assert!(
+                !file.exists(),
+                "a dead {flavor} session's {} must be collected",
+                file.display()
+            );
+        }
+
+        assert!(
+            !dead_file.exists(),
+            "{} must go with its dead session",
+            dead_file.display()
+        );
+        assert!(
+            !stray_file.exists(),
+            "{} has no session at all",
+            stray_file.display()
+        );
+        for (file, flavor) in [
+            (&held_file, "real-mode shared"),
+            (&iso_file, "isolated"),
+            (&fake_file, "fake-mode shared"),
+        ] {
+            assert!(
+                file.is_file(),
+                "a held {flavor} marker must spare {}",
+                file.display()
+            );
+        }
+        drop((marker, iso_marker, fake_marker));
+    });
+}
+
 /// `acquire` mints a marker dir before it builds the tree, so a crash in that
 /// window strands one with no runtime sibling — a fresh empty dir every session
 /// under per-session keying. GC must collect it, and must still leave one whose

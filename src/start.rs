@@ -303,10 +303,23 @@ pub(crate) fn run(
     // Marks this run's window: on the shared global store, only sessions touched
     // at or after this instant are attributed to `name` (see stamp below).
     let run_start = SystemTime::now();
-    let mut child = command
-        .args(claude_args)
-        .spawn()
-        .context("failed to spawn claude")?;
+    if let Some(cwd) = spawn_cwd.as_deref() {
+        let settings_file =
+            crate::runtime::spawn_settings_file(runtime.config_dir(), runtime.session_id());
+        if let Some(warning) = crate::cc_exempt::apply_spawn_settings(
+            &mut command,
+            runtime.config_dir(),
+            cwd,
+            claude_args,
+            &crate::cc_exempt::hook_command(),
+            &settings_file,
+        ) {
+            errln!("{warning}");
+        }
+    } else {
+        command.args(claude_args);
+    }
+    let mut child = command.spawn().context("failed to spawn claude")?;
 
     #[cfg(unix)]
     let outcome = wait_for_child(&mut child, signal_watcher.receiver())?;

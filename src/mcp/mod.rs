@@ -16,7 +16,6 @@ pub(crate) mod jobs;
 mod render;
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -822,7 +821,8 @@ pub(crate) struct DelegateArgs {
     env: Option<HashMap<String, String>>,
     /// Extra CLI arguments that go after the `claude -p` clauth invokes. Your
     /// arguments come last, so they win where a flag repeats (including
-    /// `--model` when `model` is set). `--session-id`, `--resume` and
+    /// `--model` when `model` is set), except `--settings`: clauth merges its
+    /// value into the settings it passes itself. `--session-id`, `--resume` and
     /// `--fork-session` are refused: clauth pins the session id and exports it
     /// as `CLAUTH_DELEGATE_SESSION_ID`; resume through `session_id`.
     ///
@@ -3712,11 +3712,27 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     }
     // If the run's directory is the real `$HOME`, guard against the
     // project-settings leak.
-    if let Some(dir) = spawn_cwd(workspace, opts.cwd).as_deref() {
+    let delegate_cwd = spawn_cwd(workspace, opts.cwd);
+    if let Some(dir) = delegate_cwd.as_deref() {
         command.current_dir(dir);
         crate::runtime::guard_home_project_settings(&mut command, dir);
     }
-    command.args(&opts.extra_args);
+    if let Some(dir) = delegate_cwd.as_deref() {
+        let settings_file =
+            crate::runtime::spawn_settings_file(runtime.config_dir(), runtime.session_id());
+        if let Some(warning) = crate::cc_exempt::apply_spawn_settings(
+            &mut command,
+            runtime.config_dir(),
+            dir,
+            &opts.extra_args,
+            &crate::cc_exempt::hook_command(),
+            &settings_file,
+        ) {
+            logline!("{warning}");
+        }
+    } else {
+        command.args(&opts.extra_args);
+    }
 
     let run_start = std::time::SystemTime::now();
 
@@ -4347,57 +4363,27 @@ fn read_prompt_file(cwd: Option<&str>, rel: &str) -> std::result::Result<String,
     read_resolved_prompt(&real, rel)
 }
 
-/// Open, type-check and read an already-canonicalized prompt file. The type
-/// check runs BEFORE the open — `metadata` is a stat and never opens the path,
-/// so a FIFO is refused here instead of freezing the read-only open on the
-/// server's only thread. The same check runs on the opened handle, so a path
-/// swapped between the stat and the open cannot sneak a non-regular file past.
+/// Open, type-check and read an already-canonicalized prompt file. The shared
+/// reader ([`crate::profile::read_capped_file`]) stats before open — so a
+/// FIFO is refused here instead of freezing the read-only open on the server's
+/// only thread — re-checks the opened handle, and bounds the read with a hard
+/// byte ceiling.
 fn read_resolved_prompt(
     real: &std::path::Path,
     label: &str,
 ) -> std::result::Result<String, String> {
-    let meta = std::fs::metadata(real).map_err(|e| format!("prompt `{label}` refused: {e}"))?;
-    if !meta.is_file() {
-        return Err(format!("prompt `{label}` refused: not a regular file"));
-    }
-    let file = std::fs::File::open(real).map_err(|e| format!("prompt `{label}` refused: {e}"))?;
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("prompt `{label}` refused: {e}"))?;
-    if !meta.is_file() {
-        return Err(format!("prompt `{label}` refused: not a regular file"));
-    }
-    let size = meta.len();
-    if size > PROMPT_FILE_CAP {
-        return Err(format!(
-            "prompt `{label}` refused: {size} bytes over the {PROMPT_FILE_CAP} byte cap"
-        ));
-    }
-    read_prompt_handle(file, label)
+    crate::profile::read_capped_file(real, PROMPT_FILE_CAP)
+        .map_err(|detail| format!("prompt `{label}` refused: {detail}"))
 }
 
-/// Read the validated prompt handle with a hard byte ceiling. A file can grow
-/// past the cap between the size check above and the read; `take` bounds the
-/// read to cap + 1, and a read that actually hit the bound is refused by name
-/// instead of silently truncating the prompt. Invalid UTF-8 is refused by name
-/// at the byte offset, never lossily decoded.
+/// Read an already-opened, type-checked prompt handle — the seam the growth and
+/// UTF-8 pins drive directly. The shared handle reader
+/// ([`crate::profile::read_validated_handle`]) bounds the read with a hard
+/// byte ceiling.
+#[cfg(test)]
 fn read_prompt_handle(file: std::fs::File, rel: &str) -> std::result::Result<String, String> {
-    let mut reader = file.take(PROMPT_FILE_CAP + 1);
-    let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut reader, &mut buf)
-        .map_err(|e| format!("prompt `{rel}` refused: {e}"))?;
-    if buf.len() > PROMPT_FILE_CAP as usize {
-        return Err(format!(
-            "prompt `{rel}` refused: grew past the {PROMPT_FILE_CAP} byte cap during the read"
-        ));
-    }
-    let text = std::str::from_utf8(&buf).map_err(|e| {
-        format!(
-            "prompt `{rel}` refused: invalid UTF-8 at byte offset {}",
-            e.valid_up_to()
-        )
-    })?;
-    Ok(text.to_string())
+    crate::profile::read_validated_handle(file, PROMPT_FILE_CAP)
+        .map_err(|detail| format!("prompt `{rel}` refused: {detail}"))
 }
 
 /// A reserved background job: the spec every later write of it goes through,

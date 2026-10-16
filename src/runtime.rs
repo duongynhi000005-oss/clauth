@@ -945,6 +945,7 @@ pub(crate) fn gc_stale_runtimes() {
     }
     gc_live_session_rows();
     gc_bare_markers();
+    gc_spawn_settings_files();
     crate::hook_note::gc_conversation_records();
     gc_codex_homes();
 }
@@ -1673,6 +1674,70 @@ pub(crate) mod namespaced_keychain_ledger {
 /// case, since such a session never runs clauth code and leaves its file behind.
 /// The same per-entry prune the paired trees get, minus the tree removal: this
 /// dir holds nothing but markers, so no `remove_dir_all` is handed anything here.
+/// Collect `spawn-settings-<sid>.json` files whose session died without
+/// teardown. Same liveness rule as every other sweep: a file whose paired
+/// `sessions-<sid>` marker dir holds a live flock is spared, and so is one
+/// whose liveness cannot be READ (unknown reads as live). A missing marker dir
+/// reads as DEAD — a stray file with no runtime or sessions dir at all.
+fn gc_spawn_settings_files() {
+    let Ok(root) = profiles_root_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let mut candidates: Vec<(std::path::PathBuf, ProfileName, bool, String)> = Vec::new();
+    for profile in entries.flatten() {
+        let profile_path = profile.path();
+        let Some(profile_name) = profile.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(children) = std::fs::read_dir(&profile_path) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let Some(name) = child.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Some((isolated, sid)) = parse_spawn_settings_name(&name) else {
+                continue;
+            };
+            candidates.push((
+                child.path(),
+                ProfileName::from(profile_name.clone()),
+                isolated,
+                sid,
+            ));
+        }
+    }
+    // Peek before locking, like `gc_bare_markers`: nothing to collect must not
+    // pay the state flock's wait.
+    if candidates.is_empty() {
+        return;
+    }
+    let _ = with_state_lock(|_held| {
+        for (file, profile, isolated, sid) in candidates {
+            if !session_row_is_live(&profile, isolated, &sid) {
+                let _ = std::fs::remove_file(&file);
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+}
+
+/// `spawn-settings-<sid>.json` (shared) or `spawn-settings-isolated-<sid>.json`
+/// back to `(isolated, sid)`; `None` when the name does not parse, so a stray
+/// file clauth did not write is left alone.
+fn parse_spawn_settings_name(name: &str) -> Option<(bool, String)> {
+    let rest = name.strip_prefix("spawn-settings-")?;
+    let (isolated, rest) = match rest.strip_prefix("isolated-") {
+        Some(sid) => (true, sid),
+        None => (false, rest),
+    };
+    let sid = rest.strip_suffix(".json")?;
+    is_session_id(sid).then(|| (isolated, sid.to_string()))
+}
+
 fn gc_bare_markers() {
     let Ok(dir) = live_bare_dir() else {
         return;
@@ -4514,6 +4579,13 @@ impl Drop for ProfileRuntime {
         // wedged peer, not a permissions fault, so the SAME hold is retried
         // (bounded, via `acquire_state_lock_for_teardown`) rather than split:
         // the retry re-enters the same flock for the same body.
+        // The settings file is per-session (its own sid in the profile dir), so
+        // it shares no state with the teardown lock below: remove it even when
+        // the flock cannot be taken, so a wedged peer cannot strand it.
+        let _ = std::fs::remove_file(spawn_settings_file(
+            &self.swap.runtime,
+            self.swap.session.as_str(),
+        ));
         match acquire_state_lock_for_teardown() {
             Ok(_guard) => {
                 if let Err(e) = crate::live_sessions::unregister(self.swap.session.as_str()) {
@@ -4580,7 +4652,7 @@ pub(crate) fn scrub_profile_env(command: &mut std::process::Command, stale_env_k
 /// `~/.claude/` — the file clauth itself writes for whichever profile is
 /// globally active — so that profile's `env` silently overrides the target's.
 /// Canonicalizes both sides so a symlinked `$HOME` still matches.
-fn cwd_is_real_home(dir: &Path) -> bool {
+pub(crate) fn cwd_is_real_home(dir: &Path) -> bool {
     let Ok(home) = home_dir() else {
         return false;
     };
@@ -4602,6 +4674,27 @@ pub(crate) fn guard_home_project_settings(command: &mut std::process::Command, c
     if cwd_is_real_home(cwd) {
         command.arg("--setting-sources").arg("user");
     }
+}
+
+/// The per-spawn `--settings` file for the CC permission exemption
+/// ([`crate::cc_exempt::apply_spawn_settings`]). Lives BESIDE the runtime tree
+/// (the profile dir), not inside it, so the fake-mode mirror never publishes
+/// it into `~/.claude` and `settings_sync` (which reconciles only
+/// `settings.json`) never reads it. Unique per session id; removed when this
+/// runtime drops.
+pub(crate) fn spawn_settings_file(config_dir: &Path, session_id: &str) -> PathBuf {
+    // The name carries the session's flavor so GC can find its marker: an
+    // isolated session's marker lives in `sessions-isolated-<sid>`, a shared
+    // session's in `sessions-<sid>` (or the bare fake-mode `sessions`).
+    let isolated = config_dir.file_name().is_some_and(|n| {
+        n.to_str()
+            .is_some_and(|s| s.starts_with(ISOLATED_RUNTIME_STEM))
+    });
+    let flavor = if isolated { "-isolated" } else { "" };
+    config_dir
+        .parent()
+        .unwrap_or(config_dir)
+        .join(format!("spawn-settings{flavor}-{session_id}.json"))
 }
 
 /// A [`Command`](std::process::Command) for the `claude` CLI — see

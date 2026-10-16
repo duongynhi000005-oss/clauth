@@ -1318,6 +1318,10 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         Command::HookProfileChangedNote
     ));
     assert!(matches!(command(&["self-heal"]), Command::SelfHeal));
+    assert!(matches!(
+        command(&[crate::cc_exempt::READ_HOOK_SUBCOMMAND]),
+        Command::HookReadExempt
+    ));
     match command(&["__api-key", "acme"]) {
         Command::ApiKey { profile } => assert_eq!(profile, "acme"),
         other => panic!("__api-key must parse, got {other:?}"),
@@ -1337,6 +1341,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         "mcp-await-job",
         "hook-profile-changed-note",
         "self-heal",
+        crate::cc_exempt::READ_HOOK_SUBCOMMAND,
     ] {
         assert!(
             !help.contains(hidden) && !long.contains(hidden),

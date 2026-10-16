@@ -1,6 +1,7 @@
 mod actions;
 mod alibaba_login;
 mod bell;
+mod cc_exempt;
 mod claude;
 mod claude_json;
 mod cli;
@@ -315,6 +316,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Mcp => mcp::serve(),
         Command::McpAwaitJob => mcp::await_job(),
         Command::HookProfileChangedNote => hook_note::run(),
+        Command::HookReadExempt => {
+            cc_exempt::run_read_hook();
+            Ok(())
+        }
         // The dispatch itself is one line and deliberately unpinned: a test
         // that ran it would run the real lifecycle leg. The name is pinned by
         // the parse pin in `tests/inline/cli.rs`, and the leg it points at is
