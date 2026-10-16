@@ -101,21 +101,26 @@ const SHUNT_BLOCKING_GRACE: Duration = Duration::from_secs(5);
 /// telemetry flush shunt runs after the drain.
 const STOP_MARGIN: Duration = Duration::from_secs(5);
 
-/// How long a daemon exiting on a signal waits for its children before it
-/// exits anyway. `--replace` escalates to SIGKILL once [`REPLACE_WAIT`] passes
-/// with the singleton flock still held, so the stop gets that window less 1 s
-/// for the release to be seen at `--replace`'s 50 ms poll; half of that second
-/// is [`STOP_ANSWER_GRACE`], the most a late supervisor answer adds. A
-/// `/health` probe does not eat into it: a shutdown preempts a probe, so the
-/// budget bounds only the children's exits. Every child is sent its one
+/// The window a daemon exiting on a signal gives its children to stop, one
+/// second under [`REPLACE_WAIT`] so `--replace`'s SIGKILL escalation (a 50 ms
+/// poll) still sees the flock go. The budget plus [`STOP_ANSWER_GRACE`] bounds
+/// the supervisor's answer; the daemon then joins the stop thread through its
+/// deferred log and marker writes with no bound. Every child is sent its one
 /// SIGTERM first, then all are waited for within this one aggregate bound —
 /// never N serial waits. A child still draining past it is left running with
 /// its stop deadline in its child marker; the next daemon start waits out the
-/// rest of the deadline and kills it there.
+/// rest and kills it there.
 pub(crate) const DAEMON_STOP_BUDGET: Duration = REPLACE_WAIT.saturating_sub(Duration::from_secs(1));
 
 /// How often a stop waiting inside [`DAEMON_STOP_BUDGET`] polls the child.
-const STOP_POLL: Duration = Duration::from_millis(50);
+pub(crate) const STOP_POLL: Duration = Duration::from_millis(50);
+
+/// The clamp a stop applies to its last sleep: [`STOP_POLL`] at most, the
+/// exact remaining time when less is left, so the wait ends at the deadline,
+/// never up to one poll past it.
+pub(crate) fn stop_sleep(remaining: Duration) -> Duration {
+    STOP_POLL.min(remaining)
+}
 
 /// How long past its budget a stop waits for the supervisor's answer before
 /// it calls the supervisor stuck. Only the supervisor's own timer decides that
@@ -866,36 +871,29 @@ impl<K: Supervised> Supervisor<K> {
     /// is already underway, since a second SIGTERM makes the child skip its
     /// drain), then wait until `deadline`. A child still running then is
     /// left draining, its deadline in the child marker for the next start.
-    pub(crate) fn shutdown(&mut self, deadline: Instant) {
+    /// The writes that follow the wait (the exit and "still stopping" lines,
+    /// the marker removal) come back as [`StopWrites`] instead of running
+    /// here, so the caller answers before a stalled stderr or disk there.
+    #[must_use = "dropping it skips the stop's log and marker writes"]
+    pub(crate) fn shutdown(&mut self, deadline: Instant) -> Option<StopWrites> {
         // The probe seam holds or panics the supervisor thread here, so
         // `stop`'s missed-budget and panic paths are reachable in a test.
         #[cfg(all(test, unix))]
         let _seam = probe_seam::hold();
         self.begin_stop(AfterStop::Shutdown, Tick::now());
-        let Some(running) = self.child.as_mut() else {
-            return;
-        };
+        let running = self.child.as_mut()?;
         loop {
             match running.child.try_wait() {
                 Ok(Some(status)) => {
                     let report = ExitReport::from(status);
-                    logline!(
-                        "clauth daemon: {} (pid {}) stopped ({report})",
-                        self.kind.name(),
-                        running.pid
-                    );
-                    Self::remove_marker(&self.kind);
+                    let pid = running.pid;
                     self.child = None;
-                    return;
+                    return Some(StopWrites::Exited { pid, report });
                 }
                 Ok(None) => {}
-                Err(e) => {
-                    logline!(
-                        "clauth daemon: cannot wait on {} (pid {}): {e}",
-                        self.kind.name(),
-                        running.pid
-                    );
-                    return;
+                Err(error) => {
+                    let pid = running.pid;
+                    return Some(StopWrites::CannotWait { pid, error });
                 }
             }
             let now = Instant::now();
@@ -907,14 +905,14 @@ impl<K: Supervised> Supervisor<K> {
                 stop.killed = true;
             }
             if now >= deadline {
-                logline!(
-                    "clauth daemon: {} (pid {}) is still stopping; the next daemon start finishes the stop",
-                    self.kind.name(),
-                    running.pid
-                );
-                return;
+                let pid = running.pid;
+                return Some(StopWrites::StillStopping { pid });
             }
-            std::thread::sleep(STOP_POLL.min(deadline - now));
+            let remaining = deadline - now;
+            let sleep = stop_sleep(remaining);
+            #[cfg(all(test, unix))]
+            probe_seam::record_stop_sleep(remaining, sleep);
+            std::thread::sleep(sleep);
         }
     }
 
@@ -1072,16 +1070,18 @@ impl<K: Supervised> Supervisor<K> {
             AfterStop::Respawn { why } => why.clone(),
             AfterStop::Shutdown => "the daemon is exiting".to_string(),
         };
-        logline!(
-            "clauth daemon: stopping {} (pid {}): {why}",
-            self.kind.name(),
-            running.pid
-        );
         terminate_pid(running.pid, false);
         let deadline_ms = tick.wall_ms + running.stop_bound.as_millis() as u64;
         if let Err(e) = Self::write_marker(&self.kind, &running.marker(Some(deadline_ms))) {
             logline!("clauth daemon: failed to record the child's stop deadline: {e:#}");
         }
+        #[cfg(all(test, unix))]
+        probe_seam::begin_stop_stall();
+        logline!(
+            "clauth daemon: stopping {} (pid {}): {why}",
+            self.kind.name(),
+            running.pid
+        );
         running.stop = Some(Stop {
             deadline: tick.at + running.stop_bound,
             killed: false,
@@ -2645,12 +2645,61 @@ pub(crate) fn start(
     start_kind(Gateway::for_daemon(), handle, "clauth-gateway")
 }
 
+/// What a [`Supervisor::shutdown`] still owes once its wait ends: the writes a
+/// stop makes after the child exits or the deadline passes, deferred so the
+/// caller answers before a stalled stderr or disk there reads as a missed
+/// budget.
+pub(crate) enum StopWrites {
+    /// The child exited inside the budget: log the exit and drop its marker.
+    Exited { pid: u32, report: ExitReport },
+    /// The child could not be waited on: log it.
+    CannotWait { pid: u32, error: std::io::Error },
+    /// The child outlived the budget: log it is still draining.
+    StillStopping { pid: u32 },
+}
+
+impl StopWrites {
+    /// The writes themselves, on the stop's thread, after the answer, when one
+    /// is owed (a `Disconnected` arm sends none).
+    fn perform<K: Supervised>(self, kind: &K) {
+        match self {
+            StopWrites::Exited { pid, report } => {
+                #[cfg(all(test, unix))]
+                probe_seam::write_stall();
+                logline!(
+                    "clauth daemon: {} (pid {pid}) stopped ({report})",
+                    kind.name()
+                );
+                Supervisor::<K>::remove_marker(kind);
+            }
+            StopWrites::CannotWait { pid, error } => {
+                #[cfg(all(test, unix))]
+                probe_seam::write_stall();
+                logline!(
+                    "clauth daemon: cannot wait on {} (pid {pid}): {error}",
+                    kind.name()
+                );
+            }
+            StopWrites::StillStopping { pid } => {
+                #[cfg(all(test, unix))]
+                probe_seam::write_stall();
+                logline!(
+                    "clauth daemon: {} (pid {pid}) is still stopping; the next daemon start finishes the stop",
+                    kind.name()
+                );
+            }
+        }
+    }
+}
+
 /// End a supervisor on a shutdown request: stop the child within `deadline`,
 /// then hand any child still draining to a detached reaper so its later exit
 /// is reaped rather than left a zombie (its marker names it for the next
-/// daemon's finish). Answer `done` when the caller waits on one.
+/// daemon's finish). Answer `done` when the caller waits on one, before the
+/// stop's deferred writes, so a stalled stderr or disk after the wait never
+/// reads as a missed budget.
 fn end<K: Supervised>(supervisor: &mut Supervisor<K>, deadline: Instant, done: Option<Sender<()>>) {
-    supervisor.shutdown(deadline);
+    let writes = supervisor.shutdown(deadline);
     if let Some(mut child) = supervisor.abandon() {
         std::thread::spawn(move || {
             let _ = child.wait();
@@ -2662,6 +2711,9 @@ fn end<K: Supervised>(supervisor: &mut Supervisor<K>, deadline: Instant, done: O
     probe_seam::answer_delay();
     if let Some(done) = done {
         let _ = done.send(());
+    }
+    if let Some(writes) = writes {
+        writes.perform(&supervisor.kind);
     }
 }
 
@@ -3114,6 +3166,38 @@ pub(super) mod probe_seam {
         }
     }
 
+    /// Set by [`stall_stop_writes`]: the supervisor thread carrying this name
+    /// sleeps this long before the writes of each arm a stop makes once its
+    /// child has exited or its deadline has passed, posing a stalled stderr or
+    /// disk. One slot, serialized like [`ANSWER_DELAY`].
+    static WRITE_STALL: Mutex<Option<(&'static str, Duration)>> = Mutex::new(None);
+
+    /// Stall the post-wait stop writes of the supervisor thread named
+    /// `thread` by `by`. The returned guard disarms it on drop.
+    pub fn stall_stop_writes(thread: &'static str, by: Duration) -> StallArm {
+        *WRITE_STALL.lock().expect("the write stall is not poisoned") = Some((thread, by));
+        StallArm
+    }
+
+    pub struct StallArm;
+
+    impl Drop for StallArm {
+        fn drop(&mut self) {
+            *WRITE_STALL.lock().expect("the write stall is not poisoned") = None;
+        }
+    }
+
+    /// Sleep the armed stall when the calling thread carries its name; called
+    /// right before each write a stop makes after its wait ends.
+    pub fn write_stall() {
+        let armed = *WRITE_STALL.lock().expect("the write stall is not poisoned");
+        if let Some((name, by)) = armed
+            && std::thread::current().name() == Some(name)
+        {
+            std::thread::sleep(by);
+        }
+    }
+
     /// Sleep the armed delay when the calling thread carries its name.
     pub fn answer_delay() {
         let armed = *ANSWER_DELAY
@@ -3124,6 +3208,99 @@ pub(super) mod probe_seam {
         {
             std::thread::sleep(by);
         }
+    }
+
+    /// Set by [`stall_begin_stop`]: the supervisor thread carrying this name
+    /// sleeps this long at the "stopping" line, posing a stalled stderr there
+    /// after the SIGTERM and the deadline marker, so a stall cannot delay
+    /// either. One slot, serialized like [`ANSWER_DELAY`].
+    static BEGIN_STOP_STALL: Mutex<Option<(&'static str, Duration)>> = Mutex::new(None);
+
+    /// Stall the "stopping" line of the supervisor thread named `thread` by
+    /// `by`. The returned guard disarms it on drop.
+    pub fn stall_begin_stop(thread: &'static str, by: Duration) -> BeginStopArm {
+        *BEGIN_STOP_STALL
+            .lock()
+            .expect("the begin-stop stall is not poisoned") = Some((thread, by));
+        BeginStopArm
+    }
+
+    pub struct BeginStopArm;
+
+    impl Drop for BeginStopArm {
+        fn drop(&mut self) {
+            *BEGIN_STOP_STALL
+                .lock()
+                .expect("the begin-stop stall is not poisoned") = None;
+        }
+    }
+
+    /// Sleep the armed stall when the calling thread carries its name; called
+    /// right before the "stopping" line, after the SIGTERM and the deadline
+    /// marker write.
+    pub fn begin_stop_stall() {
+        let armed = *BEGIN_STOP_STALL
+            .lock()
+            .expect("the begin-stop stall is not poisoned");
+        if let Some((name, by)) = armed
+            && std::thread::current().name() == Some(name)
+        {
+            std::thread::sleep(by);
+        }
+    }
+
+    /// One armed stop-sleep record: the supervisor thread's name and its
+    /// `(remaining, request)` sleep pairs.
+    type StopSleepRecord = (&'static str, Vec<(Duration, Duration)>);
+
+    /// The `(remaining, request)` pairs of the stop loop's sleeps, recorded by
+    /// the loop for the clamped-last-sleep pin, keyed to the supervisor thread
+    /// named by [`arm_stop_sleeps`] so a thread leaked from another test
+    /// cannot pollute a later one's record. One slot, serialized like
+    /// [`ANSWER_DELAY`].
+    static STOP_SLEEPS: Mutex<Option<StopSleepRecord>> = Mutex::new(None);
+
+    /// Record the stop loop's sleeps for the supervisor thread named `thread`.
+    /// The returned guard disarms it on drop.
+    pub fn arm_stop_sleeps(thread: &'static str) -> SleepArm {
+        *STOP_SLEEPS
+            .lock()
+            .expect("the stop-sleep record is not poisoned") = Some((thread, Vec::new()));
+        SleepArm
+    }
+
+    pub struct SleepArm;
+
+    impl Drop for SleepArm {
+        fn drop(&mut self) {
+            *STOP_SLEEPS
+                .lock()
+                .expect("the stop-sleep record is not poisoned") = None;
+        }
+    }
+
+    /// Record one sleep the stop loop requested, beside the remaining it
+    /// clamped to, when the calling thread carries the armed name.
+    pub fn record_stop_sleep(remaining: Duration, request: Duration) {
+        let mut record = STOP_SLEEPS
+            .lock()
+            .expect("the stop-sleep record is not poisoned");
+        if let Some((name, entries)) = record.as_mut()
+            && std::thread::current().name() == Some(name)
+        {
+            entries.push((remaining, request));
+        }
+    }
+
+    /// The `(remaining, request)` pairs the armed stop loop recorded, in
+    /// order; empty when none was armed.
+    pub fn stop_sleeps() -> Vec<(Duration, Duration)> {
+        STOP_SLEEPS
+            .lock()
+            .expect("the stop-sleep record is not poisoned")
+            .as_ref()
+            .map(|(_, entries)| entries.clone())
+            .unwrap_or_default()
     }
 
     /// Arm the seam to panic the next probe or `Supervisor::shutdown` to

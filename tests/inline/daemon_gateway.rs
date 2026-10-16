@@ -3315,7 +3315,9 @@ fn a_stop_left_running_by_an_exiting_daemon_is_finished_at_its_recorded_deadline
     // Its record is written once its SIGTERM trap is set.
     rig.only_call();
     rig.server.wait_serving(true);
-    before.shutdown(Instant::now());
+    // The still-stopping line is unasserted; the marker read below is the
+    // begin_stop deadline marker, which stays for the draining child.
+    let _ = before.shutdown(Instant::now());
     stub::wait_until("the stub records its SIGTERM", secs(10), || {
         !stub::terms(&rig.dir).is_empty()
     });
@@ -3508,7 +3510,8 @@ fn a_shutdown_during_an_underway_stop_sends_no_second_sigterm() {
         !stub::terms(&rig.dir).is_empty()
     });
 
-    supervisor.shutdown(Instant::now());
+    // The still-stopping line is unasserted here.
+    let _ = supervisor.shutdown(Instant::now());
     assert_eq!(
         stub::terms(&rig.dir),
         [pid],

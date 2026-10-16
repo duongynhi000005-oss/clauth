@@ -609,6 +609,9 @@ fn the_registry_error_logs_again_after_a_good_read() {
     use crate::testutil::HomeSandbox;
 
     let _home = HomeSandbox::new();
+    // The `clauth:` prefix comes from `role(stamped())`: pin it, since a prior
+    // sibling test that ran `serve()` flips the process-global stamp on.
+    let _cli = crate::logline::StampOverride::new(false);
     let path = crate::proxy::registry_path().expect("path");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     let bad = "[qwen]\nport = 9101\n[zcode]\nport = 9101\n";

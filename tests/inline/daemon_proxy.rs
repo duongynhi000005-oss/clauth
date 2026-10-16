@@ -18,7 +18,9 @@ use std::time::Duration;
 #[cfg(unix)]
 use super::*;
 #[cfg(unix)]
-use crate::daemon::gateway::{DAEMON_STOP_BUDGET, Supervised as _, Supervisor, Tick, start_kind};
+use crate::daemon::gateway::{
+    DAEMON_STOP_BUDGET, Supervised as _, Supervisor, Tick, start_kind, stop_sleep,
+};
 #[cfg(unix)]
 use crate::testutil::HomeSandbox;
 
@@ -378,7 +380,8 @@ fn a_daemon_stop_sends_each_proxy_exactly_one_sigterm() {
     let pid = rig.only_call().pid;
     assert_eq!(rig.slot().state, ProxyState::Healthy);
 
-    s.shutdown(std::time::Instant::now() + secs(4));
+    // The stop's exit line and marker removal are unasserted here.
+    let _ = s.shutdown(std::time::Instant::now() + secs(4));
     rig.server.wait_serving(false);
     assert_eq!(stub::terms(&rig.dir), [pid], "exactly one SIGTERM");
 }
@@ -404,7 +407,9 @@ fn a_proxy_still_draining_is_finished_by_the_next_daemon_at_its_deadline() {
     let mut before = rig.supervisor();
     before.step(t0());
     rig.only_call();
-    before.shutdown(std::time::Instant::now());
+    // The still-stopping line is unasserted; the marker read below is the
+    // begin_stop deadline marker, which stays for the draining child.
+    let _ = before.shutdown(std::time::Instant::now());
     stub::wait_until("the stub records its SIGTERM", secs(10), || {
         !stub::terms(&rig.dir).is_empty()
     });
@@ -566,7 +571,9 @@ fn the_stop_bound_is_the_manifest_drain_plus_the_margin() {
     s.step(t0.after(secs(1)));
     assert_eq!(rig.slot().state, ProxyState::Healthy);
 
-    s.shutdown(std::time::Instant::now());
+    // The still-stopping line is unasserted; the marker read below is the
+    // begin_stop deadline marker, which stays for the draining child.
+    let _ = s.shutdown(std::time::Instant::now());
     let marker = read_marker_at_for(&rig).expect("a marker");
     assert_eq!(marker.stop_bound_secs, 12, "drain_secs 7 + the 5 s margin");
 }
@@ -1202,6 +1209,9 @@ fn a_shutdown_during_a_manifest_read_is_preempted() {
 #[test]
 fn an_unreadable_registry_publishes_no_proxies_and_names_the_error_once() {
     let _home = HomeSandbox::new();
+    // The `clauth:` prefix comes from `role(stamped())`: pin it, since a prior
+    // sibling test that ran `serve()` flips the process-global stamp on.
+    let _cli = crate::logline::StampOverride::new(false);
     let dir = crate::profile::clauth_dir().expect("dir");
     crate::profile::mkdir_700(&dir).expect("mkdir");
     std::fs::write(
@@ -1324,6 +1334,250 @@ fn a_stop_answered_late_past_its_deadline_still_answers() {
     stub::wait_until("the child is reaped, not a zombie", secs(5), || {
         proc_state("ps", pid).expect("ps").is_none()
     });
+}
+
+/// The lines a stop raised on the test thread that call it a missed budget.
+#[cfg(unix)]
+fn missed_budget_lines(rig: &Rig) -> Vec<String> {
+    rig.lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("did not stop within"))
+        .collect()
+}
+
+/// A stop whose child outlives its deadline answers before it writes: a
+/// stderr stalled for a second (traced up to 977 ms on a loaded box) at the
+/// "still stopping" line neither reads as a missed budget nor logs one.
+#[cfg(unix)]
+#[test]
+fn a_write_stall_after_the_deadline_is_never_a_missed_budget() {
+    let rig = Rig::new("zcode");
+    std::fs::write(rig.dir.join("ignore-term"), "").expect("ignore-term");
+    let thread = start_kind(
+        Proxy {
+            service: rig.service.clone(),
+        },
+        Arc::clone(&rig.slots),
+        "zz-stall-deadline",
+    )
+    .expect("start");
+    stub::wait_until("the child runs", secs(10), || {
+        stub::invocations(&rig.dir).len() == 1
+    });
+    let pid = rig.only_call().pid;
+    let _stall = crate::daemon::gateway::probe_seam::stall_stop_writes(
+        "zz-stall-deadline",
+        Duration::from_secs(1),
+    );
+    // 300 ms budget + the 500 ms answer grace: the stalled write alone
+    // overruns it whenever it sits before the answer.
+    let answered = thread.shutdown(Duration::from_millis(300));
+    stub::signal(pid, "KILL");
+    assert!(
+        answered,
+        "a write stalled after the deadline is not a stuck thread"
+    );
+    assert_eq!(missed_budget_lines(&rig), Vec::<String>::new());
+    stub::wait_until("the child is reaped, not a zombie", secs(5), || {
+        proc_state("ps", pid).expect("ps").is_none()
+    });
+}
+
+/// A stop whose child exits inside its budget answers before it logs the
+/// exit and removes the marker: a stall at those writes longer than the
+/// budget and the grace together is never a missed budget.
+#[cfg(unix)]
+#[test]
+fn a_write_stall_after_the_child_exits_is_never_a_missed_budget() {
+    let rig = Rig::new("zcode");
+    let thread = start_kind(
+        Proxy {
+            service: rig.service.clone(),
+        },
+        Arc::clone(&rig.slots),
+        "zz-stall-exit",
+    )
+    .expect("start");
+    stub::wait_until("the child runs", secs(10), || {
+        stub::invocations(&rig.dir).len() == 1
+    });
+    let pid = rig.only_call().pid;
+    // The stub exits on its SIGTERM at once, well inside the 2 s budget;
+    // 3 s of stall overruns the budget plus the 500 ms answer grace.
+    let _stall = crate::daemon::gateway::probe_seam::stall_stop_writes(
+        "zz-stall-exit",
+        Duration::from_secs(3),
+    );
+    let answered = thread.shutdown(Duration::from_secs(2));
+    assert!(
+        answered,
+        "a write stalled after the exit is not a stuck thread"
+    );
+    assert_eq!(missed_budget_lines(&rig), Vec::<String>::new());
+    assert_eq!(
+        stub::terms(&rig.dir).len(),
+        1,
+        "one SIGTERM, and it ended the child"
+    );
+    stub::wait_until("the child is reaped, not a zombie", secs(5), || {
+        proc_state("ps", pid).expect("ps").is_none()
+    });
+}
+
+/// The clamp a stop applies to its last sleep, pinned two ways: by equality
+/// on hand-computed inputs through the pure [`stop_sleep`], then driven
+/// through the real loop with a 130 ms budget (not a multiple of the 50 ms
+/// poll, so the clamp matters), asserting every requested sleep stays inside
+/// the remaining time it clamped to. The record holds each request beside its
+/// remaining, so the pin holds at any dispatch latency or real-sleep
+/// oversleep; it never counts polls.
+#[cfg(unix)]
+#[test]
+fn the_stop_wait_clamps_its_last_sleep_to_the_deadline() {
+    let ms = Duration::from_millis;
+    assert_eq!(stop_sleep(ms(30)), ms(30));
+    assert_eq!(stop_sleep(ms(50)), ms(50));
+    assert_eq!(stop_sleep(ms(80)), ms(50));
+    assert_eq!(stop_sleep(Duration::ZERO), Duration::ZERO);
+
+    let rig = Rig::new("zcode");
+    std::fs::write(rig.dir.join("ignore-term"), "").expect("ignore-term");
+    let thread = start_kind(
+        Proxy {
+            service: rig.service.clone(),
+        },
+        Arc::clone(&rig.slots),
+        "zz-clamp",
+    )
+    .expect("start");
+    stub::wait_until("the child runs", secs(10), || {
+        stub::invocations(&rig.dir).len() == 1
+    });
+    let pid = rig.only_call().pid;
+    let _arm = crate::daemon::gateway::probe_seam::arm_stop_sleeps("zz-clamp");
+    let answered = thread.shutdown(Duration::from_millis(130));
+    stub::signal(pid, "KILL");
+    assert!(answered, "the stop answers");
+    let sleeps = crate::daemon::gateway::probe_seam::stop_sleeps();
+    assert!(
+        sleeps
+            .iter()
+            .all(|(remaining, request)| *request <= *remaining),
+        "no requested sleep ends past its remaining time: {sleeps:?}"
+    );
+    stub::wait_until("the child is reaped, not a zombie", secs(5), || {
+        proc_state("ps", pid).expect("ps").is_none()
+    });
+}
+
+/// A stalled stderr at the "stopping" line never delays the SIGTERM: the stop
+/// sends its one SIGTERM before that write, so a child's drain budget is not
+/// eaten by the log. Margins from the two orders this distinguishes, the
+/// SIGTERM at L (before the stall) against S + L (after it, the old order):
+/// the 3 s cap is half the 6 s stall, so the correct path keeps 3 s for the
+/// `/bin/kill` spawn latency while the old order still misses by 3 s, and the
+/// 12 s shutdown budget, twice the stall, still answers over stall + spawn +
+/// marker fsync.
+#[cfg(unix)]
+#[test]
+fn the_stopping_line_write_never_delays_the_sigterm() {
+    let rig = Rig::new("zcode");
+    let thread = start_kind(
+        Proxy {
+            service: rig.service.clone(),
+        },
+        Arc::clone(&rig.slots),
+        "zz-begin-stall",
+    )
+    .expect("start");
+    stub::wait_until("the child runs", secs(10), || {
+        stub::invocations(&rig.dir).len() == 1
+    });
+    let pid = rig.only_call().pid;
+    let _stall = crate::daemon::gateway::probe_seam::stall_begin_stop(
+        "zz-begin-stall",
+        Duration::from_secs(6),
+    );
+    let answered = std::thread::scope(|scope| {
+        let shutdown = scope.spawn(move || thread.shutdown(secs(12)));
+        stub::wait_until(
+            "the stub records its SIGTERM before the stop line stall ends",
+            secs(3),
+            || !stub::terms(&rig.dir).is_empty(),
+        );
+        shutdown.join().expect("the supervisor thread joins")
+    });
+    assert!(answered, "the stop answers");
+    assert_eq!(stub::terms(&rig.dir), [pid], "exactly one SIGTERM");
+}
+
+/// A daemon hard-killed while the "stopping" line's write stalls still leaves
+/// the stop's deadline in the child marker: the SIGTERM goes first, then the
+/// deadline marker, then that line, so the next start waits out the drain
+/// instead of sending the second SIGTERM that skips it. The arm stalls 6 s at
+/// the line; the test waits for the deadline marker's write to land inside
+/// that stall, poses the next start, then KILLs the stub so the supervisor
+/// answers at the stall's end rather than the 12 s shutdown budget.
+#[cfg(unix)]
+#[test]
+fn a_daemon_killed_during_the_stopping_line_leaves_the_deadline_and_no_second_sigterm() {
+    let rig = Rig::new("zcode");
+    std::fs::write(rig.dir.join("ignore-term"), "").expect("ignore-term");
+    let thread = start_kind(
+        Proxy {
+            service: rig.service.clone(),
+        },
+        Arc::clone(&rig.slots),
+        "zz-probe-crash",
+    )
+    .expect("start");
+    stub::wait_until("the child runs", secs(10), || {
+        stub::invocations(&rig.dir).len() == 1
+    });
+    let pid = rig.only_call().pid;
+    let _stall = crate::daemon::gateway::probe_seam::stall_begin_stop(
+        "zz-probe-crash",
+        Duration::from_secs(6),
+    );
+    let (marker, second) = std::thread::scope(|scope| {
+        let shutdown = scope.spawn(move || thread.shutdown(secs(12)));
+        stub::wait_until("the stub records its SIGTERM", secs(3), || {
+            !stub::terms(&rig.dir).is_empty()
+        });
+        // Wait for the deadline marker's write to land inside the stall, so a
+        // daemon killed in that window is posed with the marker it must leave.
+        let mut marker = None;
+        stub::wait_until(
+            "the deadline marker lands inside the stall",
+            secs(3),
+            || {
+                marker = read_marker_at_for(&rig).filter(|m| m.stop_deadline_ms.is_some());
+                marker.is_some()
+            },
+        );
+        let marker = marker.expect("a marker");
+        // The next daemon's start over that marker.
+        let path = crate::proxy::child_marker_path(&rig.service).expect("marker path");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        let _ = crate::daemon::gateway::stop_left_behind(&path, "probe", now_ms);
+        std::thread::sleep(Duration::from_millis(300));
+        let second = stub::terms(&rig.dir).len();
+        // KILL inside the scope, before the join, so the supervisor answers at
+        // the stall's end instead of waiting out the 12 s budget.
+        stub::signal(pid, "KILL");
+        let _ = shutdown.join();
+        (marker, second)
+    });
+    assert!(
+        marker.stop_deadline_ms.is_some(),
+        "the deadline marker is on disk once the SIGTERM is sent: {:?}, SIGTERMs after a next start: {second}",
+        marker.stop_deadline_ms
+    );
+    assert_eq!(second, 1, "a next start never sends a second SIGTERM");
 }
 
 /// The proxy memoizes its prepared manifest across retry rounds; the gateway

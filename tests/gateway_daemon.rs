@@ -288,6 +288,37 @@ fn a_daemon_boot_runs_one_healthy_gateway_and_stops_it_on_sigterm() {
     assert_eq!(sandbox.calls().len(), 1, "no restart on the way out");
 }
 
+/// A stop whose child outlives the daemon's budget logs the exact line saying
+/// the next daemon start finishes the stop: the operator learns the child is
+/// still draining. The daemon stamps each line with an ISO timestamp; strip it
+/// and pin the message by equality.
+#[test]
+fn a_stop_that_outlives_its_budget_logs_the_next_start_finishes_it() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.dir.join("ignore-term"), "").expect("ignore-term");
+    let mut daemon = sandbox.daemon(&[]);
+    wait_for_healthy(&sandbox);
+    let calls = sandbox.calls();
+    assert_eq!(calls.len(), 1, "exactly one gateway: {calls:?}");
+    let pid = calls[0].pid;
+
+    let status = daemon.terminate();
+    assert_eq!(
+        status.signal(),
+        Some(15),
+        "the daemon still dies of the SIGTERM"
+    );
+    let expected = format!(
+        "clauth daemon: the shunt gateway (pid {pid}) is still stopping; the next daemon start finishes the stop"
+    );
+    let text = sandbox.log_text();
+    assert!(
+        text.lines()
+            .any(|line| { line.split_once(' ').map(|(_, msg)| msg) == Some(expected.as_str()) }),
+        "the exact still-stopping line: {text}"
+    );
+}
+
 /// The gateway's stdout and stderr land in `~/.clauth/gateway.log`, created
 /// owner-only, and never in the daemon's own stderr: shunt logs every request
 /// at `info`, which would flood the daemon's capped log.
