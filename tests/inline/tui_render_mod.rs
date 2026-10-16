@@ -3942,13 +3942,13 @@ fn fallback_preferred_days_footer_hints() {
     let out = dump(&app, 120, 30);
     assert_eq!(
         footer_of(&out),
-        "←→ tabs   space preset   ↵ days   ↑↓ row   a actions   ? help   q back",
+        "← back   space preset   ↵ days   ↑↓ row   a actions   ? help   q back",
         "the row's hints"
     );
     let out = dump(&app, 45, 30);
     assert_eq!(
         footer_of(&out),
-        "←→ tabs   space preset   ? help   q back",
+        "← back   space preset   ? help   q back",
         "at phone width `a actions` and `↑↓ row` shed before the row's own keys"
     );
 
@@ -4004,62 +4004,75 @@ fn an_editor_owning_the_arrows_names_them_and_drops_the_tab_hint() {
     plugin.services.focus = ServicesFocus::Detail;
 
     type Open = Box<dyn Fn(&mut App)>;
-    let cases: Vec<(&str, App, Open, &str)> = vec![
+    // A descended editable pane's rest hint is `← back` (its `←` ascends);
+    // a top-level screen's is `←→ tabs`. Both carry exactly one arrow group.
+    const NAV: &str = "←→ tabs";
+    const BACK: &str = "← back";
+    let cases: Vec<(&str, App, Open, &str, &str)> = vec![
         (
             "rotate at",
             card(FallbackRow::Threshold),
             Box::new(press_enter),
+            BACK,
             TYPED,
         ),
         (
             "weekly at",
             card(FallbackRow::WeeklyAt),
             Box::new(press_enter),
+            BACK,
             TYPED,
         ),
         (
             "max spend",
             card(FallbackRow::MaxSpend),
             Box::new(press_enter),
+            BACK,
             TYPED,
         ),
         (
             "preferred days",
             card(FallbackRow::PreferredDays),
             Box::new(press_enter),
+            BACK,
             "←→ day   space toggle   ↑↓ row   ? help   q back",
         ),
         (
             "refresh",
             on_tab(Tab::Config),
             Box::new(|app| app.refresh_interval_draft = Some(InputState::new("60"))),
+            NAV,
             TYPED,
         ),
         (
             "context nudge",
             on_tab(Tab::Config),
             Box::new(|app| app.context_nudge_draft = Some(InputState::new("300k"))),
+            NAV,
             TYPED,
         ),
         (
             "weekly limit",
             on_tab(Tab::Config),
             Box::new(|app| app.weekly_threshold_draft = Some(InputState::new("95"))),
+            NAV,
             TYPED,
         ),
         (
             "herdr tag refresh",
             plugin,
             Box::new(|app| app.services.herdr_tag_draft = Some(InputState::new("5"))),
+            BACK,
             TYPED,
         ),
-        ("setup name", setup(), Box::new(press_enter), TYPED),
+        ("setup name", setup(), Box::new(press_enter), BACK, TYPED),
     ];
 
     let mut wrong = Vec::new();
-    for (label, mut app, open, want) in cases {
+    for (label, mut app, open, rest_want, want) in cases {
         let rest = footer_of(&dump(&app, 120, 30)).to_string();
-        if !rest.starts_with("←→ tabs") || rest.matches("←→").count() != 1 {
+        let nav_arrows = usize::from(rest_want == NAV);
+        if !rest.starts_with(rest_want) || rest.matches("←→").count() != nav_arrows {
             wrong.push(format!("[{label}] at rest: {rest:?}"));
         }
         open(&mut app);
@@ -7612,4 +7625,39 @@ fn the_bare_band_pads_the_no_data_dash_to_the_label_width() {
             "the no-window dash aligns with the reading at {w}"
         );
     }
+}
+
+/// The footer's first hint derives from the same pane predicate the keys use:
+/// `←→ tabs` at rest, `← back` in every descended pane.
+#[test]
+fn the_footer_nav_hint_tracks_the_pane_state() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{ConfigFocus, StatusFocus};
+    let mut app = setup_app();
+    assert!(
+        footer_of(&dump(&app, 120, 30)).starts_with("←→ tabs"),
+        "at rest the hint is the tab switch"
+    );
+
+    crate::tui::app::handle_key(
+        &mut app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Enter),
+    );
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "descended into the editable pane"
+    );
+    assert!(
+        footer_of(&dump(&app, 120, 30)).starts_with("← back"),
+        "the descended editable pane shows the ascend hint"
+    );
+
+    // A descended read-only pane shows the same `← back`.
+    app.tab = crate::tui::app::Tab::Status;
+    app.status.focus = StatusFocus::Detail;
+    assert!(
+        footer_of(&dump(&app, 120, 30)).starts_with("← back"),
+        "the descended read-only pane shows the ascend hint"
+    );
 }

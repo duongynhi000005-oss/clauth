@@ -871,6 +871,31 @@ impl ConfigDraft {
                 crate::gateway::url_names_bind(self.base_url.value.trim(), &mint.bind)
             })
     }
+
+    /// Whether this `+ new` draft holds anything a fresh [`build_draft_new`]
+    /// does not — a typed field value, a captured login, or a mint marker. The
+    /// `+ new` form never edits env rows or an existing account, so the env
+    /// buffers are always empty here; every input is checked anyway so a
+    /// future field is covered.
+    fn holds_typed_work(&self) -> bool {
+        let inputs = [
+            &self.name,
+            &self.base_url,
+            &self.api_key,
+            &self.model,
+            &self.opus_model,
+            &self.sonnet_model,
+            &self.haiku_model,
+            &self.fable_model,
+            &self.subagent_model,
+            &self.bell_threshold,
+            &self.env_value,
+            &self.env_new_key,
+        ];
+        inputs.iter().any(|i| !i.value.is_empty())
+            || self.captured_login.is_some()
+            || self.mint_for.is_some()
+    }
 }
 
 /// What a `+ new` draft's stash holds: the browser mint `+ login` finished
@@ -894,6 +919,54 @@ pub(crate) struct ConfirmState {
     /// render publishes the bound and the viewport; the key handler clamps.
     pub(crate) scroll: ConfirmScroll,
     pub(crate) on_confirm: ConfirmAction,
+}
+
+/// The loss warning a screen switch opens over unsaved work another screen
+/// also writes. `go back` is the default focus; `discard` drops the work and
+/// performs the switch that opened it, to the target fixed at that keypress.
+#[derive(Debug, Clone)]
+pub(crate) struct LossWarningState {
+    /// Highlighted choice: false = `go back`, true = `discard`.
+    pub(crate) choice: bool,
+    /// The tab the keypress that opened the warning targets.
+    pub(crate) target: Tab,
+    /// The work `discard` drops (only the warned work, nothing else).
+    pub(crate) drop: LossWarningDrop,
+}
+
+/// What `discard` on the loss warning drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LossWarningDrop {
+    /// The Setup existing-account draft (an open typed field).
+    SetupDraft,
+    /// The Fallback member-card edit (an open typed field).
+    FallbackEdit,
+    /// The suspended `+ new` form the Services mint path would displace. The
+    /// `require` flag is the picker's, carried so `discard` can reopen the mint
+    /// form exactly as the picker would.
+    NewAccountDraft { require: bool },
+}
+
+impl LossWarningDrop {
+    /// The two-sentence body, one line per sentence, naming the screen holding
+    /// the work and the other writer, the owner's example wording. Two lines
+    /// keep the renderer from splitting a word across rows at 80 columns.
+    pub(crate) fn detail_lines(self) -> [&'static str; 2] {
+        match self {
+            Self::SetupDraft => [
+                "There are unsaved edits on the Setup tab.",
+                "Fallback also edits this account.",
+            ],
+            Self::FallbackEdit => [
+                "There are unsaved edits on the Fallback tab.",
+                "Setup also edits this account.",
+            ],
+            Self::NewAccountDraft { .. } => [
+                "There are unsaved edits on the Setup tab.",
+                "Services also edits the new account form.",
+            ],
+        }
+    }
 }
 
 /// The scroll a confirm modal's body carries. `offset` is the key handler's
@@ -1675,6 +1748,9 @@ pub(crate) enum Modal {
     /// Startup re-bind confirm: move matching accounts onto the built-in
     /// presets' current ids.
     Rebind(RebindForm),
+    /// A screen switch away from unsaved work another screen also writes (see
+    /// Tab bar → Switching tabs → Loss warning).
+    LossWarning(LossWarningState),
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -4047,6 +4123,15 @@ pub(crate) struct App {
     pub(crate) config_action_cursor: usize,
     /// Inline editor for the Config detail pane; `Some` only while Actions has focus.
     pub(crate) config_draft: Option<ConfigDraft>,
+    /// The `+ new` form's draft while the form is not the active Setup pane —
+    /// suspended across a switch or while another account's detail is open, so
+    /// descending into `+ new` again restores its typed values. One slot cannot
+    /// hold both this and `config_draft` (an existing account's draft), which
+    /// is why the form gets its own home.
+    pub(crate) new_account_draft: Option<ConfigDraft>,
+    /// What the preset picker's open did to the Setup pane, so a cancel of the
+    /// pick sequence can reverse it losslessly.
+    pub(crate) preset_picker_open: PresetPickerOpen,
     /// Cursor into `chain_items()` on the Fallback left pane.
     pub(crate) chain_cursor: usize,
     /// Which Fallback pane has focus.
@@ -4736,6 +4821,8 @@ impl App {
             note_text: initial_note,
             note_editor: None,
             config_draft: None,
+            new_account_draft: None,
+            preset_picker_open: PresetPickerOpen::None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
             compact: false,
@@ -6067,17 +6154,6 @@ pub(crate) fn has_sub_focus(app: &App) -> bool {
         || (app.tab == Tab::Tokens && app.token_view == TokenView::Models)
 }
 
-/// True while focus is descended into the delegates detail: `←` ascends and
-/// `→` is inert there, the master-detail arrow-trap, instead of switching tabs.
-fn services_delegates_descended(app: &App) -> bool {
-    app.tab == Tab::Services
-        && app.services.focus == ServicesFocus::Detail
-        && app
-            .services
-            .selected_check()
-            .is_some_and(|c| c.label == "delegates")
-}
-
 /// What owns the keyboard this frame: every key it claims ([`KeyOwner::claims`]),
 /// `←`/`→` included, reaches it before any tab switch or global binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6188,6 +6264,125 @@ pub(crate) fn keyboard_owner(app: &App) -> Option<KeyOwner> {
     }
 }
 
+/// What the tab-switch keys do on the current screen, the one answer
+/// [`handle_key`], the footer and the help modal all derive from so their
+/// hints cannot drift from the keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneState {
+    /// Top level: `←`/`→`/`tab`/`⇧tab` all switch screens.
+    Rest,
+    /// A descended read-only detail: `←` ascends, `→` is inert, `tab`/`⇧tab`
+    /// ascend AND switch.
+    ReadOnly,
+    /// A descended editable detail at rest: `←` ascends (the esc path),
+    /// `→`/`tab`/`⇧tab` are inert.
+    Editable,
+}
+
+/// The pane focus this frame, reached only while nothing owns the keyboard (an
+/// open editor claims the arrows and tab itself, so it never lands here).
+pub(crate) fn pane_state(app: &App) -> PaneState {
+    if (app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail)
+        || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
+        || (app.tab == Tab::Tokens
+            && app.token_view == TokenView::Models
+            && app.model_detail_focus == StatusFocus::Detail)
+    {
+        return PaneState::ReadOnly;
+    }
+    if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions {
+        return PaneState::Editable;
+    }
+    if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
+        return PaneState::Editable;
+    }
+    if app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail {
+        // The shunt card, the herdr options and the plugin fixes change saved
+        // data; the delegates job list and every other check's detail scroll
+        // read-only.
+        let editable = app
+            .services
+            .selected_check()
+            .is_some_and(|c| matches!(c.label, "shunt" | "herdr" | "plugin"));
+        return if editable {
+            PaneState::Editable
+        } else {
+            PaneState::ReadOnly
+        };
+    }
+    PaneState::Rest
+}
+
+/// Back out of the current sub-focus, the `esc`/`←` ascend path. Mirrors the
+/// `esc` chain exactly so `←` and `esc` can never diverge.
+fn ascend_pane(app: &mut App) {
+    if app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail {
+        app.usage_detail_focus = StatusFocus::List;
+    } else if app.tab == Tab::Tokens
+        && app.token_view == TokenView::Models
+        && app.model_detail_focus == StatusFocus::Detail
+    {
+        app.model_detail_focus = StatusFocus::List;
+    } else if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions {
+        leave_config_detail(app);
+    } else if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
+        leave_fallback_detail(app);
+    } else if app.tab == Tab::Status && app.status.focus == StatusFocus::Detail {
+        app.status.focus = StatusFocus::List;
+    } else if app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail {
+        if !shunt_esc_folds_entry(app) {
+            leave_shunt_detail(app);
+        }
+    } else if app.tab == Tab::Tokens && app.token_view == TokenView::Models {
+        app.token_view = TokenView::Dashboard;
+    }
+}
+
+/// The direction a `Tab`/`BackTab` keypress names, or `None` when a reported
+/// CONTROL or ALT makes it inert. A bare `Tab` and a `Tab` with SHIFT
+/// (the kitty form of shift+tab) are distinguished; `BackTab` switches back
+/// with or without its shift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabStep {
+    Next,
+    Prev,
+}
+
+fn tab_switch_direction(key: KeyEvent) -> Option<TabStep> {
+    // `tab` switches with no modifier besides shift: any other
+    // reported modifier (ctrl, alt, super, hyper, meta) makes it inert.
+    if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Some(TabStep::Prev),
+        KeyCode::Tab => Some(TabStep::Next),
+        KeyCode::BackTab => Some(TabStep::Prev),
+        _ => None,
+    }
+}
+
+/// The tab an `⌥1`–`⌥9` keypress jumps to: `⌥1`–`⌥8` positional, `⌥9` the last
+/// tab, `⌥0` unbound. Only `ALT` may be present.
+fn alt_jump_target(key: KeyEvent) -> Option<Tab> {
+    // `⌥digit` requires ALT alone: any other reported modifier
+    // (shift, ctrl, super, hyper, meta) makes it inert.
+    if key.modifiers != KeyModifiers::ALT {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(d @ '1'..='9') => {
+            let n = d.to_digit(10)? as usize;
+            Some(if n == 9 {
+                Tab::ALL[Tab::ALL.len() - 1]
+            } else {
+                Tab::ALL[n - 1]
+            })
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     if key.kind != KeyEventKind::Press {
         return;
@@ -6196,6 +6391,15 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.quit = true;
         app.shutting_down.store(true, Ordering::SeqCst);
+        return;
+    }
+
+    // `⌥1`–`⌥9` jump, live inside every editor but inert while a modal owns the
+    // keyboard — so it runs before any non-modal owner claims the key.
+    if app.modals.is_empty()
+        && let Some(target) = alt_jump_target(key)
+    {
+        request_switch(app, target);
         return;
     }
 
@@ -6231,41 +6435,34 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     match key.code {
-        KeyCode::Left if app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail => {
-            app.usage_detail_focus = StatusFocus::List;
+        KeyCode::Left => {
+            if pane_state(app) == PaneState::Rest {
+                request_switch(app, app.tab.prev());
+            } else {
+                app.disarm_quit();
+                ascend_pane(app);
+            }
             return;
         }
-        KeyCode::Left
-            if app.tab == Tab::Tokens
-                && app.token_view == TokenView::Models
-                && app.model_detail_focus == StatusFocus::Detail =>
-        {
-            app.model_detail_focus = StatusFocus::List;
+        KeyCode::Right => {
+            // Inert in every descended pane; switches only at rest.
+            if pane_state(app) == PaneState::Rest {
+                request_switch(app, app.tab.next());
+            }
             return;
         }
-        KeyCode::Left if services_delegates_descended(app) => {
-            leave_shunt_detail(app);
-            return;
-        }
-        KeyCode::Right
-            if (app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail)
-                || (app.tab == Tab::Tokens
-                    && app.token_view == TokenView::Models
-                    && app.model_detail_focus == StatusFocus::Detail) =>
-        {
-            return;
-        }
-        KeyCode::Right if services_delegates_descended(app) => {
-            return;
-        }
-        KeyCode::Right | KeyCode::Tab => {
-            app.disarm_quit();
-            switch_tab(app, app.tab.next());
-            return;
-        }
-        KeyCode::Left | KeyCode::BackTab => {
-            app.disarm_quit();
-            switch_tab(app, app.tab.prev());
+        KeyCode::Tab | KeyCode::BackTab => {
+            // A ctrl/alt variant is inert; a descended editable pane
+            // traps the keys entirely.
+            if let Some(step) = tab_switch_direction(key)
+                && pane_state(app) != PaneState::Editable
+            {
+                let target = match step {
+                    TabStep::Next => app.tab.next(),
+                    TabStep::Prev => app.tab.prev(),
+                };
+                request_switch(app, target);
+            }
             return;
         }
         KeyCode::Char('?') => {
@@ -6360,26 +6557,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // Esc backs out of sub-focus; no-op at the top level.
         KeyCode::Esc => {
             app.disarm_quit();
-            if app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail {
-                app.usage_detail_focus = StatusFocus::List;
-            } else if app.tab == Tab::Tokens
-                && app.token_view == TokenView::Models
-                && app.model_detail_focus == StatusFocus::Detail
-            {
-                app.model_detail_focus = StatusFocus::List;
-            } else if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions {
-                leave_config_detail(app);
-            } else if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
-                leave_fallback_detail(app);
-            } else if app.tab == Tab::Status && app.status.focus == StatusFocus::Detail {
-                app.status.focus = StatusFocus::List;
-            } else if app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail {
-                if !shunt_esc_folds_entry(app) {
-                    leave_shunt_detail(app);
-                }
-            } else if app.tab == Tab::Tokens && app.token_view == TokenView::Models {
-                app.token_view = TokenView::Dashboard;
-            }
+            ascend_pane(app);
             // At top level, Esc is a no-op — ctrl+c or `q q` to quit.
             return;
         }
@@ -6735,11 +6913,194 @@ fn dash_row_start(rows: &[(u16, u16)], mut i: usize) -> usize {
     i
 }
 
+/// The warned work: an open typed field on an existing account (Setup) or a
+/// member card (Fallback) whose buffer differs from that field's saved value.
+/// Everything else suspends with no warning.
+fn shared_draft(app: &App) -> Option<LossWarningDrop> {
+    if app.tab == Tab::Setup
+        && app.config_focus == ConfigFocus::Actions
+        && let Some(d) = app.config_draft.as_ref()
+        && let Some(name) = d.editing_name.as_deref()
+        && let Some(field) = d.active
+    {
+        let name = ProfileName::from(name);
+        let saved = {
+            let cfg = app.config();
+            row_committed_value(cfg.find(&name), &name, field)
+        };
+        if d.field(field).is_some_and(|input| input.value != saved) {
+            return Some(LossWarningDrop::SetupDraft);
+        }
+    }
+    if app.tab == Tab::Fallback
+        && app.fallback_focus == FallbackFocus::Detail
+        && let Some(edit) = app.fallback_edit.as_ref()
+    {
+        let cfg = app.config();
+        let profile = cfg.find(&edit.member);
+        let differs = match &edit.state {
+            CardEdit::Threshold(input) => {
+                // Compare against the value `run_fallback_row` seeds the field
+                // from (`threshold_for`: the stored threshold or the default),
+                // so an untouched field on a default-threshold member is clean.
+                let saved = profile
+                    .map(crate::fallback::threshold_for)
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_default();
+                input.value != saved
+            }
+            CardEdit::Weekly(input) => {
+                let saved = profile
+                    .and_then(|p| p.weekly_threshold)
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_default();
+                input.value != saved
+            }
+            CardEdit::MaxSpend(input) => {
+                let saved = format!(
+                    "{:.2}",
+                    profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0)
+                );
+                input.value != saved
+            }
+            CardEdit::Days(_) | CardEdit::ArmedRemove => false,
+        };
+        if differs {
+            return Some(LossWarningDrop::FallbackEdit);
+        }
+    }
+    None
+}
+
+/// A switch the user asked for: disarm it, warn over shared unsaved work, else
+/// perform it. `target == app.tab` (a jump to the active tab) does nothing.
+fn request_switch(app: &mut App, target: Tab) {
+    if app.tab == target {
+        return;
+    }
+    disarm_switch(app);
+    if let Some(drop) = shared_draft(app) {
+        app.open_modal(Modal::LossWarning(LossWarningState {
+            choice: false,
+            target,
+            drop,
+        }));
+        return;
+    }
+    do_switch(app, target);
+}
+
+/// Perform a switch: suspend the pane it leaves, then land.
+fn do_switch(app: &mut App, target: Tab) {
+    suspend_source(app);
+    switch_tab(app, target);
+}
+
+/// Disarm everything a switch disarms at the switch itself: the
+/// 2-step quit and Fallback's armed remove. Setup's armed action is not set
+/// here: an armed Setup draft always rests with no field open, so the switch
+/// drops it whole through [`leave_config_detail`], and the `+ new` form has no
+/// armable row.
+fn disarm_switch(app: &mut App) {
+    app.disarm_quit();
+    if matches!(
+        app.fallback_edit.as_ref().map(|e| &e.state),
+        Some(CardEdit::ArmedRemove)
+    ) {
+        app.fallback_edit = None;
+    }
+}
+
+/// Whether a suspended `+ new` form holds typed work: the form's own home
+/// (`new_account_draft`, an at-rest suspend) or a field-open one still sitting
+/// in `config_draft` (a suspend that kept the edit open).
+fn suspended_new_form_holds_typed_work(app: &App) -> bool {
+    app.new_account_draft
+        .as_ref()
+        .is_some_and(ConfigDraft::holds_typed_work)
+        || app
+            .config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.is_none() && d.holds_typed_work())
+}
+
+/// The one writer of `new_account_draft`. A suspended `+ new` form holding
+/// typed work is never overwritten: the incoming draft is handed back to the
+/// caller, which keeps it, so no slot write can drop a form and no UI path
+/// panics. `Some(draft)` = refused and returned; `None` = stored.
+fn set_new_account_draft(app: &mut App, draft: ConfigDraft) -> Option<ConfigDraft> {
+    if app
+        .new_account_draft
+        .as_ref()
+        .is_some_and(ConfigDraft::holds_typed_work)
+    {
+        return Some(draft);
+    }
+    app.new_account_draft = Some(draft);
+    None
+}
+
+/// Suspend the pane the switch leaves: an open edit stays (only
+/// reachable by `⌥digit`, since editors own the arrows and tab), everything
+/// else ascends to its selector, keeping unsaved state.
+fn suspend_source(app: &mut App) {
+    let edit_open = keyboard_owner(app).is_some();
+    match app.tab {
+        Tab::Usage => {
+            // The note editor keeps the Usage descent; a bare detail
+            // ascends.
+            if !edit_open {
+                app.usage_detail_focus = StatusFocus::List;
+            }
+        }
+        Tab::Tokens => app.model_detail_focus = StatusFocus::List,
+        Tab::Setup if app.config_focus == ConfigFocus::Actions => {
+            if edit_open {
+                // Keep the descent and the edit; returning lands back in it.
+            } else if app
+                .config_draft
+                .as_ref()
+                .is_some_and(|d| d.editing_name.is_none())
+            {
+                // The `+ new` form's typed values survive in its own home.
+                let Some(draft) = app.config_draft.take() else {
+                    return;
+                };
+                match set_new_account_draft(app, draft) {
+                    None => app.config_focus = ConfigFocus::Profiles,
+                    // The slot already holds a typed form: put this form back
+                    // and keep the descent, so the pane stays on its form and
+                    // nothing is dropped.
+                    Some(draft) => app.config_draft = Some(draft),
+                }
+            } else {
+                leave_config_detail(app);
+            }
+        }
+        Tab::Fallback if app.fallback_focus == FallbackFocus::Detail => {
+            if !edit_open {
+                leave_fallback_detail(app);
+            }
+        }
+        Tab::Status => app.status.focus = StatusFocus::List,
+        Tab::Services
+            if app.services.focus == ServicesFocus::Detail
+            // `leave_shunt_detail` keeps the in-memory `+ add` drafts; only
+            // ascend while no editor (shunt field or herdr tag) owns the keys.
+            // Never `shunt_esc_folds_entry` here: that esc-path helper folds
+            // drafts, which a switch must not drop.
+            && !edit_open =>
+        {
+            leave_shunt_detail(app);
+        }
+        _ => {}
+    }
+}
+
 /// Switch the active tab and reset that tab's cursor to a sensible default.
 fn switch_tab(app: &mut App, tab: Tab) {
     app.tab = tab;
     app.tab_activity[tab.index()] = None;
-    app.config_draft = None;
     // Leaving the Services tab cancels a still-pending herdr landing: the user
     // has moved on, so a later recompute must not yank the cursor back.
     app.services.land_on_herdr = false;
@@ -6753,7 +7114,34 @@ fn switch_tab(app: &mut App, tab: Tab) {
     match tab {
         Tab::Overview => {}
         Tab::Usage => {
-            app.usage_detail_focus = StatusFocus::List;
+            if keyboard_owner(app).is_some() {
+                // A suspended note editor returns under its own account:
+                // pin the selector to the editor's profile and reload
+                // the note, so the header and the editor never disagree about
+                // whose note is open. A deleted account closes the editor and
+                // ascends, as a deleted account's Setup edit does.
+                let profile = app.note_editor.as_ref().map(|e| e.profile.clone());
+                if let Some(name) = profile {
+                    let idx = app.config().profiles.iter().position(|p| p.name == name);
+                    match idx {
+                        Some(i) => {
+                            app.profile_cursor = i;
+                            app.reload_selected_note();
+                        }
+                        None => {
+                            // The account is gone (deleted, or renamed by
+                            // another process): close the editor so no
+                            // invisible editor owns the keys. Keeping a typed
+                            // editor open under its old name left it drawn by
+                            // nobody while it still captured every key.
+                            app.note_editor = None;
+                            app.usage_detail_focus = StatusFocus::List;
+                        }
+                    }
+                }
+            } else {
+                app.usage_detail_focus = StatusFocus::List;
+            }
             app.usage_detail_scroll = 0;
         }
         Tab::Tokens => {
@@ -6764,36 +7152,75 @@ fn switch_tab(app: &mut App, tab: Tab) {
             app.token_model_cursor = 0;
         }
         Tab::Setup => {
-            app.config_focus = ConfigFocus::Profiles;
-            app.config_action_cursor = 0;
+            if keyboard_owner(app).is_some() {
+                // A suspended open edit returns into it with the selector pinned
+                // to the edit's own subject: an existing account's slot
+                // or the `+ new` row. A deleted account closes the edit through
+                // `leave_config_detail` rather than resurrecting it.
+                match app
+                    .config_draft
+                    .as_ref()
+                    .and_then(|d| d.editing_name.clone())
+                {
+                    Some(name) => {
+                        let name = ProfileName::from(name.as_str());
+                        let idx = app.config().profiles.iter().position(|p| p.name == name);
+                        match idx {
+                            Some(i) => app.profile_cursor = i,
+                            None => leave_config_detail(app),
+                        }
+                    }
+                    None => app.profile_cursor = app.profile_count(),
+                }
+            } else {
+                app.config_focus = ConfigFocus::Profiles;
+                app.config_action_cursor = 0;
+                // A suspended `+ new` form re-homes the selector onto its row —
+                // `clamp_profile_cursor` above drops the synthetic `+ new`
+                // cursor. Skipped while a suspended edit owns the selector.
+                if app.new_account_draft.is_some() {
+                    app.profile_cursor = app.profile_count();
+                    app.reload_selected_note();
+                }
+            }
             // The `+ new` form's capture row renders off this flag, and a
             // login may have been minted (or saved) elsewhere since the last
             // Setup visit.
             app.refresh_unsaved_live_login();
         }
         Tab::Fallback => {
-            app.chain_cursor = chain_cursor_for_profile(app);
-            sync_profile_from_chain(app);
-            leave_fallback_detail(app);
+            if keyboard_owner(app).is_some() {
+                // A suspended edit returns into it, pinned to the edit's member
+                // (`repin_member_edit` also closes the edit once the member left
+                // the chain, as a deleted account's Setup edit does).
+                repin_member_edit(app);
+                sync_profile_from_chain(app);
+            } else {
+                app.chain_cursor = chain_cursor_for_profile(app);
+                sync_profile_from_chain(app);
+                leave_fallback_detail(app);
+            }
         }
         Tab::Config => {
-            app.global_config_cursor = 0;
-            app.refresh_interval_draft = None;
-            app.context_nudge_draft = None;
-            app.weekly_threshold_draft = None;
+            // A suspended editor returns into it; a fresh entry re-homes the
+            // cursor. The drafts themselves clear only on their own commit /
+            // cancel — an open editor is never stale here.
+            if keyboard_owner(app).is_none() {
+                app.global_config_cursor = 0;
+            }
         }
         Tab::Status => {
             // Keep the incident cursor; reset focus to the list per the contract.
             app.status.focus = StatusFocus::List;
         }
         Tab::Services => {
-            leave_shunt_detail(app);
-            app.services.cursor = 0;
-            app.services.detail_scroll = 0;
-            // Entering the tab clears an open tag editor the same way the
-            // Config tab clears its drafts; `switch_tab` matches the
-            // destination, so the clear runs on entry, not on exit.
-            app.services.herdr_tag_draft = None;
+            // A suspended shunt field or herdr tag editor returns into it; a
+            // fresh entry resets the descent and the selection.
+            if keyboard_owner(app).is_none() {
+                leave_shunt_detail(app);
+                app.services.cursor = 0;
+                app.services.detail_scroll = 0;
+            }
             // Recompute on focus; the cached `claude --version` is not
             // re-probed, but the shunt plan and pool read re-run so a card
             // left stale by an action elsewhere reads fresh on re-entry.
@@ -10503,10 +10930,29 @@ fn open_token_picker(app: &mut App, require: bool) {
     }));
 }
 
-/// The `+ new profile` row: close the picker and open the new-account form
-/// through [`start_new_account`], seeded with the gateway's base url and the
-/// marker naming the record it mints for. A bind read failure opens no form.
+/// The `+ new profile` row: open a fresh new-account form seeded with the
+/// gateway's base url and the marker naming the record it mints for, never a
+/// suspended form the user typed. A suspended `+ new` form holding typed work
+/// is displaced by the mint form (one slot cannot hold both), so the loss
+/// warning asks first; `discard` drops it and opens the mint form, `go back`
+/// leaves it and the tab alone.
 fn open_new_profile_form(app: &mut App, require: bool) {
+    if suspended_new_form_holds_typed_work(app) {
+        disarm_switch(app);
+        app.open_modal(Modal::LossWarning(LossWarningState {
+            choice: false,
+            target: Tab::Setup,
+            drop: LossWarningDrop::NewAccountDraft { require },
+        }));
+        return;
+    }
+    open_new_profile_form_inner(app, require);
+}
+
+/// The mint form's own open, after the warning's guard has passed: close the
+/// picker (already done by the caller) and stamp a fresh draft. A bind read
+/// failure opens no form.
+fn open_new_profile_form_inner(app: &mut App, require: bool) {
     let Some(record) = app.services.shunt_record.clone() else {
         app.toast(
             ToastKind::Danger,
@@ -10534,15 +10980,22 @@ fn open_new_profile_form(app: &mut App, require: bool) {
             return;
         }
     };
-    start_new_account(app);
-    if let Some(d) = app.config_draft.as_mut() {
-        d.base_url = InputState::new(&url);
-        d.mint_for = Some(TokenMint {
-            record,
-            bind,
-            require,
-        });
-    }
+    // The mint form is always fresh: the warning guard above dropped any typed
+    // `+ new` form, so an untouched one that may still sit in `config_draft`
+    // here is interchangeable with the fresh mint form that replaces it.
+    disarm_switch(app);
+    do_switch(app, Tab::Setup);
+    app.profile_cursor = app.profile_count();
+    app.config_action_cursor = 0;
+    let mut draft = build_draft_new();
+    draft.base_url = InputState::new(&url);
+    draft.mint_for = Some(TokenMint {
+        record,
+        bind,
+        require,
+    });
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
 }
 
 /// A picker pick: open the overwrite confirm naming what it replaces. The
@@ -15716,6 +16169,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
             _ => {}
         },
         Modal::Confirm(_) => handle_confirm_key(app, key),
+        Modal::LossWarning(_) => handle_loss_warning_key(app, key),
         // The read-only `check output` modal scrolls, pages and closes like the
         // help modal, bar `?`: the body may hold one, so it is no close key here.
         Modal::CheckOutput(_) => match key.code {
@@ -16486,7 +16940,8 @@ fn profiles_naming_bind<'a>(
 /// offer leaves the focus to the descend rule (the first line in view, else
 /// none).
 fn jump_to_shunt_card(app: &mut App, focus: ShuntFocusLine) {
-    switch_tab(app, Tab::Services);
+    disarm_switch(app);
+    do_switch(app, Tab::Services);
     if let Some(idx) = app.services.checks.iter().position(|c| c.label == "shunt") {
         app.services.cursor = idx;
     }
@@ -16907,7 +17362,11 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
 fn enter_config_detail(app: &mut App) {
     app.config_action_cursor = 0;
     if app.profile_cursor >= app.profile_count() {
-        app.config_draft = Some(build_draft_new());
+        // Restore the suspended `+ new` form, else build a fresh one.
+        app.config_draft = app
+            .new_account_draft
+            .take()
+            .or_else(|| Some(build_draft_new()));
     } else if let Some(name) = app.profile_name_at(app.profile_cursor) {
         app.config_draft = Some(build_draft_existing(app, &name));
     } else {
@@ -16916,12 +17375,28 @@ fn enter_config_detail(app: &mut App) {
     app.config_focus = ConfigFocus::Actions;
 }
 
-/// Jump to the `+ new` create form (global `n`).
+/// Jump to the `+ new` create form (global `n`): disarm, suspend and switch
+/// like any other switch, then land on the `+ new` row restoring a
+/// suspended form instead of building over it.
 fn start_new_account(app: &mut App) {
-    switch_tab(app, Tab::Setup);
+    disarm_switch(app);
+    do_switch(app, Tab::Setup);
     app.profile_cursor = app.profile_count();
     app.config_action_cursor = 0;
-    app.config_draft = Some(build_draft_new());
+    // Restore a suspended `+ new` form: an open-field one still sits in
+    // `config_draft` (the suspend kept it), an at-rest one in its own home.
+    if app
+        .config_draft
+        .as_ref()
+        .is_some_and(|d| d.editing_name.is_none())
+    {
+        // Keep the suspended form, field open or not.
+    } else {
+        app.config_draft = app
+            .new_account_draft
+            .take()
+            .or_else(|| Some(build_draft_new()));
+    }
     app.config_focus = ConfigFocus::Actions;
 }
 
@@ -18548,6 +19023,28 @@ fn run_env_collision_choice(
     }
 }
 
+/// Rebind every name-keyed suspended field from the old name to the new one
+/// after an in-app rename, so a landing never sees the renamed account as gone
+/// and drops the suspended work. The Setup draft's own `editing_name` is
+/// rebound beside it in [`commit_rename`].
+fn rebind_name_keyed_state(app: &mut App, old: &ProfileName, new: &ProfileName) {
+    if let Some(editor) = app.note_editor.as_mut()
+        && editor.profile == *old
+    {
+        editor.profile = new.clone();
+    }
+    if let Some(edit) = app.fallback_edit.as_mut()
+        && edit.member == *old
+    {
+        edit.member = new.clone();
+    }
+    if let Some(stop) = app.fallback_day_stop.as_mut()
+        && stop.member == *old
+    {
+        stop.member = new.clone();
+    }
+}
+
 fn commit_rename(app: &mut App) {
     let Some(d) = app.config_draft.as_ref() else {
         return;
@@ -18581,6 +19078,7 @@ fn commit_rename(app: &mut App) {
             app.refresh_tokens();
             app.apply_forgets();
             app.last_reload_fp = reload_fingerprint();
+            rebind_name_keyed_state(app, &old_pn, &new_pn);
             if let Some(d) = app.config_draft.as_mut() {
                 d.editing_name = Some(new.clone());
                 d.name = InputState::new(&new);
@@ -18967,15 +19465,80 @@ fn prompt_save_preset(app: &mut App) {
     }));
 }
 
+/// What opening the preset picker did to the Setup pane, so a cancel of the
+/// pick sequence can reverse it losslessly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PresetPickerOpen {
+    /// No undo: the pane was already on a form, or the picker targets an
+    /// existing account.
+    #[default]
+    None,
+    /// A fresh `+ new` form was built and descended; a cancel drops it and
+    /// ascends.
+    Fresh,
+    /// A suspended `+ new` form was restored and descended; a cancel returns
+    /// it to `new_account_draft` and ascends.
+    Restored,
+}
+
+/// Reverse [`open_preset_picker`]'s open-side effect when the pick sequence
+/// ends with no preset applied: a restored form goes back to its home through
+/// the guarded writer, a fresh one is dropped, and the pane ascends to its
+/// selector. A no-op when the open changed nothing, and unless the pane holds
+/// the `+ new` draft it built or restored — a stale flag over an existing
+/// account's draft must not move it.
+fn undo_preset_picker_open(app: &mut App) {
+    let is_new_form = app
+        .config_draft
+        .as_ref()
+        .is_some_and(|d| d.editing_name.is_none());
+    match app.preset_picker_open {
+        PresetPickerOpen::None => {}
+        PresetPickerOpen::Fresh if is_new_form => {
+            app.config_draft = None;
+            app.config_focus = ConfigFocus::Profiles;
+        }
+        PresetPickerOpen::Restored if is_new_form => {
+            let Some(draft) = app.config_draft.take() else {
+                app.config_focus = ConfigFocus::Profiles;
+                app.preset_picker_open = PresetPickerOpen::None;
+                return;
+            };
+            match set_new_account_draft(app, draft) {
+                None => app.config_focus = ConfigFocus::Profiles,
+                Some(draft) => app.config_draft = Some(draft),
+            }
+        }
+        PresetPickerOpen::Fresh | PresetPickerOpen::Restored => {}
+    }
+    app.preset_picker_open = PresetPickerOpen::None;
+}
+
 /// `apply preset`: open the picker. The list always holds the built-ins, so
 /// it is never empty and needs no empty state. On `+ new` the preset's fields
 /// are stamped into the draft, not a saved profile.
 fn open_preset_picker(app: &mut App) {
+    app.preset_picker_open = PresetPickerOpen::None;
     let target = if let Some((name, _, _)) = focused_account(app) {
         PresetTarget::from(name.to_string())
     } else if app.profile_cursor >= app.profile_count() {
         if app.config_draft.is_none() {
-            app.config_draft = Some(build_draft_new());
+            // Restore the suspended `+ new` form (or build a fresh one) and
+            // descend onto it, so the preset stamps the user's own form and
+            // the form is the active pane, so a switch suspends it and `esc`/`←` ascend from it.
+            // `preset_picker_open` records which, so a cancel reverses it.
+            let restored = app.new_account_draft.is_some();
+            app.config_draft = app
+                .new_account_draft
+                .take()
+                .or_else(|| Some(build_draft_new()));
+            app.config_focus = ConfigFocus::Actions;
+            app.config_action_cursor = 0;
+            app.preset_picker_open = if restored {
+                PresetPickerOpen::Restored
+            } else {
+                PresetPickerOpen::Fresh
+            };
         }
         PresetTarget::NewAccount
     } else {
@@ -19068,6 +19631,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.modals.pop();
+            undo_preset_picker_open(app);
         }
         KeyCode::Up => {
             state.cursor = if state.cursor == 0 {
@@ -19126,6 +19690,9 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 return;
             }
             app.modals.pop();
+            // The picker is gone, so no preset will be applied: undo the
+            // open-side effect before the delete confirm.
+            undo_preset_picker_open(app);
             app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("delete preset '{}'?", preset.name),
                 detail: Some("accounts already stamped from it are untouched.".to_string()),
@@ -19173,6 +19740,9 @@ fn preset_target_block(
 /// settings" says nothing a user can act on.
 fn offer_preset_apply(app: &mut App, target: PresetTarget, preset: &crate::presets::Preset) {
     let Some((base_url, models)) = preset_target_block(app, &target) else {
+        // The pick sequence ends here with no stamp, so the open's undo is not
+        // owed and the flag must not outlive its sequence.
+        app.preset_picker_open = PresetPickerOpen::None;
         app.toast(ToastKind::Danger, format!("{target} is gone"));
         return;
     };
@@ -19242,6 +19812,9 @@ fn apply_preset_to(
         crate::presets::load_saved_preset(&preset.name)
     };
     let Some(preset) = loaded else {
+        // The pick sequence ends here with no stamp: clear the flag so it
+        // cannot act on a later, unrelated cancel.
+        app.preset_picker_open = PresetPickerOpen::None;
         app.toast(
             ToastKind::Danger,
             format!("preset '{}' is gone", preset.name),
@@ -19249,6 +19822,7 @@ fn apply_preset_to(
         return;
     };
     let Some((base_url, models)) = preset_target_block(app, target) else {
+        app.preset_picker_open = PresetPickerOpen::None;
         app.toast(ToastKind::Danger, format!("{target} is gone"));
         return;
     };
@@ -19263,6 +19837,8 @@ fn apply_preset_to(
             if let Some(pos) = selected.and_then(|row| config_row_index(app, row)) {
                 app.config_action_cursor = pos;
             }
+            // A preset landed, so the pick sequence's open-side effect is done.
+            app.preset_picker_open = PresetPickerOpen::None;
             return;
         }
         PresetTarget::Account(name) => ProfileName::from(name.as_str()),
@@ -19509,14 +20085,71 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
             ) as u16;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
+            let is_preset = matches!(&state.on_confirm, ConfirmAction::ApplyPresetOver(..));
             app.modals.pop();
+            if is_preset {
+                undo_preset_picker_open(app);
+            }
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let confirmed = state.choice;
             let action = state.on_confirm.clone();
+            let is_preset = matches!(&action, ConfirmAction::ApplyPresetOver(..));
             app.modals.pop();
             if confirmed {
                 run_confirm_action(app, action);
+            } else if is_preset {
+                undo_preset_picker_open(app);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The loss warning's grammar over its two buttons: `←`/`→`/`tab` step,
+/// `↵`/space choose, `esc`/`q` = `go back`. `discard` drops only the warned
+/// work and performs the action that opened it — a switch for the Setup and
+/// Fallback edits, the mint-form open for a suspended `+ new` form.
+fn handle_loss_warning_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::LossWarning(state)) = app.modals.last_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+            state.choice = !state.choice;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let discard = state.choice;
+            let target = state.target;
+            let drop = state.drop;
+            app.modals.pop();
+            if !discard {
+                return;
+            }
+            match drop {
+                LossWarningDrop::SetupDraft => {
+                    app.config_draft = None;
+                    app.config_focus = ConfigFocus::Profiles;
+                    do_switch(app, target);
+                }
+                LossWarningDrop::FallbackEdit => {
+                    app.fallback_edit = None;
+                    do_switch(app, target);
+                }
+                LossWarningDrop::NewAccountDraft { require } => {
+                    app.new_account_draft = None;
+                    if app
+                        .config_draft
+                        .as_ref()
+                        .is_some_and(|d| d.editing_name.is_none())
+                    {
+                        app.config_draft = None;
+                    }
+                    open_new_profile_form_inner(app, require);
+                }
             }
         }
         _ => {}
@@ -19574,6 +20207,7 @@ fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.modals.pop();
+            undo_preset_picker_open(app);
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let leftover = match form.focus {
@@ -19586,6 +20220,8 @@ fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
             app.modals.pop();
             if let Some(leftover) = leftover {
                 apply_preset_to(app, &target, &preset, leftover, &replaces, &leaves);
+            } else {
+                undo_preset_picker_open(app);
             }
         }
         _ => {}

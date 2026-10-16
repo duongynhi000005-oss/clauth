@@ -529,8 +529,6 @@ fn help_tabs_and_screen_sections_follow_descended_detail_focus() {
             "│",
             "│    ←                   return to selector",
             "│    →                   stays on detail",
-            "│    tab                 next tab",
-            "│    shift tab           previous tab",
             "│",
         ];
         assert_eq!(
@@ -917,11 +915,14 @@ fn a_help_modal_that_fits_renders_without_a_scrollbar() {
                 .to_string(),
         ],
     );
-    let tabs = rows
-        .iter()
-        .position(|r| r.contains("TABS"))
-        .expect("the tabs section");
-    assert!(tabs < head, "it follows the tabs section");
+    // At rest the switch keys live in GLOBAL, so there is no TABS section —
+    // THIS MODAL opens the keymap. (A descended pane's TABS arrow-trap block
+    // is pinned by `help_tabs_and_screen_sections_follow_descended_detail_focus`.)
+    assert!(
+        rows.iter().all(|r| !r.contains("TABS")),
+        "no tabs section at rest:\n{}",
+        rows.join("\n")
+    );
 
     let tail = rows
         .iter()
@@ -2925,4 +2926,215 @@ fn up_into_a_later_blocks_first_account_shows_its_rows() {
         joined.contains("default  deepseek-chat  → opus"),
         "block 1's head is on screen: {joined}"
     );
+}
+
+/// The loss warning renders its WARNING title, its sentence-case body (one
+/// line per sentence, whole words at 80 columns), and a right-aligned
+/// `go back` / `discard` pair for both the Setup- and the Fallback-held body
+/// Exact rows at 80×24, the size the body once split `acc`/`ount.`.
+#[test]
+fn the_loss_warning_renders_its_title_body_and_buttons() {
+    use crate::tui::app::{LossWarningDrop, LossWarningState, Modal};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for (drop, title, body) in [
+        (
+            LossWarningDrop::SetupDraft,
+            "╭─ WARNING ───────────────────────────────────╮",
+            [
+                "",
+                "  Discard the unsaved edit?",
+                "  There are unsaved edits on the Setup tab.",
+                "  Fallback also edits this account.",
+                "",
+                "                       go back     discard",
+                "",
+            ],
+        ),
+        (
+            LossWarningDrop::FallbackEdit,
+            "╭─ WARNING ──────────────────────────────────────╮",
+            [
+                "",
+                "  Discard the unsaved edit?",
+                "  There are unsaved edits on the Fallback tab.",
+                "  Setup also edits this account.",
+                "",
+                "                          go back     discard",
+                "",
+            ],
+        ),
+    ] {
+        let app = empty_app(Tab::Overview);
+        let modal = Modal::LossWarning(LossWarningState {
+            choice: false,
+            target: Tab::Overview,
+            drop,
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, f.area(), &app, &modal)).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let box_rows: Vec<&str> = rows
+            .iter()
+            .map(String::as_str)
+            .filter(|r| {
+                let t = r.trim();
+                t.starts_with('╭') || t.starts_with('│') || t.starts_with('╰')
+            })
+            .collect();
+        assert_eq!(box_rows[0].trim(), title, "the title row");
+        let inner: Vec<String> = box_rows[1..box_rows.len() - 1]
+            .iter()
+            .map(|r| r.split('│').nth(1).unwrap().trim_end().to_string())
+            .collect();
+        assert_eq!(
+            inner.iter().map(String::as_str).collect::<Vec<_>>(),
+            body,
+            "the body and button rows for {title}"
+        );
+    }
+}
+
+/// The loss warning's third body (the mint path displacing a suspended
+/// `+ new` form) renders the same shell with its own second sentence.
+/// Exact rows at 80×24; the width is the Setup body's, since both longest
+/// sentences are 42 cells.
+#[test]
+fn the_new_account_draft_warning_renders_its_body() {
+    use crate::tui::app::{LossWarningDrop, LossWarningState, Modal};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = empty_app(Tab::Overview);
+    let modal = Modal::LossWarning(LossWarningState {
+        choice: false,
+        target: Tab::Overview,
+        drop: LossWarningDrop::NewAccountDraft { require: false },
+    });
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| draw(f, f.area(), &app, &modal)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let box_rows: Vec<&str> = rows
+        .iter()
+        .map(String::as_str)
+        .filter(|r| {
+            let t = r.trim();
+            t.starts_with('╭') || t.starts_with('│') || t.starts_with('╰')
+        })
+        .collect();
+    assert_eq!(
+        box_rows[0].trim(),
+        "╭─ WARNING ───────────────────────────────────╮",
+        "the title row"
+    );
+    let inner: Vec<String> = box_rows[1..box_rows.len() - 1]
+        .iter()
+        .map(|r| r.split('│').nth(1).unwrap().trim_end().to_string())
+        .collect();
+    assert_eq!(
+        inner.iter().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "",
+            "  Discard the unsaved edit?",
+            "  There are unsaved edits on the Setup tab.",
+            "  Services also edits the new account form.",
+            "",
+            "                       go back     discard",
+            "",
+        ],
+        "the body and button rows"
+    );
+}
+
+/// The GLOBAL help section lists the screen keys after `q` (so after `?`/`a`
+/// too) in the contract's order (`← →`, `tab`, `⇧tab`, `⌥1-9`), with clauth's
+/// other rows left where they sat relative to `?`/`a`/`q`. Exact rows.
+#[test]
+fn the_help_global_section_names_the_switch_keys() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = empty_app(Tab::Overview);
+    let mut term = Terminal::new(TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let inner: Vec<String> = rows
+        .iter()
+        .filter(|r| {
+            let t = r.trim();
+            t.starts_with('│')
+        })
+        .map(|r| r.split('│').nth(1).unwrap().trim_end().to_string())
+        .collect();
+    let global = inner
+        .iter()
+        .position(|r| r.trim() == "GLOBAL")
+        .expect("the global section");
+    let glyphs = inner
+        .iter()
+        .position(|r| r.trim() == "GLYPHS")
+        .expect("the glyphs section");
+    let section: Vec<&str> = inner[global..glyphs].iter().map(String::as_str).collect();
+    assert_eq!(
+        section,
+        vec![
+            "  GLOBAL",
+            "",
+            "    n                   new account",
+            "    r                   refresh usage now",
+            "    t                   rotate all tokens",
+            "    d                   resolve credential divergence (when flagged)",
+            "    ?                   toggle this help",
+            "    a                   actions",
+            "    x                   dismiss toast / alert",
+            "    q                   back / quit",
+            "    ← →                 switch screen",
+            "    tab                 next screen",
+            "    ⇧tab                previous screen",
+            "    ⌥1-9                jump to tab",
+            "    esc                 back within a sub-view (no-op at the top level)",
+            "    page up / page down  scroll a page",
+            "    ⌃c                  quit from anywhere",
+            "",
+        ]
+    );
+}
+
+/// The descended editable pane's arrow-trap block names the inert keys —
+/// `→ · tab · ⇧tab` all stay on the detail.
+#[test]
+fn the_help_editable_descended_block_names_the_inert_keys() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = empty_app(Tab::Setup);
+    app.config_focus = ConfigFocus::Actions;
+    let mut term = Terminal::new(TestBackend::new(120, 120)).unwrap();
+    term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let tabs = rows
+        .iter()
+        .position(|r| r.contains("  TABS "))
+        .expect("the tabs section");
+    let block: Vec<String> = rows[tabs..tabs + 5]
+        .iter()
+        .map(|row| {
+            row.chars()
+                .skip_while(|ch| *ch != '│')
+                .collect::<String>()
+                .trim_end()
+                .trim_end_matches('│')
+                .trim_end()
+                .to_owned()
+        })
+        .collect();
+    let expected = TestBackend::with_lines(block.iter().map(String::as_str));
+    expected.assert_buffer_lines([
+        "│  TABS",
+        "│",
+        "│    ←                   return to selector",
+        "│    → · tab · ⇧tab      stays on detail",
+        "│",
+    ]);
 }

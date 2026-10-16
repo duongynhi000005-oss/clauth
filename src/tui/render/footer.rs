@@ -9,10 +9,11 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
-    HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, ServiceFix, ServicesFocus,
-    ShuntFieldEdit, ShuntFieldKey, ShuntFocus, ShuntSaveKey, StatusFocus, Tab, TokenView,
-    build_action_menu, config_rows, fallback_hint, field_locked, fix_verb, has_sub_focus,
-    herdr_config_writable, is_cycle_field, keyboard_owner, token_model_count,
+    HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, PaneState, ServiceFix,
+    ServicesFocus, ShuntFieldEdit, ShuntFieldKey, ShuntFocus, ShuntSaveKey, StatusFocus, Tab,
+    TokenView, build_action_menu, config_rows, fallback_hint, field_locked, fix_verb,
+    has_sub_focus, herdr_config_writable, is_cycle_field, keyboard_owner, pane_state,
+    token_model_count,
 };
 use super::super::theme;
 use super::format::spinner_frame;
@@ -109,17 +110,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         None => owner
             .is_none()
-            .then_some(
-                if (app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail)
-                    || (app.tab == Tab::Tokens
-                        && app.token_view == TokenView::Models
-                        && app.model_detail_focus == StatusFocus::Detail)
-                {
-                    ("←", "back")
-                } else {
-                    TAB_NAV
-                },
-            )
+            .then_some(if pane_state(app) == PaneState::Rest {
+                TAB_NAV
+            } else {
+                ("←", "back")
+            })
             .into_iter()
             .chain(tab_hints(app))
             .collect(),

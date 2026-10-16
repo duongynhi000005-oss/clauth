@@ -20930,13 +20930,14 @@ fn leaving_the_card_forgets_the_custom_stop() {
     }
     step_days(&mut app, &presets_then_never, "after leaving the card");
 
-    // A tab switch away and back leaves the card too.
+    // A tab switch away and back leaves the card too (`⌥digit`: `←`/`→`/`tab`
+    // are trapped in a descended editable pane).
     seed_disk_days(&app, vec![Wed, Fri]);
     step_days(&mut app, &[Vec::new()], "stepped off the custom list again");
-    super::handle_key(&mut app, key(KeyCode::Right));
-    assert_ne!(app.tab, Tab::Fallback, "→ left the tab");
-    super::handle_key(&mut app, key(KeyCode::Left));
-    assert_eq!(app.tab, Tab::Fallback, "← came back");
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_ne!(app.tab, Tab::Fallback, "⌥1 left the tab");
+    super::handle_key(&mut app, alt_digit('5'));
+    assert_eq!(app.tab, Tab::Fallback, "⌥5 came back");
     super::handle_key(&mut app, key(KeyCode::Enter));
     for _ in 0..preferred_days_row() {
         super::handle_key(&mut app, key(KeyCode::Down));
@@ -25169,7 +25170,6 @@ fn help_descriptions_style_the_keys_they_name() {
     assert_prose_part(&buf, "edit inline; ↵ again saves", "↵", true);
     assert_prose_part(&buf, "+ add env · ↵ edits a value", "↵", true);
     assert_prose_part(&buf, "↵ once to arm, again to confirm", "↵", true);
-    assert_prose_part(&buf, "(shift tab: previous)", "shift tab", true);
 
     app.modals.pop();
     app.tab = Tab::Config;
@@ -27449,7 +27449,7 @@ fn a_saving_row_sheds_its_edit_hints_in_the_footer() {
     let footer = footer_row(&rig.app, 120, 40);
     assert_eq!(
         footer.trim(),
-        "←→ tabs   ↑↓ row   r refresh   f next fix   a actions   ? help   q back",
+        "← back   ↑↓ row   r refresh   f next fix   a actions   ? help   q back",
         "a saving typed row sheds `↵ edit value`"
     );
 
@@ -27462,7 +27462,7 @@ fn a_saving_row_sheds_its_edit_hints_in_the_footer() {
     let footer = footer_row(&rig.app, 120, 40);
     assert_eq!(
         footer.trim(),
-        "←→ tabs   ↑↓ row   r refresh   ↵ edit value   f next fix   a actions   ? help   q back",
+        "← back   ↑↓ row   r refresh   ↵ edit value   f next fix   a actions   ? help   q back",
         "a row beside a saving one keeps its `↵ edit value` hint"
     );
 
@@ -27482,7 +27482,7 @@ fn a_saving_row_sheds_its_edit_hints_in_the_footer() {
     let footer = footer_row(&rig.app, 120, 40);
     assert_eq!(
         footer.trim(),
-        "←→ tabs   ↑↓ row   r refresh   f next fix   a actions   ? help   q back",
+        "← back   ↑↓ row   r refresh   f next fix   a actions   ? help   q back",
         "a saving cycle row sheds `space cycle` and `↵ custom`"
     );
 }
@@ -32165,7 +32165,7 @@ fn the_armed_key_row_footer_omits_the_edit_hint() {
     let footer = footer_row(&app, 120, 40);
     assert_eq!(
         footer.trim(),
-        "←→ tabs   ↑↓ row   a actions   ? help   q back",
+        "← back   ↑↓ row   a actions   ? help   q back",
         "the armed key row's footer drops the edit hint"
     );
 }
@@ -34995,5 +34995,2500 @@ fn the_startup_confirm_does_not_hold_the_switch_gates() {
     assert!(
         held.switch_gates.try_recv().is_ok(),
         "a non-Rebind modal holds the gate",
+    );
+}
+
+// ── screen switching and unsaved work ──
+
+fn with_mods(
+    code: KeyCode,
+    mods: ratatui::crossterm::event::KeyModifiers,
+) -> ratatui::crossterm::event::KeyEvent {
+    ratatui::crossterm::event::KeyEvent::new(code, mods)
+}
+
+fn alt_digit(d: char) -> ratatui::crossterm::event::KeyEvent {
+    with_mods(
+        KeyCode::Char(d),
+        ratatui::crossterm::event::KeyModifiers::ALT,
+    )
+}
+
+/// `tab` / `shift+tab` switch with no modifier besides shift; a reported
+/// ctrl or alt makes them inert.
+#[test]
+fn tab_and_backtab_switch_only_without_ctrl_or_alt() {
+    use ratatui::crossterm::event::KeyModifiers as M;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    assert_eq!(app.tab, Tab::Overview);
+    for mods in [M::CONTROL, M::ALT, M::CONTROL | M::SHIFT, M::ALT | M::SHIFT] {
+        super::handle_key(&mut app, with_mods(KeyCode::Tab, mods));
+        assert_eq!(app.tab, Tab::Overview, "{mods:?} + tab switched");
+        super::handle_key(&mut app, with_mods(KeyCode::BackTab, mods | M::SHIFT));
+        assert_eq!(app.tab, Tab::Overview, "{mods:?} + backtab switched");
+    }
+    super::handle_key(&mut app, key(KeyCode::Tab));
+    assert_eq!(app.tab, Tab::Usage, "a bare tab switches forward");
+    super::handle_key(&mut app, with_mods(KeyCode::BackTab, M::SHIFT));
+    assert_eq!(app.tab, Tab::Overview, "shift+tab switches back");
+    super::handle_key(&mut app, key(KeyCode::BackTab));
+    assert_eq!(
+        app.tab,
+        Tab::Services,
+        "a backtab reported without its shift still switches back, wrapping"
+    );
+    super::handle_key(&mut app, with_mods(KeyCode::Tab, M::SHIFT));
+    assert_eq!(
+        app.tab,
+        Tab::Status,
+        "a tab reported with shift (the kitty form of shift+tab) switches back"
+    );
+}
+
+/// From a descended read-only detail pane `tab` / `shift+tab` ascend it and
+/// switch; the Status detail traps `←` (ascends) and `→` (inert) like the
+/// other read-only details.
+#[test]
+fn tab_ascends_out_of_read_only_details_and_status_traps_the_arrows() {
+    use super::{StatusFocus, TokenView};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+
+    app.tab = Tab::Usage;
+    app.usage_detail_focus = StatusFocus::Detail;
+    super::handle_key(&mut app, key(KeyCode::Tab));
+    assert_eq!(app.tab, Tab::Tokens, "tab switches out of the Usage detail");
+    assert_eq!(
+        app.usage_detail_focus,
+        StatusFocus::List,
+        "the Usage detail ascended on the way out"
+    );
+
+    app.token_view = TokenView::Models;
+    app.model_detail_focus = StatusFocus::Detail;
+    super::handle_key(
+        &mut app,
+        with_mods(
+            KeyCode::BackTab,
+            ratatui::crossterm::event::KeyModifiers::SHIFT,
+        ),
+    );
+    assert_eq!(
+        app.tab,
+        Tab::Usage,
+        "shift+tab switches out of the Models detail"
+    );
+    assert_eq!(
+        app.model_detail_focus,
+        StatusFocus::List,
+        "the Models detail ascended on the way out"
+    );
+
+    app.tab = Tab::Status;
+    app.status.focus = StatusFocus::Detail;
+    super::handle_key(&mut app, key(KeyCode::Right));
+    assert_eq!(app.tab, Tab::Status, "→ is inert in the Status detail");
+    assert_eq!(app.status.focus, StatusFocus::Detail);
+    super::handle_key(&mut app, key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Status, "← ascends rather than switching");
+    assert_eq!(app.status.focus, StatusFocus::List);
+
+    app.status.focus = StatusFocus::Detail;
+    super::handle_key(&mut app, key(KeyCode::Tab));
+    assert_eq!(
+        app.tab,
+        Tab::Services,
+        "tab switches out of the Status detail"
+    );
+    assert_eq!(
+        app.status.focus,
+        StatusFocus::List,
+        "the Status detail ascended on the way out"
+    );
+}
+
+/// A descended editable pane at rest (no field open) traps every switch key:
+/// `tab`, `shift+tab` and `→` are inert, `←` ascends.
+#[test]
+fn descended_editable_panes_trap_the_switch_keys() {
+    use super::{ConfigFocus, FallbackFocus};
+    use ratatui::crossterm::event::KeyModifiers as M;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "precondition: descended"
+    );
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.active.is_none()),
+        "precondition: no field open"
+    );
+    for ev in [
+        key(KeyCode::Tab),
+        with_mods(KeyCode::BackTab, M::SHIFT),
+        key(KeyCode::Right),
+    ] {
+        super::handle_key(&mut app, ev);
+        assert_eq!(
+            app.tab,
+            Tab::Setup,
+            "{ev:?} switched out of the Setup detail"
+        );
+        assert_eq!(
+            app.config_focus,
+            ConfigFocus::Actions,
+            "{ev:?} left the detail"
+        );
+    }
+    super::handle_key(&mut app, key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Setup, "← ascends rather than switching");
+    assert_eq!(app.config_focus, ConfigFocus::Profiles);
+
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 0;
+    app.fallback_focus = FallbackFocus::Detail;
+    for ev in [
+        key(KeyCode::Tab),
+        with_mods(KeyCode::BackTab, M::SHIFT),
+        key(KeyCode::Right),
+    ] {
+        super::handle_key(&mut app, ev);
+        assert_eq!(
+            app.tab,
+            Tab::Fallback,
+            "{ev:?} switched out of the member card"
+        );
+        assert_eq!(
+            app.fallback_focus,
+            FallbackFocus::Detail,
+            "{ev:?} left the card"
+        );
+    }
+    super::handle_key(&mut app, key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Fallback, "← ascends rather than switching");
+    assert_eq!(app.fallback_focus, FallbackFocus::Chain);
+}
+
+/// `⌥1`–`⌥8` land on tabs 1–8 and `⌥9` on the last, from every tab; bare
+/// digits and `⌥0` do nothing, a jump disarms the 2-step quit, and an open
+/// modal owns the keys.
+#[test]
+fn alt_digits_jump_to_tabs() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let last = *Tab::ALL.last().unwrap();
+    for start in Tab::ALL {
+        for d in '1'..='9' {
+            app.tab = start;
+            super::handle_key(&mut app, alt_digit(d));
+            let n = d.to_digit(10).unwrap() as usize;
+            let want = if n == 9 { last } else { Tab::ALL[n - 1] };
+            assert_eq!(app.tab, want, "⌥{d} from {start:?}");
+        }
+    }
+
+    app.tab = Tab::Overview;
+    super::handle_key(&mut app, key(KeyCode::Char('3')));
+    assert_eq!(app.tab, Tab::Overview, "a bare digit is no tab key");
+    super::handle_key(&mut app, alt_digit('0'));
+    assert_eq!(app.tab, Tab::Overview, "⌥0 is unbound");
+
+    super::handle_key(&mut app, key(KeyCode::Char('q')));
+    assert!(app.armed_quit, "precondition: the quit is armed");
+    super::handle_key(&mut app, alt_digit('2'));
+    assert_eq!(app.tab, Tab::Usage);
+    assert!(!app.armed_quit, "the jump disarmed the quit");
+
+    app.open_modal(super::Modal::Help);
+    super::handle_key(&mut app, alt_digit('3'));
+    assert_eq!(app.tab, Tab::Usage, "a modal owns ⌥digit");
+    assert!(
+        matches!(app.modals.as_slice(), [super::Modal::Help]),
+        "the modal stayed open"
+    );
+}
+
+/// `⌥digit` leaves an open Config field: the switch keeps its typed text and
+/// caret uncommitted, and the return lands back in the edit.
+#[test]
+fn a_jump_suspends_an_open_config_field_and_returns_into_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_refresh_row(&mut app);
+    let saved = app.refresh_interval.load(Ordering::Relaxed);
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Backspace));
+    super::handle_key(&mut app, key(KeyCode::Char('5')));
+    super::handle_key(&mut app, key(KeyCode::Left));
+    let (value, cursor) = app
+        .refresh_interval_draft
+        .as_ref()
+        .map(|d| (d.value.clone(), d.cursor))
+        .expect("precondition: the editor is open");
+    assert_eq!(value, "95", "precondition: the typed buffer");
+
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview, "⌥1 leaves the open field");
+    assert!(
+        app.modals.is_empty(),
+        "no other screen writes the refresh interval"
+    );
+    super::handle_key(&mut app, alt_digit('6'));
+    assert_eq!(app.tab, Tab::Config);
+    assert_eq!(
+        app.refresh_interval_draft
+            .as_ref()
+            .map(|d| (d.value.clone(), d.cursor)),
+        Some((value, cursor)),
+        "the return lands in the edit with its text and caret"
+    );
+    assert_eq!(
+        super::keyboard_owner(&app),
+        Some(super::KeyOwner::RefreshInterval),
+        "the field owns the keyboard again"
+    );
+    assert_eq!(
+        app.refresh_interval.load(Ordering::Relaxed),
+        saved,
+        "the switch committed nothing"
+    );
+}
+
+/// The `+ new` form's typed values survive a jump away: the pane ascends on
+/// the way out, and descending into `+ new` again restores them.
+#[test]
+fn a_jump_keeps_the_new_account_form() {
+    use super::ConfigFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert_eq!(app.tab, Tab::Setup, "precondition: n opens the form");
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.active.is_some()),
+        "precondition: the name field is open"
+    );
+    for c in "zed".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.active.is_none() && d.name.value == "zed"),
+        "precondition: the field closed holding the typed name"
+    );
+
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview);
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.tab, Tab::Setup);
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Profiles,
+        "the pane ascended on the way out"
+    );
+    assert_eq!(
+        app.profile_cursor,
+        app.profile_count(),
+        "the selector still rests on `+ new`"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(app.config_focus, ConfigFocus::Actions);
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.is_none() && d.name.value == "zed"),
+        "descending into `+ new` restored the typed name"
+    );
+}
+
+/// An armed remove disarms on a jump away; the member stays in the chain.
+#[test]
+fn a_jump_disarms_an_armed_remove() {
+    use super::{CardEdit, FallbackFocus, FallbackRow};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 0;
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Remove)
+        .expect("Remove row exists");
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            app.fallback_edit.as_ref().map(|e| &e.state),
+            Some(CardEdit::ArmedRemove)
+        ),
+        "precondition: the remove is armed"
+    );
+
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview);
+    assert!(
+        !matches!(
+            app.fallback_edit.as_ref().map(|e| &e.state),
+            Some(CardEdit::ArmedRemove)
+        ),
+        "the jump disarmed the remove"
+    );
+    assert_eq!(
+        app.config().state.fallback_chain,
+        vec![crate::profile::ProfileName::from("a")],
+        "the member stays in the chain"
+    );
+}
+
+/// An open member-card field holds account data Setup also writes: a jump
+/// opens the loss warning. `go back` (the default) keeps the field and the
+/// tab; `discard` drops the field and performs the jump.
+#[test]
+fn a_jump_out_of_a_member_field_asks_before_dropping_it() {
+    use super::{CardEdit, FallbackFocus, FallbackRow};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.fallback_threshold = Some(80.0);
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 0;
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Threshold)
+        .expect("Threshold row exists");
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    for _ in 0..8 {
+        super::handle_key(&mut app, key(KeyCode::Backspace));
+    }
+    for c in "70".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    let typed = |app: &App| match app.fallback_edit.as_ref().map(|e| &e.state) {
+        Some(CardEdit::Threshold(input)) => Some(input.value.clone()),
+        _ => None,
+    };
+    assert_eq!(typed(&app).as_deref(), Some("70"), "precondition: typed 70");
+
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Fallback, "the warning holds the switch");
+    assert!(!app.modals.is_empty(), "the jump opened a modal");
+    assert!(renders(&app, "WARNING"), "the modal is titled WARNING");
+    assert!(renders(&app, "go back"), "the modal offers go back");
+    assert!(renders(&app, "discard"), "the modal offers discard");
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.modals.is_empty(), "↵ on the default closes the warning");
+    assert_eq!(app.tab, Tab::Fallback, "go back stays on the tab");
+    assert_eq!(
+        typed(&app).as_deref(),
+        Some("70"),
+        "go back keeps the field"
+    );
+
+    super::handle_key(&mut app, alt_digit('1'));
+    assert!(!app.modals.is_empty(), "the second jump warns again");
+    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.modals.is_empty(), "discard closes the warning");
+    assert_eq!(app.tab, Tab::Overview, "discard performs the jump");
+    assert_eq!(typed(&app), None, "discard dropped the field");
+    assert_eq!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("a"))
+            .and_then(|p| p.fallback_threshold),
+        Some(80.0),
+        "nothing was saved"
+    );
+}
+
+// ── additional acceptance pins ─────────────────────────
+
+/// For Setup, an armed action's draft drops whole on the switch. An
+/// armed Setup draft always rests with no field open (arming happens on a row,
+/// never inside a field), so `suspend_source` drops it through
+/// `leave_config_detail` — there is no separate `armed_action = None` step, and
+/// the `⌥digit` jump leaves the descended pane and the account untouched.
+#[test]
+fn a_jump_drops_the_armed_setup_draft() {
+    use super::{ConfigFocus, ConfigRow};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "precondition: descended"
+    );
+    app.config_draft.as_mut().expect("draft").armed_action = Some(ConfigRow::Delete);
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview, "the jump did not leave Setup");
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Profiles,
+        "the pane did not ascend"
+    );
+    assert!(app.config_draft.is_none(), "the jump kept the armed draft");
+    assert!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("a"))
+            .is_some(),
+        "the jump deleted the account"
+    );
+}
+
+/// A Setup existing-account field whose buffer differs from the saved value
+/// opens the loss warning naming Setup and Fallback; `esc` = `go back`, and
+/// `discard` drops the draft and performs the jump. A clean field suspends.
+#[test]
+fn a_dirty_setup_field_warns_and_a_clean_one_suspends() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter)); // open the name field
+    super::handle_key(&mut app, key(KeyCode::Char('x'))); // dirty the buffer
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Setup, "the warning did not hold the switch");
+    assert!(!app.modals.is_empty(), "the jump opened no warning modal");
+    assert!(renders(&app, "WARNING"), "the modal is not titled WARNING");
+    assert!(renders(&app, "go back"), "the modal offers no go back");
+    assert!(renders(&app, "discard"), "the modal offers no discard");
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert!(app.modals.is_empty(), "esc left the warning open");
+    assert_eq!(app.tab, Tab::Setup, "go back switched the tab");
+    super::handle_key(&mut app, alt_digit('1'));
+    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.modals.is_empty(), "discard left the warning open");
+    assert_eq!(app.tab, Tab::Overview, "discard did not perform the jump");
+    assert!(app.config_draft.is_none(), "discard kept the draft");
+
+    // A clean (unchanged) field suspends with no warning and returns into it.
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter)); // open, no typing
+    super::handle_key(&mut app, alt_digit('1'));
+    assert!(app.modals.is_empty(), "a clean field opened a warning");
+    assert_eq!(
+        app.tab,
+        Tab::Overview,
+        "the clean field did not suspend and switch"
+    );
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.tab, Tab::Setup);
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.active.is_some()),
+        "the return did not land back in the edit"
+    );
+}
+
+/// Each Config/`herdr` editor suspends byte-identical (value + caret) across a
+/// jump, committing nothing.
+#[test]
+fn a_jump_suspends_each_config_and_herdr_editor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    let mut nudge = InputState::new("300k");
+    nudge.cursor = 3;
+    app.context_nudge_draft = Some(nudge);
+    let mut weekly = InputState::new("95");
+    weekly.cursor = 1;
+    app.weekly_threshold_draft = Some(weekly);
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview);
+    super::handle_key(&mut app, alt_digit('6'));
+    assert_eq!(app.tab, Tab::Config);
+    assert_eq!(
+        app.context_nudge_draft
+            .as_ref()
+            .map(|d| (d.value.clone(), d.cursor)),
+        Some(("300k".into(), 3))
+    );
+    assert_eq!(
+        app.weekly_threshold_draft
+            .as_ref()
+            .map(|d| (d.value.clone(), d.cursor)),
+        Some(("95".into(), 1))
+    );
+
+    // The herdr tag editor on the Services tab, opened from the detail.
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.focus = super::ServicesFocus::Detail;
+    let mut tag = InputState::new("5");
+    tag.cursor = 1;
+    app.services.herdr_tag_draft = Some(tag);
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview);
+    super::handle_key(&mut app, alt_digit('8'));
+    assert_eq!(app.tab, Tab::Services);
+    assert_eq!(
+        app.services.focus,
+        super::ServicesFocus::Detail,
+        "the jump ascended the herdr detail under an open tag editor"
+    );
+    assert_eq!(
+        app.services
+            .herdr_tag_draft
+            .as_ref()
+            .map(|d| (d.value.clone(), d.cursor)),
+        Some(("5".into(), 1))
+    );
+}
+
+/// The note editor and the day picker are open edits: a jump suspends both and
+/// the return lands back in the open editor.
+#[test]
+fn a_jump_suspends_the_note_editor_and_day_picker() {
+    use super::{CardEdit, FallbackFocus};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Usage;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert!(
+        app.note_editor.is_some(),
+        "precondition: the note editor is open"
+    );
+    super::handle_key(&mut app, key(KeyCode::Char('h')));
+    super::handle_key(&mut app, key(KeyCode::Char('i')));
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview);
+    super::handle_key(&mut app, alt_digit('2'));
+    assert_eq!(app.tab, Tab::Usage);
+    assert_eq!(
+        app.note_editor.as_ref().map(|e| e.buf.text()),
+        Some("hi".to_string()),
+        "the jump dropped the note draft"
+    );
+
+    // The day picker: an open edit reached by `↵` on `preferred days`.
+    let mut app = preferred_days_app(Vec::new());
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            app.fallback_edit.as_ref().map(|e| &e.state),
+            Some(CardEdit::Days(_))
+        ),
+        "precondition: the picker is open"
+    );
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview);
+    assert!(
+        matches!(
+            app.fallback_edit.as_ref().map(|e| &e.state),
+            Some(CardEdit::Days(_))
+        ),
+        "the jump dropped the day picker"
+    );
+    super::handle_key(&mut app, alt_digit('5'));
+    assert_eq!(app.tab, Tab::Fallback);
+    assert_eq!(
+        app.fallback_focus,
+        FallbackFocus::Detail,
+        "the return did not land back in the card"
+    );
+    assert!(
+        matches!(
+            app.fallback_edit.as_ref().map(|e| &e.state),
+            Some(CardEdit::Days(_))
+        ),
+        "the return closed the day picker"
+    );
+}
+
+/// A suspended member-card edit whose member leaves the chain closes on the
+/// reload leg (`repin_member_edit`), so returning never resurrects it.
+#[test]
+fn a_suspended_member_edit_closes_when_the_member_leaves_the_chain() {
+    use super::{CardEdit, FallbackFocus, FallbackRow};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.fallback_threshold = Some(80.0); // a seeded field: opening it is clean
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 0;
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Threshold)
+        .expect("Threshold row exists");
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            app.fallback_edit.as_ref().map(|e| &e.state),
+            Some(CardEdit::Threshold(_))
+        ),
+        "precondition: the field is open"
+    );
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview);
+    assert!(
+        matches!(
+            app.fallback_edit.as_ref().map(|e| &e.state),
+            Some(CardEdit::Threshold(_))
+        ),
+        "the jump dropped the member edit"
+    );
+
+    // The member leaves the chain out-of-band; the reload's re-home closes it.
+    {
+        let mut cfg = app.config();
+        cfg.state.fallback_chain = Vec::new();
+        crate::profile::save_app_state(&cfg.state).expect("empty the chain");
+    }
+    super::repin_member_edit(&mut app);
+    assert!(
+        app.fallback_edit.is_none(),
+        "the reload left the edit open after the member left"
+    );
+    assert_eq!(app.fallback_focus, FallbackFocus::Chain);
+
+    super::handle_key(&mut app, alt_digit('5'));
+    assert_eq!(app.tab, Tab::Fallback);
+    assert!(
+        app.fallback_edit.is_none(),
+        "returning did not resurrect it"
+    );
+    assert_eq!(app.fallback_focus, FallbackFocus::Chain);
+}
+
+/// The Services details trap the switch keys by kind: the read-only delegates
+/// detail ascends on `←` and `tab`/`⇧tab`; the editable shunt card traps all
+/// four.
+#[test]
+fn services_details_trap_the_switch_keys_by_kind() {
+    use super::{PaneState, ServicesFocus, pane_state};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    // delegates (read-only): ← ascends, → inert, tab/⇧tab ascend+switch.
+    app.services.cursor = 1; // delegates is the second check
+    app.services.focus = ServicesFocus::Detail;
+    assert_eq!(
+        pane_state(&app),
+        PaneState::ReadOnly,
+        "delegates did not classify read-only"
+    );
+    super::handle_key(&mut app, key(KeyCode::Left));
+    assert_eq!(
+        app.services.focus,
+        ServicesFocus::List,
+        "← did not ascend the delegates detail"
+    );
+    assert_eq!(app.tab, Tab::Services);
+    app.services.focus = ServicesFocus::Detail;
+    super::handle_key(&mut app, key(KeyCode::Right));
+    assert_eq!(
+        app.tab,
+        Tab::Services,
+        "→ switched out of the delegates detail"
+    );
+    super::handle_key(&mut app, key(KeyCode::Tab));
+    assert_eq!(app.tab, Tab::Overview, "tab did not ascend and switch");
+    assert_eq!(app.services.focus, ServicesFocus::List);
+
+    // shunt (editable at rest): ← ascends, →/tab/⇧tab inert.
+    app.tab = Tab::Services;
+    app.services.cursor = 0; // shunt is the first check
+    app.services.focus = ServicesFocus::Detail;
+    assert_eq!(
+        pane_state(&app),
+        PaneState::Editable,
+        "shunt did not classify editable"
+    );
+    super::handle_key(&mut app, key(KeyCode::Left));
+    assert_eq!(
+        app.services.focus,
+        ServicesFocus::List,
+        "← did not ascend the shunt card"
+    );
+    assert_eq!(app.tab, Tab::Services);
+    app.services.focus = ServicesFocus::Detail;
+    let shift = ratatui::crossterm::event::KeyModifiers::SHIFT;
+    for ev in [
+        key(KeyCode::Right),
+        key(KeyCode::Tab),
+        with_mods(KeyCode::BackTab, shift),
+    ] {
+        super::handle_key(&mut app, ev);
+        assert_eq!(
+            app.tab,
+            Tab::Services,
+            "{ev:?} switched out of the shunt card"
+        );
+        assert_eq!(app.services.focus, ServicesFocus::Detail);
+    }
+}
+
+/// The suspended `+ new` form survives descending into another account in
+/// between: one `config_draft` slot cannot hold both, so the form gets its own
+/// home.
+#[test]
+fn a_suspended_new_form_survives_descending_into_another_account() {
+    use super::ConfigFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for c in "zed".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview);
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.tab, Tab::Setup);
+
+    // Descend into the existing account, then back into `+ new`.
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(app.config_focus, ConfigFocus::Actions);
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.as_deref() == Some("a")),
+        "descending did not land on the existing account"
+    );
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    app.profile_cursor = app.profile_count();
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.is_none() && d.name.value == "zed"),
+        "descending into `+ new` did not restore the typed name"
+    );
+}
+
+// ── switch paths that must keep unsaved work ─────────────────────────────────────────
+
+/// `n` after a jump away from the open `+ new` name field restores the
+/// suspended form instead of building over it.
+#[test]
+fn n_restores_the_suspended_new_form_with_an_open_field() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert_eq!(app.tab, Tab::Setup, "precondition: n opened the form");
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for c in "zed".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview, "precondition: the jump left");
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert_eq!(app.tab, Tab::Setup, "precondition: n came back");
+    assert_eq!(
+        app.config_draft
+            .as_ref()
+            .map(|d| d.name.value.clone())
+            .as_deref(),
+        Some("zed"),
+        "n rebuilt the + new form over the suspended typed name"
+    );
+}
+
+/// A suspended Setup edit returns under its own subject, not the shared
+/// `profile_cursor` another tab moved.
+#[test]
+fn setup_return_keeps_the_edited_account_selected() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter)); // open a's name field, clean
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.active.is_some()),
+        "precondition: field open"
+    );
+    super::handle_key(&mut app, alt_digit('2'));
+    assert_eq!(app.tab, Tab::Usage, "precondition: clean field suspended");
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.profile_cursor, 1,
+        "precondition: Usage moved the selection to b"
+    );
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.tab, Tab::Setup);
+    let editing = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone());
+    let shown = app
+        .config()
+        .profiles
+        .get(app.profile_cursor)
+        .map(|p| p.name.to_string());
+    assert_eq!(
+        editing.as_deref(),
+        Some("a"),
+        "precondition: the edit is a's"
+    );
+    assert_eq!(
+        shown.as_deref(),
+        Some("a"),
+        "Setup returned into a's open field under b's selection"
+    );
+}
+
+/// A suspended Fallback member edit returns on its own member's card, not the
+/// member the shared `profile_cursor` moved to.
+#[test]
+fn fallback_return_keeps_the_edited_member_selected() {
+    use super::{FallbackFocus, FallbackRow};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut pa = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    pa.fallback_threshold = Some(80.0);
+    let mut pb = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    pb.fallback_threshold = Some(60.0);
+    let mut app = app_with_unlinked_profiles(vec![pa, pb]);
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 0;
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Threshold)
+        .unwrap();
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(app.fallback_edit.is_some(), "precondition: field open");
+    super::handle_key(&mut app, alt_digit('2'));
+    assert_eq!(app.tab, Tab::Usage, "precondition: clean field suspended");
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.profile_cursor, 1,
+        "precondition: Usage moved the selection to b"
+    );
+    super::handle_key(&mut app, alt_digit('5'));
+    assert_eq!(app.tab, Tab::Fallback);
+    let member = app.fallback_edit.as_ref().map(|e| e.member.to_string());
+    let shown = super::selected_member_name(&app).map(|n| n.to_string());
+    assert_eq!(
+        member.as_deref(),
+        Some("a"),
+        "precondition: the edit is a's"
+    );
+    assert_eq!(
+        shown.as_deref(),
+        Some("a"),
+        "Fallback returned into a's open field on b's card"
+    );
+}
+
+/// An untouched `rotate at` on a member with no stored threshold is clean: the
+/// discriminator compares against the seeded default, not the empty stored
+/// value.
+#[test]
+fn an_untouched_default_threshold_field_does_not_warn() {
+    use super::{FallbackFocus, FallbackRow};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 0;
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Threshold)
+        .unwrap();
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(app.fallback_edit.is_some(), "precondition: field open");
+    super::handle_key(&mut app, alt_digit('1'));
+    assert!(
+        app.modals.is_empty(),
+        "an untouched rotate-at field (seeded from the default) opened the loss warning"
+    );
+    assert_eq!(
+        app.tab,
+        Tab::Overview,
+        "the clean field did not suspend and switch"
+    );
+}
+
+/// The `+ new` re-home leaves an open existing-account edit alone: the selector
+/// stays on the edit's account.
+#[test]
+fn the_new_form_rehome_leaves_an_open_existing_edit_alone() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for c in "zed".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, alt_digit('1'));
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(
+        app.profile_cursor,
+        app.profile_count(),
+        "precondition: on + new"
+    );
+    super::handle_key(&mut app, key(KeyCode::Up));
+    assert_eq!(app.profile_cursor, 0, "precondition: on a");
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter)); // open a's name field, clean
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.active.is_some() && d.editing_name.as_deref() == Some("a")),
+        "precondition: a's field open"
+    );
+    super::handle_key(&mut app, alt_digit('1'));
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(
+        app.profile_cursor, 0,
+        "the + new re-home moved the selector off a's open edit"
+    );
+}
+
+/// A suspended Setup edit whose account was deleted closes on return rather
+/// than resurrecting the edit under another account's pane.
+#[test]
+fn a_suspended_setup_edit_closes_when_its_account_is_deleted() {
+    use super::ConfigFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview, "precondition: suspended");
+    {
+        let mut cfg = app.config();
+        cfg.profiles.retain(|p| p.name != "a");
+        cfg.state.profiles.retain(|n| n != "a");
+    }
+    super::repin_member_edit(&mut app);
+    super::handle_key(&mut app, alt_digit('4'));
+    let editing = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone());
+    assert!(
+        !(app.config_focus == ConfigFocus::Actions && editing.as_deref() == Some("a")),
+        "returning resurrected the deleted account's open edit"
+    );
+}
+
+/// `n` from the Fallback card disarms the armed remove at the switch.
+#[test]
+fn n_from_the_fallback_card_disarms_the_remove() {
+    use super::{CardEdit, FallbackFocus, FallbackRow};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 0;
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Remove)
+        .unwrap();
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            app.fallback_edit.as_ref().map(|e| &e.state),
+            Some(CardEdit::ArmedRemove)
+        ),
+        "precondition: armed"
+    );
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert_eq!(app.tab, Tab::Setup, "precondition: n switched to Setup");
+    assert!(
+        !matches!(
+            app.fallback_edit.as_ref().map(|e| &e.state),
+            Some(CardEdit::ArmedRemove)
+        ),
+        "the n switch left the remove armed"
+    );
+}
+
+/// A note editor opened from the Usage detail keeps the descent and its caret
+/// across a jump.
+#[test]
+fn the_note_editor_keeps_the_usage_descent_and_caret() {
+    use super::StatusFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Usage;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.usage_detail_focus,
+        StatusFocus::Detail,
+        "precondition: descended"
+    );
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert!(app.note_editor.is_some(), "precondition: note editor open");
+    super::handle_key(&mut app, key(KeyCode::Char('h')));
+    super::handle_key(&mut app, key(KeyCode::Char('i')));
+    super::handle_key(&mut app, key(KeyCode::Left));
+    let caret = app.note_editor.as_ref().map(|e| e.buf.caret());
+    super::handle_key(&mut app, alt_digit('1'));
+    super::handle_key(&mut app, alt_digit('2'));
+    assert!(app.note_editor.is_some(), "precondition: editor kept");
+    assert_eq!(
+        app.usage_detail_focus,
+        StatusFocus::Detail,
+        "the jump ascended the Usage detail under an open note editor"
+    );
+    assert_eq!(
+        app.note_editor.as_ref().map(|e| e.buf.text()),
+        Some("hi".to_string()),
+        "the jump dropped the note draft"
+    );
+    assert_eq!(
+        app.note_editor.as_ref().map(|e| e.buf.caret()),
+        caret,
+        "the jump dropped or moved the note caret"
+    );
+}
+
+/// A `+ add` shunt draft (a typed upstream name) survives a jump away and
+/// back.
+#[cfg(unix)]
+#[test]
+fn a_jump_keeps_an_open_shunt_add_draft() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    assert!(
+        rig.app.services.shunt_field_edit.is_none(),
+        "precondition: no field editing"
+    );
+    assert!(
+        rig.app
+            .services
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "precondition: draft open"
+    );
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert_eq!(rig.app.tab, Tab::Overview, "precondition: jumped");
+    super::handle_key(&mut rig.app, alt_digit('8'));
+    assert!(
+        rig.app
+            .services
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "the jump folded (dropped) the open shunt add-draft"
+    );
+}
+
+/// The action-menu shunt jump keeps a suspended `+ new` form's typed values.
+#[test]
+fn the_shunt_jump_keeps_the_new_form() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for c in "zed".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::jump_to_shunt_card(&mut app, super::ShuntFocusLine::Adopt);
+    assert_eq!(
+        app.tab,
+        Tab::Services,
+        "precondition: jumped to the shunt card"
+    );
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.tab, Tab::Setup);
+    app.profile_cursor = app.profile_count();
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config_draft
+            .as_ref()
+            .map(|d| d.name.value.clone())
+            .as_deref(),
+        Some("zed"),
+        "the action-menu shunt jump lost the + new form"
+    );
+}
+
+/// The herdr tag editor keeps the Services descent across a jump.
+#[test]
+fn the_herdr_tag_editor_keeps_the_services_descent() {
+    use super::ServicesFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.focus = ServicesFocus::Detail;
+    app.services.herdr_tag_draft = Some(InputState::new("5"));
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview, "precondition: jumped");
+    super::handle_key(&mut app, alt_digit('8'));
+    assert!(
+        app.services.herdr_tag_draft.is_some(),
+        "precondition: editor kept"
+    );
+    assert_eq!(
+        app.services.focus,
+        ServicesFocus::Detail,
+        "the jump ascended the herdr detail under an open tag editor"
+    );
+}
+
+/// The `+ new` form's open field returns on the `+ new` row, not under an
+/// existing account's selection.
+#[test]
+fn the_new_form_open_field_returns_on_the_new_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    super::handle_key(&mut app, key(KeyCode::Enter)); // name field open on + new
+    for c in "zed".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    assert_eq!(
+        app.profile_cursor,
+        app.profile_count(),
+        "precondition: on + new"
+    );
+    super::handle_key(&mut app, alt_digit('1'));
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(
+        app.profile_cursor,
+        app.profile_count(),
+        "the + new form's open field returned under an existing account's selection"
+    );
+}
+
+/// An open shunt field editor (a real config field, not a draft) survives a
+/// jump with its descent.
+#[cfg(unix)]
+#[test]
+fn a_jump_keeps_an_open_shunt_field_editor() {
+    use super::{ServicesFocus, ShuntFieldEdit, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_field_edit.is_some(),
+        "precondition: field editor open"
+    );
+    for c in "high".chars() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert_eq!(rig.app.tab, Tab::Overview, "precondition: jumped away");
+    super::handle_key(&mut rig.app, alt_digit('8'));
+    assert_eq!(rig.app.tab, Tab::Services);
+    assert_eq!(
+        rig.app.services.focus,
+        ServicesFocus::Detail,
+        "the jump ascended the shunt detail under an open field editor"
+    );
+    let typed = match rig.app.services.shunt_field_edit.as_ref().map(|s| &s.edit) {
+        Some(ShuntFieldEdit::Typed { input, .. }) => Some(input.value.clone()),
+        _ => None,
+    };
+    assert_eq!(
+        typed.as_deref(),
+        Some("high"),
+        "the jump dropped or changed the typed field"
+    );
+}
+
+/// A jump away from an open Config or herdr editor commits nothing: the saved
+/// value under each draft stays put while the draft survives (F8f).
+#[test]
+fn a_jump_commits_no_config_or_herdr_draft() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.context_nudge_draft = Some(InputState::new("300k"));
+    app.weekly_threshold_draft = Some(InputState::new("95"));
+    let nudge_saved = app.config().state.context_nudge_threshold_tokens;
+    let weekly_saved = app.config().state.weekly_switch_threshold;
+    super::handle_key(&mut app, alt_digit('1'));
+    super::handle_key(&mut app, alt_digit('6'));
+    assert_eq!(app.tab, Tab::Config);
+    assert!(
+        app.context_nudge_draft.is_some(),
+        "the jump dropped the nudge draft"
+    );
+    assert!(
+        app.weekly_threshold_draft.is_some(),
+        "the jump dropped the weekly draft"
+    );
+    assert_eq!(
+        app.config().state.context_nudge_threshold_tokens,
+        nudge_saved,
+        "the switch committed the nudge draft"
+    );
+    assert_eq!(
+        app.config().state.weekly_switch_threshold,
+        weekly_saved,
+        "the switch committed the weekly draft"
+    );
+
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services.herdr_tag_draft = Some(InputState::new("7"));
+    let tag_saved = app.config().state.herdr.tag_watch_secs;
+    super::handle_key(&mut app, alt_digit('1'));
+    super::handle_key(&mut app, alt_digit('8'));
+    assert_eq!(app.tab, Tab::Services);
+    assert!(
+        app.services.herdr_tag_draft.is_some(),
+        "the jump dropped the herdr draft"
+    );
+    assert_eq!(
+        app.config().state.herdr.tag_watch_secs,
+        tag_saved,
+        "the switch committed the herdr tag draft"
+    );
+}
+
+/// The herdr and plugin details classify editable like the shunt card, so all
+/// four switch keys are trapped there at rest (F8a2).
+#[test]
+fn services_editable_details_trap_the_switch_keys() {
+    use super::{PaneState, ServicesFocus, pane_state};
+    use ratatui::crossterm::event::KeyModifiers as M;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.herdr = Some(Some(healthy_herdr_probe()));
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    for label in ["plugin", "herdr"] {
+        let idx = app
+            .services
+            .checks
+            .iter()
+            .position(|c| c.label == label)
+            .expect("the check exists");
+        app.services.cursor = idx;
+        app.services.focus = ServicesFocus::Detail;
+        assert_eq!(
+            pane_state(&app),
+            PaneState::Editable,
+            "{label} did not classify editable"
+        );
+        super::handle_key(&mut app, key(KeyCode::Left));
+        assert_eq!(
+            app.services.focus,
+            ServicesFocus::List,
+            "← did not ascend {label}"
+        );
+        assert_eq!(app.tab, Tab::Services);
+        app.services.focus = ServicesFocus::Detail;
+        for ev in [
+            key(KeyCode::Right),
+            key(KeyCode::Tab),
+            with_mods(KeyCode::BackTab, M::SHIFT),
+        ] {
+            super::handle_key(&mut app, ev);
+            assert_eq!(app.tab, Tab::Services, "{ev:?} switched out of {label}");
+            assert_eq!(app.services.focus, ServicesFocus::Detail);
+        }
+    }
+}
+
+// ── switch, mint and preset paths that keep unsaved work ────────────────────────────────────────────────
+
+/// A suspended Usage note editor returns under its own account: the selector
+/// pins to the editor's profile, not whatever another tab left there, and ↵
+/// saves to that account only.
+#[test]
+fn a_suspended_note_editor_returns_under_its_own_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let mut app = app_with(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Usage;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert!(
+        app.note_editor.is_some(),
+        "precondition: a's note editor open"
+    );
+    for c in "hi".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.tab, Tab::Setup, "precondition: jumped");
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.profile_cursor, 1,
+        "precondition: Setup moved the selection to b"
+    );
+    super::handle_key(&mut app, alt_digit('2'));
+    let editor_for = app.note_editor.as_ref().map(|e| e.profile.to_string());
+    let shown = app
+        .profile_name_at(app.profile_cursor)
+        .map(|n| n.to_string());
+    assert_eq!(
+        editor_for.as_deref(),
+        Some("a"),
+        "precondition: the editor is a's"
+    );
+    assert_eq!(
+        shown.as_deref(),
+        Some("a"),
+        "the note editor returned under b's selection; ↵ wrote a's note"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        crate::profile_notes::load_note(&crate::profile::ProfileName::from("a")).as_deref(),
+        Some("hi"),
+        "the save did not write a's note"
+    );
+    assert!(
+        crate::profile_notes::load_note(&crate::profile::ProfileName::from("b")).is_none(),
+        "the save wrote b's note"
+    );
+}
+
+/// A suspended Usage note editor whose account was deleted closes on return
+/// instead of staying open, invisible, owning the keys.
+#[test]
+fn a_suspended_note_editor_closes_when_its_account_is_deleted() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let mut app = app_with(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Usage;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert!(
+        app.note_editor.is_some(),
+        "precondition: a's note editor open"
+    );
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview, "precondition: suspended");
+    {
+        let mut cfg = app.config();
+        cfg.profiles.retain(|p| p.name != "a");
+        cfg.state.profiles.retain(|n| n != "a");
+    }
+    super::handle_key(&mut app, alt_digit('2'));
+    assert_eq!(app.tab, Tab::Usage);
+    assert!(
+        app.note_editor.is_none(),
+        "the deleted account's note editor stayed open"
+    );
+}
+
+/// A note editor opened from the Usage list (no descent) returns pinned to its
+/// account without forcing a descent.
+#[test]
+fn a_note_editor_opened_from_the_list_returns_without_a_descent() {
+    use super::StatusFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let mut app = app_with(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Usage;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert!(
+        app.note_editor.is_some(),
+        "precondition: a's note editor open from the list"
+    );
+    assert_eq!(
+        app.usage_detail_focus,
+        StatusFocus::List,
+        "precondition: no descent"
+    );
+    super::handle_key(&mut app, alt_digit('4'));
+    super::handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(
+        app.profile_cursor, 1,
+        "precondition: Setup moved the selection to b"
+    );
+    super::handle_key(&mut app, alt_digit('2'));
+    assert_eq!(app.tab, Tab::Usage);
+    assert_eq!(
+        app.profile_cursor, 0,
+        "the editor returned under b's selection"
+    );
+    assert_eq!(
+        app.usage_detail_focus,
+        StatusFocus::List,
+        "returning forced a descent"
+    );
+}
+
+/// Suspend a typed `+ new` form into its home (`new_account_draft`): Setup
+/// `+ new` → base-url field → type → commit → `⌥8` to Services at rest.
+#[cfg(unix)]
+fn suspend_a_typed_new_form(app: &mut App) {
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    super::handle_key(app, key(KeyCode::Enter));
+    let base_row = super::config_rows(app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::BaseUrl)
+        .unwrap();
+    app.config_action_cursor = base_row;
+    super::handle_key(app, key(KeyCode::Enter));
+    for c in "https://typed.example".chars() {
+        super::handle_key(app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(app, key(KeyCode::Enter));
+    super::handle_key(app, alt_digit('8'));
+    assert!(
+        app.new_account_draft
+            .as_ref()
+            .is_some_and(|d| d.base_url.value == "https://typed.example"),
+        "precondition: the typed form is suspended in its home"
+    );
+}
+
+/// Whether the typed `+ new` form survives in either slot.
+#[cfg(unix)]
+fn typed_new_form_survives(app: &App) -> bool {
+    let typed = |d: &Option<super::ConfigDraft>| {
+        d.as_ref()
+            .is_some_and(|d| d.base_url.value == "https://typed.example")
+    };
+    typed(&app.config_draft) || typed(&app.new_account_draft)
+}
+
+/// The mint `+ new profile` path asks before opening over a suspended typed
+/// `+ new` form: the loss warning opens, the mint form does not, and the typed
+/// form stays in its home.
+#[cfg(unix)]
+#[test]
+fn the_mint_new_profile_warns_over_a_suspended_typed_form() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    suspend_a_typed_new_form(&mut rig.app);
+    super::open_new_profile_form(&mut rig.app, false);
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the mint path opened the mint form instead of the warning"
+    );
+    assert_eq!(rig.app.tab, Tab::Services, "the warning switched the tab");
+    assert!(
+        rig.app.config_draft.is_none(),
+        "the mint form did not open over the suspended form"
+    );
+    assert_eq!(
+        rig.app
+            .new_account_draft
+            .as_ref()
+            .map(|d| d.base_url.value.clone())
+            .as_deref(),
+        Some("https://typed.example"),
+        "the suspended typed form did not survive in its home"
+    );
+}
+
+/// `go back` on the mint warning leaves everything as it was: the warning
+/// closes, the tab stays on Services, and the suspended form is untouched.
+#[cfg(unix)]
+#[test]
+fn go_back_on_the_mint_warning_keeps_the_suspended_form() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    suspend_a_typed_new_form(&mut rig.app);
+    super::open_new_profile_form(&mut rig.app, false);
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: the warning opened"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Esc));
+    assert!(rig.app.modals.is_empty(), "go back left the warning open");
+    assert_eq!(
+        rig.app.tab,
+        Tab::Services,
+        "go back moved the tab off Services"
+    );
+    assert!(
+        rig.app.config_draft.is_none(),
+        "go back opened no mint form"
+    );
+    assert_eq!(
+        rig.app
+            .new_account_draft
+            .as_ref()
+            .map(|d| d.base_url.value.clone())
+            .as_deref(),
+        Some("https://typed.example"),
+        "go back dropped the suspended form"
+    );
+}
+
+/// `discard` on the mint warning drops the suspended form and opens the mint
+/// form exactly as the picker would.
+#[cfg(unix)]
+#[test]
+fn discard_on_the_mint_warning_drops_the_form_and_opens_the_mint_form() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    suspend_a_typed_new_form(&mut rig.app);
+    super::open_new_profile_form(&mut rig.app, false);
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: the warning opened"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Right));
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(rig.app.modals.is_empty(), "discard left the warning open");
+    assert_eq!(
+        rig.app.tab,
+        Tab::Setup,
+        "discard did not open the mint form on Setup"
+    );
+    assert!(
+        rig.app.new_account_draft.is_none(),
+        "discard kept the suspended form"
+    );
+    assert!(
+        rig.app
+            .config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.is_none() && d.mint_for.is_some()),
+        "the mint form did not open"
+    );
+}
+
+/// A jump off the mint path never loses the suspended typed form: the warning
+/// (not the mint form) owns the jump, so the form stays in its home.
+#[cfg(unix)]
+#[test]
+fn a_jump_off_the_mint_form_never_loses_the_suspended_typed_form() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    suspend_a_typed_new_form(&mut rig.app);
+    super::open_new_profile_form(&mut rig.app, false);
+    super::handle_key(&mut rig.app, alt_digit('8'));
+    assert!(
+        typed_new_form_survives(&rig.app),
+        "a jump off the mint path overwrote the suspended typed form"
+    );
+}
+
+/// `n` on the mint path never loses the suspended typed form: the warning owns
+/// the key, so the form stays in its home.
+#[cfg(unix)]
+#[test]
+fn n_on_the_mint_form_never_loses_the_suspended_typed_form() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    suspend_a_typed_new_form(&mut rig.app);
+    super::open_new_profile_form(&mut rig.app, false);
+    super::handle_key(&mut rig.app, key(KeyCode::Char('n')));
+    assert!(
+        typed_new_form_survives(&rig.app),
+        "n on the mint path overwrote the suspended typed form"
+    );
+}
+
+/// An untouched suspended `+ new` form (a fresh `build_draft_new`, nothing
+/// typed) opens the mint form with no warning.
+#[cfg(unix)]
+#[test]
+fn an_untouched_suspended_form_opens_the_mint_form_directly() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    let app = &mut rig.app;
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    super::handle_key(app, key(KeyCode::Enter));
+    super::handle_key(app, alt_digit('8'));
+    assert!(
+        app.new_account_draft
+            .as_ref()
+            .is_some_and(|d| d.base_url.value.is_empty()),
+        "precondition: an untouched form suspended in its home"
+    );
+    super::open_new_profile_form(app, false);
+    assert!(app.modals.is_empty(), "an untouched form opened a warning");
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.is_none() && d.mint_for.is_some()),
+        "the mint form did not open directly"
+    );
+}
+
+/// The in-app rename rebinds a suspended note editor to the new name, so the
+/// landing under the new name keeps the typed draft.
+#[cfg(unix)]
+#[test]
+fn a_rename_rebinds_the_suspended_note_editor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let mut app = app_with(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Usage;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    for c in "keep me".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.tab, Tab::Setup, "precondition: jumped");
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Char('2')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    let renamed = app
+        .config()
+        .find(&crate::profile::ProfileName::from("a2"))
+        .is_some();
+    assert!(renamed, "precondition: a renamed to a2 in Setup");
+    assert_eq!(
+        app.note_editor
+            .as_ref()
+            .map(|e| e.profile.to_string())
+            .as_deref(),
+        Some("a2"),
+        "the rename did not rebind the suspended note editor"
+    );
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    super::handle_key(&mut app, alt_digit('2'));
+    let kept = app.note_editor.as_ref().map(|e| e.buf.text());
+    assert_eq!(
+        kept.as_deref(),
+        Some("keep me"),
+        "renaming the account dropped the suspended note draft"
+    );
+}
+
+/// The in-app rename rebinds a suspended Fallback member edit to the new name.
+#[cfg(unix)]
+#[test]
+fn a_rename_rebinds_the_suspended_fallback_edit() {
+    use super::{CardEdit, FallbackFocus, FallbackRow};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.fallback_threshold = Some(80.0);
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 0;
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Threshold)
+        .expect("Threshold row exists");
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            app.fallback_edit.as_ref().map(|e| &e.state),
+            Some(CardEdit::Threshold(_))
+        ),
+        "precondition: the field opened"
+    );
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.tab, Tab::Setup, "precondition: jumped to Setup");
+    assert_eq!(
+        app.fallback_edit
+            .as_ref()
+            .map(|e| e.member.to_string())
+            .as_deref(),
+        Some("a"),
+        "precondition: the edit holds member a"
+    );
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Char('2')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.fallback_edit
+            .as_ref()
+            .map(|e| e.member.to_string())
+            .as_deref(),
+        Some("a2"),
+        "the rename did not rebind the suspended fallback edit"
+    );
+}
+
+/// The in-app rename rebinds a suspended Fallback day picker to the new name.
+#[cfg(unix)]
+#[test]
+fn a_rename_rebinds_the_suspended_fallback_day_stop() {
+    use super::{CardEdit, FallbackFocus};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 0;
+    app.fallback_focus = FallbackFocus::Detail;
+    // An open day picker owns the keyboard, so a switch keeps the card open and
+    // both the edit and the day stop survive.
+    app.fallback_edit = Some(super::MemberEdit {
+        member: crate::profile::ProfileName::from("a"),
+        state: CardEdit::Days(super::DayPicker::default()),
+    });
+    app.fallback_day_stop = Some(super::MemberEdit {
+        member: crate::profile::ProfileName::from("a"),
+        state: vec![chrono::Weekday::Mon],
+    });
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.tab, Tab::Setup, "precondition: jumped to Setup");
+    assert_eq!(
+        app.fallback_day_stop
+            .as_ref()
+            .map(|e| e.member.to_string())
+            .as_deref(),
+        Some("a"),
+        "precondition: the day stop survived the jump"
+    );
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Char('2')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.fallback_day_stop
+            .as_ref()
+            .map(|e| e.member.to_string())
+            .as_deref(),
+        Some("a2"),
+        "the rename did not rebind the suspended fallback day picker"
+    );
+}
+
+/// A name miss on the Usage landing (a delete, or an out-of-app rename) closes
+/// the suspended note editor: no invisible editor owns the keys.
+#[cfg(unix)]
+#[test]
+fn a_name_miss_on_the_usage_landing_closes_the_note_editor() {
+    use super::StatusFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let mut app = app_with(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Usage;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    for c in "keep me".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.tab, Tab::Setup, "precondition: jumped");
+    // Rename out from under the app (the CLI shape): the same path the CLI
+    // takes, so the roster reloads without the editor's name.
+    let old = crate::profile::ProfileName::from("a");
+    let new = crate::profile::ProfileName::from("a2");
+    let renamed = crate::actions::rotation_guard_for_mutation(&old).and_then(|rotation| {
+        let mut cfg = app.config();
+        crate::actions::rename_profile(&mut cfg, &old, &new, &rotation)
+    });
+    assert!(renamed.is_ok(), "precondition: the external rename landed");
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    super::handle_key(&mut app, alt_digit('2'));
+    assert!(
+        app.note_editor.is_none(),
+        "the landing left the note editor open"
+    );
+    assert!(
+        !matches!(
+            super::keyboard_owner(&app),
+            Some(super::KeyOwner::NoteEditor)
+        ),
+        "a note editor still owns the keys after the close"
+    );
+    assert_eq!(
+        app.usage_detail_focus,
+        StatusFocus::List,
+        "the Usage tab does not take keys after the close"
+    );
+}
+
+/// The guarded writer hands a refused draft back to its caller and keeps the
+/// existing typed form in the slot: no slot write can drop a form and no path
+/// panics.
+#[cfg(unix)]
+#[test]
+fn the_guarded_writer_returns_the_refused_draft_without_dropping_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let mut typed = super::build_draft_new();
+    typed.base_url = super::InputState::new("https://typed.example");
+    app.new_account_draft = Some(typed);
+    let refused = super::set_new_account_draft(&mut app, super::build_draft_new());
+    assert!(
+        refused.is_some(),
+        "the occupied slot took the write without returning the draft"
+    );
+    assert_eq!(
+        refused.unwrap().base_url.value,
+        "",
+        "the incoming draft did not come back"
+    );
+    assert_eq!(
+        app.new_account_draft
+            .as_ref()
+            .map(|d| d.base_url.value.clone())
+            .as_deref(),
+        Some("https://typed.example"),
+        "the write overwrote the existing typed form"
+    );
+}
+
+/// A preset stamped onto a suspended `+ new` form lands on the user's own
+/// form, and no later switch drops it or panics: the preset restores the
+/// suspended form instead of building a fresh one, and the guarded writer
+/// refuses to overwrite an occupied slot.
+#[cfg(unix)]
+#[test]
+fn a_preset_stamped_new_form_then_n_then_a_jump_keeps_the_typed_form() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for c in "zed".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, alt_digit('1'));
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(
+        app.profile_cursor,
+        app.profile_count(),
+        "precondition: selector on + new"
+    );
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Profiles,
+        "precondition: at rest"
+    );
+    assert!(
+        app.new_account_draft
+            .as_ref()
+            .is_some_and(|d| d.name.value == "zed"),
+        "precondition: typed form suspended"
+    );
+    super::handle_key(&mut app, key(KeyCode::Char('a')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    while !app.modals.is_empty() {
+        super::handle_key(&mut app, key(KeyCode::Enter));
+    }
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| !d.base_url.value.is_empty()),
+        "the preset did not stamp the restored form"
+    );
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.name.value == "zed"),
+        "the preset landed on a fresh form"
+    );
+    assert!(
+        app.new_account_draft.is_none(),
+        "the restore left the form in the slot"
+    );
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Actions,
+        "n did not descend into the stamped form"
+    );
+    super::handle_key(&mut app, alt_digit('1'));
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.name.value == "zed")
+            || app
+                .new_account_draft
+                .as_ref()
+                .is_some_and(|d| d.name.value == "zed"),
+        "the jump dropped the typed name or the stamped form"
+    );
+}
+
+/// `apply preset` on the `+ new` form restores the suspended form first, so a
+/// captured login already on it survives the stamp.
+#[cfg(unix)]
+#[test]
+fn apply_preset_on_the_new_form_keeps_a_captured_login_on_the_stamped_form() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("alice");
+    draft.captured_login = Some(super::DraftLogin::LiveLogin(Box::new(
+        crate::actions::CaptureSnapshot {
+            credentials: None,
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+        },
+    )));
+    app.new_account_draft = Some(draft);
+    super::handle_key(&mut app, key(KeyCode::Char('a')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    while !app.modals.is_empty() {
+        super::handle_key(&mut app, key(KeyCode::Enter));
+    }
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(super::DraftLogin::LiveLogin(_))
+        ),
+        "the preset stamp dropped the captured login"
+    );
+    assert_eq!(
+        app.config_draft
+            .as_ref()
+            .map(|d| d.name.value.clone())
+            .as_deref(),
+        Some("alice"),
+        "the preset did not stamp the user's own form"
+    );
+}
+
+/// An in-app delete closes the account's suspended note editor, and the Usage
+/// tab takes keys normally after the landing, so no invisible editor keeps
+/// owning the keys.
+#[cfg(unix)]
+#[test]
+fn an_in_app_delete_closes_the_suspended_note_editor() {
+    use super::StatusFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let mut app = app_with(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Usage;
+    app.profile_cursor = 0;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    for c in "keep me".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.tab, Tab::Setup, "precondition: jumped");
+    super::perform_delete(&mut app, &crate::profile::ProfileName::from("a"));
+    assert!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("a"))
+            .is_none(),
+        "precondition: a deleted in-app"
+    );
+    super::handle_key(&mut app, alt_digit('2'));
+    assert!(
+        app.note_editor.is_none(),
+        "the delete left the note editor open"
+    );
+    assert!(
+        !matches!(
+            super::keyboard_owner(&app),
+            Some(super::KeyOwner::NoteEditor)
+        ),
+        "a note editor still owns the keys after the close"
+    );
+    assert_eq!(
+        app.usage_detail_focus,
+        StatusFocus::List,
+        "the Usage tab does not take keys after the close"
+    );
+}
+
+/// A switch whose `suspend_source` move hits an occupied slot puts the form
+/// back in the pane and keeps the descent: both forms survive, nothing panics
+/// (the guard's lossless move).
+#[cfg(unix)]
+#[test]
+fn a_refused_slot_write_puts_the_form_back_and_keeps_the_descent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    app.config_focus = super::ConfigFocus::Actions;
+    let mut slot = super::build_draft_new();
+    slot.base_url = super::InputState::new("https://slot.example");
+    app.new_account_draft = Some(slot);
+    let mut pane = super::build_draft_new();
+    pane.base_url = super::InputState::new("https://pane.example");
+    app.config_draft = Some(pane);
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview, "the jump did not land on Overview");
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.base_url.value == "https://pane.example"),
+        "the pane form was dropped instead of coming back"
+    );
+    assert!(
+        app.new_account_draft
+            .as_ref()
+            .is_some_and(|d| d.base_url.value == "https://slot.example"),
+        "the jump overwrote the slot form"
+    );
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Actions,
+        "the descent ascended instead of staying"
+    );
+}
+
+/// A preset stamped from the `+ new` row at rest lands the pane descended on
+/// the stamped form: the form is the active pane, so the selector is not
+/// navigable to overwrite it.
+#[cfg(unix)]
+#[test]
+fn a_preset_on_the_new_row_lands_descended_on_the_stamped_form() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for c in "zed".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, alt_digit('1'));
+    super::handle_key(&mut app, alt_digit('4'));
+    super::handle_key(&mut app, key(KeyCode::Char('a')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    while !app.modals.is_empty() {
+        super::handle_key(&mut app, key(KeyCode::Enter));
+    }
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Actions,
+        "the stamp left the form exposed at rest"
+    );
+    assert_eq!(
+        app.config_action_cursor, 0,
+        "the stamp did not land on the first row"
+    );
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.name.value == "zed"),
+        "the preset landed on a fresh form"
+    );
+}
+
+/// The invariant: no slot write drops a typed value. Each sequence below
+/// starts from a suspended `+ new` form holding typed fields (name, base url,
+/// api key, model, and the five alias rows) and a captured login, drives
+/// `handle_key`, and checks that the values survive: a jump off the suspended
+/// form, a preset stamped at rest then a jump away and back then `↵`, `n` then
+/// a preset, the mint path over a field-open suspended form, a cancelled
+/// preset picker, and a preset stamped at rest then `↓` `↑` `↵` onto the name
+/// field (a text row, so nothing commits).
+#[cfg(unix)]
+#[test]
+fn no_slot_write_drops_a_typed_value_across_the_switch_sequences() {
+    fn seed(app: &mut App) {
+        let mut draft = super::build_draft_new();
+        draft.name = super::InputState::new("zed");
+        draft.base_url = super::InputState::new("https://z.example");
+        draft.api_key = super::InputState::new("sk-zed");
+        draft.model = super::InputState::new("zed-model");
+        draft.opus_model = super::InputState::new("zed-opus");
+        draft.sonnet_model = super::InputState::new("zed-sonnet");
+        draft.haiku_model = super::InputState::new("zed-haiku");
+        draft.fable_model = super::InputState::new("zed-fable");
+        draft.subagent_model = super::InputState::new("zed-subagent");
+        draft.captured_login = Some(super::DraftLogin::LiveLogin(Box::new(
+            crate::actions::CaptureSnapshot {
+                credentials: None,
+                base_url: None,
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+            },
+        )));
+        app.tab = Tab::Setup;
+        app.config_draft = None;
+        app.new_account_draft = Some(draft);
+        app.profile_cursor = app.profile_count();
+        app.config_focus = super::ConfigFocus::Profiles;
+        app.config_action_cursor = 0;
+    }
+    fn holds_all(d: &Option<super::ConfigDraft>) -> bool {
+        d.as_ref().is_some_and(|d| {
+            d.name.value == "zed"
+                && d.base_url.value == "https://z.example"
+                && d.api_key.value == "sk-zed"
+                && d.model.value == "zed-model"
+                && d.opus_model.value == "zed-opus"
+                && d.sonnet_model.value == "zed-sonnet"
+                && d.haiku_model.value == "zed-haiku"
+                && d.fable_model.value == "zed-fable"
+                && d.subagent_model.value == "zed-subagent"
+                && matches!(d.captured_login, Some(super::DraftLogin::LiveLogin(_)))
+        })
+    }
+    fn holds_unstamped(d: &Option<super::ConfigDraft>) -> bool {
+        d.as_ref().is_some_and(|d| {
+            d.name.value == "zed"
+                && d.api_key.value == "sk-zed"
+                && !d.base_url.value.is_empty()
+                && matches!(d.captured_login, Some(super::DraftLogin::LiveLogin(_)))
+        })
+    }
+    fn intact(app: &App) -> bool {
+        holds_all(&app.config_draft) || holds_all(&app.new_account_draft)
+    }
+    fn unstamped(app: &App) -> bool {
+        holds_unstamped(&app.config_draft) || holds_unstamped(&app.new_account_draft)
+    }
+    fn stamp_first_preset(app: &mut App) {
+        super::handle_key(app, key(KeyCode::Char('a')));
+        while !app.modals.is_empty() {
+            match app.modals.last() {
+                Some(Modal::Confirm(_)) => {
+                    super::handle_key(app, key(KeyCode::Right));
+                    super::handle_key(app, key(KeyCode::Enter));
+                }
+                _ => super::handle_key(app, key(KeyCode::Enter)),
+            }
+        }
+    }
+
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    let app = &mut rig.app;
+
+    seed(app);
+    super::handle_key(app, alt_digit('1'));
+    super::handle_key(app, alt_digit('4'));
+    assert!(
+        intact(app),
+        "a jump off the suspended form dropped a field or the login"
+    );
+
+    seed(app);
+    stamp_first_preset(app);
+    super::handle_key(app, alt_digit('1'));
+    super::handle_key(app, alt_digit('4'));
+    super::handle_key(app, key(KeyCode::Enter));
+    assert!(
+        unstamped(app),
+        "a preset at rest then a jump away and `↵` dropped a field or the login"
+    );
+
+    seed(app);
+    super::handle_key(app, key(KeyCode::Char('n')));
+    stamp_first_preset(app);
+    assert!(
+        unstamped(app),
+        "`n` then a preset dropped a field or the login"
+    );
+
+    seed(app);
+    super::handle_key(app, key(KeyCode::Enter));
+    super::handle_key(app, key(KeyCode::Enter));
+    super::handle_key(app, alt_digit('8'));
+    super::open_new_profile_form(app, false);
+    assert!(
+        matches!(app.modals.last(), Some(Modal::LossWarning(_))),
+        "the mint path did not warn over the field-open form"
+    );
+    super::handle_key(app, key(KeyCode::Esc));
+    assert!(intact(app), "`go back` dropped a field or the login");
+    super::handle_key(app, alt_digit('4'));
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.active.is_some()),
+        "`go back` did not return into the open field"
+    );
+    assert!(
+        intact(app),
+        "the return into the open field dropped a field or the login"
+    );
+
+    seed(app);
+    super::handle_key(app, key(KeyCode::Char('a')));
+    super::handle_key(app, key(KeyCode::Enter));
+    super::handle_key(app, key(KeyCode::Esc));
+    assert!(
+        app.config_draft.is_none(),
+        "the cancelled picker left the form in the pane"
+    );
+    assert!(
+        holds_all(&app.new_account_draft),
+        "the cancelled picker did not return the form to its home intact"
+    );
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Profiles,
+        "the cancelled picker did not ascend"
+    );
+
+    seed(app);
+    stamp_first_preset(app);
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Actions,
+        "the stamp left the form exposed at rest"
+    );
+    assert_eq!(
+        app.config_action_cursor, 0,
+        "the stamp did not land on the first row"
+    );
+    // `↑` from row 0 wraps to `create account` and commits, so step down one
+    // row first and back up onto the name field: a text row that opens an
+    // editor, never commits.
+    super::handle_key(app, key(KeyCode::Down));
+    super::handle_key(app, key(KeyCode::Up));
+    super::handle_key(app, key(KeyCode::Enter));
+    assert!(
+        holds_unstamped(&app.config_draft),
+        "a preset at rest then `↑` `↵` dropped the form or created the account"
+    );
+}
+
+/// A preset apply that ends on an early return (`preset 'mine' is gone`)
+/// clears the picker-open flag: the flag must not outlive its
+/// pick sequence and act on a later, unrelated cancel.
+#[cfg(unix)]
+#[test]
+fn a_preset_apply_early_return_clears_the_picker_flag() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    crate::presets::save_preset(
+        "mine",
+        &Some("https://p.example".to_string()),
+        &crate::profile::ModelSettings::default(),
+    )
+    .expect("custom preset");
+
+    // Suspend a typed `+ new` form (name + base url), then open the picker.
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for c in "zed".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    let base_row = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::BaseUrl)
+        .expect("base url row");
+    app.config_action_cursor = base_row;
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for c in "https://typed.example".chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, alt_digit('1'));
+    super::handle_key(&mut app, alt_digit('4'));
+
+    super::open_preset_picker(&mut app);
+    assert_eq!(
+        app.preset_picker_open,
+        super::PresetPickerOpen::Restored,
+        "precondition: the open restored the form"
+    );
+    let idx = match app.modals.last() {
+        Some(super::Modal::PresetPicker(f)) => f
+            .presets
+            .iter()
+            .position(|p| p.name == "mine")
+            .expect("mine listed"),
+        _ => panic!("precondition: the picker is open"),
+    };
+    if let Some(super::Modal::PresetPicker(f)) = app.modals.last_mut() {
+        f.cursor = idx;
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter)); // pick `mine`
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::Confirm(_))),
+        "precondition: the apply confirm is open"
+    );
+    crate::presets::delete_preset("mine").expect("another process deletes the preset");
+    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Enter)); // confirm → `preset 'mine' is gone`
+    assert!(
+        app.modals.is_empty(),
+        "the early return left the sequence open"
+    );
+    assert_eq!(
+        app.preset_picker_open,
+        super::PresetPickerOpen::None,
+        "the early return left the picker-open flag set"
+    );
+}
+
+/// `undo_preset_picker_open` is a no-op unless the pane holds a `+ new` draft:
+/// a stale flag over an existing account's draft must not move
+/// it into the `+ new` slot.
+#[cfg(unix)]
+#[test]
+fn the_preset_undo_is_a_noop_unless_the_pane_holds_a_new_form() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    app.config_draft = Some(super::build_draft_existing(
+        &app,
+        &crate::profile::ProfileName::from("a"),
+    ));
+    app.config_focus = super::ConfigFocus::Actions;
+    app.preset_picker_open = super::PresetPickerOpen::Restored;
+    super::undo_preset_picker_open(&mut app);
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.editing_name.as_deref() == Some("a")),
+        "the undo moved an existing account's draft out of its pane"
+    );
+    assert!(
+        app.new_account_draft.is_none(),
+        "the undo moved an existing account's draft into the `+ new` slot"
+    );
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Actions,
+        "the undo ascended the existing account's pane"
+    );
+    assert_eq!(
+        app.preset_picker_open,
+        super::PresetPickerOpen::None,
+        "the undo left the picker-open flag set"
+    );
+}
+
+/// Only the preset sequence's own confirm calls the undo: an
+/// unrelated confirm's cancel must not move the `+ new` form the picker opened.
+#[cfg(unix)]
+#[test]
+fn an_unrelated_confirm_cancel_leaves_the_preset_open_undo_alone() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    app.config_focus = super::ConfigFocus::Actions;
+    let mut form = super::build_draft_new();
+    form.name = super::InputState::new("zed");
+    app.config_draft = Some(form);
+    app.preset_picker_open = super::PresetPickerOpen::Restored;
+    app.open_modal(super::Modal::Confirm(super::ConfirmState {
+        message: "rotate all refresh tokens?".to_string(),
+        detail: None,
+        choice: false,
+        scroll: super::ConfirmScroll::default(),
+        on_confirm: super::ConfirmAction::RotateAll,
+    }));
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert!(app.modals.is_empty(), "the unrelated confirm did not close");
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.name.value == "zed"),
+        "an unrelated confirm's cancel moved the `+ new` form out of the pane"
+    );
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Actions,
+        "an unrelated confirm's cancel ascended the pane"
+    );
+    assert!(
+        app.new_account_draft.is_none(),
+        "an unrelated confirm's cancel moved the `+ new` form into the slot"
     );
 }

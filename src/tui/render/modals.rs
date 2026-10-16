@@ -12,8 +12,9 @@ use crate::profile::DivergenceChoice;
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
     DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
-    LoginStage, Modal, NamePromptForm, PresetApplyButton, PresetApplyForm, PresetPickerForm,
-    RebindForm, StatusFocus, Tab, TokenPickerForm, TokenView, token_model_count,
+    LoginStage, LossWarningState, Modal, NamePromptForm, PaneState, PresetApplyButton,
+    PresetApplyForm, PresetPickerForm, RebindForm, StatusFocus, Tab, TokenPickerForm, TokenView,
+    pane_state, token_model_count,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -44,6 +45,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::Login => draw_login_progress(frame, area, app),
         Modal::CheckOutput(body) => draw_check_output(frame, area, body, app),
         Modal::Rebind(form) => draw_rebind(frame, area, form),
+        Modal::LossWarning(state) => draw_loss_warning(frame, area, state),
     }
 }
 
@@ -615,7 +617,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
         Line::from(modal_button(" ok ", true))
     } else {
-        choice_buttons(state.choice, destructive, &confirm_label, "   ")
+        choice_buttons(state.choice, "cancel", destructive, &confirm_label, "   ")
     };
 
     // The body scrolls (`↑`/`↓` one line, `PageUp`/`PageDown` one page) while
@@ -633,6 +635,34 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     );
     state.scroll.max_scroll.set(d.max_scroll);
     state.scroll.viewport.set(d.viewport);
+}
+
+/// The loss warning a screen switch raises over unsaved work another screen
+/// also writes: `WARNING` title, sentence-case body naming the screen holding
+/// the work and the other writer, and a `go back` / `discard` pair reusing the
+/// confirm modal's button machinery.
+fn draw_loss_warning(frame: &mut Frame<'_>, area: Rect, state: &LossWarningState) {
+    let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(
+        "Discard the unsaved edit?",
+        theme::body(),
+    ))];
+    // One line per sentence: the body reads whole at 80 columns instead of
+    // chunking a word across rows.
+    for sentence in state.drop.detail_lines() {
+        lines.push(Line::from(prose::spans(sentence, theme::dim())));
+    }
+
+    let buttons = choice_buttons(state.choice, "go back", true, "discard", "   ");
+
+    draw_modal_scrolled(
+        frame,
+        area,
+        "WARNING",
+        lines,
+        0,
+        None,
+        Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+    );
 }
 
 /// The startup re-bind confirm: grouped account moves, one toggle line per
@@ -751,13 +781,15 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
 
 fn choice_buttons(
     choice: bool,
+    cancel_label: &str,
     destructive_confirm: bool,
     confirm_label: &str,
     gap: &'static str,
 ) -> Line<'static> {
+    let cancel = format!(" {cancel_label} ");
     let label = format!(" {confirm_label} ");
     Line::from(vec![
-        modal_button(" cancel ", !choice),
+        modal_button(&cancel, !choice),
         Span::raw(gap),
         if destructive_confirm {
             danger_button(&label, choice)
@@ -1034,7 +1066,7 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
             form.scroll.get().min(u16::MAX as usize) as u16,
             None,
             Some(ModalExtra::Buttons(
-                choice_buttons(form.confirm_overwrite, true, "add", " ")
+                choice_buttons(form.confirm_overwrite, "cancel", true, "add", " ")
                     .alignment(Alignment::Right),
             )),
         );
@@ -1482,28 +1514,22 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let tab_specific = tab_specific_rows(app);
 
-    // In a descended read-only pane, arrows do not switch tabs; Tab/BackTab still do.
-    let nav: &[(&str, &str)] = if (app.tab == Tab::Usage
-        && app.usage_detail_focus == StatusFocus::Detail)
-        || (app.tab == Tab::Tokens
-            && app.token_view == TokenView::Models
-            && app.model_detail_focus == StatusFocus::Detail)
-    {
-        &[
+    // The arrow-trap in a descended pane: `←` ascends, `→` stays on detail, and
+    // in an editable pane `tab`/`⇧tab` stay too. The switch keys themselves now
+    // live in GLOBAL below, so this block is descended-only.
+    let nav: &[(&str, &str)] = match pane_state(app) {
+        PaneState::ReadOnly => &[
             ("\u{2190}", "return to selector"),
             ("\u{2192}", "stays on detail"),
-            ("tab", "next tab"),
-            ("shift tab", "previous tab"),
-        ]
-    } else {
-        &[(
-            "\u{2190} \u{2192} \u{00b7} tab",
-            concat!(
-                "previous / next tab (",
-                key_lit!("shift tab"),
-                ": previous)"
+        ],
+        PaneState::Editable => &[
+            ("\u{2190}", "return to selector"),
+            (
+                "\u{2192} \u{00b7} tab \u{00b7} \u{21e7}tab",
+                "stays on detail",
             ),
-        )]
+        ],
+        PaneState::Rest => &[],
     };
 
     // The modal's own keys, in their own section. Not folded into `global`
@@ -1528,6 +1554,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("a", "actions"),
         ("x", "dismiss toast / alert"),
         ("q", "back / quit"),
+        ("\u{2190} \u{2192}", "switch screen"),
+        ("tab", "next screen"),
+        ("\u{21e7}tab", "previous screen"),
+        ("\u{2325}1-9", "jump to tab"),
         ("esc", "back within a sub-view (no-op at the top level)"),
         ("page up / page down", "scroll a page"),
         ("\u{2303}c", "quit from anywhere"),
@@ -1546,7 +1576,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .collect();
 
     let mut lines: Vec<Line<'_>> = Vec::new();
-    lines.extend(key_section("tabs", nav));
+    if !nav.is_empty() {
+        lines.extend(key_section("tabs", nav));
+    }
     lines.extend(key_section("this modal", modal_keys));
     for (section, entries) in &tab_specific {
         lines.extend(key_section(section, entries));
