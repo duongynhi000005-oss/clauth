@@ -261,7 +261,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   gateway-env.json         # the running daemon's CODEX_HOME, HOME, USERPROFILE, SHUNT_SERVER__BIND and SHUNT_SERVER__AUTH__* keys and the client names (never the tokens) its client-tokens variable holds, which the store move, the adopt, the Services card and the client-token checks read; written at its start and again on any gateway round where the config or env file names a tokens variable it does not answer for, or no record names the running daemon (0600)
   gateway.log              # the gateway's own stdout and stderr, size-capped like daemon.log
   shunt/                   # the gateway's credential stores: accounts/{claude,codex,kimi,antigravity}/, xai-auth.json, cursor-auth.json, antigravity-auth.json, codex-auth.json, claude-credentials.json
-  proxies.toml             # the proxy registry: one [service] table per registered proxy, in service order (0600)
+  proxies.toml             # the proxy registry: one [service] table per registered proxy, in service order (0600); a row with a key clauth does not know reads `misconfigured` and refuses `enable`/`disable`, naming the row and the key
   proxies/<service>/       # one state dir per proxy, its CLAUTH_PROXY_STATE_DIR (0700)
     accounts/              # the proxy's own account store
     config.json            # the proxy's own proxy-wide settings
