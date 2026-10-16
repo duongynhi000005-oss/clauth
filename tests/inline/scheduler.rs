@@ -6766,6 +6766,21 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
     let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
 
+    // A stale entry the daemon's cache no longer backs (another process removed
+    // the cache): the stand-down mirror must remove it, not keep it.
+    store
+        .lock()
+        .unwrap()
+        .insert("cacheless".to_string(), info.clone());
+    status
+        .lock()
+        .unwrap()
+        .insert("cacheless".to_string(), super::FetchStatus::Fresh);
+    last_fetched.lock().unwrap().insert(
+        oauth_key("cacheless"),
+        super::FetchStamp::at(super::EpochMs::from_millis(super::now_ms())),
+    );
+
     super::hydrate_from_daemon_caches(
         &store,
         &status,
@@ -6801,8 +6816,8 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         "last_fetched stamped at the cache mtime: {stamp:?} vs now {now}"
     );
 
-    // No cache → left untouched (the daemon publishes it shortly); never a
-    // synthetic entry that would render as data.
+    // No cache → the stale entry is REMOVED, never a synthetic entry that
+    // would render as data.
     assert!(store.lock().unwrap().get("cacheless").is_none());
     assert!(status.lock().unwrap().get("cacheless").is_none());
     assert!(
@@ -6810,6 +6825,57 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
             .lock()
             .unwrap()
             .get(&oauth_key("cacheless"))
+            .is_none()
+    );
+}
+
+/// A cacheless third-party seed name drops its stale provider entries (store,
+/// status and cadence leg) — the mirror's third-party half.
+#[test]
+fn standdown_hydrate_removes_a_cacheless_third_party_name() {
+    use crate::testutil::{bar, stats_with_bars};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    crate::testutil::register_names(&["tp-cacheless"]);
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    tp_store.lock().unwrap().insert(
+        "tp-cacheless".to_string(),
+        stats_with_bars(vec![bar("5h", 47.0)]),
+    );
+    tp_status
+        .lock()
+        .unwrap()
+        .insert("tp-cacheless".to_string(), super::FetchStatus::Fresh);
+    last_fetched.lock().unwrap().insert(
+        tp_key("tp-cacheless"),
+        super::FetchStamp::at(super::EpochMs::from_millis(super::now_ms())),
+    );
+
+    super::hydrate_from_daemon_caches(
+        &store,
+        &status,
+        &tp_store,
+        &tp_status,
+        &last_fetched,
+        &[],
+        &["tp-cacheless".to_string()],
+        &[],
+        REFRESH_INTERVAL_MS,
+    );
+
+    assert!(tp_store.lock().unwrap().get("tp-cacheless").is_none());
+    assert!(tp_status.lock().unwrap().get("tp-cacheless").is_none());
+    assert!(
+        last_fetched
+            .lock()
+            .unwrap()
+            .get(&tp_key("tp-cacheless"))
             .is_none()
     );
 }
@@ -6867,6 +6933,68 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
         seeded.and_then(|i| i.five_hour.map(|w| w.utilization)),
         Some(55.0),
         "the daemon's newer write wins on the next hydrate"
+    );
+}
+
+/// A cache that exists but won't parse leaves the entries (a transient read
+/// must not blank a reading), and a name absent from the seed list is never
+/// touched by hydration.
+#[test]
+fn standdown_hydrate_leaves_an_unparseable_cache_and_names_off_the_seed_list() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, profile_cache_path};
+    use crate::usage::UsageInfo;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    crate::testutil::register_names(&["kitty"]);
+    let path = profile_cache_path(
+        &crate::profile::ProfileName::from("kitty"),
+        USAGE_CACHE_FILE,
+    )
+    .expect("cache path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(&path, b"not json").expect("write the unparseable cache");
+
+    let info = UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    store
+        .lock()
+        .unwrap()
+        .insert("kitty".to_string(), info.clone());
+    store
+        .lock()
+        .unwrap()
+        .insert("stranger".to_string(), info.clone());
+
+    super::hydrate_from_daemon_caches(
+        &store,
+        &status,
+        &tp_store,
+        &tp_status,
+        &last_fetched,
+        &["kitty".to_string()],
+        &[],
+        &[],
+        REFRESH_INTERVAL_MS,
+    );
+
+    assert!(
+        store.lock().unwrap().contains_key("kitty"),
+        "an unparseable cache leaves the reading as it is"
+    );
+    assert!(
+        store.lock().unwrap().contains_key("stranger"),
+        "a name absent from the seed list is never touched by hydration"
     );
 }
 

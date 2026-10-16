@@ -886,7 +886,16 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
                 caller.device_for_log()
             );
             // Apply now that the state flock and config guard dropped, before
-            // the republish so the feed reflects the forget.
+            // the republish so the feed reflects the forget. This drain runs on
+            // the request thread, so a main-loop compare can overlap it and
+            // forget this switch's change a second time, counting it external
+            // (one extra reload). The second forget also clears memory-only
+            // state that landed between the two (a fetch's streak and cadence,
+            // a kick block, the `/profile` memo); readings, status and leg come
+            // back from the disk re-seed, the epoch is monotonic and the
+            // re-seed idempotent, and the compare's per-half CAS keeps the
+            // snapshot from regressing, so the cost is at most one extra
+            // request, never a wrong figure.
             if let Some(stores) = &ctx.memory_stores {
                 crate::usage::apply_pending_forgets(stores);
             }

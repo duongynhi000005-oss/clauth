@@ -3179,6 +3179,56 @@ fn reload_fingerprint_catches_a_non_newest_config_edit() {
     );
 }
 
+/// An anchor-only write (a re-anchor) moves the reload fingerprint, so a
+/// detector picks it up even though no config/credential file changed.
+#[test]
+fn reload_fingerprint_moves_on_an_anchor_only_write() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile(&ProfileName::from("p"))).expect("save p");
+    save_app_state(&AppState {
+        profiles: vec!["p".into()],
+        ..Default::default()
+    })
+    .expect("app state");
+    let before = reload_fingerprint();
+    let anchor = profile_dir(&ProfileName::from("p"))
+        .expect("profile_dir")
+        .join(crate::profile_cache::ACCOUNT_ID_CACHE_FILE);
+    std::fs::write(&anchor, "\"uuid-A\"").expect("write the anchor");
+    crate::testutil::set_mtime(
+        &anchor,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+    );
+    let after = reload_fingerprint();
+    assert_ne!(
+        before, after,
+        "an anchor-only write must flip the fingerprint"
+    );
+}
+
+/// A codex `auth.json`-only write moves the reload fingerprint, so a codex
+/// in-place rewrite (which touches nothing else) still triggers a reload.
+#[test]
+fn reload_fingerprint_moves_on_an_auth_json_only_write() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile(&ProfileName::from("p"))).expect("save p");
+    let auth = profile_dir(&ProfileName::from("p"))
+        .expect("profile_dir")
+        .join("auth.json");
+    std::fs::write(&auth, r#"{"tokens":{"account_id":"codex-A"}}"#).expect("write auth");
+    let before = reload_fingerprint();
+    std::fs::write(&auth, r#"{"tokens":{"account_id":"codex-B"}}"#).expect("rewrite auth");
+    crate::testutil::set_mtime(
+        &auth,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+    );
+    let after = reload_fingerprint();
+    assert_ne!(
+        before, after,
+        "an auth.json-only write must flip the fingerprint"
+    );
+}
+
 // The burn-aware tunable accessors reset a hand-edited out-of-band value to the
 // default (fail-safe, like the weekly line) and keep an in-band one. An unset
 // field reads as the default so `skip_serializing_if` keeps omitting it.

@@ -1862,6 +1862,12 @@ pub(crate) struct ReloadFingerprint {
     /// milliseconds-scale walk per rolling profile per ~2h — accepted over
     /// giving the fingerprint eyes into credential bytes.
     config_mtimes: Vec<ProfileStamps>,
+    /// `(profile dir name, account_id.json write time, auth.json write time)` —
+    /// the identity files the reload compare keys on, in a SECOND per-name vec so
+    /// the config tuple above keeps its shape. An anchor-only write (a re-anchor)
+    /// or an auth.json-only write (codex rewriting its store in place) flips the
+    /// fingerprint through this.
+    identity_mtimes: Vec<IdentityStamps>,
 }
 
 /// One profile dir's entry in [`ReloadFingerprint::config_mtimes`].
@@ -1872,14 +1878,21 @@ type ProfileStamps = (
     Option<SystemTime>,
 );
 
-/// Filesystem stat of the reload triggers, plus the swap receipt beside a
-/// `session-token.json` that exists — never that file's contents, since this runs
-/// per TUI frame. Holds NO locks — `config` sits high in the rank hierarchy, so
-/// this must stay lock-free — and fails soft: a readdir/stat error contributes
-/// the empty value instead of erroring.
+/// One profile dir's identity-file stamps in
+/// [`ReloadFingerprint::identity_mtimes`]: the anchor and the codex `auth.json`,
+/// each through [`crate::profile_cache::effective_write_time`].
+type IdentityStamps = (String, Option<SystemTime>, Option<SystemTime>);
+
+/// Filesystem stat of the reload triggers, plus the touch receipt beside each
+/// store stamped through [`crate::profile_cache::effective_write_time`] (the
+/// session-token, credentials, anchor and codex-auth files) — never the files'
+/// contents, since this runs per TUI frame. Holds NO locks — `config` sits high
+/// in the rank hierarchy, so this must stay lock-free — and fails soft: a
+/// readdir/stat error contributes the empty value instead of erroring.
 pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     let profiles_toml_mtime = app_state_mtime();
     let mut config_mtimes: Vec<ProfileStamps> = Vec::new();
+    let mut identity_mtimes: Vec<IdentityStamps> = Vec::new();
     if let Ok(root) = profiles_root()
         && let Ok(entries) = std::fs::read_dir(&root)
     {
@@ -1896,14 +1909,23 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
             );
             let store =
                 crate::profile_cache::effective_write_time(&entry.path().join("credentials.json"));
-            config_mtimes.push((name, config_mtime, token, store));
+            let anchor = crate::profile_cache::effective_write_time(
+                &entry
+                    .path()
+                    .join(crate::profile_cache::ACCOUNT_ID_CACHE_FILE),
+            );
+            let auth = crate::profile_cache::effective_write_time(&entry.path().join("auth.json"));
+            config_mtimes.push((name.clone(), config_mtime, token, store));
+            identity_mtimes.push((name, anchor, auth));
         }
     }
     config_mtimes.sort();
+    identity_mtimes.sort();
     ReloadFingerprint {
         profiles_toml_mtime,
         codex_toml_mtime: crate::codex_profiles::codex_state_mtime(),
         config_mtimes,
+        identity_mtimes,
     }
 }
 

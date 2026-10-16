@@ -256,6 +256,12 @@ pub(crate) mod rank {
         /// (`usage::forget::PENDING_FORGETS`): recorded inside the state flock
         /// (rank 500), drained with no ranked lock held.
         ForgetQueue = 1805;
+        /// The per-process identity snapshot every reload compare reads
+        /// (`usage::forget::MemoryStores::snapshot`). A leaf ABOVE
+        /// [`ForgetQueue`]: the compare computes its diff under it, releases it,
+        /// then forgets into the store locks (ranks 200-350), which would
+        /// otherwise invert the order.
+        Snapshot = 1810;
         /// The managed gateway's published slot (`daemon::gateway`): the
         /// supervisor thread replaces it, the status writer and
         /// `GET /api/v1/gateway` clone it. A true leaf: every acquisition is

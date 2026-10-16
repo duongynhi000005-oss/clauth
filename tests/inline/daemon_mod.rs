@@ -63,6 +63,16 @@ fn queued_targets(d: &Daemon) -> Vec<String> {
     v
 }
 
+/// The OAuth access token the daemon's token list holds for `name`, if any.
+fn daemon_token(d: &Daemon, name: &str) -> Option<String> {
+    d.usage_tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|t| t.name.as_str() == name)
+        .map(|t| t.access_token.clone())
+}
+
 /// Epoch-ms an hour ahead — a token with real life left, so the auth gate takes
 /// the no-refresh `Ready` path.
 fn future_expiry() -> i64 {
@@ -1404,6 +1414,82 @@ fn reload_if_changed_fires_on_external_mtime_change() {
     );
 }
 
+/// A non-reload re-baseline that forgets an external change keeps the OLD
+/// fingerprint, so the next reload re-reads config and rebuilds the token list
+/// with the new credential.
+#[test]
+fn a_daemon_rebaseline_that_forgets_keeps_the_old_fingerprint_for_the_next_reload() {
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use std::time::{Duration, SystemTime};
+
+    let _home = HomeSandbox::new();
+    let a = profile_with_creds("a", "access-A");
+    let config = persist(vec![a.clone()], Some("a"), 90_000);
+    let mut daemon = daemon_for(config);
+
+    assert_eq!(daemon_token(&daemon, "a").as_deref(), Some("access-A"));
+
+    // Another process re-logs `a` (new token) and drops the cache.
+    let a_b = profile_with_creds("a", "access-B");
+    save_profile(&a_b).expect("persist a's new login");
+    crate::profile_cache::remove_profile_cache(
+        &crate::profile::ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+    );
+    let cred = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("a"),
+        "credentials.json",
+    )
+    .expect("credentials path");
+    set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
+
+    // A non-reload re-baseline (the switch path's tail) forgets the change but
+    // must keep the OLD fingerprint.
+    daemon.rebaseline_and_forget(reload_fingerprint());
+    assert_eq!(
+        daemon_token(&daemon, "a").as_deref(),
+        Some("access-A"),
+        "the token list still holds the old token until the reload"
+    );
+
+    daemon.reload_if_changed();
+    assert_eq!(
+        daemon_token(&daemon, "a").as_deref(),
+        Some("access-B"),
+        "the kept-old fingerprint makes the reload fire and rebuild the token list"
+    );
+}
+
+/// A profile `config.toml` with a TOML error makes the daemon's reload fail
+/// once; the fingerprint is adopted anyway, so the next tick does not re-read
+/// (and re-log) the broken write every tick.
+#[test]
+fn a_broken_profile_config_reload_fails_once_then_adopts_the_fingerprint() {
+    let _home = HomeSandbox::new();
+    let config = persist(vec![profile_with_creds("a", "access-A")], Some("a"), 90_000);
+    let mut daemon = daemon_for(config);
+
+    let cfg_path =
+        crate::profile::profile_subpath(&crate::profile::ProfileName::from("a"), "config.toml")
+            .expect("config path");
+    std::fs::write(&cfg_path, "not = [valid toml").expect("write broken config");
+    set_mtime(&cfg_path, SystemTime::now() + Duration::from_secs(5));
+
+    assert_ne!(
+        daemon.last_reload_fp,
+        reload_fingerprint(),
+        "the broken write must move the fingerprint"
+    );
+
+    daemon.reload_if_changed();
+
+    assert_eq!(
+        daemon.last_reload_fp,
+        reload_fingerprint(),
+        "a failed load adopts the fingerprint, so the next tick does not reload the broken write again"
+    );
+}
+
 // ── cross-process RMW atomicity (self-adoption window) ────────────────────────
 
 /// After a switch, the daemon's `last_reload_fp` equals the on-disk fingerprint — it
@@ -1456,6 +1542,274 @@ fn rmw_switch_adopts_own_write_mtime_then_reloads_external() {
         daemon.refresh_interval.load(Ordering::Relaxed),
         30_000,
         "a later external write is still reloaded (no over-adoption)"
+    );
+}
+
+// ── reload compare ───────────────────────────────────────────────────────────
+
+/// The daemon's reload forgets a half another process changed — an OAuth
+/// token change clears the OAuth reading, a third-party key change clears only
+/// the provider reading (a hybrid's OAuth leg stays).
+#[test]
+fn a_daemon_reload_forgets_external_oauth_and_third_party_changes() {
+    use crate::profile::{Profile, save_profile};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE};
+    use crate::usage::FetchStatus;
+    use std::time::{Duration, SystemTime};
+
+    let _home = HomeSandbox::new();
+
+    let a = profile_with_creds("a", "access-A");
+    let mut hybrid = Profile::new(
+        "hybrid".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("old-key".to_string()),
+    );
+    hybrid.credentials = Some(oauth_creds("hybrid-A"));
+
+    let config = persist(vec![a.clone(), hybrid.clone()], Some("a"), 90_000);
+    let mut daemon = daemon_for(config);
+
+    // Seed the OAuth readings through the real boot seed (which also stamps
+    // `last_fetched`), and plant the provider reading by hand.
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    for name in ["a", "hybrid"] {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            USAGE_CACHE_FILE,
+            &info,
+        );
+    }
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("hybrid"),
+        THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+    crate::usage::bootstrap_fetch(
+        &daemon.usage_store,
+        &daemon.usage_status,
+        &daemon.last_fetched,
+        &["a".to_string(), "hybrid".to_string()],
+        90_000,
+    );
+    daemon
+        .third_party_usage_store
+        .lock()
+        .unwrap()
+        .insert("hybrid".to_string(), stats.clone());
+    daemon
+        .third_party_status
+        .lock()
+        .unwrap()
+        .insert("hybrid".to_string(), FetchStatus::Fresh);
+
+    // Another process: `a` re-logs (new token), `hybrid` re-keys (same token).
+    let a_b = profile_with_creds("a", "access-B");
+    let mut hybrid_new = hybrid.clone();
+    hybrid_new.api_key = Some("new-key".to_string());
+    save_profile(&a_b).expect("persist a's new login");
+    save_profile(&hybrid_new).expect("persist hybrid's new key");
+    // The other process's forget_disk drops the caches the changed halves own.
+    crate::profile_cache::remove_profile_cache(
+        &crate::profile::ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+    );
+    crate::profile_cache::remove_profile_cache(
+        &crate::profile::ProfileName::from("hybrid"),
+        THIRD_PARTY_CACHE_FILE,
+    );
+    for (name, file) in [("a", "credentials.json"), ("hybrid", "config.toml")] {
+        let path = crate::profile::profile_subpath(&crate::profile::ProfileName::from(name), file)
+            .expect("changed file path");
+        set_mtime(&path, SystemTime::now() + Duration::from_secs(60));
+    }
+
+    let hybrid_oauth_base = crate::usage::epoch_value(
+        &crate::profile::ProfileName::from("hybrid"),
+        crate::usage::Half::OAuth,
+    );
+
+    daemon.reload_if_changed();
+
+    assert!(
+        !daemon.usage_store.lock().unwrap().contains_key("a"),
+        "a's OAuth reading goes with the external re-login"
+    );
+    assert!(
+        !daemon
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key("hybrid"),
+        "the hybrid's provider reading goes with the external re-key"
+    );
+    assert!(
+        daemon.usage_store.lock().unwrap().contains_key("hybrid"),
+        "the hybrid's OAuth reading stays when only the key changed"
+    );
+    assert!(
+        !daemon
+            .third_party_status
+            .lock()
+            .unwrap()
+            .contains_key("hybrid"),
+        "the hybrid's provider status goes with the external re-key"
+    );
+    assert_eq!(
+        crate::usage::epoch_value(
+            &crate::profile::ProfileName::from("hybrid"),
+            crate::usage::Half::OAuth
+        ),
+        hybrid_oauth_base,
+        "only the provider half changed: the hybrid's OAuth epoch does not move"
+    );
+}
+
+/// A no-op re-save written by another process forgets nothing.
+#[test]
+fn a_daemon_reload_forgets_nothing_on_a_noop_resave() {
+    use crate::profile::save_profile;
+    use crate::usage::{FetchStatus, Half, epoch_value};
+    use std::time::{Duration, SystemTime};
+
+    let _home = HomeSandbox::new();
+
+    let a = profile_with_creds("a", "access-A");
+    let config = persist(vec![a.clone()], Some("a"), 90_000);
+    let mut daemon = daemon_for(config);
+
+    daemon.usage_store.lock().unwrap().insert(
+        "a".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    daemon
+        .usage_status
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), FetchStatus::Fresh);
+    let base = epoch_value(&crate::profile::ProfileName::from("a"), Half::OAuth);
+
+    save_profile(&a).expect("no-op re-save");
+    let cred = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("a"),
+        "credentials.json",
+    )
+    .expect("credentials path");
+    set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
+
+    daemon.reload_if_changed();
+
+    assert!(
+        daemon.usage_store.lock().unwrap().contains_key("a"),
+        "a no-op re-save forgets nothing"
+    );
+    assert_eq!(
+        epoch_value(&crate::profile::ProfileName::from("a"), Half::OAuth),
+        base,
+        "the epoch does not move on a no-op re-save"
+    );
+
+    // An anchor backfill: the anchor appears over the unchanged stored token.
+    crate::usage::seed_login_anchor(
+        &crate::profile::ProfileName::from("a"),
+        Some(&crate::profile::AccountId::from("uuid-A")),
+    );
+    let anchor = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("a"),
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+    )
+    .expect("anchor path");
+    set_mtime(&anchor, SystemTime::now() + Duration::from_secs(120));
+    daemon.reload_if_changed();
+    assert!(
+        daemon.usage_store.lock().unwrap().contains_key("a"),
+        "an anchor backfill over the same token forgets nothing"
+    );
+    assert_eq!(
+        epoch_value(&crate::profile::ProfileName::from("a"), Half::OAuth),
+        base,
+        "the epoch does not move on an anchor backfill"
+    );
+}
+
+/// With another process paused mid-hold (new identity written, the old
+/// cache already removed), the reload's re-seed brings back no old reading.
+#[test]
+fn a_daemon_reload_reseed_brings_back_no_old_reading() {
+    use crate::profile::save_profile;
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::usage::FetchLeg;
+    use std::time::{Duration, SystemTime};
+
+    let _home = HomeSandbox::new();
+
+    let a = profile_with_creds("a", "access-A");
+    let config = persist(vec![a.clone()], Some("a"), 90_000);
+    let mut daemon = daemon_for(config);
+
+    // Seed the reading from a real cache, the way the daemon's boot seed would.
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+        &info,
+    );
+    crate::usage::bootstrap_fetch(
+        &daemon.usage_store,
+        &daemon.usage_status,
+        &daemon.last_fetched,
+        &["a".to_string()],
+        90_000,
+    );
+    assert!(daemon.usage_store.lock().unwrap().contains_key("a"));
+
+    // Another process mid-hold: the identity write landed, forget_disk already
+    // removed the old cache.
+    let a_b = profile_with_creds("a", "access-B");
+    save_profile(&a_b).expect("persist the new identity");
+    crate::profile_cache::remove_profile_cache(
+        &crate::profile::ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+    );
+    let cred = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("a"),
+        "credentials.json",
+    )
+    .expect("credentials path");
+    set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
+
+    daemon.reload_if_changed();
+
+    assert!(
+        !daemon.usage_store.lock().unwrap().contains_key("a"),
+        "the reload's re-seed brings back no old reading once the cache is gone"
+    );
+    assert!(
+        !daemon
+            .last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&FetchLeg::OAuth.key(crate::profile::ProfileName::from("a"))),
+        "the reload drops the old cadence stamp too"
     );
 }
 

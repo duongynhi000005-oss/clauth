@@ -1411,9 +1411,10 @@ pub(crate) fn fetch_raw(
 ///
 /// Run inside the caller's state-flock hold (the `/profile` read's two
 /// ride-alongs share ONE hold and ONE stored-token check). A same-account read
-/// writes nothing; a replacement removes the known-wrong anchor before writing
-/// (a failed write leaves the profile unanchored, never on the displaced
-/// account) and logs both values only when the write landed.
+/// writes nothing; a replacement writes the new anchor first and removes the
+/// known-wrong anchor only when that write fails (leaving the profile
+/// unanchored, never on the displaced account), and logs both values only when
+/// the write landed.
 fn reconcile_identity_anchor_held(
     name: &ProfileName,
     profile: &RawProfile,
@@ -1433,12 +1434,13 @@ fn reconcile_identity_anchor_held(
     if current.as_deref() == Some(uuid) {
         return;
     }
-    // Remove the known-wrong anchor before writing, so a failed write leaves
-    // the profile unanchored, never on the displaced account.
-    remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
+    // Write the new anchor first (an atomic replace), so a reader never sees
+    // the anchor absent over a still-present login; only a failed write removes
+    // it, leaving the profile unanchored, never on the displaced account.
     let landed =
         crate::profile_cache::write_profile_cache_reported(name, ACCOUNT_ID_CACHE_FILE, &new_uuid);
     if !landed {
+        remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
         logline!("clauth: {name}: could not write the identity anchor");
     } else if let Some(old) = current
         && old.trim() != uuid
@@ -1551,6 +1553,36 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
     Ok(login_profile_from_raw(p))
 }
 
+/// A test's stand-in for another process's compare landing inside
+/// `seed_login_anchor`'s hold, right before the anchor write. Run once for the
+/// profile it names.
+#[cfg(test)]
+pub(crate) type CompareHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static COMPARE_HOOK: std::sync::Mutex<Option<std::collections::HashMap<String, CompareHook>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_compare_hook(profile: &str, f: CompareHook) {
+    if let Ok(mut hooks) = COMPARE_HOOK.lock() {
+        hooks
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(profile.to_string(), f);
+    }
+}
+
+#[cfg(test)]
+fn run_compare_hook(profile: &str) {
+    let hook = COMPARE_HOOK
+        .lock()
+        .ok()
+        .and_then(|mut hooks| hooks.as_mut().and_then(|hooks| hooks.remove(profile)));
+    if let Some(f) = hook {
+        f();
+    }
+}
+
 /// Seed a profile's identity anchor from a completed login install — or clear it
 /// when the install proves no account uuid. UNCONDITIONAL overwrite, unlike
 /// [`reconcile_identity_anchor_held`]'s read-time reconcile (which writes only when
@@ -1568,14 +1600,20 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
         remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
         return;
     };
-    // Remove before writing: a failed write leaves the profile unanchored,
-    // never on the account the write was meant to replace.
-    remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
+    // Write the new anchor first (an atomic replace): a reader between this
+    // write and a failed write's remove sees either the old or the new anchor,
+    // never a gap where the anchor is absent over a still-present login (which
+    // a compare would read as a spurious change). Only a failed write removes
+    // the anchor, leaving the profile unanchored, never on the account the
+    // write was meant to replace.
+    #[cfg(test)]
+    run_compare_hook(name.as_str());
     if !crate::profile_cache::write_profile_cache_reported(
         name,
         ACCOUNT_ID_CACHE_FILE,
         &AccountId::from(uuid.to_string()),
     ) {
+        remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
         logline!("clauth: {name}: could not write the identity anchor");
     }
 }

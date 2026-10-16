@@ -173,18 +173,34 @@ impl super::Daemon {
         if current == self.last_reload_fp {
             return;
         }
-        self.last_reload_fp = current;
         match load_config() {
             Ok(new_config) => {
                 self.refresh_interval
                     .store(new_config.state.refresh_interval_ms, Ordering::Relaxed);
+                let profile_names: Vec<ProfileName> =
+                    new_config.profiles.iter().map(|p| p.name.clone()).collect();
                 if let Ok(mut c) = self.config.lock() {
                     *c = new_config;
                 }
+                // The reload DID reload config, so it adopts the fingerprint no
+                // matter what the compare found, then runs the compare before
+                // the token rebuild.
+                crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
+                self.last_reload_fp = current;
                 self.rebuild_tokens();
                 logline!("clauth daemon: reloaded config after an external change");
             }
-            Err(e) => logline!("clauth daemon: config reload failed: {e}"),
+            Err(e) => {
+                // A failed load still runs the compare against the
+                // still-current config, then adopts the fingerprint WHATEVER
+                // the compare found: a broken write fails the load AND reads as
+                // an unreadable third-party half, so without the unconditional
+                // adopt the compare would skip (and re-log the broken write)
+                // every tick.
+                self.rebaseline_and_forget(current.clone());
+                self.last_reload_fp = current;
+                logline!("clauth daemon: config reload failed: {e}");
+            }
         }
     }
 
@@ -302,7 +318,7 @@ impl super::Daemon {
                 // The gate persisted `auth_broken`; adopt that fingerprint so the
                 // next tick's reload doesn't treat our own write as external.
                 // Terminal failure (drop, not retry) — clear any backoff.
-                self.last_reload_fp = reload_fingerprint();
+                self.rebaseline_and_forget(reload_fingerprint());
                 logline!(
                     "clauth daemon: {}",
                     crate::format::login_expired(&target).line()
@@ -380,9 +396,10 @@ impl super::Daemon {
         match result {
             Ok((fp, returning, changed)) => {
                 self.rebuild_tokens();
-                // Apply now that the state flock and config guard dropped.
-                self.apply_forgets();
-                self.last_reload_fp = fp;
+                // Adopt the post-write fingerprint and run the compare, which
+                // drains the switch's own forgets first, so the compare is a
+                // no-op for them.
+                self.rebaseline_and_forget(fp);
                 self.switch_backoff = None;
                 if returning {
                     logline!("clauth daemon: returned to preferred account '{target}'");
@@ -494,9 +511,8 @@ impl super::Daemon {
         match result {
             Ok((fp, changed)) => {
                 self.rebuild_tokens();
-                // Apply now that the state flock and config guard dropped.
-                self.apply_forgets();
-                self.last_reload_fp = fp;
+                // Adopt the post-write fingerprint and run the compare.
+                self.rebaseline_and_forget(fp);
                 logline!("clauth daemon: switched off: all accounts spent");
                 if changed {
                     crate::daemon::publish_status(&self.config);

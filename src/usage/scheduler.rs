@@ -4431,8 +4431,10 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
 /// hydrate contract is testable without a full `SchedulerState`: every seed
 /// name with an on-disk cache lands in its store; an OAuth seed name and a
 /// third-party `third_party_work` name also get a freshness-derived status and
-/// `last_fetched` stamped at the cache clock ([`bootstrap_third_party`]);
-/// cacheless profiles are left untouched (the daemon will publish them shortly).
+/// `last_fetched` stamped at the cache clock ([`bootstrap_third_party`]). A
+/// name whose cache file the daemon removed drops its stale entries; a cache
+/// that exists but won't parse leaves them (a transient read must not blank a
+/// reading).
 #[allow(clippy::too_many_arguments)]
 fn hydrate_from_daemon_caches(
     store: &UsageStore,
@@ -4447,23 +4449,56 @@ fn hydrate_from_daemon_caches(
 ) {
     let now = now_ms();
     for name in oauth_seed_names {
-        try_seed_cache(
-            store,
-            status,
-            last_fetched,
-            &ProfileName::from(name.clone()),
-            now,
-            interval_ms,
-        );
+        let pname = ProfileName::from(name.clone());
+        if profile_cache_mtime_ms(&pname, USAGE_CACHE_FILE).is_none() {
+            remove_oauth_hydration_entries(store, status, last_fetched, &pname);
+        } else {
+            try_seed_cache(store, status, last_fetched, &pname, now, interval_ms);
+        }
     }
-    bootstrap_third_party(
-        tp_store,
-        tp_status,
-        last_fetched,
-        third_party_seed_names,
-        third_party_work,
-        interval_ms,
-    );
+    let scheduled: HashSet<&str> = third_party_work.iter().map(|e| e.name.as_str()).collect();
+    for name in third_party_seed_names {
+        let pname = ProfileName::from(name.clone());
+        let is_scheduled = scheduled.contains(name.as_str());
+        if profile_cache_mtime_ms(&pname, THIRD_PARTY_CACHE_FILE).is_none() {
+            remove_third_party_hydration_entries(tp_store, tp_status, last_fetched, &pname);
+        } else {
+            seed_third_party_name(
+                tp_store,
+                tp_status,
+                last_fetched,
+                &pname,
+                is_scheduled,
+                now,
+                interval_ms,
+            );
+        }
+    }
+}
+
+/// Drop one OAuth name's store entries the stand-down mirror owns: the usage
+/// cache feeds the reading, the status and the `last_fetched` leg alone.
+fn remove_oauth_hydration_entries(
+    store: &UsageStore,
+    status: &StatusStore,
+    last_fetched: &LastFetchedAt,
+    name: &ProfileName,
+) {
+    super::forget::remove_name_entry(store, name);
+    super::forget::remove_name_entry(status, name);
+    super::forget::remove_leg_entry(last_fetched, name, FetchLeg::OAuth);
+}
+
+/// Drop one third-party name's store entries the stand-down mirror owns.
+fn remove_third_party_hydration_entries(
+    store: &ThirdPartyUsageStore,
+    status: &ThirdPartyStatusStore,
+    last_fetched: &LastFetchedAt,
+    name: &ProfileName,
+) {
+    super::forget::remove_name_entry(store, name);
+    super::forget::remove_name_entry(status, name);
+    super::forget::remove_leg_entry(last_fetched, name, FetchLeg::ThirdParty);
 }
 
 #[allow(clippy::too_many_arguments)]

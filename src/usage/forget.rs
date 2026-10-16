@@ -5,7 +5,7 @@
 //! `Config`, so they run after the config guard drops; the per-process epoch
 //! gates the startup seeds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
@@ -87,7 +87,7 @@ fn stored_token_digest(access_token: &str) -> u64 {
 /// The OAuth half's identity: the anchor plus the stored-token digest. The
 /// stored login is the dominant fact — a stale anchor file left behind by a
 /// log out reads `Unanchored(None)`, never an anchor without a login.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct OAuthIdentity {
     pub(crate) anchor: Option<AccountId>,
     pub(crate) stored: Option<u64>,
@@ -283,6 +283,178 @@ pub(crate) fn read_before_identities(name: &ProfileName) -> BeforeIdentities {
         api_key,
         env_token,
         has_credentials,
+    }
+}
+
+/// Read every half a snapshot holds for `name`, straight from the raw files.
+/// Throughput is absent by design: it has no memory store to forget.
+pub(crate) fn read_snapshot_identities(name: &ProfileName) -> SnapshotIdentities {
+    let before = read_before_identities(name);
+    SnapshotIdentities {
+        oauth: before.oauth,
+        third_party: before.third_party,
+        codex: read_codex_identity(name),
+    }
+}
+
+/// Which halves' identity files exist but cannot be read or parsed — the halves
+/// the compare skips rather than reading as "no credential".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CompareSkips {
+    oauth: bool,
+    third_party: bool,
+    codex: bool,
+}
+
+impl CompareSkips {
+    fn any(self) -> bool {
+        self.oauth || self.third_party || self.codex
+    }
+
+    /// The unreadable flag for one half.
+    fn half(self, half: Half) -> bool {
+        match half {
+            Half::OAuth => self.oauth,
+            Half::ThirdParty => self.third_party,
+            Half::Codex => self.codex,
+            Half::Throughput => false,
+        }
+    }
+}
+
+/// Read `name`'s identity for the compare, marking each half whose identity
+/// file exists but cannot be read or parsed. Such a half is skipped — a torn
+/// write is RETRY, never "no credential" — so the compare forgets nothing on a
+/// guess and the fingerprint stays unadopted.
+fn read_for_compare(name: &ProfileName) -> (SnapshotIdentities, CompareSkips) {
+    let (oauth, oauth_skip) = read_oauth_for_compare(name);
+    let (third_party, third_party_skip) = read_third_party_for_compare(name);
+    let (codex, codex_skip) = read_codex_for_compare(name);
+    (
+        SnapshotIdentities {
+            oauth,
+            third_party,
+            codex,
+        },
+        CompareSkips {
+            oauth: oauth_skip,
+            third_party: third_party_skip,
+            codex: codex_skip,
+        },
+    )
+}
+
+/// The OAuth half's identity plus its unreadable flag, off ONE read of
+/// `credentials.json`. A store that exists but fails to read or parse is
+/// unreadable; a store that parses with no login is genuinely "no credential".
+fn read_oauth_for_compare(name: &ProfileName) -> (OAuthIdentity, bool) {
+    let Ok(path) = crate::profile::profile_subpath(name, "credentials.json") else {
+        return (OAuthIdentity::default(), false);
+    };
+    let creds = crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&path);
+    let stored = match creds {
+        Ok(creds) => creds
+            .claude_ai_oauth
+            .map(|o| stored_token_digest(&o.access_token)),
+        Err(_) if path.exists() => return (OAuthIdentity::default(), true),
+        Err(_) => None,
+    };
+    let anchor = match stored {
+        Some(_) => load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE)
+            .filter(|u| !u.trim().is_empty()),
+        None => None,
+    };
+    (OAuthIdentity { anchor, stored }, false)
+}
+
+/// The third-party half's identity plus its unreadable flag. The identity comes
+/// off one `config.toml` read; a store that exists but fails to read or parse
+/// is unreadable, never "no credential".
+fn read_third_party_for_compare(name: &ProfileName) -> (Option<u64>, bool) {
+    let Ok(path) = crate::profile::profile_subpath(name, "config.toml") else {
+        return (None, false);
+    };
+    let Some(endpoint) = crate::profile::stored_endpoint_identity(name) else {
+        return (None, path.exists());
+    };
+    let provider = endpoint
+        .base_url
+        .as_deref()
+        .and_then(Provider::from_base_url);
+    let identity = third_party_identity(
+        provider,
+        endpoint.api_key.as_deref(),
+        endpoint.console.as_ref(),
+        endpoint.base_url.as_deref(),
+    );
+    (identity, false)
+}
+
+/// The codex half's identity plus its unreadable flag. `auth.json` is rewritten
+/// in place by codex outside clauth's state flock, so a torn read here is the
+/// live case: it reads unreadable, never "no credential".
+fn read_codex_for_compare(name: &ProfileName) -> (Option<String>, bool) {
+    let Ok(path) = crate::profile::profile_subpath(name, "auth.json") else {
+        return (None, false);
+    };
+    match crate::codex_auth::read_store_auth(name.as_str()) {
+        Some(auth) => (auth.account_id().map(str::to_string), false),
+        None if path.exists() => (None, true),
+        None => (None, false),
+    }
+}
+
+/// Whether `half` differs between two snapshots. The OAuth half uses the stored
+/// changed predicate (an anchor backfill over the same token is not a change);
+/// the other halves compare by equality.
+fn half_changed(half: Half, before: &SnapshotIdentities, after: &SnapshotIdentities) -> bool {
+    match half {
+        Half::OAuth => oauth_changed(&before.oauth, &after.oauth),
+        Half::ThirdParty => before.third_party != after.third_party,
+        Half::Codex => before.codex != after.codex,
+        Half::Throughput => false,
+    }
+}
+
+/// The names a snapshot inspects: the config's profiles plus the codex roster
+/// (a codex-only profile lives in `codex-profiles.toml`, not `profiles.toml`).
+/// A failed roster read stands `fallback` in for the codex names — the previous
+/// snapshot's keys — so a failed read forgets no codex names on a guess.
+fn snapshot_names(
+    config: &[ProfileName],
+    fallback: impl Iterator<Item = ProfileName>,
+) -> Vec<ProfileName> {
+    let mut names: Vec<ProfileName> = config.to_vec();
+    match crate::codex_profiles::CodexState::load() {
+        Ok(codex) => names.extend(codex.profiles().iter().cloned()),
+        Err(_) => names.extend(fallback),
+    }
+    names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    names.dedup();
+    names
+}
+
+/// Build a fresh snapshot for a process that just registered its reading
+/// stores, seeded from disk so the first compare sees no spurious change.
+pub(crate) fn new_snapshot(
+    config: &[ProfileName],
+) -> Arc<RankedMutex<SnapshotMap, rank::Snapshot>> {
+    let snapshot: Arc<RankedMutex<SnapshotMap, rank::Snapshot>> =
+        Arc::new(RankedMutex::new(HashMap::new()));
+    seed_snapshot_handle(&snapshot, config);
+    snapshot
+}
+
+fn seed_snapshot_handle(
+    snapshot: &RankedMutex<SnapshotMap, rank::Snapshot>,
+    config: &[ProfileName],
+) {
+    let names = snapshot_names(config, std::iter::empty());
+    let mut map = snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for name in &names {
+        map.insert(name.to_string(), read_snapshot_identities(name));
     }
 }
 
@@ -490,6 +662,44 @@ pub(crate) struct MemoryStores {
     pub(crate) third_party_broken: ThirdPartyBroken,
     pub(crate) suppressed: SuppressedAuthExpiredStore,
     pub(crate) interval_ms: Arc<AtomicU64>,
+    /// The per-process identity snapshot the reload compare diffs against,
+    /// refreshed on every applied forget. Leaf-ranked so the compare can read
+    /// it, release it, then forget into the store locks without inverting the
+    /// lock order.
+    pub(crate) snapshot: Arc<RankedMutex<SnapshotMap, rank::Snapshot>>,
+}
+
+/// The halves a snapshot holds per name. `Throughput` has no memory store, so
+/// it is compared nowhere here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SnapshotIdentities {
+    pub(crate) oauth: OAuthIdentity,
+    pub(crate) third_party: Option<u64>,
+    pub(crate) codex: Option<String>,
+}
+
+pub(crate) type SnapshotMap = HashMap<String, SnapshotIdentities>;
+
+/// What a reload compare found: whether it forgot a change this process's own
+/// drained queue did not account for, and whether it skipped anything.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompareOutcome {
+    /// A half whose identity changed and was NOT this process's own drained
+    /// forget (an external change), or a vanished name with a non-default half.
+    external_change: bool,
+    /// The compare skipped at least one half: an identity file that exists but
+    /// cannot be read or parsed.
+    skipped: bool,
+}
+
+impl CompareOutcome {
+    /// Whether a non-reload re-baseline may adopt the new fingerprint. It may
+    /// not after an external change or a skip: the in-memory config and token
+    /// lists still match the OLD fingerprint then, so the next tick's reload
+    /// must re-read config and rebuild the token lists.
+    pub(crate) fn clean(self) -> bool {
+        !self.external_change && !self.skipped
+    }
 }
 
 #[cfg(test)]
@@ -514,7 +724,15 @@ impl MemoryStores {
             third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
             suppressed: Arc::new(RankedMutex::new(HashMap::new())),
             interval_ms: Arc::new(AtomicU64::new(90_000)),
+            snapshot: Arc::new(RankedMutex::new(HashMap::new())),
         }
+    }
+
+    /// Seed the snapshot from disk for the names a test is about to drive, so
+    /// the first compare treats the pre-test identity as the baseline (the same
+    /// moment the real `App`/`Daemon` construction seeds at).
+    pub(crate) fn seed_snapshot(&self, config: &[ProfileName]) {
+        seed_snapshot_handle(&self.snapshot, config);
     }
 }
 
@@ -523,6 +741,25 @@ impl MemoryStores {
 /// `/profile` stamp is `forget_disk(OAuth)`'s. Runs with no ranked lock held
 /// (the stores rank BELOW `Config`).
 pub(crate) fn forget_memory(stores: &MemoryStores, name: &ProfileName, half: Half) {
+    // Read the half's identity BEFORE the re-seed through the compare's
+    // unreadable-aware readers: a torn file leaves the snapshot half untouched
+    // (RETRY, never "no credential"), and a change by another process between
+    // the read and the re-seed is not absorbed into the snapshot without a
+    // forget.
+    let refreshed = read_half_identity(name, half);
+    forget_memory_with_identity(stores, name, half, refreshed);
+}
+
+/// The forget body: bump the epoch, clear the half's name-keyed entries, then
+/// re-seed from disk (a seed another process wrote survives). `refreshed` is the
+/// identity to store into the snapshot refresh; `None` (an unreadable file, or
+/// Throughput, which has no snapshot entry) leaves the snapshot half untouched.
+fn forget_memory_with_identity(
+    stores: &MemoryStores,
+    name: &ProfileName,
+    half: Half,
+    refreshed: Option<HalfIdentity>,
+) {
     bump_epoch(name, half);
     clear_memory(stores, name, half);
     let interval_ms = stores.interval_ms.load(Ordering::Relaxed);
@@ -555,6 +792,78 @@ pub(crate) fn forget_memory(stores: &MemoryStores, name: &ProfileName, half: Hal
             seed_codex_name(&stores.usage, &stores.usage_status, name, now, interval_ms);
         }
         Half::Throughput => {}
+    }
+    refresh_snapshot_half(stores, name, half, refreshed);
+}
+
+/// One half's identity read before a forget's re-seed — the value the snapshot
+/// refresh stores, so the refresh never disagrees with the re-seed's disk read.
+enum HalfIdentity {
+    OAuth(OAuthIdentity),
+    ThirdParty(Option<u64>),
+    Codex(Option<String>),
+}
+
+fn read_half_identity(name: &ProfileName, half: Half) -> Option<HalfIdentity> {
+    match half {
+        Half::OAuth => {
+            let (identity, unreadable) = read_oauth_for_compare(name);
+            (!unreadable).then_some(HalfIdentity::OAuth(identity))
+        }
+        Half::ThirdParty => {
+            let (identity, unreadable) = read_third_party_for_compare(name);
+            (!unreadable).then_some(HalfIdentity::ThirdParty(identity))
+        }
+        Half::Codex => {
+            let (identity, unreadable) = read_codex_for_compare(name);
+            (!unreadable).then_some(HalfIdentity::Codex(identity))
+        }
+        Half::Throughput => None,
+    }
+}
+
+/// One half's identity from the compare's flock-held reads, for the snapshot
+/// refresh after a compare forget: `None` when the half was unreadable (leave
+/// the snapshot half untouched) or has no snapshot entry.
+fn half_identity_from_reads(
+    reads: &HashMap<String, (SnapshotIdentities, CompareSkips)>,
+    name: &ProfileName,
+    half: Half,
+) -> Option<HalfIdentity> {
+    let (identity, unreadable) = reads.get(name.as_str())?;
+    if unreadable.half(half) {
+        return None;
+    }
+    match half {
+        Half::OAuth => Some(HalfIdentity::OAuth(identity.oauth.clone())),
+        Half::ThirdParty => Some(HalfIdentity::ThirdParty(identity.third_party)),
+        Half::Codex => Some(HalfIdentity::Codex(identity.codex.clone())),
+        Half::Throughput => None,
+    }
+}
+
+/// Store the half's pre-forget identity into the snapshot, so this process's
+/// own change reads as "already seen" at the next compare and is forgotten
+/// exactly once. Runs after the store locks above are released.
+fn refresh_snapshot_half(
+    stores: &MemoryStores,
+    name: &ProfileName,
+    half: Half,
+    refreshed: Option<HalfIdentity>,
+) {
+    let Some(refreshed) = refreshed else {
+        return; // Throughput has no snapshot entry.
+    };
+    let mut snap = stores
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = snap.entry(name.to_string()).or_default();
+    match (half, refreshed) {
+        (Half::OAuth, HalfIdentity::OAuth(v)) => entry.oauth = v,
+        (Half::ThirdParty, HalfIdentity::ThirdParty(v)) => entry.third_party = v,
+        (Half::Codex, HalfIdentity::Codex(v)) => entry.codex = v,
+        _ => {}
     }
 }
 
@@ -593,20 +902,184 @@ fn clear_memory(stores: &MemoryStores, name: &ProfileName, half: Half) {
     }
 }
 
+/// Take the pending queue (forgets + renames) without applying it, so the
+/// compare can apply it AFTER its flock-held reads. The queue lock ranks above
+/// the state flock, so the compare takes it inside the hold (ascending).
+fn take_pending_forgets() -> Vec<PendingAction> {
+    PENDING_FORGETS
+        .lock()
+        .ok()
+        .map(|mut p| std::mem::take(&mut *p))
+        .unwrap_or_default()
+}
+
 /// Drain the forgets and renames a change site noted and apply each to memory.
 /// Called by the TUI after its config guard drops (the change site itself
 /// cannot: the stores rank below `Config`).
 pub(crate) fn apply_pending_forgets(stores: &MemoryStores) {
-    let pending: Vec<PendingAction> = PENDING_FORGETS
-        .lock()
-        .ok()
-        .map(|mut p| std::mem::take(&mut *p))
-        .unwrap_or_default();
+    let pending: Vec<PendingAction> = take_pending_forgets();
     for action in pending {
         match action {
             PendingAction::Forget(name, half) => forget_memory(stores, &name, half),
             PendingAction::Rename(old, new) => forget_memory_rename(stores, &old, &new),
         }
+    }
+}
+
+/// The shared reload compare: for each name in the snapshot's union, forget the
+/// halves whose stored identity changed since this process last looked. Memory
+/// only — it never writes disk. `config` is the freshly-loaded config's profile
+/// names; the codex roster and the snapshot's own keys join it.
+pub(crate) fn reload_and_forget(stores: &MemoryStores, config: &[ProfileName]) -> CompareOutcome {
+    // Take and apply this process's pending queue first. Each taken forget is
+    // forgotten once and its snapshot half refreshed from a fresh
+    // unreadable-aware read (an unreadable file leaves the half untouched), so
+    // the diff below reads the half as already seen and never counts it as an
+    // external change; a taken rename moves the snapshot entry with the memory
+    // entries. No state flock: the anchor's remove-then-write gap is closed at
+    // its writers, so the compare needs no hold.
+    let taken: Vec<PendingAction> = take_pending_forgets();
+    let mut taken_renames: Vec<(ProfileName, ProfileName)> = Vec::new();
+    for action in &taken {
+        match action {
+            PendingAction::Forget(name, half) => forget_memory(stores, name, *half),
+            PendingAction::Rename(old, new) => {
+                taken_renames.push((old.clone(), new.clone()));
+                forget_memory_rename(stores, old, new);
+            }
+        }
+    }
+
+    // The snapshot's previous keys, for the codex-roster fallback, and the
+    // names to read identities for. Read AFTER the taken queue applied, so the
+    // keys already reflect any taken rename.
+    let read_prev_keys: Vec<ProfileName> = {
+        let snap = stores
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snap.keys().map(|k| ProfileName::from(k.clone())).collect()
+    };
+    let read_names: Vec<ProfileName> = snapshot_names(config, read_prev_keys.iter().cloned());
+    let reads: HashMap<String, (SnapshotIdentities, CompareSkips)> = read_names
+        .iter()
+        .map(|n| (n.to_string(), read_for_compare(n)))
+        .collect();
+
+    // The present-name set is the read set with the taken renames applied —
+    // never a second roster read, which could disagree with the reads.
+    let mut present = read_names;
+    for (old, new) in &taken_renames {
+        present.retain(|n| n != old);
+        if !present.contains(new) {
+            present.push(new.clone());
+        }
+    }
+    present.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    present.dedup();
+    let present_set: HashSet<String> = present.iter().map(|n| n.to_string()).collect();
+
+    // Diff the reads against the snapshot, skipping unreadable halves; then
+    // forget each changed half and the vanished names' non-default halves. The
+    // store locks rank below the snapshot lock, so the forgets run after it
+    // released.
+    let mut skipped = false;
+    let mut external_change = false;
+    let (forgets, vanished, before_map) = {
+        let snap = stores
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut forgets: Vec<(ProfileName, Half)> = Vec::new();
+        let mut vanished: Vec<(String, SnapshotIdentities)> = Vec::new();
+        let mut before_map: HashMap<String, SnapshotIdentities> = HashMap::new();
+        for name in &present {
+            let Some((after, unreadable)) = reads.get(name.as_str()) else {
+                continue;
+            };
+            skipped |= unreadable.any();
+            let before = snap.get(name.as_str()).cloned().unwrap_or_default();
+            before_map.insert(name.to_string(), before.clone());
+            for half in [Half::OAuth, Half::ThirdParty, Half::Codex] {
+                if unreadable.half(half) {
+                    continue;
+                }
+                if half_changed(half, &before, after) {
+                    external_change = true;
+                    forgets.push((name.clone(), half));
+                }
+            }
+        }
+        for (name, entry) in snap.iter() {
+            if !present_set.contains(name) {
+                vanished.push((name.clone(), entry.clone()));
+            }
+        }
+        (forgets, vanished, before_map)
+    };
+
+    for (name, half) in &forgets {
+        let refreshed = half_identity_from_reads(&reads, name, *half);
+        forget_memory_with_identity(stores, name, *half, refreshed);
+    }
+    for (name, entry) in &vanished {
+        let name = ProfileName::from(name.clone());
+        if entry.oauth != OAuthIdentity::default() {
+            external_change = true;
+            forget_memory(stores, &name, Half::OAuth);
+        }
+        if entry.third_party.is_some() {
+            external_change = true;
+            forget_memory(stores, &name, Half::ThirdParty);
+        }
+        if entry.codex.is_some() {
+            external_change = true;
+            forget_memory(stores, &name, Half::Codex);
+        }
+    }
+
+    // Re-lock to drop vanished names and write the compare's reads per half.
+    let mut snap = stores
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    snap.retain(|name, _| present_set.contains(name));
+    for name in &present {
+        let Some((after, unreadable)) = reads.get(name.as_str()) else {
+            continue;
+        };
+        let before = before_map.get(name.as_str()).cloned().unwrap_or_default();
+        write_snapshot_half_cas(&mut snap, name.as_str(), &before, after, unreadable);
+    }
+
+    CompareOutcome {
+        external_change,
+        skipped,
+    }
+}
+
+/// Write the compare's read identity for one name into the snapshot, per half.
+/// Each half write happens only where the half still equals the value the diff
+/// read (compare-and-set), so a concurrent forget's refresh is kept rather than
+/// overwritten. A half the compare marked unreadable is not written: its
+/// snapshot half keeps its current value (a torn write is RETRY, never
+/// "no credential").
+fn write_snapshot_half_cas(
+    snap: &mut SnapshotMap,
+    name: &str,
+    before: &SnapshotIdentities,
+    after: &SnapshotIdentities,
+    unreadable: &CompareSkips,
+) {
+    let entry = snap.entry(name.to_string()).or_default();
+    if !unreadable.oauth && entry.oauth == before.oauth {
+        entry.oauth = after.oauth.clone();
+    }
+    if !unreadable.third_party && entry.third_party == before.third_party {
+        entry.third_party = after.third_party;
+    }
+    if !unreadable.codex && entry.codex == before.codex {
+        entry.codex = after.codex.clone();
     }
 }
 
@@ -632,6 +1105,15 @@ pub(crate) fn forget_memory_rename(stores: &MemoryStores, old: &ProfileName, new
     // The durable `/profile` stamp rode the directory to `new`; only the old
     // name's memo is left, so `new` re-reads the moved stamp fresh.
     forget_profile_memo(old);
+    // Move the snapshot entry too: the identity rode the directory, so the
+    // compare must not read the rename as old-vanished + new-appeared.
+    let mut snap = stores
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = snap.remove(old.as_str()) {
+        snap.insert(new.to_string(), entry);
+    }
 }
 
 fn move_name_entry<T, R: crate::lockorder::Rank>(
@@ -675,7 +1157,7 @@ fn move_name_set<R: crate::lockorder::Rank>(
     }
 }
 
-fn remove_name_entry<T, R: crate::lockorder::Rank>(
+pub(super) fn remove_name_entry<T, R: crate::lockorder::Rank>(
     map: &RankedMutex<HashMap<String, T>, R>,
     name: &ProfileName,
 ) {
@@ -684,7 +1166,7 @@ fn remove_name_entry<T, R: crate::lockorder::Rank>(
         .remove(name.as_str());
 }
 
-fn remove_leg_entry<T, R: crate::lockorder::Rank>(
+pub(super) fn remove_leg_entry<T, R: crate::lockorder::Rank>(
     map: &RankedMutex<HashMap<super::LegKey, T>, R>,
     name: &ProfileName,
     leg: FetchLeg,
@@ -800,6 +1282,43 @@ mod tests {
         assert_ne!(
             before, after,
             "a generic base_url edit over the same key is a change"
+        );
+    }
+
+    /// The compare's final write is a compare-and-set, per half — a half whose
+    /// entry a concurrent forget refreshed keeps that fresher value, never the
+    /// stale identity the diff read.
+    #[test]
+    fn the_snapshot_write_keeps_a_concurrently_moved_entry() {
+        use super::{CompareSkips, SnapshotIdentities, write_snapshot_half_cas};
+        use std::collections::HashMap;
+
+        let name = "a".to_string();
+        let before = SnapshotIdentities {
+            oauth: oa(None, Some("access-A")),
+            third_party: None,
+            codex: None,
+        };
+        let after = SnapshotIdentities {
+            oauth: oa(None, Some("access-B")),
+            third_party: None,
+            codex: None,
+        };
+        let concurrent = SnapshotIdentities {
+            oauth: oa(None, Some("access-C")),
+            third_party: None,
+            codex: None,
+        };
+
+        let mut snap: HashMap<String, SnapshotIdentities> = HashMap::new();
+        snap.insert(name.clone(), concurrent.clone());
+
+        write_snapshot_half_cas(&mut snap, &name, &before, &after, &CompareSkips::default());
+
+        assert_eq!(
+            snap.get(&name),
+            Some(&concurrent),
+            "a half whose entry moved since the diff keeps the concurrent writer's value"
         );
     }
 }

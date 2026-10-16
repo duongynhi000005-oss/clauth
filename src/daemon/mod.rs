@@ -1075,6 +1075,9 @@ struct Daemon {
     /// the post-write value after every self-initiated switch so the daemon never
     /// reloads its own write.
     last_reload_fp: ReloadFingerprint,
+    /// The identity snapshot the reload compare diffs against, shared with the
+    /// REST route through `memory_stores`.
+    snapshot: Arc<RankedMutex<crate::usage::SnapshotMap, crate::lockorder::rank::Snapshot>>,
     /// Epoch-ms of the last completed main-loop tick — the watchdog's liveness
     /// signal. `0` until the first tick completes.
     heartbeat: Arc<AtomicU64>,
@@ -1117,6 +1120,20 @@ impl Daemon {
         // This process holds reading stores, so change sites record their
         // forgets here and the tick + REST handlers drain them.
         crate::usage::register_memory_stores();
+        // Take the reload fingerprint BEFORE seeding the snapshot: a write
+        // landing between the two then moves the fingerprint, so the first
+        // reload re-reads config while the snapshot already holds the newer
+        // identity — never a spurious forget off a stale snapshot.
+        let last_reload_fp = reload_fingerprint();
+        // Seed the identity snapshot from disk before the first compare, so a
+        // freshly-started daemon forgets nothing its own startup already seeded.
+        let snapshot = crate::usage::new_snapshot(
+            &config
+                .profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
+        );
         let usage_tokens: TokenList = Arc::new(RankedMutex::new(collect_tokens(&config)));
         let third_party_tokens: ThirdPartyList = Arc::new(RankedMutex::new(
             collect_third_party_entries(&config.profiles),
@@ -1149,7 +1166,8 @@ impl Daemon {
             // exit). The flag exists for `spawn_refresher`'s contract — its
             // real writer is the TUI's quit path.
             shutting_down: Arc::new(AtomicBool::new(false)),
-            last_reload_fp: reload_fingerprint(),
+            last_reload_fp,
+            snapshot,
             heartbeat: Arc::new(AtomicU64::new(0)),
             switch_backoff: None,
             switch_failure_logs: 0,
@@ -1387,6 +1405,7 @@ impl Daemon {
             third_party_broken: Arc::clone(&self.third_party_broken),
             suppressed: Arc::clone(&self.suppressed_auth_expired),
             interval_ms: Arc::clone(&self.refresh_interval),
+            snapshot: Arc::clone(&self.snapshot),
         }
     }
 
@@ -1394,6 +1413,24 @@ impl Daemon {
     /// after the state-flock and config guard drop.
     fn apply_forgets(&self) {
         crate::usage::apply_pending_forgets(&self.memory_stores());
+    }
+
+    /// Re-baseline the reload fingerprint to `fp` AND run the snapshot compare,
+    /// so a re-baseline never swallows another process's credential change that
+    /// landed just before it. The fingerprint is adopted only when the compare
+    /// found no external change and skipped nothing: otherwise the in-memory
+    /// config and token lists still match the OLD fingerprint, and keeping it
+    /// makes the next tick's reload re-read them.
+    fn rebaseline_and_forget(&mut self, fp: ReloadFingerprint) {
+        let config_profiles: Vec<ProfileName> = self
+            .config
+            .lock()
+            .map(|c| c.profiles.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        let outcome = crate::usage::reload_and_forget(&self.memory_stores(), &config_profiles);
+        if outcome.clean() {
+            self.last_reload_fp = fp;
+        }
     }
 
     /// Snapshot the live freshness/countdown stores — each snapshot's lock is

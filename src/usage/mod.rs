@@ -91,7 +91,7 @@ pub(crate) use scheduler::token_clock_expired;
 // driving a builder through `await_request_slot` doesn't sleep out the window,
 // and read one back so a leg's reservation is assertable without that sleep.
 #[cfg(test)]
-pub(crate) use fetch::{reserved_request_slot, reset_request_slots};
+pub(crate) use fetch::{reserved_request_slot, reset_request_slots, set_compare_hook};
 // Test-only: the adopt's token → uuid memo outlives a call now, so it also
 // outlives a test. Cleared with the endpoint overrides that make it reachable.
 #[cfg(test)]
@@ -110,10 +110,11 @@ pub(crate) use fetch::{clear_usage_endpoint_override, set_usage_endpoint_overrid
 pub(crate) use fetch::take_profile_fetch;
 
 pub(crate) use forget::{
-    ForgetPlan, Half, MemoryStores, OAuthIdentity, apply_pending_forgets, endpoint_identity_plan,
-    epoch_guard_if_current, epoch_value, forget_disk, forget_disk_plan, note_forget,
-    note_forget_plan, note_rename, oauth_changed, read_before_identities, read_codex_identity,
-    register_memory_stores, third_party_identity, throughput_for_endpoint, throughput_identity,
+    ForgetPlan, Half, MemoryStores, OAuthIdentity, SnapshotMap, apply_pending_forgets,
+    endpoint_identity_plan, epoch_guard_if_current, epoch_value, forget_disk, forget_disk_plan,
+    new_snapshot, note_forget, note_forget_plan, note_rename, oauth_changed,
+    read_before_identities, read_codex_identity, register_memory_stores, reload_and_forget,
+    third_party_identity, throughput_for_endpoint, throughput_identity,
 };
 #[cfg(test)]
 pub(crate) use forget::{bump_epoch, reset_pending_forgets_for_test, try_lock_epoch_for_test};

@@ -2287,12 +2287,23 @@ pub(crate) fn capture_into_profile(
         let mut profile = Profile::new(name.to_string(), base_url, api_key);
         profile.models = trimmed_models(models);
         // A fresh profile can sit on an orphan dir holding a stale anchor (a
-        // hand-edited roster, a crash before the record landed): remove it before
-        // the store write, like every other install.
-        crate::profile_cache::remove_profile_cache(
-            &name,
-            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        // hand-edited roster, a crash before the record landed). A proven
+        // re-login onto the SAME uuid keeps it in place: seed_login_anchor's
+        // atomic replace at the end of the hold means a compare reads anchored
+        // -> anchored, never a gap where the anchor is absent over a present
+        // login. Any other install removes it before the store write, so a
+        // later failure leaves the profile unanchored, never on the displaced
+        // account.
+        let same_account = matches!(
+            &anchor,
+            AnchorAction::Proven(uuid) if before.oauth.anchor.as_deref() == Some(uuid.as_str())
         );
+        if !same_account {
+            crate::profile_cache::remove_profile_cache(
+                &name,
+                crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            );
+        }
         crate::oauth::retire_unreadable_spent_record(&name);
         profile.set_credentials(credentials, held);
         save_profile(&profile)?;
@@ -2361,11 +2372,18 @@ pub(crate) fn create_profile_from_login(
         let mut profile = Profile::new(name.to_string(), None, None);
         profile.models = trimmed_models(models);
         // Same orphan-dir guard as `capture_into_profile`: remove any stale
-        // anchor before the store write.
-        crate::profile_cache::remove_profile_cache(
-            &name,
-            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
-        );
+        // anchor before the store write, unless the proven uuid matches it (a
+        // same-account re-anchor keeps it in place for the atomic replace).
+        let same_account = match account_uuid.as_ref() {
+            Some(uuid) => before.oauth.anchor.as_deref() == Some(uuid.as_str()),
+            None => false,
+        };
+        if !same_account {
+            crate::profile_cache::remove_profile_cache(
+                &name,
+                crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            );
+        }
         crate::oauth::retire_unreadable_spent_record(&name);
         profile.set_credentials(Some(credentials), held);
         save_profile(&profile)?;
@@ -2546,12 +2564,20 @@ pub(crate) fn overwrite_captured_profile(
         );
         oauth_moved = plan.oauth;
         forget_disk_plan(name, plan);
-        if installs_login {
-            // Remove the old anchor BEFORE the store write, inside the same hold
-            // that commits the credentials: a later failure in this hold (the
-            // relink, the settings write) leaves the profile unanchored, never
-            // on the account the overwrite just displaced. A proven uuid
-            // re-anchors at the end of this same hold.
+        // A proven re-login onto the SAME uuid keeps the old anchor in place
+        // through the store write: seed_login_anchor's atomic replace at the
+        // end of the hold means a compare reads anchored -> anchored, never a
+        // gap where the anchor is absent over a present login. Every other
+        // login install removes the old anchor BEFORE the store write, inside
+        // the same hold that commits the credentials: a later failure in this
+        // hold (the relink, the settings write) leaves the profile unanchored,
+        // never on the account the overwrite just displaced. A proven uuid
+        // re-anchors at the end of this same hold.
+        let same_account = matches!(
+            &anchor,
+            AnchorAction::Proven(uuid) if before.oauth.anchor.as_deref() == Some(uuid.as_str())
+        );
+        if installs_login && !same_account {
             crate::profile_cache::remove_profile_cache(
                 name,
                 crate::profile_cache::ACCOUNT_ID_CACHE_FILE,

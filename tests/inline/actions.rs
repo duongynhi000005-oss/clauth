@@ -8007,6 +8007,697 @@ fn an_oauth_log_out_forgets_this_processs_reading_and_disk_cache() {
     );
 }
 
+/// An own change site's forget plus a later reload compare advances the epoch
+/// exactly once: the applied forget refreshes the snapshot, so the compare
+/// finds no diff and does not forget the same change a second time.
+#[test]
+fn an_own_change_is_forgotten_once_across_a_reload_compare() {
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::usage::{Half, apply_pending_forgets, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let profile = hybrid_profile("acct", "access-A", "https://api.z.ai/api/anthropic", None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    seed_oauth_memory(&stores, "acct", 90_000);
+    let base = epoch_value(&name, Half::OAuth);
+
+    let mut config = inactive_config(profile);
+    clear_profile_credentials(&mut config, &name).expect("log out");
+    apply_pending_forgets(&stores);
+    assert_eq!(
+        epoch_value(&name, Half::OAuth),
+        base + 1,
+        "the change site's own forget bumped the epoch once"
+    );
+
+    reload_and_forget(&stores, std::slice::from_ref(&name));
+    assert_eq!(
+        epoch_value(&name, Half::OAuth),
+        base + 1,
+        "the reload compare must not forget the process's own change a second time"
+    );
+}
+
+/// The compare takes this process's pending forgets and applies each once, so a
+/// change site that noted (but did not yet apply) its forget is forgotten
+/// exactly once even when the compare runs before the site's own drain — and
+/// the own change is not an external change, so a non-reload re-baseline adopts
+/// the fingerprint.
+#[test]
+fn the_compare_drains_pending_forgets_before_comparing() {
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::usage::{Half, apply_pending_forgets, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let profile = hybrid_profile("acct", "access-A", "https://api.z.ai/api/anthropic", None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    seed_oauth_memory(&stores, "acct", 90_000);
+    let base = epoch_value(&name, Half::OAuth);
+
+    // The change site notes the forget but does NOT apply it.
+    let mut config = inactive_config(profile);
+    clear_profile_credentials(&mut config, &name).expect("log out");
+
+    let outcome = reload_and_forget(&stores, std::slice::from_ref(&name));
+    assert_eq!(
+        epoch_value(&name, Half::OAuth),
+        base + 1,
+        "the compare forgets the noted forget exactly once"
+    );
+    assert!(
+        outcome.clean(),
+        "an own change is not an external change, so the fingerprint adopts"
+    );
+    // A further drain must find the queue empty: the compare itself applied the
+    // noted forget, so nothing stayed queued to forget the change a second time.
+    apply_pending_forgets(&stores);
+    assert_eq!(
+        epoch_value(&name, Half::OAuth),
+        base + 1,
+        "nothing stayed queued to forget the change a second time"
+    );
+}
+
+/// A compare over a torn `credentials.json` forgets nothing and reports the
+/// half unreadable (skipped), so a non-reload re-baseline keeps the fingerprint.
+#[test]
+fn a_compare_over_a_torn_credentials_file_forgets_nothing() {
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::usage::{Half, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let profile = hybrid_profile("acct", "access-A", "https://api.z.ai/api/anthropic", None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+
+    crate::profile_cache::write_profile_cache(
+        &name,
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    seed_oauth_memory(&stores, "acct", 90_000);
+    let base = epoch_value(&name, Half::OAuth);
+
+    let cred_path = crate::profile::profile_subpath(&name, "credentials.json").expect("path");
+    std::fs::write(&cred_path, r#"{"claudeAiOauth":"#).expect("write torn credentials");
+
+    let outcome = reload_and_forget(&stores, std::slice::from_ref(&name));
+
+    assert!(
+        !outcome.clean(),
+        "an unreadable half counts as skipped, so the fingerprint stays unadopted"
+    );
+    assert!(
+        stores.usage.lock().unwrap().contains_key("acct"),
+        "a torn credentials.json forgets nothing"
+    );
+    assert_eq!(
+        epoch_value(&name, Half::OAuth),
+        base,
+        "the epoch does not move on a torn credentials.json"
+    );
+}
+
+/// A compare over a torn codex `auth.json` forgets nothing and reports the
+/// codex half unreadable (skipped).
+#[test]
+fn a_compare_over_a_torn_codex_auth_file_forgets_nothing() {
+    use crate::usage::{Half, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("cx");
+    crate::testutil::write_codex_roster(&["cx"]);
+    let auth_path = crate::profile::profile_subpath(&name, "auth.json").expect("auth path");
+    std::fs::create_dir_all(auth_path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"account_id":"codex-A","access_token":"t"}}"#,
+    )
+    .expect("write auth.json");
+
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    stores.usage.lock().unwrap().insert(
+        "cx".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 9.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let base = epoch_value(&name, Half::Codex);
+
+    std::fs::write(&auth_path, r#"{"tokens":{"account_id":"codex-"#).expect("write torn auth");
+
+    let outcome = reload_and_forget(&stores, &[]);
+
+    assert!(
+        !outcome.clean(),
+        "an unreadable half counts as skipped, so the fingerprint stays unadopted"
+    );
+    assert!(
+        stores.usage.lock().unwrap().contains_key("cx"),
+        "a torn auth.json forgets nothing"
+    );
+    assert_eq!(
+        epoch_value(&name, Half::Codex),
+        base,
+        "the epoch does not move on a torn auth.json"
+    );
+}
+
+/// After a compare over a torn `credentials.json`, writing the same token back
+/// whole and comparing again forgets nothing: the skipped half kept its
+/// snapshot value rather than being overwritten with "no credential".
+#[test]
+fn a_compare_over_a_torn_credentials_file_then_a_whole_rewrite_forgets_nothing() {
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::usage::{Half, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let profile = hybrid_profile("acct", "access-A", "https://api.z.ai/api/anthropic", None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+
+    crate::profile_cache::write_profile_cache(
+        &name,
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    seed_oauth_memory(&stores, "acct", 90_000);
+    let base = epoch_value(&name, Half::OAuth);
+
+    let cred_path = crate::profile::profile_subpath(&name, "credentials.json").expect("path");
+    std::fs::write(&cred_path, r#"{"claudeAiOauth":"#).expect("write torn credentials");
+    let _ = reload_and_forget(&stores, std::slice::from_ref(&name));
+
+    // The torn read skipped the OAuth half; write the same token back whole.
+    save_profile(&profile).expect("write the token back whole");
+    let _ = reload_and_forget(&stores, std::slice::from_ref(&name));
+
+    assert_eq!(
+        epoch_value(&name, Half::OAuth),
+        base,
+        "the skipped half kept its snapshot value, so the whole rewrite is not a change"
+    );
+}
+
+/// After a compare over a torn codex `auth.json`, writing the same account back
+/// whole and comparing again forgets nothing: the skipped half kept its
+/// snapshot value rather than being overwritten with "no credential".
+#[test]
+fn a_compare_over_a_torn_codex_auth_file_then_a_whole_rewrite_forgets_nothing() {
+    use crate::usage::{Half, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("cx");
+    crate::testutil::write_codex_roster(&["cx"]);
+    let auth_path = crate::profile::profile_subpath(&name, "auth.json").expect("auth path");
+    std::fs::create_dir_all(auth_path.parent().expect("profile dir")).expect("mkdir profile");
+    let whole = r#"{"tokens":{"account_id":"codex-A","access_token":"t"}}"#;
+    std::fs::write(&auth_path, whole).expect("write auth.json");
+
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    stores.usage.lock().unwrap().insert(
+        "cx".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 9.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let base = epoch_value(&name, Half::Codex);
+
+    std::fs::write(&auth_path, r#"{"tokens":{"account_id":"codex-"#).expect("write torn auth");
+    let _ = reload_and_forget(&stores, &[]);
+
+    // The torn read skipped the codex half; write the same account back whole.
+    std::fs::write(&auth_path, whole).expect("rewrite auth.json whole");
+    let _ = reload_and_forget(&stores, &[]);
+
+    assert_eq!(
+        epoch_value(&name, Half::Codex),
+        base,
+        "the skipped codex half kept its snapshot value, so the whole rewrite is not a change"
+    );
+}
+
+/// A drain overlapping a torn `credentials.json` leaves the snapshot half as it
+/// was: `forget_memory` reads through the unreadable-aware reader and skips the
+/// refresh rather than storing "no credential".
+#[test]
+fn a_drain_over_a_torn_credentials_file_leaves_the_snapshot_half() {
+    use crate::usage::{Half, apply_pending_forgets, note_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let profile = hybrid_profile("acct", "access-A", "https://api.z.ai/api/anthropic", None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    let seeded = stores
+        .snapshot
+        .lock()
+        .unwrap()
+        .get("acct")
+        .unwrap()
+        .oauth
+        .clone();
+
+    let cred_path = crate::profile::profile_subpath(&name, "credentials.json").expect("path");
+    std::fs::write(&cred_path, r#"{"claudeAiOauth":"#).expect("write torn credentials");
+
+    note_forget(&name, Half::OAuth);
+    apply_pending_forgets(&stores);
+
+    assert_eq!(
+        stores.snapshot.lock().unwrap().get("acct").unwrap().oauth,
+        seeded,
+        "a torn identity file leaves the snapshot half untouched, never 'no credential'"
+    );
+}
+
+/// A compare over a torn profile `config.toml` marks the third-party half
+/// unreadable and forgets nothing, keeping the fingerprint unadopted.
+#[test]
+fn a_compare_over_a_torn_profile_config_forgets_nothing() {
+    use crate::usage::{Half, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("tp");
+    let profile = hybrid_profile(
+        "tp",
+        "access-A",
+        "https://api.z.ai/api/anthropic",
+        Some("key-A"),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["tp"]);
+
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    stores.third_party_usage.lock().unwrap().insert(
+        "tp".to_string(),
+        crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]),
+    );
+    let base = epoch_value(&name, Half::ThirdParty);
+
+    let cfg_path = crate::profile::profile_subpath(&name, "config.toml").expect("path");
+    std::fs::write(&cfg_path, "not = [valid toml").expect("write torn config");
+
+    let outcome = reload_and_forget(&stores, std::slice::from_ref(&name));
+
+    assert!(
+        !outcome.clean(),
+        "an unreadable third-party half counts as skipped, so the fingerprint stays unadopted"
+    );
+    assert!(
+        stores.third_party_usage.lock().unwrap().contains_key("tp"),
+        "a torn config.toml forgets nothing"
+    );
+    assert_eq!(
+        epoch_value(&name, Half::ThirdParty),
+        base,
+        "the epoch does not move on a torn config.toml"
+    );
+}
+
+/// A failed codex roster read keeps the previous snapshot's codex names, so a
+/// codex-only name is not evicted as vanished on a torn roster.
+#[test]
+fn a_failed_codex_roster_read_keeps_the_previous_codex_names() {
+    use crate::usage::{Half, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("cx");
+    crate::testutil::write_codex_roster(&["cx"]);
+    let auth_path = crate::profile::profile_subpath(&name, "auth.json").expect("auth path");
+    std::fs::create_dir_all(auth_path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"account_id":"codex-A","access_token":"t"}}"#,
+    )
+    .expect("write auth.json");
+
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    stores.usage.lock().unwrap().insert(
+        "cx".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 9.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let base = epoch_value(&name, Half::Codex);
+
+    let roster_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    std::fs::write(&roster_path, "not = [valid toml").expect("write torn roster");
+
+    let _ = reload_and_forget(&stores, &[]);
+
+    assert!(
+        stores.usage.lock().unwrap().contains_key("cx"),
+        "a failed roster read keeps the previous codex names, so the codex reading stays"
+    );
+    assert_eq!(
+        epoch_value(&name, Half::Codex),
+        base,
+        "a failed roster read forgets no codex names on a guess"
+    );
+}
+
+/// A proven same-account re-login through the real install path leaves no gap
+/// where a compare reads the anchor absent over a present login: a compare run
+/// between the credentials write and the anchor write forgets nothing.
+#[test]
+fn a_same_account_relogin_through_the_install_path_forgets_nothing() {
+    use crate::usage::{Half, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let profile = hybrid_profile("acct", "access-A", "https://api.z.ai/api/anthropic", None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    seed_oauth_memory(&stores, "acct", 90_000);
+    let base = epoch_value(&name, Half::OAuth);
+
+    // The hook runs this process's compare between the install's credentials
+    // write and its anchor write (inside `seed_login_anchor`'s hold). The
+    // compare runs on its own thread, like a real second process: the install
+    // thread holds the state flock, which ranks above the compare's epoch, so
+    // an in-thread compare would invert the lock order.
+    let hook_stores = std::sync::Arc::new(stores);
+    crate::usage::set_compare_hook(
+        "acct",
+        std::sync::Arc::new({
+            let stores = hook_stores.clone();
+            move || {
+                let stores = stores.clone();
+                std::thread::spawn(move || {
+                    let outcome = reload_and_forget(
+                        &stores,
+                        std::slice::from_ref(&ProfileName::from("acct")),
+                    );
+                    assert!(
+                        outcome.clean(),
+                        "a compare between the credentials write and the anchor write finds no change"
+                    );
+                })
+                .join()
+                .expect("the compare thread runs to completion");
+            }
+        }),
+    );
+
+    let mut config = inactive_config(profile);
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        login_snapshot("access-A-again", Some("uuid-A")),
+    )
+    .expect("overwrite in place");
+
+    assert_eq!(
+        epoch_value(&name, Half::OAuth),
+        base,
+        "a same-account re-login re-anchors the same uuid, so the in-hold compare forgets nothing"
+    );
+}
+
+/// A proven same-account re-login through `capture_into_profile` leaves no gap
+/// where a compare reads the anchor absent over a present login: a compare run
+/// between the credentials write and the anchor write forgets nothing.
+#[test]
+fn a_same_account_capture_through_the_install_path_forgets_nothing() {
+    use crate::usage::{Half, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    seed_oauth_memory(&stores, "acct", 90_000);
+    let base = epoch_value(&name, Half::OAuth);
+
+    // Same two-process shape as the overwrite hook test: the hook runs this
+    // process's compare between the credentials write and the anchor write,
+    // inside `seed_login_anchor`'s hold, on its own thread.
+    let hook_stores = std::sync::Arc::new(stores);
+    crate::usage::set_compare_hook(
+        "acct",
+        std::sync::Arc::new({
+            let stores = hook_stores.clone();
+            move || {
+                let stores = stores.clone();
+                std::thread::spawn(move || {
+                    let outcome = reload_and_forget(
+                        &stores,
+                        std::slice::from_ref(&ProfileName::from("acct")),
+                    );
+                    assert!(
+                        outcome.clean(),
+                        "a capture's compare between the credentials write and the anchor write finds no change"
+                    );
+                })
+                .join()
+                .expect("the compare thread runs to completion");
+            }
+        }),
+    );
+
+    let mut config = AppConfig {
+        state: AppState {
+            active_profile: Some("someone-else".into()),
+            ..AppState::default()
+        },
+        profiles: vec![],
+    };
+    capture_into_profile(
+        &mut config,
+        "acct".to_string(),
+        Default::default(),
+        login_snapshot("access-A-again", Some("uuid-A")),
+    )
+    .expect("capture the same account in place");
+
+    assert_eq!(
+        epoch_value(&name, Half::OAuth),
+        base,
+        "a same-account capture re-anchors the same uuid, so the in-hold compare forgets nothing"
+    );
+}
+
+/// A proven same-account re-login through `create_profile_from_login` leaves no
+/// gap where a compare reads the anchor absent over a present login: a compare
+/// run between the credentials write and the anchor write forgets nothing.
+#[test]
+fn a_same_account_create_through_the_install_path_forgets_nothing() {
+    use crate::usage::{Half, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    seed_oauth_memory(&stores, "acct", 90_000);
+    let base = epoch_value(&name, Half::OAuth);
+
+    let hook_stores = std::sync::Arc::new(stores);
+    crate::usage::set_compare_hook(
+        "acct",
+        std::sync::Arc::new({
+            let stores = hook_stores.clone();
+            move || {
+                let stores = stores.clone();
+                std::thread::spawn(move || {
+                    let outcome = reload_and_forget(
+                        &stores,
+                        std::slice::from_ref(&ProfileName::from("acct")),
+                    );
+                    assert!(
+                        outcome.clean(),
+                        "a create's compare between the credentials write and the anchor write finds no change"
+                    );
+                })
+                .join()
+                .expect("the compare thread runs to completion");
+            }
+        }),
+    );
+
+    let mut config = AppConfig {
+        state: AppState {
+            active_profile: Some("someone-else".into()),
+            ..AppState::default()
+        },
+        profiles: vec![],
+    };
+    create_profile_from_login(
+        &mut config,
+        "acct".to_string(),
+        Default::default(),
+        oauth_pair("access-A-again"),
+        Some(AccountId::from("uuid-A")),
+    )
+    .expect("create the same account in place");
+
+    assert_eq!(
+        epoch_value(&name, Half::OAuth),
+        base,
+        "a same-account create re-anchors the same uuid, so the in-hold compare forgets nothing"
+    );
+}
+
+/// A taken forget for a name that has since been deleted (absent from the
+/// identity read set) sets its snapshot half to "no credential", so the
+/// vanished arm does not forget it a second time: one forget, no external
+/// change.
+#[test]
+fn a_deleted_names_taken_forget_is_forgotten_once() {
+    use crate::usage::{Half, epoch_value, note_forget, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("gone");
+    let profile = hybrid_profile("gone", "access-A", "https://api.z.ai/api/anthropic", None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["gone"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    seed_oauth_memory(&stores, "gone", 90_000);
+    let base = epoch_value(&name, Half::OAuth);
+
+    // Queue this process's own forget, then delete the profile out from under
+    // it: the name leaves the config and its dir, so the identity read set no
+    // longer holds it.
+    note_forget(&name, Half::OAuth);
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![],
+        ..AppState::default()
+    })
+    .expect("persist the delete");
+    std::fs::remove_dir_all(crate::profile::profile_dir(&name).expect("profile dir"))
+        .expect("remove the profile dir");
+
+    let outcome = reload_and_forget(&stores, &[]);
+    assert_eq!(
+        epoch_value(&name, Half::OAuth),
+        base + 1,
+        "the taken forget runs exactly once"
+    );
+    assert!(
+        outcome.clean(),
+        "the deleted name's taken forget is not counted as an external change"
+    );
+}
+
+/// An own rename moves the snapshot entry with the memory entries, so the
+/// next compare over the new name forgets nothing (the identity rode the dir).
+#[test]
+fn an_own_rename_moves_the_snapshot_entry() {
+    use crate::usage::{Half, apply_pending_forgets, epoch_value, reload_and_forget};
+
+    let _home = HomeSandbox::new();
+    let old = ProfileName::from("acct");
+    let new = ProfileName::from("acct-renamed");
+    let profile = hybrid_profile("acct", "access-A", "https://api.z.ai/api/anthropic", None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&old));
+    seed_oauth_memory(&stores, "acct", 90_000);
+    let base = epoch_value(&new, Half::OAuth);
+
+    let mut config = inactive_config(profile);
+    rename_profile(&mut config, &old, &new, &rotation_guard("acct")).expect("rename");
+    apply_pending_forgets(&stores);
+
+    reload_and_forget(&stores, std::slice::from_ref(&new));
+    assert_eq!(
+        epoch_value(&new, Half::OAuth),
+        base,
+        "the rename moved the snapshot entry, so the compare over the new name forgets nothing"
+    );
+}
+
 /// A2: a key edit forgets the old provider's reading, status and streak and
 /// drops the third-party disk cache, while the hybrid's OAuth leg stays.
 #[test]

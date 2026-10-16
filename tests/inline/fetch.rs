@@ -329,8 +329,9 @@ fn a_store_moved_mid_read_writes_no_anchor() {
 
 /// A failed anchor write (the off-roster skip, the same `!landed` branch an
 /// ENOSPC takes) leaves the profile UNANCHORED, never on the displaced account:
-/// the removal runs before the write, so a removable old anchor is gone even when
-/// the new write fails, and the log is exactly the failure line.
+/// the write runs first and the removal only on a failed write, so a removable
+/// old anchor is gone when the new write fails, and the log is exactly the
+/// failure line.
 #[test]
 fn a_failed_reconcile_write_leaves_no_displaced_anchor() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
@@ -362,6 +363,41 @@ fn a_failed_reconcile_write_leaves_no_displaced_anchor() {
         sink.snapshot(),
         vec!["clauth: offroster: could not write the identity anchor".to_string()],
         "the failed write logs its failure line alone"
+    );
+}
+
+/// A failed seed write (the off-roster skip, the same `!landed` branch an
+/// ENOSPC takes) leaves the profile UNANCHORED, never on the displaced account:
+/// the write runs first and the removal only on a failed write, so a removable
+/// old anchor is gone when the new write fails.
+#[test]
+fn a_failed_seed_write_leaves_no_displaced_anchor() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("offroster");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-off".to_string(),
+            refresh_token: Some("rt-off".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    let dir = crate::profile::profile_dir(&name).expect("dir");
+    std::fs::write(dir.join(ACCOUNT_ID_CACHE_FILE), br#""uuid-old""#).expect("seed anchor");
+
+    seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("uuid-new".to_string())),
+    );
+    assert_eq!(
+        load_profile_cache::<String>(&name, ACCOUNT_ID_CACHE_FILE),
+        None,
+        "a failed seed leaves the profile unanchored, never on the old account"
     );
 }
 

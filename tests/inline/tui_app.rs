@@ -20,6 +20,7 @@ fn bootstrap_busy(flag: &Arc<AtomicBool>, activity: &ActivityStore) -> bool {
 
 use super::InputState;
 use crate::fallback::parse_threshold;
+use crate::profile::ProfileName;
 use crate::testutil::write_live_creds;
 
 #[test]
@@ -2804,6 +2805,53 @@ fn the_durable_auth_verdict_seeds_the_key_rejected_set_on_reload() {
     );
 }
 
+/// A reload seeds the durable key-rejected verdict for a re-keyed name, and
+/// the compare that forgets the re-key must run BEFORE the union-add, so the
+/// seeded verdict survives the reload.
+#[test]
+fn the_rekeyed_verdict_survives_the_reload() {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    use crate::providers::Provider;
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, SystemTime};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let zai = |key: &str| {
+        let mut p = crate::testutil::blank_profile(&ProfileName::from("zai"));
+        p.provider = Some(Provider::Zai);
+        p.api_key = Some(key.to_string());
+        p.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+        p
+    };
+    let k1 = zai("k1");
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("zai")],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&k1).expect("persist k1");
+
+    let mut app = app_with(vec![k1.clone()]);
+
+    // Another process re-keys to k2, and its rejection verdict (recorded for
+    // k2) survives a key edit.
+    let k2 = zai("k2");
+    save_profile(&k2).expect("persist k2");
+    let fingerprint = crate::usage::profile_credential_fingerprint(&k2).expect("fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("zai"), fingerprint);
+
+    let config_toml = crate::profile::profile_subpath(&ProfileName::from("zai"), "config.toml")
+        .expect("config path");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(60));
+
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+    assert!(
+        app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "the seeded verdict survives the reload's compare"
+    );
+}
+
 /// A reload seeds the third-party store from disk for the display-superset
 /// names it lacks (here a DISABLED account), while a name the store already
 /// holds keeps its live reading and the `RateLimited` status a fetch that
@@ -2914,6 +2962,603 @@ fn a_reload_seeds_only_the_third_party_names_the_store_lacks() {
         (work_status, work_stamped),
         (None, false),
         "the reload writes a new name's reading only: no status, no stamp, so its first fetch is due on the next tick"
+    );
+}
+
+// ── reload compare ───────────────────────────────────────────────────────────
+
+/// An OAuth profile with `access` as its stored token; `base_url`/`api_key` make
+/// it a hybrid when set.
+fn oauth_profile(
+    name: &str,
+    access: &str,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+) -> crate::profile::Profile {
+    let mut p = crate::profile::Profile::new(
+        name.to_string(),
+        base_url.map(str::to_string),
+        api_key.map(str::to_string),
+    );
+    p.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("rt-{access}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    p
+}
+
+fn seed_oauth_reading(app: &App, names: &[&str]) {
+    crate::usage::bootstrap_fetch(
+        &app.usage_store,
+        &app.usage_status,
+        &app.last_fetched,
+        &names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+        90_000,
+    );
+}
+
+/// The OAuth access token the TUI's token list holds for `name`, if any.
+fn oauth_token(app: &App, name: &str) -> Option<String> {
+    app.usage_tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|t| t.name.as_str() == name)
+        .map(|t| t.access_token.clone())
+}
+
+/// A TUI forgets a credential another process changed (identity moved on
+/// disk, its disk cache dropped with it), and a hybrid's provider reading stays.
+#[test]
+fn a_reload_forgets_an_external_oauth_change_and_keeps_the_hybrid_provider() {
+    use crate::profile::{AppState, save_app_state, save_profile};
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::testutil::{bar, set_mtime, stats_with_bars};
+    use std::time::{Duration, SystemTime};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let a = oauth_profile("a", "access-A", None, None);
+    let hybrid = oauth_profile(
+        "hybrid",
+        "hybrid-A",
+        Some("https://api.z.ai/api/anthropic"),
+        Some("key-k"),
+    );
+    save_app_state(&AppState {
+        profiles: vec![a.name.clone(), hybrid.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&a).expect("persist a");
+    save_profile(&hybrid).expect("persist hybrid");
+
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    for name in ["a", "hybrid"] {
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from(name),
+            USAGE_CACHE_FILE,
+            &info,
+        );
+    }
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("hybrid"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats_with_bars(vec![bar("5h", 80.0)]),
+    );
+
+    let mut app = app_with(vec![a.clone(), hybrid.clone()]);
+    seed_oauth_reading(&app, &["a", "hybrid"]);
+    app.third_party_usage_store
+        .lock()
+        .unwrap()
+        .insert("hybrid".to_string(), stats_with_bars(vec![bar("5h", 80.0)]));
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("hybrid".to_string(), crate::usage::FetchStatus::Fresh);
+
+    // Another process re-logs both OAuth halves (a different token) and its
+    // forget_disk drops the OAuth cache; the provider cache stays.
+    let a_b = oauth_profile("a", "access-B", None, None);
+    let hybrid_b = oauth_profile(
+        "hybrid",
+        "hybrid-B",
+        Some("https://api.z.ai/api/anthropic"),
+        Some("key-k"),
+    );
+    save_profile(&a_b).expect("persist a's new login");
+    save_profile(&hybrid_b).expect("persist hybrid's new login");
+    for name in ["a", "hybrid"] {
+        crate::profile_cache::remove_profile_cache(&ProfileName::from(name), USAGE_CACHE_FILE);
+        let cred = crate::profile::profile_subpath(&ProfileName::from(name), "credentials.json")
+            .expect("credentials path");
+        set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
+    }
+
+    let hybrid_provider_base =
+        crate::usage::epoch_value(&ProfileName::from("hybrid"), crate::usage::Half::ThirdParty);
+
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+
+    assert!(
+        !app.usage_store.lock().unwrap().contains_key("a"),
+        "a's OAuth reading goes with the external re-login"
+    );
+    assert!(
+        !app.usage_status.lock().unwrap().contains_key("a"),
+        "a's OAuth status goes with the external re-login"
+    );
+    assert!(
+        !app.last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&crate::usage::FetchLeg::OAuth.key(ProfileName::from("a"))),
+        "a's OAuth cadence stamp goes with the external re-login"
+    );
+    assert!(
+        !app.usage_store.lock().unwrap().contains_key("hybrid"),
+        "the hybrid's OAuth reading goes with its external re-login"
+    );
+    assert!(
+        app.third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key("hybrid"),
+        "the hybrid's provider reading stays: only the OAuth half changed"
+    );
+    assert_eq!(
+        crate::usage::epoch_value(&ProfileName::from("hybrid"), crate::usage::Half::ThirdParty),
+        hybrid_provider_base,
+        "only the OAuth half changed: the hybrid's provider epoch does not move"
+    );
+}
+
+/// A non-credential config toggle that re-baselines the detector must STILL run
+/// the compare — otherwise it would swallow another process's credential change
+/// landing just before it.
+#[test]
+fn a_config_toggle_rebaseline_still_forgets_an_external_credential_change() {
+    use crate::profile::{AppState, save_app_state, save_profile};
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, SystemTime};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let a = oauth_profile("a", "access-A", None, None);
+    save_app_state(&AppState {
+        profiles: vec![a.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&a).expect("persist a");
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+
+    let mut app = app_with(vec![a.clone()]);
+    seed_oauth_reading(&app, &["a"]);
+
+    // Another process changes the credential, then THIS process runs a
+    // non-credential toggle (cycle_theme re-baselines the detector) before any
+    // reload fires.
+    let a_b = oauth_profile("a", "access-B", None, None);
+    save_profile(&a_b).expect("persist a's new login");
+    crate::profile_cache::remove_profile_cache(&ProfileName::from("a"), USAGE_CACHE_FILE);
+    let cred = crate::profile::profile_subpath(&ProfileName::from("a"), "credentials.json")
+        .expect("credentials path");
+    set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
+
+    super::cycle_theme(&mut app);
+
+    assert!(
+        !app.usage_store.lock().unwrap().contains_key("a"),
+        "the toggle's re-baseline runs the compare, so a's reading is gone"
+    );
+}
+
+/// A non-reload re-baseline that forgets an external change keeps the OLD
+/// fingerprint, so the next reload rebuilds the token list with the new
+/// credential.
+#[test]
+fn a_toggle_rebaseline_that_forgets_keeps_the_old_fingerprint_for_the_next_reload() {
+    use crate::profile::{AppState, save_app_state, save_profile};
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, SystemTime};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let a = oauth_profile("a", "access-A", None, None);
+    save_app_state(&AppState {
+        profiles: vec![a.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&a).expect("persist a");
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+
+    let mut app = app_with(vec![a.clone()]);
+    seed_oauth_reading(&app, &["a"]);
+    assert_eq!(oauth_token(&app, "a").as_deref(), Some("access-A"));
+
+    // Another process changes the credential, then a non-credential toggle runs
+    // before any reload.
+    let a_b = oauth_profile("a", "access-B", None, None);
+    save_profile(&a_b).expect("persist a's new login");
+    crate::profile_cache::remove_profile_cache(&ProfileName::from("a"), USAGE_CACHE_FILE);
+    let cred = crate::profile::profile_subpath(&ProfileName::from("a"), "credentials.json")
+        .expect("credentials path");
+    set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
+
+    super::cycle_theme(&mut app);
+
+    assert!(
+        !app.usage_store.lock().unwrap().contains_key("a"),
+        "the toggle's re-baseline runs the compare, so a's reading is gone"
+    );
+    assert_eq!(
+        oauth_token(&app, "a").as_deref(),
+        Some("access-A"),
+        "the token list still holds the old token until the reload"
+    );
+
+    assert!(
+        app.reload_if_state_changed(),
+        "the kept-old fingerprint makes the reload fire"
+    );
+    assert_eq!(
+        oauth_token(&app, "a").as_deref(),
+        Some("access-B"),
+        "the reload re-reads config and rebuilds the token list with the new credential"
+    );
+}
+
+/// A compare over a torn `credentials.json` forgets nothing and keeps
+/// the fingerprint unadopted, so the next reload re-reads config.
+#[test]
+fn a_torn_credentials_file_keeps_the_fingerprint_unadopted() {
+    use crate::profile::{AppState, save_app_state, save_profile};
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use std::time::{Duration, SystemTime};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let a = oauth_profile("a", "access-A", None, None);
+    save_app_state(&AppState {
+        profiles: vec![a.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&a).expect("persist a");
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+
+    let mut app = app_with(vec![a.clone()]);
+    seed_oauth_reading(&app, &["a"]);
+    let fp_before = app.last_reload_fp.clone();
+
+    // Tear the credentials file: it exists but cannot be parsed.
+    let cred = crate::profile::profile_subpath(&ProfileName::from("a"), "credentials.json")
+        .expect("credentials path");
+    std::fs::write(&cred, r#"{"claudeAiOauth":"#).expect("write torn credentials");
+    crate::testutil::set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
+
+    super::cycle_theme(&mut app);
+
+    assert!(
+        app.usage_store.lock().unwrap().contains_key("a"),
+        "a torn credentials.json forgets nothing"
+    );
+    assert_eq!(
+        app.last_reload_fp, fp_before,
+        "an unreadable half counts as skipped, so the fingerprint stays unadopted"
+    );
+}
+
+/// The TUI's real log-out path (`run_confirm_action(BlankCredentials)`)
+/// followed by a reload compare advances the epoch exactly once.
+#[test]
+fn the_tui_log_out_path_forgets_an_own_change_exactly_once() {
+    use crate::profile::{AppState, save_app_state, save_profile};
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::usage::{Half, epoch_value};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let a = oauth_profile("a", "access-A", None, None);
+    save_app_state(&AppState {
+        profiles: vec![a.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&a).expect("persist a");
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+
+    let mut app = app_with(vec![a.clone()]);
+    seed_oauth_reading(&app, &["a"]);
+    let base = epoch_value(&ProfileName::from("a"), Half::OAuth);
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::BlankCredentials("a".to_string()),
+    );
+    assert_eq!(
+        epoch_value(&ProfileName::from("a"), Half::OAuth),
+        base + 1,
+        "the log-out path forgot the change once"
+    );
+
+    assert!(
+        !app.reload_if_state_changed(),
+        "the log-out path adopted the fingerprint, so the reload is a no-op"
+    );
+    assert_eq!(
+        epoch_value(&ProfileName::from("a"), Half::OAuth),
+        base + 1,
+        "the epoch advanced exactly once"
+    );
+}
+
+/// A no-op re-save and an anchor backfill (anchor appears over the same
+/// stored token) written by another process forget nothing.
+#[test]
+fn a_reload_forgets_nothing_on_a_noop_resave_or_an_anchor_backfill() {
+    use crate::profile::{AccountId, AppState, save_app_state, save_profile};
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::testutil::set_mtime;
+    use crate::usage::{Half, epoch_value};
+    use std::time::{Duration, SystemTime};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let a = oauth_profile("a", "access-A", None, None);
+    save_app_state(&AppState {
+        profiles: vec![a.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&a).expect("persist a");
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+
+    let mut app = app_with(vec![a.clone()]);
+    seed_oauth_reading(&app, &["a"]);
+    let base = epoch_value(&ProfileName::from("a"), Half::OAuth);
+
+    // A no-op re-save (same token) by another process.
+    save_profile(&a).expect("no-op re-save");
+    let cred = crate::profile::profile_subpath(&ProfileName::from("a"), "credentials.json")
+        .expect("credentials path");
+    set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+    assert!(
+        app.usage_store.lock().unwrap().contains_key("a"),
+        "a no-op re-save forgets nothing"
+    );
+    assert_eq!(
+        epoch_value(&ProfileName::from("a"), Half::OAuth),
+        base,
+        "the epoch does not move on a no-op re-save"
+    );
+
+    // An anchor backfill: the anchor appears over the unchanged stored token.
+    crate::usage::seed_login_anchor(&ProfileName::from("a"), Some(&AccountId::from("uuid-A")));
+    let anchor = crate::profile::profile_subpath(
+        &ProfileName::from("a"),
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+    )
+    .expect("anchor path");
+    set_mtime(&anchor, SystemTime::now() + Duration::from_secs(120));
+    assert!(
+        app.reload_if_state_changed(),
+        "the anchor write triggers a reload"
+    );
+    assert!(
+        app.usage_store.lock().unwrap().contains_key("a"),
+        "an anchor backfill over the same token forgets nothing"
+    );
+    assert_eq!(
+        epoch_value(&ProfileName::from("a"), Half::OAuth),
+        base,
+        "the epoch does not move on an anchor backfill"
+    );
+}
+
+/// A profile deleted in another process (roster and dir both gone) is
+/// forgotten by the reload's vanished-name arm.
+#[test]
+fn a_reload_forgets_a_profile_another_process_deleted() {
+    use crate::profile::{AppState, save_app_state, save_profile};
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, SystemTime};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let a = oauth_profile("a", "access-A", None, None);
+    save_app_state(&AppState {
+        profiles: vec![a.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&a).expect("persist a");
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+
+    let mut app = app_with(vec![a.clone()]);
+    seed_oauth_reading(&app, &["a"]);
+
+    // Another process deletes the profile: out of the roster, dir removed.
+    save_app_state(&AppState {
+        profiles: vec![],
+        ..AppState::default()
+    })
+    .expect("persist the delete");
+    std::fs::remove_dir_all(
+        crate::profile::profile_dir(&ProfileName::from("a")).expect("profile dir"),
+    )
+    .expect("remove the profile dir");
+    let state_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    set_mtime(&state_path, SystemTime::now() + Duration::from_secs(60));
+
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+    assert!(
+        !app.usage_store.lock().unwrap().contains_key("a"),
+        "a deleted profile's reading goes with its dir"
+    );
+    assert!(
+        !app.usage_status.lock().unwrap().contains_key("a"),
+        "a deleted profile's status goes with its dir"
+    );
+
+    // A recreate under the same name with another login: the vanished-name arm
+    // already dropped the snapshot entry, so the recreated profile reads as
+    // brand-new and nothing of the old reading shows.
+    let a_b = oauth_profile("a", "access-B", None, None);
+    save_app_state(&AppState {
+        profiles: vec![a_b.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist the recreate");
+    save_profile(&a_b).expect("persist the recreate's login");
+    let state_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    set_mtime(&state_path, SystemTime::now() + Duration::from_secs(120));
+
+    assert!(
+        app.reload_if_state_changed(),
+        "the recreate triggers a reload"
+    );
+    assert!(
+        !app.usage_store.lock().unwrap().contains_key("a"),
+        "nothing of the old reading shows after a recreate under another login"
+    );
+}
+
+/// A codex `auth.json` account change by another process forgets the codex
+/// reading through the reload (the auth.json write flips the fingerprint, the
+/// codex half's identity compare forgets it).
+#[test]
+fn a_codex_auth_change_by_another_process_forgets_the_codex_reading() {
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, SystemTime};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    let auth_path =
+        crate::profile::profile_subpath(&ProfileName::from("cx"), "auth.json").expect("auth path");
+    std::fs::create_dir_all(auth_path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"account_id":"codex-A","access_token":"t"}}"#,
+    )
+    .expect("write auth.json");
+
+    let mut app = app_with(vec![]);
+    // A codex reading in the shared usage store.
+    app.usage_store.lock().unwrap().insert(
+        "cx".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 9.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("cx".to_string(), crate::usage::FetchStatus::Fresh);
+
+    // Another process re-logs the codex account.
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"account_id":"codex-B","access_token":"t"}}"#,
+    )
+    .expect("write the new auth.json");
+    set_mtime(&auth_path, SystemTime::now() + Duration::from_secs(60));
+
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+    assert!(
+        !app.usage_store.lock().unwrap().contains_key("cx"),
+        "the codex reading goes with the external account change"
+    );
+    assert!(
+        !app.usage_status.lock().unwrap().contains_key("cx"),
+        "the codex status goes with the external account change"
     );
 }
 

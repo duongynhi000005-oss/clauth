@@ -41,9 +41,11 @@
 //!   `~/.clauth` tree, so this process mutates the filesystem when it resolves
 //!   (~3.1 ms at 0 entries, ~5.9 ms at 2000, against a ~2.2 ms spawn floor);
 //!   and `reload_fingerprint` runs on EVERY fire, open or closed, at a readdir
-//!   plus two stats per profile (+342 µs at 2 profiles, +523 at 30, +651 at 60).
-//!   The second is the price of the gate being sound at all, and it scales with
-//!   profile count rather than with anything this module controls.
+//!   plus five stats per profile, up to four of them reading a touch receipt
+//!   each (the +342 µs at 2 profiles / +523 at 30 / +651 at 60 figures priced
+//!   the older two-stat walk). The second is the price of the gate being sound
+//!   at all, and it scales with profile count rather than with anything this
+//!   module controls.
 //! - **One record per SCOPE, not per conversation.** A `PostToolUse` fired
 //!   inside a subagent carries `agent_id`; a single shared told-flag would let
 //!   the first subagent to fire consume the note while the main thread never
