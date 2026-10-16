@@ -1422,7 +1422,7 @@ fn an_unreadable_admin_token_names_chmod_600_as_the_fix() {
     let dir = tempfile::tempdir().unwrap();
     let path = secret_file(dir.path(), "t", "x", 0o000);
 
-    let err = read_admin_token(&path).unwrap_err();
+    let err = read_admin_token_optional(&path).unwrap_err();
 
     assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
     assert_eq!(
@@ -1431,7 +1431,30 @@ fn an_unreadable_admin_token_names_chmod_600_as_the_fix() {
     );
 }
 
-/// Every `read_admin_token` refusal is a usage error, so `enable` and
+/// A token file its owner cannot read but others can (`0o044`, `0o040`)
+/// fails the read before any mode question: the refusal still names
+/// `chmod 600`, which fixes both, and never stops at the bare read error.
+#[cfg(unix)]
+#[test]
+fn an_owner_unreadable_group_readable_admin_token_names_chmod_600() {
+    let dir = tempfile::tempdir().unwrap();
+    for mode in [0o044, 0o040, 0o004] {
+        let path = secret_file(dir.path(), &format!("t{mode:o}"), "x", mode);
+
+        let err = read_admin_token_optional(&path).unwrap_err();
+
+        assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "cannot read admin token file {path:?} (permission denied); run `chmod 600` on it"
+            ),
+            "mode {mode:o}"
+        );
+    }
+}
+
+/// Every admin-token read refusal is a usage error, so `enable` and
 /// `check <service>` exit 2 on bad input the way `read_secret_file`'s other
 /// refusals do.
 #[cfg(unix)]
@@ -1446,12 +1469,68 @@ fn every_read_admin_token_refusal_is_a_usage_error() {
         ("unreadable", "x", 0o000),
     ] {
         let path = secret_file(dir.path(), name, text, mode);
-        let err = read_admin_token(&path).unwrap_err();
+        let err = read_admin_token_optional(&path).unwrap_err();
         assert!(
             err.downcast_ref::<crate::UsageError>().is_some(),
             "{name}: {err:#}"
         );
     }
+}
+
+/// The refusal mapping never doubles the `chmod 600` clause, and each order
+/// is decided by which half refused: a READ refusal decides the owner-read
+/// bit first (a `0o044` file names `chmod 600` once off the read error),
+/// while a VALIDATION refusal keeps the others-can-read question first (its
+/// message passes through unchanged, never gaining a second clause). The
+/// doubled shape needs a read that succeeds with the owner-read bit off —
+/// root only — so the mapping is pinned directly with its inputs.
+#[cfg(unix)]
+#[test]
+fn the_admin_token_refusal_mapping_decides_each_order_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = secret_file(dir.path(), "open", "x", 0o044);
+
+    let e = crate::usage_error(format!(
+        "admin token file {open:?} is accessible by other users; run `chmod 600` on it"
+    ));
+    let fixed = refuse_admin_token_validation(&open, e);
+    assert_eq!(
+        fixed.to_string(),
+        format!("admin token file {open:?} is accessible by other users; run `chmod 600` on it")
+    );
+
+    let e = crate::usage_error(format!(
+        "cannot read admin token file {open:?} (permission denied)"
+    ));
+    let fixed = refuse_admin_token_read(&open, e);
+    assert_eq!(
+        fixed.to_string(),
+        format!("cannot read admin token file {open:?} (permission denied); run `chmod 600` on it")
+    );
+}
+
+/// A token path that is a symlink loop fails the read before any mode
+/// question: the refusal is the bare read error, never `chmod 600`, which
+/// cannot fix a path that does not resolve.
+#[cfg(unix)]
+#[test]
+fn a_symlink_loop_token_names_the_bare_read_refusal_not_chmod() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("loop");
+    std::os::unix::fs::symlink("loop", &path).unwrap();
+
+    let err = read_admin_token_optional(&path).unwrap_err();
+
+    assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
+    assert!(
+        err.to_string()
+            .starts_with(&format!("cannot read admin token file {path:?}")),
+        "the refusal is the bare read error: {err}"
+    );
+    assert!(
+        !err.to_string().contains("chmod 600"),
+        "a path that does not resolve cannot be fixed by chmod: {err}"
+    );
 }
 
 /// The service form: the bind from the row, the token from its file, and
@@ -2476,6 +2555,16 @@ fn a_setting_with_no_default_gets_no_null_reset() {
     )
     .expect("check runs");
 
+    // The contract requires `default` on every setting, so the planted one is
+    // itself one departure, named once; the skipped reset adds none.
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/info",
+            "settings[4].default: the setting's type or null",
+            "nothing"
+        )]
+    );
     assert_eq!(
         report
             .skipped

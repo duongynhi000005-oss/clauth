@@ -4,11 +4,12 @@
 //!
 //! The default run is safe on a live proxy: it reads every read route, checks
 //! every `/info` declaration, probes each control route without the admin
-//! token, hits each mutating route on an id no proxy holds (proving the route
-//! exists and answers its error shape), starts one login flow and cancels it,
-//! and sends one inference request. `--destructive <account>` adds the
-//! mutating success paths on that account and ends by deleting it, for a
-//! proxy's own CI against a stub upstream.
+//! token, sends each mutating route aimed at an account id no proxy holds, a
+//! PUT on the account list and a config change naming a setting no proxy
+//! declares, starts one login flow and cancels it, and sends one inference
+//! request.
+//! `--destructive <account>` adds the mutating success paths on that account
+//! and ends by deleting it, for a proxy's own CI against a stub upstream.
 //!
 //! Bodies are read as `serde_json::Value` rather than typed structs: the check
 //! reports each wrong field by its path, which a failed typed deserialize
@@ -18,7 +19,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::proxy::{SPOKEN_MAJOR, contract_version};
@@ -74,6 +75,10 @@ impl Secret {
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn into_inner(self) -> String {
+        self.0
+    }
 }
 
 impl std::fmt::Debug for Secret {
@@ -112,6 +117,13 @@ pub(crate) fn read_secret_file(path: &Path, what: &str) -> Result<Secret> {
             )));
         }
     };
+    validate_secret_text(path, what, text)
+}
+
+/// The one rule for a credential's text and mode, after it was read: a file
+/// other users can read is refused, as is an empty value or one holding
+/// whitespace or control characters.
+fn validate_secret_text(path: &Path, what: &str, text: String) -> Result<Secret> {
     #[cfg(unix)]
     if secret_file_open_to_others(path) {
         return Err(crate::usage_error(format!(
@@ -151,37 +163,81 @@ pub(crate) fn secret_file_open_to_others(_path: &Path) -> bool {
 /// The one acceptance rule for a proxy's admin token, shared by `enable`
 /// (through `crate::proxy::ensure_proxy_token`) and `clauth proxy check
 /// <service>`: the reader's rule above plus the [`crate::gateway::MIN_ADMIN_KEY_LEN`]
-/// floor. A refusal names its fix — `chmod 600` for a file other users can
-/// read, else delete the file so clauth mints a new one.
-pub(crate) fn read_admin_token(path: &Path) -> Result<Secret> {
-    let secret = read_secret_file(path, "admin token").map_err(|e| {
-        // A file only its owner can reach that the owner still cannot read has
-        // the owner-read bit off; `chmod 600` restores it, where deleting it
-        // would throw the token away.
-        #[cfg(unix)]
-        let unreadable = {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(path)
-                .map(|meta| meta.permissions().mode() & 0o400 == 0)
-                .unwrap_or(false)
-        };
-        #[cfg(not(unix))]
-        let unreadable = false;
-        if secret_file_open_to_others(path) {
-            e
-        } else if unreadable {
-            crate::usage_error(format!("{e:#}; run `chmod 600` on it"))
-        } else {
-            crate::usage_error(format!("{e:#}; delete the file and clauth mints a new one"))
+/// floor. `None` when the file is absent, so `enable` mints and `check
+/// <service>` names the command that mints it. A refusal names its fix
+/// — `chmod 600` for a file the owner cannot read or other users can read,
+/// else delete the file so clauth mints a new one.
+pub(crate) fn read_admin_token_optional(path: &Path) -> Result<Option<Secret>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(refuse_admin_token_read(
+                path,
+                crate::usage_error(format!(
+                    "cannot read admin token file {path:?} ({})",
+                    e.kind()
+                )),
+            ));
         }
-    })?;
+    };
+    let secret = match validate_secret_text(path, "admin token", text) {
+        Ok(secret) => secret,
+        Err(e) => return Err(refuse_admin_token_validation(path, e)),
+    };
     if secret.expose().len() < crate::gateway::MIN_ADMIN_KEY_LEN {
         return Err(crate::usage_error(format!(
             "admin token file {path:?} is shorter than {} characters; delete the file and clauth mints a new one",
             crate::gateway::MIN_ADMIN_KEY_LEN
         )));
     }
-    Ok(secret)
+    Ok(Some(secret))
+}
+
+/// Whether the owner-read bit is off: a file whose owner cannot read it,
+/// which only `chmod 600` fixes (deleting it would throw the token away).
+#[cfg(unix)]
+fn admin_token_owner_unreadable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o400 == 0)
+        .unwrap_or(false)
+}
+
+/// Windows has no owner-read file mode to check.
+#[cfg(not(unix))]
+fn admin_token_owner_unreadable(_path: &Path) -> bool {
+    false
+}
+
+/// The fix for a refusal from the read itself: the owner-read bit is decided
+/// first, so an owner-unreadable mode (`0o044`, `0o040`, `0o004`, `0o000`)
+/// names `chmod 600` — which restores both bits — before the others-can-read
+/// question; the reader's own message when only other users can read it; else
+/// delete-and-mint.
+fn refuse_admin_token_read(path: &Path, e: anyhow::Error) -> anyhow::Error {
+    if admin_token_owner_unreadable(path) {
+        crate::usage_error(format!("{e:#}; run `chmod 600` on it"))
+    } else if secret_file_open_to_others(path) {
+        e
+    } else {
+        crate::usage_error(format!("{e:#}; delete the file and clauth mints a new one"))
+    }
+}
+
+/// The fix for a refusal from the validation, after the file was read: the
+/// others-can-read question first (its message already names `chmod 600`),
+/// then the owner-read bit, else delete-and-mint — the order a validation
+/// refusal always used, so a validation refusal never gains a second fix
+/// clause.
+fn refuse_admin_token_validation(path: &Path, e: anyhow::Error) -> anyhow::Error {
+    if secret_file_open_to_others(path) {
+        e
+    } else if admin_token_owner_unreadable(path) {
+        crate::usage_error(format!("{e:#}; run `chmod 600` on it"))
+    } else {
+        crate::usage_error(format!("{e:#}; delete the file and clauth mints a new one"))
+    }
 }
 
 // ── the report ──────────────────────────────────────────────────────────────
@@ -342,16 +398,15 @@ pub(crate) fn resolve_target(
         Some(path) => read_secret_file(path, "admin token")?,
         None => {
             let path = crate::proxy::admin_token_path(&service)?;
-            if !path
-                .try_exists()
-                .with_context(|| format!("failed to inspect {}", path.display()))?
-            {
-                return Err(crate::usage_error(format!(
-                    "proxy {:?} has no admin token file {path:?}; run `clauth proxy enable {service}` to mint it",
-                    service.as_str()
-                )));
+            match read_admin_token_optional(&path)? {
+                Some(secret) => secret,
+                None => {
+                    return Err(crate::usage_error(format!(
+                        "proxy {:?} has no admin token file {path:?}; run `clauth proxy enable {service}` to mint it",
+                        service.as_str()
+                    )));
+                }
             }
-            read_admin_token(&path)?
         }
     };
     let key = match key_file {

@@ -386,6 +386,55 @@ fn a_manifest_reads_back_typed() {
     );
 }
 
+/// A `sleep 60` the stub left running, its pid in `path`: killed when the
+/// test unwinds while that pid still names a `sleep` (the stub `exec`s it, so
+/// the recorded pid is the sleep's own; a pid recycled to anything but a
+/// `sleep` is left alone). Reads `path` at drop, so a guard armed before the
+/// stub ran still holds; best-effort, never asserts.
+#[cfg(unix)]
+struct SleepGuard(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for SleepGuard {
+    fn drop(&mut self) {
+        let Some(pid) = fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        else {
+            return;
+        };
+        if !names_sleep(pid) {
+            return;
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-s", "KILL", &pid.to_string()])
+            .status();
+    }
+}
+
+/// Whether `pid`'s command line still names `sleep` as its first whole word:
+/// the pid may have been recycled, so it is only the stub's sleep while it
+/// names `sleep`.
+#[cfg(unix)]
+fn names_sleep(pid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        == Some("sleep")
+}
+
 /// A `manifest` that outruns its bound is killed and reaped, never left
 /// running, and refused naming the bound. The 30 s ceiling sits far above
 /// the 2 s bound and far below the stub's 60 s sleep.
@@ -400,6 +449,7 @@ fn a_manifest_that_outruns_its_bound_is_stopped_and_refused() {
         "clauth-zcode-proxy",
         &format!("echo $$ > '{}'; exec sleep 60", dir.join("pid").display()),
     );
+    let _sleep = SleepGuard(dir.join("pid"));
     let started = std::time::Instant::now();
 
     let err = read_manifest_within(&service("zcode"), &binary, Duration::from_secs(2))
@@ -1269,6 +1319,97 @@ fn enable_of_a_refused_row_refuses_before_any_manifest_or_probe() {
         )
     );
     assert!(!ran.exists(), "no manifest ran for a refused row");
+}
+
+/// While any row is refused, `enable` of another service refuses before its
+/// manifest spawn or any port probe, with the text the write would refuse
+/// with: the write can never land, so the spawn and the probes buy nothing.
+#[cfg(unix)]
+#[test]
+fn enable_beside_a_refused_row_refuses_before_any_manifest_or_probe() {
+    let home = HomeSandbox::new();
+    let bin = home.home().join("bin");
+    let ran = bin.join("manifest-ran");
+    fs::create_dir_all(&bin).expect("bin");
+    crate::testutil::write_shim(
+        &bin,
+        "clauth-zcode-proxy",
+        &format!(
+            "if [ \"$1\" = manifest ]; then touch '{}'; printf '%s\\n' '{}'; exit 0; fi\nexit 2",
+            ran.display(),
+            ZCODE_MANIFEST
+        ),
+    );
+    let path = registry_path().unwrap();
+    write(&path, "[qwen]\nport = 65000\nenabeld = true\n");
+    let probed = std::cell::Cell::new(0_u32);
+
+    let err = enable_with("zcode", None, Some(bin.as_os_str()), |_| {
+        probed.set(probed.get() + 1);
+        Ok(())
+    })
+    .expect_err("a registry holding a refused row takes no new row");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "invalid proxy registry {}: row \"qwen\": unknown key \"enabeld\"",
+            path.display()
+        )
+    );
+    assert!(!ran.exists(), "no manifest ran while a row is refused");
+    assert_eq!(probed.get(), 0, "no port was probed while a row is refused");
+    assert_eq!(
+        fs::read_to_string(&path).expect("registry"),
+        "[qwen]\nport = 65000\nenabeld = true\n"
+    );
+}
+
+/// With two refused rows, `enable` names the first in name order — the one a
+/// write refuses with too — so the two refusal sites cannot disagree.
+#[test]
+fn enable_beside_two_refused_rows_names_the_first_in_name_order() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(
+        &path,
+        "[qwen]\nport = 65000\nenabeld = true\n[alpha]\nport = 65001\nenabeld = true\n",
+    );
+
+    let err = enable("zcode", None, None).expect_err("two refused rows refuse any write");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "invalid proxy registry {}: row \"alpha\": unknown key \"enabeld\"",
+            path.display()
+        )
+    );
+}
+
+/// A `proxies.toml` that is not UTF-8 refuses the read by name — it never
+/// parses to nothing — and `enable` of another service leaves its bytes
+/// untouched: the unreadable registry is never rewritten.
+#[test]
+fn a_non_utf8_registry_refuses_the_read_and_enable_leaves_the_bytes() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    let bytes: &[u8] = b"[zcode]\nport = 9101\n# \xff\n";
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    fs::write(&path, bytes).expect("write a non-UTF-8 registry");
+
+    let err = Registry::load().unwrap_err();
+    assert!(
+        format!("{err:#}").starts_with(&format!("failed to read {}", path.display())),
+        "the read refusal names the read, got {err:#}"
+    );
+
+    enable("qwen", None, None).expect_err("an unreadable registry refuses any write");
+    assert_eq!(
+        fs::read(&path).expect("read"),
+        bytes,
+        "the bytes are untouched"
+    );
 }
 
 /// A row carrying several unknown keys names every one, in key order; a

@@ -800,6 +800,20 @@ fn a_stop_leaving_no_daemon_stops_the_gateway_it_left() {
     }
 }
 
+/// A process the test owns outright, killed and reaped when the test unwinds,
+/// so a red before its own kill leaks nothing. Never asserts (`Drop` runs
+/// while a test unwinds; a panic there aborts the whole binary).
+#[cfg(unix)]
+struct Owned(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for Owned {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// A marker-only proxy orphan — a live pid recorded in a child marker alone,
 /// no supervisor running — is stopped by the daemon-stop path, not only by a
 /// direct `stop_left_behind_proxies` call: `stop daemon` runs the same sweep
@@ -812,11 +826,13 @@ fn a_stop_leaving_no_daemon_stops_a_marker_only_proxy_orphan() {
     let service = crate::proxy::Service::parse("zcode").expect("a service");
     crate::profile::mkdir_700(&crate::proxy::state_dir(&service).expect("state dir"))
         .expect("state dir");
-    let mut orphan = std::process::Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .expect("spawn the orphan");
-    let pid = orphan.id();
+    let mut orphan = Owned(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the orphan"),
+    );
+    let pid = orphan.0.id();
     let start = crate::daemon::gateway::process_start_time(pid).expect("start time");
     let marker = crate::daemon::gateway::ChildMarker {
         pid,
@@ -844,7 +860,7 @@ fn a_stop_leaving_no_daemon_stops_a_marker_only_proxy_orphan() {
     let exited = poll_until(
         std::time::Duration::from_secs(2),
         std::time::Duration::from_millis(20),
-        || orphan.try_wait().expect("try_wait"),
+        || orphan.0.try_wait().expect("try_wait"),
     );
     assert_eq!(
         crate::daemon::gateway::ExitReport::from(exited.expect("exited")).signal,

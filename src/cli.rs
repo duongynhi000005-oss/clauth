@@ -795,10 +795,13 @@ pub(crate) enum ProxyCommand {
     ///
     /// Drives every contract route and prints one line per departure (the
     /// route, what the contract expects, what the proxy answered), exiting 1
-    /// when there is any. Safe on a live proxy: mutating routes are only aimed
-    /// at an account id no proxy holds, and the one login flow it starts is
-    /// cancelled (a flow that takes no pastes first gets one, which it must
-    /// refuse). It does send one real inference request on the key's account.
+    /// when there is any. Safe on a live proxy: every write it sends is one a
+    /// conformant proxy refuses (each control write sent without the admin
+    /// token, mutating routes aimed at an account id no proxy holds, PUT on
+    /// the account list, a config change naming a setting no proxy declares),
+    /// and the one login flow it starts is cancelled (a flow that takes no
+    /// pastes first gets one, which it must refuse). It does send one real
+    /// inference request on the key's account.
     Check {
         /// The proxy's base URL, like http://127.0.0.1:9101, or the service of
         /// a proxy registered with `clauth proxy enable`, like zcode.

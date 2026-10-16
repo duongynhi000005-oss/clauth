@@ -2879,6 +2879,55 @@ fn adoption_records_a_symlinked_configs_target_and_the_link_survives_the_edit() 
     );
 }
 
+/// A `sleep 60` the stub left running, its pid in `path`: killed when the
+/// test unwinds while that pid still names a `sleep` (the stub `exec`s or
+/// backgrounds it, so the recorded pid is the sleep's own; a pid recycled to
+/// anything but a `sleep` is left alone). Reads `path` at drop, so a guard
+/// armed before the stub ran still holds; best-effort, never asserts.
+#[cfg(unix)]
+struct SleepGuard(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for SleepGuard {
+    fn drop(&mut self) {
+        let Some(pid) = fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        else {
+            return;
+        };
+        if !names_sleep(pid) {
+            return;
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-s", "KILL", &pid.to_string()])
+            .status();
+    }
+}
+
+/// Whether `pid`'s command line still names `sleep` as its first whole word:
+/// the pid may have been recycled, so it is only the stub's sleep while it
+/// names `sleep`.
+#[cfg(unix)]
+fn names_sleep(pid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        == Some("sleep")
+}
+
 /// A check that outruns its bound is killed and reaped, never left running,
 /// and the edit refuses with the config untouched. The 30 s ceiling sits far
 /// above the 2 s bound and far below the stub's 60 s sleep, so only a check
@@ -2888,6 +2937,7 @@ fn adoption_records_a_symlinked_configs_target_and_the_link_survives_the_edit() 
 fn a_check_that_outruns_its_bound_is_stopped_and_writes_nothing() {
     let g = gate(USER_CONFIG);
     write(&g.stub.join("slow"), "");
+    let _sleep = SleepGuard(g.stub.join("pid"));
     let _bound = CheckTimeoutOverride::set(Duration::from_secs(2));
     let started = std::time::Instant::now();
 
@@ -3258,6 +3308,7 @@ fn a_check_that_passes_after_writing_past_the_cap_lands_its_edit() {
 fn a_checks_stderr_is_read_within_the_checks_bound() {
     let g = gate(USER_CONFIG);
     write(&g.stub.join("held"), "");
+    let _held_guard = SleepGuard(g.stub.join("held-pid"));
     let _bound = CheckTimeoutOverride::set(Duration::from_secs(2));
     let started = std::time::Instant::now();
 

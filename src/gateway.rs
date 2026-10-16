@@ -814,11 +814,11 @@ impl SecretToken {
     }
 
     /// A token the caller already read and validated with the acceptance rule
-    /// it owns (e.g. [`crate::proxy_check::read_admin_token`]): wraps that same
-    /// read's value, so no second read of the file can hand back a different,
-    /// unvalidated token.
-    pub(crate) fn from_validated(token: String) -> Self {
-        Self(token)
+    /// it owns ([`crate::proxy_check::read_admin_token_optional`]): takes the
+    /// reader's `Secret` by value, so no caller passes a `String` it built
+    /// itself.
+    pub(crate) fn from_validated(secret: crate::proxy_check::Secret) -> Self {
+        Self(secret.into_inner())
     }
 }
 
