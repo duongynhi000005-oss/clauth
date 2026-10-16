@@ -821,10 +821,11 @@ pub(crate) struct DelegateArgs {
     env: Option<HashMap<String, String>>,
     /// Extra CLI arguments that go after the `claude -p` clauth invokes. Your
     /// arguments come last, so they win where a flag repeats (including
-    /// `--model` when `model` is set), except `--settings`: clauth merges its
-    /// value into the settings it passes itself. `--session-id`, `--resume` and
-    /// `--fork-session` are refused: clauth pins the session id and exports it
-    /// as `CLAUTH_DELEGATE_SESSION_ID`; resume through `session_id`.
+    /// `--model` when `model` is set), except a `--settings` before `--`, which
+    /// clauth merges into its own settings file when it passes one.
+    /// `--session-id`, `--resume` and `--fork-session` are refused: clauth pins
+    /// the session id and exports it as `CLAUTH_DELEGATE_SESSION_ID`; resume
+    /// through `session_id`.
     ///
     /// A delegate that must write files needs
     /// `args: ["--dangerously-skip-permissions"]`; without it the session

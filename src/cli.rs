@@ -564,8 +564,8 @@ pub(crate) struct StartArgs {
     /// Profile to launch under.
     #[arg(required_unless_present = "auto")]
     pub(crate) profile: Option<String>,
-    /// Args handed to `claude` as given, except a `--settings` value, which
-    /// clauth merges into the settings it passes itself.
+    /// Args handed to `claude` as given, except a `--settings` before `--`,
+    /// which clauth merges into its own settings file when it passes one.
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
