@@ -93,6 +93,7 @@ fn tokens_dashboard_uses_alignment_not_middot() {
         first_session_date: Some("2026-01-18T19:26:04Z".into()),
         last_computed_date: Some("2026-06-09".into()),
         topped_up_through: Some("2026-06-15".into()),
+        speed_days: Default::default(),
         today: Some(DaySummary {
             date: "2026-06-15".into(),
             input: 12_300_000,
@@ -114,10 +115,13 @@ fn tokens_dashboard_uses_alignment_not_middot() {
         .flat_map(|y| (0..100usize).map(move |x| (x, y)))
         .map(|(x, y)| buf.content[y * 100 + x].symbol().to_owned())
         .collect();
-    // Skip the 3-row header which now has a middot in the gauge area.
+    // Skip the 3-row header which now has a middot in the gauge area. The today
+    // card's ruled speed row carries the body's one sanctioned `·` between its
+    // two figures; every other fact still separates by alignment.
     let body: String = text.chars().skip(3 * 100).take(27 * 100).collect();
+    let body_sans_speed = body.replace("now · — today", "now — today");
     assert!(
-        !body.contains('·'),
+        !body_sans_speed.contains('·'),
         "tokens dashboard must use alignment, not `·` separators"
     );
     assert!(text.contains("jan 18"), "span start missing");
@@ -158,6 +162,7 @@ fn count_cache_toggle_switches_token_basis() {
         first_session_date: None,
         last_computed_date: None,
         topped_up_through: None,
+        speed_days: Default::default(),
         today: Some(DaySummary {
             date: "2026-06-15".into(),
             input: 10_000_000,

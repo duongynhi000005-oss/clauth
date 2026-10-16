@@ -447,6 +447,7 @@ fn cache_hit_ratio_math() {
         first_session_date: None,
         last_computed_date: None,
         topped_up_through: None,
+        speed_days: Default::default(),
         today: None,
     };
     // cache_read / (cache_read + cache_create + input) = 500 / 2000 = 0.25
@@ -471,6 +472,7 @@ fn cache_hit_ratio_zero_denominator() {
         first_session_date: None,
         last_computed_date: None,
         topped_up_through: None,
+        speed_days: Default::default(),
         today: None,
     };
     assert_eq!(stats.cache_hit_ratio(), 0.0);
@@ -3537,5 +3539,41 @@ fn persist_ledger_rekeys_covered_days_onto_the_served_model() {
     assert_eq!(
         ledger.wire_model_fields("2026-06-14", "deepseek-v4-pro"),
         None
+    );
+}
+
+// ── tps: the tokens worker only reads the speed ledger ────────────────────────
+
+/// The tokens worker never writes `token_speed.json` (the producer folds it at
+/// day rollover); `persist_ledger` leaves the file untouched and the worker
+/// reads `TokenStats.speed_days` from it.
+#[test]
+fn persist_ledger_does_not_write_the_speed_ledger() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let clauth = sb.home().join(".clauth");
+    let claude = sb.home().join(".claude");
+    std::fs::create_dir_all(&clauth).unwrap();
+    std::fs::create_dir_all(&claude).unwrap();
+
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth);
+    let base = TokenStats::default();
+    persist_ledger(
+        &claude,
+        &mut ledger,
+        &clauth,
+        &base,
+        "2026-10-15",
+        |_, _| {},
+    );
+
+    assert!(
+        !clauth.join("token_speed.json").exists(),
+        "the tokens worker never writes the speed ledger"
+    );
+    assert!(
+        crate::token_ledger::SpeedLedger::load(&clauth)
+            .days
+            .is_empty(),
+        "an empty speed ledger loads empty"
     );
 }

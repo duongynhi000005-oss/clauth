@@ -49,6 +49,12 @@ use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs};
 
 const LEDGER_FILE: &str = "token_ledger.json";
 
+/// The speed ledger's own file (`~/.clauth/token_speed.json`).
+const SPEED_LEDGER_FILE: &str = "token_speed.json";
+
+/// The speed ledger's schema version.
+const SPEED_LEDGER_VERSION: u16 = 1;
+
 /// The usage-shape classifier version this build re-derives recorded days
 /// under. Each classifier change bumps it; every ledger stamped below it owes
 /// exactly one re-derive pass.
@@ -529,6 +535,188 @@ fn prev_day(date: &str) -> Option<String> {
     let secs = iso_to_epoch_secs(&format!("{date}T00:00:00+00:00"))?;
     let iso = epoch_secs_to_iso(secs - 86_400);
     iso.get(..10).map(str::to_owned)
+}
+
+/// Per-day tps speed sums in `~/.clauth/token_speed.json`, apart from the
+/// token ledger so an older clauth saving that file never drops them.
+#[derive(Debug, Default)]
+pub(crate) struct SpeedLedger {
+    pub(crate) days: crate::tps::DaySums,
+    /// Newer version: never save over it and never retry-reload.
+    newer: bool,
+    /// Unreadable (a read error): never save over it, but the producer may
+    /// retry-reload when its file changes or on a timer.
+    unreadable: bool,
+    /// The on-disk file does not parse; rename it aside before the first save.
+    corrupt: bool,
+    /// The rename-aside failure was already logged.
+    rename_logged: bool,
+}
+
+/// The speed ledger's wire shape: `{version: 1, days: {date: {account: {model:
+/// {output, gen_ms}}}}}`.
+#[derive(Serialize, Deserialize, Default)]
+struct SpeedLedgerWire {
+    #[serde(default)]
+    version: u16,
+    #[serde(default)]
+    days: crate::tps::DaySums,
+}
+
+impl SpeedLedger {
+    pub(crate) fn load(clauth_dir: &Path) -> Self {
+        let path = clauth_dir.join(SPEED_LEDGER_FILE);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Self::default();
+            }
+            Err(_) => {
+                // Any other read error is not "absent": never save over a file
+                // we could not read. The producer logs this once.
+                return Self {
+                    days: Default::default(),
+                    newer: false,
+                    unreadable: true,
+                    corrupt: false,
+                    rename_logged: false,
+                };
+            }
+        };
+        let wire = match serde_json::from_slice::<SpeedLedgerWire>(&bytes) {
+            Ok(w) => w,
+            Err(_) => {
+                // Never save over an unparsable file: its rows are not
+                // re-derivable once the transcripts age out.
+                return Self {
+                    days: Default::default(),
+                    newer: false,
+                    unreadable: false,
+                    corrupt: true,
+                    rename_logged: false,
+                };
+            }
+        };
+        if wire.version > SPEED_LEDGER_VERSION {
+            return Self {
+                days: Default::default(),
+                newer: true,
+                unreadable: false,
+                corrupt: false,
+                rename_logged: false,
+            };
+        }
+        Self {
+            days: wire.days,
+            newer: false,
+            unreadable: false,
+            corrupt: false,
+            rename_logged: false,
+        }
+    }
+
+    /// True when the on-disk file must never be saved over (newer version or
+    /// unreadable).
+    pub(crate) fn unusable(&self) -> bool {
+        self.newer || self.unreadable
+    }
+
+    /// True when the file is a newer version (never retry-reload).
+    pub(crate) fn newer(&self) -> bool {
+        self.newer
+    }
+
+    /// Fold the producer's finalized days (strictly before `today`) that this
+    /// ledger lacks or that differ (a producer's past day is final; the fold
+    /// copies it). Returns whether anything changed.
+    pub(crate) fn record(&mut self, days: &crate::tps::DaySums, today: &str) -> bool {
+        let mut changed = false;
+        for (date, accounts) in days {
+            if date.as_str() >= today {
+                continue;
+            }
+            for (account, models) in accounts {
+                for (model, sum) in models {
+                    let slot = self
+                        .days
+                        .entry(date.clone())
+                        .or_default()
+                        .entry(account.clone())
+                        .or_default();
+                    match slot.get(model) {
+                        Some(w) if w.output == sum.output && w.gen_ms == sum.gen_ms => {}
+                        _ => {
+                            slot.insert(model.clone(), *sum);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Persist atomically (0600). Returns whether the save succeeded. An
+    /// unusable file is never touched (returns false). An unparsable file is
+    /// renamed aside once (0600) before the first save; a failed rename skips
+    /// the write and returns false, leaving the corrupt file in place.
+    pub(crate) fn save(&mut self, clauth_dir: &Path) -> bool {
+        if self.unusable() {
+            return false;
+        }
+        let path = clauth_dir.join(SPEED_LEDGER_FILE);
+        if self.corrupt {
+            let aside = clauth_dir.join(format!(
+                "token_speed.json.corrupt-{}",
+                crate::usage::now_ms()
+            ));
+            if std::fs::rename(&path, &aside).is_err() {
+                if !self.rename_logged {
+                    crate::logline::logline!(
+                        "clauth: could not move the unreadable token_speed.json aside; not saving over it"
+                    );
+                    self.rename_logged = true;
+                }
+                return false;
+            }
+            self.rename_logged = false;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o600));
+            }
+            crate::logline::logline!(
+                "clauth: token_speed.json was unreadable; moved aside to {}",
+                aside.display()
+            );
+            self.corrupt = false;
+        }
+        let wire = SpeedLedgerWire {
+            version: SPEED_LEDGER_VERSION,
+            days: self.days.clone(),
+        };
+        let Ok(bytes) = serde_json::to_vec(&wire) else {
+            return false;
+        };
+        crate::profile::atomic_write_600(&path, &bytes).is_ok()
+    }
+
+    /// The speed rows summed across accounts (incl. `*`) and models per day:
+    /// `date -> (output, gen_ms)`. Avg speed = output ÷ seconds.
+    pub(crate) fn speed_days(&self) -> std::collections::BTreeMap<String, crate::tps::DaySum> {
+        let mut out = std::collections::BTreeMap::new();
+        for (date, accounts) in &self.days {
+            let mut day = crate::tps::DaySum::default();
+            for models in accounts.values() {
+                for w in models.values() {
+                    day.output = day.output.saturating_add(w.output);
+                    day.gen_ms = day.gen_ms.saturating_add(w.gen_ms);
+                }
+            }
+            out.insert(date.clone(), day);
+        }
+        out
+    }
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@
 //! derived from the cache-file mtime so the single-shot `status --json` still
 //! produces a coherent shape.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -696,7 +696,68 @@ pub(crate) struct StatusBody {
     #[serde(default)]
     #[schema(required = true)]
     pub(crate) proxies: Vec<ProxySlot>,
+    /// Additive: the lease holder's tps cache republished minus its `days`
+    /// (which the ledger owns), plus `age_secs`. `None` = no producer cache.
+    /// `default` so a reader stays additive-tolerant of an older writer.
+    #[serde(default)]
+    #[schema(required = true)]
+    pub(crate) tps: Option<TpsSlot>,
     pub(crate) profiles: Vec<ProfileEntry>,
+}
+
+/// The status feed's tps slot: the producer's cache minus `days`, plus the
+/// cache's age in whole seconds.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct TpsSlot {
+    pub(crate) version: u16,
+    pub(crate) generated_at: String,
+    pub(crate) total: crate::tps::Figures,
+    pub(crate) accounts: BTreeMap<String, crate::tps::Figures>,
+    pub(crate) sessions: BTreeMap<String, TpsSession>,
+    pub(crate) age_secs: u64,
+}
+
+/// One session's figures in the tps slot. Flattened-out (no serde flatten) so
+/// the schema derives cleanly while the wire shape stays `{account, live, m5,
+/// h1}` — identical to the cache's [`crate::tps::SessionFigures`].
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct TpsSession {
+    pub(crate) account: Option<String>,
+    pub(crate) live: crate::tps::Figure,
+    pub(crate) m5: crate::tps::Figure,
+    pub(crate) h1: crate::tps::Figure,
+}
+
+/// The cache minus `days`, plus `age_secs`; `None` when no cache exists or it
+/// does not parse. A cache older than [`crate::tps::STALE_AFTER_MS`] still
+/// republishes here — the feed is a fact, not a liveness gate (that gate is
+/// `which --json`'s).
+fn tps_slot() -> Option<TpsSlot> {
+    let snap = crate::tps::load_cache()?;
+    let age_ms = snap.age_ms(now_ms())?;
+    let sessions = snap
+        .sessions
+        .into_iter()
+        .map(|(sid, s)| {
+            (
+                sid,
+                TpsSession {
+                    account: s.account,
+                    live: s.figures.live,
+                    m5: s.figures.m5,
+                    h1: s.figures.h1,
+                },
+            )
+        })
+        .collect();
+    Some(TpsSlot {
+        version: snap.version,
+        generated_at: snap.generated_at,
+        total: snap.total,
+        accounts: snap.accounts,
+        sessions,
+        age_secs: age_ms / 1000,
+    })
 }
 
 /// Build the full `status.json` body. `interval_ms` is the live refresh interval
@@ -721,6 +782,20 @@ pub(crate) fn build_status_with_codex(
     interval_ms: u64,
     live: Option<&LiveSignals>,
     include_disabled: bool,
+) -> (StatusBody, Option<crate::codex_profiles::CodexState>) {
+    build_status_impl(config, interval_ms, live, include_disabled, true)
+}
+
+/// [`build_status_with_codex`] with the tps slot included or skipped. The
+/// daemonless republish path skips it: it backdates `generated_at` and would
+/// freeze a `tps.age_secs ~0` over a stale stamp, and the slot is the daemon's
+/// to republish.
+pub(crate) fn build_status_impl(
+    config: &AppConfig,
+    interval_ms: u64,
+    live: Option<&LiveSignals>,
+    include_disabled: bool,
+    include_tps: bool,
 ) -> (StatusBody, Option<crate::codex_profiles::CodexState>) {
     let mut profiles = build_profile_entries(config, interval_ms, live, include_disabled);
     // One read feeds both the entries and the slots below, so a load error
@@ -749,6 +824,7 @@ pub(crate) fn build_status_with_codex(
         clauth_version: env!("CARGO_PKG_VERSION").to_string(),
         gateway: Some(slot_or_record(live.and_then(|s| s.gateway))),
         proxies: super::proxies::entries(live.and_then(|s| s.proxies)),
+        tps: if include_tps { tps_slot() } else { None },
         profiles,
     };
     (body, codex)

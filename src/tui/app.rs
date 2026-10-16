@@ -4313,6 +4313,11 @@ pub(crate) struct App {
     /// offset. Never compiled into the binary.
     #[cfg(test)]
     pub(crate) anim_phase_ms: Option<u64>,
+    /// Pinned wall clock for render tests that must advance a tps snapshot past
+    /// its stale window without sleeping. `fresh_tps` reads this when set, so
+    /// freshness is still judged per call. Never compiled into the binary.
+    #[cfg(test)]
+    pub(crate) tps_now_override: Option<u64>,
     /// The day-list notices last surfaced, empty while the lists are ordinary.
     /// Holding the MESSAGES rather than a flag is what makes the gate right on
     /// both axes `AppConfig::day_claim_collision` documents: each string
@@ -4410,6 +4415,29 @@ pub(crate) struct App {
     /// The widest the header's `[ N live ]` chip has read `N`, in cells: the
     /// chip renders at least this wide for the TUI's lifetime.
     pub(crate) live_count_width: usize,
+    /// The last tps snapshot read off the producer's cache, `None` when the
+    /// cache is absent. Seeded in [`App::new`] beside `live_sessions`, so the
+    /// header's `[ — tok/s ]` and the other no-reading forms render from the
+    /// first frame; re-read on the tick by [`poll_tps`].
+    pub(crate) tps: Option<crate::tps::Snapshot>,
+    /// The widest the header's `[ R tok/s ]` chip has read `R`, in cells.
+    pub(crate) tps_rate_width: usize,
+    /// Throttle for the per-tick tps cache re-read.
+    last_tps_refresh: Instant,
+    /// Finished delegate jobs' resolved average speeds, keyed by job id. Filled
+    /// on the tick path (never in render) and evicted when a job leaves the
+    /// list; a job that has not resolved yet is simply absent and retried with
+    /// a per-job back-off.
+    pub(crate) delegate_speed_cache: HashMap<String, f64>,
+    /// Per-job retry state for finished jobs that have not resolved: the epoch
+    /// ms of the next attempt and the current (doubling) back-off.
+    pub(crate) delegate_speed_retry: HashMap<String, FinishedRetry>,
+    /// How many transcript-store walks the resolver has performed — a test seam
+    /// proving one walk per pass. Never compiled into the binary.
+    #[cfg(test)]
+    pub(crate) delegate_speed_walks: usize,
+    /// Throttle for the per-tick finished-speeds resolution.
+    last_finished_speeds_refresh: Instant,
     /// The codex roster as the Overview lists it and the header counts it.
     /// Cached like `live_sessions`: [`codex_rows`] is a roster read plus a few
     /// small files per account, the header draws on every tab every frame, and
@@ -4739,6 +4767,7 @@ impl App {
         // Seed the token cache and the live tally before `config` moves into the
         // handle below.
         let live_sessions = crate::live_sessions::LiveTally::collect(&config);
+        let tps = crate::tps::load_cache();
         let daemon_health = crate::daemon::daemon_health();
         // The Overview pool actions read this record without the Services tab
         // ever opening: load it at construction, the same cheap local read the
@@ -4904,6 +4933,8 @@ impl App {
             started_at: Instant::now(),
             #[cfg(test)]
             anim_phase_ms: None,
+            #[cfg(test)]
+            tps_now_override: None,
             day_claim_notices: Vec::new(),
             tick_count: 0,
             quit: false,
@@ -4929,6 +4960,14 @@ impl App {
             live_count_width: live_count_text(live_sessions.total()).chars().count(),
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
+            tps: None,
+            tps_rate_width: 0,
+            last_tps_refresh: Instant::now(),
+            delegate_speed_cache: HashMap::new(),
+            delegate_speed_retry: HashMap::new(),
+            #[cfg(test)]
+            delegate_speed_walks: 0,
+            last_finished_speeds_refresh: Instant::now(),
             codex_rows: codex_rows(),
             last_codex_rows_refresh: Some(Instant::now()),
             shunt_pool: ShuntPool::default(),
@@ -4939,6 +4978,9 @@ impl App {
             pool_mutation_tx,
         };
         adopt_shunt_record(&mut app, shunt_record);
+        // Seed the tps cache through the one freshness path the tick uses, so
+        // the construction seed and every later poll agree on the width hold.
+        app.set_tps(tps);
         app.refresh_unsaved_live_login();
         let rebind_form = {
             let config = app.config();
@@ -5068,6 +5110,54 @@ impl App {
             .live_count_width
             .max(live_count_text(tally.total()).chars().count());
         self.live_sessions = tally;
+    }
+
+    /// The production write path for the tps snapshot read off the producer's
+    /// cache; `None` = no producer.
+    pub(crate) fn set_tps(&mut self, snapshot: Option<crate::tps::Snapshot>) {
+        self.tps = snapshot;
+        // Grow the width hold by whatever the chip renders this read — a fresh
+        // figure or the `—` of an absent/stale cache — so a rate that narrows
+        // by a digit moves nothing right of the chip, exactly like
+        // `live_count_width`.
+        let rendered = self.tps_rate_text();
+        self.tps_rate_width = self.tps_rate_width.max(rendered.chars().count());
+    }
+
+    /// The tok/s chip's figure ceiling, in cells: the widest whole figure
+    /// (`9999`) the header's whole-`k` form reaches, past which the figure
+    /// abbreviates to `10k` and the chip never grows.
+    pub(crate) const TPS_RATE_FIGURE_W: usize = 4;
+
+    /// The header chip's number: the fresh rate, or `—` for no producer / a
+    /// stale or unparseable cache.
+    pub(crate) fn tps_rate_text(&self) -> String {
+        match self.fresh_tps() {
+            Some(s) => crate::tps::format_figure_capped(s.total.live.rate, Self::TPS_RATE_FIGURE_W),
+            None => "—".to_owned(),
+        }
+    }
+
+    /// The tps snapshot while a fresh producer stands behind it: `None` for no
+    /// snapshot, one past [`crate::tps::STALE_AFTER_MS`], or an unparseable /
+    /// future `generated_at`. A surface renders a figure only off this, never
+    /// off [`App::tps`] alone.
+    pub(crate) fn fresh_tps(&self) -> Option<&crate::tps::Snapshot> {
+        let snap = self.tps.as_ref()?;
+        let now = self.tps_now_ms();
+        snap.age_ms(now)
+            .is_some_and(|age| age <= crate::tps::STALE_AFTER_MS)
+            .then_some(snap)
+    }
+
+    /// The wall clock the tps surfaces read: the test override when pinned,
+    /// else the real clock. Shared so every surface's "now" agrees.
+    pub(crate) fn tps_now_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(ms) = self.tps_now_override {
+            return ms;
+        }
+        crate::usage::now_ms()
     }
 
     /// Phase clock every ambient animation keys off: milliseconds since the TUI
@@ -21815,6 +21905,8 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_services_refresh(app);
     drain_daemon_control(app);
     poll_daemon_health(app);
+    poll_tps(app);
+    poll_finished_speeds(app);
     poll_pending_require(app);
     drain_left_behind_probe(app);
 
@@ -21882,6 +21974,135 @@ fn poll_daemon_health(app: &mut App) {
     app.last_daemon_probe = Instant::now();
     app.daemon_health = crate::daemon::daemon_health();
     sync_gateway_state(app);
+}
+
+/// Re-read the producer's tps cache on the same once-a-second cadence as the
+/// daemon probe: one JSON read is cheap but not per-frame cheap, and the
+/// lease holder rewrites it on its own tick. This TUI is itself the producer
+/// when it holds the lease, reading the cache its scheduler wrote, so the two
+/// never disagree.
+fn poll_tps(app: &mut App) {
+    const TPS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+    if app.last_tps_refresh.elapsed() < TPS_REFRESH_INTERVAL {
+        return;
+    }
+    app.last_tps_refresh = Instant::now();
+    let snapshot = crate::tps::load_cache();
+    app.set_tps(snapshot);
+}
+
+/// A transcript sum's average speed: output tokens ÷ generation seconds,
+/// `None` when the sum carries no generation time.
+pub(crate) fn day_average(sum: crate::tps::DaySum) -> Option<f64> {
+    (sum.gen_ms > 0).then(|| sum.output as f64 / (sum.gen_ms as f64 / 1000.0))
+}
+
+/// Per-job back-off for a finished job whose average has not resolved: the
+/// epoch ms of the next attempt and the current (doubling) back-off in ms.
+pub(crate) struct FinishedRetry {
+    pub(crate) next_ms: u64,
+    pub(crate) backoff_ms: u64,
+}
+
+/// First retry back-off, and the cap the doubling stops at.
+const FINISHED_SPEED_FIRST_BACKOFF_MS: u64 = 2_000;
+const FINISHED_SPEED_MAX_BACKOFF_MS: u64 = 60_000;
+
+/// Resolve finished delegate jobs' own average speeds into the App cache, once
+/// a second, on the tick path — never in render, so a frame never walks the
+/// transcript store.
+fn poll_finished_speeds(app: &mut App) {
+    const FINISHED_SPEED_INTERVAL: Duration = Duration::from_secs(1);
+    if app.last_finished_speeds_refresh.elapsed() < FINISHED_SPEED_INTERVAL {
+        return;
+    }
+    app.last_finished_speeds_refresh = Instant::now();
+    resolve_finished_speeds(app);
+}
+
+/// The finished-speeds pass, throttle-free so a test can drive it directly.
+/// Every pending id is matched against ONE transcript-store walk per pass, and
+/// a job that still has no figure (no session id, or its transcript not yet
+/// rescued into the global store) is backed off — 2 s doubling to 60 s — so the
+/// store is not re-walked for it every second. A `None` is never cached; the
+/// job retries until it resolves or leaves the list, whose ids are evicted.
+pub(crate) fn resolve_finished_speeds(app: &mut App) {
+    let now = crate::usage::now_ms();
+    app.delegate_speed_cache.retain(|id, _| {
+        app.services
+            .delegates
+            .iter()
+            .any(|job| job.record.job_id == *id)
+    });
+    app.delegate_speed_retry.retain(|id, _| {
+        app.services
+            .delegates
+            .iter()
+            .any(|job| job.record.job_id == *id)
+    });
+
+    // Pending finished jobs past their back-off, keyed by session id.
+    let mut pending: Vec<(&crate::mcp::jobs::StoredJob, &str)> = Vec::new();
+    for job in &app.services.delegates {
+        if job.phase() != crate::mcp::jobs::JobPhase::Done {
+            continue;
+        }
+        if app.delegate_speed_cache.contains_key(&job.record.job_id) {
+            continue;
+        }
+        if let Some(retry) = app.delegate_speed_retry.get(&job.record.job_id)
+            && now < retry.next_ms
+        {
+            continue;
+        }
+        if let Some(sid) = job.record.session_id.as_deref() {
+            pending.push((job, sid));
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+
+    // One walk matched against every pending id, never one walk per id.
+    #[cfg(test)]
+    {
+        app.delegate_speed_walks += 1;
+    }
+    let by_sid: HashMap<String, std::path::PathBuf> = crate::sessions::walk()
+        .into_iter()
+        .map(|w| (w.id, w.path))
+        .collect();
+
+    for (job, sid) in pending {
+        let speed = by_sid
+            .get(sid)
+            .and_then(|path| crate::tps::transcript_speed(path))
+            .and_then(day_average);
+        match speed {
+            Some(speed) => {
+                app.delegate_speed_cache
+                    .insert(job.record.job_id.clone(), speed);
+                app.delegate_speed_retry.remove(&job.record.job_id);
+            }
+            None => {
+                let backoff = app.delegate_speed_retry.get(&job.record.job_id).map_or(
+                    FINISHED_SPEED_FIRST_BACKOFF_MS,
+                    |r| {
+                        r.backoff_ms
+                            .saturating_mul(2)
+                            .min(FINISHED_SPEED_MAX_BACKOFF_MS)
+                    },
+                );
+                app.delegate_speed_retry.insert(
+                    job.record.job_id.clone(),
+                    FinishedRetry {
+                        next_ms: now.saturating_add(backoff),
+                        backoff_ms: backoff,
+                    },
+                );
+            }
+        }
+    }
 }
 
 /// Resolve a pending `require client tokens` on every tick, whatever tab is

@@ -822,7 +822,18 @@ fn status_feed_json(
 ) -> Option<Vec<u8>> {
     debug_assert!(!crate::lockorder::holds::<crate::lockorder::rank::State>());
     debug_assert!(!crate::lockorder::holds::<crate::lockorder::rank::Config>());
-    let mut body = build_status(config, config.state.refresh_interval_ms, live, false);
+    // The daemonless republish carries no tps slot: its `age_secs` would
+    // otherwise freeze at ~0 while the backdated stamp reads stale for hours.
+    // The ruling makes the daemon the slot's only republisher, so the slot is
+    // skipped (not even parsed) whenever the stamp is backdated.
+    let mut body = status_json::build_status_impl(
+        config,
+        config.state.refresh_interval_ms,
+        live,
+        false,
+        generated_at.is_none(),
+    )
+    .0;
     // The backdate this applies is the one deliberate exception to
     // `build_status`'s "the stamp never precedes a per-entry verdict instant"
     // ordering: a non-daemon publish carries a daemon's OLD stamp over entries

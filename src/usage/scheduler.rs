@@ -3833,6 +3833,60 @@ fn catch_up_staged_pairs(config: &crate::profile::ConfigHandle) {
     }
 }
 
+// The tps producer, one per thread. The scheduler tick runs on one
+// dedicated thread for the process lifetime (the TUI's and the daemon's
+// alike), and a test drives `tick` on its own test thread, so thread-local
+// state is the producer's home: it survives across ticks without a field on
+// [`SchedulerState`] (whose literal constructions the tests pin).
+thread_local! {
+    static TPS_PRODUCER: std::cell::RefCell<crate::tps::Producer> =
+        std::cell::RefCell::new(crate::tps::Producer::new());
+    /// (last write ms, last written bytes with `generated_at` blanked).
+    static TPS_LAST_WRITE: std::cell::RefCell<(u64, Option<Vec<u8>>)> =
+        const { std::cell::RefCell::new((0, None)) };
+}
+
+/// The lease holder's tps leg: one tail pass, then publish the snapshot into
+/// `~/.clauth/tps_cache.json` (0600, the producer's own file — it never writes
+/// the daemon-owned `status.json`). The whole snapshot is rewritten only when
+/// its content apart from `generated_at` changed; otherwise it is refreshed at
+/// most every 10 s so a reader's staleness gate (`STALE_AFTER_MS` = 30 s) never
+/// trips on a merely-idle producer.
+fn tps_producer_tick(now_ms: u64) {
+    let snap = TPS_PRODUCER.with(|p| p.borrow_mut().tick(now_ms));
+    let Ok(dir) = crate::profile::clauth_dir() else {
+        return;
+    };
+    let mut body = snap.clone();
+    body.generated_at = String::new();
+    let Ok(slow_bytes) = serde_json::to_vec(&body) else {
+        return;
+    };
+    let Ok(bytes) = serde_json::to_vec(&snap) else {
+        return;
+    };
+    let write = TPS_LAST_WRITE.with(|c| {
+        let c = c.borrow();
+        let changed = c.1.as_deref() != Some(slow_bytes.as_slice());
+        changed || now_ms.saturating_sub(c.0) >= 10_000
+    });
+    if !write {
+        return;
+    }
+    if let Err(e) = crate::profile::atomic_write_600(&dir.join(crate::tps::TPS_CACHE_FILE), &bytes)
+    {
+        logline!("clauth: failed to publish tps_cache.json: {e}");
+        // Do not advance the stamp: the next tick retries the write, and the
+        // restart watermark must only ever cover a cache that is actually on disk.
+        return;
+    }
+    TPS_LAST_WRITE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.0 = now_ms;
+        c.1 = Some(slow_bytes);
+    });
+}
+
 /// One scheduler tick: drain forced refetches, partition both legs, publish
 /// countdowns, fan out fetches (OAuth + third-party) that republish each
 /// profile's countdown as it lands, propagate rotated tokens, evaluate
@@ -4103,6 +4157,11 @@ fn tick(state: &SchedulerState) {
         &state.pending_switch,
         &state.third_party_broken,
     );
+
+    // tps producer leg, lease holder only (a stood-down tick returned above):
+    // tail transcripts and republish the shared tps cache every other surface
+    // hydrates from.
+    tps_producer_tick(now_ms());
 }
 
 /// The pacing key for `wham/usage`. Its own host, so codex polls never

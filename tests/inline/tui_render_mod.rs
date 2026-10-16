@@ -3311,7 +3311,7 @@ fn the_overview_name_column_desktop_rows_replace_the_pre_s9_clip() {
     assert_eq!(
         got,
         vec![
-            "│ ❯   abcdefghijklmnopqrstuvwxyz                            —                        [█░░░░░░░░░] 12%                  [█░░░░░░░░░]  8%                        │",
+            "│ ❯   abcdefghijklmnopqrstuvwxyz                —                        [█░░░░░░░░░] 12%                  [█░░░░░░░░░]  8%                                    │",
         ],
         "name column ascii row at 160 cols"
     );
@@ -3334,8 +3334,8 @@ fn the_overview_name_column_desktop_rows_measure_by_cells() {
     assert_eq!(
         got,
         vec![
-            "│   ● cjk-日 本 語 ア カ ウ ン ト                                   —                        [█████░░░░░] 49%                  [███░░░░░░░] 30%                        │",
-            "│     emoji-🧭 ⚠️ -account                                    —                        [██████░░░░] 63%                  [████░░░░░░] 40%                        │",
+            "│   ● cjk-日 本 語 ア カ ウ ン ト                       —                        [█████░░░░░] 49%                  [███░░░░░░░] 30%                                    │",
+            "│     emoji-🧭 ⚠️ -account                        —                        [██████░░░░] 63%                  [████░░░░░░] 40%                                    │",
         ],
         "name column wide rows at 160 cols"
     );
@@ -7512,17 +7512,17 @@ fn the_header_gauge_keeps_two_rounded_decimals_at_every_width() {
         (
             "alpha",
             80,
-            "▝▜█████▛▘ [ 0 live ] · alpha 1% [░░░░░░░░░░]                  ● status.claude.ai",
+            "▝▜█████▛▘ alpha 1% [░░░░░░░░░░]                               ● status.claude.ai",
         ),
         (
             "bravo",
             80,
-            "▝▜█████▛▘ [ 0 live ] · bravo 73.42% [███████░░░]              ● status.claude.ai",
+            "▝▜█████▛▘ bravo 73.42% [███████░░░]                           ● status.claude.ai",
         ),
         (
             "charlie",
             80,
-            "▝▜█████▛▘ [ 0 live ] · charlie 100% [██████████]              ● status.claude.ai",
+            "▝▜█████▛▘ charlie 100% [██████████]                           ● status.claude.ai",
         ),
     ];
     for (active, w, row) in want {
@@ -7534,6 +7534,185 @@ fn the_header_gauge_keeps_two_rounded_decimals_at_every_width() {
             "header gauge for {active} at {w} cols"
         );
     }
+}
+
+/// A fresh tps snapshot whose `name` account carries `speed`, so the header's
+/// speed suffix and the tok/s chip read off it.
+fn tps_snap(name: &str, rate: f64, speed: Option<f64>) -> crate::tps::Snapshot {
+    let stamp =
+        chrono::DateTime::from_timestamp_millis(i64::try_from(crate::usage::now_ms()).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string();
+    let figures = |rate: f64, speed: Option<f64>| crate::tps::Figures {
+        live: crate::tps::Figure { rate, speed },
+        ..crate::tps::Figures::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        total: figures(rate, speed),
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert(name.into(), figures(rate, speed));
+    snap
+}
+
+/// The chips' shed checks charge the widest the gauge and its suffix can ever
+/// render, so a chip's presence depends on the terminal width and the active
+/// account's name only — never on a reading (`1%`/`73.42%`/`100%`) or a speed
+/// update. Pinned at 80 (shed) and 120 (fits), across the boundary.
+#[test]
+fn the_chip_shed_depends_only_on_width_and_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+    let mut app = p1_readings_app();
+    app.tab = Tab::Tokens;
+
+    // No speed yet (the tok/s chip reads `—`): every reading sheds the chip at
+    // 80 and keeps it at 120.
+    for (w, want_chip) in [(80u16, false), (120u16, true)] {
+        for active in ["alpha", "bravo", "charlie"] {
+            app.config().state.active_profile = Some(active.into());
+            let row = dump(&app, w, 40)
+                .lines()
+                .nth(1)
+                .map(str::trim_end)
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(
+                row.contains("[ — tok/s ]"),
+                want_chip,
+                "{active} at {w} (no speed): {row:?}"
+            );
+        }
+    }
+
+    // A fresh speed (suffix present) must not move the chip either.
+    app.set_tps(Some(tps_snap("alpha", 5.0, Some(92.4))));
+    for (w, want_chip) in [(80u16, false), (120u16, true)] {
+        app.config().state.active_profile = Some("alpha".into());
+        let row = dump(&app, w, 40)
+            .lines()
+            .nth(1)
+            .map(str::trim_end)
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            row.contains("[ 5.0 tok/s ]"),
+            want_chip,
+            "alpha at {w} (speed 92.4): {row:?}"
+        );
+    }
+
+    // A provider gauge carries the suffix charge too: speed None vs 92.4 flips
+    // neither the chips nor the indicator at the widths the reviewer probed.
+    let mut provider = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("z.ai".into()),
+            profiles: vec!["z.ai".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile {
+            base_url: Some("https://api.example.com".to_string()),
+            api_key: Some("key".to_string()),
+            ..oauth("z.ai", false)
+        }],
+    });
+    provider.tab = Tab::Tokens;
+    for w in [49u16, 57, 64, 72] {
+        provider.set_tps(Some(tps_snap("z.ai", 5.0, None)));
+        let idle = dump(&provider, w, 40)
+            .lines()
+            .nth(1)
+            .map(str::trim_end)
+            .unwrap_or_default()
+            .to_string();
+        provider.set_tps(Some(tps_snap("z.ai", 5.0, Some(92.4))));
+        let busy = dump(&provider, w, 40)
+            .lines()
+            .nth(1)
+            .map(str::trim_end)
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            idle.contains("● status.claude.ai"),
+            busy.contains("● status.claude.ai"),
+            "indicator unchanged for the provider at {w}: {idle:?} / {busy:?}"
+        );
+        assert_eq!(
+            idle.contains(" tok/s ]"),
+            busy.contains(" tok/s ]"),
+            "tok/s chip unchanged for the provider at {w}"
+        );
+        assert_eq!(
+            idle.contains(" live ]"),
+            busy.contains(" live ]"),
+            "live chip unchanged for the provider at {w}"
+        );
+    }
+}
+
+/// The shed checks charge each chip at its figure ceiling — `[ 9999 tok/s ]`
+/// and `[ 999 live ]` — so a rate (none → 67.2 → 12345) or count (9 → 10)
+/// update leaves presence unchanged; only a resize flips it.
+#[test]
+fn the_chip_shed_charges_the_figure_ceilings() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: vec!["uwuclxdy".into()],
+            ..AppState::default()
+        },
+        profiles: vec![oauth("uwuclxdy", false)],
+    });
+    app.tab = Tab::Tokens;
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), oauth_usage(42.0, 42.0));
+
+    // 96..=99: the ceiling charges shed the tok/s chip and keep the live chip,
+    // whatever the rate and count.
+    for w in 96u16..=99 {
+        for rate in [None, Some(67.2), Some(12_345.0)] {
+            for live in [9usize, 10] {
+                app.set_tps(rate.map(|r| tps_snap("uwuclxdy", r, None)));
+                app.set_live_sessions(crate::live_sessions::LiveTally::of(
+                    (0..live).map(|i| crate::testutil::live_row(&format!("4242-{i}"), "uwuclxdy")),
+                ));
+                let row = dump(&app, w, 40)
+                    .lines()
+                    .nth(1)
+                    .map(str::trim_end)
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    !row.contains(" tok/s ]"),
+                    "tok/s chip sheds at {w} for rate {rate:?}, live {live}: {row:?}"
+                );
+                assert!(
+                    row.contains(" live ]"),
+                    "live chip holds at {w} for rate {rate:?}, live {live}: {row:?}"
+                );
+            }
+        }
+    }
+
+    // A resize across the boundary flips the tok/s chip on.
+    app.set_tps(Some(tps_snap("uwuclxdy", 67.2, None)));
+    let row = dump(&app, 101, 40)
+        .lines()
+        .nth(1)
+        .map(str::trim_end)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        row.contains(" tok/s ]"),
+        "the tok/s chip appears past the boundary at 101: {row:?}"
+    );
 }
 
 /// One account with a 73.42% reading and one whose 5h window is absent but

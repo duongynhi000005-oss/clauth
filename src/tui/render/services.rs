@@ -1952,7 +1952,16 @@ fn draw_delegates_detail(frame: &mut Frame<'_>, inner: Rect, app: &App) {
         return;
     }
     let descended = app.services.focus == ServicesFocus::Detail;
-    let cells = delegate_cells(&app.services.delegates, crate::usage::now_ms());
+    let mut cells = delegate_cells(&app.services.delegates, crate::usage::now_ms());
+    // The live/average speed fact rides each row once the producer answers:
+    // a running job's own session, a finished job's own transcript. Applied
+    // after the cell build so the row builder takes the figure as a fact and a
+    // render test can pass it in directly.
+    for (cell, job) in cells.iter_mut().zip(app.services.delegates.iter()) {
+        if let Some(fact) = delegate_speed_fact(job, app) {
+            cell.facts.push(fact);
+        }
+    }
     let mut body = inner;
     if let Some(line) = app
         .services
@@ -2617,6 +2626,37 @@ fn delegate_row(job: &StoredJob, now: u64) -> DelegateCells {
         // terminal only as visible escapes.
         cwd: record.cwd.as_deref().map(escape_control),
     }
+}
+
+/// The row's `S t/s` fact: a running job's live speed off its own Claude Code
+/// session, a finished job's average off the App's resolved cache. `None`
+/// renders nothing (a job with no fresh reading keeps its existing facts).
+fn delegate_speed_fact(job: &StoredJob, app: &App) -> Option<String> {
+    match job.phase() {
+        JobPhase::Running | JobPhase::Blocking => {
+            let sid = job.record.session_id.as_deref()?;
+            let speed = app.fresh_tps()?.sessions.get(sid)?.figures.live.speed?;
+            Some(speed_fact(speed))
+        }
+        JobPhase::Done => finished_speed_fact(job, app),
+        JobPhase::Orphaned => None,
+    }
+}
+
+/// A finished job's own average, read off the App cache the tick path fills
+/// ([`crate::tui::app`] resolves each finished transcript once, retrying until
+/// a figure lands). The render pass stays pure — no store walk, no transcript
+/// read here.
+fn finished_speed_fact(job: &StoredJob, app: &App) -> Option<String> {
+    app.delegate_speed_cache
+        .get(&job.record.job_id)
+        .copied()
+        .map(speed_fact)
+}
+
+/// `S t/s` for the row's facts, in `format_figure`'s grammar.
+fn speed_fact(speed: f64) -> String {
+    format!("{} t/s", crate::tps::format_figure(speed))
 }
 
 /// Which kill lands first and how far off it is. `monitor` reports both figures

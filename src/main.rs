@@ -64,6 +64,7 @@ mod status;
 mod throughput;
 mod token_ledger;
 mod tokens;
+mod tps;
 mod tui;
 mod update;
 mod usage;

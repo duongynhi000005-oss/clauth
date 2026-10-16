@@ -8866,3 +8866,266 @@ fn the_resting_tag_refresh_row_keeps_its_full_label_on_narrow_panes() {
         }
     }
 }
+
+// ── tps: the delegate row's `S t/s` fact ─────────────────────────────────
+
+/// A running row's facts gain its live `S t/s`, a finished row's its own
+/// average; both ride the row as an extra fact the builder is passed.
+#[test]
+fn a_delegate_row_carries_its_speed_fact_when_the_figure_is_passed_in() {
+    use crate::mcp::jobs::JobPhase;
+    use ratatui::text::Line;
+
+    let line_text = |line: &Line| {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    };
+    let running = super::DelegateCells {
+        state: JobPhase::Running,
+        profile: "acct".to_string(),
+        facts: vec!["elapsed 5s".to_string(), super::speed_fact(92.4)],
+        cwd: None,
+    };
+    assert_eq!(
+        line_text(&super::delegate_row_line(&running, 4, 100, false, false)),
+        "  ● running   acct  elapsed 5s · 92 t/s"
+    );
+    let done = super::DelegateCells {
+        state: JobPhase::Done,
+        profile: "acct".to_string(),
+        facts: vec!["finished just now".to_string(), super::speed_fact(88.0)],
+        cwd: None,
+    };
+    assert_eq!(
+        line_text(&super::delegate_row_line(&done, 4, 100, false, false)),
+        "  ● done      acct  finished just now · 88 t/s"
+    );
+}
+
+/// A finished job's row reads its average off the App cache the tick path
+/// fills — the render never walks the store — and the cache evicts ids that
+/// left the delegate list.
+#[test]
+fn a_finished_jobs_speed_reads_the_cache_and_evicts_gone_ids() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // The formula: output ÷ generation seconds, None without generation time.
+    assert_eq!(
+        crate::tui::app::day_average(crate::tps::DaySum {
+            output: 900,
+            gen_ms: 10_000
+        }),
+        Some(90.0)
+    );
+    assert_eq!(
+        crate::tui::app::day_average(crate::tps::DaySum {
+            output: 900,
+            gen_ms: 0
+        }),
+        None
+    );
+
+    // A finished record listed through the store's own reader.
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-done-0.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-done-0",
+            "profile": "acct",
+            "state": "done",
+            "started_at": NOW - 1_800_000,
+            "done_at": NOW - 900_000,
+            "session_id": "sess-1",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut app = app_with_delegates(jobs::list(NOW));
+    let done = &app.services.delegates[0];
+
+    // Uncached → no fact (the sandbox store has no transcript to resolve).
+    assert_eq!(super::delegate_speed_fact(done, &app), None);
+
+    // A resolved figure in the cache renders through the row, and a second ask
+    // still returns it — the render never re-resolves.
+    app.delegate_speed_cache.insert("d-done-0".into(), 90.0);
+    assert_eq!(
+        super::delegate_speed_fact(done, &app),
+        Some("90 t/s".to_string())
+    );
+    assert_eq!(
+        super::delegate_speed_fact(done, &app),
+        Some("90 t/s".to_string())
+    );
+
+    // The tick pass evicts a cached id that left the delegate list.
+    app.delegate_speed_cache.insert("stale-id".into(), 42.0);
+    crate::tui::app::resolve_finished_speeds(&mut app);
+    assert!(
+        !app.delegate_speed_cache.contains_key("stale-id"),
+        "a job gone from the list is evicted"
+    );
+}
+
+/// A running job's live speed reads its OWN session, never the account's
+/// figure: a snapshot where the two differ still yields the session's value.
+#[test]
+fn a_running_jobs_speed_reads_its_own_session_not_the_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    jobs::write_heartbeat_with_session(
+        &running_spec("d-run-0", "acct", NOW - 5_000, RecordKind::Collectable),
+        NOW - 1_000,
+        "working",
+        Some("sess-1"),
+    )
+    .unwrap();
+    let mut app = app_with_delegates(jobs::list(NOW));
+
+    let stamp = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(crate::usage::now_ms() - 1_000).unwrap(),
+    )
+    .unwrap()
+    .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+    .to_string();
+    let figures = |speed: f64| crate::tps::Figures {
+        live: crate::tps::Figure {
+            rate: 1.0,
+            speed: Some(speed),
+        },
+        ..Default::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        accounts: std::collections::BTreeMap::from([("acct".to_string(), figures(99.0))]),
+        sessions: std::collections::BTreeMap::from([(
+            "sess-1".to_string(),
+            crate::tps::SessionFigures {
+                account: Some("acct".to_string()),
+                figures: figures(42.0),
+            },
+        )]),
+        ..Default::default()
+    };
+    snap.total = figures(42.0);
+    app.set_tps(Some(snap));
+
+    let job = &app.services.delegates[0];
+    assert_eq!(
+        job.phase(),
+        super::JobPhase::Running,
+        "the fixture is running"
+    );
+    assert_eq!(
+        super::delegate_speed_fact(job, &app),
+        Some("42 t/s".to_string()),
+        "the session's speed, not the account's 99"
+    );
+}
+
+/// The finished-speed resolver walks the transcript store once per pass for
+/// every pending id, and backs a still-unresolved job off (2 s doubling) so the
+/// store is not re-walked for it every second.
+#[test]
+fn the_finished_speed_resolver_walks_once_and_backs_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    for (id, sid) in [("d-a", "sess-a"), ("d-b", "sess-b")] {
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "job_id": id,
+                "profile": "acct",
+                "state": "done",
+                "started_at": NOW - 1_800_000,
+                "done_at": NOW - 900_000,
+                "session_id": sid,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    let mut app = app_with_delegates(jobs::list(NOW));
+
+    crate::tui::app::resolve_finished_speeds(&mut app);
+    assert_eq!(
+        app.delegate_speed_walks, 1,
+        "one walk covers both pending ids"
+    );
+    assert_eq!(app.delegate_speed_retry.len(), 2);
+    for retry in app.delegate_speed_retry.values() {
+        assert_eq!(retry.backoff_ms, 2_000, "first failure backs off 2 s");
+    }
+
+    crate::tui::app::resolve_finished_speeds(&mut app);
+    assert_eq!(
+        app.delegate_speed_walks, 1,
+        "no second walk while both jobs are backed off"
+    );
+
+    for retry in app.delegate_speed_retry.values_mut() {
+        retry.next_ms = 0;
+    }
+    crate::tui::app::resolve_finished_speeds(&mut app);
+    assert_eq!(app.delegate_speed_walks, 2);
+    for retry in app.delegate_speed_retry.values() {
+        assert_eq!(retry.backoff_ms, 4_000, "the back-off doubles");
+    }
+}
+
+/// A finished delegate whose transcript sits in the global store resolves to
+/// its own average through the producer's `transcript_speed`: the fixture's
+/// one 1222-token response over 13.597 s reads 89.87 t/s.
+#[test]
+fn a_finished_jobs_speed_resolves_from_its_transcript() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "0c1f6a52-7d4e-4b0a-9a51-3f2b8e6c1d01";
+    let store = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join(format!("{sid}.jsonl")),
+        include_str!("../fixtures/tps-one-response.jsonl"),
+    )
+    .unwrap();
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-fix.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-fix",
+            "profile": "acct",
+            "state": "done",
+            "started_at": NOW - 1_800_000,
+            "done_at": NOW - 900_000,
+            "session_id": sid,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut app = app_with_delegates(jobs::list(NOW));
+    // Seed a stale back-off for this job, so the `is_empty` check below proves
+    // the resolved arm clears it rather than trivially passing on an empty map.
+    app.delegate_speed_retry.insert(
+        "d-fix".into(),
+        crate::tui::app::FinishedRetry {
+            next_ms: 0,
+            backoff_ms: 0,
+        },
+    );
+
+    crate::tui::app::resolve_finished_speeds(&mut app);
+
+    let speed = app.delegate_speed_cache.get("d-fix").copied();
+    assert!(
+        speed.is_some_and(|s| (s - 1222.0 / 13.597).abs() < 1e-3),
+        "the job's own average: {speed:?}"
+    );
+    assert!(
+        app.delegate_speed_retry.is_empty(),
+        "a resolved job keeps no back-off"
+    );
+}

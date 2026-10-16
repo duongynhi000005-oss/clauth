@@ -93,6 +93,7 @@ fn build_status_top_level_shape_and_active() {
             "proxies",
             "refresh_interval_ms",
             "schema",
+            "tps",
             "wrap_off",
         ],
     );
@@ -1822,6 +1823,7 @@ fn status_body_matches_legacy_json_bytes() {
         clauth_version: "9.9.9".to_string(),
         gateway: None,
         proxies: Vec::new(),
+        tps: None,
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -1913,7 +1915,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":"work","#,
         r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
         r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
-        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"profiles":["#,
+        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
@@ -1949,13 +1951,14 @@ fn status_body_matches_legacy_json_bytes() {
         clauth_version: "9.9.9".to_string(),
         gateway: None,
         proxies: Vec::new(),
+        tps: None,
         profiles: vec![],
     };
     let expected = concat!(
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":null,"#,
         r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
-        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"profiles":[]}"#,
+        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -2968,4 +2971,69 @@ fn the_proxies_array_merges_a_live_slot_over_the_record() {
     assert_eq!(proxies[1]["version"], "1.2.0");
     assert_eq!(proxies[1]["contract"], "1.0");
     assert_eq!(proxies[1]["pid"], 4242);
+}
+
+/// The daemon republishes the lease holder's tps cache as one additive `tps`
+/// slot: the cache minus its `days`, plus `age_secs`; schema stays 2. No cache
+/// publishes `tps: null`, never a fabricated zero.
+#[test]
+fn build_status_republishes_the_tps_cache_as_an_additive_slot() {
+    let home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    let none = status_value(&config, 300_000, None, false);
+    assert_eq!(none["tps"], serde_json::Value::Null, "no cache: null");
+
+    let now = crate::usage::now_ms();
+    let generated_at = chrono::DateTime::from_timestamp_millis(i64::try_from(now - 3_000).unwrap())
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+        .to_string();
+    let live = |rate: f64, speed: Option<f64>| crate::tps::Figures {
+        live: crate::tps::Figure { rate, speed },
+        ..crate::tps::Figures::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: generated_at.clone(),
+        total: live(67.0, Some(92.0)),
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert("work".into(), live(67.0, Some(92.0)));
+    snap.sessions.insert(
+        "s1".into(),
+        crate::tps::SessionFigures {
+            account: Some("work".into()),
+            figures: live(67.0, Some(92.0)),
+        },
+    );
+    snap.days
+        .entry("2026-10-15".into())
+        .or_default()
+        .entry("work".into())
+        .or_default()
+        .insert(
+            "claude-opus-5-5".into(),
+            crate::tps::DaySum {
+                output: 1222,
+                gen_ms: 13_597,
+            },
+        );
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(v["schema"], 2, "an additive field never bumps the schema");
+    let tps = &v["tps"];
+    assert_eq!(tps["generated_at"], generated_at.as_str());
+    assert_eq!(tps["total"]["live"]["rate"], 67.0);
+    assert_eq!(tps["accounts"]["work"]["live"]["speed"], 92.0);
+    assert_eq!(tps["sessions"]["s1"]["account"], "work");
+    assert_eq!(tps["sessions"]["s1"]["live"]["rate"], 67.0);
+    assert!(tps.get("days").is_none(), "days stay in the cache: {tps}");
+    let age = tps["age_secs"].as_u64().expect("age_secs is a number");
+    assert!((3..=5).contains(&age), "age off generated_at: {age}");
 }

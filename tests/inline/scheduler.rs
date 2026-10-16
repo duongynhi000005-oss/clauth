@@ -15513,3 +15513,116 @@ fn a_codex_seed_holds_the_epoch_guard_through_its_writes() {
         "the status landed under the held guard"
     );
 }
+
+// ── tps producer leg ─────────────────────────────────────────────────────────
+
+/// A scheduler with no profiles, so a tick fetches nothing and only the legs
+/// that need no account run. `lease` decides who holds `usage-fetch.lock`.
+fn tps_state(lease: Arc<crate::daemon::FetchLease>) -> super::SchedulerState {
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    super::SchedulerState {
+        config: Arc::new(RankedMutex::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        })),
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: lease,
+        standdown_active: AtomicBool::new(false),
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+    }
+}
+
+/// One 1222-token response that ended a second ago, 13 s after its user line.
+fn seed_recent_response(home: &std::path::Path) {
+    let now = crate::usage::now_ms();
+    let stamp = |ms: u64| {
+        chrono::DateTime::from_timestamp_millis(i64::try_from(ms).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+    let dir = home.join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let user = serde_json::json!({
+        "type": "user", "timestamp": stamp(now - 14_000), "sessionId": "tick",
+        "message": {"role": "user", "content": "go"},
+    });
+    let reply = serde_json::json!({
+        "type": "assistant", "timestamp": stamp(now - 1_000), "sessionId": "tick",
+        "message": {
+            "id": "msg_tick", "model": "claude-opus-5-5", "role": "assistant",
+            "usage": {"input_tokens": 1, "output_tokens": 1222,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+        },
+    });
+    std::fs::write(dir.join("tick.jsonl"), format!("{user}\n{reply}\n")).unwrap();
+}
+
+/// With no daemon, the process holding the lease (the TUI's scheduler runs
+/// this same tick) produces the tps cache, and the leg never writes the
+/// daemon-owned `status.json`.
+#[test]
+fn the_lease_holding_tick_produces_the_tps_cache_without_a_daemon() {
+    let home = crate::testutil::HomeSandbox::new();
+    seed_recent_response(home.home());
+    let state = tps_state(Arc::new(crate::daemon::FetchLease::new()));
+
+    super::tick(&state);
+
+    let snap = crate::tps::load_cache().expect("the lease holder wrote tps_cache.json");
+    let m5 = snap.sessions["tick"].figures.m5.rate;
+    assert!(
+        (m5 - 1222.0 / 300.0).abs() < 1e-3,
+        "the cache carries the response: {m5}"
+    );
+    assert!(
+        !home.home().join(".clauth/status.json").exists(),
+        "the producer leg never writes status.json: the daemon is its one writer"
+    );
+}
+
+/// A process that stood down (another instance holds the lease) produces
+/// nothing: one tps producer, like one usage fetcher.
+#[test]
+fn a_stood_down_tick_writes_no_tps_cache() {
+    let home = crate::testutil::HomeSandbox::new();
+    seed_recent_response(home.home());
+    let other = crate::daemon::FetchLease::new();
+    assert!(other.acquire(), "the first instance wins the lease");
+    let state = tps_state(Arc::new(crate::daemon::FetchLease::new()));
+
+    super::tick(&state);
+
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join(crate::tps::TPS_CACHE_FILE)
+            .exists(),
+        "only the lease holder writes the tps cache"
+    );
+}

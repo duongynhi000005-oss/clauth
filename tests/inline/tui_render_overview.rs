@@ -2211,7 +2211,7 @@ fn live_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
     let col = header
         .find("live")
         .expect("the accounts table carries a `live` header");
-    line_text(row).chars().skip(col).collect()
+    line_text(row).chars().skip(col).take(widths.live).collect()
 }
 
 /// The column answers "how many `clauth start` sessions are on this account",
@@ -2422,6 +2422,51 @@ fn live_column_width_is_monotone_in_inner_width() {
                     );
                 }
                 prev = Some(width);
+            }
+        }
+    }
+}
+
+/// The speed column's width gate sweeps like the live column's: only
+/// 0 -> TPS_W transitions as the inner width grows (never a drop), the column
+/// never appears without the live column, and it never appears while the 7d
+/// stamp is shed. Swept at the stock label budget and at two-decimal readings,
+/// which widen every usage tier.
+#[test]
+fn tps_column_width_is_monotone_in_inner_width() {
+    let decimals = LabelWidths { five: 6, seven: 6 };
+    for labels in [LabelWidths::default(), decimals] {
+        let (_, seven_excess) = labels.excess();
+        for max_name in 8..=22 {
+            let mut prev = None;
+            for total in 30..=200 {
+                let width = tps_column_width(max_name, total, labels);
+                if let Some(prev_w) = prev
+                    && width != prev_w
+                {
+                    assert_eq!(
+                        (prev_w, width),
+                        (0, TPS_W),
+                        "tps column must only appear (0 -> TPS_W), never drop or \
+                         flip, at name {max_name}, total {total}, labels {labels:?} \
+                         ({prev_w} -> {width})",
+                    );
+                }
+                prev = Some(width);
+                if width > 0 {
+                    assert!(
+                        live_column_width(max_name, total, labels) > 0,
+                        "tps on implies live on, at name {max_name}, total {total}, \
+                         labels {labels:?}"
+                    );
+                    let (_, _, _, seven_day) = overview_tiers(max_name, total, labels);
+                    assert_eq!(
+                        seven_day,
+                        SEVEN_DAY_MAX + seven_excess,
+                        "tps on implies the 7d stamp is unshed, at name {max_name}, \
+                         total {total}, labels {labels:?}"
+                    );
+                }
             }
         }
     }
@@ -3580,7 +3625,10 @@ fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
         resets,
     };
     let (config, readings) = config_with(vec![], None, vec![]);
-    let app = App::new(config);
+    let mut app = App::new(config);
+    // The chip renders only while the widths charge its slot, which needs a
+    // visible codex row carrying a reset.
+    app.codex_rows = vec![row(Some(2))];
     let text = |line: ratatui::text::Line<'_>| -> String {
         line.spans.iter().map(|s| s.content.clone()).collect()
     };
@@ -3593,6 +3641,169 @@ fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
     assert!(
         !text(render_codex_row(&row(None), &wide, false)).contains("↺"),
         "no available reset (the constructor floors zero to None): no chip"
+    );
+}
+
+/// The cell sitting under the `t/s` header on `row`, padding included; empty
+/// when the column is dropped. Mirrors `five_hour_cell_text` so the pin proves
+/// the cell sits under its own header, not just that a blank exists somewhere.
+fn tps_column_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
+    if widths.tps == 0 {
+        return String::new();
+    }
+    let header = line_text(&overview_header(widths, false));
+    let col = header
+        .find("t/s")
+        .expect("the accounts table carries a `t/s` header");
+    line_text(row).chars().skip(col).take(widths.tps).collect()
+}
+
+/// The banked-reset chip trails the t/s column the same way it trails `live`:
+/// a dim `↺ N` must never land under `t/s` and read as that row's speed. Pinned
+/// by column position through the header at a width with the t/s column on and
+/// one with it off — the chip adds the blank t/s slot only where the column is.
+#[test]
+fn a_codex_reset_chip_never_sits_under_the_tps_header() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: Some(2),
+    };
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    // The chip renders only while the widths charge its slot.
+    app.codex_rows = vec![row.clone()];
+
+    // t/s column on: the chip sits one gap past the blank t/s cell.
+    let wide = OverviewWidths::new(200, &app, &readings);
+    assert_eq!((wide.live, wide.tps), (LIVE_W, TPS_W));
+    let line = render_codex_row(&row, &wide, false);
+    assert_eq!(
+        tps_column_text(&wide, &line),
+        " ".repeat(wide.tps),
+        "the t/s cell stays blank under the t/s header"
+    );
+    let tps_col = line_text(&overview_header(&wide, false))
+        .find("t/s")
+        .expect("the accounts table carries a `t/s` header");
+    let text = line_text(&line);
+    let chip_col = text
+        .chars()
+        .position(|c| c == '↺')
+        .expect("two banked resets render the chip");
+    assert_eq!(
+        chip_col,
+        tps_col + wide.tps + wide.gap,
+        "the chip starts one gap past the t/s column"
+    );
+
+    // t/s column off: the chip still trails the live slot, one gap past it.
+    let narrow = OverviewWidths::new(100, &app, &readings);
+    assert_eq!((narrow.live, narrow.tps), (LIVE_W, 0));
+    let line = render_codex_row(&row, &narrow, false);
+    let live_col = line_text(&overview_header(&narrow, false))
+        .find("live")
+        .expect("the accounts table carries a `live` header");
+    let text = line_text(&line);
+    let chip_col = text
+        .chars()
+        .position(|c| c == '↺')
+        .expect("two banked resets render the chip");
+    assert_eq!(
+        chip_col,
+        live_col + narrow.live + narrow.gap,
+        "the chip starts one gap past the live column when t/s is dropped"
+    );
+}
+
+/// The trailing `↺ N` chip charge comes off the gap first, then the name down
+/// to its floor, and past that the chip sheds whole: the name column is
+/// untouched at wide panes, and the row never exceeds the pane. Codex-only
+/// roster, one- and two-digit counts.
+#[test]
+fn a_codex_reset_chip_charges_the_gap_then_the_name_then_sheds() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    let rows = || {
+        vec![
+            CodexRow {
+                name: crate::profile::ProfileName::from("cx1"),
+                active: false,
+                broken: false,
+                plan: Some("pro".to_string()),
+                five_hour: None,
+                seven_day: None,
+                resets: Some(12),
+            },
+            CodexRow {
+                name: crate::profile::ProfileName::from("cx2"),
+                active: false,
+                broken: false,
+                plan: Some("plus".to_string()),
+                five_hour: None,
+                seven_day: None,
+                resets: Some(2),
+            },
+        ]
+    };
+    app.codex_rows = rows();
+
+    // The gap absorbs the chip charge first: at these panes the name column is
+    // unchanged by a banked reset.
+    for inner in [132, 137, 140] {
+        let name_with = OverviewWidths::new(inner as u16, &app, &readings).name;
+        for r in &mut app.codex_rows {
+            r.resets = None;
+        }
+        let name_without = OverviewWidths::new(inner as u16, &app, &readings).name;
+        assert_eq!(name_with, name_without, "no name loss at inner {inner}");
+        app.codex_rows = rows();
+    }
+
+    // The base row fits at every width; wherever the chip is charged the whole
+    // row fits too.
+    for w in 60u16..=220 {
+        let inner = usize::from(w) - 4;
+        let widths = OverviewWidths::new(w - 4, &app, &readings);
+        let base = super::fixed_overview_width_cols(
+            widths.name,
+            widths.kind,
+            widths.five_hour,
+            widths.seven_day,
+            widths.live,
+            widths.tps,
+            widths.gap,
+        ) + super::TIMER_SLOT;
+        assert!(base <= inner, "the base row exceeds the pane at {w}");
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 20)).expect("terminal");
+        term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
+            .expect("draw");
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        if rows.iter().any(|r| r.contains("↺")) {
+            // "↺ 12" — the widest chip in the fixture — sits one gap past the
+            // columns; a charged row never exceeds the pane.
+            let row_w = base + widths.gap + "↺ 12".chars().count();
+            assert!(row_w <= inner, "the charged row exceeds the pane at {w}");
+        }
+    }
+
+    // Below the name floor the chip sheds whole: inner 30 leaves no room even
+    // with the gap at its floor and the name at `NAME_READING_FLOOR`.
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        !rows.iter().any(|r| r.contains("↺")),
+        "the chip sheds whole below the name floor: {rows:?}"
     );
 }
 
@@ -5352,5 +5563,142 @@ fn the_stay_caption_desktop_rows_match_the_pre_s9_render() {
             vec!["  [ stay ] on the active account when all spent"],
             "stay caption at inner {w} cells"
         );
+    }
+}
+
+// ── tps: the overview `t/s` column ───────────────────────────────────────
+
+/// A fresh snapshot giving `a` a live speed of 92.4 and `b` none.
+fn tps_overview_snapshot(age_ms: u64) -> crate::tps::Snapshot {
+    let stamp = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(crate::usage::now_ms() - age_ms).unwrap(),
+    )
+    .unwrap()
+    .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+    .to_string();
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert(
+        "a".into(),
+        crate::tps::Figures {
+            live: crate::tps::Figure {
+                rate: 67.2,
+                speed: Some(92.4),
+            },
+            ..Default::default()
+        },
+    );
+    snap
+}
+
+/// The `t/s` column sits after `live`: a cell carries the account's live speed,
+/// right-aligned, blank where absent, and the whole column drops before the
+/// 7d reset stamp (and before the live column).
+#[test]
+fn the_overview_tps_column_renders_blank_when_absent_and_drops_first() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = profile("a", 80.0, 42.0, 3600);
+    let (b, b_readings) = profile("b", 80.0, 10.0, 3600);
+    let (config, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
+    let mut app = App::new(config);
+    app.set_tps(Some(tps_overview_snapshot(1_000)));
+
+    // Both columns fit at a wide width, with the full 7d stamp present; the
+    // header closes with the speed column.
+    let wide = OverviewWidths::new(200, &app, &readings);
+    assert_eq!((wide.live, wide.tps), (LIVE_W, TPS_W));
+    assert!(
+        wide.seven_day >= 26,
+        "the full 7d stamp holds: {}",
+        wide.seven_day
+    );
+    assert!(
+        line_text(&overview_header(&wide, false)).ends_with("t/s "),
+        "the header closes with the speed column"
+    );
+
+    // `a` carries its speed right-aligned, `b` a blank cell — never a dash for
+    // a figure the producer did not read.
+    assert_eq!(
+        line_text(&Line::from(super::tps_cell(&app, "a", TPS_W))),
+        "  92"
+    );
+    assert_eq!(
+        line_text(&Line::from(super::tps_cell(&app, "b", TPS_W))),
+        "    "
+    );
+
+    // The column drops whole with the 7d stamp: at 103 the stamp and the
+    // column hold; two columns narrower the stamp has shed and so has the t/s
+    // column (the live column still fits).
+    let stamped = OverviewWidths::new(103, &app, &readings);
+    assert!(stamped.seven_day >= 26, "{}", stamped.seven_day);
+    assert_eq!(stamped.tps, TPS_W);
+    let shed = OverviewWidths::new(101, &app, &readings);
+    assert!(shed.seven_day < 26, "{}", shed.seven_day);
+    assert_eq!(shed.tps, 0, "the t/s column drops with the 7d stamp");
+    assert_eq!(shed.live, LIVE_W, "the live column still holds");
+
+    // The row renders the right-aligned speed under the t/s header, and a
+    // blank cell for the account without one.
+    let row_a = line_text(&render_overview_row(
+        &app, 0, &wide, false, false, &readings,
+    ));
+    assert!(row_a.contains("  92"), "{row_a:?}");
+}
+
+/// The cell's figure abbreviates to a whole `k` once the formatted text would
+/// exceed the 4-cell column, capped at `999k`, never truncated into `…`.
+#[test]
+fn the_tps_cell_abbreviates_with_k_and_never_truncates() {
+    assert_eq!(crate::tps::format_figure_capped(9_999.4, TPS_W), "9999");
+    assert_eq!(crate::tps::format_figure_capped(9_999.6, TPS_W), "10k");
+    assert_eq!(crate::tps::format_figure_capped(12_800.0, TPS_W), "13k");
+    assert_eq!(crate::tps::format_figure_capped(1_200_000.0, TPS_W), "999k");
+}
+
+/// The row never exceeds the pane in any reset mode: the wall-clock bonus
+/// yields to the t/s column only when the post-bonus row still fits. Swept at
+/// a whole reading and at a two-decimal one (which widens the 5h tier's
+/// excess), so the saturation path above excess 0 is charged too.
+#[test]
+fn the_overview_row_never_exceeds_the_pane_in_any_reset_mode() {
+    use crate::profile::ResetDisplay;
+    let _home = crate::testutil::HomeSandbox::new();
+    for mode in [
+        ResetDisplay::Relative,
+        ResetDisplay::Clock,
+        ResetDisplay::Both,
+    ] {
+        for util in [42.0, 73.42] {
+            let (a, a_readings) = profile("a", 80.0, util, 3600);
+            let (mut config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec![]);
+            config.state.reset_display = Some(mode);
+            let mut app = App::new(config);
+            app.set_tps(Some(tps_overview_snapshot(1_000)));
+            for w in 95..=140u16 {
+                let widths = OverviewWidths::new(w, &app, &readings);
+                let row_w = super::fixed_overview_width_cols(
+                    widths.name,
+                    widths.kind,
+                    widths.five_hour,
+                    widths.seven_day,
+                    widths.live,
+                    widths.tps,
+                    widths.gap,
+                ) + super::TIMER_SLOT;
+                assert!(
+                    row_w <= w as usize,
+                    "{mode:?} at {w} (util {util}): {row_w} > {w}"
+                );
+            }
+        }
     }
 }

@@ -375,7 +375,7 @@ fn dashboard_reflows_to_two_columns_on_big_terminals() {
         "total stacks under the first card instead of sitting beside it"
     );
     assert!(
-        row(6).contains(" TOTAL "),
+        row(7).contains(" TOTAL "),
         "total is the second left-column card"
     );
     let act_row = (0..40).find(|&y| row(y).contains(" ACTIVITY "));
@@ -1810,4 +1810,294 @@ fn the_composition_card_keeps_every_share_at_28_by_30() {
             );
         }
     }
+}
+
+// ── tps: the today-card speed row and the total-card avg speed ───────────
+
+/// A fresh snapshot with `total.live.speed` 92.4 and a day sum of 900 tokens
+/// over 10 s (90 t/s) across one account and model.
+fn tps_tokens_snapshot(age_ms: u64) -> crate::tps::Snapshot {
+    let stamp = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(crate::usage::now_ms() - age_ms).unwrap(),
+    )
+    .unwrap()
+    .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+    .to_string();
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        total: crate::tps::Figures {
+            live: crate::tps::Figure {
+                rate: 67.2,
+                speed: Some(92.4),
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    snap.days.insert(
+        crate::tokens::today_date(),
+        std::collections::BTreeMap::from([(
+            "uwuclxdy".to_string(),
+            std::collections::BTreeMap::from([(
+                "sonnet".to_string(),
+                crate::tps::DaySum {
+                    output: 900,
+                    gen_ms: 10_000,
+                },
+            )]),
+        )]),
+    );
+    snap
+}
+
+/// The today card's speed row reads `S t/s now · S t/s today`, the `now` figure
+/// off `total.live.speed` and the `today` figure summed over accounts × models.
+#[test]
+fn the_today_card_speed_row_reads_now_and_today() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.set_tps(Some(tps_tokens_snapshot(1_000)));
+
+    let line = super::today_speed_line(&app);
+    assert_eq!(line_text(&line), "speed     92 t/s now · 90 t/s today");
+
+    // A hydrated app with no producer reads `—` for both figures, never a
+    // fabricated 0.
+    app.set_tps(None);
+    let line = super::today_speed_line(&app);
+    assert_eq!(line_text(&line), "speed     — now · — today");
+
+    // A fresh app (no cache read) still shows the row, both figures `—`.
+    let fresh = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    assert_eq!(
+        line_text(&super::today_speed_line(&fresh)),
+        "speed     — now · — today"
+    );
+}
+
+/// The total card's `avg speed` row divides the ledger's lifetime speed sums
+/// (output ÷ generation seconds) across every finalized day.
+#[test]
+fn the_total_card_avg_speed_reads_the_ledger_speed_rows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut stats = populated_stats();
+    stats.speed_days.insert(
+        "2026-10-14".to_string(),
+        crate::tps::DaySum {
+            output: 1_800,
+            gen_ms: 20_000,
+        },
+    );
+    let (lines, _meta) = total_lines(&stats, 40, false, None);
+    let avg = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("avg speed"))
+        .expect("a ledger with speed rows shows the avg speed line");
+    assert_eq!(avg, "avg speed 90 t/s");
+
+    // An empty ledger speed map leaves the card exactly as it rendered before.
+    let (empty_lines, _) = total_lines(&populated_stats(), 40, false, None);
+    assert!(
+        !empty_lines
+            .iter()
+            .map(line_text)
+            .any(|t| t.contains("avg speed")),
+        "no speed rows, no avg speed line"
+    );
+}
+
+// ── tps: the daily trend card's speed strip ──────────────────────────────
+
+/// Two days of tokens, `2026-06-01` carrying a 90 t/s speed row and
+/// `2026-06-02` none.
+fn strip_stats() -> TokenStats {
+    let mut stats = TokenStats {
+        daily: vec![
+            DayTokens {
+                date: "2026-06-01".into(),
+                tokens: 100,
+            },
+            DayTokens {
+                date: "2026-06-02".into(),
+                tokens: 50,
+            },
+        ],
+        ..Default::default()
+    };
+    stats.speed_days.insert(
+        "2026-06-01".to_string(),
+        crate::tps::DaySum {
+            output: 900,
+            gen_ms: 10_000,
+        },
+    );
+    stats
+}
+
+/// The strip is one block per bar, scaled to the shown days' max with the
+/// `SPARK` ramp, blank where no producer ran.
+#[test]
+fn the_speed_strip_scales_blocks_and_blanks_where_absent() {
+    assert_eq!(
+        line_text(&super::speed_strip(&[Some(90.0), None], 90.0, 5, 2, 1)),
+        "██   "
+    );
+    assert_eq!(
+        line_text(&super::speed_strip(
+            &[Some(45.0), Some(90.0)],
+            90.0,
+            5,
+            2,
+            1
+        )),
+        "▅▅ ██"
+    );
+}
+
+/// The trend footer gains `· avg S t/s` once any shown bar has a speed row, and
+/// stays bare when none do. The strip row itself appears only on a card tall
+/// enough to keep the month ticks under it.
+#[test]
+fn the_trend_strip_and_footer_avg_appear_only_with_speed_rows() {
+    let stats = strip_stats();
+    let tall = trend_lines(&stats, 40, 5, TokenPeriod::Daily);
+    assert_eq!(tall.len(), 5, "bars + strip + ticks + caption");
+    let caption = line_text(tall.last().expect("caption row"));
+    assert!(
+        caption.contains("· avg 90 t/s"),
+        "the footer averages the shown speed rows: {caption:?}"
+    );
+
+    let no_speed = TokenStats {
+        daily: stats.daily.clone(),
+        ..Default::default()
+    };
+    let bare = trend_lines(&no_speed, 40, 5, TokenPeriod::Daily);
+    let caption = line_text(bare.last().expect("caption row"));
+    assert!(
+        !caption.contains("avg"),
+        "no suffix without speed rows: {caption:?}"
+    );
+}
+
+/// On a short card the strip drops before the month ticks: at height 4 the tick
+/// row stays and the strip is the row that gives way.
+#[test]
+fn the_trend_speed_strip_drops_before_the_month_ticks() {
+    let stats = strip_stats();
+    let tall = trend_lines(&stats, 40, 5, TokenPeriod::Daily);
+    let short = trend_lines(&stats, 40, 4, TokenPeriod::Daily);
+    assert_eq!(tall.len(), 5);
+    assert_eq!(short.len(), 4, "the strip row drops, the ticks stay");
+    assert_eq!(
+        line_text(&short[2]),
+        line_text(&tall[3]),
+        "the short card's third line is the tick row the tall card keeps after its strip"
+    );
+}
+
+// ── tps survivors: dashboard visibility, the `*` account, the weekly fold ──
+
+/// The today and total cards grew to 7 rows so their ruled speed rows reach the
+/// screen: pinned through the full dashboard render, not the row builders.
+#[test]
+fn the_dashboard_shows_the_speed_rows_when_the_cards_grew() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_stats(TokenPeriod::Daily);
+    let mut stats = populated_stats();
+    stats.speed_days.insert(
+        "2026-06-20".to_string(),
+        crate::tps::DaySum {
+            output: 1_800,
+            gen_ms: 20_000,
+        },
+    );
+    app.token_stats = Some(stats);
+    app.set_tps(Some(tps_tokens_snapshot(1_000)));
+
+    let out = render_dashboard(&app, 160, 40);
+    assert!(
+        out.contains("avg speed"),
+        "the total card's avg speed row is on screen"
+    );
+    assert!(
+        out.contains("now · "),
+        "the today card's speed row is on screen"
+    );
+}
+
+/// The today speed row sums every account, the reserved unattributed `*` row
+/// included.
+#[test]
+fn the_today_speed_row_sums_the_unattributed_star_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    let mut snap = tps_tokens_snapshot(1_000);
+    snap.days
+        .get_mut(&crate::tokens::today_date())
+        .expect("the fixture carries a day row")
+        .insert(
+            "*".to_string(),
+            std::collections::BTreeMap::from([(
+                "sonnet".to_string(),
+                crate::tps::DaySum {
+                    output: 100,
+                    gen_ms: 10_000,
+                },
+            )]),
+        );
+    app.set_tps(Some(snap));
+
+    // (900 + 100) ÷ (10 s + 10 s) = 50 t/s.
+    assert_eq!(
+        line_text(&super::today_speed_line(&app)),
+        "speed     92 t/s now · 50 t/s today"
+    );
+}
+
+/// The weekly lens folds every day of a bucket's speed rows before the strip
+/// and footer average.
+#[test]
+fn the_weekly_trend_strip_folds_days_into_their_bucket() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // 2026-06-01 is a monday, so both days fold into one ISO-week bucket.
+    let mut stats = TokenStats {
+        daily: vec![
+            DayTokens {
+                date: "2026-06-01".into(),
+                tokens: 100,
+            },
+            DayTokens {
+                date: "2026-06-02".into(),
+                tokens: 50,
+            },
+        ],
+        ..Default::default()
+    };
+    for (day, output) in [("2026-06-01", 900u64), ("2026-06-02", 100)] {
+        stats.speed_days.insert(
+            day.to_string(),
+            crate::tps::DaySum {
+                output,
+                gen_ms: 10_000,
+            },
+        );
+    }
+    let lines = trend_lines(&stats, 40, 5, TokenPeriod::Weekly);
+    let caption = line_text(lines.last().expect("caption row"));
+    assert!(
+        caption.contains("· avg 50 t/s"),
+        "the bucket folds both days' sums (900+100 ÷ 20 s), not the first day's 90: {caption:?}"
+    );
 }

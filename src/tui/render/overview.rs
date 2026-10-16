@@ -326,6 +326,13 @@ struct OverviewWidths {
     seven_day: usize,
     /// `LIVE_W` when the live-session column fits, `0` when it is dropped.
     live: usize,
+    /// `TPS_W` when the per-account speed column fits, `0` when it is dropped.
+    tps: usize,
+    /// The codex rows' trailing `↺ N` chip slot (gap + the widest visible chip
+    /// text), charged whenever a visible codex row carries a banked reset and
+    /// the row has room for it; `0` when none does or the chip sheds whole, so
+    /// the renderer drops the chip instead of clipping it mid-glyph.
+    codex_chip_w: usize,
     gap: usize,
     /// Widest amount string (`"1.71"` of `"1.71 USD"`) across DeepSeek rows, so
     /// currencies align in the column. `0` when no DeepSeek balance is cached.
@@ -390,6 +397,10 @@ fn pool_window(utilization: Option<f64>, reset: Option<u64>) -> Option<UsageWind
 /// count, because the column is budgeted on width alone and its cost has to be
 /// constant for that to hold.
 const LIVE_W: usize = 4;
+/// Width of the per-account speed column: one cell past the `t/s` header so a
+/// three-digit figure (`999`) and the header both fit. Like the live column it
+/// is budgeted on width alone and drops whole, never clipping.
+const TPS_W: usize = 4;
 
 /// Widest the name column ever reaches (the clamp ceiling at wide widths).
 const NAME_MAX: usize = 22;
@@ -401,8 +412,9 @@ const FIVE_HOUR_MAX: usize = 26;
 /// bare `100%` alone, the bar (brackets included) shed rather than clipping the
 /// figure.
 const FIVE_HOUR_MIN: usize = 4;
-/// Narrowest an account name gets, and only once the 5h column is down to its
-/// bare reading: the chain panel's name floor.
+/// Narrowest an account name gets: once the 5h column is down to its bare
+/// reading, or to make room for the codex rows' `↺ N` chip. The chain panel's
+/// name floor.
 const NAME_READING_FLOOR: usize = 6;
 /// Widest the 7d column reaches before the wall-clock stamp bonus.
 const SEVEN_DAY_MAX: usize = 27;
@@ -473,6 +485,19 @@ impl OverviewWidths {
             LabelWidths::default()
         };
         let labels = claude_labels.widest(codex_labels).widest(pool_labels);
+        // The widest `↺ N` chip text across visible codex rows, `0` when none
+        // carries a banked reset. Only the text: the gap before it joins the
+        // column gaps in the width budget below.
+        let codex_chip_text = if app.harness_filter.shows_codex() {
+            app.codex_rows
+                .iter()
+                .filter_map(|r| r.resets)
+                .map(|count| format!("↺ {count}").chars().count())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let (five_excess, seven_excess) = labels.excess();
         let (mut name, kind, mut five_hour, mut seven_day) =
             overview_tiers(max_name, total, labels);
@@ -486,13 +511,15 @@ impl OverviewWidths {
             // from slack the layout would otherwise spend on gap padding, after
             // the live column and the shrink loop have settled — so turning the
             // setting on can add a stamp but never cost a countdown, a bar or
-            // the live column. Widening the tier itself instead pushed the 7d
-            // column down to 5 at 130 columns, deleting its bar. A column that
-            // gets only part of the 10 still degrades cleanly in
-            // `reset_suffix`.
+            // the live column. The t/s column is charged AFTER this bonus (its
+            // slot is 0 in the slack), so a wall-clock stamp outranks it too.
+            // Widening the tier itself instead pushed the 7d column down to 5
+            // at 130 columns, deleting its bar. A column that gets only part of
+            // the 10 still degrades cleanly in `reset_suffix`.
             let slack = |five: usize, seven: usize| {
                 total.saturating_sub(
-                    fixed_overview_width(name, kind, five, seven, live, GAP_MIN) + TIMER_SLOT,
+                    fixed_overview_width_cols(name, kind, five, seven, live, 0, GAP_MIN)
+                        + TIMER_SLOT,
                 )
             };
             if five_hour == FIVE_HOUR_MAX + five_excess {
@@ -502,24 +529,76 @@ impl OverviewWidths {
                 seven_day += CLOCK_COLS.min(slack(five_hour, seven_day));
             }
         }
+        // The speed column exists from the first frame; cells are blank until a
+        // fresh producer answers. It drops whole before `live` (it needs both
+        // columns to fit) and before the 7d stamp, and yields to the wall-clock
+        // bonus: once the bonus has claimed its cells, the column is kept only
+        // if the post-bonus row still fits the pane.
+        let tps = if tps_column_width(max_name, total, labels) > 0 {
+            let need =
+                fixed_overview_width_cols(name, kind, five_hour, seven_day, live, TPS_W, GAP_MIN)
+                    + TIMER_SLOT;
+            if need <= total { TPS_W } else { 0 }
+        } else {
+            0
+        };
 
-        let base = fixed_overview_width(name, kind, five_hour, seven_day, live, GAP_MIN);
-        let column_count = 3 + usize::from(seven_day > 0) + usize::from(live > 0);
+        let base = fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, GAP_MIN);
+        let column_count =
+            3 + usize::from(seven_day > 0) + usize::from(live > 0) + usize::from(tps > 0);
         let gap_slots = column_count.saturating_sub(1).max(1);
         // `fixed_overview_width` omits the TIMER_SLOT the row always renders;
         // widening gaps from that undercounted figure overflows the row at
         // narrow widths and clips the tail of the 5h column. Widen from the
         // real leftover instead.
-        let gap = (GAP_MIN + total.saturating_sub(base + TIMER_SLOT) / gap_slots).clamp(GAP_MIN, 8);
+        let mut gap =
+            (GAP_MIN + total.saturating_sub(base + TIMER_SLOT) / gap_slots).clamp(GAP_MIN, 8);
+        let mut codex_chip_w = if codex_chip_text > 0 {
+            gap + codex_chip_text
+        } else {
+            0
+        };
 
         // The name column is the one flexible text column (the only column that
-        // truncates with `…`; kind/5h/7d/live are fixed-width). Once the gap is
-        // at its ceiling and the clock bonus has taken what it wants, spare
-        // width goes to the name instead of stranding at the row end.
+        // truncates with `…`; kind/5h/7d/live/t/s are fixed-width). Once the gap
+        // is at its ceiling and the clock bonus has taken what it wants, spare
+        // width goes to the name instead of stranding at the row end. The codex
+        // chip slot is charged after this, so the name absorbs its own slack
+        // exactly as it would without the chip.
         if gap == 8 {
             name += total.saturating_sub(
-                fixed_overview_width(name, kind, five_hour, seven_day, live, gap) + TIMER_SLOT,
+                fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, gap)
+                    + TIMER_SLOT,
             );
+        }
+        // The chip slot is charged against the flexible widths — the gap first,
+        // down to its floor, then the name down to `NAME_READING_FLOOR` — and
+        // past the floor the chip sheds whole, nothing charged: the name and gap
+        // revert to the uncharged layout, and the renderer drops the chip
+        // rather than letting it peek in.
+        if codex_chip_text > 0 {
+            let name_uncharged = name;
+            let gap_uncharged = gap;
+            loop {
+                let row =
+                    fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, gap)
+                        + TIMER_SLOT
+                        + codex_chip_w;
+                if row <= total {
+                    break;
+                }
+                if gap > GAP_MIN {
+                    gap -= 1;
+                    codex_chip_w = gap + codex_chip_text;
+                } else if name > NAME_READING_FLOOR {
+                    name -= 1;
+                } else {
+                    name = name_uncharged;
+                    gap = gap_uncharged;
+                    codex_chip_w = 0;
+                    break;
+                }
+            }
         }
 
         let deepseek_amount_w = app
@@ -540,6 +619,8 @@ impl OverviewWidths {
             five_hour,
             seven_day,
             live,
+            tps,
+            codex_chip_w,
             gap,
             deepseek_amount_w,
             claude_labels,
@@ -689,6 +770,51 @@ fn live_column_width(max_name: usize, total: usize, labels: LabelWidths) -> usiz
     }
 }
 
+/// The per-account speed column width at `total`: [`TPS_W`] only when it fits
+/// here and at every wider width, `0` otherwise. Decided like the live column
+/// (monotone, gated on width alone) but charged both the live column and the
+/// full 7d reset stamp, so it drops whole before the live column and before
+/// the 7d stamp sheds its spare cell — the first column to go.
+fn tps_column_width(max_name: usize, total: usize, labels: LabelWidths) -> usize {
+    // The `+ seven_excess` terms below mirror `live_column_width`'s stamp check
+    // and saturation bound for symmetry, but no reachable label width can bind
+    // them: `26 + excess` only differs from the plain `26` once
+    // `5 + seven_excess >= 26` (a reading past ~24 cells), so no test can red a
+    // mutant dropping them.
+    let (five_excess, seven_excess) = labels.excess();
+    let fits = |w: usize| {
+        let (name, kind, five_hour, seven_day) = overview_tiers(max_name, w, labels);
+        // 26 + the label excess = the 7d reset stamp present (its spare cell
+        // already shed; `SEVEN_DAY_BAR` is bar + `%` alone). The column
+        // outlives the stamp unless it is charged the stamp's width.
+        seven_day >= 26 + seven_excess
+            && fixed_overview_width_cols(name, kind, five_hour, seven_day, LIVE_W, TPS_W, GAP_MIN)
+                + TIMER_SLOT
+                <= w
+    };
+    let largest_ladder_at = NAME_WIDE_AT
+        .max(KIND_WIDE_AT)
+        .max(FIVE_HOUR_WIDE_AT)
+        .max(SEVEN_DAY_WIDE_AT);
+    let saturation = fixed_overview_width_cols(
+        NAME_MAX,
+        KIND_MAX,
+        FIVE_HOUR_MAX + five_excess,
+        SEVEN_DAY_MAX + seven_excess,
+        LIVE_W,
+        TPS_W,
+        GAP_MIN,
+    ) + TIMER_SLOT;
+    let ceiling = saturation.max(largest_ladder_at);
+    if total >= ceiling {
+        if fits(total) { TPS_W } else { 0 }
+    } else if (total..=ceiling).all(fits) {
+        TPS_W
+    } else {
+        0
+    }
+}
+
 fn fixed_overview_width(
     name: usize,
     kind: usize,
@@ -697,12 +823,25 @@ fn fixed_overview_width(
     live: usize,
     gap: usize,
 ) -> usize {
-    let column_count = 3 + usize::from(seven_day > 0) + usize::from(live > 0);
+    fixed_overview_width_cols(name, kind, five_hour, seven_day, live, 0, gap)
+}
+
+fn fixed_overview_width_cols(
+    name: usize,
+    kind: usize,
+    five_hour: usize,
+    seven_day: usize,
+    live: usize,
+    tps: usize,
+    gap: usize,
+) -> usize {
+    let column_count =
+        3 + usize::from(seven_day > 0) + usize::from(live > 0) + usize::from(tps > 0);
     // 2 = cursor prefix. Timer slot is in the gap before 5h, not a column.
     // kind→timer gap is 4 chars narrower than standard (min 1).
     let narrow = gap.saturating_sub(4).max(1);
     let standard_gaps = column_count.saturating_sub(2);
-    4 + name + kind + five_hour + seven_day + live + standard_gaps * gap + narrow
+    4 + name + kind + five_hour + seven_day + live + tps + standard_gaps * gap + narrow
 }
 
 fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
@@ -731,6 +870,10 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
     if widths.live > 0 {
         spans.push(gap(widths));
         spans.push(Span::styled(fixed("live", widths.live), theme::label()));
+    }
+    if widths.tps > 0 {
+        spans.push(gap(widths));
+        spans.push(Span::styled(fixed("t/s", widths.tps), theme::label()));
     }
     Line::from(spans)
 }
@@ -786,12 +929,20 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> 
         spans.push(cell(row.seven_day.as_ref(), labels.seven, widths.seven_day));
     }
     // The chip trails the columns — after the live slot's width, so a dim
-    // reset count can never sit under `live` and read as a session count.
+    // reset count can never sit under `live` and read as a session count, and
+    // after the t/s slot's width when that column is present, so it can never
+    // sit under `t/s` and read as that row's speed.
     if widths.live > 0 {
         spans.push(gap(widths));
         spans.push(Span::raw(" ".repeat(widths.live)));
     }
-    if let Some(count) = row.resets {
+    if widths.tps > 0 {
+        spans.push(gap(widths));
+        spans.push(Span::raw(" ".repeat(widths.tps)));
+    }
+    if widths.codex_chip_w > 0
+        && let Some(count) = row.resets
+    {
         spans.push(gap(widths));
         spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
     }
@@ -1183,8 +1334,31 @@ fn render_overview_row(
             widths.live,
         ));
     }
+    if widths.tps > 0 {
+        spans.push(gap(widths));
+        spans.push(tps_cell(app, &profile.name, widths.tps));
+    }
 
     Line::from(spans)
+}
+
+/// The row's speed cell: the account's live speed off a fresh producer, blank
+/// when absent (never a dash standing in for a figure clauth did not read).
+/// Right-aligned to the column, and a figure ≥ 10 000 abbreviates to whole `k`
+/// (`12k`) so the column never clips a number into `…`. Already the `TEXT_DIM`
+/// tier a disabled row flattens to, so it needs no `hue` pass of its own.
+fn tps_cell(app: &App, name: &str, width: usize) -> Span<'static> {
+    let speed = app
+        .fresh_tps()
+        .and_then(|s| s.accounts.get(name))
+        .and_then(|f| f.live.speed);
+    match speed {
+        Some(v) => {
+            let text = crate::tps::format_figure_capped(v, width);
+            Span::styled(format!("{text:>width$}"), theme::dim())
+        }
+        None => Span::raw(" ".repeat(width)),
+    }
 }
 
 /// The row's live-session cell: how many `clauth start` sessions are running as

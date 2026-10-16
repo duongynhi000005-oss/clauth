@@ -33849,7 +33849,7 @@ fn dashboard_card_focus_styles_are_exact() {
         "focused first title is bold"
     );
     assert_eq!(
-        buf.cell((0, 9)).unwrap().fg,
+        buf.cell((0, 10)).unwrap().fg,
         line,
         "the second card's border is blurred"
     );
@@ -33877,7 +33877,7 @@ fn dashboard_card_focus_styles_are_exact() {
         "the blurred first title drops bold"
     );
     assert_eq!(
-        buf.cell((0, 9)).unwrap().fg,
+        buf.cell((0, 10)).unwrap().fg,
         strong,
         "the total card's border is strong when focused"
     );
@@ -33974,7 +33974,7 @@ fn dashboard_fits_on_a_big_terminal_with_no_scrollbar() {
         "the first card blurs after ↓"
     );
     assert_eq!(
-        buf.cell((0, 9)).unwrap().fg,
+        buf.cell((0, 10)).unwrap().fg,
         crate::tui::theme::line_strong_color(),
         "↓ moves focus to the total card"
     );
@@ -34012,7 +34012,7 @@ fn dashboard_scrollbar_sits_in_the_padding_column_only_on_overflow() {
 
 /// The scrollbar thumb stays whole and ends on the last body row at the end of
 /// the grid: at 45×24, ↓×6 (focus ACTIVITY) the rightmost column holds exactly
-/// 8 `┃` cells (viewport 20, total 49, hand-computed) at rows 15–22.
+/// 7 `┃` cells (viewport 20, total 47, hand-computed) at rows 16–22.
 #[test]
 fn dashboard_scrollbar_thumb_fills_to_the_last_row_at_the_end() {
     use super::{KeyCode, handle_key};
@@ -34028,8 +34028,8 @@ fn dashboard_scrollbar_thumb_fills_to_the_last_row_at_the_end() {
     let thumb: Vec<u16> = (3..(h - 1))
         .filter(|&y| buf.cell((col, y)).unwrap().symbol() == "┃")
         .collect();
-    assert_eq!(thumb.len(), 8, "thumb is 8 cells, got {thumb:?}");
-    assert_eq!(*thumb.first().unwrap(), 15, "thumb starts at row 15");
+    assert_eq!(thumb.len(), 7, "thumb is 7 cells, got {thumb:?}");
+    assert_eq!(*thumb.first().unwrap(), 16, "thumb starts at row 16");
     assert_eq!(
         *thumb.last().unwrap(),
         22,

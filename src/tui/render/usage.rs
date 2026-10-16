@@ -351,6 +351,11 @@ fn build_usage_lines(
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.extend(header_lines(profile, header, inner_w, readings));
     lines.push(Line::from(""));
+    // The live speed/rate rows sit under the header, ahead of the usage bars:
+    // they are the account's current figures, read off a fresh producer, and
+    // render from the first frame.
+    lines.extend(tps_rows(profile, app, inner_w));
+    lines.push(Line::from(""));
 
     // Notes close the pane (cloudy's placement): below the usage bars and the
     // extra-usage/balance rows, so the account's figures read first. Every
@@ -975,6 +980,100 @@ fn header_lines(
     }
     lines.extend(status_lines(profile, header, inner_w, readings));
     lines
+}
+
+/// The `speed` and `rate` rows: each reads `live · 5m · 1h · today`, one figure
+/// per window, `—` faint where the producer carries none. Speed is output
+/// tokens ÷ generation seconds; rate is output tokens ÷ wall-clock window
+/// length (today = seconds since 00:00 UTC, `0` under a fresh producer with no
+/// day row). Windows shed whole from the right when `inner_w` cannot hold them;
+/// both rows shed to the same window set (the wider rate row decides).
+fn tps_rows(profile: &Profile, app: &App, inner_w: u16) -> Vec<Line<'static>> {
+    let name = profile.name.as_str();
+    let figures = app.fresh_tps().and_then(|s| s.accounts.get(name));
+    let today = app
+        .fresh_tps()
+        .and_then(|s| s.days.get(&crate::tokens::today_date()))
+        .and_then(|accounts| accounts.get(name))
+        .map(|models| {
+            models
+                .values()
+                .fold(crate::tps::DaySum::default(), |acc, d| crate::tps::DaySum {
+                    output: acc.output + d.output,
+                    gen_ms: acc.gen_ms + d.gen_ms,
+                })
+        });
+    let secs_since_midnight = (app.tps_now_ms() % 86_400_000) as f64 / 1000.0;
+    let today_speed = today.and_then(crate::tui::app::day_average);
+    // A fresh account with no day row has a real zero today-rate, not an
+    // absence; only no fresh producer reads `—`.
+    let today_rate = figures.map(|_| {
+        if secs_since_midnight > 0.0 {
+            today.map_or(0.0, |t| t.output as f64 / secs_since_midnight)
+        } else {
+            0.0
+        }
+    });
+
+    let speed_values = [
+        ("live", figures.and_then(|f| f.live.speed)),
+        ("5m", figures.and_then(|f| f.m5.speed)),
+        ("1h", figures.and_then(|f| f.h1.speed)),
+        ("today", today_speed),
+    ];
+    let rate_values = [
+        ("live", figures.map(|f| f.live.rate)),
+        ("5m", figures.map(|f| f.m5.rate)),
+        ("1h", figures.map(|f| f.h1.rate)),
+        ("today", today_rate),
+    ];
+    let keep = row_windows("tok/s", &rate_values, inner_w);
+    vec![
+        figure_row("speed", "t/s", &speed_values[..keep]),
+        figure_row("rate", "tok/s", &rate_values[..keep]),
+    ]
+}
+
+/// How many windows (the leftmost `live` included) fit `inner_w` for a row
+/// whose figures carry `unit`.
+fn row_windows(unit: &'static str, values: &[(&'static str, Option<f64>)], inner_w: u16) -> usize {
+    let mut used = KEY_W + KEY_GUTTER;
+    for (i, (window, value)) in values.iter().enumerate() {
+        let figure = value.map_or_else(
+            || "—".to_owned(),
+            |v| format!("{} {unit}", crate::tps::format_figure(v)),
+        );
+        let sep_w = if i > 0 { " · ".chars().count() } else { 0 };
+        let cell_w = sep_w + Span::raw(*window).width() + 1 + figure.chars().count();
+        if i > 0 && used + cell_w > inner_w as usize {
+            return i;
+        }
+        used += cell_w;
+    }
+    values.len()
+}
+
+fn figure_row(
+    label: &'static str,
+    unit: &'static str,
+    values: &[(&'static str, Option<f64>)],
+) -> Line<'static> {
+    let mut spans = vec![key_span(label)];
+    for (i, (window, value)) in values.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", theme::dim()));
+        }
+        spans.push(Span::styled(*window, theme::dim()));
+        spans.push(Span::raw(" "));
+        match value {
+            Some(v) => spans.push(Span::styled(
+                format!("{} {unit}", crate::tps::format_figure(*v)),
+                theme::body(),
+            )),
+            None => spans.push(Span::styled("—", theme::faint())),
+        }
+    }
+    Line::from(spans)
 }
 
 /// The `pricing` header row: the peak-rate state sampled now, named as a pill

@@ -489,6 +489,9 @@ pub(crate) struct TokenStats {
     pub(crate) topped_up_through: Option<String>,  // latest "YYYY-MM-DD" added by top-up
     /// Today's usage, built live from transcripts; `None` when idle today.
     pub(crate) today: Option<DaySummary>,
+    /// The ledger's tps speed rows summed per finalized day across accounts
+    /// and models: date → (output, gen_ms). Avg speed = output ÷ seconds.
+    pub(crate) speed_days: std::collections::BTreeMap<String, crate::tps::DaySum>,
 }
 
 impl TokenStats {
@@ -795,6 +798,7 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
         first_session_date: wire.first_session_date,
         last_computed_date: wire.last_computed_date.clone(),
         topped_up_through: None,
+        speed_days: Default::default(),
         today: None,
     };
 
@@ -1728,6 +1732,8 @@ fn persist_ledger(
     if ledger.record(base, today) {
         ledger.save(dir);
     }
+    // The speed ledger is written by the producer at day rollover; the tokens
+    // worker only reads it (for `TokenStats.speed_days`), never writes it.
     if run_backfill(claude_dir, ledger, today, &mut progress) {
         ledger.save(dir);
     }
@@ -1787,9 +1793,14 @@ pub(crate) fn spawn(
             // Fold durably-recorded days (past the frozen base, before the
             // transcript horizon) into the base so they survive transcript pruning.
             let mut ledger = clauth_dir.as_deref().map(crate::token_ledger::Ledger::load);
+            let speed_days = clauth_dir
+                .as_deref()
+                .map(|d| crate::token_ledger::SpeedLedger::load(d).speed_days())
+                .unwrap_or_default();
             if let Some(l) = &ledger {
                 l.apply_to_base(&mut base, lcd.as_deref());
             }
+            base.speed_days = speed_days;
             // Phase 1 — instant lifetime/model data (stats-cache + ledger), no
             // transcript IO.
             let _ = tx.send(TokensEvent::Base(Box::new(base.clone())));
@@ -1820,6 +1831,9 @@ pub(crate) fn spawn(
                         let _ = tx.send(TokensEvent::Progress { done, total });
                     }
                 });
+                // Re-read the producer's latest folds so the Loaded event
+                // carries the fresh day sums.
+                base.speed_days = crate::token_ledger::SpeedLedger::load(dir).speed_days();
             }
             let _ = tx.send(TokensEvent::Loaded(Box::new(base)));
         };

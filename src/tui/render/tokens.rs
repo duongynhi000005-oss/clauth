@@ -36,8 +36,9 @@ use super::panes::{
 use crate::format::format_pct;
 use crate::pricing::{HourTokens, PriceTable};
 use crate::tokens::{
-    DaySummary, ModelTokens, PeriodDay, PeriodModel, TokenStats, bucket_activity, bucket_tokens,
-    current_bucket_bounds, effective_cache_basis, is_anthropic, model_display_name, today_date,
+    DaySummary, ModelTokens, PeriodDay, PeriodModel, TokenStats, bucket_activity, bucket_start,
+    bucket_tokens, current_bucket_bounds, effective_cache_basis, is_anthropic, model_display_name,
+    today_date,
 };
 
 /// Key column width for label:value rows (`sessions` (8) + a 2-cell gap).
@@ -655,9 +656,9 @@ struct DashRects {
 
 /// Two-column reflow gates: enough width for a card column plus a chart column
 /// that still beats the single-column band, enough height for the full card
-/// stack (6+6+7+6 rows) with a usable hour chart below it.
+/// stack (7+7+7+6 rows) with a usable hour chart below it.
 const TWO_COL_MIN_W: u16 = 140;
-const TWO_COL_MIN_H: u16 = 30;
+const TWO_COL_MIN_H: u16 = 32;
 /// Card (left) column width in the two-column layout.
 const CARD_COL_W: u16 = 56;
 
@@ -695,8 +696,8 @@ fn dash_rects(area: Rect) -> DashRects {
         let cols: [Rect; 2] =
             Layout::horizontal([Constraint::Length(CARD_COL_W), Constraint::Fill(1)]).areas(area);
         let left: [Rect; 5] = Layout::vertical([
-            Constraint::Length(6), // today / this week / this month
-            Constraint::Length(6), // total
+            Constraint::Length(7), // today / this week / this month
+            Constraint::Length(7), // total
             Constraint::Length(7), // top models
             Constraint::Length(6), // composition
             Constraint::Min(5),    // hour of day (grows)
@@ -766,10 +767,10 @@ impl DashRects {
 
 /// Natural card row heights for the narrow (phone-width) stacked layout, in
 /// reading order: today, total, trend, top models, composition, hour, activity.
-const NARROW_ROWS: [u16; 7] = [6, 6, 4, 7, 6, 9, 7];
+const NARROW_ROWS: [u16; 7] = [7, 7, 4, 7, 6, 9, 7];
 /// Natural row heights for the single-column band layout: first|total, trend
 /// (its short-terminal floor), models|comp, hour|activity at its 4-row minimum.
-const SINGLE_COL_ROWS: [u16; 4] = [6, 4, 7, 4];
+const SINGLE_COL_ROWS: [u16; 4] = [7, 4, 7, 4];
 
 /// Whether the dashboard reflows to two columns at this size.
 fn two_col(area: Rect) -> bool {
@@ -997,6 +998,8 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             // Today's date → the today card's title-right meta badge.
             let today_meta = stats.today.as_ref().map(|t| short_date(&t.date));
+            let mut today_body = today_lines(stats, inner_w(d.first), count_cache, prices);
+            today_body.push(today_speed_line(app));
             card(
                 frame,
                 d.first,
@@ -1005,7 +1008,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 true,
                 focused(CardKind::First),
                 card_spin,
-                today_lines(stats, inner_w(d.first), count_cache, prices),
+                today_body,
             );
         }
     }
@@ -1269,6 +1272,46 @@ fn today_lines(
     ]
 }
 
+/// The today card's `speed` row: `S t/s now · S t/s today`, each figure off a
+/// fresh producer (`total.live.speed`, then the day's accounts × models sums).
+/// Renders from the first frame: before a producer answers, both figures read
+/// `—`.
+fn today_speed_line(app: &App) -> Line<'static> {
+    let tps = app.fresh_tps();
+    let now = tps.and_then(|s| s.total.live.speed);
+    let today = tps
+        .and_then(|s| s.days.get(&today_date()))
+        .map(|accounts| {
+            accounts.values().flat_map(|models| models.values()).fold(
+                crate::tps::DaySum::default(),
+                |acc, d| crate::tps::DaySum {
+                    output: acc.output + d.output,
+                    gen_ms: acc.gen_ms + d.gen_ms,
+                },
+            )
+        })
+        .and_then(crate::tui::app::day_average);
+    let figure = |v: Option<f64>| {
+        v.map_or_else(
+            || Span::styled("—", theme::faint()),
+            |x| {
+                Span::styled(
+                    format!("{} t/s", crate::tps::format_figure(x)),
+                    theme::body(),
+                )
+            },
+        )
+    };
+    Line::from(vec![
+        key("speed"),
+        figure(now),
+        Span::styled(" now", theme::dim()),
+        Span::styled(" · ", theme::dim()),
+        figure(today),
+        Span::styled(" today", theme::dim()),
+    ])
+}
+
 /// The lifetime TOTAL card: kv rows grouped on the left (the old right-edge
 /// `msgs`/date scatter read as fragments on wide cards), lifetime date range
 /// as the returned title-right meta.
@@ -1319,6 +1362,25 @@ fn total_lines(
         key("msgs"),
         Span::styled(fmt_count(stats.total_messages), theme::body()),
     ]));
+    if !stats.speed_days.is_empty() {
+        let (output, gen_ms) = stats
+            .speed_days
+            .values()
+            .fold((0u64, 0u64), |(o, g), d| (o + d.output, g + d.gen_ms));
+        let avg = crate::tui::app::day_average(crate::tps::DaySum { output, gen_ms });
+        lines.push(Line::from(vec![
+            key("avg speed"),
+            avg.map_or_else(
+                || Span::styled("—", theme::faint()),
+                |v| {
+                    Span::styled(
+                        format!("{} t/s", crate::tps::format_figure(v)),
+                        theme::body(),
+                    )
+                },
+            ),
+        ]));
+    }
     let meta = match (stats.first_session_date.as_deref(), last) {
         (Some(first), Some(latest)) => {
             Some(format!("{} → {}", short_date(first), short_date(latest)))
@@ -1381,7 +1443,10 @@ fn period_lines(
 
 /// The trend chart — per-day columns, or calendar buckets under the weekly /
 /// monthly lens (peak caption names the bucket). The bars grow to fill `h` rows,
-/// caption pinned to the bottom.
+/// caption pinned to the bottom. Under the bars a speed strip carries one block
+/// per bar at that day's average speed (blank where no producer ran), and the
+/// caption gains `· avg S t/s`; on a short card the strip drops before the
+/// month ticks.
 fn trend_lines(stats: &TokenStats, w: usize, h: usize, period: TokenPeriod) -> Vec<Line<'static>> {
     let series = match period.bucket() {
         Some(b) => bucket_tokens(&stats.daily, b),
@@ -1410,20 +1475,101 @@ fn trend_lines(stats: &TokenStats, w: usize, h: usize, period: TokenPeriod) -> V
     // Bars widen to fill the card; a month tick row squeezes in under the axis
     // only when the chart keeps ≥ 2 rows of its own (same gate as hour-of-day).
     let (cell, gap) = bucket_layout(vals.len(), w);
+
+    // Per-shown-bar speed sums off the ledger: daily keys look the day up, the
+    // weekly/monthly lenses fold every day whose bucket starts at that bar.
+    let bucket = period.bucket();
+    let day_sums: Vec<Option<crate::tps::DaySum>> = dates
+        .iter()
+        .map(|date| match bucket {
+            None => stats.speed_days.get(*date).copied(),
+            Some(b) => {
+                let mut sum = crate::tps::DaySum::default();
+                for (d, s) in &stats.speed_days {
+                    if bucket_start(d, b) == *date {
+                        sum.output += s.output;
+                        sum.gen_ms += s.gen_ms;
+                    }
+                }
+                (sum.output > 0 || sum.gen_ms > 0).then_some(sum)
+            }
+        })
+        .collect();
+    let speeds: Vec<Option<f64>> = day_sums
+        .iter()
+        .map(|s| s.and_then(crate::tui::app::day_average))
+        .collect();
+    let any_speed = speeds.iter().any(Option::is_some);
+    let max_speed = speeds.iter().flatten().fold(0.0f64, |a, s| a.max(*s));
+
     let ticks = h >= 4;
-    let mut lines = bar_chart_sqrt(
-        &vals,
-        w,
-        h.saturating_sub(1 + usize::from(ticks)),
-        theme::accent(),
-        cell,
-        gap,
-    );
+    // The strip needs one more row than the ticks: it drops first on a short
+    // card, before the month tick row.
+    let strip = any_speed && h >= 5;
+    let bars_h = h.saturating_sub(1 + usize::from(ticks) + usize::from(strip));
+    let mut lines = bar_chart_sqrt(&vals, w, bars_h, theme::accent(), cell, gap);
+    if strip {
+        lines.push(speed_strip(&speeds, max_speed, w, cell, gap));
+    }
     if ticks {
         lines.push(month_ticks(&dates, w, cell, gap));
     }
-    lines.push(center(vec![Span::styled(peak, theme::faint())], w));
+    // The footer's average sums output ÷ seconds over the shown bars that have
+    // a speed row; no rows → no suffix.
+    let (out, gen_total) = day_sums
+        .iter()
+        .flatten()
+        .filter(|d| d.gen_ms > 0)
+        .fold((0u64, 0u64), |(o, g), d| (o + d.output, g + d.gen_ms));
+    let mut caption = vec![Span::styled(peak, theme::faint())];
+    if let Some(avg) = crate::tui::app::day_average(crate::tps::DaySum {
+        output: out,
+        gen_ms: gen_total,
+    }) {
+        let suffix = Span::styled(
+            format!(" · avg {} t/s", crate::tps::format_figure(avg)),
+            theme::faint(),
+        );
+        // The suffix drops whole when the caption would not fit, never clips
+        // mid-figure.
+        if span_w(&caption) + suffix.width() <= w {
+            caption.push(suffix);
+        }
+    }
+    lines.push(center(caption, w));
     lines
+}
+
+/// One row under the bars: a block per bar at that day's average speed, scaled
+/// to the shown days' max with the same `SPARK` ramp the bar chart's partial
+/// cells use. Blank where no producer ran.
+fn speed_strip(
+    speeds: &[Option<f64>],
+    max: f64,
+    width: usize,
+    cell_w: usize,
+    gap: usize,
+) -> Line<'static> {
+    let chart_w = speeds.len() * cell_w + speeds.len().saturating_sub(1) * gap;
+    let pad = width.saturating_sub(chart_w) / 2;
+    let mut s = String::with_capacity(chart_w);
+    for (i, speed) in speeds.iter().enumerate() {
+        if i > 0 {
+            s.extend(std::iter::repeat_n(' ', gap));
+        }
+        let ch = match speed {
+            None => ' ',
+            // Zero is decided off the formatted text, so it holds under either
+            // `format_figure` version.
+            Some(v) if crate::tps::format_figure(*v) == "0" => SPARK[0],
+            Some(v) => SPARK[(((v / max) * 7.0).round() as usize).min(7)],
+        };
+        s.extend(std::iter::repeat_n(ch, cell_w));
+    }
+    Line::from(vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(s, theme::dim()),
+    ])
 }
 
 fn model_lines(

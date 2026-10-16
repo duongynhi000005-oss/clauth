@@ -1265,6 +1265,23 @@ pub(crate) fn owner_of(session_id: &str) -> Option<String> {
         .or_else(|| owner_in(&load_store(&store_path()?), session_id))
 }
 
+/// Resolve the STORE half of the owner for a batch of session ids over ONE
+/// owner-store load. The hook's `resolved` is read fresh by the caller, so this
+/// answers only from `session_profiles.json`. `None` for an id that is absent
+/// or `Contested`.
+pub(crate) fn owners_of(ids: impl IntoIterator<Item = String>) -> HashMap<String, Option<String>> {
+    let Some(path) = store_path() else {
+        return HashMap::new();
+    };
+    let store = load_store(&path);
+    ids.into_iter()
+        .map(|id| {
+            let owner = owner_in(&store, &id);
+            (id, owner)
+        })
+        .collect()
+}
+
 /// Annotate each session's `last_ran_profile`. The exact per-conversation
 /// observation wins where it exists; the global owner store answers for ids it
 /// never saw. Loads the store once, so a caller can attach owners without

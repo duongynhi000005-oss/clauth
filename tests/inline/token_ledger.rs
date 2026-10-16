@@ -893,3 +893,183 @@ fn a_pre_map_ledger_owes_one_remap_and_the_stamp_persists() {
     ledger.save(dir.path());
     assert_eq!(Ledger::load(dir.path()).remap_through("2026-06-20"), None);
 }
+
+// ── tps speed ledger (token_speed.json) ───────────────────────────────────────
+
+/// Speed history lives in its own file: a pre-migration token ledger loads and
+/// stays byte-identical through a speed fold, the producer's finalized day sums
+/// land in `token_speed.json` under (day, account, model) with today's left
+/// out, and a second fold changes nothing.
+#[test]
+fn a_pre_migration_ledger_loads_and_speed_rows_fold_into_their_own_file() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let v1 = r#"{"recorded_through":"2026-10-13","days":{"2026-10-13":{"claude-opus-5-5":{"input":1,"output":2,"cache_read":3,"cache_create":4}}},"backfill_done":true,"shape_clf":3,"model_map":1}"#;
+    std::fs::write(dir.join("token_ledger.json"), v1).unwrap();
+
+    let l = Ledger::load(&dir);
+    assert_eq!(l.recorded_through.as_deref(), Some("2026-10-13"));
+    assert_eq!(l.days["2026-10-13"]["claude-opus-5-5"].output, 2);
+
+    let mut days = crate::tps::DaySums::new();
+    for (date, account, output, gen_ms) in [
+        ("2026-10-14", "kerry", 1222, 13_597),
+        ("2026-10-14", "*", 300, 4_000),
+        ("2026-10-15", "kerry", 50, 1_000),
+    ] {
+        days.entry(date.into())
+            .or_default()
+            .entry(account.into())
+            .or_default()
+            .insert(
+                "claude-opus-5-5".into(),
+                crate::tps::DaySum { output, gen_ms },
+            );
+    }
+    let mut speed = SpeedLedger::load(&dir);
+    assert!(speed.record(&days, "2026-10-15"), "a finalized day folds");
+    assert!(
+        !speed.record(&days, "2026-10-15"),
+        "a second fold is a no-op"
+    );
+    speed.save(&dir);
+
+    assert_eq!(
+        std::fs::read_to_string(dir.join("token_ledger.json")).unwrap(),
+        v1,
+        "the token ledger is never written by a speed fold"
+    );
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("token_speed.json")).unwrap()).unwrap();
+    assert_eq!(
+        raw,
+        serde_json::json!({"version": 1, "days": {"2026-10-14": {
+            "*": {"claude-opus-5-5": {"output": 300, "gen_ms": 4000}},
+            "kerry": {"claude-opus-5-5": {"output": 1222, "gen_ms": 13597}},
+        }}}),
+        "only the finalized day, keyed day -> account -> model, unattributed under *"
+    );
+    assert_eq!(
+        SpeedLedger::load(&dir).days["2026-10-14"]["kerry"]["claude-opus-5-5"],
+        crate::tps::DaySum {
+            output: 1222,
+            gen_ms: 13_597
+        },
+        "the speed ledger loads back"
+    );
+}
+
+/// An unparsable `token_speed.json` is renamed aside before the first save,
+/// never saved over (its rows have no second source).
+#[test]
+fn an_unparsable_speed_ledger_is_renamed_aside_not_saved_over() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("token_speed.json"), "not json").unwrap();
+
+    let mut l = SpeedLedger::load(&dir);
+    let mut days = crate::tps::DaySums::new();
+    days.entry("2026-09-20".to_owned())
+        .or_default()
+        .entry("kerry".to_owned())
+        .or_default()
+        .insert(
+            "claude-opus-5-5".to_owned(),
+            crate::tps::DaySum {
+                output: 1,
+                gen_ms: 2,
+            },
+        );
+    assert!(l.record(&days, "2026-09-21"));
+    assert!(l.save(&dir), "the fresh save succeeds");
+
+    let aside = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().contains("corrupt"));
+    assert!(aside, "the corrupt file was renamed aside");
+    let reloaded = SpeedLedger::load(&dir);
+    assert!(
+        reloaded.days.contains_key("2026-09-20"),
+        "the fresh file holds the folded day"
+    );
+}
+
+/// A read error other than NotFound (a directory at the file's path) marks the
+/// ledger unreadable: it is never saved over, and the days stay in the cache.
+#[test]
+fn an_unreadable_speed_ledger_is_never_saved_over() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir(dir.join("token_speed.json")).unwrap();
+
+    let mut l = SpeedLedger::load(&dir);
+    assert!(
+        l.unusable(),
+        "a directory read error is unreadable, not absent"
+    );
+    let mut days = crate::tps::DaySums::new();
+    days.entry("2026-09-20".to_owned())
+        .or_default()
+        .entry("kerry".to_owned())
+        .or_default()
+        .insert(
+            "claude-opus-5-5".to_owned(),
+            crate::tps::DaySum {
+                output: 1,
+                gen_ms: 2,
+            },
+        );
+    assert!(l.record(&days, "2026-09-21"));
+    assert!(!l.save(&dir), "never saved over an unreadable file");
+    assert!(
+        dir.join("token_speed.json").is_dir(),
+        "the unreadable file is untouched"
+    );
+}
+
+/// Two saves after one corruption make exactly one aside (the flag clears on a
+/// successful rename) and the aside is 0600.
+#[test]
+fn a_corrupt_speed_ledger_is_renamed_aside_exactly_once() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("token_speed.json"), "not json").unwrap();
+
+    let mut l = SpeedLedger::load(&dir);
+    let mut days = crate::tps::DaySums::new();
+    days.entry("2026-09-20".to_owned())
+        .or_default()
+        .entry("kerry".to_owned())
+        .or_default()
+        .insert(
+            "claude-opus-5-5".to_owned(),
+            crate::tps::DaySum {
+                output: 1,
+                gen_ms: 2,
+            },
+        );
+    assert!(l.record(&days, "2026-09-21"));
+    assert!(l.save(&dir));
+    assert!(l.save(&dir), "the second save needs no rename");
+
+    let asides: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("corrupt"))
+        .collect();
+    assert_eq!(asides.len(), 1, "exactly one aside");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(asides[0].path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the aside is 0600");
+    }
+}

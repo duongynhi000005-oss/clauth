@@ -42,6 +42,23 @@ const GAUGE_NAME_MIN: usize = 3;
 /// constant keeps the ladder still as the reading ticks, and only a longer
 /// label (`73.42%`) widens it.
 const GAUGE_PCT_W: usize = 4;
+/// The widest label the gauge's percent can ever render: `99.99%`, the ceiling
+/// `format_pct` reaches at two decimals. Charged in the chip shed checks in
+/// place of the live label (through [`gauge_tail_w`], so the formatter owns
+/// the number), so a reading update never moves a chip.
+const GAUGE_MAX_PCT: f64 = 99.99;
+/// The widest the speed suffix can ever render: ` (9999 t/s)`, the suffix's
+/// figure going through the same four-cell `format_figure_capped` as the chip.
+/// Charged in the chip shed checks so a speed update never moves a
+/// chip.
+const GAUGE_MAX_SUFFIX_W: usize = 11;
+/// The widest the tok/s chip can ever render: `[ 9999 tok/s ]`, the four-cell
+/// figure ceiling the chip's whole-`k` form reaches. Charged in the shed checks
+/// so a rate update never moves a chip.
+const TPS_CHIP_CEILING_W: usize = 14; // "[ " + "9999" + " tok/s ]"
+/// The widest the live chip can ever render: `[ 999 live ]`, three digits.
+/// Charged in the shed checks so a count update never moves a chip.
+const LIVE_CHIP_CEILING_W: usize = 12; // "[ " + "999" + " live ]"
 /// Flush bar brackets: `[` + `]`.
 const GAUGE_BAR_CHROME_W: usize = 2;
 /// Every gauge gap — name → percent, percent → bar, bare rung — 1 cell.
@@ -280,16 +297,16 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
         rows[0],
     );
 
-    // ── Row 1: [[ N live ] · ][gauge] ...... ● feed ──────────────────────
-    // The fleet's live count and the active profile's gauge, left-aligned, and
-    // the status indicator, the only thing right-aligned, across an elastic
-    // gap. The account counts and the harness filter left this row for the
-    // accounts panel's title row, whose meta slots carry them beside the bare
-    // `ACCOUNTS` title (the filter name left, the roster counts right). The
-    // indicator drops whole, head and feed together, since a dot
-    // left to render clips the feed mid-word and a half-spelled source says
-    // less than none. Its gate is charged the gauge as rendered, so the gauge's
-    // own ladder gives way before the indicator does.
+    // ── Row 1: [[ N live ]  [ R tok/s ] · ][gauge][ (S t/s)] ...... ● feed ──
+    // The fleet's live-session count, the total consumption rate, the active
+    // profile's gauge with its speed suffix, left-aligned, and the status
+    // indicator, the only thing right-aligned, across an elastic gap. The
+    // indicator drops whole, head and feed together, since a dot left to
+    // render clips the feed mid-word and a half-spelled source says less than
+    // none. Its gate is charged the content as rendered, so the content's own
+    // ladder gives way before the indicator does. Narrow widths shed the tok/s
+    // chip first, then the live chip, then the speed suffix, then the gauge's
+    // own ladder, then the indicator.
     let row1_width = rows[1].width as usize;
     let feed = "status.claude.ai";
     let status_head = "● ";
@@ -297,31 +314,102 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
     // Right-aligned columns keep a minimum 3-cell gap from the content to
     // their left (`CONTENT_GAP`, the same gap row 0 keeps): the indicator sheds
     // before it would render closer than that, never at a 1-2 cell squeeze.
-    let mut left_spans: Vec<Span<'static>> = Vec::new();
+    let left_budget = row1_width.saturating_sub(status_w + CONTENT_GAP);
+
+    let live = live_chip_spans(app);
+    let tps = tps_chip_spans(app);
+    let suffix = speed_suffix_spans(app, gauge.as_ref());
+    let suffix_w: usize = suffix.iter().map(|s| s.width()).sum();
+
+    // The gauge's full form is the content with the highest priority after the
+    // indicator: the suffix sheds before the gauge's ladder, so the gauge keeps
+    // its full form while the suffix can still ride it, and only shrinks once
+    // the suffix is gone.
+    let mut gauge_spans_vec: Vec<Span<'static>> = Vec::new();
+    let mut keep_suffix = false;
     if let Some(ref g) = gauge {
-        let gauge_budget = row1_width.saturating_sub(status_w + CONTENT_GAP);
-        let fit = gauge_fit(gauge_budget, Span::raw(g.name.as_str()).width(), g.pct);
-        if fit.visible {
-            left_spans.extend(gauge_spans(fit, &g.name, g.pct, app.anim_ms()));
+        let name_len = Span::raw(g.name.as_str()).width();
+        let full_fit = gauge_fit(usize::MAX, name_len, g.pct);
+        let full_reserved = gauge_total_w(full_fit.name_w, full_fit.bar_cells, g.pct);
+        if full_reserved + suffix_w <= left_budget {
+            gauge_spans_vec = gauge_spans(full_fit, &g.name, g.pct, app.anim_ms());
+            keep_suffix = !suffix.is_empty();
+        } else if full_reserved <= left_budget {
+            gauge_spans_vec = gauge_spans(full_fit, &g.name, g.pct, app.anim_ms());
+        } else {
+            let fit = gauge_fit(left_budget, name_len, g.pct);
+            if fit.visible {
+                gauge_spans_vec = gauge_spans(fit, &g.name, g.pct, app.anim_ms());
+            }
         }
     }
-    // The fleet's live-session count leads the row as a counter chip, zero
-    // included: hiding it at zero would move the gauge each time the first
-    // session starts or the last one ends. It takes only what the gauge and the
-    // indicator leave, so it is the first thing the row sheds, whole with its
-    // separator, never costing the gauge a cell.
-    let mut prefix = live_chip_spans(app);
-    if !left_spans.is_empty() {
-        prefix.push(Span::styled(" · ", theme::dim()));
+    let gauge_w: usize = gauge_spans_vec.iter().map(|s| s.width()).sum();
+    // The chip shed checks charge the widest the gauge, its speed suffix and
+    // each chip can ever render — the full bar rung with the widest percent
+    // label, the ` (9999 t/s)` suffix, and the `[ 9999 tok/s ]` / `[ 999 live ]`
+    // ceilings — so a chip's presence depends on the terminal width and the
+    // active account's name only, never on a reading, speed, rate or count
+    // update. The gauge, suffix and chips still render at their real widths in
+    // whatever room the shed checks leave.
+    let (charged_gauge_w, charged_suffix_w) = gauge.as_ref().map_or((0, 0), |g| {
+        let oauth = g.pct.is_some();
+        let name_w = Span::raw(g.name.as_str()).width().min(GAUGE_NAME_MAX);
+        (
+            gauge_total_w(
+                name_w,
+                if oauth { GAUGE_BAR_FULL } else { 0 },
+                oauth.then_some(GAUGE_MAX_PCT),
+            ),
+            GAUGE_MAX_SUFFIX_W,
+        )
+    });
+    let sep_w = if gauge_w > 0 {
+        " · ".chars().count()
+    } else {
+        0
+    };
+
+    // The chips take only what the gauge (and the suffix) leave, so the tok/s
+    // chip sheds first, whole with its chip gap, then the live chip, whole with
+    // its separator — never costing the gauge a cell.
+    let mut left: Vec<Span<'static>> = Vec::new();
+    if !tps.is_empty()
+        && LIVE_CHIP_CEILING_W
+            + CHIP_GAP.chars().count()
+            + TPS_CHIP_CEILING_W
+            + sep_w
+            + charged_gauge_w
+            + charged_suffix_w
+            <= left_budget
+    {
+        left.extend(live);
+        left.push(Span::raw(CHIP_GAP));
+        left.extend(tps);
+        if gauge_w > 0 {
+            left.push(Span::styled(" · ", theme::dim()));
+        }
+        left.extend(gauge_spans_vec);
+        if keep_suffix {
+            left.extend(suffix);
+        }
+    } else if LIVE_CHIP_CEILING_W + sep_w + charged_gauge_w + charged_suffix_w <= left_budget {
+        left.extend(live);
+        if gauge_w > 0 {
+            left.push(Span::styled(" · ", theme::dim()));
+        }
+        left.extend(gauge_spans_vec);
+        if keep_suffix {
+            left.extend(suffix);
+        }
+    } else {
+        left.extend(gauge_spans_vec);
+        if keep_suffix {
+            left.extend(suffix);
+        }
     }
-    let prefix_w: usize = prefix.iter().map(|s| s.width()).sum();
-    let gauge_w: usize = left_spans.iter().map(|s| s.width()).sum();
-    if prefix_w + gauge_w + status_w + CONTENT_GAP <= row1_width {
-        prefix.append(&mut left_spans);
-        left_spans = prefix;
-    }
-    let left_w: usize = left_spans.iter().map(|s| s.width()).sum();
-    let mut row1_spans = left_spans;
+
+    let left_w: usize = left.iter().map(|s| s.width()).sum();
+    let mut row1_spans = left;
     if row1_width >= left_w + status_w + CONTENT_GAP {
         let gap = row1_width - left_w - status_w;
         row1_spans.push(Span::raw(" ".repeat(gap)));
@@ -364,6 +452,55 @@ fn live_chip_spans(app: &App) -> Vec<Span<'static>> {
     spans
 }
 
+/// `[ R tok/s ]`: the total consumption rate read off the producer's cache, in
+/// the live chip's grammar — brackets and unit dim, the number `TEXT` + bold,
+/// dim at zero and as the `—` of a cache that has no fresh producer behind it.
+/// The number field holds the widest text the chip has ever rendered (fresh
+/// figure or `—`), blank cells after the closing bracket filling the
+/// difference, so a 1 s-updating rate never moves the gauge. It renders from
+/// the first frame: an unhydrated launch still shows `[ — tok/s ]`.
+fn tps_chip_spans(app: &App) -> Vec<Span<'static>> {
+    let number = app.tps_rate_text();
+    // Bright only for a fresh non-zero reading: the no-reading `—` and the
+    // zero both stay dim, per the Counter chip contract.
+    let bright = app.fresh_tps().is_some() && number != "0";
+    let number_style = if bright {
+        Style::default().fg(theme::text_color()).bold()
+    } else {
+        theme::dim()
+    };
+    let pad = app.tps_rate_width.saturating_sub(number.chars().count());
+    let mut spans = vec![
+        Span::styled("[ ", theme::dim()),
+        Span::styled(number, number_style),
+        Span::styled(" tok/s ]", theme::dim()),
+    ];
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    spans
+}
+
+/// ` (S t/s)`: the active account's live speed, dim like the other secondary
+/// figures on the row. Empty when the gauge is absent or the account has no
+/// fresh live speed.
+fn speed_suffix_spans(app: &App, gauge: Option<&ActiveGauge>) -> Vec<Span<'static>> {
+    let Some(gauge) = gauge else {
+        return Vec::new();
+    };
+    let Some(speed) = app
+        .fresh_tps()
+        .and_then(|s| s.accounts.get(&gauge.name))
+        .and_then(|f| f.live.speed)
+    else {
+        return Vec::new();
+    };
+    vec![Span::styled(
+        format!(" ({} t/s)", crate::tps::format_figure_capped(speed, 4)),
+        theme::dim(),
+    )]
+}
+
 fn status_dot_color(app: &App) -> ratatui::style::Color {
     use crate::status::Impact;
     match app.status.worst_active_impact() {
@@ -373,7 +510,6 @@ fn status_dot_color(app: &App) -> ratatui::style::Color {
         Impact::None | Impact::Other(_) => theme::success_color(),
     }
 }
-
 /// The cells between two service chips.
 const CHIP_GAP: &str = "  ";
 

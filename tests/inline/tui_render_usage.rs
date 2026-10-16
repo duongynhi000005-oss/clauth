@@ -3304,7 +3304,7 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
         .unwrap();
     assert_eq!(
         app.usage_detail_max_scroll.get(),
-        8,
+        11,
         "resized viewport publishes the smaller bound"
     );
     let at = app.usage_detail_scroll;
@@ -3625,4 +3625,114 @@ fn kick_spans_pads_by_cells() {
     let spans = super::kick_spans("日本語の上流", 0, 30);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
     assert_eq!(ratatui::text::Span::raw(&joined).width(), 30);
+}
+
+// ── tps: the `speed` and `rate` rows ─────────────────────────────────────
+
+fn tps_line_text(line: &Line<'static>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// A fresh snapshot for `uwuclxdy` with live/m5/h1 figures and no day sums.
+fn tps_full_snapshot(age_ms: u64) -> crate::tps::Snapshot {
+    let stamp = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(crate::usage::now_ms() - age_ms).unwrap(),
+    )
+    .unwrap()
+    .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+    .to_string();
+    let fig = |rate: f64, speed: Option<f64>| crate::tps::Figure { rate, speed };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert(
+        "uwuclxdy".into(),
+        crate::tps::Figures {
+            live: fig(67.2, Some(92.4)),
+            m5: fig(61.0, Some(88.0)),
+            h1: fig(58.0, Some(84.0)),
+        },
+    );
+    snap
+}
+
+/// The `speed` and `rate` rows carry all four windows, `—` faint where absent,
+/// and shed whole windows from the right when the pane cannot hold them.
+#[test]
+fn the_tps_rows_render_four_windows_and_a_dash_where_absent() {
+    use crate::profile::{AppConfig, AppState};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = Profile::new("uwuclxdy".to_string(), None, None);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile.clone()],
+    };
+    let mut app = App::new(config);
+    app.set_tps(Some(tps_full_snapshot(1_000)));
+
+    // No day sums: the speed row's `today` reads `—`, but a fresh account's
+    // today RATE is a real zero, never an absence.
+    let rows = tps_rows(&profile, &app, 100);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today —"
+    );
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live 67 tok/s · 5m 61 tok/s · 1h 58 tok/s · today 0 tok/s"
+    );
+
+    // A day sum of 900 tokens over 10 s: the speed row's `today` is the
+    // deterministic 900 ÷ 10 = 90 t/s.
+    let mut snap = tps_full_snapshot(1_000);
+    snap.days.insert(
+        crate::tokens::today_date(),
+        std::collections::BTreeMap::from([(
+            "uwuclxdy".to_string(),
+            std::collections::BTreeMap::from([(
+                "sonnet".to_string(),
+                crate::tps::DaySum {
+                    output: 900,
+                    gen_ms: 10_000,
+                },
+            )]),
+        )]),
+    );
+    // Pin the clock to 900 s after 00:00 UTC today, and stamp the snapshot 1 s
+    // before it, so it reads fresh under the pinned clock and the today rate
+    // divides by exactly 900.
+    let now = crate::usage::now_ms();
+    let fixed = now - (now % 86_400_000) + 900_000;
+    snap.generated_at =
+        chrono::DateTime::from_timestamp_millis(i64::try_from(fixed - 1_000).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string();
+    app.set_tps(Some(snap));
+    app.tps_now_override = Some(fixed);
+    let rows = tps_rows(&profile, &app, 100);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today 90 t/s"
+    );
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live 67 tok/s · 5m 61 tok/s · 1h 58 tok/s · today 1.0 tok/s"
+    );
+
+    // A pane too narrow sheds whole windows from the right, never a partial
+    // figure; both rows shed to the same (rate row's) window set.
+    let rows = tps_rows(&profile, &app, 50);
+    assert_eq!(tps_line_text(&rows[0]), "speed     live 92 t/s · 5m 88 t/s");
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live 67 tok/s · 5m 61 tok/s"
+    );
 }

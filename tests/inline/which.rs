@@ -1156,6 +1156,9 @@ fn json_tier_agrees_with_the_status_json_surface() {
 /// so a consumer's key lookup never has to branch on presence.
 #[test]
 fn json_tier_is_null_when_nothing_resolved() {
+    // `json_view` reaches `tps_view` -> `load_cache` -> `home_dir`, which panics
+    // in a test build without a sandbox override.
+    let _home = HomeSandbox::new();
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let value = json_view(&config, None);
 
@@ -1638,4 +1641,130 @@ fn a_claude_runtime_claim_outranks_an_inherited_codex_home() {
         claude_session_dir_claims_this_process(),
         "a clauth runtime CLAUDE_CONFIG_DIR is this process's identity and wins"
     );
+}
+
+// ── tps: `which --json` tps field ─────────────────────────────────────────────
+
+/// Write a tps cache naming `account`, aged `age_ms` before `now_ms`, with an
+/// optional `sess-1` session row.
+fn write_tps_cache_at(
+    home: &HomeSandbox,
+    now_ms: u64,
+    age_ms: u64,
+    account: &str,
+    with_session: bool,
+) {
+    let generated_at = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(now_ms - age_ms).expect("age in range"),
+    )
+    .expect("valid ms")
+    .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+    .to_string();
+    let figures = |rate: f64, speed: Option<f64>| crate::tps::Figures {
+        live: crate::tps::Figure { rate, speed },
+        ..crate::tps::Figures::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at,
+        total: figures(67.0, Some(92.0)),
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts
+        .insert(account.to_owned(), figures(67.0, Some(92.0)));
+    if with_session {
+        snap.sessions.insert(
+            "sess-1".to_owned(),
+            crate::tps::SessionFigures {
+                account: Some(account.to_owned()),
+                figures: figures(50.0, Some(33.0)),
+            },
+        );
+    }
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+}
+
+fn resolved_cl() -> (String, Source) {
+    ("cl".to_owned(), Source::CredentialLessActive)
+}
+
+/// No cache, or one older than 30 s, reads `tps: null`; a fresh cache carries
+/// the resolved profile's live figures with `session: null` when the env names
+/// no cached session.
+#[test]
+fn json_tps_is_null_without_a_fresh_cache_and_carries_live_figures_with_one() {
+    let home = HomeSandbox::new();
+    let config = config_with(vec![blank_profile("cl")], Some("cl"));
+    let resolved = resolved_cl();
+
+    assert_eq!(
+        json_view(&config, Some(&resolved))["tps"],
+        serde_json::Value::Null
+    );
+
+    // Stale by 5 s.
+    write_tps_cache_at(
+        &home,
+        crate::usage::now_ms(),
+        crate::tps::STALE_AFTER_MS + 5_000,
+        "cl",
+        false,
+    );
+    assert_eq!(
+        json_view(&config, Some(&resolved))["tps"],
+        serde_json::Value::Null
+    );
+
+    // Fresh: 5 s inside the staleness edge (the exact edge is pinned by
+    // `json_tps_staleness_edge_is_exact` with a fixed clock).
+    write_tps_cache_at(
+        &home,
+        crate::usage::now_ms(),
+        crate::tps::STALE_AFTER_MS - 5_000,
+        "cl",
+        false,
+    );
+    let v = json_view(&config, Some(&resolved));
+    assert_eq!(v["tps"]["speed"], 92.0);
+    assert_eq!(v["tps"]["rate"], 67.0);
+    assert_eq!(v["tps"]["session"], serde_json::Value::Null);
+    let age = v["tps"]["age_secs"].as_u64().expect("age_secs is a number");
+    assert!(age < 30, "age off generated_at: {}", v["tps"]);
+}
+
+/// The staleness edge is exact: age == 30 s is fresh, age == 30 s + 1 ms is
+/// null. Pinned with a fixed clock through [`tps_view_at`].
+#[test]
+fn json_tps_staleness_edge_is_exact() {
+    let home = HomeSandbox::new();
+    let now = 1_800_000_000_000u64;
+    write_tps_cache_at(&home, now, crate::tps::STALE_AFTER_MS, "cl", false);
+
+    let fresh = tps_view_at(Some("cl"), now);
+    assert_eq!(fresh["speed"], 92.0, "age == 30 s is fresh");
+    assert_eq!(fresh["age_secs"], 30);
+
+    // Query AFTER the stamp so the age is 30 s + 1 ms, exercising the
+    // staleness check itself rather than the future-stamp guard.
+    let stale = tps_view_at(Some("cl"), now + 1);
+    assert_eq!(stale, serde_json::Value::Null, "age == 30 s + 1 ms is null");
+}
+
+/// With `CLAUDE_CODE_SESSION_ID` naming a session in the cache, `session`
+/// carries that session's live figures.
+#[test]
+fn json_tps_reads_the_session_row_when_the_env_names_one() {
+    let home = HomeSandbox::new();
+    let config = config_with(vec![blank_profile("cl")], Some("cl"));
+    let resolved = resolved_cl();
+    write_tps_cache_at(&home, crate::usage::now_ms(), 3_000, "cl", true);
+    // SAFETY: test-only, serialized by HomeSandbox's lock, restored on its Drop.
+    unsafe { std::env::set_var("CLAUDE_CODE_SESSION_ID", "sess-1") };
+
+    let v = json_view(&config, Some(&resolved));
+    assert_eq!(v["tps"]["speed"], 92.0);
+    assert_eq!(v["tps"]["session"]["speed"], 33.0);
+    assert_eq!(v["tps"]["session"]["rate"], 50.0);
 }
