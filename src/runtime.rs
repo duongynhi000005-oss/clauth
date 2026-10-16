@@ -1670,15 +1670,11 @@ pub(crate) mod namespaced_keychain_ledger {
     }
 }
 
-/// Drop the markers of bare `claude` sessions that have exited — the ordinary
-/// case, since such a session never runs clauth code and leaves its file behind.
-/// The same per-entry prune the paired trees get, minus the tree removal: this
-/// dir holds nothing but markers, so no `remove_dir_all` is handed anything here.
-/// Collect `spawn-settings-<sid>.json` files whose session died without
-/// teardown. Same liveness rule as every other sweep: a file whose paired
-/// `sessions-<sid>` marker dir holds a live flock is spared, and so is one
-/// whose liveness cannot be READ (unknown reads as live). A missing marker dir
-/// reads as DEAD — a stray file with no runtime or sessions dir at all.
+/// Collect `spawn-settings[-isolated]-<sid>.json` files whose session died
+/// without teardown. The name carries the flavor, so liveness is the registry's
+/// own [`session_row_is_live`] over every marker layout (per-session and fake
+/// mode's bare `sessions/`): a held marker spares the file, an undecidable one
+/// reads as live, and a file with no marker at all is a crash leftover.
 fn gc_spawn_settings_files() {
     let Ok(root) = profiles_root_dir() else {
         return;
@@ -1738,6 +1734,10 @@ fn parse_spawn_settings_name(name: &str) -> Option<(bool, String)> {
     is_session_id(sid).then(|| (isolated, sid.to_string()))
 }
 
+/// Drop the markers of bare `claude` sessions that have exited — the ordinary
+/// case, since such a session never runs clauth code and leaves its file behind.
+/// The same per-entry prune the paired trees get, minus the tree removal: this
+/// dir holds nothing but markers, so no `remove_dir_all` is handed anything here.
 fn gc_bare_markers() {
     let Ok(dir) = live_bare_dir() else {
         return;
