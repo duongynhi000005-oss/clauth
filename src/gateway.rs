@@ -115,7 +115,7 @@ impl GatewayRecord {
     /// re-pointed link takes a fresh adoption.
     pub(crate) fn new(config: PathBuf) -> Result<Self> {
         check_adoptable(&config)?;
-        let config = std::fs::canonicalize(&config)
+        let config = dunce::canonicalize(&config)
             .with_context(|| format!("cannot resolve the shunt config {}", config.display()))?;
         check_adoptable(&config)?;
         Ok(Self {
@@ -146,7 +146,10 @@ impl GatewayRecord {
         {
             return Ok(None);
         }
-        let record: Self = read_toml_file(&path)?;
+        let mut record: Self = read_toml_file(&path)?;
+        // A record an older clauth wrote holds Windows' verbatim `\\?\` form;
+        // load it as the plain path every surface shows.
+        record.config = dunce::simplified(&record.config).to_path_buf();
         check_record(&record)
             .with_context(|| format!("invalid gateway record {}", path.display()))?;
         Ok(Some(record))
@@ -5056,7 +5059,10 @@ fn another_owners_login(
     Ok(None)
 }
 
-/// `path` canonicalized; `None` when it does not exist.
+/// `path` canonicalized; `None` when it does not exist. `std`, never `dunce`:
+/// these paths are only compared with each other, and on Windows `dunce`
+/// keeps the `\\?\` prefix past 260 characters but drops it below, so a long
+/// source would stop matching a short `~/.clauth`.
 fn canonical(path: &Path) -> Result<Option<PathBuf>> {
     match std::fs::canonicalize(path) {
         Ok(path) => Ok(Some(path)),

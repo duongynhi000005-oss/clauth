@@ -23,6 +23,10 @@ toml = "1.1.6"
 toml_edit = "0.25.15"
 anyhow = "1.0.104"
 dirs = "7.0.0"
+# Windows `std::fs::canonicalize` returns a `\\?\` verbatim path; `dunce`
+# strips that prefix wherever a plain form exists, so the adopted shunt config
+# is stored and shown as its plain drive path (a no-op elsewhere).
+dunce = "1.0.5"
 ureq = "3.4.2"
 self-replace = "1.5.0"
 signal-hook = "0.4.4"

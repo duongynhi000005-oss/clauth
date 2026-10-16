@@ -109,6 +109,51 @@ fn the_record_refuses_a_config_it_cannot_edit_in_place() {
     }
 }
 
+/// `path` as `std::fs::canonicalize` resolves it, less a `\\?\` verbatim
+/// prefix: the plain drive path a Windows canonical path stands for (a no-op
+/// elsewhere, where canonicalize never adds one).
+fn plain_canonical(path: &Path) -> String {
+    let resolved = fs::canonicalize(path).expect("canonical");
+    let resolved = resolved.to_str().expect("utf-8 path").to_string();
+    resolved
+        .strip_prefix(r"\\?\")
+        .map_or(resolved.clone(), str::to_string)
+}
+
+/// Windows canonicalizes to a `\\?\C:\…` verbatim path, which the record, the
+/// `status.json` slot, the card and every error would then show; the record
+/// holds the plain path that verbatim form stands for.
+#[test]
+fn an_adopted_record_holds_the_plain_config_path() {
+    let home = HomeSandbox::new();
+    let record = adopted(&home);
+    let plain = plain_canonical(&home.home().join("etc").join("shunt.toml"));
+    assert_eq!(record.config().to_str(), Some(plain.as_str()));
+}
+
+/// A record an older clauth wrote holds the verbatim form; it loads as the
+/// plain path, so no surface shows the prefix before a fresh adoption.
+#[cfg(windows)]
+#[test]
+fn a_record_holding_a_verbatim_config_path_loads_plain() {
+    let home = HomeSandbox::new();
+    let config = home.home().join("etc").join("shunt.toml");
+    write(&config, "[server]\n");
+    let verbatim = fs::canonicalize(&config).expect("canonical");
+    let verbatim = verbatim.to_str().expect("utf-8 path");
+    assert!(
+        verbatim.starts_with(r"\\?\"),
+        "std canonicalizes to the verbatim form here: {verbatim}"
+    );
+    let path = record_path().expect("record path");
+    write(&path, &format!("config = {}\n", toml_edit::value(verbatim)));
+    let record = GatewayRecord::load().expect("load").expect("a record");
+    assert_eq!(
+        record.config().to_str(),
+        Some(plain_canonical(&config).as_str())
+    );
+}
+
 /// An adopt refuses a config the gateway could never run: on top of the
 /// record's own checks, one that does not parse as TOML, which a bind from
 /// the env would otherwise let through. A config that parses is adoptable.
@@ -121,7 +166,7 @@ fn an_adopt_refuses_a_config_that_does_not_parse() {
         adoptable_record(config.clone())
             .expect("adoptable")
             .config(),
-        std::fs::canonicalize(&config).expect("canonical")
+        dunce::canonicalize(&config).expect("canonical")
     );
 
     write(&config, "a = 1\n[server\n");
@@ -4941,6 +4986,42 @@ fn a_named_codex_file_moves_in_unless_it_is_another_owners_login() {
                 .exists()
         );
     }
+}
+
+/// A store source under `~/.clauth` stays clauth's own however long its path:
+/// `dunce` keeps a canonical path's `\\?\` prefix past 260 characters and
+/// drops it below, so both sides of the prefix check must resolve the same
+/// way or a clauth file reads as foreign and moves.
+#[cfg(windows)]
+#[test]
+fn a_long_store_source_under_clauth_stays_clauth_owned() {
+    let home = HomeSandbox::new();
+    let mut path = home.home().join(".clauth").join("codex");
+    for segment in ["a", "b", "c", "d", "e"] {
+        path.push(segment.repeat(60));
+    }
+    path.push("auth.json");
+    assert!(
+        path.as_os_str().len() > 260,
+        "the source path is long: {path:?}"
+    );
+    write(&path, "clauth-profile-login");
+    let record = with_env_file(&home, &format!("CODEX_AUTH_FILE={}\n", quoted(&path)));
+
+    assert_eq!(
+        move_stores(&record).map_err(|e| format!("{e:#}")),
+        Ok(StoreMove {
+            moved: Vec::new(),
+            kept: vec![KeptFile::At {
+                path: path.clone(),
+                reason: KeptReason::ClauthOwned,
+            }],
+        })
+    );
+    assert_eq!(
+        fs::read_to_string(&path).expect("still there"),
+        "clauth-profile-login"
+    );
 }
 
 /// A hard link onto the codex CLI's login is another owner's login even though

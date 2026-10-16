@@ -410,6 +410,31 @@ fn without_a_supervisor_the_slot_reads_the_record_alone() {
     );
 }
 
+/// The slot's `config` (the `status.json` bytes the `shunt` card reads) names
+/// the plain path, never the `\\?\C:\…` verbatim form Windows canonicalizes
+/// to.
+#[test]
+fn the_slot_names_the_plain_config_path() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join("etc");
+    fs::create_dir_all(&dir).expect("etc");
+    let config = dir.join("shunt.toml");
+    fs::write(&config, "[server]\n").expect("config");
+    let record = GatewayRecord::new(config.clone()).expect("adoptable");
+    GatewayRecord::update(|slot| {
+        *slot = Some(record);
+        Ok(())
+    })
+    .expect("save");
+    let resolved = fs::canonicalize(&config).expect("canonical");
+    let resolved = resolved.to_str().expect("utf-8 path").to_string();
+    let plain = resolved
+        .strip_prefix(r"\\?\")
+        .map_or(resolved.clone(), str::to_string);
+
+    assert_eq!(unsupervised_slot().config.as_deref(), Some(plain.as_str()));
+}
+
 /// The gateway's log stays under the daemon's size cap on the supervisor's
 /// own cadence: a step trims an oversized `gateway.log` in place to its last
 /// whole lines within 1 MiB.

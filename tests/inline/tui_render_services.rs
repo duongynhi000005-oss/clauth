@@ -354,6 +354,37 @@ fn the_shunt_detail_renders_every_set_field() {
     );
 }
 
+/// The card's `config` readout over a real adoption names the plain path,
+/// never the `\\?\C:\…` verbatim form Windows canonicalizes to.
+#[test]
+fn the_shunt_card_names_the_plain_config_path() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join("etc");
+    std::fs::create_dir_all(&dir).expect("etc");
+    let config = dir.join("shunt.toml");
+    std::fs::write(&config, "[server]\n").expect("config");
+    let record = crate::gateway::GatewayRecord::new(config.clone()).expect("adoptable");
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record);
+        Ok(())
+    })
+    .expect("save");
+    let resolved = std::fs::canonicalize(&config).expect("canonical");
+    let resolved = resolved.to_str().expect("utf-8 path").to_string();
+    let plain = resolved
+        .strip_prefix(r"\\?\")
+        .map_or(resolved.clone(), str::to_string);
+
+    let slot = crate::daemon::gateway::unsupervised_slot();
+    let card = crate::tui::app::shunt_check(&slot, false, None);
+    let line = format!("config: {plain}");
+    assert!(
+        card.detail.contains(&line),
+        "the card reads {line:?}: {:?}",
+        card.detail
+    );
+}
+
 /// The untrusted `/health` version's planted `ESC [2J` renders as its visible
 /// escape, pinned by equality on the rendered version row.
 #[test]
