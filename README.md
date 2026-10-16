@@ -113,7 +113,7 @@ clauth start --isolated personal -p < prompt.txt
 
 Every command and flag: [Quickstart](https://github.com/uwuclxdy/clauth/wiki/Quickstart#commands).
 
-The active profile shows in orange. Usage bars are cached locally, so they stay on screen even when the Anthropic API is rate-limited or offline. <kbd>←</kbd> <kbd>→</kbd> move between the eight tabs, <kbd>?</kbd> lists the keys for the tab you are on.
+The active profile shows in orange. Usage bars are cached locally, so they stay on screen even when the Anthropic API is rate-limited or offline. <kbd>←</kbd> <kbd>→</kbd> or <kbd>tab</kbd> / <kbd>⇧tab</kbd> move between the eight tabs, <kbd>⌥1</kbd>–<kbd>⌥9</kbd> jump straight to one, and <kbd>?</kbd> lists the keys for the tab you are on.
 
 | Tab | What it holds |
 |-----|---------------|
