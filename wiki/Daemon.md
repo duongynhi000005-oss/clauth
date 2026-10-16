@@ -187,6 +187,31 @@ Compare more than the modification time when you do. A daemon rewrites this file
     "since": "2026-09-07T18:02:11+00:00"
   },
   "proxies": [],
+  "tps": {
+    "version": 1,
+    "generated_at": "2026-09-07T19:04:39.123+00:00",
+    "total": {
+      "live": { "rate": 67.0, "speed": 92.0 },
+      "m5": { "rate": 58.1, "speed": 88.3 },
+      "h1": { "rate": 41.7, "speed": 75.9 }
+    },
+    "accounts": {
+      "kitty": {
+        "live": { "rate": 67.0, "speed": 92.0 },
+        "m5": { "rate": 58.1, "speed": 88.3 },
+        "h1": { "rate": 41.7, "speed": 75.9 }
+      }
+    },
+    "sessions": {
+      "abc123": {
+        "account": "kitty",
+        "live": { "rate": 67.0, "speed": 92.0 },
+        "m5": { "rate": 58.1, "speed": 88.3 },
+        "h1": { "rate": 41.7, "speed": 75.9 }
+      }
+    },
+    "age_secs": 1
+  },
   "profiles": [
     {
       "name": "kitty",
@@ -271,6 +296,10 @@ Compare more than the modification time when you do. A daemon rewrites this file
 | `proxies[].restarts`, `proxies[].last_exit` | `restarts` counts the restarts after an exit clauth did not ask for, since the daemon started; a stop clauth asked for (a row change, `disabled`) is not one. `last_exit` is how the last proxy process ended, `{ "code": integer \| null, "signal": integer \| null }` (`signal` always `null` on Windows), `null` before any has. |
 | `proxies[].reason` | Why the proxy cannot start or was stopped (`no_token`, `manifest_refused`, `misconfigured`, `contract_mismatch`), else `null`. |
 | `proxies[].since` | ISO-8601 UTC of the last change of `state`; `null` until a supervisor has set one. |
+| `tps` | Additive (schema stays `2`; absent from an older writer ⇒ `null`). The lease holder's token-speed cache minus its `days`, plus `age_secs`. `null` = no producer cache, a cache that does not parse, one written by a newer clauth, one whose `generated_at` does not parse or is in the future, or a feed republished outside the daemon. A cache older than 30 s still republishes here — the feed is a fact, not a liveness gate. The daemon is the slot's only republisher: the daemonless republish (a switch outside the daemon backdating the stamp) publishes `tps: null` rather than a frozen `age_secs`. |
+| `tps.version`, `tps.generated_at` | `version` is the cache's, currently `1`. `generated_at` is the cache's own last-write stamp, ISO-8601 UTC `+00:00` with milliseconds — the producer's last WRITE, not its last tick, since the write is throttled. |
+| `tps.total`, `tps.accounts`, `tps.sessions` | The cache's figures. Each of `total`, every `accounts[name]` and every `sessions[sid]` is `{ "live": Figure, "m5": Figure, "h1": Figure }`, and a `Figure` is `{ "rate": float, "speed": float \| null }` — the 10 s / 5 min / 1 h windows. `total` is the fleet (every session); `accounts` lists each account that spent output in the last hour (an unattributed session lands in `total` and `sessions`, never in `accounts`); `sessions` lists each session with output in the last hour, its `account` the session's current member, or `null` when clauth could not resolve one. `sessions` is keyed by Claude Code session id; a subagent's transcript counts under its parent session. |
+| `tps.age_secs` | The cache's age in whole seconds (`generated_at` → now), so a reader dates the figures the same way it dates the feed. |
 | `profiles[].provider` | One of four cases: `"anthropic"` for a profile with no endpoint of its own (the managed `base_url` is unset), the recognised provider's display name (`"DeepSeek"`, `"Z.ai"`, …) for a typed third-party account, and `"generic"` for every other endpoint: an api-key account no provider recognises (litellm, LM Studio, ollama, a LAN gateway). Keyed on the managed `base_url` alone, so the label never contradicts the `base_url` published beside it; an operator-authored `ANTHROPIC_BASE_URL` reroutes requests without changing it. A codex entry publishes `"openai"`, with `base_url` `null`. |
 | `profiles[].harness` | Additive (absent ⇒ `"claude"`). `"claude"` or `"codex"`: which roster the entry comes from. Codex entries are appended after every Claude Code one, so a reader that predates the field still reads the prefix it always read. Names are unique across both rosters, so `name` alone still identifies an entry. |
 | `profiles[].tier` | Plan label (`"Max 5x"`, `"Pro"`, `"Free"`…), `null` when nothing on disk claims a tier. Opaque display string, so never switch on it. A **canceled** subscription reports its real post-cancellation tier (`"Free"`) and never the word `canceled`: cancellation is a status, not a tier, and no field here exposes it. `null` is rarer than it looks: a token-only account resolves its tier from the OAuth `subscription_type` alone, Free included. A codex entry carries the ChatGPT plan word the account reports, lowercased (`"plus"`, `"pro"`), from its last usage poll or, before any, from the login itself; never a `Claude` label. |
@@ -288,12 +317,12 @@ Compare more than the modification time when you do. A daemon rewrites this file
 
 ### Evolution rule (the load-bearing part)
 
-- **Writers**: additive only under the same `schema`: new fields may appear, existing fields never change type/meaning. A breaking change bumps `schema`. The codex fields (`active_codex_profile`, `codex_fallback_chain`, `codex_wrap_off`, `clauth_version`, `profiles[].harness`, the `"unknown"` `auth_status` value and the codex entries themselves) are additive under schema `2`: a reader that knows none of them sees the Claude Code feed alone, with the codex entries trailing the array. The `gateway` object and every `gateway.state` value are additive under schema `2` the same way, and the `proxies` array with every `proxies[].state` value is additive under schema `2` the same way again.
+- **Writers**: additive only under the same `schema`: new fields may appear, existing fields never change type/meaning. A breaking change bumps `schema`. The codex fields (`active_codex_profile`, `codex_fallback_chain`, `codex_wrap_off`, `clauth_version`, `profiles[].harness`, the `"unknown"` `auth_status` value and the codex entries themselves) are additive under schema `2`: a reader that knows none of them sees the Claude Code feed alone, with the codex entries trailing the array. The `gateway` object and every `gateway.state` value are additive under schema `2` the same way, the `proxies` array with every `proxies[].state` value is additive under schema `2` the same way again, and the `tps` object is additive under schema `2` the same way once more.
 - **Readers**: ignore unknown fields; default absent optional fields (absent `auth_status` ⇒ `"ok"`, absent `harness` ⇒ `"claude"`); refuse only on `schema` greater than what they know, showing "daemon newer than me" rather than garbage.
 
 ## `clauth status --json`
 
-Same schema, produced single-shot from the on-disk caches with no daemon and no network fetch: `pending_switch` is always `null`, `generated_at` is the print stamp, and freshness/next-refresh derive from each profile's own cache (the OAuth body's `fetched_at` stamp when it carries one, the cache mtime otherwise). One code path builds both (`daemon::status_json::build_status`), so the key SHAPE cannot drift between the daemon feed and the CLI snapshot. Values can: the single-shot form derives `fetch_status` from the caches, so a profile the live daemon shows as `Failed` or `RateLimited` reads as `Cached` here at the same instant. Poll the feed, not the CLI, when the fetch outcome matters. The codex entries and the top-level codex slots are built from the same on-disk files the same way on both paths; nothing live feeds them.
+Same schema, produced single-shot from the on-disk caches with no daemon and no network fetch: `pending_switch` is always `null`, `generated_at` is the print stamp, and freshness/next-refresh derive from each profile's own cache (the OAuth body's `fetched_at` stamp when it carries one, the cache mtime otherwise). One code path builds both (`daemon::status_json::build_status`), so the key SHAPE cannot drift between the daemon feed and the CLI snapshot. Values can: the single-shot form derives `fetch_status` from the caches, so a profile the live daemon shows as `Failed` or `RateLimited` reads as `Cached` here at the same instant. Poll the feed, not the CLI, when the fetch outcome matters. The codex entries and the top-level codex slots are built from the same on-disk files the same way on both paths; nothing live feeds them. The `tps` slot is the one half that differs by path: the single-shot CLI reads it straight off the producer cache, while the daemonless REPUBLISH of the file (a switch outside the daemon backdating the stamp) publishes it as `null`, since the daemon is its only republisher.
 
 `"AuthExpired"` is the one exception, exact on both paths. Single-shot it comes from a durable per-profile record written when a fetch died on a credential that cannot self-heal. That record applies only as long as the credential recorded with it still matches the one on disk, so a re-login retires it with no daemon and no timer involved. A profile the daemon has never fetched carries no record and reads `null`.
 

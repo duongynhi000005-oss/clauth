@@ -72,7 +72,7 @@ The environment is scrubbed before the spawn: `CODEX_HOME`, `CODEX_SQLITE_HOME`,
 
 `--with-fallback` is refused: `--with-fallback is not available on a codex profile: codex reads auth.json once at start, so a chain lands at the NEXT start, not mid-session — start without the flag`. `--explain` prints `would start on 'work'` and exits. `--auto` walks the Claude Code chain and never lands on a codex profile. A chain clauth has declared dead is refused before anything is built ([below](Codex#when-a-chain-dies)). ``failed to launch codex — is the `codex` CLI installed and on PATH?`` is what a missing `codex` looks like.
 
-Inside the session, `clauth which` prints the profile name, and `clauth which --json` answers `{"profile": "work", "source": "codex_home", "harness": "codex", ...}`.
+Inside the session, `clauth which` prints the profile name, and `clauth which --json` answers `{"profile": "work", "source": "codex_home", "harness": "codex", "tps": null, ...}` — `tps` stays `null` because token speed reads Claude Code transcripts, never codex's.
 
 ## Switch
 

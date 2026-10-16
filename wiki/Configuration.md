@@ -251,6 +251,8 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   tls.json                 # REST API certificate directory, written on the first `--listen` start
   session_profiles.json    # which account each Claude Code session ran on
   token_ledger.json        # the per-day token ledger behind the Tokens tab
+  tps_cache.json           # the lease holder's live token-speed cache, republished into status.json's `tps` slot (0600)
+  token_speed.json         # the per-day speed ledger behind the token-speed surfaces, written by the producer alone (0600); one that does not parse is renamed token_speed.json.corrupt-<epoch_ms> (0600) before the next save, and one clauth cannot read, or one a newer clauth wrote, is never saved over
   clauth.log, daemon.log   # event lines from the TUI and the daemon
   clauthd.pid              # the running daemon's process id
   gateway.toml             # the managed shunt gateway: its adopted config, optional binary and env file, the disabled flag (0600)
