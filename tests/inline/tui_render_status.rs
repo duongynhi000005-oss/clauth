@@ -371,3 +371,24 @@ fn the_status_detail_desktop_rows_measure_by_cells() {
         "status detail rows at 160 cols"
     );
 }
+
+/// A resolved incident under a minute reads `lasted 1m`, never `lasted 45s`
+/// (the status caller floors the span at 60 s).
+#[test]
+fn a_sub_minute_resolved_incident_reads_one_minute() {
+    let started_ms = 1_780_740_881_000u64;
+    let incident = Incident {
+        id: "sub-minute".into(),
+        title: "brief blip".into(),
+        link: "https://example.com/".into(),
+        phase: UpdatePhase::Resolved,
+        impact: Impact::None,
+        started_ms,
+        resolved_ms: Some(started_ms + 45_000),
+        components: vec![],
+        updates: vec![],
+    };
+    let lines = detail_lines(&incident, 160);
+    let duration = lines[0].spans.last().expect("a duration span");
+    assert_eq!(duration.content.as_ref(), "lasted 1m");
+}

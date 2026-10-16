@@ -1405,7 +1405,7 @@ fn login_labels_read_the_same_for_every_flow() {
     assert_eq!(text(&snap, ConfigRow::Login), "re-login");
 }
 
-/// cloudy-tui "Keys and commands inside prose" on the token row: both fix
+/// Keys and commands inside prose on the token row: both fix
 /// lines' commands render ACCENT, never bold.
 #[test]
 fn session_token_fix_lines_style_their_commands() {

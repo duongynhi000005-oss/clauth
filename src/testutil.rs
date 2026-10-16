@@ -1682,7 +1682,7 @@ pub(crate) fn lines_buffer(
 }
 
 /// Asserts how `phrase` renders where its `part` is a key or a typed command
-/// in prose (cloudy-tui "Keys and commands inside prose"): every non-space
+/// in prose: every non-space
 /// cell of `part` is `ACCENT`, bold for a key and not for a command, and no
 /// other non-space cell of `phrase` is `ACCENT`.
 pub(crate) fn assert_prose_part(

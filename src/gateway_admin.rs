@@ -4,20 +4,13 @@
 //! rewriting the adopted config's unchanged bytes through
 //! [`gateway::write_checked`] (shunt's watcher reloads and re-reads the
 //! `${file:}` admin key) and retrying; a second 401, or a poll that never
-//! clears, is [`ShuntAdminError::RestartRequired`]. No caller in the TUI yet:
-//! the Overview shunt section, a later task, is the first.
+//! clears, is [`ShuntAdminError::RestartRequired`]. The Overview shunt section
+//! is the listing/remove/refresh caller; add and complete stay uncalled until
+//! the Setup `+ new` form lands.
 //!
 //! No credential byte, response body or header value reaches an error here:
 //! [`ShuntAdminError`] carries clauth's own sentence per status, and the pasted
 //! login code is relayed verbatim into the request body and never stored.
-
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller in the TUI yet: the Overview shunt section is the first (the E1 precedent, an engine commit with no caller)"
-    )
-)]
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -56,6 +49,13 @@ impl PoolFamily {
     /// The add body: claude sends `mode: "oauth"` always (refreshable,
     /// usage-readable), never shunt's `setup_token` default; codex and
     /// antigravity take a name alone.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the add path is a later task (B3): no caller until the Setup + new form"
+        )
+    )]
     fn add_body(self, name: &ShuntAccountName) -> String {
         match self {
             PoolFamily::Claude => {
@@ -194,6 +194,13 @@ impl ShuntAccountName {
 // ── outcomes ────────────────────────────────────────────────────────────────
 
 /// A started add: the authorize URL the TUI opens in the browser.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the add path is a later task (B3): no caller until the Setup + new form"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AddOutcome {
     pub(crate) authorize_url: String,
@@ -201,6 +208,13 @@ pub(crate) struct AddOutcome {
 
 /// A completed login. shunt's `message` sentence is dropped: a response body
 /// never reaches a user surface.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the add path is a later task (B3): no caller until the Setup + new form"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompleteOutcome {
     pub(crate) live: bool,
@@ -371,6 +385,13 @@ impl std::error::Error for ShuntAdminError {
 /// shunt's own bound on the code exchange, `COMPLETION_EXCHANGE_TIMEOUT`
 /// (`src/admin/session.rs:238` @8ed21d0): each complete handler awaits it and
 /// answers 502 past it, so a client bound must exceed it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the add path is a later task (B3): the complete route's bound stays for its doc"
+    )
+)]
 const COMPLETION_EXCHANGE_TIMEOUT_SECS: u64 = 30;
 
 /// The complete route's response bound, above
@@ -472,6 +493,13 @@ fn recorded_agent_bounds() -> Vec<(AdminRoute, Duration)> {
 // ── the operations ──────────────────────────────────────────────────────────
 
 /// Start a claude, codex or antigravity add and return the authorize URL.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the add path is a later task (B3): no caller until the Setup + new form"
+    )
+)]
 pub(crate) fn add_pool_account(
     record: &GatewayRecord,
     family: PoolFamily,
@@ -496,6 +524,13 @@ pub(crate) fn add_pool_account(
 
 /// Finish an add with the pasted code, relayed verbatim (clauth never parses
 /// or stores it).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the add path is a later task (B3): no caller until the Setup + new form"
+    )
+)]
 pub(crate) fn complete_pool_account(
     record: &GatewayRecord,
     family: PoolFamily,
@@ -821,11 +856,25 @@ impl Drop for PollRequestOverride {
 
 // ── wire shapes ─────────────────────────────────────────────────────────────
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the add path is a later task (B3): no caller until the Setup + new form"
+    )
+)]
 #[derive(Deserialize)]
 struct AddOutcomeWire {
     authorize_url: String,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the add path is a later task (B3): no caller until the Setup + new form"
+    )
+)]
 #[derive(Deserialize)]
 struct CompleteOutcomeWire {
     live: bool,

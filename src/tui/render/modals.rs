@@ -988,7 +988,7 @@ fn draw_token_picker(frame: &mut Frame<'_>, area: Rect, form: &TokenPickerForm) 
 }
 
 /// The picker's first-class `+ new` row: `ACCENT` at rest, `ACCENT + bold`
-/// while selected (the `+ new` row's color is its identity, per cloudy-tui).
+/// while selected (the `+ new` row's color is its identity).
 fn new_profile_row(selected: bool) -> Line<'static> {
     let arrow = if selected {
         Span::styled("\u{276f} ", theme::accent().bold())

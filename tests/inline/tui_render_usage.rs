@@ -3502,7 +3502,7 @@ fn the_note_slot_scrolls_the_draft_to_keep_the_caret_visible() {
     assert_eq!(caret.y, 4, "the caret parks on the inner bottom row");
 }
 
-/// cloudy-tui "Keys and commands inside prose" on the Usage tab: the auth-broken
+/// Keys and commands inside prose on the Usage tab: the auth-broken
 /// fix's `clauth login <name>`, the console-login messages' `clauth login` and
 /// the empty notes row's `n`, each in its prose's own line.
 #[test]

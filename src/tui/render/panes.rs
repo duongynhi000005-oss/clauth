@@ -677,7 +677,7 @@ pub(super) struct ScrolledDraw {
     pub(crate) total: usize,
 }
 
-/// A pane note pinned under a scrolled form (cloudy-tui "Pinned footnote"):
+/// A pane note pinned under a scrolled form:
 /// one blank margin row above the wrapped note, the scroll area shrunk by the
 /// footnote's height plus that margin, the overflow scrollbar spanning the
 /// scroll area only. `footnote` is the raw one-fragment text; it wraps at the

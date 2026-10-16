@@ -1,5 +1,5 @@
-//! Keys and typed commands inside TUI prose (cloudy-tui "Keys and commands
-//! inside prose"): copy marks them with [`key`] / [`cmd`], every render site
+//! Keys and typed commands inside TUI prose:
+//! copy marks them with [`key`] / [`cmd`], every render site
 //! turns the marked string into spans through [`spans`] or [`wrap`].
 //!
 //! The markers are private-use code points, so no literal copy can hold one:

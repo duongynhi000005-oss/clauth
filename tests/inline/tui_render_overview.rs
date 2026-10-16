@@ -2865,8 +2865,8 @@ fn deepseek_amount_w_spans_all_currencies() {
 
 /// `c` cycles the Overview's harness filter, and `label_name` names the
 /// harness the panel is showing for the left meta slot beside the bare
-/// `ACCOUNTS` title. Nameless while both show, so the unfiltered panel renders
-/// no left slot.
+/// `ACCOUNTS` title. Nameless while every section shows, so the unfiltered
+/// panel renders no left slot. Four states: all → claude → codex → shunt.
 #[test]
 fn the_harness_filter_cycles_and_names_itself() {
     use crate::tui::app::HarnessFilter;
@@ -2887,7 +2887,17 @@ fn the_harness_filter_cycles_and_names_itself() {
     assert_eq!(codex.label_name(), Some("codex"));
     assert!(codex.shows_codex() && !codex.shows_claude());
 
-    assert_eq!(codex.next(), HarnessFilter::All, "three states, then back");
+    let shunt = codex.next();
+    assert_eq!(
+        shunt.label_name(),
+        Some("shunt"),
+        "the fourth state names the shunt pool"
+    );
+    assert!(
+        !shunt.shows_claude() && !shunt.shows_codex(),
+        "the shunt filter hides the claude and codex rows"
+    );
+    assert_eq!(shunt.next(), HarnessFilter::All, "four states, then back");
     assert!(HarnessFilter::All.shows_claude() && HarnessFilter::All.shows_codex());
 }
 
@@ -2939,6 +2949,13 @@ fn the_accounts_title_row_carries_the_harness_filter() {
         accounts_title_row(&app, 25),
         "╭─ ACCOUNTS ─ codex ────╮",
         "the codex filter names the harness it shows"
+    );
+
+    app.harness_filter = HarnessFilter::Codex.next();
+    assert_eq!(
+        accounts_title_row(&app, 25),
+        "╭─ ACCOUNTS ─ shunt ────╮",
+        "the shunt filter names the pool it shows"
     );
 }
 
@@ -4030,24 +4047,700 @@ fn the_last_codex_row_and_thumb_follow_a_short_viewport() {
     assert_eq!(accounts_scrollbar_column(&app, 80, 8), "     ");
 }
 
-/// cloudy-tui "Keys and commands inside prose": the codex section's heading
-/// names its switch command in ACCENT, never bold, the rest of the line dim.
+/// The accounts list's rows with the panel border and padding cut off and
+/// trailing blanks trimmed, so a heading line reads as its own text.
+fn accounts_list_lines(app: &App, width: u16, height: u16) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), app, &app.readings_snapshot()))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())
+        .iter()
+        .map(|row| {
+            row.trim_start_matches('│')
+                .trim_end_matches('│')
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The codex section's heading is the harness name alone (cloudy
+/// 2026-10-14: the `— switch with clauth <name>` tail is gone).
 #[test]
-fn the_codex_heading_styles_its_switch_command() {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
+fn the_codex_heading_is_the_harness_name_alone() {
     let _home = crate::testutil::HomeSandbox::new();
-    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     crate::testutil::write_codex_roster(&["cx1"]);
     let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
     let app = App::new(config);
-    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
-    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
-    crate::testutil::assert_prose_part(
-        term.backend().buffer(),
-        "codex — switch with clauth <name>",
-        "clauth <name>",
-        false,
+    let lines = accounts_list_lines(&app, 100, 12);
+    assert!(
+        lines.iter().any(|line| line == "codex"),
+        "a heading line reads `codex` alone: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("switch with")),
+        "no switch hint on the heading: {lines:?}"
+    );
+}
+
+// ── the shunt pool section (B2; design record "Pool rows") ─────────────────
+
+/// A pool account with every flag clear and no readings: available, unpaused.
+fn pool_account(name: &str) -> crate::gateway_admin::PoolAccount {
+    crate::gateway_admin::PoolAccount {
+        name: name.to_string(),
+        available: true,
+        near_quota: false,
+        cooldown_secs_remaining: None,
+        needs_relogin: false,
+        paused: false,
+        disabled: false,
+        utilization_5h: None,
+        reset_5h: None,
+        utilization_7d: None,
+        reset_7d: None,
+        plan: None,
+        status: None,
+    }
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs()
+}
+
+/// Three providers, five pool rows: `alpha` (readings, available), `beta`
+/// (needs a re-login), `cx-work` (cooling down 240 s), `spare` (paused), `k1`
+/// (kimi, no actions).
+fn sample_pool() -> crate::tui::app::ShuntPool {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    let now = now_epoch();
+    crate::tui::app::ShuntPool::Read(vec![
+        PoolProvider {
+            name: "claude-main".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![
+                PoolAccount {
+                    plan: Some("max".to_string()),
+                    utilization_5h: Some(0.12),
+                    reset_5h: Some(now + 3 * 3600),
+                    utilization_7d: Some(0.40),
+                    reset_7d: Some(now + 5 * 86_400),
+                    ..pool_account("alpha")
+                },
+                PoolAccount {
+                    available: false,
+                    needs_relogin: true,
+                    plan: Some("max".to_string()),
+                    ..pool_account("beta")
+                },
+            ],
+        },
+        PoolProvider {
+            name: "codex".to_string(),
+            auth: PoolAuth::Codex,
+            accounts: vec![
+                PoolAccount {
+                    available: false,
+                    cooldown_secs_remaining: Some(240),
+                    plan: Some("plus".to_string()),
+                    utilization_5h: Some(0.55),
+                    reset_5h: Some(now + 3600),
+                    ..pool_account("cx-work")
+                },
+                PoolAccount {
+                    available: false,
+                    paused: true,
+                    ..pool_account("spare")
+                },
+            ],
+        },
+        PoolProvider {
+            name: "kimi".to_string(),
+            auth: PoolAuth::Kimi,
+            accounts: vec![pool_account("k1")],
+        },
+    ])
+}
+
+/// One claude account plus [`sample_pool`], the pool read in.
+fn pool_app() -> App {
+    let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    app.shunt_pool = sample_pool();
+    app
+}
+
+/// Each provider in the listing gets one `shunt (<provider>)` section heading
+/// after the claude (and codex) rows, its accounts under it in listing order,
+/// and the title-right meta counts the pool rows.
+#[test]
+fn pool_rows_list_under_one_heading_per_provider() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = pool_app();
+    let lines = accounts_list_lines(&app, 100, 20);
+    let at = |pred: &dyn Fn(&str) -> bool, what: &str| {
+        lines
+            .iter()
+            .position(|line| pred(line))
+            .unwrap_or_else(|| panic!("{what} not drawn: {lines:?}"))
+    };
+    let order = [
+        at(&|l| l.contains("cl1"), "the claude row"),
+        at(&|l| l == "shunt (claude-main)", "the claude-main heading"),
+        at(&|l| l.contains("alpha"), "alpha"),
+        at(&|l| l.contains("beta"), "beta"),
+        at(&|l| l == "shunt (codex)", "the codex provider heading"),
+        at(&|l| l.contains("cx-work"), "cx-work"),
+        at(&|l| l.contains("spare"), "spare"),
+        at(&|l| l == "shunt (kimi)", "the kimi heading"),
+        at(&|l| l.contains("k1"), "k1"),
+    ];
+    assert!(
+        order.windows(2).all(|pair| pair[0] < pair[1]),
+        "claude rows, then each provider heading with its accounts: {lines:?}"
+    );
+    assert!(
+        accounts_title_row(&app, 60).ends_with(" 1 claude · 5 shunt ─╮"),
+        "the meta counts the five pool rows: {:?}",
+        accounts_title_row(&app, 60)
+    );
+}
+
+/// The foreground and modifiers of the first cell of the accounts-list line
+/// whose trimmed text is exactly `heading`, drawn with the Overview cursor on
+/// flat row `cursor`.
+fn heading_cell(
+    app: &mut App,
+    cursor: usize,
+    heading: &str,
+) -> (ratatui::style::Color, ratatui::style::Modifier) {
+    app.overview_cursor = cursor;
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), app, &app.readings_snapshot()))
+        .expect("draw");
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let (y, row) = rows
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.trim_start_matches('│').trim_end_matches('│').trim() == heading)
+        .unwrap_or_else(|| panic!("heading {heading:?} not drawn: {rows:?}"));
+    let x = row
+        .chars()
+        .position(|c| c != '│' && c != ' ')
+        .expect("a heading has text");
+    let cell = buf
+        .cell((
+            u16::try_from(x).expect("x fits"),
+            u16::try_from(y).expect("y fits"),
+        ))
+        .expect("cell in the buffer");
+    (cell.fg, cell.modifier)
+}
+
+/// The `codex` and every `shunt (<provider>)` heading render `TEXT_DIM + bold`
+/// at rest and `TEXT + bold` while the cursor rests on a row under it, the
+/// list section-header rule (cloudy 2026-10-15, over the mockup's plain dim);
+/// only the heading
+/// over the cursor lifts.
+#[test]
+fn a_section_heading_lifts_only_while_a_row_under_it_holds_the_cursor() {
+    use crate::tui::theme;
+    use ratatui::style::Modifier;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = pool_app();
+    // flat rows: cl1 0 · cx1 1 · alpha 2, beta 3 (claude-main) ·
+    // cx-work 4, spare 5 (codex) · k1 6 (kimi)
+    assert_eq!(app.main_items().len(), 7, "the fixture's flat rows");
+    let rest = (theme::text_dim_color(), Modifier::BOLD);
+    let lifted = (theme::text_color(), Modifier::BOLD);
+    let headings = [
+        "codex",
+        "shunt (claude-main)",
+        "shunt (codex)",
+        "shunt (kimi)",
+    ];
+    let cases: [(usize, Option<&str>); 6] = [
+        (0, None),
+        (1, Some("codex")),
+        (2, Some("shunt (claude-main)")),
+        (3, Some("shunt (claude-main)")),
+        (4, Some("shunt (codex)")),
+        (6, Some("shunt (kimi)")),
+    ];
+    for (cursor, lifted_heading) in cases {
+        for heading in headings {
+            let want = if Some(heading) == lifted_heading {
+                lifted
+            } else {
+                rest
+            };
+            assert_eq!(
+                heading_cell(&mut app, cursor, heading),
+                want,
+                "heading {heading:?} with the cursor on flat row {cursor}"
+            );
+        }
+    }
+}
+
+/// An unread pool's one heading has no row under it, so it stays at rest,
+/// `TEXT_DIM + bold`, wherever the cursor is.
+#[test]
+fn an_unread_pool_heading_rests_dim_and_bold() {
+    use crate::tui::theme;
+    use ratatui::style::Modifier;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    app.shunt_pool = crate::tui::app::ShuntPool::NotRead("the gateway did not answer".to_string());
+    assert_eq!(
+        heading_cell(&mut app, 0, "shunt — not read: the gateway did not answer"),
+        (theme::text_dim_color(), Modifier::BOLD)
+    );
+}
+
+/// At narrow widths, under the shunt filter, the pool band alone sizes the
+/// usage columns: a `73.42%` reading still renders whole and its `%` lines up
+/// with a `5%` one, where a column sized for `100%` would cut it.
+#[test]
+fn a_narrow_shunt_view_sizes_its_columns_for_the_pool_band() {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, _readings) = config_with(vec![profile("cl1", 12.0, 30.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    app.harness_filter = crate::tui::app::HarnessFilter::Shunt;
+    let now = now_epoch();
+    app.shunt_pool = crate::tui::app::ShuntPool::Read(vec![PoolProvider {
+        name: "p".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![
+            PoolAccount {
+                utilization_5h: Some(0.05),
+                reset_5h: Some(now + 3 * 3600),
+                utilization_7d: Some(0.05),
+                reset_7d: Some(now + 5 * 86_400),
+                ..pool_account("al")
+            },
+            PoolAccount {
+                utilization_5h: Some(0.7342),
+                reset_5h: Some(now + 3 * 3600),
+                utilization_7d: Some(0.7342),
+                reset_7d: Some(now + 5 * 86_400),
+                ..pool_account("be")
+            },
+        ],
+    }]);
+    for width in [34_u16, 45] {
+        // Untrimmed rows: the caret gutter keeps both rows' columns in step.
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 10))
+            .expect("terminal");
+        term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+            .expect("draw");
+        let lines = crate::testutil::buffer_rows(term.backend().buffer());
+        let row = |name: &str| {
+            lines
+                .iter()
+                .find(|line| {
+                    line.trim_start_matches('│')
+                        .trim_start_matches([' ', '❯'])
+                        .starts_with(&format!("{name} "))
+                })
+                .unwrap_or_else(|| panic!("{name} not drawn at {width}: {lines:?}"))
+                .clone()
+        };
+        let first_percent = |line: &str| line.chars().position(|c| c == '%');
+        let (al, be) = (row("al"), row("be"));
+        assert!(
+            be.contains("73.42%"),
+            "the wide reading renders whole at {width}: {be:?}"
+        );
+        assert_eq!(
+            first_percent(&al),
+            first_percent(&be),
+            "the band's `%` signs align at {width}:\n{al:?}\n{be:?}"
+        );
+    }
+}
+
+/// The pool rows are a band of their own in the usage columns, like the codex
+/// rows: each reading is left-padded to the band's widest, so a `5%` and a
+/// `73.42%` pool reading end their `%` in the same column, in the 5h and the 7d
+/// column alike, beside a claude row whose own readings stay short.
+#[test]
+fn pool_readings_align_their_percent_signs_within_their_band() {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, _readings) = config_with(vec![profile("cl1", 12.0, 30.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    let now = now_epoch();
+    app.shunt_pool = crate::tui::app::ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![
+            PoolAccount {
+                utilization_5h: Some(0.05),
+                reset_5h: Some(now + 3 * 3600),
+                utilization_7d: Some(0.05),
+                reset_7d: Some(now + 5 * 86_400),
+                ..pool_account("alpha")
+            },
+            PoolAccount {
+                utilization_5h: Some(0.7342),
+                reset_5h: Some(now + 3 * 3600),
+                utilization_7d: Some(0.7342),
+                reset_7d: Some(now + 5 * 86_400),
+                ..pool_account("beta")
+            },
+        ],
+    }]);
+    let lines = accounts_list_lines(&app, 140, 12);
+    let row = |name: &str| {
+        lines
+            .iter()
+            .find(|line| line.contains(name))
+            .unwrap_or_else(|| panic!("{name} not drawn: {lines:?}"))
+            .clone()
+    };
+    let percents = |line: &str| -> Vec<usize> {
+        line.chars()
+            .enumerate()
+            .filter(|(_, c)| *c == '%')
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let (alpha, beta) = (row("alpha"), row("beta"));
+    assert!(
+        beta.contains("73.42%"),
+        "the wide reading renders whole: {beta:?}"
+    );
+    assert_eq!(percents(&alpha).len(), 2, "two readings on {alpha:?}");
+    assert_eq!(
+        percents(&alpha),
+        percents(&beta),
+        "the band's `%` signs align:\n{alpha:?}\n{beta:?}"
+    );
+}
+
+/// A pool row carries its state only through cues the claude and codex rows
+/// already use: the broken-login glyph in DANGER before a name that needs a
+/// re-login, a whole row dimmed while paused, a cooldown's remaining time in
+/// the timer slot in WARNING; no status word anywhere, the bars for readings.
+#[test]
+fn pool_row_status_rides_the_existing_row_cues() {
+    use crate::tui::theme;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let app = pool_app();
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+        .expect("draw");
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+
+    let relogin =
+        crate::testutil::needle_cells(buf, &format!("{} beta", theme::dead_credential_glyph()))
+            .unwrap_or_else(|| panic!("beta carries the broken-login glyph: {rows:?}"));
+    assert_eq!(
+        relogin[0].fg,
+        theme::danger().fg.expect("danger color"),
+        "the glyph is DANGER"
+    );
+
+    let spare = crate::testutil::needle_cells(buf, "spare").expect("spare drawn");
+    assert!(
+        spare
+            .iter()
+            .all(|cell| cell.fg == theme::dim().fg.expect("dim color")),
+        "a paused account's name dims like a disabled claude account"
+    );
+
+    let cx_row = rows
+        .iter()
+        .find(|row| row.contains("cx-work"))
+        .expect("cx-work drawn");
+    assert!(
+        cx_row.contains(" 4m "),
+        "the cooldown's 240 s reads `4m` in the timer slot: {cx_row:?}"
+    );
+    let cooldown = crate::testutil::needle_cells(buf, "4m").expect("cooldown drawn");
+    assert!(
+        cooldown
+            .iter()
+            .all(|cell| cell.fg == theme::warning().fg.expect("warning color")),
+        "the cooldown is WARNING"
+    );
+
+    let alpha_row = rows
+        .iter()
+        .find(|row| row.contains("alpha"))
+        .expect("alpha drawn");
+    assert!(
+        alpha_row.contains("12%") && alpha_row.contains("40%") && alpha_row.contains("max"),
+        "alpha shows its plan and both readings as percentages: {alpha_row:?}"
+    );
+
+    for word in [
+        "relogin",
+        "cooling",
+        "paused",
+        "disabled",
+        "quota",
+        "available",
+    ] {
+        assert!(
+            !rows.iter().any(|row| row.contains(word)),
+            "no status word `{word}` on any row: {rows:?}"
+        );
+    }
+}
+
+/// A listing that cannot be read names no provider: one resting heading
+/// carries the reason, no pool rows, and the meta counts no shunt term.
+#[test]
+fn an_unread_pool_is_one_heading_with_its_reason() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    app.shunt_pool = crate::tui::app::ShuntPool::NotRead("the gateway is not running".to_string());
+    let lines = accounts_list_lines(&app, 100, 12);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("shunt"))
+            .collect::<Vec<_>>(),
+        vec!["shunt — not read: the gateway is not running"],
+        "one heading with the reason, no provider headings: {lines:?}"
+    );
+    assert!(
+        accounts_title_row(&app, 60).ends_with(" 1 claude ─╮"),
+        "no shunt term while the pool is not read: {:?}",
+        accounts_title_row(&app, 60)
+    );
+}
+
+/// Wire strings on a pool row (account name, plan, provider) reach the screen
+/// escaped, as the heading, menu, confirm and toasts already escape them: no
+/// bidi or control symbol lands in a cell.
+#[test]
+fn pool_names_off_the_wire_render_escaped() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_app();
+    if let crate::tui::app::ShuntPool::Read(providers) = &mut app.shunt_pool {
+        providers[0].name = "pro\u{202e}vider".to_string();
+        providers[0].accounts[0].name = "al\u{202e}pha".to_string();
+        providers[0].accounts[0].plan = Some("m\u{202e}x".to_string());
+    }
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+        .expect("draw");
+    let raw: Vec<String> = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .filter(|s| s.contains('\u{202e}'))
+        .collect();
+    assert!(
+        raw.is_empty(),
+        "a raw bidi symbol reached the buffer: {raw:?}"
+    );
+}
+
+/// The running pool row shows the braille spinner in its marker slot.
+#[test]
+fn a_running_pool_row_shows_the_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_app();
+    app.pool_mutation_row = Some((
+        crate::gateway_admin::PoolFamily::Claude,
+        crate::gateway_admin::ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let alpha_row = rows
+        .iter()
+        .find(|row| row.contains("alpha"))
+        .expect("alpha drawn");
+    assert!(
+        alpha_row.contains("⠋"),
+        "the running row shows the braille spinner: {alpha_row:?}"
+    );
+}
+
+/// The spinner keys on the account's `(family, name)`, never the row index, so
+/// a reorder under a running mutation cannot move it onto another account.
+#[test]
+fn the_spinner_follows_the_account_when_the_listing_reorders() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_app();
+    app.pool_mutation_row = Some((
+        crate::gateway_admin::PoolFamily::Claude,
+        crate::gateway_admin::ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    if let crate::tui::app::ShuntPool::Read(providers) = &mut app.shunt_pool {
+        providers[0].accounts.swap(0, 1);
+    }
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let alpha_row = rows
+        .iter()
+        .find(|row| row.contains("alpha"))
+        .expect("alpha drawn");
+    let beta_row = rows
+        .iter()
+        .find(|row| row.contains("beta"))
+        .expect("beta drawn");
+    assert!(
+        alpha_row.contains("⠋"),
+        "the spinner follows alpha across the reorder: {alpha_row:?}"
+    );
+    assert!(
+        !beta_row.contains("⠋"),
+        "the spinner does not land on beta (the old index): {beta_row:?}"
+    );
+}
+
+/// A selected paused pool row keeps the current-row bold over its dim color,
+/// the claude row's `bold_when` promotion.
+#[test]
+fn a_selected_paused_pool_row_keeps_the_current_row_bold() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = pool_app();
+    app.overview_cursor = 4;
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+        .expect("draw");
+    let spare =
+        crate::testutil::needle_cells(term.backend().buffer(), "spare").expect("spare drawn");
+    assert!(
+        spare
+            .iter()
+            .any(|cell| cell.modifier.contains(Modifier::BOLD)),
+        "a selected paused row's label takes the current-row bold: {:?}",
+        spare.iter().map(|cell| cell.modifier).collect::<Vec<_>>()
+    );
+}
+
+/// A sub-minute cooldown reads its seconds, the arm the shared
+/// `duration_label` gained when the pool's formatter and the status feed's
+/// merged.
+#[test]
+fn a_sub_minute_cooldown_reads_seconds() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_app();
+    if let crate::tui::app::ShuntPool::Read(providers) = &mut app.shunt_pool {
+        providers[0].accounts[0].cooldown_secs_remaining = Some(45);
+    }
+    let lines = accounts_list_lines(&app, 100, 20);
+    assert!(
+        lines.iter().any(|line| line.contains("45s")),
+        "a 45 s cooldown reads `45s` in the timer slot: {lines:?}"
+    );
+}
+
+/// No adopted gateway: no shunt section at all.
+#[test]
+fn no_adopted_gateway_draws_no_shunt_section() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    app.shunt_pool = crate::tui::app::ShuntPool::Absent;
+    let lines = accounts_list_lines(&app, 100, 12);
+    assert!(
+        !lines.iter().any(|line| line.contains("shunt")),
+        "nothing names shunt: {lines:?}"
+    );
+}
+
+/// The shunt filter shows the pool rows alone; the meta still counts every
+/// section, as it does under the claude and codex filters.
+#[test]
+fn the_shunt_filter_shows_the_pool_rows_alone() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_app();
+    app.harness_filter = crate::tui::app::HarnessFilter::Codex.next();
+    let lines = accounts_list_lines(&app, 100, 20);
+    assert!(
+        !lines.iter().any(|line| line.contains("cl1")),
+        "no claude row under the shunt filter: {lines:?}"
+    );
+    for name in ["alpha", "beta", "cx-work", "spare", "k1"] {
+        assert!(
+            lines.iter().any(|line| line.contains(name)),
+            "{name} drawn under the shunt filter: {lines:?}"
+        );
+    }
+    assert!(
+        accounts_title_row(&app, 60).ends_with(" 1 claude · 5 shunt ─╮"),
+        "the meta counts every section: {:?}",
+        accounts_title_row(&app, 60)
+    );
+}
+
+/// The published cursor starts walk both bands: each pool row's rendered line
+/// accounts for the codex spacer + heading AND the per-provider shunt headings,
+/// so the page step (which reads these starts) can never land a selection off
+/// its row, and the scrollbar's total counts every rendered line.
+#[test]
+fn the_page_step_and_scrollbar_walk_a_list_with_all_three_sections() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let (config, readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
+    app.shunt_pool = sample_pool();
+
+    // Full-height draw publishes the geometry the page step and scrollbar read.
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
+        .expect("draw");
+    // items: cl1, cx1, alpha, beta, cx-work, spare, k1.
+    assert_eq!(
+        *app.overview_selector.starts.borrow(),
+        vec![0, 3, 6, 7, 9, 10, 12],
+        "each pool row's rendered line crosses both bands"
+    );
+    assert_eq!(
+        app.overview_selector.total.get(),
+        13,
+        "the scrollbar counts every rendered line, headings included"
+    );
+
+    // A short viewport with the cursor on the last pool row keeps the caret on
+    // that row.
+    app.overview_cursor = 6;
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows[6].contains("❯") && rows[6].contains("k1"),
+        "the last pool row follows: {rows:?}"
+    );
+    assert!(
+        accounts_scrollbar_column(&app, 80, 8).contains('┃'),
+        "the scrollbar thumb shows the overflow"
     );
 }
 

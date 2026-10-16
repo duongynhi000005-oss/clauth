@@ -4836,7 +4836,7 @@ fn a_stopless_card_still_scrolls_one_line_per_press() {
     );
 }
 
-/// cloudy-tui "Keys and commands inside prose" in a detail pane: the plugin
+/// Keys and commands inside prose in a detail pane: the plugin
 /// row's unprobed `claude` line names `r` ACCENT + bold, and the herdr row's
 /// install sub-line names `clauth herdr install` ACCENT, never bold, both
 /// drawn through the detail pane (the herdr line off `herdr_check` itself, the
@@ -5801,8 +5801,8 @@ fn render_tall(app: &App) {
     term.draw(|f| super::draw(f, f.area(), app)).unwrap();
 }
 
-/// `↵` expands a focused entry and `space` collapses it, the cloudy-tui
-/// disclosure contract (both keys activate, independently per entry).
+/// `↵` expands a focused entry and `space` collapses it, the disclosure
+/// contract (both keys activate, independently per entry).
 #[test]
 fn a_config_entry_enter_expands_and_space_collapses() {
     use crate::tui::app::ShuntFocus;

@@ -1,7 +1,7 @@
 //! Application state, keymap, and tick logic.
 //!
 //! Layout invariants:
-//!   - Overview: selectable Claude and Codex rows; `overview_cursor` maps onto
+//!   - Overview: selectable Claude, Codex and pool rows; `overview_cursor` maps onto
 //!     the visible filter, while Claude selections sync `profile_cursor` with Usage and Setup.
 //!   - Config: master-detail — account list + `+ new` row + inline editor
 //!     (`config_draft`). No popups for create / edit / rename / delete.
@@ -1083,6 +1083,22 @@ pub(crate) enum ConfirmAction {
         record: crate::gateway::GatewayRecord,
         profile: String,
     },
+    /// `remove <name>?` on a pool row: run the pool account's remove on a
+    /// worker. Everything is read when the confirm opened, so confirming runs
+    /// that exact account, never a lookup by position.
+    RemovePoolAccount {
+        record: crate::gateway::GatewayRecord,
+        family: crate::gateway_admin::PoolFamily,
+        name: crate::gateway_admin::ShuntAccountName,
+        /// The account's display name, escaped, for the toast.
+        display: String,
+        /// The account's `(family, name)` the spinner keys on, read when the
+        /// confirm opened.
+        marker: (
+            crate::gateway_admin::PoolFamily,
+            crate::gateway_admin::ShuntAccountName,
+        ),
+    },
     /// `point <profile> at the shunt gateway?`'s `overwrite`: mint the profile's
     /// client token, then point the profile at the gateway (`url`). `replace`
     /// is the confirm's third body line (`None` = nothing to replace), built
@@ -1425,6 +1441,10 @@ pub(crate) enum ActionMenuAction {
     /// The `stop shunt` verb: a transient hold while a fresh daemon runs the
     /// gateway.
     StopShunt,
+    /// Refresh the focused pool account's login (claude and antigravity only).
+    RefreshPoolAccount,
+    /// Remove the focused pool account (behind a `remove <name>?` confirm).
+    RemovePoolAccount,
     // Setup tab — all three act on the focused account and none has a key.
     /// Copy every setting of the focused account onto a new one, credentials
     /// excluded. Prompts for the new name.
@@ -1458,6 +1478,28 @@ pub(crate) enum ActionMenuAction {
 pub(crate) enum DaemonControlResult {
     Start(std::result::Result<crate::daemon::StartOutcome, String>),
     Stop(std::result::Result<crate::daemon::DaemonStop, String>),
+}
+
+/// What a pool remove/refresh worker reports, once. `error` is the failure's
+/// `Display` (clauth's own sentence); `removed` is shunt's `removed: bool`
+/// (false = "it did not exist", never "gone"); `needs_relogin` is a refresh
+/// whose answer still asks for a re-login.
+#[derive(Debug)]
+pub(crate) enum PoolMutationResult {
+    Removed {
+        name: String,
+        removed: bool,
+        error: Option<String>,
+    },
+    Refreshed {
+        name: String,
+        needs_relogin: bool,
+        error: Option<String>,
+    },
+    /// The worker panicked: the busy marker must still clear, and the toast
+    /// says which operation never ran. The pool is re-read after it like
+    /// after every other outcome.
+    Panicked { operation: &'static str },
 }
 
 /// State for the action-menu modal.
@@ -1579,6 +1621,8 @@ impl ActionMenuAction {
             Self::StopDaemon => "stop daemon",
             Self::StartShunt => "start shunt",
             Self::StopShunt => "stop shunt",
+            Self::RefreshPoolAccount => "refresh",
+            Self::RemovePoolAccount => "remove",
             Self::Duplicate => "duplicate account",
             Self::SaveAsPreset => "save as preset",
             Self::ApplyPreset => "apply preset",
@@ -3623,6 +3667,9 @@ pub(crate) struct Banner {
 pub(crate) enum MainItemKind {
     Profile(usize),
     Codex(usize),
+    /// A pool row, addressed as (provider index, account index) into the one
+    /// [`App::shunt_pool`] snapshot both the render and the key handlers read.
+    Shunt(usize, usize),
 }
 
 /// The Overview's visible harness filter; selection maps onto the rows it shows.
@@ -3632,22 +3679,28 @@ pub(crate) enum HarnessFilter {
     All,
     Claude,
     Codex,
+    Shunt,
 }
 
 impl HarnessFilter {
-    /// `c` cycles: both → claude → codex → both.
+    /// `c` cycles: all → claude → codex → shunt → all.
     pub(crate) fn next(self) -> Self {
         match self {
             HarnessFilter::All => HarnessFilter::Claude,
             HarnessFilter::Claude => HarnessFilter::Codex,
-            HarnessFilter::Codex => HarnessFilter::All,
+            HarnessFilter::Codex => HarnessFilter::Shunt,
+            HarnessFilter::Shunt => HarnessFilter::All,
         }
     }
     pub(crate) fn shows_claude(self) -> bool {
-        !matches!(self, HarnessFilter::Codex)
+        matches!(self, HarnessFilter::All | HarnessFilter::Claude)
     }
     pub(crate) fn shows_codex(self) -> bool {
-        !matches!(self, HarnessFilter::Claude)
+        matches!(self, HarnessFilter::All | HarnessFilter::Codex)
+    }
+    /// Whether the shunt pool rows show: under `All` and `Shunt` only.
+    pub(crate) fn shows_shunt(self) -> bool {
+        matches!(self, HarnessFilter::All | HarnessFilter::Shunt)
     }
     /// Harness name for the accounts panel's left meta slot; `None` while both
     /// harnesses show, so the unfiltered panel renders no left slot.
@@ -3656,6 +3709,30 @@ impl HarnessFilter {
             HarnessFilter::All => None,
             HarnessFilter::Claude => Some("claude"),
             HarnessFilter::Codex => Some("codex"),
+            HarnessFilter::Shunt => Some("shunt"),
+        }
+    }
+}
+
+/// The Overview shunt section's pool listing: the providers and accounts the
+/// gateway reported, the reason a read failed, or no adopted gateway (no
+/// section at all). The one snapshot both the render and the key handlers
+/// read; `Absent` until the first read lands through [`shunt_pool_probe`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) enum ShuntPool {
+    #[default]
+    Absent,
+    NotRead(String),
+    Read(Vec<crate::gateway_admin::PoolProvider>),
+}
+
+impl ShuntPool {
+    /// The number of pool rows (one per provider-account pair), for the
+    /// accounts panel's title-right meta. Zero under `Absent` and `NotRead`.
+    pub(crate) fn row_count(&self) -> usize {
+        match self {
+            ShuntPool::Read(providers) => providers.iter().map(|p| p.accounts.len()).sum(),
+            _ => 0,
         }
     }
 }
@@ -3927,6 +4004,14 @@ pub(crate) struct App {
     pub(crate) profile_cursor: usize,
     pub(crate) overview_selector: ListView,
     pub(crate) overview_cursor: usize,
+    /// The one remembered Overview item: a cursor-move key sets it to the item
+    /// now under the cursor, and every placement (a filter change, tab entry,
+    /// a clamp) returns the cursor to it where the item set still holds it. A
+    /// claude row is remembered as `profile_cursor` itself (the stored index
+    /// is ignored, never a copy), a codex or pool row literally, so a pick on
+    /// another tab lands the Overview there for free while a codex/pool row
+    /// stays put; a filter merely hides it, so the round trip restores it.
+    pub(crate) overview_remembered: Option<MainItemKind>,
     pub(crate) usage_selector: ListView,
     pub(crate) usage_detail_focus: StatusFocus,
     pub(crate) usage_detail_scroll: usize,
@@ -4246,6 +4331,27 @@ pub(crate) struct App {
     /// Throttle for the per-tick codex re-read; same contract as
     /// `last_live_sessions_refresh`.
     last_codex_rows_refresh: Option<Instant>,
+    /// The Overview shunt section's pool listing (`Absent` until the first
+    /// read lands). UI-thread-only; the render and the key handlers both read
+    /// this one snapshot, never a per-frame re-read.
+    pub(crate) shunt_pool: ShuntPool,
+    /// The worker running [`shunt_pool_probe`]; `prober` is `None` under test.
+    pub(crate) shunt_pool_probe: ProbeWorker<ShuntPool>,
+    /// Throttle for the per-tick pool re-read while the Overview tab shows.
+    last_shunt_pool_refresh: Option<Instant>,
+    /// The account `(family, name)` a remove/refresh worker is acting on;
+    /// `None` while none runs. Every row whose provider maps to that family and
+    /// whose name matches renders a braille spinner in its marker slot while
+    /// set, and a second pool action while one runs toasts that it is still
+    /// running. Keyed by identity, never a row index, so a reorder under a
+    /// running mutation cannot move the spinner onto another account.
+    pub(crate) pool_mutation_row: Option<(
+        crate::gateway_admin::PoolFamily,
+        crate::gateway_admin::ShuntAccountName,
+    )>,
+    /// Pool remove/refresh worker results; drained in `on_tick`.
+    pool_mutation_rx: std::sync::mpsc::Receiver<PoolMutationResult>,
+    pool_mutation_tx: std::sync::mpsc::Sender<PoolMutationResult>,
 }
 
 /// Read every named profile's long-lived-token status for the Overview cache.
@@ -4525,11 +4631,16 @@ impl App {
         let (daemon_control_tx, daemon_control_rx) = std::sync::mpsc::channel();
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
+        let (pool_mutation_tx, pool_mutation_rx) = std::sync::mpsc::channel();
 
         // Seed the token cache and the live tally before `config` moves into the
         // handle below.
         let live_sessions = crate::live_sessions::LiveTally::collect(&config);
         let daemon_health = crate::daemon::daemon_health();
+        // The Overview pool actions read this record without the Services tab
+        // ever opening: load it at construction, the same cheap local read the
+        // Services recompute makes.
+        let shunt_record = crate::gateway::GatewayRecord::load().ok().flatten();
         let session_tokens = collect_session_tokens(
             &config
                 .profiles
@@ -4585,6 +4696,7 @@ impl App {
             profile_cursor: 0,
             overview_selector: ListView::default(),
             overview_cursor: 0,
+            overview_remembered: None,
             usage_selector: ListView::default(),
             usage_detail_focus: StatusFocus::List,
             usage_detail_scroll: 0,
@@ -4713,7 +4825,14 @@ impl App {
             last_live_sessions_refresh: Some(Instant::now()),
             codex_rows: codex_rows(),
             last_codex_rows_refresh: Some(Instant::now()),
+            shunt_pool: ShuntPool::default(),
+            shunt_pool_probe: ProbeWorker::new(shunt_pool_probe),
+            last_shunt_pool_refresh: None,
+            pool_mutation_row: None,
+            pool_mutation_rx,
+            pool_mutation_tx,
         };
+        adopt_shunt_record(&mut app, shunt_record);
         app.refresh_unsaved_live_login();
         let rebind_form = {
             let config = app.config();
@@ -5723,6 +5842,15 @@ impl App {
         if self.harness_filter.shows_codex() {
             rows.extend((0..self.codex_rows.len()).map(MainItemKind::Codex));
         }
+        if self.harness_filter.shows_shunt()
+            && let ShuntPool::Read(providers) = &self.shunt_pool
+        {
+            for (pi, provider) in providers.iter().enumerate() {
+                for ai in 0..provider.accounts.len() {
+                    rows.push(MainItemKind::Shunt(pi, ai));
+                }
+            }
+        }
         rows
     }
 
@@ -5738,7 +5866,7 @@ impl App {
     pub(crate) fn clamp_profile_cursor(&mut self) {
         let max = self.profile_count().saturating_sub(1);
         self.profile_cursor = self.profile_cursor.min(max);
-        self.clamp_overview_cursor();
+        self.place_overview_cursor();
         // Every reload path lands here (a roster change can move or remove the
         // selected account), so the note tracks the selection for free.
         self.reload_selected_note();
@@ -5755,16 +5883,77 @@ impl App {
         self.main_items().get(self.overview_cursor).copied()
     }
 
-    fn clamp_overview_cursor(&mut self) {
-        self.overview_cursor = self
-            .overview_cursor
-            .min(self.main_items().len().saturating_sub(1));
+    /// Whether the item universe still holds `item` (regardless of filter). A
+    /// row is gone only when its own list was read and lacks it; an unread
+    /// pool (`NotRead` / `Absent`) hides its rows like a filter, never drops
+    /// them, so the next read restores the cursor.
+    fn holds_item(&self, item: MainItemKind) -> bool {
+        match item {
+            MainItemKind::Profile(i) => i < self.profile_count(),
+            MainItemKind::Codex(i) => i < self.codex_rows.len(),
+            MainItemKind::Shunt(pi, ai) => match &self.shunt_pool {
+                ShuntPool::Read(providers) => {
+                    providers.get(pi).is_some_and(|p| ai < p.accounts.len())
+                }
+                ShuntPool::NotRead(_) | ShuntPool::Absent => true,
+            },
+        }
     }
 
+    /// Place the Overview cursor on the remembered item's row when the current
+    /// view shows it; on row 0 when the item still exists but the filter hides
+    /// it (`c` never writes it); when the item set no longer holds it, or
+    /// nothing is remembered, keep the cursor's index clamped to the view and
+    /// remember the item now there. Identity stays by (kind, index); a
+    /// remembered claude row is `profile_cursor` itself, never a stored copy.
+    fn place_overview_cursor(&mut self) {
+        if self.tab != Tab::Overview {
+            return;
+        }
+        let items = self.main_items();
+        let remembered = match self.overview_remembered {
+            Some(MainItemKind::Profile(_)) => Some(MainItemKind::Profile(self.profile_cursor)),
+            other => other,
+        };
+        let target = remembered.and_then(|item| items.iter().position(|row| *row == item));
+        if let Some(idx) = target {
+            self.overview_cursor = idx;
+        } else {
+            match remembered {
+                Some(item) if self.holds_item(item) => {
+                    self.overview_cursor = 0;
+                }
+                _ => {
+                    self.overview_cursor = self.overview_cursor.min(items.len().saturating_sub(1));
+                    self.overview_remembered = items.get(self.overview_cursor).copied();
+                }
+            }
+        }
+        self.sync_overview_profile_selection();
+    }
+
+    /// The placement invariant: while the Overview shows and its cursor rests
+    /// on a claude row k, `profile_cursor == k`, so the `a` menu names the
+    /// highlighted claude row (off the Overview, entering it re-places first).
+    /// The note reloads only when the selection actually moved.
     fn sync_overview_profile_selection(&mut self) {
-        if let Some(MainItemKind::Profile(idx)) = self.current_main_item() {
+        if let Some(MainItemKind::Profile(idx)) = self.current_main_item()
+            && self.profile_cursor != idx
+        {
             self.profile_cursor = idx;
             self.reload_selected_note();
+        }
+    }
+
+    /// A cursor-move key: when the index changed, the remembered item is the
+    /// one now under the cursor (a move onto a claude row remembers it as
+    /// `profile_cursor` itself). A key that leaves the index where it was (a
+    /// one-row view) remembers nothing — it was no choice of a new row.
+    fn move_overview_cursor(&mut self, next: usize) {
+        if next != self.overview_cursor {
+            self.overview_cursor = next;
+            self.overview_remembered = self.current_main_item();
+            self.sync_overview_profile_selection();
         }
     }
 }
@@ -6099,12 +6288,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // `c` still reaches the per-tab dispatch (Tokens binds it too).
         KeyCode::Char('c') if app.tab == Tab::Overview => {
             app.disarm_quit();
-            let selected = app.current_main_item();
+            // `c` changes the filter, then places the cursor on the remembered
+            // item's row when the new view shows it, else row 0; it never
+            // writes the remembered item (a filter only hides it).
             app.harness_filter = app.harness_filter.next();
-            app.overview_cursor = selected
-                .and_then(|item| app.main_items().iter().position(|row| *row == item))
-                .unwrap_or(0);
-            app.sync_overview_profile_selection();
+            app.place_overview_cursor();
             app.overview_selector.offset.set(0);
             return;
         }
@@ -6549,15 +6737,17 @@ fn dash_row_start(rows: &[(u16, u16)], mut i: usize) -> usize {
 
 /// Switch the active tab and reset that tab's cursor to a sensible default.
 fn switch_tab(app: &mut App, tab: Tab) {
-    if tab == Tab::Overview && app.tab != Tab::Overview {
-        app.overview_cursor = app.profile_cursor;
-    }
     app.tab = tab;
     app.tab_activity[tab.index()] = None;
     app.config_draft = None;
     // Leaving the Services tab cancels a still-pending herdr landing: the user
     // has moved on, so a later recompute must not yank the cursor back.
     app.services.land_on_herdr = false;
+    // Entering the Overview with nothing remembered seeds the claude row
+    // (whose index is `profile_cursor` itself) before the placement runs.
+    if tab == Tab::Overview && app.overview_remembered.is_none() {
+        app.overview_remembered = Some(MainItemKind::Profile(app.profile_cursor));
+    }
     // Clamp cursor: a Config `+ new` selection must land on a real account.
     app.clamp_profile_cursor();
     match tab {
@@ -6795,20 +6985,22 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
         KeyCode::Up if count > 0 => {
-            app.overview_cursor = (app.overview_cursor + count - 1) % count;
-            app.sync_overview_profile_selection();
+            app.move_overview_cursor((app.overview_cursor + count - 1) % count);
         }
         KeyCode::Down if count > 0 => {
-            app.overview_cursor = (app.overview_cursor + 1) % count;
-            app.sync_overview_profile_selection();
+            app.move_overview_cursor((app.overview_cursor + 1) % count);
         }
         KeyCode::PageUp if count > 0 => {
-            app.overview_cursor = selector_page_up(app.overview_cursor, &app.overview_selector);
-            app.sync_overview_profile_selection();
+            app.move_overview_cursor(selector_page_up(
+                app.overview_cursor,
+                &app.overview_selector,
+            ));
         }
         KeyCode::PageDown if count > 0 => {
-            app.overview_cursor = selector_page_down(app.overview_cursor, &app.overview_selector);
-            app.sync_overview_profile_selection();
+            app.move_overview_cursor(selector_page_down(
+                app.overview_cursor,
+                &app.overview_selector,
+            ));
         }
         KeyCode::Enter => activate_main_item(app),
         _ => {}
@@ -7646,7 +7838,7 @@ fn toggle_shunt_enabled(app: &mut App) {
     recompute_services_checks(app, false, ShuntRefresh::Restart);
 }
 
-/// Toggle one config entry row expanded/collapsed (the cloudy-tui disclosure
+/// Toggle one config entry row expanded/collapsed (the disclosure
 /// contract: `space` and `↵` both activate, independently per entry). The
 /// recompute prunes an expanded key whose entry left the config, so a key
 /// re-appearing after an edit arrives collapsed.
@@ -9230,6 +9422,18 @@ pub(crate) enum ShuntRefresh {
     Restart,
 }
 
+/// Set the gateway record the TUI holds, applying the record-changed rule the
+/// Services recompute used to inline: a record change (a re-adopt, a
+/// binary/env move) retires the last refusal's check output. The one writer
+/// every record reader routes through, so the Overview pool actions and the
+/// Services card always see the same adopted gateway.
+fn adopt_shunt_record(app: &mut App, record: Option<crate::gateway::GatewayRecord>) {
+    if record != app.services.shunt_record {
+        app.services.check_output = None;
+    }
+    app.services.shunt_record = record;
+}
+
 /// Recompute the Services tab's rows: `shunt` (the managed gateway's readout),
 /// `delegates` (its detail is the job list), `plugin` (the four integration
 /// readouts in one detail), `herdr`. Every read is a local FS/`PATH` check;
@@ -9320,12 +9524,7 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
         }
     }
     let record = crate::gateway::GatewayRecord::load().ok().flatten();
-    if record != app.services.shunt_record {
-        // The last refusal belonged to the record it edited against; a record
-        // change (a re-adopt, a binary/env move) retires it.
-        app.services.check_output = None;
-    }
-    app.services.shunt_record = record;
+    adopt_shunt_record(app, record);
     // The adopted config's editor view: a cheap local read on the recompute,
     // like the record and the admin need. `None` while no record exists (the
     // absent card shows no config section); a config read/parse failure keeps
@@ -12210,6 +12409,307 @@ fn pool_probe() -> PoolOutcome {
     }
 }
 
+/// The Overview shunt section's prober: reload the record and read the typed
+/// pool listing. `Absent` with no adopted gateway, with a config whose admin
+/// entry clauth cannot read (no `[server.admin]`/clauth entry, or a missing
+/// admin token file: the Services card offers the fix, never an error heading),
+/// `NotRead("the gateway is not running")` when the status feed does not show it
+/// healthy (no request is made), else the listing or the error's `Display`.
+fn shunt_pool_probe() -> ShuntPool {
+    let Some(record) = crate::gateway::GatewayRecord::load().ok().flatten() else {
+        return ShuntPool::Absent;
+    };
+    // The admin-entry check comes first: it reads the config alone, so it holds
+    // even when the gateway is down. A config clauth has no admin entry in, or
+    // whose token file is missing, has no pool it can read.
+    match crate::gateway::admin_need(record.config()) {
+        Ok(crate::gateway::AdminNeed::Neither) => {}
+        Ok(_) => return ShuntPool::Absent,
+        Err(e) => return ShuntPool::NotRead(format!("{e}")),
+    }
+    match crate::gateway::read_admin_token() {
+        Ok(_) => {}
+        Err(e) => match e.downcast_ref::<crate::gateway::ChatgptOauthProvidersError>() {
+            Some(crate::gateway::ChatgptOauthProvidersError::NoAdminToken) => {
+                return ShuntPool::Absent;
+            }
+            _ => return ShuntPool::NotRead(format!("{e}")),
+        },
+    }
+    let (slot, _) = crate::daemon::gateway_slot(crate::daemon::daemon_health());
+    if slot.state != GatewayState::Healthy {
+        return ShuntPool::NotRead("the gateway is not running".to_string());
+    }
+    match crate::gateway_admin::list_pool(&record) {
+        Ok(providers) => ShuntPool::Read(providers),
+        Err(e) => ShuntPool::NotRead(format!("{e}")),
+    }
+}
+
+/// One pool remove/refresh the worker runs to completion. The slow calls — a
+/// refresh can block up to its 600 s bound — never hold a frame.
+enum PoolJob {
+    Remove {
+        record: crate::gateway::GatewayRecord,
+        family: crate::gateway_admin::PoolFamily,
+        name: crate::gateway_admin::ShuntAccountName,
+        display: String,
+    },
+    Refresh {
+        record: crate::gateway::GatewayRecord,
+        family: crate::gateway_admin::RefreshFamily,
+        name: crate::gateway_admin::ShuntAccountName,
+        display: String,
+    },
+    /// Test seam: a job that panics, so the unwind path's failure landing is
+    /// reachable without a real gateway panic.
+    #[cfg(test)]
+    Panic { operation: &'static str },
+}
+
+impl PoolJob {
+    /// The operation name a failure toast carries.
+    fn operation(&self) -> &'static str {
+        match self {
+            PoolJob::Remove { .. } => "remove",
+            PoolJob::Refresh { .. } => "refresh",
+            #[cfg(test)]
+            PoolJob::Panic { operation } => operation,
+        }
+    }
+
+    fn run(self) -> PoolMutationResult {
+        match self {
+            #[cfg(test)]
+            PoolJob::Panic { .. } => panic!("test seam: the pool job panicked"),
+            PoolJob::Remove {
+                record,
+                family,
+                name,
+                display,
+            } => match crate::gateway_admin::remove_pool_account(&record, family, &name) {
+                Ok(outcome) => PoolMutationResult::Removed {
+                    name: display,
+                    removed: outcome.removed,
+                    error: None,
+                },
+                Err(e) => PoolMutationResult::Removed {
+                    name: display,
+                    removed: false,
+                    error: Some(format!("{e}")),
+                },
+            },
+            PoolJob::Refresh {
+                record,
+                family,
+                name,
+                display,
+            } => match crate::gateway_admin::refresh_pool_account(&record, family, &name) {
+                Ok(outcome) => PoolMutationResult::Refreshed {
+                    name: display,
+                    needs_relogin: outcome.needs_relogin,
+                    error: None,
+                },
+                Err(e) => PoolMutationResult::Refreshed {
+                    name: display,
+                    needs_relogin: false,
+                    error: Some(format!("{e}")),
+                },
+            },
+        }
+    }
+}
+
+/// Start a pool mutation on a worker, one at a time. A second action while one
+/// runs toasts that it is still running. `marker` keys the in-flight spinner by
+/// the account's `(family, name)`, never a row index, so a reorder under a
+/// running mutation never moves the spinner onto another account.
+fn start_pool_mutation(
+    app: &mut App,
+    marker: (
+        crate::gateway_admin::PoolFamily,
+        crate::gateway_admin::ShuntAccountName,
+    ),
+    job: PoolJob,
+) {
+    if app.pool_mutation_row.is_some() {
+        app.toast(
+            ToastKind::Info,
+            "a pool action is still running\nwait for it, then try again",
+        );
+        return;
+    }
+    app.pool_mutation_row = Some(marker);
+    let operation = job.operation();
+    let tx = app.pool_mutation_tx.clone();
+    spawn_worker(move || {
+        // A panic inside the job still lands a failure, so the busy marker
+        // never sticks (the `ShuntActionWorker::start` precedent).
+        let result = catch_unwind(AssertUnwindSafe(|| job.run()))
+            .unwrap_or(PoolMutationResult::Panicked { operation });
+        let _ = tx.send(result);
+    });
+}
+
+/// The pool row under the cursor, resolved for a mutation.
+type ResolvedPoolRow = (
+    crate::gateway::GatewayRecord,
+    crate::gateway_admin::PoolAuth,
+    crate::gateway_admin::ShuntAccountName,
+    String,
+);
+
+/// Resolve the pool row under the cursor for a mutation: the record, the
+/// provider's auth, the account's validated name and its escaped display name.
+/// `None` when the cursor is not on a pool row, the snapshot or record
+/// vanished, or the name fails shunt's grammar.
+fn pool_row_at_cursor(app: &App) -> Option<ResolvedPoolRow> {
+    let MainItemKind::Shunt(pi, ai) = app.current_main_item()? else {
+        return None;
+    };
+    let record = app.services.shunt_record.clone()?;
+    let ShuntPool::Read(providers) = &app.shunt_pool else {
+        return None;
+    };
+    let provider = providers.get(pi)?;
+    let account = provider.accounts.get(ai)?;
+    let name = crate::gateway_admin::ShuntAccountName::new(&account.name)?;
+    Some((
+        record,
+        provider.auth.clone(),
+        name,
+        escape_control(&account.name),
+    ))
+}
+
+/// `refresh` on a pool row: run it on a worker (claude and antigravity only;
+/// the type makes codex and kimi unrepresentable).
+fn start_pool_refresh(app: &mut App) {
+    let Some((record, auth, name, display)) = pool_row_at_cursor(app) else {
+        return;
+    };
+    let Some(family) = auth.clone().family() else {
+        return;
+    };
+    let Some(refresh_family) = auth.refresh_family() else {
+        return;
+    };
+    start_pool_mutation(
+        app,
+        (family, name.clone()),
+        PoolJob::Refresh {
+            record,
+            family: refresh_family,
+            name,
+            display,
+        },
+    );
+}
+
+/// `remove` on a pool row: open the `remove <name>?` confirm, cancel focused.
+/// The target is read when the confirm opens, so confirming runs that account.
+fn open_pool_remove_confirm(app: &mut App) {
+    let Some((record, auth, name, display)) = pool_row_at_cursor(app) else {
+        return;
+    };
+    let Some(family) = auth.family() else {
+        return;
+    };
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: format!("remove {display}?"),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RemovePoolAccount {
+            record,
+            family,
+            name: name.clone(),
+            display,
+            marker: (family, name),
+        },
+    }));
+}
+
+/// Land a finished pool read into [`App::shunt_pool`], re-placing the cursor
+/// while the Overview shows (entering it re-places otherwise), and
+/// re-adopting the record the prober read so a re-adopt on the Overview reaches
+/// the pool actions.
+fn drain_shunt_pool_probe(app: &mut App) {
+    if let Some(pool) = app.shunt_pool_probe.drain() {
+        app.shunt_pool = pool;
+        app.place_overview_cursor();
+        adopt_shunt_record(app, crate::gateway::GatewayRecord::load().ok().flatten());
+    }
+}
+
+/// Drain pool remove/refresh results: the toast, then a fresh pool read.
+fn drain_pool_mutations(app: &mut App) {
+    while let Ok(result) = app.pool_mutation_rx.try_recv() {
+        app.pool_mutation_row = None;
+        handle_pool_mutation_result(app, result);
+    }
+}
+
+/// The toast a pool mutation's result raises, then the re-read it triggers.
+fn handle_pool_mutation_result(app: &mut App, result: PoolMutationResult) {
+    match result {
+        PoolMutationResult::Removed {
+            name,
+            removed: true,
+            error: None,
+        } => app.toast(ToastKind::Success, format!("removed {name}")),
+        // `removed: false` is shunt's "it did not exist", never "gone": the
+        // account left the store behind the listing's back.
+        PoolMutationResult::Removed {
+            name,
+            removed: false,
+            error: None,
+        } => app.toast(ToastKind::Warning, format!("{name} was not in the pool")),
+        PoolMutationResult::Removed {
+            error: Some(error), ..
+        } => app.toast(ToastKind::Danger, escape_control(&error)),
+        PoolMutationResult::Refreshed {
+            name,
+            needs_relogin: false,
+            error: None,
+        } => app.toast(ToastKind::Success, format!("refreshed {name}")),
+        PoolMutationResult::Refreshed {
+            name,
+            needs_relogin: true,
+            error: None,
+        } => app.toast(ToastKind::Warning, format!("{name} still needs a re-login")),
+        PoolMutationResult::Refreshed {
+            error: Some(error), ..
+        } => app.toast(ToastKind::Danger, escape_control(&error)),
+        PoolMutationResult::Panicked { operation } => {
+            app.toast(ToastKind::Danger, format!("{operation} failed"));
+        }
+    }
+    app.shunt_pool_probe.restart();
+}
+
+/// Re-read the pool listing for the Overview's shunt section, at most once
+/// every 10 s while the Overview tab shows. The read runs on a worker (it can
+/// block up to ~20 s), so the result lands through [`drain_shunt_pool_probe`].
+/// The periodic poll uses [`ProbeWorker::start`] — a read slower than one gate
+/// lands, never discarded — while a landed mutation re-reads through
+/// [`ProbeWorker::restart`], whose result must postdate the mutation.
+fn poll_shunt_pool(app: &mut App) {
+    const SHUNT_POOL_INTERVAL: Duration = Duration::from_secs(10);
+    if app.tab != Tab::Overview {
+        return;
+    }
+    if app
+        .last_shunt_pool_refresh
+        .is_some_and(|t| t.elapsed() < SHUNT_POOL_INTERVAL)
+    {
+        return;
+    }
+    app.last_shunt_pool_refresh = Some(Instant::now());
+    app.shunt_pool_probe.start();
+}
+
 /// The production action prober: run one confirmed shunt-card action to
 /// completion. The slow calls — the `/health` probe, the store plan, `shunt
 /// check` — never hold a frame here. Every error keeps its cause chain as
@@ -13053,6 +13553,7 @@ fn activate_main_item(app: &mut App) {
     match item {
         MainItemKind::Profile(idx) => request_switch_to(app, idx),
         MainItemKind::Codex(_) => {}
+        MainItemKind::Shunt(_, _) => {}
     }
 }
 
@@ -13074,7 +13575,7 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
         return;
     }
     app.profile_cursor = new_idx;
-    app.overview_cursor = new_idx;
+    app.move_overview_cursor(new_idx);
 }
 
 /// One off-thread AUTH-1 switch-gate answer, posted by `spawn_switch_gate`'s
@@ -15388,8 +15889,14 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
 
     match app.tab {
         Tab::Overview => {
-            if matches!(app.current_main_item(), Some(MainItemKind::Profile(_))) {
-                context = push_account_scope(app, &mut scoped);
+            match app.current_main_item() {
+                Some(MainItemKind::Profile(_)) => {
+                    context = push_account_scope(app, &mut scoped);
+                }
+                Some(MainItemKind::Shunt(_, _)) => {
+                    context = push_pool_scope(app, &mut scoped);
+                }
+                Some(MainItemKind::Codex(_)) | None => {}
             }
             actions.push(RefreshAll);
             actions.push(NewAccount);
@@ -15599,6 +16106,24 @@ fn push_account_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<S
         scoped.push(ActionMenuAction::OpenProviderConsole);
     }
     Some(name.to_string())
+}
+
+/// The scoped items a pool row offers: `refresh` where shunt has a refresh
+/// route (claude and antigravity) and `remove` where it has any admin route
+/// (every family but kimi and unknown auth). Returns the account's display
+/// name, which the menu drops when the group stays empty. The gate is the
+/// same `pool_row_at_cursor` lookup the handlers run, so the menu never offers
+/// a key the pick cannot run (no record, unread pool, or an unparseable name
+/// offers nothing).
+fn push_pool_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<String> {
+    let (_, auth, _, display) = pool_row_at_cursor(app)?;
+    if auth.clone().refresh_family().is_some() {
+        scoped.push(ActionMenuAction::RefreshPoolAccount);
+    }
+    if auth.family().is_some() {
+        scoped.push(ActionMenuAction::RemovePoolAccount);
+    }
+    Some(display)
 }
 
 /// The console page the focused account's endpoint mints its api key on.
@@ -15825,6 +16350,8 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::StartShunt | ActionMenuAction::StopShunt => {
             dispatch_shunt_verb(app, action);
         }
+        ActionMenuAction::RefreshPoolAccount => start_pool_refresh(app),
+        ActionMenuAction::RemovePoolAccount => open_pool_remove_confirm(app),
         ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
         ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
         ActionMenuAction::ApplyPreset => open_preset_picker(app),
@@ -19621,6 +20148,24 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             app.services.shunt_token_refusal.take();
             start_shunt_token_save(app, ShuntSaveKey::Token(profile.clone()), record, profile);
         }
+        ConfirmAction::RemovePoolAccount {
+            record,
+            family,
+            name,
+            display,
+            marker,
+        } => {
+            start_pool_mutation(
+                app,
+                marker,
+                PoolJob::Remove {
+                    record,
+                    family,
+                    name,
+                    display,
+                },
+            );
+        }
         ConfirmAction::AddToken {
             record,
             profile,
@@ -20580,7 +21125,10 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_live_sessions(app);
     sync_broken_verdicts(app);
     poll_codex_rows(app);
+    poll_shunt_pool(app);
     drain_service_probes(app);
+    drain_shunt_pool_probe(app);
+    drain_pool_mutations(app);
     poll_services_refresh(app);
     drain_daemon_control(app);
     poll_daemon_health(app);
@@ -20635,12 +21183,8 @@ fn poll_codex_rows(app: &mut App) {
         return;
     }
     app.last_codex_rows_refresh = Some(Instant::now());
-    let selected = app.current_main_item();
     app.codex_rows = codex_rows();
-    app.clamp_overview_cursor();
-    if app.tab == Tab::Overview && selected != app.current_main_item() {
-        app.sync_overview_profile_selection();
-    }
+    app.place_overview_cursor();
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `[ daemon ]`

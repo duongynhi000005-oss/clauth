@@ -6,20 +6,20 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{ListItem, Paragraph};
 
-use super::super::app::{App, CodexRow, MainItemKind, ReadingsSnapshot};
+use super::super::app::{App, CodexRow, ReadingsSnapshot, ShuntPool, escape_control};
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
-    NO_DATA, PCT_LABEL_BUDGET, ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed,
-    fixed_split, grapheme_cells, is_past_reset, reset_resume, spinner_frame, spinner_style,
-    truncate, window_label, window_summary_spans_bracketed,
+    NO_DATA, PCT_LABEL_BUDGET, ResetFmt, account_type_label, cue_style, duration_label,
+    fetch_cue_color, fixed, fixed_split, grapheme_cells, is_past_reset, reset_resume,
+    spinner_frame, spinner_style, truncate, window_label, window_summary_spans_bracketed,
 };
 use super::header::pulse_name_spans;
 use super::panes::{
     bold_when, draw_following_list, empty_state, name_color, section_box, section_box_meta,
     select_line, wrap_words,
 };
-use super::prose::{self, cmd_lit};
+use super::prose;
 use super::usage::{eta_left_secs, window_rate_unit};
 use crate::fallback::{BlockedReason, SwitchAction, blocked_reason, soonest_resume, threshold_for};
 use crate::format::format_pct;
@@ -129,10 +129,10 @@ fn more_members_line(hidden: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The accounts panel's title-right meta: one count per harness — both
-/// harnesses whatever the filter shows, since the counts describe the rows the
+/// The accounts panel's title-right meta: one count per harness — every
+/// harness whatever the filter shows, since the counts describe the rows the
 /// table lists, never the view. A roster with no accounts drops out of the
-/// words; with both empty there is nothing to count and no slot renders.
+/// words; with all empty there is nothing to count and no slot renders.
 fn harness_counts(app: &App) -> String {
     let mut terms: Vec<String> = Vec::new();
     let claude_n = app.config().profiles.len();
@@ -142,6 +142,10 @@ fn harness_counts(app: &App) -> String {
     let codex_n = app.codex_rows.len();
     if codex_n > 0 {
         terms.push(format!("{codex_n} codex"));
+    }
+    let shunt_n = app.shunt_pool.row_count();
+    if shunt_n > 0 {
+        terms.push(format!("{shunt_n} shunt"));
     }
     terms.join(" · ")
 }
@@ -170,7 +174,15 @@ fn draw_overview_accounts(
     } else {
         &[]
     };
-    if app.config().profiles.is_empty() && codex.is_empty() {
+    // The shunt section draws even when no rows can: a failed read still names
+    // its reason. `Absent` (no adopted gateway) draws nothing.
+    let shunt_draws = app.harness_filter.shows_shunt()
+        && match &app.shunt_pool {
+            ShuntPool::Read(providers) => !providers.is_empty(),
+            ShuntPool::NotRead(_) => true,
+            ShuntPool::Absent => false,
+        };
+    if app.config().profiles.is_empty() && codex.is_empty() && !shunt_draws {
         app.overview_selector.offset.set(0);
         app.overview_selector.viewport.set(0);
         app.overview_selector.starts.replace(Vec::new());
@@ -190,56 +202,117 @@ fn draw_overview_accounts(
     let items = app.main_items();
     let sel = app.overview_cursor.min(items.len().saturating_sub(1));
     let width = list_area.width;
+    let reset_fmt = ResetFmt::from_state(&app.config().state);
     let claude_count = if app.harness_filter.shows_claude() {
         app.profile_count()
     } else {
         0
     };
-    let mut rows: Vec<ListItem<'_>> = Vec::with_capacity(items.len() + 2);
-    for (index, item) in items.iter().enumerate() {
-        if index == claude_count && !codex.is_empty() {
-            if claude_count > 0 {
+    let codex_count = codex.len();
+
+    // One pass builds both the rendered rows and the cursor-indexed starts, so
+    // a heading or blank line can never shift a selection off its row: the
+    // page step and the selection both read what this walk produced.
+    let mut rows: Vec<ListItem<'_>> = Vec::with_capacity(items.len() + 8);
+    let mut starts: Vec<usize> = Vec::with_capacity(items.len());
+    let mut rendered: usize = 0;
+    let mut flat: usize = 0;
+
+    // Claude rows: no band chrome ahead of them.
+    while flat < claude_count {
+        starts.push(rendered);
+        let line = render_overview_row(app, flat, &widths, flat == sel, focused, readings);
+        rows.push(ListItem::new(select_line(
+            line,
+            flat == sel,
+            focused,
+            width,
+        )));
+        rendered += 1;
+        flat += 1;
+    }
+
+    // Codex band: a blank spacer (when claude rows precede) + one section
+    // header that lifts while the cursor rests on a codex row.
+    if codex_count > 0 {
+        if claude_count > 0 {
+            rows.push(ListItem::new(Line::from("")));
+            rendered += 1;
+        }
+        let heading = if (claude_count..claude_count + codex_count).contains(&sel) {
+            theme::label_active()
+        } else {
+            theme::label()
+        };
+        rows.push(ListItem::new(Line::from(prose::spans("  codex", heading))));
+        rendered += 1;
+        for codex_row in codex.iter() {
+            starts.push(rendered);
+            let line = render_codex_row(codex_row, &widths, flat == sel);
+            rows.push(ListItem::new(select_line(
+                line,
+                flat == sel,
+                focused,
+                width,
+            )));
+            rendered += 1;
+            flat += 1;
+        }
+    }
+
+    // Shunt band: a blank spacer (when any rows precede), then one
+    // `shunt (<provider>)` heading per provider with its accounts under it, or
+    // one `shunt — not read: …` heading with no rows.
+    match &app.shunt_pool {
+        ShuntPool::Read(providers) if !providers.is_empty() && app.harness_filter.shows_shunt() => {
+            if claude_count + codex_count > 0 {
+                rows.push(ListItem::new(Line::from("")));
+                rendered += 1;
+            }
+            let mut shunt_flat = claude_count + codex_count;
+            for provider in providers.iter() {
+                let provider_rows = provider.accounts.len();
+                let heading = if (shunt_flat..shunt_flat + provider_rows).contains(&sel) {
+                    theme::label_active()
+                } else {
+                    theme::label()
+                };
+                rows.push(ListItem::new(Line::from(prose::spans(
+                    &format!("  shunt ({})", escape_control(&provider.name)),
+                    heading,
+                ))));
+                rendered += 1;
+                let family = provider.auth.clone().family();
+                for account in provider.accounts.iter() {
+                    starts.push(rendered);
+                    let line =
+                        render_pool_row(app, family, account, &widths, flat == sel, reset_fmt);
+                    rows.push(ListItem::new(select_line(
+                        line,
+                        flat == sel,
+                        focused,
+                        width,
+                    )));
+                    rendered += 1;
+                    flat += 1;
+                }
+                shunt_flat += provider_rows;
+            }
+        }
+        ShuntPool::NotRead(reason) if app.harness_filter.shows_shunt() => {
+            if claude_count + codex_count > 0 {
                 rows.push(ListItem::new(Line::from("")));
             }
             rows.push(ListItem::new(Line::from(prose::spans(
-                concat!("  codex — switch with ", cmd_lit!("clauth <name>")),
-                theme::dim(),
+                &format!("  shunt — not read: {}", escape_control(reason)),
+                theme::label(),
             ))));
         }
-        let selected = index == sel;
-        let line = match item {
-            MainItemKind::Profile(idx) => {
-                render_overview_row(app, *idx, &widths, selected, focused, readings)
-            }
-            MainItemKind::Codex(idx) => render_codex_row(&codex[*idx], &widths, selected),
-        };
-        rows.push(ListItem::new(select_line(line, selected, focused, width)));
+        _ => {}
     }
-    // One three-way offset: the blank + header the codex band inserts ahead of
-    // its first row, used for both the selection's rendered row and the
-    // cursor-indexed starts the page step reads.
-    let codex_off = if codex.is_empty() {
-        0
-    } else if claude_count > 0 {
-        2
-    } else {
-        1
-    };
-    let render_sel = sel
-        + if codex.is_empty() || sel < claude_count {
-            0
-        } else {
-            codex_off
-        };
+
+    let render_sel = starts.get(sel).copied().unwrap_or(0);
     draw_following_list(frame, list_area, rows, render_sel, &app.overview_selector);
-    // The list's rows are flat, but the codex band inserts a blank spacer and a
-    // header ahead of the first codex row, so cursor row -> rendered line is
-    // not the identity. Republish the cursor-indexed starts for the page step.
-    let starts: Vec<usize> = items
-        .iter()
-        .enumerate()
-        .map(|(i, _)| if i < claude_count { i } else { i + codex_off })
-        .collect();
     let block_ends: Vec<usize> = starts.iter().map(|s| s + 1).collect();
     app.overview_selector.starts.replace(starts);
     app.overview_selector.block_ends.replace(block_ends);
@@ -259,11 +332,12 @@ struct OverviewWidths {
     deepseek_amount_w: usize,
     claude_labels: LabelWidths,
     codex_labels: LabelWidths,
+    pool_labels: LabelWidths,
 }
 
 /// The widest reading a band renders in each usage column. Every reading is
 /// left-padded to its band's widest so the `%` signs align, and a column
-/// widens by the excess of either band over [`PCT_LABEL_BUDGET`].
+/// widens by the widest band's excess over [`PCT_LABEL_BUDGET`].
 #[derive(Debug, Clone, Copy, Default)]
 struct LabelWidths {
     five: usize,
@@ -298,6 +372,17 @@ impl LabelWidths {
 /// its cap prints as read.
 fn codex_label(window: &UsageWindow) -> String {
     format_pct(window.utilization)
+}
+
+/// A pool account's window as the bracketed bar renders it: shunt reports a
+/// 0-1 fraction for every family and an epoch-seconds reset, the claude row's
+/// bar model reads a 0-100 utilization and an ISO reset stamp. The one
+/// conversion both the width band and [`render_pool_row`] use.
+fn pool_window(utilization: Option<f64>, reset: Option<u64>) -> Option<UsageWindow> {
+    utilization.map(|fraction| UsageWindow {
+        utilization: fraction * 100.0,
+        resets_at: reset.map(|secs| crate::usage::epoch_secs_to_iso(secs as i64)),
+    })
 }
 
 /// Width of the live-session column: its `live` header text, which is also the
@@ -368,7 +453,26 @@ impl OverviewWidths {
         } else {
             LabelWidths::default()
         };
-        let labels = claude_labels.widest(codex_labels);
+        let pool_labels = if app.harness_filter.shows_shunt() {
+            match &app.shunt_pool {
+                ShuntPool::Read(providers) => {
+                    LabelWidths::of(providers.iter().flat_map(|p| p.accounts.iter()).map(|a| {
+                        (
+                            pool_window(a.utilization_5h, a.reset_5h)
+                                .as_ref()
+                                .map(window_label),
+                            pool_window(a.utilization_7d, a.reset_7d)
+                                .as_ref()
+                                .map(window_label),
+                        )
+                    }))
+                }
+                ShuntPool::NotRead(_) | ShuntPool::Absent => LabelWidths::default(),
+            }
+        } else {
+            LabelWidths::default()
+        };
+        let labels = claude_labels.widest(codex_labels).widest(pool_labels);
         let (five_excess, seven_excess) = labels.excess();
         let (mut name, kind, mut five_hour, mut seven_day) =
             overview_tiers(max_name, total, labels);
@@ -440,13 +544,18 @@ impl OverviewWidths {
             deepseek_amount_w,
             claude_labels,
             codex_labels,
+            pool_labels,
         }
     }
 
     /// Whether the 7d column holds its bar: below that tier it is the bare
     /// reading.
     fn seven_day_bar(&self) -> bool {
-        let (_, seven_excess) = self.claude_labels.widest(self.codex_labels).excess();
+        let (_, seven_excess) = self
+            .claude_labels
+            .widest(self.codex_labels)
+            .widest(self.pool_labels)
+            .excess();
         self.seven_day >= SEVEN_DAY_BAR + seven_excess
     }
 }
@@ -685,6 +794,125 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> 
     if let Some(count) = row.resets {
         spans.push(gap(widths));
         spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
+    }
+    Line::from(spans)
+}
+
+/// One pool account in the claude columns: name, plan in the type column, 5h
+/// and 7d as the claude rows' bracketed bars with reset countdowns, and a
+/// blank live column. Status rides the existing cues only: the broken-login
+/// glyph (DANGER) before a name that needs a re-login, a whole row flattened
+/// to dim while paused or disabled, a cooldown's remaining time in the timer
+/// slot (WARNING); a remove/refresh in flight puts the braille spinner in the
+/// marker slot. No status word anywhere.
+fn render_pool_row(
+    app: &App,
+    family: Option<crate::gateway_admin::PoolFamily>,
+    account: &crate::gateway_admin::PoolAccount,
+    widths: &OverviewWidths,
+    selected: bool,
+    reset_fmt: ResetFmt,
+) -> Line<'static> {
+    let disabled = account.paused || account.disabled;
+    let running = app
+        .pool_mutation_row
+        .as_ref()
+        .is_some_and(|(running_family, name)| {
+            family == Some(*running_family) && account.name == name.as_str()
+        });
+    let hue = |s: Style| if disabled { theme::dim() } else { s };
+    // A selected paused/disabled row still takes the current-row bold, the
+    // claude row's `bold_when` promotion.
+    let name_style = bold_when(
+        if disabled {
+            theme::dim()
+        } else {
+            theme::base()
+        },
+        selected,
+    );
+    let marker = if running {
+        Span::styled(spinner_frame(app.tick_count), hue(theme::accent()))
+    } else if account.needs_relogin {
+        Span::styled(theme::dead_credential_glyph(), hue(theme::danger()))
+    } else {
+        Span::raw(" ")
+    };
+    let timer = match account.cooldown_secs_remaining {
+        Some(secs) => {
+            let label = duration_label(secs);
+            Span::styled(format!("{label:>4} "), hue(theme::warning()))
+        }
+        None => Span::raw(" ".repeat(TIMER_SLOT)),
+    };
+    let mut spans = vec![
+        if selected {
+            Span::styled("❯ ", theme::accent().bold())
+        } else {
+            Span::raw("  ")
+        },
+        marker,
+        Span::raw(" "),
+        Span::styled(
+            fixed(&escape_control(&account.name), widths.name),
+            name_style,
+        ),
+        Span::raw(" ".repeat(widths.gap)),
+        match account.plan.as_deref() {
+            Some(plan) => {
+                Span::styled(fixed(&escape_control(plan), widths.kind), hue(theme::dim()))
+            }
+            None => Span::styled(fixed(NO_DATA, widths.kind), hue(theme::faint())),
+        },
+    ];
+    spans.push(narrow_gap(widths));
+    spans.push(timer);
+    // Flatten the bar's threshold colors and reset countdown to dim for a
+    // paused/disabled row, the same pass the claude row applies.
+    let flatten = |mut spans: Vec<Span<'static>>| {
+        if disabled {
+            for s in &mut spans {
+                s.style = theme::dim();
+            }
+        }
+        spans
+    };
+    let five = pool_window(account.utilization_5h, account.reset_5h);
+    let five_spans = flatten(window_summary_spans_bracketed(
+        five.as_ref(),
+        widths.five_hour,
+        widths.pool_labels.five,
+        true,
+        None,
+        reset_fmt,
+        five.as_ref().is_some_and(is_past_reset),
+    ));
+    let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
+    spans.extend(five_spans);
+    spans.push(Span::raw(
+        " ".repeat(widths.five_hour.saturating_sub(five_len)),
+    ));
+    if widths.seven_day > 0 {
+        spans.push(gap(widths));
+        let seven = pool_window(account.utilization_7d, account.reset_7d);
+        let seven_spans = flatten(window_summary_spans_bracketed(
+            seven.as_ref(),
+            widths.seven_day,
+            widths.pool_labels.seven,
+            widths.seven_day_bar(),
+            None,
+            reset_fmt,
+            seven.as_ref().is_some_and(is_past_reset),
+        ));
+        let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
+        spans.extend(seven_spans);
+        spans.push(Span::raw(
+            " ".repeat(widths.seven_day.saturating_sub(seven_len)),
+        ));
+    }
+    if widths.live > 0 {
+        spans.push(gap(widths));
+        spans.push(Span::raw(" ".repeat(widths.live)));
     }
     Line::from(spans)
 }

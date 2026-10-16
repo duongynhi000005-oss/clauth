@@ -6515,7 +6515,7 @@ fn the_tick_lands_the_no_daemon_warning() {
     assert_eq!(gateway_unrun_toasts(&app), vec![super::ToastKind::Warning]);
 }
 
-/// Toast lifetimes per the cloudy-tui contract: a red toast lingers 6 s, every
+/// Toast lifetimes: a red toast lingers 6 s, every
 /// other kind 5 s, each pinned on both sides of its edge.
 #[test]
 fn toasts_live_five_seconds_and_red_ones_six() {
@@ -19357,8 +19357,9 @@ fn c_on_the_tokens_tab_flips_count_cache() {
     );
 }
 
-/// On the Overview `c` cycles the filter both → claude → codex → both and
-/// leaves the Tokens flag alone; on a tab with no `c` binding it is a no-op.
+/// On the Overview `c` cycles the filter all → claude → codex → shunt → all
+/// and leaves the Tokens flag alone; on a tab with no `c` binding it is a
+/// no-op.
 #[test]
 fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
     use super::{HarnessFilter, handle_key};
@@ -19370,18 +19371,16 @@ fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
     let count_cache = app.config().state.count_cache;
 
     let mut seen = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
-        seen.push(app.harness_filter);
+        seen.push(app.harness_filter.label_name());
     }
     assert_eq!(
         seen,
-        [
-            HarnessFilter::Claude,
-            HarnessFilter::Codex,
-            HarnessFilter::All
-        ]
+        [Some("claude"), Some("codex"), Some("shunt"), None],
+        "four states, then back to all"
     );
+    assert_eq!(app.harness_filter, HarnessFilter::All);
     assert_eq!(
         app.config().state.count_cache,
         count_cache,
@@ -19396,6 +19395,1081 @@ fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
         "no `c` binding on Usage"
     );
     assert_eq!(app.config().state.count_cache, count_cache);
+}
+
+// ── Overview shunt pool rows (B2) ───────────────────────────────────────────
+
+/// One claude account `a`, then pool rows in cursor order: `alpha` (claude
+/// family, index 1), `cx-work` (codex family, 2), `k1` (kimi, 3), and the
+/// adopted gateway's record. Call it with a `HomeSandbox` held.
+fn pool_rows_app() -> App {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    let account = |name: &str| PoolAccount {
+        name: name.to_string(),
+        available: true,
+        near_quota: false,
+        cooldown_secs_remaining: None,
+        needs_relogin: false,
+        paused: false,
+        disabled: false,
+        utilization_5h: None,
+        reset_5h: None,
+        utilization_7d: None,
+        reset_7d: None,
+        plan: None,
+        status: None,
+    };
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = super::ShuntPool::Read(vec![
+        PoolProvider {
+            name: "claude-main".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![account("alpha")],
+        },
+        PoolProvider {
+            name: "codex".to_string(),
+            auth: PoolAuth::Codex,
+            accounts: vec![account("cx-work")],
+        },
+        PoolProvider {
+            name: "kimi".to_string(),
+            auth: PoolAuth::Kimi,
+            accounts: vec![account("k1")],
+        },
+    ]);
+    // A pool that was read implies an adopted gateway: its record, bound to a
+    // port nothing listens on (these tests send no request).
+    let config = crate::profile::home_dir()
+        .expect("sandboxed home")
+        .join("etc")
+        .join("shunt.toml");
+    std::fs::create_dir_all(config.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&config, "[server]\nbind = \"127.0.0.1:9\"\n").expect("write config");
+    app.services.shunt_record =
+        Some(crate::gateway::GatewayRecord::new(config).expect("adoptable"));
+    app
+}
+
+/// The scoped labels the action menu opens with at the current cursor.
+fn scoped_labels(app: &App) -> Vec<&'static str> {
+    let menu = super::build_action_menu(app);
+    menu.items[..menu.scoped_len]
+        .iter()
+        .map(|item| item.label)
+        .collect()
+}
+
+/// `↓` walks from the claude rows into the pool rows; `a` on a pool row offers
+/// the actions its family has: refresh and remove for a claude login, remove
+/// alone for a codex one (shunt has no codex refresh route), none for kimi.
+#[test]
+fn the_action_menu_on_a_pool_row_offers_its_familys_actions() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 0;
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.overview_cursor, 1, "↓ reaches the first pool row");
+    assert_eq!(
+        scoped_labels(&app),
+        vec!["refresh", "remove"],
+        "alpha (claude)"
+    );
+    assert_eq!(
+        super::build_action_menu(&app).context.as_deref(),
+        Some("alpha"),
+        "the scoped group names the pool account"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(scoped_labels(&app), vec!["remove"], "cx-work (codex)");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        scoped_labels(&app),
+        Vec::<&str>::new(),
+        "k1 (kimi): no actions"
+    );
+
+    // The menu offers only what its pick can run: with no gateway record a
+    // pool action could do nothing, so none is offered.
+    app.overview_cursor = 1;
+    app.services.shunt_record = None;
+    assert_eq!(
+        scoped_labels(&app),
+        Vec::<&str>::new(),
+        "no record: no pool action on alpha"
+    );
+}
+
+/// `⏎` on a pool row does nothing: no modal, no tab change, no switch.
+#[test]
+fn enter_on_a_pool_row_does_nothing() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 1;
+    let active_before = app.config().state.active_profile.clone();
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty(), "no modal opened");
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(
+        app.config().state.active_profile,
+        active_before,
+        "no switch"
+    );
+}
+
+/// Picking `remove` on a pool row opens a confirm naming the account, cancel
+/// focused.
+#[test]
+fn remove_on_a_pool_row_asks_first() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 1;
+    let menu = super::build_action_menu(&app);
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|item| item.label == "remove")
+        .and_then(|item| item.hotkey)
+        .expect("remove carries a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    let Some(super::Modal::Confirm(state)) = app.modals.last() else {
+        panic!(
+            "remove opens a confirm, got {:?}",
+            app.modals.last().map(|_| "another modal")
+        );
+    };
+    assert_eq!(state.message, "remove alpha?");
+    assert!(!state.choice, "cancel is focused");
+}
+
+// ── Overview shunt pool worker + end-to-end mutations (B2) ──────────────────
+
+/// A test admin token long enough for shunt to accept (>= 32 characters).
+const POOL_ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef0123456789abcdef";
+
+/// Write the gateway admin token into the sandboxed home, so a mutation's
+/// `admin_token()` read finds it (the `gateway_admin` tests' `write_token`).
+fn write_pool_token(home: &crate::testutil::HomeSandbox, token: &str) {
+    let path = home.home().join(".clauth").join("gateway-admin-token");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(path, token).expect("write token");
+}
+
+/// A gateway record whose config binds the gateway at `addr` (the
+/// `gateway_admin` tests' `record_at`).
+fn pool_record_at(
+    home: &crate::testutil::HomeSandbox,
+    addr: std::net::SocketAddr,
+) -> crate::gateway::GatewayRecord {
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&config, format!("[server]\nbind = \"{addr}\"\n")).expect("write config");
+    crate::gateway::GatewayRecord::new(config).expect("adoptable")
+}
+
+/// The socket address off a `serve_endpoints_raw` base string.
+fn pool_listener_addr(base: &str) -> std::net::SocketAddr {
+    base.trim_start_matches("http://").parse().expect("addr")
+}
+
+/// How many times the stubbed pool prober has run.
+static POOL_PROBE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// When set, the stub answers `NotRead("stub")` instead of an empty `Read`.
+static POOL_PROBE_NOTREAD: AtomicBool = AtomicBool::new(false);
+
+fn counting_pool_probe() -> super::ShuntPool {
+    POOL_PROBE_CALLS.fetch_add(1, Ordering::SeqCst);
+    if POOL_PROBE_NOTREAD.load(Ordering::SeqCst) {
+        super::ShuntPool::NotRead("stub".to_string())
+    } else {
+        super::ShuntPool::Read(vec![])
+    }
+}
+
+/// The pool read runs on a worker and lands through the drain; the 10 s gate
+/// blocks a re-read; a landed mutation restarts it outside the gate.
+#[test]
+fn the_pool_probe_lands_through_the_drain_and_obeys_the_ten_second_gate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    POOL_PROBE_CALLS.store(0, Ordering::SeqCst);
+    POOL_PROBE_NOTREAD.store(false, Ordering::SeqCst);
+    let mut app = pool_rows_app();
+    app.shunt_pool_probe.prober = Some(counting_pool_probe);
+    app.last_shunt_pool_refresh = None;
+
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        app.shunt_pool,
+        super::ShuntPool::Read(vec![]),
+        "the read lands"
+    );
+    assert_eq!(POOL_PROBE_CALLS.load(Ordering::SeqCst), 1);
+
+    // Within the 10 s window a second poll is a no-op.
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        POOL_PROBE_CALLS.load(Ordering::SeqCst),
+        1,
+        "the 10 s gate blocks a re-read"
+    );
+
+    // A fresh poll after the gate re-reads, and a `NotRead` answer lands too.
+    POOL_PROBE_NOTREAD.store(true, Ordering::SeqCst);
+    app.last_shunt_pool_refresh = None;
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        app.shunt_pool,
+        super::ShuntPool::NotRead("stub".to_string()),
+        "a failed read lands its reason"
+    );
+    assert_eq!(POOL_PROBE_CALLS.load(Ordering::SeqCst), 2);
+
+    // A landed mutation restarts the read immediately, outside the 10 s gate.
+    super::handle_pool_mutation_result(
+        &mut app,
+        super::PoolMutationResult::Removed {
+            name: "alpha".to_string(),
+            removed: true,
+            error: None,
+        },
+    );
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        POOL_PROBE_CALLS.load(Ordering::SeqCst),
+        3,
+        "a mutation restarts the read"
+    );
+}
+
+/// `refresh` on a pool row runs the worker against the adopted gateway: the
+/// request path is the account's refresh route, and the toast reads the
+/// account's name.
+#[test]
+fn refresh_on_a_pool_row_lands_the_request_and_the_toast() {
+    use super::handle_key;
+    let home = crate::testutil::HomeSandbox::new();
+    write_pool_token(&home, POOL_ADMIN_TOKEN);
+    let (base, seen) = crate::testutil::serve_endpoints_raw(1, |_, _| {
+        (200, r#"{"needs_relogin":false}"#.to_string())
+    });
+    let mut app = pool_rows_app();
+    app.services.shunt_record = Some(pool_record_at(&home, pool_listener_addr(&base)));
+    app.overview_cursor = 1;
+
+    let menu = super::build_action_menu(&app);
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|item| item.label == "refresh")
+        .and_then(|item| item.hotkey)
+        .expect("refresh carries a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+
+    let raw = seen.join().expect("listener");
+    assert_eq!(
+        crate::testutil::request_path(&raw[0]),
+        "/admin/api/accounts/claude/alpha/refresh"
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.body == "refreshed alpha"),
+        "the success toast names the account: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// `remove` on a pool row runs the confirmed remove on a worker: the request
+/// path is the account's DELETE route, and the toast reads the account's name.
+#[test]
+fn removing_a_pool_row_lands_the_request_and_the_toast() {
+    use super::handle_key;
+    let home = crate::testutil::HomeSandbox::new();
+    write_pool_token(&home, POOL_ADMIN_TOKEN);
+    let (base, seen) =
+        crate::testutil::serve_endpoints_raw(1, |_, _| (200, r#"{"removed":true}"#.to_string()));
+    let mut app = pool_rows_app();
+    app.services.shunt_record = Some(pool_record_at(&home, pool_listener_addr(&base)));
+    app.overview_cursor = 1;
+
+    let menu = super::build_action_menu(&app);
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|item| item.label == "remove")
+        .and_then(|item| item.hotkey)
+        .expect("remove carries a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    let action = match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.on_confirm.clone(),
+        other => panic!("remove opens a confirm, got {other:?}"),
+    };
+    super::run_confirm_action(&mut app, action);
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+
+    let raw = seen.join().expect("listener");
+    assert_eq!(
+        crate::testutil::request_path(&raw[0]),
+        "/admin/api/accounts/claude/alpha"
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.body == "removed alpha"),
+        "the success toast names the account: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A claude row survives a round trip through filters that show nothing: an
+/// empty codex roster and an absent pool leave the codex and shunt filters
+/// both with no rows.
+#[test]
+fn a_claude_row_survives_the_filter_round_trip() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.overview_cursor, 1);
+    assert!(matches!(
+        app.current_main_item(),
+        Some(super::MainItemKind::Profile(1))
+    ));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, super::HarnessFilter::Claude);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, super::HarnessFilter::Codex);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, super::HarnessFilter::Shunt);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, super::HarnessFilter::All);
+    assert_eq!(
+        app.overview_cursor, 1,
+        "the claude row comes back in all view"
+    );
+    assert!(matches!(
+        app.current_main_item(),
+        Some(super::MainItemKind::Profile(1))
+    ));
+}
+
+/// The pool read polls only while the Overview tab shows.
+#[test]
+fn the_pool_read_polls_only_while_the_overview_shows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    POOL_PROBE_CALLS.store(0, Ordering::SeqCst);
+    let mut app = pool_rows_app();
+    app.shunt_pool_probe.prober = Some(counting_pool_probe);
+    app.last_shunt_pool_refresh = None;
+    app.tab = Tab::Usage;
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    assert_eq!(
+        POOL_PROBE_CALLS.load(Ordering::SeqCst),
+        0,
+        "off the Overview no read starts"
+    );
+    app.tab = Tab::Overview;
+    app.last_shunt_pool_refresh = None;
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        POOL_PROBE_CALLS.load(Ordering::SeqCst),
+        1,
+        "on the Overview the read starts"
+    );
+}
+
+/// A second pool action while one runs toasts that it is still running and
+/// starts nothing.
+#[test]
+fn a_second_pool_action_while_one_runs_toasts_and_starts_nothing() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 1;
+    let marker = (
+        crate::gateway_admin::PoolFamily::Claude,
+        crate::gateway_admin::ShuntAccountName::new("alpha").expect("valid"),
+    );
+    app.pool_mutation_row = Some(marker.clone());
+    let menu = super::build_action_menu(&app);
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|item| item.label == "refresh")
+        .and_then(|item| item.hotkey)
+        .expect("refresh carries a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body == "a pool action is still running\nwait for it, then try again"),
+        "the busy guard toasts: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        app.pool_mutation_row,
+        Some(marker),
+        "the in-flight marker is unchanged: nothing started"
+    );
+}
+
+/// The busy marker clears when the mutation result lands.
+#[test]
+fn the_busy_marker_clears_when_the_result_lands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 1;
+    app.pool_mutation_row = Some((
+        crate::gateway_admin::PoolFamily::Claude,
+        crate::gateway_admin::ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    app.pool_mutation_tx
+        .send(super::PoolMutationResult::Removed {
+            name: "alpha".to_string(),
+            removed: true,
+            error: None,
+        })
+        .expect("send");
+    super::drain_pool_mutations(&mut app);
+    assert!(app.pool_mutation_row.is_none(), "the busy marker cleared");
+}
+
+/// A refresh whose answer still asks for a re-login toasts exactly that, never
+/// the success toast.
+#[test]
+fn a_refresh_still_needing_relogin_toasts_it() {
+    use super::handle_key;
+    let home = crate::testutil::HomeSandbox::new();
+    write_pool_token(&home, POOL_ADMIN_TOKEN);
+    let (base, seen) = crate::testutil::serve_endpoints_raw(1, |_, _| {
+        (200, r#"{"needs_relogin":true}"#.to_string())
+    });
+    let mut app = pool_rows_app();
+    app.services.shunt_record = Some(pool_record_at(&home, pool_listener_addr(&base)));
+    app.overview_cursor = 1;
+    let menu = super::build_action_menu(&app);
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|item| item.label == "refresh")
+        .and_then(|item| item.hotkey)
+        .expect("refresh carries a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+    seen.join().expect("listener");
+    let toasts: Vec<(super::ToastKind, &str)> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert!(
+        toasts
+            .iter()
+            .any(|(kind, body)| *kind == super::ToastKind::Warning
+                && *body == "alpha still needs a re-login"),
+        "the re-login toast: {toasts:?}"
+    );
+    assert!(
+        !toasts.iter().any(|(_, body)| *body == "refreshed alpha"),
+        "no success toast: {toasts:?}"
+    );
+}
+
+/// A failed remove toasts the error's `Display`, never a success: a 400 maps
+/// to `ShuntAdminError::BadRequest`.
+#[test]
+fn a_failed_remove_toasts_the_errors_display() {
+    use super::handle_key;
+    let home = crate::testutil::HomeSandbox::new();
+    write_pool_token(&home, POOL_ADMIN_TOKEN);
+    let (base, seen) =
+        crate::testutil::serve_endpoints_raw(1, |_, _| (400, r#"{"removed":false}"#.to_string()));
+    let mut app = pool_rows_app();
+    app.services.shunt_record = Some(pool_record_at(&home, pool_listener_addr(&base)));
+    app.overview_cursor = 1;
+    let menu = super::build_action_menu(&app);
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|item| item.label == "remove")
+        .and_then(|item| item.hotkey)
+        .expect("remove carries a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    let action = match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.on_confirm.clone(),
+        other => panic!("remove opens a confirm, got {other:?}"),
+    };
+    super::run_confirm_action(&mut app, action);
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+    seen.join().expect("listener");
+    assert!(
+        app.toasts.iter().any(|t| {
+            t.kind == super::ToastKind::Danger
+                && t.body == "the gateway refused the request (status 400)"
+        }),
+        "the failure toast is the error's Display: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A panic inside a pool job still lands a failure, so the busy marker never
+/// sticks (the `PoolJob::Panic` test seam).
+#[test]
+fn a_panicking_pool_job_lands_a_failure_and_clears_the_busy_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 1;
+    super::start_pool_mutation(
+        &mut app,
+        (
+            crate::gateway_admin::PoolFamily::Claude,
+            crate::gateway_admin::ShuntAccountName::new("alpha").expect("valid"),
+        ),
+        super::PoolJob::Panic {
+            operation: "remove",
+        },
+    );
+    assert!(
+        app.pool_mutation_row.is_some(),
+        "the marker is set before the job runs"
+    );
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+    assert!(
+        app.pool_mutation_row.is_none(),
+        "the busy marker cleared despite the panic"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == super::ToastKind::Danger && t.body == "remove failed"),
+        "the panic lands a failure naming the op: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A pool listing of one claude provider holding `names`, every flag clear.
+fn one_provider_pool(names: &[&str]) -> super::ShuntPool {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    let account = |name: &str| PoolAccount {
+        name: name.to_string(),
+        available: true,
+        near_quota: false,
+        cooldown_secs_remaining: None,
+        needs_relogin: false,
+        paused: false,
+        disabled: false,
+        utilization_5h: None,
+        reset_5h: None,
+        utilization_7d: None,
+        reset_7d: None,
+        plan: None,
+        status: None,
+    };
+    super::ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: names.iter().map(|n| account(n)).collect(),
+    }])
+}
+
+/// A TUI launched on the Overview with a gateway adopted on disk offers the
+/// pool actions without the Services tab ever being opened (the record lived
+/// only in the Services recompute).
+#[test]
+fn a_fresh_overview_offers_the_pool_actions() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_adopted_record(&home, false, "[server]\nbind = \"127.0.0.1:9\"\n");
+    assert!(
+        crate::gateway::GatewayRecord::load()
+            .expect("load")
+            .is_some(),
+        "fixture control: the gateway is adopted on disk"
+    );
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    assert_eq!(app.tab, Tab::Overview, "the TUI opens on the Overview");
+    super::on_tick(&mut app);
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    app.overview_cursor = 1;
+    assert_eq!(scoped_labels(&app), vec!["refresh", "remove"]);
+}
+
+/// A listing that read fine and holds no account: the pool really shrank.
+fn emptied_pool() -> super::ShuntPool {
+    super::ShuntPool::Read(Vec::new())
+}
+
+/// A pool read that empties the section under the cursor moves the cursor
+/// onto a claude row, and the claude selection follows it, so the action
+/// menu names the highlighted row (the `poll_codex_rows` precedent). An
+/// unread pool only hides its rows (`an_unread_pool_keeps_the_pool_row_for_the_next_read`).
+#[test]
+fn a_shrinking_pool_keeps_the_menu_on_the_highlighted_row() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    app.overview_cursor = 0;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(
+        app.current_main_item(),
+        Some(super::MainItemKind::Shunt(0, 0)),
+        "↑ on the first row wraps to the last pool row"
+    );
+    app.shunt_pool_probe.prober = Some(emptied_pool);
+    app.last_shunt_pool_refresh = None;
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        app.current_main_item(),
+        Some(super::MainItemKind::Profile(1)),
+        "the clamp lands on the last claude row `b`"
+    );
+    assert_eq!(
+        super::build_action_menu(&app).context.as_deref(),
+        Some("b"),
+        "the menu names the highlighted row"
+    );
+}
+
+static SLOW_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn slow_read_pool() -> super::ShuntPool {
+    SLOW_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    super::ShuntPool::NotRead("the read".to_string())
+}
+
+/// A pool read still in flight when the next 10 s gate comes round lands
+/// anyway: the periodic poll starts a read only when none runs, never
+/// discards one (the Services periodic reads use `start`).
+#[test]
+fn a_read_slower_than_the_gate_still_lands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    SLOW_READS.store(0, std::sync::atomic::Ordering::SeqCst);
+    let mut app = pool_rows_app();
+    app.shunt_pool_probe.prober = Some(slow_read_pool);
+    for _ in 0..3 {
+        app.last_shunt_pool_refresh = None;
+        super::poll_shunt_pool(&mut app);
+        // The next gate tick finds the read still in flight.
+        app.last_shunt_pool_refresh = None;
+        super::poll_shunt_pool(&mut app);
+        super::join_test_workers();
+        super::drain_shunt_pool_probe(&mut app);
+    }
+    assert_eq!(
+        app.shunt_pool,
+        super::ShuntPool::NotRead("the read".to_string()),
+        "after {} completed reads none landed",
+        SLOW_READS.load(std::sync::atomic::Ordering::SeqCst)
+    );
+}
+
+/// shunt answers a remove of a name its store does not hold with 200
+/// `removed: false`: the toast says so in WARNING, never `removed <name>`
+/// (`RemoveOutcome.removed`).
+#[test]
+fn a_remove_shunt_answers_not_found_is_no_success() {
+    let home = crate::testutil::HomeSandbox::new();
+    write_pool_token(&home, POOL_ADMIN_TOKEN);
+    let (base, seen) =
+        crate::testutil::serve_endpoints_raw(1, |_, _| (200, r#"{"removed":false}"#.to_string()));
+    let mut app = pool_rows_app();
+    app.services.shunt_record = Some(pool_record_at(&home, pool_listener_addr(&base)));
+    app.overview_cursor = 1;
+    let hotkey = super::build_action_menu(&app)
+        .items
+        .iter()
+        .find(|item| item.label == "remove")
+        .and_then(|item| item.hotkey)
+        .expect("remove carries a hotkey");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    let action = match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.on_confirm.clone(),
+        other => panic!("remove opens a confirm, got {other:?}"),
+    };
+    super::run_confirm_action(&mut app, action);
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+    seen.join().expect("listener");
+    let toasts: Vec<(super::ToastKind, &str)> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert!(
+        toasts
+            .iter()
+            .any(|(kind, body)| *kind == super::ToastKind::Warning
+                && *body == "alpha was not in the pool"),
+        "a not-found remove warns: {toasts:?}"
+    );
+    assert!(
+        !toasts.iter().any(|(_, body)| *body == "removed alpha"),
+        "no success toast: {toasts:?}"
+    );
+}
+
+/// A gateway whose config carries no admin entry for clauth has no pool clauth
+/// can read: no shunt section, never an error heading (main's ruling
+/// 2026-10-15, reconciling the design record's "Settled: usage" "health only,
+/// no error" with "Pool rows"; the Services card offers the fix).
+#[test]
+fn a_gateway_without_an_admin_entry_draws_no_pool_section() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_adopted_record(&home, false, "[server]\nbind = \"127.0.0.1:9\"\n");
+    assert_eq!(super::shunt_pool_probe(), super::ShuntPool::Absent);
+}
+
+/// A gateway whose config carries clauth's admin entry but whose token file is
+/// missing has no pool clauth can read: the config's `${file:}` reference
+/// resolves to a missing file, so the token read reports `NoAdminToken`.
+#[test]
+fn a_missing_admin_token_file_reads_the_pool_as_absent() {
+    let home = crate::testutil::HomeSandbox::new();
+    let key_ref = format!(
+        "${{file:{}}}",
+        crate::gateway::admin_token_path()
+            .expect("token path")
+            .display()
+    );
+    let config = format!(
+        "[server]\nbind = \"127.0.0.1:9\"\n\n[server.admin]\n[[server.admin.write_keys]]\nid = \"clauth\"\nkey = {}\n",
+        toml_edit::value(key_ref.as_str())
+    );
+    crate::testutil::write_adopted_record(&home, false, &config);
+    assert_eq!(
+        super::shunt_pool_probe(),
+        super::ShuntPool::Absent,
+        "a missing admin token file reads the pool as absent"
+    );
+}
+
+/// A full `c` round trip with every filter non-empty brings back the row the
+/// user was on: the filters between placed the cursor on their first row, the
+/// user never moved it, so the all view lands on the claude row it started on.
+#[test]
+fn a_codex_row_survives_a_non_empty_shunt_filter() {
+    use super::{HarnessFilter, MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::Codex);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::Shunt);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::All);
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Profile(0)),
+        "the row the user was on comes back in all view, not the codex filter's first row"
+    );
+}
+
+/// Every `c` round trip brings the row back, not only the first: landing in
+/// the all view leaves nothing that lets the next trip's filters replace it.
+#[test]
+fn a_second_filter_round_trip_keeps_the_claude_row() {
+    use super::{HarnessFilter, MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(1)));
+    for trip in ["first trip", "second trip", "third trip"] {
+        for _ in 0..4 {
+            handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+        }
+        assert_eq!(app.harness_filter, HarnessFilter::All);
+        assert_eq!(
+            app.current_main_item(),
+            Some(MainItemKind::Profile(1)),
+            "{trip}"
+        );
+    }
+}
+
+/// An arrow press that moves nothing (a one-row filtered view) is no choice
+/// of a new row: the round trip still brings back the row the user was on.
+#[test]
+fn an_arrow_that_moves_nothing_keeps_the_row_the_user_was_on() {
+    use super::{HarnessFilter, MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::Codex);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::All);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(1)));
+}
+
+/// A tab round trip keeps a pool row selected in the all view: entering the
+/// Overview never maps the claude cursor onto a pool row's index.
+#[test]
+fn a_tab_round_trip_keeps_a_pool_row() {
+    use super::{MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 0)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    assert_ne!(app.tab, Tab::Overview);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 0)));
+}
+
+/// Under the shunt filter a tab round trip keeps the pool account selected,
+/// never another account at the claude cursor's index.
+#[test]
+fn a_tab_round_trip_under_the_shunt_filter_keeps_the_pool_account() {
+    use super::{HarnessFilter, MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha", "beta", "gamma"]);
+    for _ in 0..3 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    }
+    assert_eq!(app.harness_filter, HarnessFilter::Shunt);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 1)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 1)));
+}
+
+/// Cycling every tab, the Fallback tab included (it moves the claude cursor
+/// onto the chain when the selected account is outside it), keeps the pool
+/// row the user was on: only the user's own Overview moves pick a pool row.
+#[test]
+fn a_tab_cycle_through_fallback_keeps_the_pool_row() {
+    use super::{MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.config().state.fallback_chain = vec!["a".into()];
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 0)));
+    assert_eq!(app.profile_cursor, 1, "`b`, outside the chain");
+    for _ in 0..Tab::ALL.len() {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Tab));
+    }
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 0)));
+}
+
+/// A codex row that leaves the roster while another tab shows: back on the
+/// Overview the cursor lands on the nearest row, and the action menu names the
+/// account that row shows, never another claude account.
+#[test]
+fn an_off_tab_codex_shrink_keeps_the_menu_on_the_highlighted_row() {
+    use super::{MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
+    assert_eq!(app.profile_cursor, 0);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    assert_eq!(app.tab, Tab::Usage);
+    crate::testutil::write_codex_roster(&[]);
+    app.last_codex_rows_refresh = None;
+    super::poll_codex_rows(&mut app);
+    assert!(
+        app.codex_rows.is_empty(),
+        "precondition: the poll dropped the codex row"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(1)));
+    assert_eq!(
+        super::build_action_menu(&app).context.as_deref(),
+        Some("b"),
+        "the menu names the highlighted row"
+    );
+}
+
+/// The codex poll runs every second on every tab: while Setup shows the
+/// `+ new` form it must leave the claude cursor alone, or the form turns into
+/// an existing account's editor.
+#[test]
+fn a_codex_poll_keeps_the_new_account_form() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert_eq!(app.tab, Tab::Setup);
+    assert_eq!(app.profile_cursor, 2, "precondition: the `+ new` row");
+    assert!(super::config_rows(&app).contains(&super::ConfigRow::Create));
+    app.last_codex_rows_refresh = None;
+    super::poll_codex_rows(&mut app);
+    assert_eq!(app.profile_cursor, 2, "a codex poll keeps the `+ new` form");
+    assert!(super::config_rows(&app).contains(&super::ConfigRow::Create));
+}
+
+/// A codex poll while Usage shows keeps the account picked there, even when
+/// the Overview remembers a codex row its filter hides.
+#[test]
+fn a_codex_poll_keeps_the_usage_pick_under_the_claude_filter() {
+    use super::{HarnessFilter, MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::Claude);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    assert_eq!(app.tab, Tab::Usage);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.profile_cursor, 1, "precondition: `b` picked on Usage");
+    app.last_codex_rows_refresh = None;
+    super::poll_codex_rows(&mut app);
+    assert_eq!(app.profile_cursor, 1, "a codex poll keeps the Usage pick");
+}
+
+/// A pool read that fails once hides the pool rows without forgetting the one
+/// the user was on: when the listing reads again, the cursor is back on it.
+#[test]
+fn an_unread_pool_keeps_the_pool_row_for_the_next_read() {
+    use super::{MainItemKind, ShuntPool, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha", "beta"]);
+    for _ in 0..3 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 1)));
+    app.shunt_pool = ShuntPool::NotRead("the gateway did not answer".to_string());
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Overview);
+    app.shunt_pool = one_provider_pool(&["alpha", "beta"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 1)));
+}
+
+/// The claude round trip with a codex roster and a pool on screen: the
+/// selected claude row comes back in the all view.
+#[test]
+fn a_claude_row_survives_non_empty_filters() {
+    use super::{HarnessFilter, MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(1)));
+    for _ in 0..4 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    }
+    assert_eq!(app.harness_filter, HarnessFilter::All);
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Profile(1)),
+        "the claude row comes back in all view"
+    );
 }
 
 // ── Overview selection across harnesses ─────────────────────────────────────
@@ -19539,8 +20613,13 @@ fn codex_rows_can_be_selected_without_acting_on_a_claude_account() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
     assert_eq!(app.harness_filter, HarnessFilter::Codex);
     assert_eq!(
+        app.overview_cursor, 2,
+        "the codex row the user picked comes back under the codex filter"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
         app.overview_cursor, 0,
-        "a hidden selection lands on the first visible row"
+        "codex-only navigation wraps to the first row"
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Up));
     assert_eq!(
@@ -19548,15 +20627,16 @@ fn codex_rows_can_be_selected_without_acting_on_a_claude_account() {
         "codex-only navigation wraps to the last row"
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    assert_eq!(
-        app.overview_cursor, 0,
-        "codex-only navigation wraps to the first row"
-    );
+    assert_eq!(app.overview_cursor, 0);
     assert_eq!(
         app.current_main_item().map(|item| format!("{item:?}")),
         Some("Codex(0)".to_string())
     );
     assert!(app.toasts.is_empty());
+    // Through the shunt filter (which hides the codex row) and back: the
+    // selection the hiding filter could not show comes back in all view.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::Shunt);
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
     assert_eq!(app.harness_filter, HarnessFilter::All);
     assert_eq!(
@@ -24011,7 +25091,7 @@ fn the_move_failed_toast_escapes_control_and_bidi() {
     );
 }
 
-// ── keys and commands inside prose (cloudy-tui) ──────────────────────────────
+// ── keys and commands inside prose ───────────────────────────────────────────
 
 /// The whole frame at `w`×`h`, for the prose-styling pins below.
 fn prose_frame(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {

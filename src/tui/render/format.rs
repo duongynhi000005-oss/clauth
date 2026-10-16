@@ -159,6 +159,26 @@ pub(super) fn bar_string_with_cells(pct: f64, cells: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(cells - filled))
 }
 
+/// A duration as its largest whole unit, one unit only (`45s`, `4m`, `1h`,
+/// `2d`). The pool row's cooldown slot (4 cells) and the status feed's incident
+/// duration share it; unlike [`crate::usage::humanize_duration`] (two units,
+/// `1h 0m`), it never spills. The status caller floors sub-minute spans to
+/// `1m` at the call site — a sub-minute incident reads `1m`, never `45s`.
+pub(super) fn duration_label(secs: u64) -> String {
+    let mins = secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+    if days >= 1 {
+        format!("{days}d")
+    } else if hours >= 1 {
+        format!("{hours}h")
+    } else if mins >= 1 {
+        format!("{mins}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// The widest whole reading, `100%`: the label budget every Overview usage tier
 /// is sized for. A longer label (`73.42%`) widens its column by the excess.
 pub(super) const PCT_LABEL_BUDGET: usize = 4;

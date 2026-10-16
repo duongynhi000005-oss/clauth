@@ -16,7 +16,9 @@ use ratatui::widgets::{Block, Paragraph};
 
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
-use super::format::{NO_DATA, fixed, middle_truncate, relative_age, spinner_frame, truncate};
+use super::format::{
+    NO_DATA, duration_label, fixed, middle_truncate, relative_age, spinner_frame, truncate,
+};
 use super::panes::{
     draw_scrollbar, empty_state, follow_scroll_offset, key_cell, master_detail, section_box,
     wrap_words,
@@ -344,7 +346,9 @@ fn detail_lines(incident: &Incident, inner_w: usize) -> Vec<Line<'static>> {
 
     let dur_str = match incident.resolved_ms {
         Some(resolved) if resolved >= incident.started_ms => {
-            let dur = duration_label((resolved - incident.started_ms) / 1000);
+            // The floor keeps the pre-shared-formatter output: a sub-minute
+            // incident reads `1m`, never `45s` (see `duration_label`).
+            let dur = duration_label(((resolved - incident.started_ms) / 1000).max(60));
             format!("lasted {dur}")
         }
         _ => "ongoing".to_string(),
@@ -646,20 +650,6 @@ fn components_line(components: &[(String, String)], inner_w: usize) -> Line<'sta
 /// Decimal digit count of `n` (for reserving `+N` width).
 fn count_digits(n: usize) -> usize {
     if n == 0 { 1 } else { (n.ilog10() + 1) as usize }
-}
-
-/// Single-largest-unit duration label for a span in seconds: `47m`, `2h`, `3d`.
-fn duration_label(secs: u64) -> String {
-    let mins = secs / 60;
-    let hours = mins / 60;
-    let days = hours / 24;
-    if days >= 1 {
-        format!("{days}d")
-    } else if hours >= 1 {
-        format!("{hours}h")
-    } else {
-        format!("{}m", mins.max(1))
-    }
 }
 
 /// Detail key column: `key` padded to the shared key-cell width in the eyebrow

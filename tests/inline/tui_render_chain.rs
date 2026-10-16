@@ -2939,7 +2939,7 @@ fn the_add_picker_names_the_blocker_before_a_carried_list() {
     );
 }
 
-/// cloudy-tui "Keys and commands inside prose" on the Fallback card: the
+/// Keys and commands inside prose on the Fallback card: the
 /// auth-broken fix's command and every key the preferred-days tooltip names.
 #[test]
 fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {

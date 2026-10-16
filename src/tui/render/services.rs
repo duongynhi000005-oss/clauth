@@ -1183,7 +1183,7 @@ fn action_lead(saving: bool, selected: bool, app: &App) -> Span<'static> {
 }
 
 /// The `+ add <kind>` row: a first-class `+ add` row — `ACCENT` label, bold
-/// while selected (the cloudy-tui Master-detail `+ new` rule), no disclosure
+/// while selected (the master-detail `+ new` rule), no disclosure
 /// glyph.
 fn add_line(kind: ShuntAddKind, selected: bool, app: &App) -> Line<'static> {
     let label = if selected {
