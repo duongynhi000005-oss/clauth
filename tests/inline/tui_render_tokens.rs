@@ -1046,13 +1046,13 @@ fn total_cost_counts_unpriced_with_tokens() {
         ],
         ..Default::default()
     };
-    let (lines, _meta) = total_lines(&stats, 60, false, Some(&table));
+    let (lines, _meta) = total_lines(&stats, &stats.speed_days, 60, false, Some(&table));
     assert!(
         line_text(&lines[1]).contains("$1.00+"),
         "unpriced token-bearing models floor the lifetime figure, got {:?}",
         line_text(&lines[1])
     );
-    let (bare, _meta) = total_lines(&stats, 60, false, None);
+    let (bare, _meta) = total_lines(&stats, &stats.speed_days, 60, false, None);
     assert!(line_text(&bare[1]).contains('—'), "no table → dash");
 
     // A zero-token unpriced model does NOT floor the figure: the count is
@@ -1071,7 +1071,8 @@ fn total_cost_counts_unpriced_with_tokens() {
         ],
         ..Default::default()
     };
-    let (zero_lines, _meta) = total_lines(&zero_only, 60, false, Some(&table));
+    let (zero_lines, _meta) =
+        total_lines(&zero_only, &zero_only.speed_days, 60, false, Some(&table));
     let zero_cost = line_text(&zero_lines[1]);
     assert!(
         zero_cost.contains("$1.00") && !zero_cost.contains('+'),
@@ -1249,7 +1250,7 @@ fn trend_bars_widen_with_gaps_and_carry_month_ticks() {
         daily,
         ..Default::default()
     };
-    let lines: Vec<String> = trend_lines(&stats, 48, 6, TokenPeriod::Lifetime)
+    let lines: Vec<String> = trend_lines(&stats, &stats.speed_days, 48, 6, TokenPeriod::Lifetime)
         .iter()
         .map(line_text)
         .collect();
@@ -1270,7 +1271,7 @@ fn trend_bars_widen_with_gaps_and_carry_month_ticks() {
     assert!(lines[5].contains("peak"));
 
     // Below the 4-row gate the tick row is dropped, never the chart.
-    let short = trend_lines(&stats, 48, 3, TokenPeriod::Lifetime);
+    let short = trend_lines(&stats, &stats.speed_days, 48, 3, TokenPeriod::Lifetime);
     assert!(!line_text(&short[short.len() - 2]).contains("jun"));
 }
 
@@ -1565,7 +1566,7 @@ fn model_detail_marks_nothing_on_incomplete_split() {
 #[test]
 fn the_total_cache_hit_badge_drops_to_its_own_line_when_narrow() {
     let stats = populated_stats();
-    let (lines, _) = total_lines(&stats, 24, true, None);
+    let (lines, _) = total_lines(&stats, &stats.speed_days, 24, true, None);
     let texts: Vec<String> = lines.iter().map(line_text).collect();
     assert_eq!(
         texts,
@@ -1852,7 +1853,7 @@ fn tps_tokens_snapshot(age_ms: u64) -> crate::tps::Snapshot {
 }
 
 /// The today card's speed row reads `S t/s now · S t/s today`, the `now` figure
-/// off `total.live.speed` and the `today` figure summed over accounts × models.
+/// off `total.live.speed` and the `today` figure the merged day sum's average.
 #[test]
 fn the_today_card_speed_row_reads_now_and_today() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1862,13 +1863,19 @@ fn the_today_card_speed_row_reads_now_and_today() {
     });
     app.set_tps(Some(tps_tokens_snapshot(1_000)));
 
-    let line = super::today_speed_line(&app);
+    let line = super::today_speed_line(
+        &app,
+        Some(crate::tps::DaySum {
+            output: 900,
+            gen_ms: 10_000,
+        }),
+    );
     assert_eq!(line_text(&line), "speed     92 t/s now · 90 t/s today");
 
     // A hydrated app with no producer reads `—` for both figures, never a
     // fabricated 0.
     app.set_tps(None);
-    let line = super::today_speed_line(&app);
+    let line = super::today_speed_line(&app, None);
     assert_eq!(line_text(&line), "speed     — now · — today");
 
     // A fresh app (no cache read) still shows the row, both figures `—`.
@@ -1877,7 +1884,7 @@ fn the_today_card_speed_row_reads_now_and_today() {
         profiles: Vec::new(),
     });
     assert_eq!(
-        line_text(&super::today_speed_line(&fresh)),
+        line_text(&super::today_speed_line(&fresh, None)),
         "speed     — now · — today"
     );
 }
@@ -1895,7 +1902,7 @@ fn the_total_card_avg_speed_reads_the_ledger_speed_rows() {
             gen_ms: 20_000,
         },
     );
-    let (lines, _meta) = total_lines(&stats, 40, false, None);
+    let (lines, _meta) = total_lines(&stats, &stats.speed_days, 40, false, None);
     let avg = lines
         .iter()
         .map(line_text)
@@ -1904,7 +1911,8 @@ fn the_total_card_avg_speed_reads_the_ledger_speed_rows() {
     assert_eq!(avg, "avg speed 90 t/s");
 
     // An empty ledger speed map leaves the card exactly as it rendered before.
-    let (empty_lines, _) = total_lines(&populated_stats(), 40, false, None);
+    let empty = populated_stats();
+    let (empty_lines, _) = total_lines(&empty, &empty.speed_days, 40, false, None);
     assert!(
         !empty_lines
             .iter()
@@ -1968,7 +1976,7 @@ fn the_speed_strip_scales_blocks_and_blanks_where_absent() {
 #[test]
 fn the_trend_strip_and_footer_avg_appear_only_with_speed_rows() {
     let stats = strip_stats();
-    let tall = trend_lines(&stats, 40, 5, TokenPeriod::Daily);
+    let tall = trend_lines(&stats, &stats.speed_days, 40, 5, TokenPeriod::Daily);
     assert_eq!(tall.len(), 5, "bars + strip + ticks + caption");
     let caption = line_text(tall.last().expect("caption row"));
     assert!(
@@ -1980,7 +1988,7 @@ fn the_trend_strip_and_footer_avg_appear_only_with_speed_rows() {
         daily: stats.daily.clone(),
         ..Default::default()
     };
-    let bare = trend_lines(&no_speed, 40, 5, TokenPeriod::Daily);
+    let bare = trend_lines(&no_speed, &no_speed.speed_days, 40, 5, TokenPeriod::Daily);
     let caption = line_text(bare.last().expect("caption row"));
     assert!(
         !caption.contains("avg"),
@@ -1993,8 +2001,8 @@ fn the_trend_strip_and_footer_avg_appear_only_with_speed_rows() {
 #[test]
 fn the_trend_speed_strip_drops_before_the_month_ticks() {
     let stats = strip_stats();
-    let tall = trend_lines(&stats, 40, 5, TokenPeriod::Daily);
-    let short = trend_lines(&stats, 40, 4, TokenPeriod::Daily);
+    let tall = trend_lines(&stats, &stats.speed_days, 40, 5, TokenPeriod::Daily);
+    let short = trend_lines(&stats, &stats.speed_days, 40, 4, TokenPeriod::Daily);
     assert_eq!(tall.len(), 5);
     assert_eq!(short.len(), 4, "the strip row drops, the ticks stay");
     assert_eq!(
@@ -2034,10 +2042,10 @@ fn the_dashboard_shows_the_speed_rows_when_the_cards_grew() {
     );
 }
 
-/// The today speed row sums every account, the reserved unattributed `*` row
+/// The merged day sums fold every account, the reserved unattributed `*` row
 /// included.
 #[test]
-fn the_today_speed_row_sums_the_unattributed_star_account() {
+fn the_merged_day_sums_include_the_unattributed_star_account() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = App::new(AppConfig {
         state: AppState::default(),
@@ -2059,9 +2067,21 @@ fn the_today_speed_row_sums_the_unattributed_star_account() {
         );
     app.set_tps(Some(snap));
 
-    // (900 + 100) ÷ (10 s + 10 s) = 50 t/s.
+    let merged = super::merged_speed_days(&TokenStats::default(), &app);
+    let today = merged
+        .get(&crate::tokens::today_date())
+        .copied()
+        .expect("the cache's day row reaches the merge");
     assert_eq!(
-        line_text(&super::today_speed_line(&app)),
+        today,
+        crate::tps::DaySum {
+            output: 1_000,
+            gen_ms: 20_000,
+        },
+        "(900 + 100) over (10 s + 10 s), the `*` row included"
+    );
+    assert_eq!(
+        line_text(&super::today_speed_line(&app, Some(today))),
         "speed     92 t/s now · 50 t/s today"
     );
 }
@@ -2094,10 +2114,144 @@ fn the_weekly_trend_strip_folds_days_into_their_bucket() {
             },
         );
     }
-    let lines = trend_lines(&stats, 40, 5, TokenPeriod::Weekly);
+    let lines = trend_lines(&stats, &stats.speed_days, 40, 5, TokenPeriod::Weekly);
     let caption = line_text(lines.last().expect("caption row"));
     assert!(
         caption.contains("· avg 50 t/s"),
         "the bucket folds both days' sums (900+100 ÷ 20 s), not the first day's 90: {caption:?}"
+    );
+}
+
+/// A producer cache holding yesterday + today and a ledger holding an older day
+/// merge into the Tokens day sums: the TOTAL card and the trend footer average
+/// over all three (900+1800+200 ÷ 10+20+20 s = 58 t/s), never the ledger's one
+/// day (90 t/s). A stale cache contributes nothing, so only the ledger day
+/// survives.
+#[test]
+fn the_tokens_surfaces_merge_the_cache_days_over_the_ledger() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_stats(TokenPeriod::Daily);
+
+    let mut stats = TokenStats {
+        daily: vec![
+            DayTokens {
+                date: "2026-06-01".into(),
+                tokens: 100,
+            },
+            DayTokens {
+                date: "2026-06-02".into(),
+                tokens: 50,
+            },
+            DayTokens {
+                date: "2026-06-03".into(),
+                tokens: 25,
+            },
+        ],
+        ..Default::default()
+    };
+    stats.speed_days.insert(
+        "2026-06-01".to_string(),
+        crate::tps::DaySum {
+            output: 900,
+            gen_ms: 10_000,
+        },
+    );
+    let mut snap = tps_tokens_snapshot(1_000);
+    snap.days.clear();
+    snap.days.insert(
+        "2026-06-02".to_string(),
+        std::collections::BTreeMap::from([(
+            "uwuclxdy".to_string(),
+            std::collections::BTreeMap::from([(
+                "sonnet".to_string(),
+                crate::tps::DaySum {
+                    output: 1_800,
+                    gen_ms: 20_000,
+                },
+            )]),
+        )]),
+    );
+    snap.days.insert(
+        "2026-06-03".to_string(),
+        std::collections::BTreeMap::from([(
+            "uwuclxdy".to_string(),
+            std::collections::BTreeMap::from([(
+                "sonnet".to_string(),
+                crate::tps::DaySum {
+                    output: 200,
+                    gen_ms: 20_000,
+                },
+            )]),
+        )]),
+    );
+    app.token_stats = Some(stats);
+    app.set_tps(Some(snap));
+
+    let out = render_dashboard(&app, 160, 40);
+    assert!(
+        out.contains("avg speed 58 t/s"),
+        "the TOTAL card averages all three merged days, not the ledger's 90: {out:?}"
+    );
+    assert!(
+        out.contains("· avg 58 t/s"),
+        "the trend footer averages all three merged days: {out:?}"
+    );
+
+    // A stale cache contributes nothing: only the ledger day survives.
+    app.set_tps(Some(tps_tokens_snapshot(31_000)));
+    let out = render_dashboard(&app, 160, 40);
+    assert!(
+        out.contains("avg speed 90 t/s"),
+        "a stale cache leaves only the ledger day on the TOTAL card: {out:?}"
+    );
+    assert!(
+        out.contains("· avg 90 t/s"),
+        "a stale cache leaves only the ledger day on the trend footer: {out:?}"
+    );
+}
+
+/// A date in both the ledger and the cache reads the LEDGER's sum: the folded,
+/// finalized day wins over a cache the producer has not yet dropped. Guards the
+/// `or_insert_with` merge against a cache-wins `insert` regression.
+#[test]
+fn the_merged_day_sums_let_the_ledger_win_on_a_shared_date() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    let mut stats = TokenStats::default();
+    stats.speed_days.insert(
+        "2026-06-01".to_string(),
+        crate::tps::DaySum {
+            output: 900,
+            gen_ms: 10_000,
+        },
+    );
+    let mut snap = tps_tokens_snapshot(1_000);
+    snap.days.clear();
+    snap.days.insert(
+        "2026-06-01".to_string(),
+        std::collections::BTreeMap::from([(
+            "uwuclxdy".to_string(),
+            std::collections::BTreeMap::from([(
+                "sonnet".to_string(),
+                crate::tps::DaySum {
+                    output: 50,
+                    gen_ms: 10_000,
+                },
+            )]),
+        )]),
+    );
+    app.set_tps(Some(snap));
+
+    let merged = super::merged_speed_days(&stats, &app);
+    assert_eq!(
+        merged.get("2026-06-01"),
+        Some(&crate::tps::DaySum {
+            output: 900,
+            gen_ms: 10_000,
+        }),
+        "the ledger's finalized day wins over the cache's day"
     );
 }

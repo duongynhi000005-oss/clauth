@@ -983,16 +983,23 @@ fn header_lines(
 }
 
 /// The `speed` and `rate` rows: each reads `live · 5m · 1h · today`, one figure
-/// per window, `—` faint where the producer carries none. Speed is output
-/// tokens ÷ generation seconds; rate is output tokens ÷ wall-clock window
-/// length (today = seconds since 00:00 UTC, `0` under a fresh producer with no
-/// day row). Windows shed whole from the right when `inner_w` cannot hold them;
-/// both rows shed to the same window set (the wider rate row decides).
+/// per window: `—` faint with no fresh producer, and on a speed window no
+/// response touched; a fresh producer's absent account reads a `0` rate. Speed
+/// is output tokens ÷ generation seconds; rate is output tokens ÷ wall-clock
+/// window length (today = seconds since 00:00 UTC, `0` under a fresh producer
+/// with no day row). Windows shed whole from the right when `inner_w` cannot
+/// hold them; both rows shed to the same window set (the wider rate row
+/// decides).
 fn tps_rows(profile: &Profile, app: &App, inner_w: u16) -> Vec<Line<'static>> {
     let name = profile.name.as_str();
-    let figures = app.fresh_tps().and_then(|s| s.accounts.get(name));
-    let today = app
-        .fresh_tps()
+    // `fresh` gates every figure: `—` everywhere with no fresh producer. Under
+    // a fresh producer `accounts` names only accounts with finished responses,
+    // so an absent account still has a real zero RATE (rate is never absent
+    // under a fresh producer; `which --json` already says `rate: 0`) while its
+    // SPEED stays `—`, since no response touched the window.
+    let fresh = app.fresh_tps();
+    let figures = fresh.and_then(|s| s.accounts.get(name));
+    let today = fresh
         .and_then(|s| s.days.get(&crate::tokens::today_date()))
         .and_then(|accounts| accounts.get(name))
         .map(|models| {
@@ -1007,7 +1014,7 @@ fn tps_rows(profile: &Profile, app: &App, inner_w: u16) -> Vec<Line<'static>> {
     let today_speed = today.and_then(crate::tui::app::day_average);
     // A fresh account with no day row has a real zero today-rate, not an
     // absence; only no fresh producer reads `—`.
-    let today_rate = figures.map(|_| {
+    let today_rate = fresh.map(|_| {
         if secs_since_midnight > 0.0 {
             today.map_or(0.0, |t| t.output as f64 / secs_since_midnight)
         } else {
@@ -1022,9 +1029,9 @@ fn tps_rows(profile: &Profile, app: &App, inner_w: u16) -> Vec<Line<'static>> {
         ("today", today_speed),
     ];
     let rate_values = [
-        ("live", figures.map(|f| f.live.rate)),
-        ("5m", figures.map(|f| f.m5.rate)),
-        ("1h", figures.map(|f| f.h1.rate)),
+        ("live", fresh.map(|_| figures.map_or(0.0, |f| f.live.rate))),
+        ("5m", fresh.map(|_| figures.map_or(0.0, |f| f.m5.rate))),
+        ("1h", fresh.map(|_| figures.map_or(0.0, |f| f.h1.rate))),
         ("today", today_rate),
     ];
     let keep = row_windows("tok/s", &rate_values, inner_w);

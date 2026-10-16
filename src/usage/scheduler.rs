@@ -3849,8 +3849,8 @@ thread_local! {
 /// The lease holder's tps leg: one tail pass, then publish the snapshot into
 /// `~/.clauth/tps_cache.json` (0600, the producer's own file — it never writes
 /// the daemon-owned `status.json`). The whole snapshot is rewritten only when
-/// its content apart from `generated_at` changed; otherwise it is refreshed at
-/// most every 10 s so a reader's staleness gate (`STALE_AFTER_MS` = 30 s) never
+/// its content apart from `generated_at` changed; otherwise it is refreshed
+/// every 10 s so a reader's staleness gate (`STALE_AFTER_MS` = 30 s) never
 /// trips on a merely-idle producer.
 fn tps_producer_tick(now_ms: u64) {
     let snap = TPS_PRODUCER.with(|p| p.borrow_mut().tick(now_ms));

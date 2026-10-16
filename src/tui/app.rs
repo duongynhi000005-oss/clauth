@@ -5115,6 +5115,20 @@ impl App {
     /// The production write path for the tps snapshot read off the producer's
     /// cache; `None` = no producer.
     pub(crate) fn set_tps(&mut self, snapshot: Option<crate::tps::Snapshot>) {
+        // A fresh snapshot that dropped a day the previous snapshot held means
+        // the producer just folded that day into the speed ledger and dropped it
+        // from the cache in the same tick. Nudge the tokens worker so it
+        // re-reads the ledger at once, instead of leaving the merged day sums
+        // blank until its next 90 s cycle. A day that stays (no fold, or a fold
+        // whose ledger save failed keeps the day in the cache) fires nothing.
+        if let (Some(prev), Some(next)) = (&self.tps, &snapshot) {
+            let next_is_fresh = next
+                .age_ms(self.tps_now_ms())
+                .is_some_and(|age| age <= crate::tps::STALE_AFTER_MS);
+            if next_is_fresh && prev.days.keys().any(|d| !next.days.contains_key(d)) {
+                let _ = self.tokens_refresh.send(());
+            }
+        }
         self.tps = snapshot;
         // Grow the width hold by whatever the chip renders this read — a fresh
         // figure or the `—` of an absent/stale cache — so a rate that narrows

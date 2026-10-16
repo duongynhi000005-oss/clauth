@@ -3736,3 +3736,50 @@ fn the_tps_rows_render_four_windows_and_a_dash_where_absent() {
         "rate      live 67 tok/s · 5m 61 tok/s"
     );
 }
+
+/// Under a fresh producer, an account ABSENT from the cache (`accounts` names
+/// only accounts with finished responses) still has a real zero rate on every
+/// window — rate is never absent under a fresh producer, `which --json` already
+/// says `rate: 0` — while its speed windows stay `—` (no response touched
+/// them). With no fresh producer behind the cache every figure reads `—`.
+#[test]
+fn tps_rows_reads_zero_rate_for_a_fresh_producers_absent_account() {
+    use crate::profile::{AppConfig, AppState};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = Profile::new("absent".to_string(), None, None);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile.clone()],
+    };
+    let mut app = App::new(config);
+
+    // The cache names only `uwuclxdy`; `absent` is missing from it.
+    app.set_tps(Some(tps_full_snapshot(1_000)));
+    let rows = tps_rows(&profile, &app, 100);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live — · 5m — · 1h — · today —",
+        "speed stays absent while no response touches its windows"
+    );
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live 0 tok/s · 5m 0 tok/s · 1h 0 tok/s · today 0 tok/s",
+        "a fresh producer's absent account still reads a zero rate"
+    );
+
+    // No fresh producer: every figure reads `—`.
+    app.set_tps(None);
+    let rows = tps_rows(&profile, &app, 100);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live — · 5m — · 1h — · today —"
+    );
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live — · 5m — · 1h — · today —"
+    );
+}

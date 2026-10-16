@@ -397,9 +397,10 @@ fn pool_window(utilization: Option<f64>, reset: Option<u64>) -> Option<UsageWind
 /// count, because the column is budgeted on width alone and its cost has to be
 /// constant for that to hold.
 const LIVE_W: usize = 4;
-/// Width of the per-account speed column: one cell past the `t/s` header so a
-/// three-digit figure (`999`) and the header both fit. Like the live column it
-/// is budgeted on width alone and drops whole, never clipping.
+/// Width of the per-account speed column: the `t/s` header plus one cell,
+/// which a four-digit figure (`9999`) fills; past it the figure abbreviates to
+/// whole `k`. Like the live column it is budgeted on width alone and drops
+/// whole, never clipping.
 const TPS_W: usize = 4;
 
 /// Widest the name column ever reaches (the clamp ceiling at wide widths).

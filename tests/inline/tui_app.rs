@@ -38137,3 +38137,84 @@ fn an_unrelated_confirm_cancel_leaves_the_preset_open_undo_alone() {
         "an unrelated confirm's cancel moved the `+ new` form into the slot"
     );
 }
+
+// ── tps: set_tps nudges the tokens worker when a fresh snapshot drops a day ──
+
+/// One cache day entry, `date → account → model → DaySum`; the values are
+/// irrelevant to the drop detection (only the date keys matter).
+fn tps_day(
+    date: &str,
+) -> (
+    String,
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, crate::tps::DaySum>>,
+) {
+    (
+        date.to_string(),
+        std::collections::BTreeMap::from([(
+            "acct".to_string(),
+            std::collections::BTreeMap::from([(
+                "model".to_string(),
+                crate::tps::DaySum {
+                    output: 1,
+                    gen_ms: 1_000,
+                },
+            )]),
+        )]),
+    )
+}
+
+/// A fresh snapshot whose cache `days` hold exactly `days`.
+fn tps_snap(age_ms: u64, days: crate::tps::DaySums) -> crate::tps::Snapshot {
+    let stamp = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(crate::usage::now_ms() - age_ms).unwrap(),
+    )
+    .unwrap()
+    .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+    .to_string();
+    crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        days,
+        ..Default::default()
+    }
+}
+
+/// `set_tps` nudges the tokens worker exactly when a fresh snapshot drops a day
+/// the previous snapshot held — the producer folded that day into the speed
+/// ledger and dropped it from the cache in the same tick, so the worker must
+/// re-read the ledger at once rather than leave the merged day sums blank until
+/// its next 90 s cycle. A day that stays (no fold, or a fold whose ledger save
+/// failed) keeps the cache unchanged and fires no refresh.
+#[test]
+fn set_tps_nudges_the_tokens_worker_when_a_fresh_snapshot_drops_a_day() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let two_days: crate::tps::DaySums =
+        std::collections::BTreeMap::from([tps_day("2026-06-01"), tps_day("2026-06-02")]);
+    let one_day: crate::tps::DaySums = std::collections::BTreeMap::from([tps_day("2026-06-01")]);
+
+    // A fold that drops 2026-06-02: the refresh fires exactly once.
+    let mut app = bare_app();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    app.tokens_refresh = tx;
+    app.set_tps(Some(tps_snap(1_000, two_days.clone())));
+    assert!(rx.try_recv().is_err(), "the seed snapshot drops nothing");
+    app.set_tps(Some(tps_snap(1_000, one_day.clone())));
+    assert_eq!(rx.try_recv(), Ok(()), "a dropped day fires one refresh");
+    assert!(rx.try_recv().is_err(), "and only one");
+
+    // Unchanged days (no fold): no refresh.
+    let mut app = bare_app();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    app.tokens_refresh = tx;
+    app.set_tps(Some(tps_snap(1_000, two_days.clone())));
+    app.set_tps(Some(tps_snap(1_000, two_days.clone())));
+    assert!(rx.try_recv().is_err(), "no day dropped, no refresh");
+
+    // A fold whose ledger save failed keeps the day in the cache: no refresh.
+    let mut app = bare_app();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    app.tokens_refresh = tx;
+    app.set_tps(Some(tps_snap(1_000, two_days.clone())));
+    app.set_tps(Some(tps_snap(1_000, two_days)));
+    assert!(rx.try_recv().is_err(), "the kept day reads as no drop");
+}

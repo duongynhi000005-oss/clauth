@@ -903,6 +903,9 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let count_cache = app.config().state.count_cache;
     let prices = app.price_table.as_ref();
     let period = app.token_period;
+    // One merged day-sum map feeds every speed surface this frame: the today
+    // card, the TOTAL `avg speed`, the trend strip and its footer.
+    let speed_days = merged_speed_days(stats, app);
     // While the transcript top-up is in flight, the first card's title carries a
     // braille spinner (one clock — the app's tick frame).
     let card_spin = app.tokens_topping_up.then(|| spinner_frame(app.tick_count));
@@ -999,7 +1002,10 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
             // Today's date → the today card's title-right meta badge.
             let today_meta = stats.today.as_ref().map(|t| short_date(&t.date));
             let mut today_body = today_lines(stats, inner_w(d.first), count_cache, prices);
-            today_body.push(today_speed_line(app));
+            today_body.push(today_speed_line(
+                app,
+                speed_days.get(&today_date()).copied(),
+            ));
             card(
                 frame,
                 d.first,
@@ -1015,7 +1021,8 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Total stays the lifetime anchor in every period — the scoped window
     // already owns the first card.
     if on_screen(r.total) {
-        let (total_body, total_meta) = total_lines(stats, inner_w(d.total), count_cache, prices);
+        let (total_body, total_meta) =
+            total_lines(stats, &speed_days, inner_w(d.total), count_cache, prices);
         card(
             frame,
             d.total,
@@ -1063,7 +1070,13 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
             None => indeterminate_bar(app.tick_count, track, &label),
         }]
     } else {
-        trend_lines(stats, inner_w(d.trend), inner_h(d.trend), period)
+        trend_lines(
+            stats,
+            &speed_days,
+            inner_w(d.trend),
+            inner_h(d.trend),
+            period,
+        )
     };
     if on_screen(r.trend) {
         card(
@@ -1272,25 +1285,42 @@ fn today_lines(
     ]
 }
 
-/// The today card's `speed` row: `S t/s now · S t/s today`, each figure off a
-/// fresh producer (`total.live.speed`, then the day's accounts × models sums).
-/// Renders from the first frame: before a producer answers, both figures read
-/// `—`.
-fn today_speed_line(app: &App) -> Line<'static> {
-    let tps = app.fresh_tps();
-    let now = tps.and_then(|s| s.total.live.speed);
-    let today = tps
-        .and_then(|s| s.days.get(&today_date()))
-        .map(|accounts| {
-            accounts.values().flat_map(|models| models.values()).fold(
-                crate::tps::DaySum::default(),
-                |acc, d| crate::tps::DaySum {
-                    output: acc.output + d.output,
-                    gen_ms: acc.gen_ms + d.gen_ms,
-                },
-            )
-        })
-        .and_then(crate::tui::app::day_average);
+/// The Tokens tab's per-day speed sums: the speed ledger's finalized days
+/// (`stats.speed_days`), plus the fresh producer cache's `days` — today and
+/// yesterday, which the producer folds into the ledger only once a day is older
+/// than yesterday — for every date the ledger lacks. Each cache day sums over
+/// every account (the reserved unattributed `*` included) and model. A stale
+/// cache contributes nothing, so only the ledger's days survive, matching
+/// "never show a figure clauth did not read". One merge, used by the trend
+/// strip, its footer, the TOTAL `avg speed` and the today card.
+fn merged_speed_days(
+    stats: &TokenStats,
+    app: &App,
+) -> std::collections::BTreeMap<String, crate::tps::DaySum> {
+    let mut days = stats.speed_days.clone();
+    if let Some(snap) = app.fresh_tps() {
+        for (date, accounts) in &snap.days {
+            days.entry(date.clone()).or_insert_with(|| {
+                accounts.values().flat_map(|models| models.values()).fold(
+                    crate::tps::DaySum::default(),
+                    |acc, d| crate::tps::DaySum {
+                        output: acc.output.saturating_add(d.output),
+                        gen_ms: acc.gen_ms.saturating_add(d.gen_ms),
+                    },
+                )
+            });
+        }
+    }
+    days
+}
+
+/// The today card's `speed` row: `S t/s now · S t/s today`. The `now` figure is
+/// the fresh producer's `total.live.speed`; the `today` figure is the merged
+/// day sum's average (see [`merged_speed_days`]). Renders from the first frame:
+/// before a producer answers, both figures read `—`.
+fn today_speed_line(app: &App, today: Option<crate::tps::DaySum>) -> Line<'static> {
+    let now = app.fresh_tps().and_then(|s| s.total.live.speed);
+    let today = today.and_then(crate::tui::app::day_average);
     let figure = |v: Option<f64>| {
         v.map_or_else(
             || Span::styled("—", theme::faint()),
@@ -1317,6 +1347,7 @@ fn today_speed_line(app: &App) -> Line<'static> {
 /// as the returned title-right meta.
 fn total_lines(
     stats: &TokenStats,
+    speed_days: &std::collections::BTreeMap<String, crate::tps::DaySum>,
     w: usize,
     count_cache: bool,
     prices: Option<&PriceTable>,
@@ -1362,9 +1393,8 @@ fn total_lines(
         key("msgs"),
         Span::styled(fmt_count(stats.total_messages), theme::body()),
     ]));
-    if !stats.speed_days.is_empty() {
-        let (output, gen_ms) = stats
-            .speed_days
+    if !speed_days.is_empty() {
+        let (output, gen_ms) = speed_days
             .values()
             .fold((0u64, 0u64), |(o, g), d| (o + d.output, g + d.gen_ms));
         let avg = crate::tui::app::day_average(crate::tps::DaySum { output, gen_ms });
@@ -1447,7 +1477,13 @@ fn period_lines(
 /// per bar at that day's average speed (blank where no producer ran), and the
 /// caption gains `· avg S t/s`; on a short card the strip drops before the
 /// month ticks.
-fn trend_lines(stats: &TokenStats, w: usize, h: usize, period: TokenPeriod) -> Vec<Line<'static>> {
+fn trend_lines(
+    stats: &TokenStats,
+    speed_days: &std::collections::BTreeMap<String, crate::tps::DaySum>,
+    w: usize,
+    h: usize,
+    period: TokenPeriod,
+) -> Vec<Line<'static>> {
     let series = match period.bucket() {
         Some(b) => bucket_tokens(&stats.daily, b),
         None => stats.daily.clone(),
@@ -1476,16 +1512,17 @@ fn trend_lines(stats: &TokenStats, w: usize, h: usize, period: TokenPeriod) -> V
     // only when the chart keeps ≥ 2 rows of its own (same gate as hour-of-day).
     let (cell, gap) = bucket_layout(vals.len(), w);
 
-    // Per-shown-bar speed sums off the ledger: daily keys look the day up, the
-    // weekly/monthly lenses fold every day whose bucket starts at that bar.
+    // Per-shown-bar speed sums off the merged day sums: daily keys look the day
+    // up, the weekly/monthly lenses fold every day whose bucket starts at that
+    // bar.
     let bucket = period.bucket();
     let day_sums: Vec<Option<crate::tps::DaySum>> = dates
         .iter()
         .map(|date| match bucket {
-            None => stats.speed_days.get(*date).copied(),
+            None => speed_days.get(*date).copied(),
             Some(b) => {
                 let mut sum = crate::tps::DaySum::default();
-                for (d, s) in &stats.speed_days {
+                for (d, s) in speed_days {
                     if bucket_start(d, b) == *date {
                         sum.output += s.output;
                         sum.gen_ms += s.gen_ms;

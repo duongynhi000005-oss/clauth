@@ -5,11 +5,12 @@
 //! Row 0 reads `clauth vX.Y.Z` on the left with the herdr tag between them,
 //! and the `[ shunt ]  [ daemon ]` service chips on the right edge; it sheds
 //! the tag first, then the shunt chip, then the daemon chip. Row 1 carries
-//! the fleet's live-session count, the active-profile usage gauge and the
-//! status indicator, nothing else: the account counts and the harness filter
-//! live on the accounts panel's title row, as meta slots beside the bare
-//! `ACCOUNTS` title. Row 1 sheds the live count first; the gauge's ladder
-//! drops the usage bar before the name.
+//! the fleet's live-session chip, the tok/s chip, the active-profile usage
+//! gauge with its speed suffix and the status indicator: the account counts
+//! and the harness filter live on the accounts panel's title row, as meta
+//! slots beside the bare `ACCOUNTS` title. Row 1 sheds the tok/s chip first,
+//! then the live chip, then the speed suffix; the gauge's ladder drops the
+//! usage bar before the name.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};

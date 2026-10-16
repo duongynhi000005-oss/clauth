@@ -2130,7 +2130,8 @@ pub(crate) fn shared_runtime_dirs() -> Vec<PathBuf> {
 ///
 /// An isolated runtime's transcripts live
 /// ONLY in this throwaway tree (never symlinked to the global store) and are
-/// discarded on teardown/GC, so the session index can reach them only while the
+/// rescued into the global store on teardown ([`crate::start::rescue_teardown`])
+/// and GC ([`rescue_tombstone`]); this listing reaches them only while the
 /// session is live. Gated on a live *isolated* session specifically (not
 /// [`has_live_session`], which also counts shared sessions) and on the projects
 /// dir existing, so a shared-only or not-yet-written runtime is skipped.
