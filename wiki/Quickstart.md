@@ -97,7 +97,7 @@ clauth list           # account table with cached usage, no network
 
 ### Rules worth knowing
 
-- **`start` argument order.** clauth's own flags go before the profile name. Anything clauth does not recognize is forwarded to `claude` verbatim, leading hyphens included, except a `--settings` value, which clauth merges into the settings it passes itself. Use `--` for a spelling both programs own, like `--help`.
+- **`start` argument order.** clauth's own flags go before the profile name. Anything clauth does not recognize is forwarded to `claude` verbatim, leading hyphens included; the one exception is a `--settings` before `--`, which clauth merges into its own settings file when it passes one. Use `--` for a spelling both programs own, like `--help`.
 - **Auto memory and `Read` of tool results don't prompt.** Claude Code checks both the written and the resolved path, and a shared session's config dir links into `~/.claude`, so the resolved one falls outside the dirs it exempts.
   - `start` and `delegate` point `autoMemoryDirectory` at the linked-to dir, and add a `Read` hook that allows only the session's own tool results. Grep and Glob on them still prompt.
   - A memory directory you set yourself, in any settings file or `--settings`, wins.
