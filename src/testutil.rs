@@ -482,6 +482,41 @@ pub(crate) fn request_header(raw: &str, name: &str) -> Option<String> {
         })
 }
 
+/// Read an ENTIRE HTTP request (headers + any `Content-Length` body) off a
+/// stream before the caller writes its response. A close that leaves request
+/// bytes unread sends RST instead of FIN, and an RST can discard the client's
+/// not-yet-read response. A bodyless GET drains in one read, which is why only
+/// the POST-driven servers need this.
+pub(crate) fn drain_http_request(sock: &mut impl std::io::Read) -> Vec<u8> {
+    let mut req = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        match sock.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                req.extend_from_slice(&tmp[..n]);
+                if let Some(hlen) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let cl = req[..hlen]
+                        .split(|&b| b == b'\n')
+                        .find_map(|line| {
+                            std::str::from_utf8(line)
+                                .ok()?
+                                .to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if req.len() >= hlen + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    req
+}
+
 /// The projection under [`serve_endpoints_recording`]: hands back each
 /// request's RAW text, headers included, for a leg whose correctness is in a
 /// header it sent (a bearer token, an account id, a content type). It is

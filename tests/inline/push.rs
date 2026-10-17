@@ -887,22 +887,29 @@ fn the_transport_returns_a_redirect_status_without_following_it() {
                 }
             };
             stream.set_nonblocking(false).ok();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .ok();
             let conn = rustls::ServerConnection::new(server_tls).expect("server conn");
             let mut tls = rustls::StreamOwned::new(conn, stream);
-            let mut buf = [0u8; 4096];
-            let mut seen = 0;
-            while !buf[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
-                match tls.read(&mut buf[seen..]) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => seen += n,
-                }
-            }
+            // Drain the WHOLE request before answering: a close that leaves
+            // request bytes unread sends RST, and an RST can discard the
+            // client's not-yet-read response.
+            crate::testutil::drain_http_request(&mut tls);
             let response = format!(
                 "HTTP/1.1 301 Moved Permanently\r\nLocation: https://localhost:{deaf_port}/moved\r\n\
                  Content-Length: 0\r\nConnection: close\r\n\r\n"
             );
             tls.write_all(response.as_bytes()).expect("write 301");
+            tls.flush().expect("flush 301");
+            // TLS close_notify, then the TCP write half's FIN, then drain the
+            // client's side until EOF or a read error (bounded by the socket's
+            // read timeout), so the server never closes with unread data.
+            tls.conn.send_close_notify();
             let _ = tls.flush();
+            let _ = tls.sock.shutdown(std::net::Shutdown::Write);
+            let mut discard = [0u8; 4096];
+            while tls.read(&mut discard).is_ok_and(|n| n > 0) {}
         });
 
         let ca_pem = std::fs::read(&ca_crt).expect("read ca");

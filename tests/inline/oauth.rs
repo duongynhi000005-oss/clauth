@@ -37,44 +37,6 @@ fn persist_rotation(
         })
 }
 
-/// Read an ENTIRE HTTP request (headers + any `Content-Length` body) off a
-/// loopback socket before the caller writes its response. On Windows a
-/// `close()` with unread bytes still in the recv buffer emits an abortive RST
-/// (WSAECONNABORTED 10053) that truncates the client's read of the response;
-/// Linux closes gracefully, so an un-drained POST body only bites the Windows
-/// CI leg. A bodyless GET drains in one read, which is why only the
-/// POST-driven servers need this.
-fn drain_http_request(sock: &mut std::net::TcpStream) -> Vec<u8> {
-    use std::io::Read;
-    let mut req = Vec::new();
-    let mut tmp = [0u8; 1024];
-    loop {
-        match sock.read(&mut tmp) {
-            Ok(0) => break,
-            Ok(n) => {
-                req.extend_from_slice(&tmp[..n]);
-                if let Some(hlen) = req.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let cl = req[..hlen]
-                        .split(|&b| b == b'\n')
-                        .find_map(|line| {
-                            std::str::from_utf8(line)
-                                .ok()?
-                                .to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                        })
-                        .unwrap_or(0);
-                    if req.len() >= hlen + 4 + cl {
-                        break;
-                    }
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    req
-}
-
 fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
@@ -2637,7 +2599,7 @@ fn kick_emits_cc_message_wire_shape() {
     let server = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
-        let req = drain_http_request(&mut sock);
+        let req = crate::testutil::drain_http_request(&mut sock);
         let _ =
             sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}");
         let _ = sock.shutdown(std::net::Shutdown::Write);
@@ -2766,7 +2728,7 @@ fn kick_429_surfaces_limiter_metadata() {
     let server = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
-        drain_http_request(&mut sock);
+        crate::testutil::drain_http_request(&mut sock);
         let response = format!(
             "HTTP/1.1 429 Too Many Requests\r\n\
              retry-after: 120\r\n\
@@ -2889,7 +2851,7 @@ fn token_agent_surfaces_non_2xx_as_ok_not_a_transport_error() {
     let server = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().expect("accept");
         sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
-        drain_http_request(&mut sock);
+        crate::testutil::drain_http_request(&mut sock);
         // The shape the real token endpoint answers a dead refresh token with.
         let body = br#"{"error": "invalid_grant"}"#;
         let _ = sock.write_all(
