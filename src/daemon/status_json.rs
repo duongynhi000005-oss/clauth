@@ -253,7 +253,6 @@ pub(crate) struct ProfileEntry {
     /// it never opted into `auto_start`, or it cannot open a window.
     /// `default` so a reader stays additive-tolerant of an older writer.
     #[serde(default)]
-    #[schema(required = true)]
     pub(crate) auto_start_queue: Option<QueueEntry>,
     #[schema(required = true)]
     pub(crate) bell_threshold: Option<f64>,
@@ -671,7 +670,6 @@ pub(crate) struct StatusBody {
     /// that reads them today changes meaning. `default` so a reader stays
     /// additive-tolerant of an older writer.
     #[serde(default)]
-    #[schema(required = true)]
     pub(crate) active_codex_profile: Option<String>,
     #[serde(default)]
     #[schema(value_type = Vec<String>)]
@@ -688,19 +686,16 @@ pub(crate) struct StatusBody {
     /// serves. `default` so a reader stays additive-tolerant of an older
     /// writer.
     #[serde(default)]
-    #[schema(required = true)]
     pub(crate) gateway: Option<GatewaySlot>,
     /// Additive: the managed proxies, one object per registry row, the array
     /// `GET /api/v1/proxies` serves. `default` so a reader stays
     /// additive-tolerant of an older writer.
     #[serde(default)]
-    #[schema(required = true)]
     pub(crate) proxies: Vec<ProxySlot>,
     /// Additive: the lease holder's tps cache republished minus its `days`
     /// (which the ledger owns), plus `age_secs`. `None` = no producer cache.
     /// `default` so a reader stays additive-tolerant of an older writer.
     #[serde(default)]
-    #[schema(required = true)]
     pub(crate) tps: Option<TpsSlot>,
     pub(crate) profiles: Vec<ProfileEntry>,
 }

@@ -3551,23 +3551,14 @@ fn get_proxies_publishes_the_live_slot_over_the_record() {
     assert_eq!(body[0]["pid"], 4242);
 }
 
-/// `ProxySlot` documents every field as required, like `GatewaySlot`: the
-/// served OpenAPI schema's `required` list names all 12 fields, so a client
-/// generated from it never types a proxy field as optional by accident.
+/// `ProxySlot` documents the 12 fields it shipped with in v0.17.0 as required,
+/// like `GatewaySlot`, so a client generated from the served schema never types
+/// one of them as optional by accident. A field added to it later goes on the
+/// optional side ([`status_body_requires_only_what_every_supported_daemon_sends`]).
 #[test]
-fn proxy_slot_requires_every_field() {
-    let doc = openapi_document_bytes().expect("document serializes");
-    let value: serde_json::Value = serde_json::from_slice(&doc).expect("json");
-    let required = value["components"]["schemas"]["ProxySlot"]["required"]
-        .as_array()
-        .unwrap_or_else(|| panic!("ProxySlot documents a required list"));
-    let mut required: Vec<&str> = required
-        .iter()
-        .map(|field| field.as_str().expect("a field name"))
-        .collect();
-    required.sort_unstable();
+fn proxy_slot_requires_the_fields_it_shipped_with() {
     assert_eq!(
-        required,
+        served_required("ProxySlot"),
         [
             "answerer",
             "binary",
@@ -3583,5 +3574,107 @@ fn proxy_slot_requires_every_field() {
             "version",
         ],
         "ProxySlot's required set"
+    );
+}
+
+/// The served OpenAPI document's `components.schemas.<schema>` node.
+fn served_schema(schema: &str) -> serde_json::Value {
+    let doc = openapi_document_bytes().expect("document serializes");
+    let value: serde_json::Value = serde_json::from_slice(&doc).expect("json");
+    value["components"]["schemas"]
+        .get(schema)
+        .cloned()
+        .unwrap_or_else(|| panic!("{schema} is not a component schema"))
+}
+
+/// The served schema's `required` names, sorted.
+fn served_required(schema: &str) -> Vec<String> {
+    let mut keys: Vec<String> = served_schema(schema)["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{schema} documents a required list"))
+        .iter()
+        .map(|field| field.as_str().expect("a field name").to_owned())
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// Whether the served schema documents `key` among its properties.
+fn documents(schema: &str, key: &str) -> bool {
+    served_schema(schema)["properties"].get(key).is_some()
+}
+
+/// A generated client rejects a body missing a `required` key, and the clauth
+/// app talks to daemons back to v0.16.0 (cloudy, 2026-10-16: no minimum-daemon
+/// gate). So a status key is required only when every such daemon sends it: a
+/// key added after v0.16.0 (`gateway`, `proxies`, `tps`) or one marked
+/// `#[serde(default)]` (`active_codex_profile`, the codex chain slots,
+/// `clauth_version`) stays documented but optional. A new status key joins this
+/// list only if v0.16.0 already emitted it. Nested objects follow the same rule,
+/// which no test here pins: a field added to one after the release that
+/// introduced the object stays optional.
+#[test]
+fn status_body_requires_only_what_every_supported_daemon_sends() {
+    assert_eq!(
+        served_required("StatusBody"),
+        [
+            "active_profile",
+            "generated_at",
+            "pending_switch",
+            "profiles",
+            "refresh_interval_ms",
+            "schema",
+            "wrap_off",
+        ],
+        "StatusBody's required set"
+    );
+    for additive in [
+        "active_codex_profile",
+        "clauth_version",
+        "codex_fallback_chain",
+        "codex_wrap_off",
+        "gateway",
+        "proxies",
+        "tps",
+    ] {
+        assert!(
+            documents("StatusBody", additive),
+            "StatusBody documents {additive}"
+        );
+    }
+}
+
+/// [`status_body_requires_only_what_every_supported_daemon_sends`] for one
+/// `profiles[]` entry: `auto_start_queue` is `#[serde(default)]`, so it is
+/// documented but optional.
+#[test]
+fn profile_entry_requires_only_what_every_supported_daemon_sends() {
+    assert_eq!(
+        served_required("ProfileEntry"),
+        [
+            "active",
+            "auth_status",
+            "auto_start",
+            "base_url",
+            "bell_threshold",
+            "fallback",
+            "fetch_status",
+            "fetched_at",
+            "harness",
+            "has_live_session",
+            "name",
+            "next_refresh_at",
+            "provider",
+            "rolling_token",
+            "stale",
+            "third_party",
+            "tier",
+            "windows",
+        ],
+        "ProfileEntry's required set"
+    );
+    assert!(
+        documents("ProfileEntry", "auto_start_queue"),
+        "ProfileEntry documents auto_start_queue"
     );
 }
