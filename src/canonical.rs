@@ -27,7 +27,9 @@ pub(crate) fn plain(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     dunce::canonicalize(path)
 }
 
-/// `dunce::simplified`: an [`identity`] result at the moment it is shown.
+/// `dunce::simplified`: an already-resolved path in its plain spelling: an
+/// [`identity`] result at the moment it is shown, or a stored path an older
+/// clauth wrote verbatim.
 #[expect(
     clippy::disallowed_methods,
     reason = "this module is the one place that calls it"
