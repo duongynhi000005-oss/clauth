@@ -33,13 +33,14 @@ fn quota_yields_bars_plan_and_detail_rows() {
     assert_eq!(stats.plan.as_deref(), Some("pro"));
     assert!(!stats.best_effort, "typed provider is not best-effort");
 
-    // Three bars, sorted shortest window first. Labels decode from unit/number:
-    // token limits unit=3 number=5 → 5h and unit=6 number=1 → 7d; TIME_LIMIT
-    // unit=5 number=1 → 30d sorts last (mapped, not a duplicated "tokens limit").
+    // Three bars, sorted shortest window first. The token limits' labels decode
+    // from unit/number: unit=3 number=5 → 5h and unit=6 number=1 → 7d. TIME_LIMIT
+    // (unit=5 number=1, a month) is the MCP web tools' quota, not an inference
+    // window, so it reads `mcp tools` and still sorts last.
     assert_eq!(stats.bars.len(), 3);
     assert_eq!(stats.bars[0].label, "5h");
     assert_eq!(stats.bars[1].label, "7d");
-    assert_eq!(stats.bars[2].label, "30d");
+    assert_eq!(stats.bars[2].label, "mcp tools");
 
     // TIME_LIMIT (now last) absolutes: currentValue → used, +remaining → total.
     assert_eq!(stats.bars[2].used, Some(250.0));

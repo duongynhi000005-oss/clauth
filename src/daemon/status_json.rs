@@ -24,8 +24,8 @@ use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
 };
 use crate::profile_json::{
-    OauthAge, Window, oauth_age, provider_label, published_windows, publishes_a_live_window,
-    stale_after_ms, tier_label, usage_cache_file,
+    OauthAge, Window, oauth_age, provider_label, published_windows, published_windows_with_label,
+    publishes_a_live_window, stale_after_ms, tier_label, usage_cache_file,
 };
 use crate::providers::ThirdPartyStats;
 use crate::usage::{
@@ -264,6 +264,14 @@ pub(crate) struct ProfileEntry {
     /// account's provider-derived ones. Empty when the cache behind them
     /// holds none.
     pub(crate) windows: Vec<Window>,
+    /// The label of this profile's LONG window by PRESENCE (`7d`, else `30d`
+    /// for a provider-marked monthly quota), carried in-memory only so the
+    /// push sender reads it off the entry it is already pushing instead of
+    /// re-reading the profile's cache every tick. Never published: the push
+    /// needs the presence label even when the long window's row is lapsed and
+    /// so absent from `windows`, which the published array cannot carry.
+    #[serde(skip)]
+    pub(crate) long_window_label: Option<&'static str>,
     /// The third-party availability object (`available`), `None` for OAuth
     /// accounts.
     #[schema(required = true)]
@@ -545,6 +553,7 @@ pub(crate) fn build_profile_entries(
             } else {
                 None
             };
+            let (windows, long_window_label) = published_windows_with_label(name);
 
             ProfileEntry {
                 name: name.clone(),
@@ -573,7 +582,8 @@ pub(crate) fn build_profile_entries(
                     }),
                 bell_threshold: p.bell_threshold,
                 fallback: fallback(config, p),
-                windows: published_windows(name),
+                windows,
+                long_window_label,
                 third_party,
             }
         })
@@ -648,6 +658,9 @@ pub(crate) fn build_codex_entries(
                 bell_threshold: None,
                 fallback: None,
                 windows: published_windows(name),
+                // Codex windows are always 5h/7d; the push reads its 7d label
+                // directly (no monthly), so the presence label is never needed.
+                long_window_label: None,
                 third_party: None,
             }
         })

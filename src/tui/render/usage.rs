@@ -1487,7 +1487,11 @@ fn status_lines(
                         // that a live-looking 5h window can't serve while the week
                         // is spent. A 5h-only spend is self-evident from the reset.
                         if header.diag.weekly_hard {
-                            fetch_hint = Some(UsageDiag::WeeklyHard);
+                            let monthly = readings
+                                .usage_of(&profile.name)
+                                .and_then(|u| u.long_window())
+                                .is_some_and(|(label, _)| label == crate::usage::LABEL_30D);
+                            fetch_hint = Some(UsageDiag::WeeklyHard { monthly });
                         }
                     }
                     // Nothing pending and nothing maxed — the `idle` dot, which
@@ -1581,8 +1585,10 @@ enum UsageDiag {
     Stuck429 { throttler: String },
     /// AUTH-1 quarantine.
     AuthBroken,
-    /// 7d window at/over the hard cap.
-    WeeklyHard,
+    /// Long window (7d, else the provider-marked monthly quota) at/over the
+    /// hard cap; `monthly` names the monthly arm so the teach never calls a
+    /// monthly-only block "weekly".
+    WeeklyHard { monthly: bool },
     /// Billing member that spent its `max_auto_spend` budget.
     BudgetSpent,
     /// Armed to spend with no cap and no parking spot (DANGER).
@@ -1633,7 +1639,13 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
                 cmd(&format!("clauth login {profile_name}"))
             )
         }
-        UsageDiag::WeeklyHard => "weekly limit is spent".to_string(),
+        UsageDiag::WeeklyHard { monthly } => {
+            if monthly {
+                "monthly quota is spent".to_string()
+            } else {
+                "weekly limit is spent".to_string()
+            }
+        }
         UsageDiag::BudgetSpent => "raise max spend on the fallback tab".to_string(),
         UsageDiag::SpendUncapped => crate::fallback::uncapped_spend_fix().to_string(),
         UsageDiag::Stale => "last usage check failed".to_string(),

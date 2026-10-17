@@ -1620,7 +1620,10 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
         reason(BlockedReason::AuthBroken, DIAG_AUTH_BROKEN),
         reason(BlockedReason::KeyRejected, DIAG_KEY_REJECTED),
         reason(
-            BlockedReason::WeeklySpent { resets_in: None },
+            BlockedReason::WeeklySpent {
+                resets_in: None,
+                monthly: false,
+            },
             DIAG_WEEKLY_SPENT,
         ),
         reason(BlockedReason::KickRejected { lifts_in: 0 }, DIAG_KICK),
@@ -1639,7 +1642,13 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
             },
             "one model's week spent, other models ok",
         ),
-        reason(BlockedReason::WeeklySoft { pct: 0.0 }, DIAG_WEEKLY_SOFT),
+        reason(
+            BlockedReason::WeeklySoft {
+                pct: 0.0,
+                monthly: false,
+            },
+            DIAG_WEEKLY_SOFT,
+        ),
         reason(BlockedReason::Stale, DIAG_STALE),
         (super::services::fix_mark(), "has a fix"),
     ]

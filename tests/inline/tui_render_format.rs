@@ -207,7 +207,7 @@ fn brackets_stay_dim_regardless_of_fetch_state() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let w = cue_window(50.0);
     let spans =
-        window_summary_spans_bracketed(Some(&w), 17, 0, true, None, ResetFmt::default(), false);
+        window_summary_spans_bracketed(Some(&w), 17, 0, true, None, ResetFmt::default(), false, 0);
     assert_eq!(spans[0].content, "[");
     assert_eq!(spans[0].style.fg, theme::dim().fg);
     assert_eq!(spans[2].content, "]");
@@ -219,7 +219,8 @@ fn brackets_stay_dim_regardless_of_fetch_state() {
 #[test]
 fn no_data_dash_stays_faint() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let spans = window_summary_spans_bracketed(None, 17, 0, true, None, ResetFmt::default(), false);
+    let spans =
+        window_summary_spans_bracketed(None, 17, 0, true, None, ResetFmt::default(), false, 0);
     // 17 wide: the 10-cell bar + 2 brackets + 1 gap leave the 13-cell dash span.
     assert_eq!(spans[0].content, "            —");
     assert_eq!(spans[0].style.fg, theme::faint().fg);
@@ -551,7 +552,7 @@ fn overview_reset_middle_dot_stays_uncolored_in_both_mode() {
             clock: ClockFormat::H24,
         },
     ] {
-        let single = window_summary_spans_bracketed(Some(&w), 160, 0, true, None, no_dot, false);
+        let single = window_summary_spans_bracketed(Some(&w), 160, 0, true, None, no_dot, false, 0);
         assert!(
             !single.iter().any(|s| s.content == " · "),
             "no separator without a countdown+stamp pair"
@@ -612,9 +613,9 @@ fn stale_window_fades_only_fill_and_percent() {
     // a mutation that leaked `stale` into the reset color.
     let reset = Some(theme::warning());
     let live =
-        window_summary_spans_bracketed(Some(&w), 26, 0, true, reset, ResetFmt::default(), false);
+        window_summary_spans_bracketed(Some(&w), 26, 0, true, reset, ResetFmt::default(), false, 0);
     let stale =
-        window_summary_spans_bracketed(Some(&w), 26, 0, true, reset, ResetFmt::default(), true);
+        window_summary_spans_bracketed(Some(&w), 26, 0, true, reset, ResetFmt::default(), true, 0);
 
     // spans[0] = `[`, [1] = fill, [2] = `]`, [3] = ` XX%`, [4..] = reset suffix.
     assert_eq!(live[1].content, "█████░░░░░");

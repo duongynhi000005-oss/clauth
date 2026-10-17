@@ -647,10 +647,27 @@ fn start_block_labels_are_the_tui_chip_words() {
         start_block_label(&StartBlock::NotOauth),
         "not an oauth account"
     );
-    assert_eq!(start_block_label(&StartBlock::WeeklySpent), "weekly spent");
     assert_eq!(
-        start_block_label(&StartBlock::WeeklySoft { pct: 99.0 }),
+        start_block_label(&StartBlock::WeeklySpent { monthly: false }),
+        "weekly spent"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::WeeklySpent { monthly: true }),
+        "30d spent"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::WeeklySoft {
+            pct: 99.0,
+            monthly: false
+        }),
         "weekly 99%"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::WeeklySoft {
+            pct: 99.0,
+            monthly: true
+        }),
+        "30d 99%"
     );
     assert_eq!(
         start_block_label(&StartBlock::FiveHour { pct: 100.0 }),

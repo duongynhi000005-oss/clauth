@@ -812,6 +812,7 @@ fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conv
             resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
             used: None,
             total: None,
+            inference_quota: false,
         }],
         plan: None,
         endpoint: None,
@@ -3712,6 +3713,125 @@ fn a_seven_day_window_reaching_the_weekly_line_queues_one_push_across_ticks() {
         [crate::push::Trigger::Window {
             profile: "alpha".to_string()
         }]
+    );
+}
+
+/// A monthly-only member's marked `30d` window judges at the member's weekly
+/// line (the ruling's "window push follows that line too"): the published
+/// `windows` array carries the 30d row and the push reads it as the long
+/// window when no 7d row exists.
+#[test]
+fn a_monthly_window_reaching_the_weekly_line_queues_one_push_across_ticks() {
+    let _home = HomeSandbox::new();
+    let url = "https://token-plan.maas.qwencloudapi.com/apps/anthropic";
+    let mut profile = Profile::new(
+        "qwen".to_string(),
+        Some(url.to_string()),
+        Some("k".to_string()),
+    );
+    profile.provider = crate::providers::Provider::from_base_url(url);
+    profile.fallback_threshold = Some(90.0);
+    profile.weekly_threshold = Some(80.0);
+    let mut config = persist(vec![profile.clone()], Some("qwen"), 60_000);
+    config.state.fallback_chain = vec!["qwen".into()];
+    config.profiles = vec![profile];
+    // The marked monthly bar at 85% — past the member's own weekly line (80)
+    // but under the chain default (98), so only the override can fire the push.
+    // With no 5h or 7d row, only the long window could fire it at all.
+    let resets_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![crate::providers::UsageBar {
+            label: "30d".to_string(),
+            pct: 85.0,
+            resets_at: Some(resets_at),
+            used: None,
+            total: None,
+            inference_quota: true,
+        }],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("qwen"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+    let mut d = daemon_for(config);
+    let (queue, inbox) = crate::push::queue_for_tests();
+    d.push = Some(queue);
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("qwen".to_string(), crate::usage::FetchStatus::Fresh);
+
+    d.write_status();
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Window {
+            profile: "qwen".to_string()
+        }]
+    );
+}
+
+/// The control arm: the same monthly bar at 85% with NO per-account override
+/// sits under the chain default (98), so no push fires. The main test's 80%
+/// override is what made the bar cross — 85% clears 80 but not 98, so the two
+/// arms together pin that the member's own weekly line judges the monthly
+/// window, not the chain default.
+#[test]
+fn a_monthly_window_under_the_chain_default_queues_no_push() {
+    let _home = HomeSandbox::new();
+    let url = "https://token-plan.maas.qwencloudapi.com/apps/anthropic";
+    let mut profile = Profile::new(
+        "qwen".to_string(),
+        Some(url.to_string()),
+        Some("k".to_string()),
+    );
+    profile.provider = crate::providers::Provider::from_base_url(url);
+    profile.fallback_threshold = Some(90.0);
+    let mut config = persist(vec![profile.clone()], Some("qwen"), 60_000);
+    config.state.fallback_chain = vec!["qwen".into()];
+    config.profiles = vec![profile];
+    let resets_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![crate::providers::UsageBar {
+            label: "30d".to_string(),
+            pct: 85.0,
+            resets_at: Some(resets_at),
+            used: None,
+            total: None,
+            inference_quota: true,
+        }],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("qwen"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+    let mut d = daemon_for(config);
+    let (queue, inbox) = crate::push::queue_for_tests();
+    d.push = Some(queue);
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("qwen".to_string(), crate::usage::FetchStatus::Fresh);
+
+    d.write_status();
+    d.write_status();
+
+    assert!(
+        inbox.try_iter().collect::<Vec<_>>().is_empty(),
+        "a monthly window under the chain default queues no push"
     );
 }
 

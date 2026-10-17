@@ -19316,6 +19316,159 @@ fn a_herdr_first_launch_under_the_rebind_confirm_defers_the_landing() {
     );
 }
 
+/// The overview's long slot shows a monthly-only account's quota with the
+/// `30d ` label in the cell — the header stays `7d`, so the cell names the
+/// window itself. A two-row roster (an OAuth account beside qwen) pins the
+/// cross-row contract the single-row pin could not: the `%` signs align on one
+/// rail and the OAuth row keeps its own figure with no `30d` dead cells, so an
+/// OAuth account in a roster holding a monthly row stays byte-identical.
+#[test]
+fn the_overview_long_slot_labels_a_monthly_only_accounts_quota() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::tui::theme::Tier;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(Tier::Full);
+    let kerry = Profile::new("kerry".to_string(), None, None);
+    let url = "https://token-plan.maas.qwencloudapi.com/apps/anthropic";
+    let mut qwen = Profile::new(
+        "qwen".to_string(),
+        Some(url.to_string()),
+        Some("k".to_string()),
+    );
+    qwen.provider = Provider::from_base_url(url);
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![kerry.name.clone(), qwen.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![kerry, qwen],
+    });
+    // The OAuth row's 7d figure (no reset: the countdown is not what this pin
+    // guards, and its text drifts with the clock).
+    app.usage_store.lock().unwrap().insert(
+        "kerry".to_string(),
+        UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 40.0,
+                resets_at: None,
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    // qwen's marked monthly cache, re-anchored so its reset stays live. The
+    // stamp is `now + 30d + 6h` (not the exact `now + 30d` the reanchor helper
+    // writes) so the countdown sits mid-bucket and stays `30d 6h` across the
+    // run's sub-second drift.
+    let mut stats: crate::providers::ThirdPartyStats =
+        serde_json::from_str(crate::testutil::QWEN_MONTHLY_CACHE).expect("captured cache parses");
+    for bar in &mut stats.bars {
+        bar.resets_at = Some(epoch_secs_to_iso(now_epoch_secs() + 30 * 86_400 + 6 * 3600));
+    }
+    app.third_party_usage_store
+        .lock()
+        .unwrap()
+        .insert("qwen".to_string(), stats);
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let kerry_row = rows
+        .iter()
+        .find(|r| r.contains("kerry"))
+        .expect("a kerry row renders");
+    let qwen_row = rows
+        .iter()
+        .find(|r| r.contains("qwen"))
+        .expect("a qwen row renders");
+    assert_eq!(
+        kerry_row,
+        "│ ❯   kerry       —                   ⋯             —                 [████░░░░░░]   40%                               │",
+        "the OAuth row keeps its own figure with no monthly dead cells, its % on the shared rail"
+    );
+    assert_eq!(
+        qwen_row,
+        "│     qwen        API                               —                 30d [░░░░░░] 0.01% (30d 6h)                      │",
+        "the monthly row names the window in-cell, takes the prefix's cells from its own bar, and keeps its % on the shared rail"
+    );
+}
+
+/// The bare-reading tier pins the owner's recorded deviation: at ≤100 cols the
+/// monthly figure renders bare under the `7d` header (no `30d ` prefix, no
+/// bar), because the bare tier has no bar cells to borrow the prefix from.
+/// Same two-row roster as the 120-col pin, so the OAuth row's alignment holds
+/// beside the monthly row at a stock terminal width.
+#[test]
+fn the_overview_bare_tier_shows_a_monthly_only_quota_without_the_label() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::tui::theme::Tier;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(Tier::Full);
+    let kerry = Profile::new("kerry".to_string(), None, None);
+    let url = "https://token-plan.maas.qwencloudapi.com/apps/anthropic";
+    let mut qwen = Profile::new(
+        "qwen".to_string(),
+        Some(url.to_string()),
+        Some("k".to_string()),
+    );
+    qwen.provider = Provider::from_base_url(url);
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![kerry.name.clone(), qwen.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![kerry, qwen],
+    });
+    app.usage_store.lock().unwrap().insert(
+        "kerry".to_string(),
+        UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 40.0,
+                resets_at: None,
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    let mut stats: crate::providers::ThirdPartyStats =
+        serde_json::from_str(crate::testutil::QWEN_MONTHLY_CACHE).expect("captured cache parses");
+    for bar in &mut stats.bars {
+        bar.resets_at = Some(epoch_secs_to_iso(now_epoch_secs() + 30 * 86_400 + 6 * 3600));
+    }
+    app.third_party_usage_store
+        .lock()
+        .unwrap()
+        .insert("qwen".to_string(), stats);
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let kerry_row = rows
+        .iter()
+        .find(|r| r.contains("kerry"))
+        .expect("a kerry row renders");
+    let qwen_row = rows
+        .iter()
+        .find(|r| r.contains("qwen"))
+        .expect("a qwen row renders");
+    assert_eq!(
+        kerry_row,
+        "│ ❯   kerry        —               ⋯             —           40%               │",
+        "the OAuth row keeps its own figure with no bar at the bare tier"
+    );
+    assert_eq!(
+        qwen_row,
+        "│     qwen         API                           —         0.01%               │",
+        "the monthly figure renders bare under the 7d header at the bare tier"
+    );
+}
+
 /// A launch outside herdr mode opens the `home tab` (default `overview`) and
 /// never touches the herdr landing marker.
 #[test]
@@ -34244,6 +34397,7 @@ mod usage_picker {
                 resets_at: Some(live_iso()),
                 used: None,
                 total: None,
+                inference_quota: false,
             }],
             plan: None,
             endpoint: None,

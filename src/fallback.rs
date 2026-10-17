@@ -6,9 +6,9 @@ use crate::actions::{switch_off_locked, switch_profile_locked};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile, ProfileName, WalkOrder};
 use crate::usage::{
-    FetchStatus, KickBlocks, PollStreaks, StatusStore, ThirdPartyStatusStore, ThirdPartyStreaks,
-    ThirdPartyUsageStore, UsageInfo, UsageStore, UsageWindow, five_hour_live, iso_to_epoch_secs,
-    now_epoch_secs, seven_day_live,
+    FetchStatus, KickBlocks, LABEL_30D, PollStreaks, StatusStore, ThirdPartyStatusStore,
+    ThirdPartyStreaks, ThirdPartyUsageStore, UsageInfo, UsageStore, UsageWindow, five_hour_live,
+    iso_to_epoch_secs, long_window_live, now_epoch_secs,
 };
 
 // Test-only per-thread counter: increments each time an evaluator entry point
@@ -258,7 +258,8 @@ fn spend_armed(usage: Option<&crate::usage::UsageInfo>, budget_on: bool, ceiling
 /// 98): it protects the CHAIN (a wrong hop strands days, not hours), not one
 /// member's taste. Whether a member is JUDGED against it is per-account —
 /// `Profile::check_weekly` off raises that member's line to the hard cap (see
-/// [`weekly_line`]). Only `seven_day` gates HERE — per-model `weekly_scoped`
+/// [`weekly_line`]). Only the LONG window gates HERE — the aggregate 7d, else a
+/// provider-marked monthly inference quota — while per-model `weekly_scoped`
 /// limits (e.g. "7d fable") gate separately, per-account and never as full
 /// exhaustion (see [`scoped_weekly_blocked_info`]). Store-side twin logic
 /// inlines this same shape (see `is_exhausted_from_usage`).
@@ -267,11 +268,10 @@ pub(crate) fn weekly_blocked_info(
     now_secs: i64,
     weekly_pct: f64,
 ) -> bool {
-    seven_day_live(info, now_secs)
+    long_window_live(info, now_secs)
         && info
-            .seven_day
-            .as_ref()
-            .is_some_and(|w| w.utilization >= weekly_pct)
+            .long_window()
+            .is_some_and(|(_, w)| w.utilization >= weekly_pct)
 }
 
 /// The SOFT weekly line a member's aggregate 7d window is judged at:
@@ -317,15 +317,16 @@ pub(crate) fn weekly_blocked(
     })
 }
 
-/// The aggregate 7d window at/over the API's refusal cap — dead for days, no
-/// per-account setting consulted (see [`weekly_blocked`]).
+/// The account's LONG window (aggregate 7d, else a monthly inference quota)
+/// at/over the API's refusal cap — dead for days, no per-account setting
+/// consulted (see [`weekly_blocked`]).
 pub(crate) fn weekly_hard_blocked(usage: Option<&UsageInfo>) -> bool {
     usage.is_some_and(|u| weekly_blocked_info(u, now_epoch_secs(), WEEKLY_HARD_BLOCK_PCT))
 }
 
 /// Whether one window carries a parseable reset still in the future — the
 /// per-window liveness primitive [`scoped_weekly_blocked_info`] applies to
-/// each `weekly_scoped` entry (mirroring `seven_day_live` for the aggregate).
+/// each `weekly_scoped` entry (mirroring `long_window_live` for the aggregate).
 pub(crate) fn window_live(w: &UsageWindow, now_secs: i64) -> bool {
     w.resets_at
         .as_deref()
@@ -613,7 +614,7 @@ pub(crate) fn projected_exhausted(
 /// still bails the WHOLE result to `None` rather than being skipped around
 /// (see the loop's `config.find` below). Reuses
 /// [`is_exhausted_hard`]'s wall-clock gates (`five_hour_live` and the weekly
-/// `seven_day_live` block) for every OTHER member: one exhausted in neither
+/// `long_window_live` block) for every OTHER member: one exhausted in neither
 /// window already has headroom — `find_recovered_member` / `scan_recovery`
 /// would relink it on the very next tick — so THAT member's presence bails
 /// the WHOLE result to `None` rather than being skipped around; the
@@ -657,11 +658,11 @@ pub(crate) fn soonest_resume(
         if !is_exhausted_hard(profile, usage.get(name.as_str())) {
             return None;
         }
-        // A weekly-dead member resumes at its 7d reset (its 5h window may be
-        // lapsed or absent entirely); anyone else at their next 5h reset.
+        // A weekly-dead member resumes at its long-window reset (its 5h window
+        // may be lapsed or absent entirely); anyone else at their next 5h reset.
         let usage = usage.get(name.as_str())?;
         let window = if weekly_blocked(profile, weekly_pct, Some(usage)) {
-            usage.seven_day.as_ref()?
+            usage.long_window().map(|(_, w)| w)?
         } else {
             usage.five_hour.as_ref()?
         };
@@ -699,10 +700,15 @@ pub(crate) enum BlockedReason {
     /// wrong fix — the key must be re-entered. A lapsed Alibaba console session
     /// is NOT this (its key still serves).
     KeyRejected,
-    /// 7d window at/over the hard cap ([`WEEKLY_HARD_BLOCK_PCT`]) — dead until the
-    /// weekly reset. `resets_in` is seconds to that reset when the window carries
-    /// a parseable `resets_at`.
-    WeeklySpent { resets_in: Option<i64> },
+    /// Long window (7d, else the provider-marked monthly quota) at/over the
+    /// hard cap ([`WEEKLY_HARD_BLOCK_PCT`]) — dead until the
+    /// window's reset. `resets_in` is seconds to that reset when the window
+    /// carries a parseable `resets_at`; `monthly` names the monthly arm so the
+    /// copy never calls a monthly-only block "weekly".
+    WeeklySpent {
+        resets_in: Option<i64>,
+        monthly: bool,
+    },
     /// The messages limiter refused this member's 5h auto-start kick (switch-grade
     /// — the same block the walk routes around): clauth can't bring it online
     /// regardless of its usage headroom. `lifts_in` is seconds to the limiter's
@@ -720,9 +726,12 @@ pub(crate) enum BlockedReason {
     /// this member's `check_scoped` gate is on: out of rotation, though it
     /// still serves other models. `label`/`pct` name the worst such window.
     ScopedSpent { label: String, pct: f64 },
-    /// 7d window over the soft switch line but under the hard cap: still serves
-    /// every request, just won't be picked. `pct` is the current utilization.
-    WeeklySoft { pct: f64 },
+    /// Long window (7d, else the provider-marked monthly quota) over the soft
+    /// switch line but under the hard cap: still serves
+    /// every request, just won't be picked. `pct` is the current utilization;
+    /// `monthly` names the monthly arm so the copy never calls a monthly-only
+    /// block "weekly".
+    WeeklySoft { pct: f64, monthly: bool },
     /// Last read wasn't live (cached / endpoint-429): the numbers are old, so the
     /// chain distrusts this member's apparent headroom.
     Stale,
@@ -797,10 +806,16 @@ pub(crate) fn health_blocked_reason(
     let now = now_epoch_secs();
     // Weekly HARD cap first: dead for days regardless of the 5h window.
     if weekly_hard_blocked(usage) {
-        let resets_in = usage
-            .and_then(|u| u.seven_day.as_ref())
-            .and_then(|w| reset_secs(w, now));
-        return Some(BlockedReason::WeeklySpent { resets_in });
+        let (monthly, resets_in) = usage
+            .map(|u| u.long_window())
+            .map(|l| {
+                (
+                    l.is_some_and(|(label, _)| label == LABEL_30D),
+                    l.and_then(|(_, w)| reset_secs(w, now)),
+                )
+            })
+            .unwrap_or((false, None));
+        return Some(BlockedReason::WeeklySpent { resets_in, monthly });
     }
     // Kick-rejected outranks the usage blocks: the limiter won't let clauth start
     // this member at all, so its free/paid headroom is moot. Below weekly-hard
@@ -847,10 +862,12 @@ pub(crate) fn health_blocked_reason(
     }
     if weekly_blocked(profile, soft, usage) {
         let pct = usage
-            .and_then(|u| u.seven_day.as_ref())
-            .map(|w| w.utilization)
+            .and_then(|u| u.long_window())
+            .map(|(_, w)| w.utilization)
             .unwrap_or(soft);
-        return Some(BlockedReason::WeeklySoft { pct });
+        let monthly =
+            usage.is_some_and(|u| u.long_window().is_some_and(|(label, _)| label == LABEL_30D));
+        return Some(BlockedReason::WeeklySoft { pct, monthly });
     }
     if matches!(status, Some(FetchStatus::Cached | FetchStatus::RateLimited)) {
         return Some(BlockedReason::Stale);
@@ -1304,16 +1321,16 @@ fn is_exhausted_active_from_usage(
 }
 
 /// The soonest-reset ranking key for one member's cached usage: the epoch min
-/// over the aggregate 7d `resets_at` and every `weekly_scoped` entry's,
-/// `None` when no weekly window carries a parseable reset (an idle/cold
-/// account). The 5h `resets_at` is deliberately NOT folded in — it slides at
-/// `now + 5h` on idle windows and is not a ranking key (measured). Scoped windows carry the aggregate's instant
-/// today, so the min is future-proofing rather than a second source.
+/// over the account's long window's `resets_at` and every `weekly_scoped`
+/// entry's, `None` when no weekly window carries a parseable reset (an
+/// idle/cold account). The 5h `resets_at` is deliberately NOT folded in — it
+/// slides at `now + 5h` on idle windows and is not a ranking key (measured).
+/// Scoped windows carry the aggregate's instant today, so the min is
+/// future-proofing rather than a second source.
 fn weekly_reset_key(info: &UsageInfo) -> Option<i64> {
     let mut best: Option<i64> = info
-        .seven_day
-        .as_ref()
-        .and_then(|w| w.resets_at.as_deref())
+        .long_window()
+        .and_then(|(_, w)| w.resets_at.as_deref())
         .and_then(iso_to_epoch_secs);
     for scoped in &info.weekly_scoped {
         if let Some(t) = scoped
@@ -1329,14 +1346,14 @@ fn weekly_reset_key(info: &UsageInfo) -> Option<i64> {
 }
 
 /// The most-weekly-headroom ranking key for one member's cached usage: its
-/// live 7d utilization, then its live 5h utilization. A window past its reset
-/// or carrying no parseable reset, and an absent 5h window, read as unused:
-/// the same wall-clock rule the exhaustion predicates apply. `None` when the
-/// reading holds no weekly window at all: an unknown week cannot be proven
-/// emptier than a read one.
+/// live long-window utilization, then its live 5h utilization. A window past
+/// its reset or carrying no parseable reset, and an absent 5h window, read as
+/// unused: the same wall-clock rule the exhaustion predicates apply. `None`
+/// when the reading holds no weekly window at all: an unknown week cannot be
+/// proven emptier than a read one.
 fn weekly_headroom_key(info: &UsageInfo, now_secs: i64) -> Option<(f64, f64)> {
-    let seven = info.seven_day.as_ref()?;
-    let seven_used = if seven_day_live(info, now_secs) {
+    let (_, seven) = info.long_window()?;
+    let seven_used = if long_window_live(info, now_secs) {
         seven.utilization
     } else {
         0.0
@@ -1408,8 +1425,8 @@ pub(crate) enum StartBlock {
     Canceled,
     KickRejected,
     NotOauth,
-    WeeklySpent,
-    WeeklySoft { pct: f64 },
+    WeeklySpent { monthly: bool },
+    WeeklySoft { pct: f64, monthly: bool },
     FiveHour { pct: f64 },
     ScopedSpent { label: String, pct: f64 },
 }
@@ -1461,7 +1478,11 @@ pub(crate) fn start_block(
     let exhausted = is_exhausted_from_info(member, usage, member.weekly_line, now);
     if exhausted && usage.is_some_and(|info| weekly_blocked_info(info, now, WEEKLY_HARD_BLOCK_PCT))
     {
-        return Some(StartBlock::WeeklySpent);
+        let monthly = usage.is_some_and(|info| {
+            info.long_window()
+                .is_some_and(|(label, _)| label == LABEL_30D)
+        });
+        return Some(StartBlock::WeeklySpent { monthly });
     }
     if kick_rejected {
         return Some(StartBlock::KickRejected);
@@ -1492,10 +1513,14 @@ pub(crate) fn start_block(
     }
     if exhausted && usage.is_some_and(|info| weekly_blocked_info(info, now, member.weekly_line)) {
         let pct = usage
-            .and_then(|info| info.seven_day.as_ref())
-            .map(|w| w.utilization)
+            .and_then(|info| info.long_window())
+            .map(|(_, w)| w.utilization)
             .unwrap_or(member.weekly_line);
-        return Some(StartBlock::WeeklySoft { pct });
+        let monthly = usage.is_some_and(|info| {
+            info.long_window()
+                .is_some_and(|(label, _)| label == LABEL_30D)
+        });
+        return Some(StartBlock::WeeklySoft { pct, monthly });
     }
     None
 }

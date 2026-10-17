@@ -1413,6 +1413,10 @@ pub(crate) const ALIBABA_NO_BARS_CACHE_BYTES: &str = r#"{"is_available":true,"ro
 /// provider writes. The mixed bar keys are the point — a reader that assumed
 /// every bar carries the same five fields parses this one wrong.
 pub(crate) const THIRD_PARTY_BARS_CACHE_BYTES: &str = r#"{"is_available":true,"rows":[{"label":"30d","value":"","kind":"heading"},{"label":"search-prime","value":"12 / 100","kind":"body"},{"label":"web-reader","value":"3 / 100","kind":"body"},{"label":"zread","value":"0 / 50","kind":"body"},{"label":"7d tokens","value":"","kind":"heading"},{"label":"GLM-5.3","value":"80.1M","kind":"body"},{"label":"GLM-5.2","value":"40.2M","kind":"body"},{"label":"GLM-4.7","value":"3.1M","kind":"body"},{"label":"total","value":"123.4M  (1.2k calls)","kind":"faint"}],"bars":[{"label":"5h","pct":12.5,"resets_at":"2026-08-15T12:00:00Z"},{"label":"7d","pct":48.0,"resets_at":"2026-08-20T00:00:00Z"},{"label":"30d","pct":3.0,"resets_at":"2026-09-01T00:00:00Z","used":123.4,"total":4000.0}],"plan":"pro","best_effort":false}"#;
+/// The cache the Alibaba arm writes for the captured Qwen Cloud monthly
+/// payloads: one `30d` bar the provider marks as the account's inference quota,
+/// the lite tier's 11500 allowance turning the ratio into `used / total`.
+pub(crate) const QWEN_MONTHLY_CACHE: &str = r#"{"is_available":true,"rows":[],"bars":[{"label":"30d","pct":0.0095790974,"resets_at":"2026-11-11T16:00:00+00:00","used":1.101596201,"total":11500.0,"inference_quota":true}],"plan":"lite","best_effort":false}"#;
 
 /// A real two-wallet DeepSeek cache: the empty USD wallet FIRST, the funded
 /// CNY wallet second. Captured 2026-08-28 from the operator's `DS6` profile's
@@ -1930,6 +1934,7 @@ pub(crate) fn bar(label: &str, pct: f64) -> crate::providers::UsageBar {
         resets_at: None,
         used: None,
         total: None,
+        inference_quota: false,
     }
 }
 

@@ -5291,6 +5291,7 @@ fn roster_rank_skips_a_third_party_bar_whose_reset_has_passed() {
         resets_at,
         used: None,
         total: None,
+        inference_quota: false,
     };
     write_profile_cache(
         &crate::profile::ProfileName::from("zai"),
@@ -5343,6 +5344,153 @@ fn roster_rank_skips_a_third_party_bar_whose_reset_has_passed() {
             amount: 1117.10,
         },
         "with no live bar the wallet arm takes over, the same rank a barless provider gets",
+    );
+}
+
+/// A monthly-only provider (Alibaba's marked `30d` bar, no 5h/7d) ranks on its
+/// monthly quota — the live long window — exactly as a 7d account ranks on its
+/// week, so a monthly-only account never sorts as `Unknown` while `clauth list`
+/// shows its `30d` figure.
+#[test]
+fn roster_rank_ranks_a_monthly_only_account_on_its_monthly_quota() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use crate::providers::{ThirdPartyStats, UsageBar};
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["qwen"]);
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("qwen"),
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: vec![UsageBar {
+                label: "30d".to_string(),
+                pct: 20.0,
+                resets_at: Some(stamp(30 * 86_400)),
+                used: None,
+                total: None,
+                inference_quota: true,
+            }],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("qwen")),
+        RosterRank::Window(80.0),
+        "a monthly-only account ranks on its live monthly quota"
+    );
+}
+
+/// A best-effort (generic-scanner) account ranks on its live 5h bar: the rank
+/// reads the ungated bar→window mapping, not [`ThirdPartyStats::to_usage_info`]'s
+/// best-effort refusal, so `Window(80.0)` (100 − 5h 20%) is what base
+/// `c6be6ecb` returned.
+#[test]
+fn roster_rank_ranks_a_best_effort_account_on_its_live_5h_bar() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use crate::providers::{ThirdPartyStats, UsageBar};
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["gen"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("gen"),
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: vec![
+                UsageBar {
+                    label: "5h".to_string(),
+                    pct: 20.0,
+                    resets_at: None,
+                    used: None,
+                    total: None,
+                    inference_quota: false,
+                },
+                UsageBar {
+                    label: "7d".to_string(),
+                    pct: 30.0,
+                    resets_at: None,
+                    used: None,
+                    total: None,
+                    inference_quota: false,
+                },
+            ],
+            plan: None,
+            endpoint: None,
+            best_effort: true,
+        },
+    );
+
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("gen")),
+        RosterRank::Window(80.0),
+        "a best-effort account ranks on its live 5h bar"
+    );
+}
+
+/// A duplicate label resolves to its live bar: with a lapsed `5h` bar ahead of
+/// a live one, the rank takes the live `5h` bar (base `c6be6ecb` read the
+/// first live `5h` bar the same way), never the lapsed head nor a fall-through
+/// to the `7d` bar.
+#[test]
+fn roster_rank_takes_the_first_live_5h_bar_when_a_label_occurs_twice() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use crate::providers::{ThirdPartyStats, UsageBar};
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["gen"]);
+    let live = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 30 * 86_400);
+    let lapsed = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 3600);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("gen"),
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: vec![
+                UsageBar {
+                    label: "5h".to_string(),
+                    pct: 100.0,
+                    resets_at: Some(lapsed),
+                    used: None,
+                    total: None,
+                    inference_quota: false,
+                },
+                UsageBar {
+                    label: "5h".to_string(),
+                    pct: 20.0,
+                    resets_at: Some(live.clone()),
+                    used: None,
+                    total: None,
+                    inference_quota: false,
+                },
+                UsageBar {
+                    label: "7d".to_string(),
+                    pct: 30.0,
+                    resets_at: Some(live),
+                    used: None,
+                    total: None,
+                    inference_quota: false,
+                },
+            ],
+            plan: None,
+            endpoint: None,
+            best_effort: true,
+        },
+    );
+
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("gen")),
+        RosterRank::Window(80.0),
+        "a best-effort account ranks on the first live 5h bar, not the lapsed head nor the 7d"
     );
 }
 
@@ -5401,6 +5549,7 @@ fn roster_rank_ignores_a_retyped_profiles_leftover_oauth_cache() {
                 resets_at: Some(stamp(3600)),
                 used: None,
                 total: None,
+                inference_quota: false,
             }],
             plan: None,
             endpoint: None,

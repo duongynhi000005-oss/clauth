@@ -116,7 +116,8 @@ pub(crate) struct Reading<'a> {
     /// The 5h window: the chain's switch line for this account (`None` off
     /// the chain) and the utilization read (`None` when the reading has none).
     pub(crate) five_hour: WindowReading,
-    /// The 7d window against the member's weekly line.
+    /// The long window (7d, else the provider-marked monthly quota) against
+    /// the member's weekly line.
     pub(crate) seven_day: WindowReading,
     /// A `Fresh`, trusted reading: only one moves the window latches.
     pub(crate) fresh: bool,

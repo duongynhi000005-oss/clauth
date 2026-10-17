@@ -303,6 +303,7 @@ fn stats(
         usage.per_5_hour_percentage,
         usage.per_5_hour_reset_time,
         quota.and_then(|q| q.allowance(tier, "five_hour")),
+        false,
     ) {
         bars.push(bar);
     }
@@ -311,6 +312,7 @@ fn stats(
         usage.per_1_month_percentage,
         usage.per_1_month_reset_time,
         quota.and_then(|q| q.allowance(tier, "monthly")),
+        true,
     ) {
         bars.push(bar);
     }
@@ -362,12 +364,15 @@ fn stats(
 ///
 /// `pct` arrives as a RATIO in 0..1 (0.1284 = 12.84%), so it is scaled by 100
 /// and clamped — a hand-back above 1.0 would otherwise render a bar many times
-/// its own width.
+/// its own width. `inference_quota` marks the monthly `30d` bar (the account's
+/// inference quota, which gates like a weekly window) and stays off the `5h`
+/// bar, which maps by label as before.
 fn window_bar(
     label: &str,
     ratio: Option<f64>,
     reset_ms: Option<i64>,
     total: Option<f64>,
+    inference_quota: bool,
 ) -> Option<UsageBar> {
     let pct = ratio
         .filter(|r| r.is_finite())
@@ -382,6 +387,7 @@ fn window_bar(
         // quota-config leg answered.
         used: total.map(|t| t * pct / 100.0),
         total,
+        inference_quota,
     })
 }
 

@@ -436,6 +436,307 @@ fn list_table_falls_through_to_the_wallet_over_a_non_canonical_bar_label() {
     );
 }
 
+/// The cache the Alibaba arm writes for the captured Qwen Cloud monthly payloads
+/// (`providers_alibaba.rs`' `the_captured_monthly_usage_reads_as_one_30d_bar`):
+/// one `30d` bar the provider marks as the account's inference quota, the
+/// lite tier's 11500 allowance turning the ratio into `used / total`. Lives in
+/// `testutil` so the Overview render test drives the same captured bytes.
+use crate::testutil::QWEN_MONTHLY_CACHE;
+
+fn qwen_config() -> AppConfig {
+    let url = "https://token-plan.maas.qwencloudapi.com/apps/anthropic";
+    let mut qwen = Profile::new("qwen".to_string(), Some(url.to_string()), Some("k".into()));
+    qwen.provider = crate::providers::Provider::from_base_url(url);
+    // Saved: the feed classifies a third-party account off its stored config.
+    crate::profile::save_profile(&qwen).unwrap();
+    AppConfig {
+        state: AppState::default(),
+        profiles: vec![qwen],
+    }
+}
+
+/// A monthly-only account (Alibaba's one `30d` bar) fills the long column
+/// with its monthly figure, the label in the cell since the header says 7D;
+/// it has no 5h window, so that column stays a dash.
+#[test]
+fn list_table_shows_a_monthly_only_accounts_quota_in_the_long_column() {
+    let _home = HomeSandbox::new();
+    let config = qwen_config();
+    crate::testutil::register_names(&["qwen"]);
+    crate::testutil::write_captured_third_party_cache("qwen", QWEN_MONTHLY_CACHE);
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN                  5H USED           7D USED  ENDPOINT",
+            "  qwen     Alibaba Model Studio        -  30d 1.10 / 11500  https://token-plan.maas.qwencloudapi.com/apps/anthropic",
+        ],
+        "a monthly-only row shows its monthly quota, labelled, in the long column"
+    );
+}
+
+/// The status feed's `windows` carries the monthly quota as a `30d` row beside
+/// the 5h/7d ones: the same typed entries `clauth list` renders from.
+#[test]
+fn a_monthly_only_accounts_entry_publishes_a_30d_window() {
+    let _home = HomeSandbox::new();
+    let config = qwen_config();
+    crate::testutil::register_names(&["qwen"]);
+    crate::testutil::write_captured_third_party_cache("qwen", QWEN_MONTHLY_CACHE);
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let rows: Vec<(&str, f64, bool)> = entries[0]
+        .windows
+        .iter()
+        .map(|w| (w.label.as_str(), w.utilization_pct, w.resets_at.is_some()))
+        .collect();
+    assert_eq!(
+        rows,
+        [("30d", 0.0095790974, true)],
+        "the monthly quota publishes as one live `30d` window"
+    );
+}
+
+/// z.ai's month-long bar is its MCP web tools' quota, never an inference
+/// window: a cache written before the relabel still carries it as an unmarked
+/// `30d`, and it publishes nothing, so only the provider's mark decides.
+#[test]
+fn an_unmarked_30d_bar_publishes_no_window() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let mut zai = Profile::new("z.ai".to_string(), Some(url.to_string()), Some("k".into()));
+    zai.provider = crate::providers::Provider::from_base_url(url);
+    crate::profile::save_profile(&zai).unwrap();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+    crate::testutil::register_names(&["z.ai"]);
+    crate::testutil::write_captured_third_party_cache(
+        "z.ai",
+        crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES,
+    );
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let labels: Vec<&str> = entries[0]
+        .windows
+        .iter()
+        .map(|w| w.label.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        ["5h", "7d"],
+        "an unmarked `30d` bar is not a window"
+    );
+}
+
+/// The mark check's second guard, on the LIST's long column: an unmarked `30d`
+/// bar (z.ai's MCP web-tools quota) with no 7d bar beside it must not fill the
+/// long column. The captured z.ai cache minus its 7d bar leaves a live 5h and
+/// an unmarked 30d; the long column stays a dash, never `30d x%`.
+#[test]
+fn an_unmarked_30d_bar_with_no_7d_fills_no_long_column() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let mut zai = Profile::new("z.ai".to_string(), Some(url.to_string()), Some("k".into()));
+    zai.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+    crate::testutil::register_names(&["z.ai"]);
+    let mut stats: crate::providers::ThirdPartyStats =
+        serde_json::from_slice(&crate::testutil::reanchored_bars_cache_bytes(
+            crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES,
+        ))
+        .unwrap();
+    stats.bars.retain(|b| b.label != "7d");
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("z.ai"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN  5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai    12.5%        -  https://api.z.ai/api/anthropic",
+        ],
+        "an unmarked 30d with no 7d never fills the long column"
+    );
+}
+
+/// A best-effort (generic-scanner) account keeps its live `5h`/`7d` bars in
+/// both columns: the long column reads the ungated bar→window mapping, not
+/// [`ThirdPartyStats::to_usage_info`]'s best-effort refusal, so the figures a
+/// reader sees are the figures base `c6be6ecb` rendered.
+#[test]
+fn list_table_shows_a_best_effort_accounts_bars_in_both_columns() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.example.com/anthropic";
+    let mut generic = Profile::new("gen".to_string(), Some(url.to_string()), Some("k".into()));
+    generic.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![generic],
+    };
+    crate::testutil::register_names(&["gen"]);
+    crate::testutil::write_captured_third_party_cache(
+        "gen",
+        r#"{"is_available":true,"rows":[],"bars":[{"label":"5h","pct":20.0,"resets_at":"2026-01-01T00:00:00Z"},{"label":"7d","pct":30.0,"resets_at":"2026-01-01T00:00:00Z"}],"best_effort":true}"#,
+    );
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN     5H USED  7D USED  ENDPOINT",
+            "  gen      generic      20%      30%  https://api.example.com/anthropic",
+        ],
+        "a best-effort account keeps its live 5h and 7d bars in both columns"
+    );
+}
+
+/// A duplicate label is a designed shape: the generic scanner emits one bar per
+/// element under a window-literal key, so two `7d` bars can share one label.
+/// The long column shows the first LIVE bar under the label presence chose —
+/// base `c6be6ecb` read the first live `7d` bar the same way — never the first
+/// (lapsed) one, so a lapsed head of the list cannot dash a live figure behind
+/// it.
+#[test]
+fn list_table_takes_the_first_live_bar_when_a_label_occurs_twice() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.example.com/anthropic";
+    let mut gen_profile = Profile::new("gen".to_string(), Some(url.to_string()), Some("k".into()));
+    gen_profile.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![gen_profile],
+    };
+    crate::testutil::register_names(&["gen"]);
+    let live = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 30 * 86_400);
+    let lapsed = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 3600);
+    let stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![
+            crate::providers::UsageBar {
+                label: "7d".to_string(),
+                pct: 90.0,
+                resets_at: Some(lapsed),
+                used: None,
+                total: None,
+                inference_quota: false,
+            },
+            crate::providers::UsageBar {
+                label: "7d".to_string(),
+                pct: 30.0,
+                resets_at: Some(live.clone()),
+                used: None,
+                total: None,
+                inference_quota: false,
+            },
+            crate::providers::UsageBar {
+                label: "5h".to_string(),
+                pct: 20.0,
+                resets_at: Some(live),
+                used: None,
+                total: None,
+                inference_quota: false,
+            },
+        ],
+        plan: None,
+        endpoint: None,
+        best_effort: true,
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("gen"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN     5H USED  7D USED  ENDPOINT",
+            "  gen      generic      20%      30%  https://api.example.com/anthropic",
+        ],
+        "the long column shows the first live bar under the presence label"
+    );
+}
+
+/// When a cache holds a marked and an unmarked `30d` bar together, the long
+/// column shows the MARKED bar's figures: the figure lookup repeats the mark
+/// check, so the unmarked bar (a stale z.ai-style MCP web-tools quota) can
+/// never stand in for the marked monthly inference quota.
+#[test]
+fn list_table_prefers_the_marked_30d_bar_over_an_unmarked_one() {
+    let _home = HomeSandbox::new();
+    let url = "https://token-plan.maas.qwencloudapi.com/apps/anthropic";
+    let mut qwen = Profile::new("qwen".to_string(), Some(url.to_string()), Some("k".into()));
+    qwen.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![qwen],
+    };
+    crate::testutil::register_names(&["qwen"]);
+    let stamp = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 30 * 86_400);
+    // The unmarked bar comes FIRST so a label-only lookup would take it.
+    let stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![
+            crate::providers::UsageBar {
+                label: "30d".to_string(),
+                pct: 77.0,
+                resets_at: Some(stamp.clone()),
+                used: None,
+                total: None,
+                inference_quota: false,
+            },
+            crate::providers::UsageBar {
+                label: "30d".to_string(),
+                pct: 12.5,
+                resets_at: Some(stamp),
+                used: Some(123.4),
+                total: Some(4000.0),
+                inference_quota: true,
+            },
+        ],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("qwen"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+    assert!(
+        table.contains("30d 123.40 / 4000"),
+        "the long column shows the marked bar's absolute amounts, got:\n{table}"
+    );
+    assert!(
+        !table.contains("77%"),
+        "the unmarked 30d bar never stands in for the marked quota, got:\n{table}"
+    );
+}
+
 /// The wallet fallback: a scalar provider (DeepSeek) has no bars, so the first
 /// FUNDED wallet's spendable balance stands in for the headroom the columns
 /// exist to show — one figure, in the 5h column, same as the MCP headline.

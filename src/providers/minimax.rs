@@ -121,6 +121,7 @@ fn bars(models: &[ModelRemains]) -> Vec<UsageBar> {
             resets_at: m.end_time.map(ms_to_iso),
             used: None,
             total: None,
+            inference_quota: false,
         });
     }
     if let Some(pct) = utilization(m.current_weekly_remaining_percent) {
@@ -130,6 +131,7 @@ fn bars(models: &[ModelRemains]) -> Vec<UsageBar> {
             resets_at: m.weekly_end_time.map(ms_to_iso),
             used: None,
             total: None,
+            inference_quota: false,
         });
     }
     bars

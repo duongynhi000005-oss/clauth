@@ -142,7 +142,7 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
     let profile = &app.config().profiles[0];
     let (five, seven) = overview_windows(profile, &readings);
     let five = five.expect("5h bar synthesizes a window");
-    let seven = seven.expect("7d bar synthesizes a window");
+    let seven = seven.expect("7d bar synthesizes a window").window;
 
     assert!(
         app.active_burn_rate(
@@ -267,6 +267,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
         resets_at: Some(reset_in(reset_secs)),
         used: None,
         total: None,
+        inference_quota: false,
     };
     let stats = crate::providers::ThirdPartyStats {
         is_available: true,
@@ -5158,6 +5159,7 @@ fn tp_bar(pct: f64) -> crate::providers::ThirdPartyStats {
             )),
             used: None,
             total: None,
+            inference_quota: false,
         }],
         plan: None,
         endpoint: None,

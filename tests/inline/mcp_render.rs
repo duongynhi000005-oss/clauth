@@ -59,6 +59,7 @@ fn bar(label: &str, pct: f64) -> UsageBar {
         resets_at: None,
         used: None,
         total: None,
+        inference_quota: false,
     }
 }
 
@@ -71,6 +72,7 @@ fn lapsed_bar(label: &str, pct: f64) -> UsageBar {
         )),
         used: None,
         total: None,
+        inference_quota: false,
     }
 }
 
@@ -127,6 +129,7 @@ fn third_party_headline_drops_bars_whose_reset_has_passed() {
                 resets_at: Some(live),
                 used: None,
                 total: None,
+                inference_quota: false,
             },
         ],
         vec![],

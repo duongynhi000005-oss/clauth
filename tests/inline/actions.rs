@@ -1063,6 +1063,7 @@ fn one_shot_stores(
                             resets_at: w.resets_at.clone(),
                             used: None,
                             total: None,
+                            inference_quota: false,
                         })
                         .into_iter()
                         .collect(),

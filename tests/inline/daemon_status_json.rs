@@ -1449,6 +1449,37 @@ fn published_entries_deserialize_into_the_typed_contract() {
     assert_eq!(win_keys, ["label", "resets_at", "utilization_pct"]);
 }
 
+/// The typed entry carries its long-window PRESENCE label in-memory (`7d`, else
+/// `30d`), so the push sender reads it off the entry instead of re-reading the
+/// profile's cache every tick — and it never leaks into the published body.
+#[test]
+fn the_entry_carries_the_long_window_presence_label_unpublished() {
+    let _home = HomeSandbox::new();
+    // A monthly-only third-party account: label `30d`, one published 30d row.
+    let url = "https://token-plan.maas.qwencloudapi.com/apps/anthropic";
+    let mut qwen = Profile::new("qwen".to_string(), Some(url.to_string()), Some("k".into()));
+    qwen.provider = crate::providers::Provider::from_base_url(url);
+    crate::profile::save_profile(&qwen).expect("save the qwen profile");
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![qwen],
+    };
+    crate::testutil::register_names(&["qwen"]);
+    crate::testutil::write_captured_third_party_cache("qwen", crate::testutil::QWEN_MONTHLY_CACHE);
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    assert_eq!(entries[0].long_window_label, Some("30d"));
+
+    let v = status_value(&config, config.state.refresh_interval_ms, None, false);
+    assert!(
+        !v["profiles"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("long_window_label"),
+        "the presence label is an in-memory field, never published"
+    );
+}
+
 /// The codex half of the feed is ADDITIVE (decision 10): the top-level
 /// `active_profile`/`wrap_off` stay the CLAUDE slots, the per-harness ones sit
 /// beside them, and codex entries are APPENDED so a reader that predates codex
@@ -1862,6 +1893,7 @@ fn status_body_matches_legacy_json_bytes() {
                         resets_at: None,
                     },
                 ],
+                long_window_label: Some("7d"),
                 third_party: Some(ThirdPartyAvailability { available: true }),
             },
             ProfileEntry {
@@ -1883,6 +1915,7 @@ fn status_body_matches_legacy_json_bytes() {
                 bell_threshold: None,
                 fallback: None,
                 windows: vec![],
+                long_window_label: None,
                 third_party: None,
             },
             ProfileEntry {
@@ -1907,6 +1940,7 @@ fn status_body_matches_legacy_json_bytes() {
                 bell_threshold: None,
                 fallback: None,
                 windows: vec![],
+                long_window_label: None,
                 third_party: None,
             },
         ],
@@ -2211,6 +2245,7 @@ fn status_body_never_leaks_a_credential() {
                 resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + 2 * 3600)),
                 used: None,
                 total: None,
+                inference_quota: false,
             }],
             plan: None,
             endpoint: None,
@@ -2571,6 +2606,7 @@ fn status_schema_agrees_with_the_serialized_body() {
                 resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + 2 * 3600)),
                 used: None,
                 total: None,
+                inference_quota: false,
             }],
             plan: None,
             endpoint: None,

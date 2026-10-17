@@ -1299,7 +1299,10 @@ fn reason_pills_keep_two_rounded_decimals() {
         "[ 5h 73.42% ]"
     );
     assert_eq!(
-        pill(BlockedReason::WeeklySoft { pct: 99.999 }),
+        pill(BlockedReason::WeeklySoft {
+            pct: 99.999,
+            monthly: false
+        }),
         "[ weekly 100% ]  still serving"
     );
     assert_eq!(
@@ -1308,6 +1311,76 @@ fn reason_pills_keep_two_rounded_decimals() {
             pct: 1.000_000_000_000_000_9
         }),
         "[ 7d fable 1% ]  other models ok"
+    );
+}
+
+/// The soft-block pill names a monthly window (`30d 99%`), never "weekly" —
+/// the owner's copy ruling, pinned on the render arm itself.
+#[test]
+fn the_soft_block_pill_names_a_monthly_window() {
+    let pill: String = reason_pill_spans(
+        &BlockedReason::WeeklySoft {
+            pct: 99.0,
+            monthly: true,
+        },
+        ResetFmt::default(),
+    )
+    .iter()
+    .map(|s| s.content.as_ref())
+    .collect();
+    assert_eq!(pill, "[ 30d 99% ]  still serving");
+}
+
+/// The spent-block fix names a monthly quota (`monthly quota is spent`), never
+/// "weekly limit is spent" — the owner's copy ruling, pinned on the render arm
+/// itself.
+#[test]
+fn the_spent_fix_names_a_monthly_quota() {
+    assert_eq!(
+        reason_fix(
+            &BlockedReason::WeeklySpent {
+                resets_in: None,
+                monthly: true,
+            },
+            &crate::profile::ProfileName::from("acct")
+        ),
+        "monthly quota is spent"
+    );
+}
+
+/// The spent pill names a monthly quota (`30d spent`), never "weekly spent" —
+/// the owner's copy ruling, pinned on the render arm itself. (`30d spent`
+/// rides two arms: this one and `format.rs`'s `start_block_label`; both are
+/// pinned separately so neither can revert to the weekly word alone.)
+#[test]
+fn the_spent_pill_names_a_monthly_quota() {
+    let pill: String = reason_pill_spans(
+        &BlockedReason::WeeklySpent {
+            resets_in: None,
+            monthly: true,
+        },
+        ResetFmt::default(),
+    )
+    .iter()
+    .map(|s| s.content.as_ref())
+    .collect();
+    assert_eq!(pill, "[ 30d spent ]");
+}
+
+/// The soft-block fix line names the monthly quota (`monthly quota past the
+/// weekly switch line, still serving`), never the weekly wording — the owner's
+/// copy ruling, pinned on the render arm itself.
+#[test]
+fn the_soft_fix_names_a_monthly_quota() {
+    assert_eq!(
+        reason_fix(
+            &BlockedReason::WeeklySoft {
+                pct: 99.0,
+                monthly: true,
+            },
+            &crate::profile::ProfileName::from("acct")
+        ),
+        "monthly quota past the weekly switch line, still serving"
     );
 }
 
@@ -1754,14 +1827,20 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
         BlockedReason::Canceled,
         BlockedReason::AuthBroken,
         BlockedReason::KeyRejected,
-        BlockedReason::WeeklySpent { resets_in: None },
+        BlockedReason::WeeklySpent {
+            resets_in: None,
+            monthly: false,
+        },
         BlockedReason::KickRejected { lifts_in: 60 },
         BlockedReason::BudgetSpent,
         BlockedReason::FiveHour {
             pct: 99.0,
             resets_in: None,
         },
-        BlockedReason::WeeklySoft { pct: 85.0 },
+        BlockedReason::WeeklySoft {
+            pct: 85.0,
+            monthly: false,
+        },
         BlockedReason::Stale,
     ];
     let mut seen: Vec<String> = Vec::new();

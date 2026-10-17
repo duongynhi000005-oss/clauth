@@ -28,11 +28,11 @@ use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resum
 use super::global_config::reminder_text;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
-    DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
-    MIN_VALUE_W, bold_when, cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list,
-    head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style,
-    master_detail, name_color, pill, rail_hint_lines, section_box, section_box_verbatim,
-    select_line, value_caret, wrap_words,
+    DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_MONTHLY_SOFT, DIAG_MONTHLY_SPENT, DIAG_STALE,
+    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when, cycle_row_lines,
+    draw_scrolled_lines_with_footnote, draw_selector_list, head_cols, help_tooltip_lines,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill,
+    rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret, wrap_words,
 };
 use super::prose::{cmd, key};
 use crate::fallback::{
@@ -476,8 +476,12 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
         BlockedReason::Canceled => (DIAG_CANCELED.to_string(), theme::danger().bold(), None),
         BlockedReason::AuthBroken => (DIAG_AUTH_BROKEN.to_string(), theme::danger().bold(), None),
         BlockedReason::KeyRejected => (DIAG_KEY_REJECTED.to_string(), theme::danger().bold(), None),
-        BlockedReason::WeeklySpent { resets_in } => (
-            DIAG_WEEKLY_SPENT.to_string(),
+        BlockedReason::WeeklySpent { resets_in, monthly } => (
+            if *monthly {
+                DIAG_MONTHLY_SPENT.to_string()
+            } else {
+                DIAG_WEEKLY_SPENT.to_string()
+            },
             theme::danger().bold(),
             resets_in.as_ref().map(|s| reset_pill(*s, fmt)),
         ),
@@ -499,8 +503,12 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
             theme::warning().bold(),
             Some("other models ok".to_string()),
         ),
-        BlockedReason::WeeklySoft { pct } => (
-            format!("weekly {}", format_pct(*pct)),
+        BlockedReason::WeeklySoft { pct, monthly } => (
+            format!(
+                "{} {}",
+                if *monthly { "30d" } else { "weekly" },
+                format_pct(*pct)
+            ),
             theme::warning().bold(),
             Some("still serving".to_string()),
         ),
@@ -527,14 +535,26 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> Str
             format!("re-login with {}", cmd(&format!("clauth login {name}")))
         }
         BlockedReason::KeyRejected => "re-enter the api key on the setup tab".to_string(),
-        BlockedReason::WeeklySpent { .. } => "weekly limit is spent".to_string(),
+        BlockedReason::WeeklySpent { monthly, .. } => {
+            if *monthly {
+                "monthly quota is spent".to_string()
+            } else {
+                "weekly limit is spent".to_string()
+            }
+        }
         BlockedReason::KickRejected { .. } => "claude code is refusing to start it".to_string(),
         BlockedReason::BudgetSpent => "raise max spend below".to_string(),
         BlockedReason::FiveHour { .. } => "5h quota is spent, it resets on its own".to_string(),
         BlockedReason::ScopedSpent { .. } => {
             "that model's weekly window is spent, other models still serve".to_string()
         }
-        BlockedReason::WeeklySoft { .. } => DIAG_WEEKLY_SOFT.to_string(),
+        BlockedReason::WeeklySoft { monthly, .. } => {
+            if *monthly {
+                DIAG_MONTHLY_SOFT.to_string()
+            } else {
+                DIAG_WEEKLY_SOFT.to_string()
+            }
+        }
         BlockedReason::Stale => "last usage check failed".to_string(),
     }
 }

@@ -1489,8 +1489,9 @@ impl Daemon {
     /// invalid; `AuthExpired`: a provider rejected the usage credential; an
     /// `expired` access token only waits for its rotation), and a chain
     /// member's window reaching the line the chain switches it at, on a fresh
-    /// reading, the bell's own rule: the 5h window at its `threshold`, the 7d
-    /// at its weekly line; a codex chain member at the lines the codex chain
+    /// reading, the bell's own rule: the 5h window at its `threshold`, the long
+    /// window (7d, else the provider-marked monthly quota) at its weekly line;
+    /// a codex chain member at the lines the codex chain
     /// switches it at (`fallback::snapshot_codex_chain`: the default 5h
     /// threshold, the codex weekly line). Nothing is queued while the API is
     /// off.
@@ -1517,6 +1518,18 @@ impl Daemon {
                 .find(|w| w.label == label)
                 .map(|w| w.utilization_pct)
         };
+        // The long window's util, read at the presence label the entry already
+        // carries from `build_status` (the same single cache read its published
+        // rows derive from), never at whichever row survived the liveness
+        // filter — a lapsed 7d window reads the 7d label and thus no published
+        // row, instead of falling to the monthly row. Codex windows are always
+        // 5h/7d, so a codex member keeps its 7d row.
+        let long_util = |entry: &status_json::ProfileEntry| {
+            if codex_member(entry).is_some() {
+                return util(entry, crate::usage::LABEL_7D);
+            }
+            entry.long_window_label.and_then(|label| util(entry, label))
+        };
         let readings = entries.iter().map(|entry| crate::push::Reading {
             name: entry.name.as_str(),
             failing: entry.auth_status == "broken"
@@ -1539,7 +1552,10 @@ impl Daemon {
                         codex_member(entry)
                             .map(crate::codex_profiles::CodexState::weekly_switch_threshold_pct)
                     }),
-                util: util(entry, crate::usage::LABEL_7D),
+                // The long window — 7d, else the published 30d monthly row —
+                // judges at the member's weekly line (the ruling's "window push
+                // follows that line too").
+                util: long_util(entry),
             },
             fresh: !entry.stale && entry.fetch_status.as_deref() == Some(fresh_status),
         });

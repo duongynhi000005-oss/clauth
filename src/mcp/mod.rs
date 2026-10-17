@@ -315,18 +315,20 @@ fn roster_rank(name: &ProfileName) -> RosterRank {
     let Some(stats) = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE) else {
         return RosterRank::Unknown;
     };
-    if let Some(bar) = stats
-        .bars
-        .iter()
-        .filter(|b| crate::profile_json::usage_bar_is_live(b))
-        .find(|b| b.label == "5h")
-        .or_else(|| {
-            stats
-                .bars
-                .iter()
-                .filter(|b| crate::profile_json::usage_bar_is_live(b))
-                .find(|b| b.label == "7d")
-        })
+    // Rank the third-party arm off its derived windows — live 5h first (the
+    // pool a `delegate` actually competes for), else its live long window (7d,
+    // else the provider-marked monthly quota), then the wallet — the same
+    // derivation the list's long column reads, so a bar the roster ranks the
+    // account on cannot render as dashes there and vice versa. Each figure is
+    // the first LIVE bar under its label (the shared
+    // [`crate::profile_json::live_bar`]), as base read raw bars: a duplicate
+    // label resolves to its live bar, never the first, possibly lapsed, one.
+    if let Some(bar) = crate::profile_json::live_bar(&stats, crate::usage::LABEL_5H) {
+        return RosterRank::Window(100.0 - bar.pct);
+    }
+    if let Some(info) = stats.windows_info()
+        && let Some((label, _)) = info.long_window()
+        && let Some(bar) = crate::profile_json::live_bar(&stats, label)
     {
         return RosterRank::Window(100.0 - bar.pct);
     }

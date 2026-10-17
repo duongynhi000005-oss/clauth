@@ -4939,6 +4939,15 @@ fn both_windows(five: f64, seven: f64) -> UsageInfo {
     }
 }
 
+/// UsageInfo carrying only a live provider-marked monthly window at `util` (no
+/// 7d) — a monthly-only account, the shape the long-window accessor falls to.
+fn monthly_usage(util: f64) -> UsageInfo {
+    UsageInfo {
+        monthly: Some(window(util, Some(live_reset()))),
+        ..UsageInfo::default()
+    }
+}
+
 // `candidate_excluded` (the dead-member predicate the reachability checks
 // share) and `blocked_reason`'s dead-first rungs
 // (`Disabled`/`Canceled`/`AuthBroken`) are two hand-written ladders over one
@@ -5458,7 +5467,7 @@ fn blocked_reason_weekly_hard_carries_the_7d_reset_countdown() {
     assert!(
         matches!(
             blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None),
-            Some(BlockedReason::WeeklySpent { resets_in: Some(secs) })
+            Some(BlockedReason::WeeklySpent { resets_in: Some(secs), monthly: false })
                 if (3500..=3600).contains(&secs)
         ),
         "got {:?}",
@@ -5489,6 +5498,54 @@ fn blocked_reason_weekly_hard_outranks_a_5h_block() {
         ),
         Some(BlockedReason::WeeklySpent { .. })
     ));
+}
+
+/// A monthly-only member past the SOFT weekly line (99%) carries `monthly: true`
+/// on its block — the producer that decides it, not the renderer, so every
+/// surface downstream reads `30d 99%`, never "weekly 99%".
+#[test]
+fn a_monthly_only_member_past_the_soft_line_carries_the_monthly_label() {
+    let p = profile_with_usage("a", Some(90.0), Some(monthly_usage(99.0)));
+    let (cfg, readings) = config_with_chain(vec![p], "a");
+    assert_eq!(
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None
+        ),
+        Some(BlockedReason::WeeklySoft {
+            pct: 99.0,
+            monthly: true
+        })
+    );
+}
+
+/// A monthly-only member at the HARD cap (100%) carries `monthly: true` on its
+/// spent block — the producer that decides it, so the pill and fix read
+/// `30d spent` / `monthly quota is spent`.
+#[test]
+fn a_monthly_only_member_at_the_hard_cap_carries_the_monthly_label() {
+    let p = profile_with_usage("a", Some(90.0), Some(monthly_usage(100.0)));
+    let (cfg, readings) = config_with_chain(vec![p], "a");
+    let reason = blocked_reason(
+        &cfg,
+        &cfg.profiles[0],
+        None,
+        &HashSet::new(),
+        readings.usage.get(cfg.profiles[0].name.as_str()),
+        None,
+    );
+    assert_eq!(
+        reason.as_ref().map(|r| match r {
+            BlockedReason::WeeklySpent { monthly, resets_in } => (*monthly, resets_in.is_some()),
+            _ => (false, false),
+        }),
+        Some((true, true)),
+        "the hard-spent monthly member carries the monthly label and a live reset"
+    );
 }
 
 #[test]
@@ -5564,7 +5621,7 @@ fn blocked_reason_weekly_soft_below_the_hard_cap_still_shows() {
     let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(matches!(
         blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None),
-        Some(BlockedReason::WeeklySoft { pct }) if (pct - 99.0).abs() < f64::EPSILON
+        Some(BlockedReason::WeeklySoft { pct, monthly: false }) if (pct - 99.0).abs() < f64::EPSILON
     ));
 }
 
@@ -7487,8 +7544,17 @@ fn start_walk_skips_what_the_switch_walk_skips() {
     assert_eq!(rows[2].block, Some(StartBlock::Canceled));
     assert_eq!(rows[3].block, Some(StartBlock::KickRejected));
     assert_eq!(rows[4].block, Some(StartBlock::FiveHour { pct: 100.0 }));
-    assert_eq!(rows[5].block, Some(StartBlock::WeeklySpent));
-    assert_eq!(rows[6].block, Some(StartBlock::WeeklySoft { pct: 99.0 }));
+    assert_eq!(
+        rows[5].block,
+        Some(StartBlock::WeeklySpent { monthly: false })
+    );
+    assert_eq!(
+        rows[6].block,
+        Some(StartBlock::WeeklySoft {
+            pct: 99.0,
+            monthly: false
+        })
+    );
 }
 
 #[test]
@@ -7567,7 +7633,10 @@ fn start_walk_with_nothing_startable_returns_no_pick_and_every_verdict() {
     );
     assert_eq!(rows[0].block, Some(StartBlock::Disabled));
     assert_eq!(rows[1].block, Some(StartBlock::FiveHour { pct: 100.0 }));
-    assert_eq!(rows[2].block, Some(StartBlock::WeeklySpent));
+    assert_eq!(
+        rows[2].block,
+        Some(StartBlock::WeeklySpent { monthly: false })
+    );
 }
 
 /// The scoped half of the start walk's accept, spelled from the walk's own
@@ -7685,6 +7754,36 @@ fn an_empty_day_list_leaves_the_flag_in_charge_at_the_chain() {
         &HashSet::new(),
     );
     assert!(member.preferred, "no list, so the flag decides");
+}
+
+/// A monthly-only member past the SOFT line gets the monthly start-block label:
+/// `start_block` sets `monthly` from the long window, so `start_block_label`
+/// reads `30d 99%`, never "weekly 99%".
+#[test]
+fn start_block_names_a_monthly_only_members_soft_block() {
+    let (config, _readings) = config_with_chain(vec![start_walk_profile("p")], "p");
+    let member = chain_member(
+        &config,
+        &ProfileName::from("p"),
+        config.state.weekly_switch_threshold_pct(),
+        &HashSet::new(),
+    );
+    let profile = config
+        .find(&ProfileName::from("p"))
+        .expect("fixture profile");
+    let usage = monthly_usage(99.0);
+    let block = start_block(&config, &member, profile, Some(&usage), false, false, None);
+    assert_eq!(
+        block,
+        Some(StartBlock::WeeklySoft {
+            pct: 99.0,
+            monthly: true
+        })
+    );
+    assert_eq!(
+        crate::format::start_block_label(&block.expect("a block")),
+        "30d 99%"
+    );
 }
 
 #[test]
@@ -8106,6 +8205,7 @@ fn tp_stats(pct: f64) -> crate::providers::ThirdPartyStats {
             resets_at: Some(live_reset()),
             used: None,
             total: None,
+            inference_quota: false,
         }],
         plan: None,
         endpoint: None,
@@ -8254,6 +8354,103 @@ fn a_hybrid_active_walks_on_its_provider_windows() {
         None,
         "a hybrid active with provider headroom must not switch on its stale OAuth reading"
     );
+}
+
+/// A third-party store entry whose provider publishes one live `30d` bar at
+/// `pct`: the shape Alibaba's Qwen Cloud Token Plan reads as (a monthly quota,
+/// no 5h or 7d window), the bar marked as the account's inference quota the way
+/// the Alibaba arm writes it to the cache.
+fn tp_monthly_stats(pct: f64) -> crate::providers::ThirdPartyStats {
+    let mut v = serde_json::to_value(tp_stats(pct)).unwrap();
+    v["bars"][0]["label"] = "30d".into();
+    v["bars"][0]["inference_quota"] = true.into();
+    serde_json::from_value(v).unwrap()
+}
+
+/// A monthly-only member's monthly quota meets the weekly line (98 by default)
+/// when it has no 7d window: past the line the active walks off, under it it
+/// stays. The OAuth arm is the control: the same 99% on a 7d window walks off
+/// today, so the third-party arm differs only in the window's label.
+#[test]
+fn a_monthly_only_active_walks_off_past_the_weekly_line() {
+    use crate::usage::ThirdPartyUsageStore;
+
+    // Control: an OAuth active whose 7d window sits past the weekly line.
+    let (config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let weekly_spent = UsageInfo {
+        five_hour: Some(window(10.0, Some(live_reset()))),
+        seven_day: Some(window(99.0, Some(live_reset()))),
+        ..UsageInfo::default()
+    };
+    let usage: HashMap<String, UsageInfo> = HashMap::from([
+        ("a".to_string(), weekly_spent),
+        (
+            "b".to_string(),
+            usage_info(Some(window(10.0, Some(live_reset())))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target_with_usage(
+            &snap,
+            &usage,
+            &HashSet::new(),
+            ActiveBurnRate::FromDisk
+        ),
+        Some(SwitchAction::To("b".to_string())),
+        "control: a 7d window past the weekly line walks the active off"
+    );
+
+    for (pct, expected, why) in [
+        (
+            99.0,
+            Some(SwitchAction::To("b".to_string())),
+            "a monthly quota past the weekly line walks the active off",
+        ),
+        (
+            50.0,
+            None,
+            "a monthly quota under the weekly line keeps the active",
+        ),
+    ] {
+        let mut a = profile_with_util("a", Some(95.0), None);
+        a.profile.base_url =
+            Some("https://token-plan.maas.qwencloudapi.com/apps/anthropic".to_string());
+        a.profile.api_key = Some("key".to_string());
+        let (config, _readings) =
+            config_with_chain(vec![a, profile_with_util("b", Some(95.0), Some(10.0))], "a");
+        let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+        let store = store_with_utils(&[("b", 10.0)]);
+        let tp_store: ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+            "a".to_string(),
+            tp_monthly_stats(pct),
+        )])));
+        let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("a")]);
+
+        let usage = usage_snapshot_for_chain(
+            &store,
+            &tp_store,
+            &third_party_names,
+            &third_party_names,
+            &snap.chain,
+        );
+        assert_eq!(
+            next_auto_switch_target_with_usage(
+                &snap,
+                &usage,
+                &third_party_names,
+                ActiveBurnRate::FromDisk,
+            ),
+            expected,
+            "{why} (monthly at {pct}%)"
+        );
+    }
 }
 
 /// A hybrid active under burn-aware switching never pairs

@@ -394,6 +394,13 @@ pub(crate) struct UsageBar {
     /// no total field but carries `currentValue` + `remaining`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) total: Option<f64>,
+    /// `true` when the provider marks this bar as the account's inference
+    /// quota. The mark — never the `30d` label alone — is what makes a
+    /// month-long bar a monthly window: a stale cache's unmarked `30d` (z.ai's
+    /// MCP web-tools quota, or one written before the mark existed) maps
+    /// nothing. Set by the Alibaba arm on its monthly bar only.
+    #[serde(default, skip_serializing_if = "crate::profile::is_false")]
+    pub(crate) inference_quota: bool,
 }
 
 impl ThirdPartyStats {
@@ -433,30 +440,46 @@ impl ThirdPartyStats {
 
 impl ThirdPartyStats {
     /// These stats as the [`UsageInfo`] the scheduling layer reads, or `None`
-    /// when this provider published no window clauth recognises.
+    /// when this provider published no window clauth recognises or it came
+    /// from the best-effort scanner.
     ///
     /// A provider bar and an OAuth window are the same measurement — a rolling
-    /// percentage with a reset instant — so mapping the two labels the chain
-    /// actually judges (`5h`, `7d`) lets a third-party member take part in
+    /// percentage with a reset instant — so mapping the three labels the chain
+    /// actually judges (`5h`, `7d`, and a provider-marked `30d`) lets a
+    /// third-party member take part in
     /// auto-switch, `clauth list`'s used columns, and the published
     /// `status.json` `windows` array with no per-provider branching downstream.
     ///
-    /// Two deliberate exclusions:
-    ///
-    /// - Any other label (z.ai's `30d`) is dropped rather than folded into
-    ///   [`UsageInfo::weekly_scoped`]. That vec means per-MODEL weekly windows
-    ///   and carries the `check_scoped` gate's semantics; a monthly account-wide
-    ///   ceiling landing there would block the member as though one model were
-    ///   capped, which is neither what it measures nor what the gate documents.
-    /// - `best_effort` stats — the generic scanner's guess at an unknown
-    ///   endpoint's shape — never become windows. A misread field there is a
-    ///   figure nobody verified, and the cost of believing it is an account
-    ///   parked out of the rotation on a number the vendor never published.
-    ///   They keep rendering as bars, which is a claim about the display only.
+    /// The `best_effort` gate: a generic scanner's guess at an unknown
+    /// endpoint's shape never becomes a window. A misread field there is a
+    /// figure nobody verified, and the cost of believing it is an account
+    /// parked out of the rotation on a number the vendor never published.
+    /// They keep rendering as bars, which is a claim about the display only.
+    /// Surfaces that only DISPLAY the figures (the list's long column, the MCP
+    /// roster rank) read [`Self::windows_info`] instead, exactly as base read
+    /// raw bars there.
     pub(crate) fn to_usage_info(&self) -> Option<crate::usage::UsageInfo> {
         if self.best_effort {
             return None;
         }
+        self.windows_info()
+    }
+
+    /// The ungated bar→window mapping: `5h`, `7d`, and a provider-marked `30d`
+    /// become the [`UsageInfo`] windows with NO `best_effort` refusal. The
+    /// chain, the status feed and the fallback walk read windows through
+    /// [`Self::to_usage_info`] (a scanner guess must never park an account out
+    /// of the rotation); the list's long column and the MCP roster rank read
+    /// this, so a generic endpoint whose scanned usage carries a `5h`/`7d`
+    /// window still renders and ranks on them as base did. One deliberate
+    /// exclusion: a bar under any other label — an unmarked month-long bar
+    /// (z.ai's MCP web-tools quota, or a cache written before the mark
+    /// existed) included — is dropped rather than folded into
+    /// [`UsageInfo::weekly_scoped`]. That vec means per-MODEL weekly windows
+    /// and carries the `check_scoped` gate's semantics; a monthly account-wide
+    /// ceiling landing there would block the member as though one model were
+    /// capped, which is neither what it measures nor what the gate documents.
+    pub(crate) fn windows_info(&self) -> Option<crate::usage::UsageInfo> {
         let window = |label: &str| {
             self.bars
                 .iter()
@@ -468,10 +491,24 @@ impl ThirdPartyStats {
         };
         let five_hour = window(crate::usage::LABEL_5H);
         let seven_day = window(crate::usage::LABEL_7D);
-        (five_hour.is_some() || seven_day.is_some()).then(|| crate::usage::UsageInfo {
-            five_hour,
-            seven_day,
-            ..Default::default()
+        // The account-wide monthly inference quota: the provider MARK on a
+        // `30d` label, never the label alone, so a stale unmarked `30d` maps
+        // nothing.
+        let monthly = self
+            .bars
+            .iter()
+            .find(|b| b.inference_quota && b.label == crate::usage::LABEL_30D)
+            .map(|b| crate::usage::UsageWindow {
+                utilization: b.pct.clamp(0.0, 100.0),
+                resets_at: b.resets_at.clone(),
+            });
+        (five_hour.is_some() || seven_day.is_some() || monthly.is_some()).then(|| {
+            crate::usage::UsageInfo {
+                five_hour,
+                seven_day,
+                monthly,
+                ..Default::default()
+            }
         })
     }
 }

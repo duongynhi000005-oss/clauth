@@ -678,6 +678,12 @@ pub(crate) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
 pub(crate) const DIAG_KICK: &str = "claude code blocked";
 pub(crate) const DIAG_WEEKLY_SPENT: &str = "weekly spent";
 pub(crate) const DIAG_WEEKLY_SOFT: &str = "past the weekly switch line, still serving";
+/// The monthly-quota spellings of the two weekly pill words above: a
+/// monthly-only member blocked by its marked 30d quota is never called
+/// "weekly", whatever surface renders the block.
+pub(crate) const DIAG_MONTHLY_SPENT: &str = "30d spent";
+pub(crate) const DIAG_MONTHLY_SOFT: &str =
+    "monthly quota past the weekly switch line, still serving";
 pub(crate) const DIAG_STALE: &str = "stale data";
 
 /// A seconds age as the relative ladder (`4m ago`, `2h ago`, `3d ago`), open
@@ -709,8 +715,18 @@ pub(crate) fn start_block_label(block: &StartBlock) -> String {
         StartBlock::Canceled => DIAG_CANCELED.to_string(),
         StartBlock::KickRejected => DIAG_KICK.to_string(),
         StartBlock::NotOauth => "not an oauth account".to_string(),
-        StartBlock::WeeklySpent => DIAG_WEEKLY_SPENT.to_string(),
-        StartBlock::WeeklySoft { pct } => format!("weekly {}", format_pct(*pct)),
+        StartBlock::WeeklySpent { monthly } => {
+            if *monthly {
+                DIAG_MONTHLY_SPENT.to_string()
+            } else {
+                DIAG_WEEKLY_SPENT.to_string()
+            }
+        }
+        StartBlock::WeeklySoft { pct, monthly } => format!(
+            "{} {}",
+            if *monthly { "30d" } else { "weekly" },
+            format_pct(*pct)
+        ),
         StartBlock::FiveHour { pct } => format!("5h {}", format_pct(*pct)),
         StartBlock::ScopedSpent { label, pct } => {
             format!("{label} {}, other models ok", format_pct(*pct))

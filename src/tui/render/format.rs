@@ -213,7 +213,11 @@ pub(super) fn window_label(window: &UsageWindow) -> String {
 /// pass the drain hue for a live window, `None` to keep it faint.
 /// All other bar sites use [`bar_string_with_cells`] directly (no brackets).
 /// `label_w` is the widest label the caller's column renders: the reading is
-/// left-padded to it so a column's `%` signs align.
+/// left-padded to it so a column's `%` signs align. `prefix_cells` is a
+/// left-hand prefix the caller renders OUTSIDE this call (e.g. the overview's
+/// `30d ` monthly label): the bar sheds that many cells so the whole cell
+/// still fits the column and the `%` stays on the shared rail.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn window_summary_spans_bracketed(
     window: Option<&UsageWindow>,
     width: usize,
@@ -222,6 +226,7 @@ pub(super) fn window_summary_spans_bracketed(
     reset_style: Option<Style>,
     fmt: ResetFmt,
     stale: bool,
+    prefix_cells: usize,
 ) -> Vec<Span<'static>> {
     bracketed_spans(
         window,
@@ -232,6 +237,7 @@ pub(super) fn window_summary_spans_bracketed(
         fmt,
         stale,
         now_epoch_secs(),
+        prefix_cells,
     )
 }
 
@@ -248,7 +254,17 @@ pub(crate) fn window_summary_spans_bracketed_at(
     stale: bool,
     now: i64,
 ) -> Vec<Span<'static>> {
-    bracketed_spans(window, width, 0, include_bar, reset_style, fmt, stale, now)
+    bracketed_spans(
+        window,
+        width,
+        0,
+        include_bar,
+        reset_style,
+        fmt,
+        stale,
+        now,
+        0,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -261,6 +277,7 @@ fn bracketed_spans(
     fmt: ResetFmt,
     stale: bool,
     now: i64,
+    prefix_cells: usize,
 ) -> Vec<Span<'static>> {
     // `[` + cells + `]` + ` ` + label: whether the bar's floor fits beside a
     // label `label_w` wide.
@@ -294,7 +311,7 @@ fn bracketed_spans(
     if !bar_fits(label_w) {
         return vec![Span::styled(format!("{label:>label_w$}"), fill_style)];
     }
-    let cells = rail_cells(width, label_w);
+    let cells = rail_cells(width, label_w).saturating_sub(prefix_cells);
     let mut spans = vec![
         Span::styled("[", bracket),
         Span::styled(bar_string_with_cells(pct, cells), fill_style),

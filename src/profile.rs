@@ -1179,7 +1179,9 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
-fn is_false(b: &bool) -> bool {
+/// `skip_serializing_if` guard: serialize a bool field only when true. Shared
+/// with [`crate::providers::UsageBar`]'s `inference_quota` mark.
+pub(crate) fn is_false(b: &bool) -> bool {
     !*b
 }
 

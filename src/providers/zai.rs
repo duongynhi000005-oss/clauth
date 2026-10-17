@@ -72,6 +72,7 @@ fn quota_stats(data: &QuotaData) -> ThirdPartyStats {
             resets_at: limit.next_reset_time.map(ms_to_iso),
             used,
             total,
+            inference_quota: false,
         });
         // Per-web-tool breakdown (search-prime / web-reader / zread), only when
         // anything has been used — an all-zero breakdown is noise.
@@ -150,17 +151,23 @@ fn model_rows(total: &ModelTotalUsage) -> Vec<StatRow> {
     rows
 }
 
-/// Bar label for a limit. Prefers the window decoded from `unit`/`number`
-/// (`5h`, `7d`, `30d`) since GLM's token limits are per-window caps the user
-/// thinks of in those terms; falls back to the API type (`tokens limit`) when
-/// the window code is unknown. The two token limits thus read `5h` / `7d`
-/// instead of a duplicated `tokens limit`.
+/// Bar label for a limit. A `TIME_LIMIT` reads `mcp tools` whatever its
+/// window code: the month-long bar is the MCP web tools' quota, never an
+/// inference window, so `30d` would misname it as the account's monthly
+/// inference quota. The two `TOKENS_LIMIT` limits decode from `unit`/`number`
+/// (`5h`, `7d`) — the per-window caps the user thinks of in those terms — and
+/// any other type falls back to the API type (`tokens limit`) when the window
+/// code is unknown.
 fn limit_label(limit: &Limit) -> String {
+    if limit.limit_type == "TIME_LIMIT" {
+        return "mcp tools".to_string();
+    }
     window_label(limit.unit, limit.number).unwrap_or_else(|| type_label(&limit.limit_type))
 }
 
-/// `TIME_LIMIT` → "time limit", `TOKENS_LIMIT` → "tokens limit", any other type
-/// lowercased with `_` → space.
+/// `TOKENS_LIMIT` → "tokens limit", any other type lowercased with `_` →
+/// space. `TIME_LIMIT` never reaches here — [`limit_label`] relabels it
+/// `mcp tools` first.
 fn type_label(limit_type: &str) -> String {
     limit_type.to_ascii_lowercase().replace('_', " ")
 }

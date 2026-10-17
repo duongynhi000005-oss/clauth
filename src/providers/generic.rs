@@ -219,6 +219,7 @@ fn extract_bar(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -
             resets_at: Some(resets_at),
             used: None,
             total: None,
+            inference_quota: false,
         });
     };
     let label = bar_label(obj, parent_key);
@@ -234,6 +235,7 @@ fn extract_bar(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -
         resets_at,
         used,
         total,
+        inference_quota: false,
     })
 }
 

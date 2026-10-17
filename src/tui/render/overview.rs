@@ -26,8 +26,8 @@ use crate::format::format_pct;
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::providers::Provider;
 use crate::usage::{
-    LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs, now_ms,
-    selected_next_refresh, switch_grade_kick_lifts,
+    LABEL_5H, LABEL_7D, LABEL_30D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs,
+    now_ms, selected_next_refresh, switch_grade_kick_lifts,
 };
 use std::collections::HashSet;
 
@@ -450,7 +450,7 @@ impl OverviewWidths {
                 let five = five.filter(|_| p.provider != Some(Provider::DeepSeek));
                 (
                     five.as_ref().map(window_label),
-                    seven.as_ref().map(window_label),
+                    seven.as_ref().map(|l| window_label(&l.window)),
                 )
             }))
         } else {
@@ -1038,6 +1038,7 @@ fn render_pool_row(
         None,
         reset_fmt,
         five.as_ref().is_some_and(is_past_reset),
+        0,
     ));
     let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
     spans.extend(five_spans);
@@ -1055,6 +1056,7 @@ fn render_pool_row(
             None,
             reset_fmt,
             seven.as_ref().is_some_and(is_past_reset),
+            0,
         ));
         let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
         spans.extend(seven_spans);
@@ -1306,6 +1308,7 @@ fn render_overview_row(
             reset_style(LABEL_5H, five_window.as_ref()),
             reset_fmt,
             five_window.as_ref().is_some_and(is_past_reset),
+            0,
         ))
     };
     let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -1314,15 +1317,35 @@ fn render_overview_row(
     spans.push(Span::raw(" ".repeat(five_pad)));
     if widths.seven_day > 0 {
         spans.push(gap(widths));
-        let seven_spans = flatten(window_summary_spans_bracketed(
-            seven_window.as_ref(),
+        let seven_monthly = seven_window.as_ref().is_some_and(|l| l.monthly);
+        let seven_window = seven_window.as_ref().map(|l| &l.window);
+        // The label the drain/pace reads: the monthly window paces per-day over
+        // 30d, not 7d.
+        let seven_label = if seven_monthly { LABEL_30D } else { LABEL_7D };
+        let seven_bar = widths.seven_day_bar();
+        // The monthly prefix takes its 4 cells from the row's own bar, so the
+        // column never widens for it and the `%` stays on the shared rail. At
+        // the bare-reading tier (≤100 cols) there are no bar cells to borrow
+        // the prefix from, so the monthly figure renders bare under the `7d`
+        // header — a recorded deviation from the labelled-cell display ruling:
+        // the owner chose the bare figure over widening the column.
+        let mut seven_cell = window_summary_spans_bracketed(
+            seven_window,
             widths.seven_day,
             widths.claude_labels.seven,
-            widths.seven_day_bar(),
-            reset_style(LABEL_7D, seven_window.as_ref()),
+            seven_bar,
+            reset_style(seven_label, seven_window),
             reset_fmt,
-            seven_window.as_ref().is_some_and(is_past_reset),
-        ));
+            seven_window.is_some_and(is_past_reset),
+            if seven_monthly && seven_bar { 4 } else { 0 },
+        );
+        if seven_monthly && seven_bar {
+            // The header stays `7d`, so the cell names the window itself.
+            // Inserted BEFORE the disabled-row flatten so a disabled monthly
+            // row dims it with the rest of the cell.
+            seven_cell.insert(0, Span::styled(format!("{LABEL_30D} "), theme::faint()));
+        }
+        let seven_spans = flatten(seven_cell);
         let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
         let seven_pad = widths.seven_day.saturating_sub(seven_len);
         spans.extend(seven_spans);
@@ -1467,18 +1490,40 @@ fn deepseek_balance_cell(
     vec![Span::styled(truncate(&inner, width), theme::dim())]
 }
 
-/// The `(5h, 7d)` windows to show in the overview row. OAuth profiles use their
-/// live `UsageInfo`; an api-key/provider profile carries one only when it was
-/// seeded from its provider windows, so each missing slot is synthesized from
-/// the third-party bar whose label matches (`5h` / `7d`) —
-/// the same labels `zai` decodes from its window codes. `None` per slot when no
-/// source exists (renders `—`).
+/// The overview's long-window slot: the window, plus whether it is the monthly
+/// one (so the cell prefixes `30d ` — the header stays `7d` — and the reset
+/// drain reads the monthly pace).
+struct OverviewLong {
+    window: UsageWindow,
+    monthly: bool,
+}
+
+/// The `(5h, long)` windows to show in the overview row. OAuth profiles use
+/// their live `UsageInfo`; an api-key/provider profile carries one only when it
+/// was seeded from its provider windows, so each missing slot is synthesized
+/// from the third-party bar whose label matches (`5h` / `7d`) — the same
+/// labels `zai` decodes from its window codes. The second slot is the account's
+/// LONG window: the 7d window when present, else the provider-marked monthly
+/// quota (an OAuth reading has no monthly, so its 7d-else-first-scoped
+/// fallback stays byte-identical). `None` per slot when no source exists
+/// (renders `—`).
 fn overview_windows(
     profile: &Profile,
     readings: &ReadingsSnapshot,
-) -> (Option<UsageWindow>, Option<UsageWindow>) {
+) -> (Option<UsageWindow>, Option<OverviewLong>) {
     if let Some(usage) = readings.usage_of(&profile.name) {
-        return (usage.five_hour.clone(), usage.weekly_window().cloned());
+        let long = if profile.usage_cache_is_third_party() {
+            usage.long_window().map(|(label, w)| OverviewLong {
+                window: w.clone(),
+                monthly: label == LABEL_30D,
+            })
+        } else {
+            usage.weekly_window().map(|w| OverviewLong {
+                window: w.clone(),
+                monthly: false,
+            })
+        };
+        return (usage.five_hour.clone(), long);
     }
     let Some(bars) = readings.stats_of(&profile.name).map(|s| &s.bars) else {
         return (None, None);
@@ -1489,7 +1534,13 @@ fn overview_windows(
             resets_at: b.resets_at.clone(),
         })
     };
-    (window_for(LABEL_5H), window_for(LABEL_7D))
+    (
+        window_for(LABEL_5H),
+        window_for(LABEL_7D).map(|window| OverviewLong {
+            window,
+            monthly: false,
+        }),
+    )
 }
 
 /// Whether this row draws a cached reading: a 5h window, a 7d window in a row
@@ -1503,7 +1554,7 @@ fn draws_a_reading(
     profile: &Profile,
     readings: &ReadingsSnapshot,
     five_window: Option<&UsageWindow>,
-    seven_window: Option<&UsageWindow>,
+    seven_window: Option<&OverviewLong>,
     widths: &OverviewWidths,
 ) -> bool {
     if profile.provider == Some(Provider::DeepSeek) {

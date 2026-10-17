@@ -238,6 +238,7 @@ fn tp_bar(
         resets_at: Some(crate::usage::epoch_secs_to_iso(reset_secs)),
         used,
         total,
+        inference_quota: false,
     }
 }
 
@@ -2278,6 +2279,46 @@ fn spent_skipped_account_pill_is_bare() {
     );
 }
 
+/// The Usage tab's spent teach names a monthly quota (`monthly quota is
+/// spent`), never "weekly limit is spent": the teach producer reads the long
+/// window's label, so a monthly-only account at the hard cap gets the monthly
+/// arm of the diagnostic.
+#[test]
+fn the_usage_teach_names_a_monthly_quota() {
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags {
+            weekly_hard: true,
+            ..DiagFlags::default()
+        },
+        peak: None,
+    };
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("qwen"));
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "qwen",
+        crate::usage::UsageInfo {
+            monthly: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    let rendered = status_text(&status_lines(&profile, &header, 120, &readings));
+    let hint_line = rendered
+        .lines()
+        .find(|l| l.contains("is spent"))
+        .expect("a spent account renders its hint");
+    assert_eq!(hint_line, "└ monthly quota is spent");
+}
+
 /// The retry ordinal survives English's teen exceptions (`11th`–`13th` beat
 /// the `1`/`2`/`3` last-digit rules).
 #[test]
@@ -2317,6 +2358,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
                 plan: None,
                 five_hour: None,
                 seven_day: None,
+                monthly: None,
                 weekly_scoped: Vec::new(),
                 window_dollars: Vec::new(),
                 extra_usage: extra,
@@ -3179,6 +3221,7 @@ fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
                 resets_at: None,
                 used: None,
                 total: None,
+                inference_quota: false,
             }],
             plan: None,
             endpoint: None,

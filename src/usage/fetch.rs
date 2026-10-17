@@ -508,6 +508,12 @@ pub(crate) struct UsageInfo {
     pub(crate) five_hour: Option<UsageWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) seven_day: Option<UsageWindow>,
+    /// The account-wide MONTHLY inference quota a third-party provider marked
+    /// as such (Alibaba's `30d` bar). A per-account ceiling, never a per-model
+    /// window: it gates like the weekly line when the account has no 7d
+    /// window, and never lands in [`UsageInfo::weekly_scoped`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) monthly: Option<UsageWindow>,
     /// Per-model weekly windows (`weekly_scoped` limits) in `limits[]` order —
     /// grows as the server exposes new models, no per-model field needed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -556,10 +562,16 @@ pub(crate) struct UsageInfo {
 /// built dynamically from the scope name (see [`ScopedWindow`]).
 pub(crate) const LABEL_5H: &str = "5h";
 pub(crate) const LABEL_7D: &str = "7d";
+/// The label of a provider-marked monthly inference-quota window. It is a
+/// WINDOW label here, not a duration claim: an unmarked `30d` bar never
+/// reaches this slot (a stale z.ai cache's MCP web-tools quota is dropped as
+/// unmarked, and a fresh z.ai read labels its month-long bar `mcp tools`).
+pub(crate) const LABEL_30D: &str = "30d";
 
 impl UsageInfo {
-    /// All available windows as `(label, &UsageWindow)` pairs: 5h, 7d, then each
-    /// per-model weekly window in `limits[]` order.
+    /// All available windows as `(label, &UsageWindow)` pairs: 5h, 7d, the
+    /// monthly inference quota when present, then each per-model weekly window
+    /// in `limits[]` order.
     pub(crate) fn windows(&self) -> Vec<(&str, &UsageWindow)> {
         let mut out = Vec::new();
         if let Some(w) = &self.five_hour {
@@ -568,10 +580,30 @@ impl UsageInfo {
         if let Some(w) = &self.seven_day {
             out.push((LABEL_7D, w));
         }
+        if let Some(w) = &self.monthly {
+            out.push((LABEL_30D, w));
+        }
         for s in &self.weekly_scoped {
             out.push((s.label.as_str(), &s.window));
         }
         out
+    }
+
+    /// The account's LONG window and its label — the weekly headroom/line the
+    /// fallback walk judges: the aggregate `seven_day` (`LABEL_7D`) when
+    /// present, else the account-wide monthly inference quota (`LABEL_30D`).
+    /// Precedence is by PRESENCE, not liveness: a caller that needs a live
+    /// window applies liveness (e.g. [`long_window_live`]) to what this
+    /// returned, exactly as it did to the 7d window before, so the list, push,
+    /// overview and chain never pick by different rules. Every site that reads
+    /// the 7d window as the account's weekly headroom or weekly line calls
+    /// this, so a monthly-only account gates and orders exactly like a weekly
+    /// one.
+    pub(crate) fn long_window(&self) -> Option<(&'static str, &UsageWindow)> {
+        self.seven_day
+            .as_ref()
+            .map(|w| (LABEL_7D, w))
+            .or_else(|| self.monthly.as_ref().map(|w| (LABEL_30D, w)))
     }
 
     /// Most representative weekly window: the aggregate `seven_day` when present,
@@ -592,9 +624,9 @@ pub(crate) fn window_duration_secs(label: &str) -> Option<i64> {
         // `7d` plus every per-model weekly label (`"7d fable"`, `"7d opus"`, …).
         Some(7 * 86_400)
     } else {
-        // Provider window labels of the form `<n>h` / `<n>d` (e.g. z.ai's
-        // `5h`/`7d`/`30d`) so any api-key account with a windowed limit gets the
-        // same average pace + ideal-pace line as the OAuth windows.
+        // Provider window labels of the form `<n>h` / `<n>d` (e.g. `5h`, `7d`,
+        // a provider-marked `30d`) so any api-key account with a windowed limit
+        // gets the same average pace + ideal-pace line as the OAuth windows.
         parse_nh_nd_label(label)
     }
 }
@@ -1351,6 +1383,8 @@ fn assemble_usage(
                 plan,
                 five_hour: windows.five_hour,
                 seven_day: windows.seven_day,
+                // The OAuth wire never carries a monthly inference quota.
+                monthly: None,
                 weekly_scoped: windows.weekly_scoped,
                 window_dollars: windows.window_dollars,
                 extra_usage: raw.extra_usage,
@@ -1680,12 +1714,12 @@ pub(crate) fn five_hour_live(info: &UsageInfo, now_secs: i64) -> bool {
         .is_some_and(|resets_at| now_secs < resets_at)
 }
 
-/// [`five_hour_live`] for the OVERALL weekly window: live iff it carries a
-/// parseable reset that is still in the future.
-pub(crate) fn seven_day_live(info: &UsageInfo, now_secs: i64) -> bool {
-    info.seven_day
-        .as_ref()
-        .and_then(|w| w.resets_at.as_deref())
+/// [`five_hour_live`] for the account's LONG window (the aggregate 7d, else
+/// the monthly inference quota): live iff it carries a parseable reset that is
+/// still in the future.
+pub(crate) fn long_window_live(info: &UsageInfo, now_secs: i64) -> bool {
+    info.long_window()
+        .and_then(|(_, w)| w.resets_at.as_deref())
         .and_then(iso_to_epoch_secs)
         .is_some_and(|resets_at| now_secs < resets_at)
 }
@@ -1704,8 +1738,9 @@ fn maxed_window_reset_in(live: bool, window: Option<&UsageWindow>, now_secs: i64
     Some(resets_at - now_secs)
 }
 
-/// True iff a request would currently be REFUSED: a live 5h **or** 7d window
-/// pinned at the API's 100% cap. Such a window can't change until it resets, so
+/// True iff a request would currently be REFUSED: a live 5h or long window
+/// (the 7d, else the monthly inference quota) pinned at the API's 100% cap.
+/// Such a window can't change until it resets, so
 /// the opt-out `refresh_spent_accounts` fetch gate may skip the account until
 /// then. Deliberately keyed on the 100% hard cap, NOT the sub-100 fallback
 /// switch threshold: a below-cap window still moves and must keep being polled,
@@ -1718,16 +1753,16 @@ pub(crate) fn windows_maxed(info: &UsageInfo, now_secs: i64) -> bool {
     )
     .is_some()
         || maxed_window_reset_in(
-            seven_day_live(info, now_secs),
-            info.seven_day.as_ref(),
+            long_window_live(info, now_secs),
+            info.long_window().map(|(_, w)| w),
             now_secs,
         )
         .is_some()
 }
 
 /// Seconds until a spent account (`windows_maxed`) resumes polling: the LATEST
-/// reset among its live-maxed 5h/7d windows. It stays blocked until every maxed
-/// window lapses, so a maxed weekly (7d) window dominates a maxed 5h one — the
+/// reset among its live-maxed 5h/long windows. It stays blocked until every
+/// maxed window lapses, so a maxed long window dominates a maxed 5h one — the
 /// caption reads "resets in <weekly>", not the sooner-but-still-blocked 5h.
 /// `None` when the account is not currently maxed.
 pub(crate) fn spent_resume_in_secs(info: &UsageInfo, now_secs: i64) -> Option<i64> {
@@ -1737,8 +1772,8 @@ pub(crate) fn spent_resume_in_secs(info: &UsageInfo, now_secs: i64) -> Option<i6
         now_secs,
     );
     let seven = maxed_window_reset_in(
-        seven_day_live(info, now_secs),
-        info.seven_day.as_ref(),
+        long_window_live(info, now_secs),
+        info.long_window().map(|(_, w)| w),
         now_secs,
     );
     match (five, seven) {

@@ -2280,6 +2280,7 @@ mod hybrid_burn_replay {
                     resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
                     used: None,
                     total: None,
+                    inference_quota: false,
                 }],
                 plan: None,
                 endpoint: None,

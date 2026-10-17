@@ -293,6 +293,7 @@ fn oauth_profile(
         }),
         five_hour,
         seven_day: None,
+        monthly: None,
         weekly_scoped,
         window_dollars: Vec::new(),
         extra_usage: extra,
