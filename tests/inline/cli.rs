@@ -3998,6 +3998,78 @@ fn cli_codex_delete_refuses_while_a_rotation_holds_the_lock() {
     );
 }
 
+/// The CLI codex delete under a live session appends its `--force` tail only to
+/// the typed live-session refusal, pinned by equality (N9).
+#[test]
+fn cli_codex_delete_live_session_names_only_the_force_tail() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    crate::testutil::write_codex_store("cx", "{}");
+    let _live = crate::testutil::arm_live_session(home.home(), "cx");
+
+    let outcome = dispatch(
+        Cli::try_parse_from(["clauth", "delete", "cx", "--yes"]).expect("delete must parse"),
+    );
+    assert_eq!(
+        outcome
+            .expect_err("a live session refuses the codex delete")
+            .to_string(),
+        "'cx' has a live session, pass --force to remove it anyway"
+    );
+}
+
+/// What `exit_code` prints on the refusal (`Error: {e:?}`) is the one tail
+/// sentence: the tail-bearing message and its cause never both print (M5).
+#[test]
+fn cli_codex_delete_live_session_prints_one_line_under_debug() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    crate::testutil::write_codex_store("cx", "{}");
+    let _live = crate::testutil::arm_live_session(home.home(), "cx");
+
+    let err = dispatch(
+        Cli::try_parse_from(["clauth", "delete", "cx", "--yes"]).expect("delete must parse"),
+    )
+    .expect_err("refused");
+    assert_eq!(
+        format!("{err:?}"),
+        "'cx' has a live session, pass --force to remove it anyway",
+        "the printed error repeats the refusal under Caused by"
+    );
+}
+
+/// The `--force` tail rides the TYPED live-session refusal alone: a delete that
+/// fails for another reason (a state-flock timeout) under a live session gets
+/// no tail naming a flag that cannot fix it (N9).
+#[test]
+fn cli_codex_delete_lock_failure_under_a_live_session_gets_no_force_tail() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    crate::testutil::write_codex_store("cx", "{}");
+    let _live = crate::testutil::arm_live_session(home.home(), "cx");
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+
+    let outcome = dispatch(
+        Cli::try_parse_from(["clauth", "delete", "cx", "--yes"]).expect("delete must parse"),
+    );
+    crate::lock::set_state_lock_timeout_override(None);
+    let err = outcome
+        .expect_err("the state-flock timeout fails the delete")
+        .to_string();
+    assert!(
+        err.contains("state lock"),
+        "the lock error reached the CLI: {err}"
+    );
+    assert!(
+        !err.contains("pass --force"),
+        "a lock error got the --force tail: {err}"
+    );
+}
+
 /// A quarantined codex profile refuses `clauth start` by name — `--explain`
 /// included, the way the claude arm runs `admit` there — naming the fix,
 /// before any spawn. The explain leg runs first: it is the one that can red by

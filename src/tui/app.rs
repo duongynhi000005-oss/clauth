@@ -533,6 +533,63 @@ impl ConfigRow {
 /// (no `model` key); a custom id set via ⏎ is outside this list.
 pub(crate) const MODEL_PRESETS: [&str; 5] = ["fable", "opus", "sonnet", "haiku", "opusplan"];
 
+/// The codex detail pane's focusable action rows, in render order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexDetailRow {
+    ReLogin,
+    Delete,
+}
+
+impl CodexDetailRow {
+    pub(crate) const ALL: [CodexDetailRow; 2] = [CodexDetailRow::ReLogin, CodexDetailRow::Delete];
+}
+
+/// The pool detail pane's focusable action rows. A kimi or unknown auth mode
+/// lists none (facts only); codex has no refresh route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolDetailRow {
+    Refresh,
+    Remove,
+}
+
+/// Which pool job is in flight, beside [`App::pool_mutation_row`]'s identity
+/// marker. The detail pane spins the action row whose job this is — a running
+/// `remove` never lights the `refresh` row, and a codex-family remove (whose
+/// rows are `[remove]` only) still shows its spinner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolMutationKind {
+    Remove,
+    Refresh,
+}
+
+impl App {
+    /// The pool detail's action rows for the selected pool account: `refresh`
+    /// for claude and antigravity (shunt has no codex refresh route), `remove`
+    /// for every family with an admin route. kimi and unknown auth modes get
+    /// neither.
+    pub(crate) fn pool_detail_rows(&self) -> Vec<PoolDetailRow> {
+        let Some((pi, ai)) = self.setup_pool_pair() else {
+            return Vec::new();
+        };
+        let Some((account, auth)) = self.shunt_pool_row(pi, ai) else {
+            return Vec::new();
+        };
+        // A name outside shunt's grammar has no mutation route (pool_row_at
+        // refuses it): the row still shows its facts, but no action rows.
+        if crate::gateway_admin::ShuntAccountName::new(&account.name).is_none() {
+            return Vec::new();
+        }
+        let mut rows = Vec::new();
+        if auth.clone().refresh_family().is_some() {
+            rows.push(PoolDetailRow::Refresh);
+        }
+        if auth.clone().family().is_some() {
+            rows.push(PoolDetailRow::Remove);
+        }
+        rows
+    }
+}
+
 /// The alias-override rows, in the order Setup lists them.
 const OVERRIDE_ROWS: [ConfigRow; 5] = [
     ConfigRow::FableModel,
@@ -1177,12 +1234,6 @@ pub(crate) enum ConfirmAction {
         name: crate::gateway_admin::ShuntAccountName,
         /// The account's display name, escaped, for the toast.
         display: String,
-        /// The account's `(family, name)` the spinner keys on, read when the
-        /// confirm opened.
-        marker: (
-            crate::gateway_admin::PoolFamily,
-            crate::gateway_admin::ShuntAccountName,
-        ),
     },
     /// `point <profile> at the shunt gateway?`'s `overwrite`: mint the profile's
     /// client token, then point the profile at the gateway (`url`). `replace`
@@ -1755,6 +1806,11 @@ pub(crate) enum Modal {
     /// code field ([`LoginSession::paste_field`]) included. esc/q collapse it
     /// to the footer indicator — the login keeps running.
     Login,
+    /// In-flight codex browser re-login progress; renders live from
+    /// [`App::codex_login`]. Its own shell: `r` opens the browser again, `c`
+    /// copies the authorize link, no paste door — codex's callback answers on
+    /// this machine alone.
+    CodexLogin,
     /// Read-only scrollable text modal for the shunt card's `check output`:
     /// the masked stderr of the last failed check.
     CheckOutput(String),
@@ -3761,6 +3817,39 @@ pub(crate) enum MainItemKind {
     Shunt(usize, usize),
 }
 
+/// One structural entry in the shared band walk ([`App::band_entries`]):
+/// spacers and headings separate the claude, codex and shunt bands, and the
+/// items are the selectable rows. Headings and spacers are never selectable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BandEntry {
+    Spacer,
+    /// A heading line's text (already control-escaped, with its two-cell
+    /// indent); the caller computes the focus tier from its own selection.
+    Heading(String),
+    Item(MainItemKind),
+}
+
+/// What Setup's selector has selected: a harness item, or the trailing `+ new`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupSelection {
+    Item(MainItemKind),
+    New,
+}
+
+/// Setup's stored selection for a codex or pool row, by IDENTITY — the profile
+/// name for a codex row, the `(provider name, account name)` for a pool row —
+/// never an index (lead's call: resolved to an index each time it is read, so
+/// a roster or listing change keeps the same account selected). The pool
+/// account is the listing's raw `String`, not a validated `ShuntAccountName`:
+/// a listing row outside shunt's grammar is still a selectable row (only the
+/// mutation needs the validated name, which `pool_row_at` re-checks). A claude
+/// row and `+ new` need no entry: they are `profile_cursor` itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SetupItem {
+    Codex(ProfileName),
+    Pool { provider: String, account: String },
+}
+
 /// The Overview's visible harness filter; selection maps onto the rows it shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum HarnessFilter {
@@ -3917,6 +4006,27 @@ pub(crate) struct LoginSession {
     /// derives no `Debug`, so they cannot ride a `{:?}`.
     pub(crate) paste_field: Option<InputState>,
 }
+
+/// In-flight codex browser re-login: the account name, the generation, the
+/// authorize URL once the worker announces it (`r` re-opens it, `c` copies it),
+/// and the cancel handle the worker's listener wait honours. No paste door and
+/// no stage — codex's callback answers on this machine alone, so the worker's
+/// next report is the minted chain or the failure.
+pub(crate) struct CodexLoginSession {
+    pub(crate) name: String,
+    pub(crate) generation: u64,
+    pub(crate) url: Option<String>,
+    pub(crate) cancel: crate::codex_login::LoginCancel,
+}
+
+/// The codex browser login the `re-login` worker runs: the announce callback
+/// and the cancel handle, producing the minted outcome or its error sentence.
+#[cfg(test)]
+pub(crate) type CodexLoginWorker =
+    fn(
+        &dyn Fn(&str),
+        &crate::codex_login::LoginCancel,
+    ) -> std::result::Result<crate::codex_login::CodexLoginOutcome, String>;
 
 /// The paste half of an OAuth login: the links `c` copies and a paste is
 /// checked against, and the sender a parsed code goes down to the worker.
@@ -4096,6 +4206,22 @@ pub(crate) struct App {
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
     pub(crate) profile_cursor: usize,
+    /// Setup's selection when it is a codex or pool row; `None` means the
+    /// claude `profile_cursor` (or its `+ new` synthetic at `profile_count()`)
+    /// is the selection, today's behaviour. A claude row selected in Setup IS
+    /// `profile_cursor`; a codex or pool row is stored here so it does not move
+    /// the shared cursor.
+    pub(crate) setup_item: Option<SetupItem>,
+    /// The flat [`App::setup_items`] index [`App::setup_item`] last resolved
+    /// to, for the dropped-for-good clamp (the row now at that index, across
+    /// bands).
+    pub(crate) setup_item_index: Option<usize>,
+    /// A held-but-hidden Setup identity (a pool hidden by an unread listing),
+    /// kept separately exactly as the Overview holds `overview_remembered`.
+    /// While set, the first row IS the selection; the identity comes back when
+    /// the read restores it only if the user has not moved the selection since
+    /// (a move or a descend replaces it).
+    pub(crate) setup_remembered: Option<SetupItem>,
     pub(crate) overview_selector: ListView,
     pub(crate) overview_cursor: usize,
     /// The one remembered Overview item: a cursor-move key sets it to the item
@@ -4139,6 +4265,16 @@ pub(crate) struct App {
     pub(crate) config_focus: ConfigFocus,
     /// Cursor into the detail rows on the Setup tab's right pane.
     pub(crate) config_action_cursor: usize,
+    /// The descended codex detail's armed 2-step (`delete account`). A separate
+    /// field from the claude draft's `armed_action` because the codex detail
+    /// has no `ConfigDraft`. The second ⏎ acts on the identity the SELECTION
+    /// still holds: any path that moved it while armed disarms first, so the
+    /// selection IS the armed identity (no separate field, the F2 call).
+    pub(crate) codex_detail_armed: bool,
+    /// The descended pool detail's armed 2-step (`remove`). The armed identity
+    /// is the selection's own pool pair, re-resolved on the second ⏎ (same
+    /// reason as the codex flag).
+    pub(crate) pool_detail_armed: bool,
     /// Inline editor for the Config detail pane; `Some` only while Actions has focus.
     pub(crate) config_draft: Option<ConfigDraft>,
     /// The `+ new` form's draft while the form is not the active Setup pane —
@@ -4210,6 +4346,27 @@ pub(crate) struct App {
         std::sync::mpsc::Receiver<(u64, std::result::Result<LoginResult, String>)>,
     pub(crate) login_result_tx:
         std::sync::mpsc::Sender<(u64, std::result::Result<LoginResult, String>)>,
+
+    /// In-flight codex browser re-login (the Setup codex detail's `re-login`
+    /// row); `None` while idle. Its own session and channels: codex's callback
+    /// answers on this machine alone, so the flow is one worker with no paste
+    /// door. The worker LANDS the minted chain itself (behind the rotation
+    /// flock), so the result channel carries the canonical name or the error
+    /// sentence — the UI drains only the outcome, never parks on the flock.
+    pub(crate) codex_login: Option<CodexLoginSession>,
+    pub(crate) codex_login_generation: u64,
+    pub(crate) codex_login_url_rx: std::sync::mpsc::Receiver<(u64, String)>,
+    pub(crate) codex_login_url_tx: std::sync::mpsc::Sender<(u64, String)>,
+    pub(crate) codex_login_result_rx:
+        std::sync::mpsc::Receiver<(u64, String, std::result::Result<String, String>)>,
+    pub(crate) codex_login_result_tx:
+        std::sync::mpsc::Sender<(u64, String, std::result::Result<String, String>)>,
+    /// The codex browser login the `re-login` worker runs. A plain fn field so
+    /// a test swaps in a hermetic stand-in that never binds codex's loopback
+    /// ports or opens a browser (the `SchedulerState.fetcher` field precedent).
+    /// The non-test worker always runs [`codex_login::login_with`].
+    #[cfg(test)]
+    pub(crate) codex_login_worker: CodexLoginWorker,
 
     /// Claude status feed state; UI-thread-only (no shared lock).
     pub(crate) status: StatusState,
@@ -4472,7 +4629,8 @@ pub(crate) struct App {
     pub(crate) shunt_pool: ShuntPool,
     /// The worker running [`shunt_pool_probe`]; `prober` is `None` under test.
     pub(crate) shunt_pool_probe: ProbeWorker<ShuntPool>,
-    /// Throttle for the per-tick pool re-read while the Overview tab shows.
+    /// Throttle for the per-tick pool re-read while the Overview or Setup tab
+    /// shows.
     last_shunt_pool_refresh: Option<Instant>,
     /// The account `(family, name)` a remove/refresh worker is acting on;
     /// `None` while none runs. Every row whose provider maps to that family and
@@ -4484,6 +4642,9 @@ pub(crate) struct App {
         crate::gateway_admin::PoolFamily,
         crate::gateway_admin::ShuntAccountName,
     )>,
+    /// Which job the in-flight mutation is — the detail pane spins the action
+    /// row whose job runs, `remove` included, never the wrong neighbour row.
+    pub(crate) pool_mutation_kind: Option<PoolMutationKind>,
     /// Pool remove/refresh worker results; drained in `on_tick`.
     pool_mutation_rx: std::sync::mpsc::Receiver<PoolMutationResult>,
     pool_mutation_tx: std::sync::mpsc::Sender<PoolMutationResult>,
@@ -4781,6 +4942,8 @@ impl App {
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
         let (pool_mutation_tx, pool_mutation_rx) = std::sync::mpsc::channel();
+        let (codex_login_url_tx, codex_login_url_rx) = std::sync::mpsc::channel();
+        let (codex_login_result_tx, codex_login_result_rx) = std::sync::mpsc::channel();
 
         // Seed the token cache and the live tally before `config` moves into the
         // handle below.
@@ -4847,6 +5010,9 @@ impl App {
             check_output_viewport: std::cell::Cell::new(0),
             help_viewport: std::cell::Cell::new(0),
             profile_cursor: 0,
+            setup_item: None,
+            setup_item_index: None,
+            setup_remembered: None,
             overview_selector: ListView::default(),
             overview_cursor: 0,
             overview_remembered: None,
@@ -4878,6 +5044,8 @@ impl App {
             global_config_total: std::cell::Cell::new(0),
             config_focus: ConfigFocus::Profiles,
             config_action_cursor: 0,
+            codex_detail_armed: false,
+            pool_detail_armed: false,
             fallback_focus: FallbackFocus::Chain,
             fallback_detail_cursor: 0,
             fallback_edit: None,
@@ -4904,6 +5072,16 @@ impl App {
             login_event_tx,
             login_result_rx,
             login_result_tx,
+            codex_login: None,
+            codex_login_generation: 0,
+            codex_login_url_rx,
+            codex_login_url_tx,
+            codex_login_result_rx,
+            codex_login_result_tx,
+            #[cfg(test)]
+            codex_login_worker: |_announce, _cancel| {
+                Err("test seam: no real codex browser login".to_string())
+            },
             status: StatusState::default(),
             status_events,
             status_refresh,
@@ -4995,6 +5173,7 @@ impl App {
             shunt_pool_probe: ProbeWorker::new(shunt_pool_probe),
             last_shunt_pool_refresh: None,
             pool_mutation_row: None,
+            pool_mutation_kind: None,
             pool_mutation_rx,
             pool_mutation_tx,
         };
@@ -6006,6 +6185,11 @@ impl App {
         self.services.land_on_herdr = false;
         self.modal_generation
             .set(self.modal_generation.get().wrapping_add(1));
+        // Opening any modal (help, the action menu, a confirm, a login) moves
+        // focus away: an armed codex/pool 2-step disarms and its label restores
+        // (the cloudy-tui Inline 2-step rule).
+        disarm_codex_2step(self);
+        disarm_pool_2step(self);
         self.modals.push(modal);
     }
 
@@ -6019,6 +6203,19 @@ impl App {
                 .set(self.modal_generation.get().wrapping_add(1));
         }
         popped
+    }
+
+    /// Drop every modal matching `pred` and bump the modal generation once
+    /// when any dropped, so a scroll bound published before the close is
+    /// stale. The login modals close through here; [`pop_modal`] covers the
+    /// top-modal pop.
+    fn retain_modals(&mut self, pred: impl Fn(&Modal) -> bool) {
+        let before = self.modals.len();
+        self.modals.retain(pred);
+        if self.modals.len() != before {
+            self.modal_generation
+                .set(self.modal_generation.get().wrapping_add(1));
+        }
     }
 
     /// Every write of [`App::gateway_state`] after construction lands here.
@@ -6107,24 +6304,105 @@ impl App {
 
     // ── Main list ────────────────────────────────────────────────────────────
 
+    /// The Overview's visible item list under its current harness filter.
     pub(crate) fn main_items(&self) -> Vec<MainItemKind> {
-        let mut rows = Vec::new();
-        if self.harness_filter.shows_claude() {
-            rows.extend((0..self.profile_count()).map(MainItemKind::Profile));
+        self.main_items_for(self.harness_filter)
+    }
+
+    /// The flat item list for `filter`: the [`App::band_entries`] items in
+    /// walk order. One producer with the filter as a parameter — the Overview
+    /// passes its filter, Setup passes [`HarnessFilter::All`] — so the two
+    /// lists can never drift.
+    pub(crate) fn main_items_for(&self, filter: HarnessFilter) -> Vec<MainItemKind> {
+        self.band_entries(filter)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                BandEntry::Item(item) => Some(item),
+                BandEntry::Spacer | BandEntry::Heading(_) => None,
+            })
+            .collect()
+    }
+
+    /// The shared band walk: claude rows first (no chrome), then the codex
+    /// band, then the shunt band, each introduced by a blank spacer when rows
+    /// precede it and a section heading. Both selectors render from this one
+    /// walk — the Overview's `draw_overview_accounts` and Setup's `draw_selector`
+    /// derive their rows, headings, spacers and order from it, and each lifts a
+    /// heading only while a row under it holds focus via [`App::heading_ranges`].
+    pub(crate) fn band_entries(&self, filter: HarnessFilter) -> Vec<BandEntry> {
+        let claude_count = if filter.shows_claude() {
+            self.profile_count()
+        } else {
+            0
+        };
+        let codex_count = if filter.shows_codex() {
+            self.codex_rows.len()
+        } else {
+            0
+        };
+        let mut entries = Vec::new();
+        entries.extend((0..claude_count).map(|i| BandEntry::Item(MainItemKind::Profile(i))));
+        if codex_count > 0 {
+            if claude_count > 0 {
+                entries.push(BandEntry::Spacer);
+            }
+            entries.push(BandEntry::Heading("codex".to_string()));
+            entries.extend((0..codex_count).map(|i| BandEntry::Item(MainItemKind::Codex(i))));
         }
-        if self.harness_filter.shows_codex() {
-            rows.extend((0..self.codex_rows.len()).map(MainItemKind::Codex));
-        }
-        if self.harness_filter.shows_shunt()
-            && let ShuntPool::Read(providers) = &self.shunt_pool
-        {
-            for (pi, provider) in providers.iter().enumerate() {
-                for ai in 0..provider.accounts.len() {
-                    rows.push(MainItemKind::Shunt(pi, ai));
+        match (&self.shunt_pool, filter.shows_shunt()) {
+            (ShuntPool::Read(providers), true) if !providers.is_empty() => {
+                if claude_count + codex_count > 0 {
+                    entries.push(BandEntry::Spacer);
+                }
+                for (pi, provider) in providers.iter().enumerate() {
+                    entries.push(BandEntry::Heading(format!(
+                        "shunt ({})",
+                        escape_control(&provider.name)
+                    )));
+                    entries.extend(
+                        (0..provider.accounts.len())
+                            .map(|ai| BandEntry::Item(MainItemKind::Shunt(pi, ai))),
+                    );
                 }
             }
+            (ShuntPool::NotRead(reason), true) => {
+                if claude_count + codex_count > 0 {
+                    entries.push(BandEntry::Spacer);
+                }
+                entries.push(BandEntry::Heading(format!(
+                    "shunt — not read: {}",
+                    escape_control(reason)
+                )));
+            }
+            _ => {}
         }
-        rows
+        entries
+    }
+
+    /// The flat item range each heading covers, in entry order:
+    /// `(entry_index, flat_start, flat_end)` (end exclusive). One shared walk
+    /// so the Overview and Setup selectors agree on which heading lifts when a
+    /// row under it holds focus.
+    pub(crate) fn heading_ranges(entries: &[BandEntry]) -> Vec<(usize, usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut flat = 0;
+        let mut open: Option<(usize, usize)> = None;
+        for (i, entry) in entries.iter().enumerate() {
+            match entry {
+                BandEntry::Heading(_) => {
+                    if let Some((hi, s)) = open.take() {
+                        ranges.push((hi, s, flat));
+                    }
+                    open = Some((i, flat));
+                }
+                BandEntry::Item(_) => flat += 1,
+                BandEntry::Spacer => {}
+            }
+        }
+        if let Some((hi, s)) = open.take() {
+            ranges.push((hi, s, flat));
+        }
+        ranges
     }
 
     pub(crate) fn profile_count(&self) -> usize {
@@ -6154,6 +6432,270 @@ impl App {
 
     pub(crate) fn current_main_item(&self) -> Option<MainItemKind> {
         self.main_items().get(self.overview_cursor).copied()
+    }
+
+    /// Setup's flat item list: the Overview's items under the all-filter. Its
+    /// `len()` is the trailing `+ new` row.
+    pub(crate) fn setup_items(&self) -> Vec<MainItemKind> {
+        self.main_items_for(HarnessFilter::All)
+    }
+
+    /// What Setup's selector has selected: a harness item, or the trailing
+    /// `+ new`. A claude row is `profile_cursor` itself (its `+ new` synthetic
+    /// at `profile_count()`); a codex or pool row is the stored
+    /// [`App::setup_item`] IDENTITY, resolved to its index against the current
+    /// lists. A hidden identity lives in [`App::setup_remembered`] alone, so
+    /// the shown selection IS the first row; a read list that dropped the
+    /// identity is re-homed by [`App::rehome_setup_selection`] on the tick.
+    pub(crate) fn setup_selection(&self) -> SetupSelection {
+        if let Some(item) = &self.setup_item
+            && let Some(resolved) = self.resolve_setup_item(item)
+        {
+            return SetupSelection::Item(resolved);
+        }
+        if self.profile_cursor >= self.profile_count() {
+            SetupSelection::New
+        } else {
+            SetupSelection::Item(MainItemKind::Profile(self.profile_cursor))
+        }
+    }
+
+    /// Resolve a stored Setup identity to its current `MainItemKind` index;
+    /// `None` when the current lists no longer hold it.
+    fn resolve_setup_item(&self, item: &SetupItem) -> Option<MainItemKind> {
+        match item {
+            SetupItem::Codex(name) => self
+                .codex_rows
+                .iter()
+                .position(|row| row.name == *name)
+                .map(MainItemKind::Codex),
+            SetupItem::Pool { provider, account } => {
+                let ShuntPool::Read(providers) = &self.shunt_pool else {
+                    return None;
+                };
+                providers
+                    .iter()
+                    .enumerate()
+                    .find(|(_, p)| p.name == *provider)
+                    .and_then(|(pi, p)| {
+                        p.accounts
+                            .iter()
+                            .position(|a| a.name == account.as_str())
+                            .map(|ai| MainItemKind::Shunt(pi, ai))
+                    })
+            }
+        }
+    }
+
+    /// Whether the identity is still held — a codex name in the roster, a pool
+    /// `(provider, account)` in a read listing, or a pool hidden by an unread
+    /// listing (which keeps its rows like a filter, never drops them).
+    fn holds_setup_item(&self, item: &SetupItem) -> bool {
+        match item {
+            SetupItem::Codex(name) => self.codex_rows.iter().any(|row| row.name == *name),
+            SetupItem::Pool { provider, account } => match &self.shunt_pool {
+                ShuntPool::Read(providers) => providers.iter().any(|p| {
+                    p.name == *provider && p.accounts.iter().any(|a| a.name == account.as_str())
+                }),
+                ShuntPool::NotRead(_) | ShuntPool::Absent => true,
+            },
+        }
+    }
+
+    /// The identity for a resolved harness item; `None` for a claude row (the
+    /// shared cursor is its own identity).
+    fn setup_item_for(&self, item: MainItemKind) -> Option<SetupItem> {
+        match item {
+            MainItemKind::Codex(i) => self
+                .codex_rows
+                .get(i)
+                .map(|row| SetupItem::Codex(row.name.clone())),
+            MainItemKind::Shunt(pi, ai) => {
+                let (account, _) = self.shunt_pool_row(pi, ai)?;
+                let provider = pool_provider_name(self, pi)?;
+                let account = account.name.clone();
+                Some(SetupItem::Pool { provider, account })
+            }
+            MainItemKind::Profile(_) => None,
+        }
+    }
+
+    /// The flat cursor position of the current Setup selection (an index into
+    /// [`App::setup_items`], its `len()` the trailing `+ new` row) — the input
+    /// to the wrapping ↑↓ step. A held-but-hidden identity (an unread pool)
+    /// shows on the first row, the Overview's placement rule.
+    pub(crate) fn setup_position(&self) -> usize {
+        let items = self.setup_items();
+        match self.setup_selection() {
+            SetupSelection::New => items.len(),
+            SetupSelection::Item(item) => items.iter().position(|row| *row == item).unwrap_or(0),
+        }
+    }
+
+    /// Land the Setup selection on flat position `pos`: a codex or pool item
+    /// is stored as its [`App::SetupItem`] identity (leaving `profile_cursor`
+    /// alone); a claude row or `+ new` clears it and moves the shared cursor.
+    /// A move is a choice of a new row, so it replaces any held-but-hidden
+    /// identity (`setup_remembered`).
+    fn place_setup_selection(&mut self, pos: usize) {
+        self.setup_remembered = None;
+        match self.setup_items().get(pos) {
+            Some(item @ (MainItemKind::Codex(_) | MainItemKind::Shunt(..))) => {
+                if let Some(identity) = self.setup_item_for(*item) {
+                    self.setup_item = Some(identity);
+                    self.setup_item_index = Some(pos);
+                }
+            }
+            Some(MainItemKind::Profile(i)) => {
+                self.setup_item = None;
+                self.setup_item_index = None;
+                if self.profile_cursor != *i {
+                    self.profile_cursor = *i;
+                    self.reload_selected_note();
+                }
+            }
+            None => {
+                self.setup_item = None;
+                self.setup_item_index = None;
+                self.profile_cursor = self.profile_count();
+            }
+        }
+    }
+
+    /// The flat [`App::setup_items`] index `item` sits at (a claude row's is
+    /// its profile index; `+ new` is the list's `len()`).
+    fn flat_index_of(&self, item: MainItemKind) -> usize {
+        self.setup_items()
+            .iter()
+            .position(|row| *row == item)
+            .unwrap_or(0)
+    }
+
+    /// Re-place the Setup selection after the codex or pool snapshot changed,
+    /// the Overview's placement rule. Runs only while Setup shows (the
+    /// Overview's precedent: [`App::place_overview_cursor`] returns early off
+    /// the Overview), so a pool read on another tab never rewrites the shared
+    /// claude cursor its row is. A selection that still resolves stays (its
+    /// flat index refreshed beside it); a hidden-but-held one (an unread pool)
+    /// ascends out of the detail, holds the identity separately in
+    /// `setup_remembered` and shows on the first row; a dropped-for-good one
+    /// lands on the Setup row now at the flat index it held, clamped to the
+    /// last item row (`+ new` only when no item row exists) — across bands,
+    /// never the shared claude cursor by accident. A held identity comes back
+    /// only while the selection has not moved since (a move or a descend
+    /// replaces it).
+    fn rehome_setup_selection(&mut self) {
+        if self.tab != Tab::Setup {
+            return;
+        }
+        // A held-but-hidden identity restores when the read returns it — only
+        // if the selection still sits where the hide left it.
+        if let Some(remembered) = self.setup_remembered.clone() {
+            if let Some(resolved) = self.resolve_setup_item(&remembered) {
+                self.setup_item = Some(remembered);
+                self.setup_item_index = Some(self.flat_index_of(resolved));
+                self.setup_remembered = None;
+                return;
+            }
+            if !self.holds_setup_item(&remembered) {
+                self.setup_remembered = None;
+            }
+        }
+        let Some(item) = self.setup_item.clone() else {
+            return;
+        };
+        if let Some(resolved) = self.resolve_setup_item(&item) {
+            self.setup_item_index = Some(self.flat_index_of(resolved));
+            return; // still resolves
+        }
+        if self.holds_setup_item(&item) {
+            // Hidden but held: ascend, hold the identity separately (like
+            // `overview_remembered`) and put the selection on the shown first
+            // row. It comes back only if the selection did not move since.
+            if self.config_focus == ConfigFocus::Actions {
+                leave_config_detail(self);
+            }
+            if self.setup_remembered.is_none() {
+                self.place_setup_selection(0);
+                self.setup_remembered = Some(item);
+            }
+            return;
+        }
+        // Dropped for good: the row now at the flat index it held, clamped to
+        // the last item row (`+ new` only when no item row exists), across
+        // bands.
+        let items = self.setup_items();
+        let held = self.setup_item_index.unwrap_or(0);
+        let pos = if items.is_empty() {
+            0
+        } else {
+            held.min(items.len() - 1)
+        };
+        self.place_setup_selection(pos);
+        if self.config_focus == ConfigFocus::Actions {
+            leave_config_detail(self);
+        }
+    }
+
+    /// The current Setup selection as a codex-row index, `None` off a codex row.
+    pub(crate) fn setup_codex_index(&self) -> Option<usize> {
+        match self.setup_selection() {
+            SetupSelection::Item(MainItemKind::Codex(i)) if i < self.codex_rows.len() => Some(i),
+            _ => None,
+        }
+    }
+
+    /// The current Setup selection as a `(provider, account)` pool pair.
+    pub(crate) fn setup_pool_pair(&self) -> Option<(usize, usize)> {
+        match self.setup_selection() {
+            SetupSelection::Item(MainItemKind::Shunt(pi, ai)) => Some((pi, ai)),
+            _ => None,
+        }
+    }
+
+    /// The pool account and its provider's auth at `(provider, account)`.
+    pub(crate) fn shunt_pool_row(
+        &self,
+        pi: usize,
+        ai: usize,
+    ) -> Option<(
+        &crate::gateway_admin::PoolAccount,
+        &crate::gateway_admin::PoolAuth,
+    )> {
+        match &self.shunt_pool {
+            ShuntPool::Read(providers) => {
+                let provider = providers.get(pi)?;
+                Some((provider.accounts.get(ai)?, &provider.auth))
+            }
+            ShuntPool::NotRead(_) | ShuntPool::Absent => None,
+        }
+    }
+
+    /// Every provider serving the pool account named `name` under the auth mode
+    /// `auth`, control-escaped, in listing order — the pool detail's `provider`
+    /// row (` · `-joined). A provider serves an account only when its auth
+    /// family equals the account's (shunt stores accounts per family); kimi and
+    /// unknown modes, which have no family, match on the auth mode itself.
+    pub(crate) fn pool_providers_for(
+        &self,
+        auth: &crate::gateway_admin::PoolAuth,
+        name: &str,
+    ) -> Vec<String> {
+        let family = auth.clone().family();
+        match &self.shunt_pool {
+            ShuntPool::Read(providers) => providers
+                .iter()
+                .filter(|p| {
+                    p.accounts.iter().any(|a| a.name == name)
+                        && match family {
+                            Some(f) => p.auth.clone().family() == Some(f),
+                            None => p.auth.clone() == auth.clone(),
+                        }
+                })
+                .map(|p| escape_control(&p.name))
+                .collect(),
+            ShuntPool::NotRead(_) | ShuntPool::Absent => Vec::new(),
+        }
     }
 
     /// Whether the item universe still holds `item` (regardless of filter). A
@@ -6227,6 +6769,9 @@ impl App {
             self.overview_cursor = next;
             self.overview_remembered = self.current_main_item();
             self.sync_overview_profile_selection();
+            // A selection change on another tab replaces a held-but-hidden
+            // Setup identity: the read must not restore it over this pick.
+            self.setup_remembered = None;
         }
     }
 }
@@ -6617,6 +7162,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     if app.login.is_some() && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
         app.login = None;
         app.toast(ToastKind::Info, "login canceled");
+        return;
+    }
+
+    // The codex re-login's twin: a collapsed login cancels on esc/q the same
+    // way — the worker's listener wait stops (its ports free) and `q` never
+    // arms the 2-step quit around a live login.
+    if app.codex_login.is_some() && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        cancel_codex_login(app);
         return;
     }
 
@@ -7352,27 +7905,44 @@ fn switch_tab(app: &mut App, tab: Tab) {
                         let name = ProfileName::from(name.as_str());
                         let idx = app.config().profiles.iter().position(|p| p.name == name);
                         match idx {
-                            Some(i) => app.profile_cursor = i,
+                            Some(i) => {
+                                app.setup_item = None;
+                                app.profile_cursor = i;
+                            }
                             None => leave_config_detail(app),
                         }
                     }
-                    None => app.profile_cursor = app.profile_count(),
+                    None => {
+                        app.setup_item = None;
+                        app.profile_cursor = app.profile_count();
+                    }
                 }
             } else {
                 app.config_focus = ConfigFocus::Profiles;
                 app.config_action_cursor = 0;
-                // A suspended `+ new` form re-homes the selector onto its row —
-                // `clamp_profile_cursor` above drops the synthetic `+ new`
-                // cursor. Skipped while a suspended edit owns the selector.
+                disarm_codex_2step(app);
+                disarm_pool_2step(app);
+                // A suspended `+ new` form re-homes the selector onto its row.
+                // Skipped while a suspended edit owns the selector.
                 if app.new_account_draft.is_some() {
+                    app.setup_item = None;
                     app.profile_cursor = app.profile_count();
                     app.reload_selected_note();
+                } else {
+                    // Fresh entry: land on the shared claude row (a remembered
+                    // codex or pool selection is its own item, kept across a
+                    // switch back).
                 }
             }
             // The `+ new` form's capture row renders off this flag, and a
             // login may have been minted (or saved) elsewhere since the last
             // Setup visit.
             app.refresh_unsaved_live_login();
+            // The codex or pool snapshot may have changed while Setup was
+            // hidden; place the selection on entry, before the first frame and
+            // the first key — the Overview's precedent (`place_overview_cursor`
+            // runs in `switch_tab`), never one tick late on `on_tick`.
+            app.rehome_setup_selection();
         }
         Tab::Fallback => {
             if keyboard_owner(app).is_some() {
@@ -7421,9 +7991,21 @@ fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
         return;
     }
     app.profile_cursor = (app.profile_cursor as i32 + delta).rem_euclid(len as i32) as usize;
+    // A move of the shared claude cursor is a selection change: a held-but-hidden
+    // Setup identity is replaced, never restored over the moved-to row.
+    app.setup_remembered = None;
     // The note belongs to the selection: the row must never show the previous
     // account's note under the newly selected header.
     app.reload_selected_note();
+}
+
+/// Move Setup's selector by `delta`, wrapping over the item rows plus `+ new`.
+fn step_setup_cursor(app: &mut App, delta: i32, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let next = (app.setup_position() as i32 + delta).rem_euclid(len as i32) as usize;
+    app.place_setup_selection(next);
 }
 
 /// One page = the current viewport minus one overlap line (minimum 1), so a
@@ -13178,7 +13760,14 @@ fn start_pool_mutation(
         );
         return;
     }
+    let kind = match &job {
+        PoolJob::Remove { .. } => PoolMutationKind::Remove,
+        PoolJob::Refresh { .. } => PoolMutationKind::Refresh,
+        #[cfg(test)]
+        PoolJob::Panic { .. } => PoolMutationKind::Remove,
+    };
     app.pool_mutation_row = Some(marker);
+    app.pool_mutation_kind = Some(kind);
     let operation = job.operation();
     let tx = app.pool_mutation_tx.clone();
     spawn_worker(move || {
@@ -13206,6 +13795,13 @@ fn pool_row_at_cursor(app: &App) -> Option<ResolvedPoolRow> {
     let MainItemKind::Shunt(pi, ai) = app.current_main_item()? else {
         return None;
     };
+    pool_row_at(app, pi, ai)
+}
+
+/// Resolve the pool row at `(provider, account)`: the record, the provider's
+/// auth, the account's validated name and its escaped display name. `None`
+/// when the snapshot or record vanished, or the name fails shunt's grammar.
+fn pool_row_at(app: &App, pi: usize, ai: usize) -> Option<ResolvedPoolRow> {
     let record = app.services.shunt_record.clone()?;
     let ShuntPool::Read(providers) = &app.shunt_pool else {
         return None;
@@ -13224,9 +13820,14 @@ fn pool_row_at_cursor(app: &App) -> Option<ResolvedPoolRow> {
 /// `refresh` on a pool row: run it on a worker (claude and antigravity only;
 /// the type makes codex and kimi unrepresentable).
 fn start_pool_refresh(app: &mut App) {
-    let Some((record, auth, name, display)) = pool_row_at_cursor(app) else {
+    let Some(resolved) = pool_row_at_cursor(app) else {
         return;
     };
+    start_pool_refresh_row(app, resolved);
+}
+
+/// The `refresh` job behind both the Overview's action and Setup's detail row.
+fn start_pool_refresh_row(app: &mut App, (record, auth, name, display): ResolvedPoolRow) {
     let Some(family) = auth.clone().family() else {
         return;
     };
@@ -13239,6 +13840,35 @@ fn start_pool_refresh(app: &mut App) {
         PoolJob::Refresh {
             record,
             family: refresh_family,
+            name,
+            display,
+        },
+    );
+}
+
+/// The `remove` job behind the Overview's confirm and Setup's inline 2-step —
+/// one build, never two (F21).
+fn start_pool_remove_row(app: &mut App, (record, auth, name, display): ResolvedPoolRow) {
+    let Some(family) = auth.family() else {
+        return;
+    };
+    start_pool_remove(app, record, family, name, display);
+}
+
+/// Build and start one pool `remove` job, shared by both remove callers.
+fn start_pool_remove(
+    app: &mut App,
+    record: crate::gateway::GatewayRecord,
+    family: crate::gateway_admin::PoolFamily,
+    name: crate::gateway_admin::ShuntAccountName,
+    display: String,
+) {
+    start_pool_mutation(
+        app,
+        (family, name.clone()),
+        PoolJob::Remove {
+            record,
+            family,
             name,
             display,
         },
@@ -13265,7 +13895,6 @@ fn open_pool_remove_confirm(app: &mut App) {
             family,
             name: name.clone(),
             display,
-            marker: (family, name),
         },
     }));
 }
@@ -13286,6 +13915,7 @@ fn drain_shunt_pool_probe(app: &mut App) {
 fn drain_pool_mutations(app: &mut App) {
     while let Ok(result) = app.pool_mutation_rx.try_recv() {
         app.pool_mutation_row = None;
+        app.pool_mutation_kind = None;
         handle_pool_mutation_result(app, result);
     }
 }
@@ -13336,7 +13966,7 @@ fn handle_pool_mutation_result(app: &mut App, result: PoolMutationResult) {
 /// [`ProbeWorker::restart`], whose result must postdate the mutation.
 fn poll_shunt_pool(app: &mut App) {
     const SHUNT_POOL_INTERVAL: Duration = Duration::from_secs(10);
-    if app.tab != Tab::Overview {
+    if !matches!(app.tab, Tab::Overview | Tab::Setup) {
         return;
     }
     if app
@@ -13876,6 +14506,19 @@ pub(crate) fn escape_control(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// A pool provider's auth mode as the pool detail's `family` row reads it:
+/// the family name, or the unknown mode's own string (control-escaped).
+pub(crate) fn pool_auth_label(auth: &crate::gateway_admin::PoolAuth) -> String {
+    use crate::gateway_admin::PoolAuth;
+    match auth {
+        PoolAuth::Claude => "claude".to_string(),
+        PoolAuth::Codex => "codex".to_string(),
+        PoolAuth::Antigravity => "antigravity".to_string(),
+        PoolAuth::Kimi => "kimi".to_string(),
+        PoolAuth::Unknown(mode) => escape_control(mode),
+    }
 }
 
 /// A compact toast detail from an `anyhow::Error`: the root cause first (it
@@ -16398,6 +17041,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
         Modal::Login => handle_login_modal_key(app, key),
+        Modal::CodexLogin => handle_codex_login_modal_key(app, key),
         Modal::Rebind(_) => handle_rebind_key(app, key),
     }
 }
@@ -16448,6 +17092,39 @@ fn handle_login_modal_key(app: &mut App, key: KeyEvent) {
                 && session.open_door().is_some()
             {
                 session.paste_field = Some(InputState::new(""));
+            }
+        }
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+            app.pop_modal();
+        }
+        _ => {}
+    }
+}
+
+/// Keys on the codex login modal: `r` re-opens the authorize URL once the
+/// worker announced it, `c` copies it (OSC 52, as the claude modal's `c`
+/// does); no `p` — codex's callback answers on this machine alone, so there is
+/// no paste door. esc/q/⏎ collapse to the footer indicator; the login keeps
+/// running (a real cancel is the top-level esc once collapsed).
+fn handle_codex_login_modal_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('r' | 'R') => {
+            if let Some(url) = app.codex_login.as_ref().and_then(|s| s.url.clone()) {
+                match crate::platform::open_url(&url) {
+                    Ok(()) => app.toast(ToastKind::Info, "opening your browser…"),
+                    Err(_) => app.toast(ToastKind::Danger, "couldn't open the browser"),
+                }
+            }
+        }
+        KeyCode::Char('c' | 'C') => {
+            if let Some(link) = app.codex_login.as_ref().and_then(|s| s.url.clone()) {
+                match (app.clipboard)(&link) {
+                    Ok(()) => app.toast(ToastKind::Info, "link copied to clipboard"),
+                    Err(e) => app.toast(
+                        ToastKind::Danger,
+                        format!("couldn't copy the link to clipboard\n{e}"),
+                    ),
+                }
             }
         }
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
@@ -16580,26 +17257,32 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
         // endpoint + models as a template, stamp one back onto it. On `+ new`
         // there is no source account to duplicate or save, but a preset can
         // still stamp the draft's endpoint + model fields.
-        Tab::Setup => {
-            if let Some((name, _, _)) = focused_account(app) {
-                context = Some(name.to_string());
-                scoped.push(Duplicate);
-                scoped.push(SaveAsPreset);
-                scoped.push(ApplyPreset);
-                // The api-key row is on this tab, so the page that key comes
-                // from belongs next to it.
-                if focused_provider_console(app).is_some() {
-                    scoped.push(OpenProviderConsole);
+        Tab::Setup => match app.setup_selection() {
+            SetupSelection::Item(MainItemKind::Profile(_)) => {
+                if let Some((name, _, _)) = focused_account(app) {
+                    context = Some(name.to_string());
+                    scoped.push(Duplicate);
+                    scoped.push(SaveAsPreset);
+                    scoped.push(ApplyPreset);
+                    // The api-key row is on this tab, so the page that key comes
+                    // from belongs next to it.
+                    if focused_provider_console(app).is_some() {
+                        scoped.push(OpenProviderConsole);
+                    }
                 }
-            } else if app.profile_cursor >= app.profile_count() {
-                // `+ new` only: its draft is what a preset stamps.
+            }
+            // `+ new` only: its draft is what a preset stamps.
+            SetupSelection::New => {
                 context = app
                     .config_draft
                     .as_ref()
                     .and_then(|d| d.name.trimmed_some());
                 scoped.push(ApplyPreset);
             }
-        }
+            // A codex or pool row gains nothing: its detail rows carry the
+            // actions (re-login / delete account; refresh / remove).
+            SetupSelection::Item(MainItemKind::Codex(_) | MainItemKind::Shunt(..)) => {}
+        },
         // Fallback: every action the chain and its detail rows carry is bound to
         // a key of its own (⏎, ⇧↑↓, space, +/-).
         Tab::Fallback => {}
@@ -17315,25 +17998,37 @@ fn set_token_period(app: &mut App, period: TokenPeriod) {
 /// Setup tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
 /// edits/toggles/arms/creates. Esc (global) returns to list.
 fn handle_config_key(app: &mut App, key: KeyEvent) {
-    let sel_len = app.profile_count() + 1; // includes trailing `+ new` row
-    app.profile_cursor = app.profile_cursor.min(sel_len - 1);
+    let sel_len = app.setup_items().len() + 1; // includes trailing `+ new` row
 
     match app.config_focus {
         ConfigFocus::Profiles => match key.code {
-            KeyCode::Up => step_profile_cursor(app, -1, sel_len),
-            KeyCode::Down => step_profile_cursor(app, 1, sel_len),
+            KeyCode::Up => step_setup_cursor(app, -1, sel_len),
+            KeyCode::Down => step_setup_cursor(app, 1, sel_len),
             KeyCode::PageUp => {
-                app.profile_cursor = selector_page_up(app.profile_cursor, &app.setup_selector);
-                app.reload_selected_note();
+                let next = selector_page_up(app.setup_position(), &app.setup_selector);
+                app.place_setup_selection(next);
             }
             KeyCode::PageDown => {
-                app.profile_cursor = selector_page_down(app.profile_cursor, &app.setup_selector);
-                app.reload_selected_note();
+                let next = selector_page_down(app.setup_position(), &app.setup_selector);
+                app.place_setup_selection(next);
             }
             KeyCode::Enter => enter_config_detail(app),
             _ => {}
         },
         ConfigFocus::Actions => {
+            // The codex and pool detail panes run their own row lists and
+            // actions; the claude path (and the `+ new` form) keep `config_rows`.
+            match app.setup_selection() {
+                SetupSelection::Item(MainItemKind::Codex(_)) => {
+                    handle_codex_detail_key(app, key);
+                    return;
+                }
+                SetupSelection::Item(MainItemKind::Shunt(..)) => {
+                    handle_pool_detail_key(app, key);
+                    return;
+                }
+                _ => {}
+            }
             let rows = config_rows(app);
             if rows.is_empty() {
                 app.config_focus = ConfigFocus::Profiles;
@@ -17414,6 +18109,377 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Keys on the Setup codex detail pane: ↑↓ walk its action rows (wrapping),
+/// page keys page them, ⏎/space run the row — `re-login` starts the codex
+/// browser flow, `delete account` arms the inline 2-step then deletes.
+/// Clear the codex detail's armed 2-step (flag + identity together, so neither
+/// can outlive the other and re-arm on a stale name).
+fn disarm_codex_2step(app: &mut App) {
+    app.codex_detail_armed = false;
+}
+
+/// Clear the pool detail's armed 2-step.
+fn disarm_pool_2step(app: &mut App) {
+    app.pool_detail_armed = false;
+}
+
+fn handle_codex_detail_key(app: &mut App, key: KeyEvent) {
+    let rows = CodexDetailRow::ALL;
+    let last = rows.len() - 1;
+    app.config_action_cursor = app.config_action_cursor.min(last);
+    match key.code {
+        KeyCode::Up => {
+            disarm_codex_2step(app);
+            app.config_action_cursor = if app.config_action_cursor == 0 {
+                last
+            } else {
+                app.config_action_cursor - 1
+            };
+        }
+        KeyCode::Down => {
+            disarm_codex_2step(app);
+            app.config_action_cursor = if app.config_action_cursor >= last {
+                0
+            } else {
+                app.config_action_cursor + 1
+            };
+        }
+        KeyCode::PageUp => {
+            disarm_codex_2step(app);
+            let starts = app.setup_detail_row_starts.borrow();
+            let block_ends = app.setup_detail_block_ends.borrow();
+            let tips = app.setup_detail_tips.borrow();
+            app.config_action_cursor = page_up_cursor_by_rows(
+                app.config_action_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.setup_detail_viewport.get(),
+                app.setup_detail_offset.get(),
+                app.setup_detail_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            disarm_codex_2step(app);
+            let starts = app.setup_detail_row_starts.borrow();
+            let block_ends = app.setup_detail_block_ends.borrow();
+            app.config_action_cursor = page_down_cursor_by_rows(
+                app.config_action_cursor,
+                &starts,
+                &block_ends,
+                app.setup_detail_viewport.get(),
+                app.setup_detail_offset.get(),
+                app.setup_detail_total.get(),
+            );
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let Some(i) = app.setup_codex_index() else {
+                return;
+            };
+            let Some(name) = app.codex_rows.get(i).map(|r| r.name.clone()) else {
+                return;
+            };
+            match rows[app.config_action_cursor] {
+                CodexDetailRow::ReLogin => start_codex_login(app, name.as_str()),
+                CodexDetailRow::Delete => {
+                    if app.codex_detail_armed {
+                        // The second ⏎ acts on the identity the SELECTION
+                        // still holds: any path that moved it while armed
+                        // disarmed first, so it IS the armed account.
+                        app.codex_detail_armed = false;
+                        let Some(name) = app
+                            .setup_codex_index()
+                            .and_then(|i| app.codex_rows.get(i).map(|r| r.name.clone()))
+                        else {
+                            return;
+                        };
+                        perform_codex_delete(app, name.as_str());
+                    } else {
+                        app.codex_detail_armed = true;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The provider `pi`'s name in the read listing.
+fn pool_provider_name(app: &App, pi: usize) -> Option<String> {
+    match &app.shunt_pool {
+        ShuntPool::Read(providers) => providers.get(pi).map(|p| p.name.clone()),
+        ShuntPool::NotRead(_) | ShuntPool::Absent => None,
+    }
+}
+
+/// Keys on the Setup pool detail pane: ↑↓ walk its action rows, ⏎/space run
+/// them — `refresh` on a worker, `remove` behind the inline 2-step (never the
+/// Overview's confirm modal). The 2-step acts on the selection's own pool pair.
+fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
+    let rows = app.pool_detail_rows();
+    if rows.is_empty() {
+        return;
+    }
+    let last = rows.len() - 1;
+    app.config_action_cursor = app.config_action_cursor.min(last);
+    match key.code {
+        KeyCode::Up => {
+            disarm_pool_2step(app);
+            app.config_action_cursor = if app.config_action_cursor == 0 {
+                last
+            } else {
+                app.config_action_cursor - 1
+            };
+        }
+        KeyCode::Down => {
+            disarm_pool_2step(app);
+            app.config_action_cursor = if app.config_action_cursor >= last {
+                0
+            } else {
+                app.config_action_cursor + 1
+            };
+        }
+        KeyCode::PageUp => {
+            disarm_pool_2step(app);
+            let starts = app.setup_detail_row_starts.borrow();
+            let block_ends = app.setup_detail_block_ends.borrow();
+            let tips = app.setup_detail_tips.borrow();
+            app.config_action_cursor = page_up_cursor_by_rows(
+                app.config_action_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.setup_detail_viewport.get(),
+                app.setup_detail_offset.get(),
+                app.setup_detail_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            disarm_pool_2step(app);
+            let starts = app.setup_detail_row_starts.borrow();
+            let block_ends = app.setup_detail_block_ends.borrow();
+            app.config_action_cursor = page_down_cursor_by_rows(
+                app.config_action_cursor,
+                &starts,
+                &block_ends,
+                app.setup_detail_viewport.get(),
+                app.setup_detail_offset.get(),
+                app.setup_detail_total.get(),
+            );
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let Some((pi, ai)) = app.setup_pool_pair() else {
+                return;
+            };
+            let Some(resolved) = pool_row_at(app, pi, ai) else {
+                return;
+            };
+            match rows[app.config_action_cursor] {
+                PoolDetailRow::Refresh => start_pool_refresh_row(app, resolved),
+                PoolDetailRow::Remove => {
+                    if app.pool_detail_armed {
+                        // The second ⏎ acts on the identity the selection still
+                        // holds, re-resolved against the current listing (a
+                        // re-read may have moved the row).
+                        app.pool_detail_armed = false;
+                        if let Some((pi, ai)) = app.setup_pool_pair()
+                            && let Some(resolved) = pool_row_at(app, pi, ai)
+                        {
+                            start_pool_remove_row(app, resolved);
+                        }
+                    } else {
+                        app.pool_detail_armed = true;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Delete a codex account from the Setup detail pane, behind the same
+/// rotation guard, live-session gate and store write the CLI's
+/// `clauth delete <name>` runs. The selection follows the drop-placement rule:
+/// ascend to the selector, then land on the row now at the deleted row's flat
+/// index, clamped to the last item row (`+ new` only when none exists) — never
+/// wherever `profile_cursor` happened to sit.
+fn perform_codex_delete(app: &mut App, name: &str) {
+    // The deleted row's codex-band index, for the flat drop placement (the row
+    // now at `profile_count() + old_index`, clamped, across bands).
+    let old_index = app
+        .codex_rows
+        .iter()
+        .position(|row| row.name.as_str() == name);
+    let result = rotation_guard_for_mutation(&ProfileName::from(name))
+        .and_then(|rotation| crate::actions::delete_codex_profile(name, false, &rotation));
+    match result {
+        Ok(detached) => {
+            // The flat index the deleted row held, for the drop placement: the
+            // row now at that index, clamped (across bands), the `+ new` row
+            // only when no item row exists.
+            let flat = app.profile_count() + old_index.unwrap_or(0);
+            app.codex_rows = codex_rows();
+            disarm_codex_2step(app);
+            app.config_focus = ConfigFocus::Profiles;
+            app.config_action_cursor = 0;
+            let items = app.setup_items();
+            let pos = if items.is_empty() {
+                0
+            } else {
+                flat.min(items.len() - 1)
+            };
+            app.place_setup_selection(pos);
+            app.toast(ToastKind::Success, format!("deleted '{name}'"));
+            // The CLI's postscript: a delete that detached the operator's own
+            // `~/.codex/auth.json` slot logs their codex out from that moment.
+            if let Some(slot) = detached {
+                app.toast(
+                    ToastKind::Warning,
+                    format!(
+                        "{} followed that profile's chain and is detached now, so your own \
+                         codex has no login; run `codex login` to mint a fresh one",
+                        slot.display()
+                    ),
+                );
+            }
+        }
+        Err(e) => {
+            disarm_codex_2step(app);
+            app.toast(ToastKind::Danger, format!("delete failed\n{e:#}"));
+        }
+    }
+}
+
+/// Start the codex browser re-login: preflight the name, then run the browser
+/// flow on a worker — it binds codex's registered loopback ports and opens the
+/// browser, never on the UI thread — and show the codex login modal. The worker
+/// LANDS the minted chain itself (behind the blocking rotation flock) and sends
+/// the canonical name or error sentence down the result channel; the UI drains
+/// only that outcome through [`drain_codex_login`].
+fn start_codex_login(app: &mut App, name: &str) {
+    if let Some(session) = app.codex_login.as_ref() {
+        // A second ⏎ on `re-login` while one runs reopens its modal (the claude
+        // precedent); only a different account names the running one.
+        if session.name != name {
+            app.toast(
+                ToastKind::Warning,
+                format!("a login for '{}' is already in progress", session.name),
+            );
+        }
+        open_codex_login_modal(app);
+        return;
+    }
+    let trimmed = match crate::actions::codex_browser_preflight(name) {
+        Ok(t) => t,
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("login failed\n{e:#}"));
+            return;
+        }
+    };
+    app.codex_login_generation += 1;
+    let generation = app.codex_login_generation;
+    let cancel = crate::codex_login::LoginCancel::new();
+    app.codex_login = Some(CodexLoginSession {
+        name: trimmed.clone(),
+        generation,
+        url: None,
+        cancel: cancel.clone(),
+    });
+    #[cfg(test)]
+    let worker_fn = app.codex_login_worker;
+    let url_tx = app.codex_login_url_tx.clone();
+    let result_tx = app.codex_login_result_tx.clone();
+    spawn_worker(move || {
+        let announce = move |url: &str| {
+            let _ = url_tx.send((generation, url.to_string()));
+        };
+        #[cfg(test)]
+        let outcome = worker_fn(&announce, &cancel);
+        #[cfg(not(test))]
+        let outcome =
+            crate::codex_login::login_with_cancel(&announce, &cancel).map_err(|e| format!("{e:#}"));
+        // A cancel seen here, BEFORE the landing, drops the minted chain
+        // unwritten (it was never used, so the account's current chain stays
+        // valid) — the cancel toast already said "login canceled". Once the
+        // landing starts it is the commit point: its outcome always reaches a
+        // toast, even when a cancel arrives during it.
+        let res = if cancel.is_canceled() {
+            Err("login canceled".to_string())
+        } else {
+            // A TUI re-login never recreates a deleted account: the landing
+            // requires it to still exist (the CLI keeps its create-or-reauth).
+            outcome.and_then(|o| {
+                crate::actions::land_codex_login(
+                    &trimmed,
+                    &o,
+                    crate::actions::CodexLandMode::RequireExisting,
+                )
+                .map_err(|e| format!("{e:#}"))
+            })
+        };
+        let _ = result_tx.send((generation, trimmed.clone(), res));
+    });
+    open_codex_login_modal(app);
+}
+
+/// Cancel an in-flight codex re-login: signal the worker's listener wait (its
+/// registered ports free), drop the session, and toast. The worker's own
+/// pre-landing cancel check drops the minted chain unwritten; a landing that
+/// already started is the commit point and still toasts its outcome.
+fn cancel_codex_login(app: &mut App) {
+    if let Some(session) = app.codex_login.take() {
+        session.cancel.cancel();
+    }
+    close_codex_login_modal(app);
+    app.toast(ToastKind::Info, "login canceled");
+}
+
+fn open_codex_login_modal(app: &mut App) {
+    if !app.modals.iter().any(|m| matches!(m, Modal::CodexLogin)) {
+        app.open_modal(Modal::CodexLogin);
+    }
+}
+
+fn close_codex_login_modal(app: &mut App) {
+    app.retain_modals(|m| !matches!(m, Modal::CodexLogin));
+}
+
+/// Fold a finished codex login into the app on the UI thread: the worker
+/// already landed the minted chain (rename guard, live-session refusal,
+/// account-swap refusal, store write), so the UI drains only the outcome — the
+/// canonical name on success (re-reading the codex snapshot), or the refusal /
+/// failure sentence, which toasts and leaves the store unchanged.
+fn drain_codex_login(app: &mut App) {
+    while let Ok((generation, url)) = app.codex_login_url_rx.try_recv() {
+        if app
+            .codex_login
+            .as_ref()
+            .is_some_and(|s| s.generation == generation)
+            && let Some(session) = app.codex_login.as_mut()
+        {
+            session.url = Some(url);
+        }
+    }
+    while let Ok((generation, name, result)) = app.codex_login_result_rx.try_recv() {
+        if app.codex_login.as_ref().map(|s| s.generation) == Some(generation) {
+            app.codex_login = None;
+            close_codex_login_modal(app);
+        } else if matches!(&result, Err(e) if e == "login canceled") {
+            // A cancel took the session before the landing: the cancel toast
+            // already reported it. A landing that had started is the commit
+            // point, so any other outcome falls through and toasts.
+            continue;
+        }
+        match result {
+            Ok(canonical) => {
+                app.codex_rows = codex_rows();
+                app.toast(ToastKind::Success, format!("logged in '{canonical}'"));
+            }
+            Err(e) => app.toast(ToastKind::Danger, format!("login for '{name}' failed\n{e}")),
+        }
+    }
+}
+
 /// Alias overrides collapse: render the ones the draft shows (or, with no
 /// draft, the ones the profile sets), tuck the rest behind a single
 /// `+ model override` reveal until ⏎ expands them.
@@ -17450,35 +18516,50 @@ fn push_override_rows(
     }
 }
 
+/// The `+ new` create-form rows: name, base url, the api key once a base url
+/// makes this an API account, the model rows, then `+ login` (OAuth mode) and
+/// the live-login capture, closing on `create account`.
+fn new_account_rows(app: &App, draft: Option<&ConfigDraft>) -> Vec<ConfigRow> {
+    // The api key only means something once a base url makes this an API
+    // account, so it stays hidden until one is typed.
+    let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl];
+    if draft.is_some_and(|d| !d.base_url.value.trim().is_empty()) {
+        rows.push(ConfigRow::ApiKey);
+    }
+    // Env rows stay existing-account-only.
+    rows.push(ConfigRow::Model);
+    push_override_rows(&mut rows, draft, None);
+    if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
+        rows.push(ConfigRow::Login);
+    }
+    // The live-login capture row sits right below `+ login` and survives
+    // into api mode (`+ login` doesn't): a live setup can be an endpoint
+    // too. Hidden while the live login is saved or absent — nothing to
+    // capture.
+    if app.unsaved_live_login {
+        rows.push(ConfigRow::CaptureLogin);
+    }
+    rows.push(ConfigRow::Create);
+    rows
+}
+
 /// Detail rows for the current selection. `+ new` → create form; account →
 /// settings (auto-start only for OAuth).
 pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
-    let cfg = app.config();
     let draft = app.config_draft.as_ref();
-    if app.profile_cursor >= cfg.profiles.len() {
-        // `+ new` create form. The api key only means something once a base url
-        // makes this an API account, so it stays hidden until one is typed.
-        let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl];
-        if draft.is_some_and(|d| !d.base_url.value.trim().is_empty()) {
-            rows.push(ConfigRow::ApiKey);
+    // Resolve the selection BEFORE the config guard (see `build_snap`).
+    let selection = app.setup_selection();
+    let cfg = app.config();
+    let profile_idx = match selection {
+        SetupSelection::New => return new_account_rows(app, draft),
+        SetupSelection::Item(MainItemKind::Profile(i)) => i,
+        // The codex and pool detail panes render their own row lists; this is
+        // never called for them.
+        SetupSelection::Item(MainItemKind::Codex(_) | MainItemKind::Shunt(..)) => {
+            return Vec::new();
         }
-        // Env rows stay existing-account-only.
-        rows.push(ConfigRow::Model);
-        push_override_rows(&mut rows, draft, None);
-        if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
-            rows.push(ConfigRow::Login);
-        }
-        // The live-login capture row sits right below `+ login` and survives
-        // into api mode (`+ login` doesn't): a live setup can be an endpoint
-        // too. Hidden while the live login is saved or absent — nothing to
-        // capture.
-        if app.unsaved_live_login {
-            rows.push(ConfigRow::CaptureLogin);
-        }
-        rows.push(ConfigRow::Create);
-        return rows;
-    }
-    let profile = cfg.profiles.get(app.profile_cursor);
+    };
+    let profile = cfg.profiles.get(profile_idx);
     // `is_api` tracks the base-url buffer live (draft wins): api key shows only
     // in API mode, auto-start (OAuth-only) only when it's empty, so both flip the
     // instant a base url is typed.
@@ -17547,16 +18628,31 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
 /// Enter the detail pane, seeding a draft for the current selection.
 fn enter_config_detail(app: &mut App) {
     app.config_action_cursor = 0;
-    if app.profile_cursor >= app.profile_count() {
-        // Restore the suspended `+ new` form, else build a fresh one.
-        app.config_draft = app
-            .new_account_draft
-            .take()
-            .or_else(|| Some(build_draft_new()));
-    } else if let Some(name) = app.profile_name_at(app.profile_cursor) {
-        app.config_draft = Some(build_draft_existing(app, &name));
-    } else {
-        return;
+    // Descending into the shown row adopts it: a held-but-hidden identity
+    // (setup_remembered) is replaced, never restored over the pane the user is
+    // now editing.
+    app.setup_remembered = None;
+    match app.setup_selection() {
+        SetupSelection::New => {
+            // Restore the suspended `+ new` form, else build a fresh one.
+            app.config_draft = app
+                .new_account_draft
+                .take()
+                .or_else(|| Some(build_draft_new()));
+        }
+        SetupSelection::Item(MainItemKind::Profile(i)) => {
+            if let Some(name) = app.profile_name_at(i) {
+                app.config_draft = Some(build_draft_existing(app, &name));
+            } else {
+                return;
+            }
+        }
+        // Codex and pool detail panes have no draft; descending only arms their
+        // action rows (a fresh descend starts disarmed).
+        SetupSelection::Item(MainItemKind::Codex(_) | MainItemKind::Shunt(..)) => {
+            disarm_codex_2step(app);
+            disarm_pool_2step(app);
+        }
     }
     app.config_focus = ConfigFocus::Actions;
 }
@@ -17567,6 +18663,9 @@ fn enter_config_detail(app: &mut App) {
 fn start_new_account(app: &mut App) {
     disarm_switch(app);
     do_switch(app, Tab::Setup);
+    app.setup_item = None;
+    app.setup_item_index = None;
+    app.setup_remembered = None;
     app.profile_cursor = app.profile_count();
     app.config_action_cursor = 0;
     // Restore a suspended `+ new` form: an open-field one still sits in
@@ -17657,6 +18756,10 @@ fn leave_config_detail(app: &mut App) {
     });
     app.config_focus = ConfigFocus::Profiles;
     app.config_draft = None;
+    // An armed codex/pool 2-step disarms on esc/ascend: the label restores and
+    // no stale identity outlives the pane (the Inline 2-step rule).
+    disarm_codex_2step(app);
+    disarm_pool_2step(app);
     if mint_dropped {
         app.toast(
             ToastKind::Warning,
@@ -18385,12 +19488,7 @@ fn open_login_modal(app: &mut App) {
 
 /// Drop the login progress modal (login finished, failed, or was canceled).
 fn close_login_modal(app: &mut App) {
-    let before = app.modals.len();
-    app.modals.retain(|m| !matches!(m, Modal::Login));
-    if app.modals.len() != before {
-        app.modal_generation
-            .set(app.modal_generation.get().wrapping_add(1));
-    }
+    app.retain_modals(|m| !matches!(m, Modal::Login));
 }
 
 /// Arm an account-action row (`Delete`, `ClearSessionToken`, or `Disabled` in
@@ -19352,6 +20450,13 @@ fn finish_created_profile(app: &mut App, name: &str) {
         .position(|p| p.name == name)
         .unwrap_or(0);
     app.profile_cursor = new_idx;
+    // Setup lands on the new account's row and the Overview's remembered row
+    // moves onto it, so a switch to the Overview lands there too. A create or
+    // duplicate is a selection change: a held-but-hidden Setup identity is
+    // replaced, never restored over the new row.
+    app.setup_item = None;
+    app.setup_remembered = None;
+    app.overview_remembered = Some(MainItemKind::Profile(new_idx));
     app.config_focus = ConfigFocus::Profiles;
     app.config_draft = None;
 }
@@ -20129,20 +21234,10 @@ fn duplicate_profile_into(app: &mut App, source: &ProfileName, new_name: &Profil
     };
     match result {
         Ok(()) => {
-            app.refresh_tokens();
-            app.apply_forgets();
-            app.rebaseline_and_forget(reload_fingerprint());
-            let idx = app
-                .config()
-                .profiles
-                .iter()
-                .position(|p| p.name == *new_name)
-                .unwrap_or(0);
-            app.profile_cursor = idx;
-            app.config_action_cursor = 0;
-            if app.config_focus == ConfigFocus::Actions {
-                app.config_draft = Some(build_draft_existing(app, new_name));
-            }
+            // A duplicate is a create (the spec's "after any create, claude
+            // included"): the same shared tail as the `+ new` create — lands
+            // Setup on the new row and the Overview's remembered row onto it.
+            finish_created_profile(app, new_name.as_str());
             app.toast(
                 ToastKind::Success,
                 format!("duplicated '{source}' as '{new_name}'"),
@@ -20981,18 +22076,8 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             family,
             name,
             display,
-            marker,
         } => {
-            start_pool_mutation(
-                app,
-                marker,
-                PoolJob::Remove {
-                    record,
-                    family,
-                    name,
-                    display,
-                },
-            );
+            start_pool_remove(app, record, family, name, display);
         }
         ConfirmAction::AddToken {
             record,
@@ -21888,6 +22973,7 @@ pub(crate) fn on_tick(app: &mut App) {
     }
     drain_pricing_events(app);
     drain_login_events(app);
+    drain_codex_login(app);
 
     if app.reload_if_state_changed() {
         app.clamp_profile_cursor();
@@ -21963,6 +23049,12 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_finished_speeds(app);
     poll_pending_require(app);
     drain_left_behind_probe(app);
+
+    // The codex or pool snapshot may have changed under the selection this
+    // tick; re-place it by the Overview's rule (ascend + first row for a
+    // hidden-but-held row, the row now at the flat index it held for a
+    // dropped one).
+    app.rehome_setup_selection();
 
     warn_day_claim_notices(app);
     update_banner(app);

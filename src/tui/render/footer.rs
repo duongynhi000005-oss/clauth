@@ -8,9 +8,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{
-    App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
-    HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, PaneState, ScrollStamp, ServiceFix,
-    ServicesFocus, ShuntFieldEdit, ShuntFieldKey, ShuntFocus, ShuntSaveKey, StatusFocus, Tab,
+    App, CodexDetailRow, CodexLoginSession, ConfigFocus, ConfigRow, FallbackHint, FooterAlert,
+    GLOBAL_CONFIG_ROWS, GlobalConfigRow, HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession,
+    MainItemKind, Modal, PaneState, PoolDetailRow, ScrollStamp, ServiceFix, ServicesFocus,
+    SetupSelection, ShuntFieldEdit, ShuntFieldKey, ShuntFocus, ShuntSaveKey, StatusFocus, Tab,
     TokenView, build_action_menu, config_rows, fallback_hint, field_locked, fix_verb,
     has_sub_focus, herdr_config_writable, is_cycle_field, keyboard_owner, pane_state,
     token_model_count,
@@ -144,6 +145,22 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
+    // A codex browser re-login in flight owns the footer the same way: the
+    // modal is the live view, this row is the collapsed one carrying the name.
+    // As on the claude login line, any open non-login modal owns esc/q first,
+    // so its own row rides behind the codex lead; collapsed, esc cancels.
+    if let Some(session) = &app.codex_login {
+        let keys = match owner.and_then(|o| owner_hints(o, app, frame_area)) {
+            Some(hints) => LoginKeys::Owner(hints),
+            None => match app.modals.last() {
+                Some(_) => LoginKeys::Back,
+                None => LoginKeys::Cancel,
+            },
+        };
+        draw_codex_login(frame, area, session, keys, app.tick_count);
+        return;
+    }
+
     // A live alert replaces the hint bar in place — one footer row, never stacked.
     if let Some(alert) = &app.footer_alert {
         draw_alert(frame, area, alert);
@@ -222,8 +239,8 @@ fn bound_is_current(stamp: ScrollStamp, area: Rect, app: &App) -> bool {
 /// bar the `? help` that [`draw`] derives from what the owner claims. For the
 /// modal owner the row is read off the top modal's real handler, one arm per
 /// modal, so a new modal that skips its arm fails to compile. `None` only for
-/// the login modal, whose live-stage footer [`draw_login`] owns (the open code
-/// field, an open editor and the collapsed state each name their own keys).
+/// the two login modals, whose login-in-flight footers [`draw_login`] and
+/// `draw_codex_login` own.
 fn owner_hints(
     owner: KeyOwner,
     app: &App,
@@ -305,7 +322,7 @@ fn owner_hints(
                 ("↵", "choose"),
                 ("q", "not now"),
             ]),
-            Some(Modal::Login) | None => None,
+            Some(Modal::Login | Modal::CodexLogin) | None => None,
         },
         KeyOwner::SetupField
         | KeyOwner::MemberField
@@ -433,58 +450,114 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("a", "actions"),
                 ("?", "help"),
             ],
-            ConfigFocus::Actions => {
-                // Row-aware: the `model` row cycles on space; `alert at` steps on
-                // `+`/`-`; env rows edit a value or open the add-env key editor.
-                match config_rows(app).get(app.config_action_cursor) {
-                    Some(ConfigRow::Model) => &[
-                        ("↑↓", "row"),
-                        ("space", "cycle"),
-                        ("↵", "custom"),
-                        ("a", "actions"),
-                        ("?", "help"),
-                    ],
-                    Some(ConfigRow::BellThreshold) => &[
-                        ("↑↓", "row"),
-                        ("+", "raise"),
-                        ("-", "lower"),
-                        ("↵", "type"),
-                        ("a", "actions"),
-                        ("?", "help"),
-                    ],
-                    Some(ConfigRow::EnvEntry(_)) => &[
-                        ("↑↓", "row"),
-                        ("↵", "edit value"),
-                        ("a", "actions"),
-                        ("?", "help"),
-                    ],
-                    Some(ConfigRow::EnvAdd) => &[
-                        ("↑↓", "row"),
-                        ("↵", "add env"),
-                        ("a", "actions"),
-                        ("?", "help"),
-                    ],
-                    Some(ConfigRow::ModelOverrideAdd) => &[
-                        ("↑↓", "row"),
-                        ("↵", "add override"),
-                        ("a", "actions"),
-                        ("?", "help"),
-                    ],
-                    // The mint-seeded api key row is a Disabled row (focusable
-                    // but inert), so the footer drops its edit hint.
-                    Some(ConfigRow::ApiKey)
-                        if app.config_draft.as_ref().is_some_and(|d| d.mint_armed()) =>
-                    {
-                        &[("↑↓", "row"), ("a", "actions"), ("?", "help")]
+            ConfigFocus::Actions => match app.setup_selection() {
+                // The codex and pool detail panes carry their own action rows;
+                // the hint derives from the row under the cursor, never a dead
+                // `↵ edit / toggle` or a key the pane does not bind.
+                SetupSelection::Item(MainItemKind::Codex(_)) => {
+                    if app.codex_detail_armed {
+                        &[("↵", "confirm delete"), ("esc", "cancel"), ("?", "help")]
+                    } else {
+                        match CodexDetailRow::ALL.get(app.config_action_cursor) {
+                            Some(CodexDetailRow::ReLogin) => &[
+                                ("↑↓", "row"),
+                                ("↵", "re-login"),
+                                ("a", "actions"),
+                                ("?", "help"),
+                            ],
+                            Some(CodexDetailRow::Delete) => &[
+                                ("↑↓", "row"),
+                                ("↵", "delete"),
+                                ("a", "actions"),
+                                ("?", "help"),
+                            ],
+                            None => &[("a", "actions"), ("?", "help")],
+                        }
                     }
-                    _ => &[
-                        ("↑↓", "row"),
-                        ("↵", "edit / toggle"),
-                        ("a", "actions"),
-                        ("?", "help"),
-                    ],
                 }
-            }
+                SetupSelection::Item(MainItemKind::Shunt(..)) => {
+                    if app.pool_detail_armed {
+                        &[("↵", "confirm remove"), ("esc", "cancel"), ("?", "help")]
+                    } else {
+                        let rows = app.pool_detail_rows();
+                        if rows.is_empty() {
+                            // kimi / unknown auth mode (or a name outside
+                            // shunt's grammar): facts only, nothing to walk or
+                            // run — advertise no row key.
+                            &[("a", "actions"), ("?", "help")]
+                        } else {
+                            match rows.get(app.config_action_cursor) {
+                                Some(PoolDetailRow::Refresh) => &[
+                                    ("↑↓", "row"),
+                                    ("↵", "refresh"),
+                                    ("a", "actions"),
+                                    ("?", "help"),
+                                ],
+                                Some(PoolDetailRow::Remove) => &[
+                                    ("↑↓", "row"),
+                                    ("↵", "remove"),
+                                    ("a", "actions"),
+                                    ("?", "help"),
+                                ],
+                                None => &[("a", "actions"), ("?", "help")],
+                            }
+                        }
+                    }
+                }
+                // Claude rows and `+ new` keep the row-aware claude arm:
+                // the `model` row cycles on space; `alert at` steps on
+                // `+`/`-`; env rows edit a value or open the add-env editor.
+                SetupSelection::Item(MainItemKind::Profile(_)) | SetupSelection::New => {
+                    match config_rows(app).get(app.config_action_cursor) {
+                        Some(ConfigRow::Model) => &[
+                            ("↑↓", "row"),
+                            ("space", "cycle"),
+                            ("↵", "custom"),
+                            ("a", "actions"),
+                            ("?", "help"),
+                        ],
+                        Some(ConfigRow::BellThreshold) => &[
+                            ("↑↓", "row"),
+                            ("+", "raise"),
+                            ("-", "lower"),
+                            ("↵", "type"),
+                            ("a", "actions"),
+                            ("?", "help"),
+                        ],
+                        Some(ConfigRow::EnvEntry(_)) => &[
+                            ("↑↓", "row"),
+                            ("↵", "edit value"),
+                            ("a", "actions"),
+                            ("?", "help"),
+                        ],
+                        Some(ConfigRow::EnvAdd) => &[
+                            ("↑↓", "row"),
+                            ("↵", "add env"),
+                            ("a", "actions"),
+                            ("?", "help"),
+                        ],
+                        Some(ConfigRow::ModelOverrideAdd) => &[
+                            ("↑↓", "row"),
+                            ("↵", "add override"),
+                            ("a", "actions"),
+                            ("?", "help"),
+                        ],
+                        // The mint-seeded api key row is a Disabled row (focusable
+                        // but inert), so the footer drops its edit hint.
+                        Some(ConfigRow::ApiKey)
+                            if app.config_draft.as_ref().is_some_and(|d| d.mint_armed()) =>
+                        {
+                            &[("↑↓", "row"), ("a", "actions"), ("?", "help")]
+                        }
+                        _ => &[
+                            ("↑↓", "row"),
+                            ("↵", "edit / toggle"),
+                            ("a", "actions"),
+                            ("?", "help"),
+                        ],
+                    }
+                }
+            },
         },
         Tab::Config => {
             if GLOBAL_CONFIG_ROWS
@@ -599,9 +672,15 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     };
 
     let mut hints = tail.to_vec();
-    // The armed remove's way out is its `esc cancel`: `q` ascends out of the
-    // card the same way there, so `q back` would be a second name for it.
-    if !(app.tab == Tab::Fallback && fallback_hint(app) == FallbackHint::DetailRemoveArmed) {
+    // An armed 2-step's way out is its `esc cancel`: `q` ascends out of the card
+    // the same way there, so `q back` would be a second name for it. The codex
+    // and pool details arm the same way, so they skip `q` too.
+    let setup_armed = app.tab == Tab::Setup
+        && app.config_focus == ConfigFocus::Actions
+        && (app.codex_detail_armed || app.pool_detail_armed);
+    if !(setup_armed
+        || (app.tab == Tab::Fallback && fallback_hint(app) == FallbackHint::DetailRemoveArmed))
+    {
         hints.push(("q", q_label));
     }
     hints
@@ -978,6 +1057,40 @@ fn draw_login(
     ];
     // Each hint here carries a 3-space lead, while `shed_to_width` counts a gap
     // only between groups: the name and one lead come off its budget.
+    let lead = spans.iter().map(Span::width).sum::<usize>() + 3;
+    let mut hints = hints.to_vec();
+    shed_to_width(&mut hints, (area.width as usize).saturating_sub(lead));
+    for (key, action) in hints {
+        spans.push(Span::styled(format!("   {key} "), theme::accent().bold()));
+        spans.push(Span::styled(action, theme::dim()));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans))
+            .style(theme::base())
+            .alignment(Alignment::Left),
+        area,
+    );
+}
+
+/// Codex-login-in-progress line, the [`draw_login`] shape without the paste
+/// door: the name, plus the hint that tracks what esc/q do this frame.
+fn draw_codex_login(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    session: &CodexLoginSession,
+    keys: LoginKeys,
+    tick: u64,
+) {
+    let hints: &[(&str, &str)] = match keys {
+        LoginKeys::Back => &[("q", "back")],
+        LoginKeys::Cancel => &[("esc", "cancel")],
+        LoginKeys::Paste => &[],
+        LoginKeys::Owner(hints) => hints,
+    };
+    let mut spans = vec![
+        Span::styled(format!("{} ", spinner_frame(tick)), theme::accent()),
+        Span::styled(format!("logging in '{}'", session.name), theme::dim()),
+    ];
     let lead = spans.iter().map(Span::width).sum::<usize>() + 3;
     let mut hints = hints.to_vec();
     shed_to_width(&mut hints, (area.width as usize).saturating_sub(lead));

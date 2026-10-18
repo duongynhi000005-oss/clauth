@@ -71,6 +71,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
             }
         }
         Modal::Login => draw_login_progress(frame, area, app),
+        Modal::CodexLogin => draw_codex_login_progress(frame, area, app),
         Modal::CheckOutput(body) => {
             draw_check_output(frame, area, body, app);
             app.check_output_max_scroll_stamp.set(stamp(area, app));
@@ -172,6 +173,39 @@ fn code_field_row(field: &InputState) -> Line<'static> {
     } else {
         labelled_input(CODE_LABEL, field, true)
     }
+}
+
+/// The codex re-login modal: the claude login shell minus the paste door. It
+/// waits on the browser callback alone (`r` opens the browser again, `c` copies
+/// the authorize link), so there is no code field and no stage ladder.
+fn draw_codex_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(session) = app.codex_login.as_ref() else {
+        return; // the login ended this frame; the modal pops on the next drain
+    };
+    let lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled(
+            format!("logging in '{}'", session.name),
+            theme::body(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", spinner_frame(app.tick_count)),
+                theme::accent(),
+            ),
+            Span::styled("continue in your browser", theme::dim()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("r", theme::accent().bold()),
+            Span::styled("  open the browser again", theme::dim()),
+        ]),
+        Line::from(vec![
+            Span::styled("c", theme::accent().bold()),
+            Span::styled("  copy link", theme::dim()),
+        ]),
+    ];
+    draw_modal_scrolled(frame, area, "LOGIN", lines, 0, None, None);
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {

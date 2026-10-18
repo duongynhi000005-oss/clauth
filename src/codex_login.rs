@@ -35,6 +35,10 @@ use crate::oauth_login::{AuthorizeRejection, base64url_nopad, percent_encode, qu
 /// server will accept, not a free port.
 const PRIMARY_PORT: u16 = 1455;
 const FALLBACK_PORT: u16 = 1457;
+/// codex's registered redirect ports in bind order — the one const both arms of
+/// [`bind_registered_port`] read, so a swapped order or a dropped fallback reds
+/// the pin instead of shipping green from a `#[cfg]` arm no test compiles.
+const REGISTERED_PORTS: [u16; 2] = [PRIMARY_PORT, FALLBACK_PORT];
 const CALLBACK_PATH: &str = "/auth/callback";
 const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 /// codex's originator header/param value.
@@ -54,10 +58,87 @@ pub(crate) struct CodexLoginOutcome {
     pub(crate) account_id: Option<String>,
 }
 
+/// A cancel handle for a running browser login: `cancel` stops the callback
+/// wait — the listener drops, freeing the registered ports — and the worker
+/// returns the `login canceled` sentence instead of waiting out the 300 s
+/// timeout. `Clone` shares one flag between the UI and the worker.
+#[derive(Clone)]
+pub(crate) struct LoginCancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl LoginCancel {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )))
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn is_canceled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// `#[cfg(test)]`: the loopback port pair a login binds instead of the
+/// registered 1455/1457, so a test drives the flow on an ephemeral port.
+#[cfg(test)]
+static LOGIN_PORTS_OVERRIDE: std::sync::Mutex<Option<[u16; 2]>> = std::sync::Mutex::new(None);
+
+/// `#[cfg(test)]`: the browser-open step, overridden to a no-op so a test never
+/// launches a browser.
+#[cfg(test)]
+static URL_OPENER_OVERRIDE: std::sync::Mutex<Option<fn(&str)>> = std::sync::Mutex::new(None);
+
+/// Test-only RAII: drive [`login_with_cancel`] on the given loopback ports with
+/// the given browser opener (a no-op in tests), restoring both on drop even
+/// under a panic — the `EndpointSandbox` shape, so no override can leak into a
+/// sibling test.
+#[cfg(test)]
+pub(crate) struct CodexLoginSeam;
+
+#[cfg(test)]
+impl CodexLoginSeam {
+    pub(crate) fn new(ports: [u16; 2], opener: fn(&str)) -> Self {
+        if let Ok(mut guard) = LOGIN_PORTS_OVERRIDE.lock() {
+            *guard = Some(ports);
+        }
+        if let Ok(mut guard) = URL_OPENER_OVERRIDE.lock() {
+            *guard = Some(opener);
+        }
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for CodexLoginSeam {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = LOGIN_PORTS_OVERRIDE.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = URL_OPENER_OVERRIDE.lock() {
+            *guard = None;
+        }
+    }
+}
+
 /// Run the loopback PKCE flow. `announce` receives the authorize URL (the CLI
 /// prints it and opens a browser). Blocks until the callback lands or the
 /// timeout elapses.
 pub(crate) fn login_with(announce: impl Fn(&str)) -> Result<CodexLoginOutcome> {
+    login_with_cancel(announce, &LoginCancel::new())
+}
+
+/// [`login_with`], honouring a cancel: the callback wait checks the flag each
+/// 50 ms iteration and bails the moment it is set, dropping the listener so the
+/// registered ports free immediately. The TUI re-login's worker passes the
+/// handle its session holds; the CLI's never-cancelled one lives for this call
+/// alone.
+pub(crate) fn login_with_cancel(
+    announce: impl Fn(&str),
+    cancel: &LoginCancel,
+) -> Result<CodexLoginOutcome> {
     let (verifier, challenge) = new_pkce()?;
     let state = random_b64url(32)?;
 
@@ -68,17 +149,52 @@ pub(crate) fn login_with(announce: impl Fn(&str)) -> Result<CodexLoginOutcome> {
     let url = authorize_url(&redirect_uri, &challenge, &state);
 
     announce(&url);
-    let _ = crate::platform::open_url(&url);
+    open_authorize_url(&url);
 
-    let code = wait_for_code(&listener, &state)?;
+    let code = wait_for_code(&listener, &state, cancel)?;
     let tokens = exchange_code(&code, &verifier, &redirect_uri)?;
     Ok(build_auth_json(tokens))
 }
 
+/// Open the authorize URL in the operator's browser, or the test's no-op when
+/// [`CodexLoginSeam`] armed one — a login under test never launches a browser.
+fn open_authorize_url(url: &str) {
+    #[cfg(test)]
+    if let Some(opener) = URL_OPENER_OVERRIDE.lock().ok().and_then(|guard| *guard) {
+        opener(url);
+        return;
+    }
+    let _ = crate::platform::open_url(url);
+}
+
 fn bind_registered_port() -> Result<(TcpListener, u16)> {
-    for port in [PRIMARY_PORT, FALLBACK_PORT] {
+    let ports = {
+        #[cfg(test)]
+        {
+            LOGIN_PORTS_OVERRIDE
+                .lock()
+                .ok()
+                .and_then(|guard| *guard)
+                .unwrap_or(REGISTERED_PORTS)
+        }
+        #[cfg(not(test))]
+        {
+            REGISTERED_PORTS
+        }
+    };
+    bind_port_pair(ports)
+}
+
+/// Try each of `ports` in order; the first that binds wins. The port actually
+/// bound is returned (a `0` binds an ephemeral port, so the redirect_uri names
+/// that, not the requested `0`). Refuses once both are held. Split out of
+/// [`bind_registered_port`] so a test drives the order on its own ephemeral
+/// ports without touching the process-global override.
+fn bind_port_pair(ports: [u16; 2]) -> Result<(TcpListener, u16)> {
+    for port in ports {
         if let Ok(l) = TcpListener::bind(("127.0.0.1", port)) {
-            return Ok((l, port));
+            let bound = l.local_addr().map(|a| a.port()).unwrap_or(port);
+            return Ok((l, bound));
         }
     }
     bail!(
@@ -126,12 +242,21 @@ fn authorize_url(redirect_uri: &str, challenge: &str, state: &str) -> String {
 }
 
 /// Block on the loopback socket for the OAuth redirect, validating `state`.
-fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String> {
+/// Bails `login canceled` as soon as `cancel` is set, so an abandoned login
+/// never holds codex's registered ports for the rest of its timeout.
+fn wait_for_code(
+    listener: &TcpListener,
+    expected_state: &str,
+    cancel: &LoginCancel,
+) -> Result<String> {
     listener
         .set_nonblocking(true)
         .context("failed to set the callback listener non-blocking")?;
     let deadline = Instant::now() + LOGIN_TIMEOUT;
     loop {
+        if cancel.is_canceled() {
+            bail!("login canceled");
+        }
         if Instant::now() >= deadline {
             bail!("timed out waiting for the codex login callback");
         }

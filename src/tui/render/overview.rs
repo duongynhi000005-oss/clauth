@@ -6,7 +6,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{ListItem, Paragraph};
 
-use super::super::app::{App, CodexRow, ReadingsSnapshot, ShuntPool, escape_control};
+use super::super::app::{
+    App, BandEntry, CodexRow, MainItemKind, ReadingsSnapshot, ShuntPool, escape_control,
+};
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
@@ -203,112 +205,66 @@ fn draw_overview_accounts(
     let sel = app.overview_cursor.min(items.len().saturating_sub(1));
     let width = list_area.width;
     let reset_fmt = ResetFmt::from_state(&app.config().state);
-    let claude_count = if app.harness_filter.shows_claude() {
-        app.profile_count()
-    } else {
-        0
-    };
-    let codex_count = codex.len();
+    let entries = app.band_entries(app.harness_filter);
+    let ranges = App::heading_ranges(&entries);
 
-    // One pass builds both the rendered rows and the cursor-indexed starts, so
-    // a heading or blank line can never shift a selection off its row: the
-    // page step and the selection both read what this walk produced.
+    // One pass over the shared band walk builds both the rendered rows and the
+    // cursor-indexed starts (lead's call 1: the Overview and Setup selectors
+    // both render from this one walk, so a band added later shows on both). A
+    // heading or blank spacer can never shift a selection off its row.
     let mut rows: Vec<ListItem<'_>> = Vec::with_capacity(items.len() + 8);
     let mut starts: Vec<usize> = Vec::with_capacity(items.len());
     let mut rendered: usize = 0;
     let mut flat: usize = 0;
-
-    // Claude rows: no band chrome ahead of them.
-    while flat < claude_count {
-        starts.push(rendered);
-        let line = render_overview_row(app, flat, &widths, flat == sel, focused, readings);
-        rows.push(ListItem::new(select_line(
-            line,
-            flat == sel,
-            focused,
-            width,
-        )));
-        rendered += 1;
-        flat += 1;
-    }
-
-    // Codex band: a blank spacer (when claude rows precede) + one section
-    // header that lifts while the cursor rests on a codex row.
-    if codex_count > 0 {
-        if claude_count > 0 {
-            rows.push(ListItem::new(Line::from("")));
-            rendered += 1;
-        }
-        let heading = if (claude_count..claude_count + codex_count).contains(&sel) {
-            theme::label_active()
-        } else {
-            theme::label()
-        };
-        rows.push(ListItem::new(Line::from(prose::spans("  codex", heading))));
-        rendered += 1;
-        for codex_row in codex.iter() {
-            starts.push(rendered);
-            let line = render_codex_row(codex_row, &widths, flat == sel);
-            rows.push(ListItem::new(select_line(
-                line,
-                flat == sel,
-                focused,
-                width,
-            )));
-            rendered += 1;
-            flat += 1;
-        }
-    }
-
-    // Shunt band: a blank spacer (when any rows precede), then one
-    // `shunt (<provider>)` heading per provider with its accounts under it, or
-    // one `shunt — not read: …` heading with no rows.
-    match &app.shunt_pool {
-        ShuntPool::Read(providers) if !providers.is_empty() && app.harness_filter.shows_shunt() => {
-            if claude_count + codex_count > 0 {
+    for (i, entry) in entries.iter().enumerate() {
+        match entry {
+            BandEntry::Spacer => {
                 rows.push(ListItem::new(Line::from("")));
                 rendered += 1;
             }
-            let mut shunt_flat = claude_count + codex_count;
-            for provider in providers.iter() {
-                let provider_rows = provider.accounts.len();
-                let heading = if (shunt_flat..shunt_flat + provider_rows).contains(&sel) {
+            BandEntry::Heading(text) => {
+                let heading = if ranges
+                    .iter()
+                    .any(|&(hi, start, end)| hi == i && (start..end).contains(&sel))
+                {
                     theme::label_active()
                 } else {
                     theme::label()
                 };
                 rows.push(ListItem::new(Line::from(prose::spans(
-                    &format!("  shunt ({})", escape_control(&provider.name)),
+                    &format!("  {text}"),
                     heading,
                 ))));
                 rendered += 1;
-                let family = provider.auth.clone().family();
-                for account in provider.accounts.iter() {
-                    starts.push(rendered);
-                    let line =
-                        render_pool_row(app, family, account, &widths, flat == sel, reset_fmt);
-                    rows.push(ListItem::new(select_line(
-                        line,
-                        flat == sel,
-                        focused,
-                        width,
-                    )));
-                    rendered += 1;
-                    flat += 1;
-                }
-                shunt_flat += provider_rows;
+            }
+            BandEntry::Item(item) => {
+                starts.push(rendered);
+                let line = match *item {
+                    MainItemKind::Profile(_) => {
+                        render_overview_row(app, flat, &widths, flat == sel, focused, readings)
+                    }
+                    MainItemKind::Codex(idx) => render_codex_row(&codex[idx], &widths, flat == sel),
+                    MainItemKind::Shunt(pi, ai) => {
+                        let Some((account, auth)) = app.shunt_pool_row(pi, ai) else {
+                            rows.push(ListItem::new(Line::from("")));
+                            rendered += 1;
+                            flat += 1;
+                            continue;
+                        };
+                        let family = auth.clone().family();
+                        render_pool_row(app, family, account, &widths, flat == sel, reset_fmt)
+                    }
+                };
+                rows.push(ListItem::new(select_line(
+                    line,
+                    flat == sel,
+                    focused,
+                    width,
+                )));
+                rendered += 1;
+                flat += 1;
             }
         }
-        ShuntPool::NotRead(reason) if app.harness_filter.shows_shunt() => {
-            if claude_count + codex_count > 0 {
-                rows.push(ListItem::new(Line::from("")));
-            }
-            rows.push(ListItem::new(Line::from(prose::spans(
-                &format!("  shunt — not read: {}", escape_control(reason)),
-                theme::label(),
-            ))));
-        }
-        _ => {}
     }
 
     let render_sel = starts.get(sel).copied().unwrap_or(0);

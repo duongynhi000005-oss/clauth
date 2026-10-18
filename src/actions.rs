@@ -1423,6 +1423,23 @@ fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
 /// counterpart here. Returns the slot it detached, so the caller can say the
 /// operator's own codex is logged out now.
 ///
+/// The typed live-session refusal [`delete_codex_profile`] raises when the
+/// profile still runs a live session and `force` was not passed. Kept
+/// downcastable so the CLI caller appends its `--force` escape-hatch tail to
+/// THIS refusal alone: a second `has_live_session` read would re-answer a
+/// question the delete already answered, and tag an unrelated failure (a state
+/// flock timeout) with a flag that cannot fix it.
+#[derive(Debug)]
+pub(crate) struct CodexLiveSession(pub(crate) String);
+
+impl std::fmt::Display for CodexLiveSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "'{}' has a live session", self.0)
+    }
+}
+
+impl std::error::Error for CodexLiveSession {}
+
 /// `_rotation` is [`rotation_guard_for_mutation`]'s guard for `name`, and
 /// `force` does not waive it: a standby rotation racing this removal would
 /// either resurrect an orphan `auth.json` holding the pair it minted, or lose
@@ -1445,7 +1462,11 @@ pub(crate) fn delete_codex_profile(
         }
         let owned = ProfileName::from(name);
         if !force && crate::runtime::has_live_session(&owned) {
-            bail!("'{name}' has a live session, pass --force to remove it anyway");
+            // One sentence source for both harnesses: the CLI caller appends its
+            // `--force` tail, the TUI surfaces this alone (a TUI refusal never
+            // names a CLI flag). Raised as a TYPED error so the CLI matches it,
+            // never re-reads the predicate.
+            return Err(anyhow::Error::new(CodexLiveSession(name.to_string())));
         }
         // Before the dir goes: a slot still linked into it would dangle, and
         // the operator's next `codex login` would revoke through that link
@@ -1762,11 +1783,72 @@ fn write_codex_profile_store(
 /// cross-harness clash (an own-roster codex name is a re-auth, exempt — the
 /// full check under the lock allows it). Returns the trimmed name. Extracted
 /// so the "own-roster passes, cross-harness refuses" rule is testable without
-/// opening a real browser.
-fn codex_browser_preflight(name: &str) -> Result<String> {
+/// opening a real browser; the TUI's `re-login` shares it.
+pub(crate) fn codex_browser_preflight(name: &str) -> Result<String> {
     let trimmed = validate_name_chars(name)?.to_string();
     validate_foreign_harness_free(&trimmed, Harness::Codex)?;
     Ok(trimmed)
+}
+
+/// Whether the shared landing may create a profile for a name the store does
+/// not hold. The CLI's `clauth login --codex` creates-or-re-auths; a TUI
+/// re-login only ever re-auths an account that already exists, so a name gone
+/// from the store (deleted while the browser ran) refuses instead of being
+/// silently re-created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexLandMode {
+    /// The CLI: create when the name is free, re-auth when it exists.
+    CreateOrReauth,
+    /// The TUI re-login: the account must already exist.
+    RequireExisting,
+}
+
+/// The shared landing both the CLI and the TUI re-login call after the browser
+/// flow minted a chain: re-resolve the name, guard the rotation, refuse a live
+/// session or account swap, write the store. `mode` decides whether a name the
+/// store does not hold is created ([`CodexLandMode::CreateOrReauth`]) or
+/// refused ([`CodexLandMode::RequireExisting`]).
+pub(crate) fn land_codex_login(
+    trimmed: &str,
+    outcome: &crate::codex_login::CodexLoginOutcome,
+    mode: CodexLandMode,
+) -> Result<String> {
+    let guess = crate::codex_profiles::CodexState::load()?
+        .canonical_name(trimmed)
+        .unwrap_or_else(|| trimmed.to_string());
+    let _rotation_guard =
+        crate::runtime::RotationGuard::acquire(&ProfileName::from(guess.as_str()))?;
+    let account_id = crate::codex_auth::CodexAuth::parse(&outcome.auth_json)
+        .ok()
+        .and_then(|a| a.account_id().map(str::to_string));
+    let canonical = crate::codex_profiles::CodexState::update(|state| {
+        let (canonical, reauth) = match state.canonical_name(trimmed) {
+            Some(canonical) => (canonical, true),
+            None => match mode {
+                CodexLandMode::CreateOrReauth => {
+                    validate_profile_name(trimmed, Harness::Codex, None)?;
+                    (trimmed.to_string(), false)
+                }
+                // A TUI re-login never recreates an account the browser
+                // round-trip outlived: refuse instead of minting the old name.
+                CodexLandMode::RequireExisting => {
+                    bail!("codex profile '{trimmed}' no longer exists");
+                }
+            },
+        };
+        if canonical != guess {
+            bail!("'{trimmed}' was renamed while the login ran — re-run it");
+        }
+        if crate::runtime::has_live_session(&ProfileName::from(canonical.as_str())) {
+            bail!("'{canonical}' has a live codex session — close it before re-authenticating");
+        }
+        if reauth {
+            refuse_codex_account_swap(&canonical, account_id.as_deref())?;
+        }
+        write_codex_profile_store(state, &canonical, &outcome.auth_json)?;
+        Ok(canonical)
+    })?;
+    Ok(canonical)
 }
 
 /// `clauth login <name> --codex --browser` — mint a FRESH codex chain via
@@ -1781,34 +1863,7 @@ pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
         outln!("clauth: if the browser did not open, paste that URL into it");
     })?;
 
-    let guess = crate::codex_profiles::CodexState::load()?
-        .canonical_name(&trimmed)
-        .unwrap_or_else(|| trimmed.clone());
-    let _rotation_guard =
-        crate::runtime::RotationGuard::acquire(&ProfileName::from(guess.as_str()))?;
-    let account_id = crate::codex_auth::CodexAuth::parse(&outcome.auth_json)
-        .ok()
-        .and_then(|a| a.account_id().map(str::to_string));
-    let canonical = crate::codex_profiles::CodexState::update(|state| {
-        let (canonical, reauth) = match state.canonical_name(&trimmed) {
-            Some(canonical) => (canonical, true),
-            None => {
-                validate_profile_name(&trimmed, Harness::Codex, None)?;
-                (trimmed.clone(), false)
-            }
-        };
-        if canonical != guess {
-            bail!("'{trimmed}' was renamed while the login ran — re-run it");
-        }
-        if crate::runtime::has_live_session(&ProfileName::from(canonical.as_str())) {
-            bail!("'{canonical}' has a live codex session — close it before re-authenticating");
-        }
-        if reauth {
-            refuse_codex_account_swap(&canonical, account_id.as_deref())?;
-        }
-        write_codex_profile_store(state, &canonical, &outcome.auth_json)?;
-        Ok(canonical)
-    })?;
+    let canonical = land_codex_login(&trimmed, &outcome, CodexLandMode::CreateOrReauth)?;
 
     outln!("clauth: logged a fresh codex chain into codex profile '{canonical}'");
     if let Some(acc) = outcome.account_id {

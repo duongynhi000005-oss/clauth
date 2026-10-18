@@ -112,30 +112,38 @@ fn the_callback_parses_an_error_into_the_closed_set_and_echoes_nothing() {
     );
 }
 
-/// The registered redirect set is two fixed ports, tried in order; a free
-/// port elsewhere would not match a registered redirect_uri, so with both held
-/// the login refuses instead of binding one.
+/// codex's registered redirect ports, pinned by literal: the redirect_uri must
+/// match a registered one, so a swapped order or a dropped fallback ships a
+/// browser login whose callback never reaches clauth.
 #[test]
-fn the_login_binds_the_registered_ports_in_order_and_refuses_with_both_held() {
-    // The ports are real loopback ports: a box already holding one names the
-    // skip instead of reading a foreign holder as the fn's own choice.
-    for port in [PRIMARY_PORT, FALLBACK_PORT] {
-        if let Err(e) = TcpListener::bind(("127.0.0.1", port)) {
-            eprintln!(
-                "SKIPPED the_login_binds_the_registered_ports_in_order_and_refuses_with_both_held: \
-                 port {port} is in use on this box ({e})"
-            );
-            return;
-        }
-    }
-    let (primary, port) = bind_registered_port().expect("the primary port is free");
-    assert_eq!(port, PRIMARY_PORT);
-    let (fallback, port) = bind_registered_port().expect("the fallback port is free");
-    assert_eq!(
-        port, FALLBACK_PORT,
-        "the single fallback once the primary is held"
-    );
-    let err = bind_registered_port().expect_err("both held").to_string();
+fn the_registered_ports_are_pinned_by_literal() {
+    assert_eq!(REGISTERED_PORTS, [1455, 1457]);
+}
+
+/// The redirect set is two ports tried in order; a free port elsewhere would
+/// not match a registered redirect_uri, so with both held the login refuses
+/// instead of binding one. Driven through `bind_port_pair` on two ephemeral
+/// ports the test reserves itself, so it never binds codex's registered
+/// 1455/1457 and shares no lock with the cancel test (a failing sibling cannot
+/// poison it).
+#[test]
+fn the_login_binds_the_seam_ports_in_order_and_refuses_with_both_held() {
+    // Two free ephemeral ports, held together while the second binds so they
+    // are distinct, then released for the seam to re-bind.
+    let (p1, p2) = {
+        let first = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let second = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let p1 = first.local_addr().expect("addr").port();
+        let p2 = second.local_addr().expect("addr").port();
+        drop(first);
+        drop(second);
+        (p1, p2)
+    };
+    let (primary, port) = bind_port_pair([p1, p2]).expect("the first port is free");
+    assert_eq!(port, p1);
+    let (fallback, port) = bind_port_pair([p1, p2]).expect("the fallback once the primary is held");
+    assert_eq!(port, p2);
+    let err = bind_port_pair([p1, p2]).expect_err("both held").to_string();
     assert_eq!(
         err,
         "codex's login ports (1455 and 1457) are both in use — close whatever holds them \
@@ -143,6 +151,81 @@ fn the_login_binds_the_registered_ports_in_order_and_refuses_with_both_held() {
     );
     drop(primary);
     drop(fallback);
+}
+
+/// A cancel stops the callback wait within one 50 ms poll (the listener drops,
+/// freeing the port) — never the 300 s timeout the worker would otherwise wait
+/// out. Driven through an ephemeral listener so the test never binds codex's
+/// registered ports 1455/1457 nor launches a browser.
+#[test]
+fn a_cancel_stops_the_callback_wait_and_frees_the_port() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let cancel = LoginCancel::new();
+    let flag = cancel.clone();
+    let t0 = std::time::Instant::now();
+    let h = std::thread::spawn(move || {
+        let r = wait_for_code(&listener, "state", &cancel);
+        drop(listener);
+        r
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    flag.cancel();
+    let r = h.join().expect("join");
+    let took = t0.elapsed();
+    let err = r.expect_err("canceled");
+    assert_eq!(err.to_string(), "login canceled");
+    assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+    std::net::TcpListener::bind(("127.0.0.1", port)).expect("the port is free again");
+}
+
+/// A cancel on the real `login_with_cancel` drops the listener the login
+/// bound — the ephemeral port binds again right after — and returns within a
+/// bounded time, never the 300 s timeout. Driven through the seam on an
+/// ephemeral port with a no-op browser opener, so the test never binds codex's
+/// registered ports 1455/1457 nor launches a browser (M4). The port is read
+/// off the announce URL the seam's binding produced, never hardcoded.
+#[test]
+fn a_cancel_frees_the_login_port_end_to_end() {
+    let seam = CodexLoginSeam::new([0, 0], |_| {});
+    let cancel = LoginCancel::new();
+    let flag = cancel.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t0 = std::time::Instant::now();
+    let h = std::thread::spawn(move || {
+        login_with_cancel(
+            |url| {
+                let query = url.split_once('?').map(|(_, q)| q).unwrap_or(url);
+                let redirect_uri = query_param(query, "redirect_uri").expect("redirect_uri");
+                let port = redirect_uri
+                    .strip_prefix("http://localhost:")
+                    .and_then(|rest| rest.split('/').next())
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .expect("the redirect_uri names the bound port");
+                let _ = tx.send(port);
+            },
+            &cancel,
+        )
+    });
+    let port = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the login announced the authorize URL");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    flag.cancel();
+    let r = h.join().expect("join");
+    let took = t0.elapsed();
+    // No `Debug` on the token-carrying outcome, so no `expect_err`: match it.
+    let err = match r {
+        Ok(_) => panic!("a cancel must not land a login"),
+        Err(e) => e,
+    };
+    assert_eq!(err.to_string(), "login canceled");
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "a cancel returns within 2 s, took {took:?}"
+    );
+    std::net::TcpListener::bind(("127.0.0.1", port)).expect("the port is free again");
+    drop(seam);
 }
 
 /// The wire shape of the code exchange against a local stub: form-urlencoded

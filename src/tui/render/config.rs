@@ -12,22 +12,23 @@ use ratatui::text::{Line, Span};
 use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, load_profile_cache};
 
 use super::super::app::{
-    App, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin, InputState, MODEL_PRESETS,
-    ReadingsSnapshot, config_rows, escape_control,
+    App, BandEntry, CodexDetailRow, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin, HarnessFilter,
+    InputState, MODEL_PRESETS, MainItemKind, PoolDetailRow, PoolMutationKind, ReadingsSnapshot,
+    SetupSelection, config_rows, escape_control, pool_auth_label,
 };
 use super::super::theme;
-use super::format::{middle_truncate, truncate};
+use super::format::{NO_DATA, middle_truncate, spinner_frame, truncate};
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, MIN_VALUE_W, bold_when, cycle_row_lines,
-    draw_scrolled_lines, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
+    draw_following_list, draw_scrolled_lines, head_cols, help_tooltip_lines, highlight_row,
     invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, picker_row, pill,
     section_box, section_box_verbatim, value_caret,
 };
-use super::prose::{cmd, cmd_lit, key_lit};
+use super::prose::{cmd, cmd_lit, key_lit, spans as prose_spans};
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
     // +1 for the trailing `+ new` picker row.
-    let items = app.config().profiles.len() + 1;
+    let items = app.setup_items().len() + 1;
     let (selector, settings) = master_detail(area, items);
 
     let profiles_focused = app.config_focus == ConfigFocus::Profiles;
@@ -36,41 +37,140 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
 }
 
 fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
+    let block = section_box("accounts", focused, true, area.width);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Compute the band walk, the flat item list and the cursor position BEFORE
+    // the config guard: all three read the profile count under their own short
+    // guard, and `RankedMutex` refuses a nested acquisition of the same rank.
+    let entries = app.band_entries(HarnessFilter::All);
+    let items = app.setup_items();
+    let pos = app.setup_position();
     let cfg = app.config();
-    let count = cfg.profiles.len();
-    let sel = app.profile_cursor.min(count);
-    draw_selector_list(
-        frame,
-        area,
-        "accounts",
+    let ranges = App::heading_ranges(&entries);
+    let width = inner.width;
+
+    // One pass over the shared band walk builds both the rendered rows and the
+    // cursor-indexed starts, so a heading or spacer never shifts a selection
+    // off its row. `pos` is the flat item index, `items.len()` the `+ new`
+    // row — the clamped form would double-select the last item beside `+ new`.
+    let mut rows: Vec<ratatui::widgets::ListItem<'static>> = Vec::with_capacity(items.len() + 8);
+    let mut starts: Vec<usize> = Vec::with_capacity(items.len());
+    let mut flat: usize = 0;
+    for (i, entry) in entries.iter().enumerate() {
+        match entry {
+            BandEntry::Spacer => {
+                rows.push(ratatui::widgets::ListItem::new(Line::from("")));
+            }
+            BandEntry::Heading(text) => {
+                let heading = if ranges
+                    .iter()
+                    .any(|&(hi, start, end)| hi == i && (start..end).contains(&pos))
+                {
+                    theme::label_active()
+                } else {
+                    theme::label()
+                };
+                rows.push(ratatui::widgets::ListItem::new(Line::from(prose_spans(
+                    &format!("  {text}"),
+                    heading,
+                ))));
+            }
+            BandEntry::Item(item) => {
+                starts.push(rows.len());
+                rows.push(ratatui::widgets::ListItem::new(setup_selector_row(
+                    app,
+                    &cfg,
+                    *item,
+                    flat == pos,
+                    focused,
+                    width,
+                )));
+                flat += 1;
+            }
+        }
+    }
+    let new_row = rows.len();
+    rows.push(ratatui::widgets::ListItem::new(picker_row(
+        pos == items.len(),
         focused,
-        sel,
-        &app.setup_selector,
-        |w| {
-            let mut rows: Vec<_> = cfg
-                .profiles
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    // A disabled account can never be active, so dim wins outright.
-                    let ns = if p.is_disabled() {
-                        theme::dim()
-                    } else {
-                        name_color(cfg.is_active(&p.name))
-                    };
-                    picker_row(i == sel, focused, p.name.to_string(), ns, w)
-                })
-                .collect();
-            rows.push(picker_row(
-                count == sel,
-                focused,
-                "+ new".to_string(),
-                theme::accent(),
-                w,
-            ));
-            rows
-        },
-    );
+        "+ new".to_string(),
+        theme::accent(),
+        width,
+    )));
+
+    let render_sel = if pos >= items.len() {
+        new_row
+    } else {
+        starts.get(pos).copied().unwrap_or(0)
+    };
+    // The `+ new` row joins the starts list so the page step treats it as the
+    // last selectable row (a PageDown at `+ new` stays, not clamps to the last
+    // item).
+    starts.push(new_row);
+    draw_following_list(frame, inner, rows, render_sel, &app.setup_selector);
+    let block_ends: Vec<usize> = starts.iter().map(|s| s + 1).collect();
+    app.setup_selector.starts.replace(starts);
+    app.setup_selector.block_ends.replace(block_ends);
+}
+
+/// One Setup selector row for a harness item: a claude row (dim disabled,
+/// active-orange), a codex row (its name, `×` when quarantined), or a pool row
+/// (its name, dim when paused/disabled, `×` when it needs a re-login). Headings
+/// and the `+ new` row are never items.
+fn setup_selector_row(
+    app: &App,
+    cfg: &crate::profile::AppConfig,
+    item: MainItemKind,
+    selected: bool,
+    focused: bool,
+    width: u16,
+) -> Line<'static> {
+    match item {
+        MainItemKind::Profile(i) => {
+            let Some(p) = cfg.profiles.get(i) else {
+                return Line::from("");
+            };
+            // A disabled account can never be active, so dim wins outright.
+            let ns = if p.is_disabled() {
+                theme::dim()
+            } else {
+                name_color(cfg.is_active(&p.name))
+            };
+            picker_row(selected, focused, p.name.to_string(), ns, width)
+        }
+        MainItemKind::Codex(i) => {
+            let Some(row) = app.codex_rows.get(i) else {
+                return Line::from("");
+            };
+            let ns = theme::base();
+            let name = if row.broken {
+                format!("{} {}", theme::dead_credential_glyph(), row.name)
+            } else {
+                row.name.to_string()
+            };
+            picker_row(selected, focused, name, ns, width)
+        }
+        MainItemKind::Shunt(pi, ai) => {
+            let Some(provider) = app.shunt_pool_row(pi, ai) else {
+                return Line::from("");
+            };
+            let ns = if provider.0.paused || provider.0.disabled {
+                theme::dim()
+            } else {
+                theme::base()
+            };
+            // Names off the wire are escaped before render, the Overview's rule.
+            let account = escape_control(&provider.0.name);
+            let name = if provider.0.needs_relogin {
+                format!("{} {account}", theme::dead_credential_glyph())
+            } else {
+                account
+            };
+            picker_row(selected, focused, name, ns, width)
+        }
+    }
 }
 
 /// Snapshot taken under one short `config` guard, decoupled from render so
@@ -229,30 +329,37 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
             String::new()
         }
     };
+    // Resolve the selection BEFORE taking the config guard: `setup_selection`
+    // reads the profile count under its own short guard, and `RankedMutex`
+    // refuses a nested acquisition of the same rank.
+    let selection = app.setup_selection();
     let cfg = app.config();
-    if app.profile_cursor >= cfg.profiles.len() {
-        let mut snap = Snap::blank("+ new account");
-        let stash = app
-            .config_draft
-            .as_ref()
-            .and_then(|d| d.captured_login.as_ref());
-        // Mirror commit_new_account's consume rule: a typed base url flips the
-        // form to API mode and the mint will be discarded, so no stale ✓. The
-        // live-login stash survives into api mode, so its ✓ tracks the stash
-        // alone.
-        let oauth_mode = app
-            .config_draft
-            .as_ref()
-            .is_some_and(|d| d.base_url.value.trim().is_empty());
-        snap.captured = oauth_mode && stash.is_some_and(|s| matches!(s, DraftLogin::Mint(_)));
-        snap.captured_live = stash.is_some_and(|s| matches!(s, DraftLogin::LiveLogin(_)));
-        snap.mint_armed = app
-            .config_draft
-            .as_ref()
-            .is_some_and(ConfigDraft::mint_armed);
-        return snap;
-    }
-    match cfg.profiles.get(app.profile_cursor) {
+    let profile_idx = match selection {
+        SetupSelection::Item(MainItemKind::Profile(i)) => i,
+        _ => {
+            let mut snap = Snap::blank("+ new account");
+            let stash = app
+                .config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref());
+            // Mirror commit_new_account's consume rule: a typed base url flips the
+            // form to API mode and the mint will be discarded, so no stale ✓. The
+            // live-login stash survives into api mode, so its ✓ tracks the stash
+            // alone.
+            let oauth_mode = app
+                .config_draft
+                .as_ref()
+                .is_some_and(|d| d.base_url.value.trim().is_empty());
+            snap.captured = oauth_mode && stash.is_some_and(|s| matches!(s, DraftLogin::Mint(_)));
+            snap.captured_live = stash.is_some_and(|s| matches!(s, DraftLogin::LiveLogin(_)));
+            snap.mint_armed = app
+                .config_draft
+                .as_ref()
+                .is_some_and(ConfigDraft::mint_armed);
+            return snap;
+        }
+    };
+    match cfg.profiles.get(profile_idx) {
         Some(p) => {
             let sidecar = crate::claude::sidecar_summary(&p.name);
             Snap {
@@ -348,12 +455,27 @@ fn login_email(
 }
 
 fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
+    // The codex and pool detail panes render their own rows and actions.
+    match app.setup_selection() {
+        SetupSelection::Item(MainItemKind::Codex(_)) => {
+            draw_codex_detail(frame, area, app);
+            return;
+        }
+        SetupSelection::Item(MainItemKind::Shunt(..)) => {
+            draw_pool_detail(frame, area, app);
+            return;
+        }
+        _ => {}
+    }
     let actions_focused = app.config_focus == ConfigFocus::Actions;
     let draft = app.config_draft.as_ref();
     let snap = build_snap(app, readings, draft.is_none());
 
     // Profile names render verbatim; structural titles ("+ new account", "settings") stay uppercased.
-    let is_profile_name = app.profile_cursor < app.config().profiles.len();
+    let is_profile_name = matches!(
+        app.setup_selection(),
+        SetupSelection::Item(MainItemKind::Profile(_))
+    );
     let block = if is_profile_name {
         section_box_verbatim(&snap.title, actions_focused, false, area.width)
     } else {
@@ -366,6 +488,254 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Readin
     let cursor = app.config_action_cursor.min(rows.len().saturating_sub(1));
 
     draw_settings_rows(frame, inner, app, &rows, cursor, &snap, actions_focused);
+}
+
+/// The codex detail pane: `type`/`plan` (and `login  [ needs re-login ]` only
+/// while quarantined) as static key rows, then the `re-login` and `delete
+/// account` action rows. A codex account is deliberately NOT a `Profile` (see
+/// [`CodexRow`]), so this is its own renderer, never the claude detail.
+fn draw_codex_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let actions_focused = app.config_focus == ConfigFocus::Actions;
+    let Some(row) = app.setup_codex_index().and_then(|i| app.codex_rows.get(i)) else {
+        return;
+    };
+    let block = section_box_verbatim(row.name.as_ref(), actions_focused, false, area.width);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            key_cell("type", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+            theme::label(),
+        ),
+        Span::styled("codex", theme::accent()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            key_cell("plan", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+            theme::label(),
+        ),
+        match row.plan.as_deref() {
+            Some(plan) => Span::styled(escape_control(plan), theme::accent()),
+            None => Span::styled(NO_DATA.to_string(), theme::faint()),
+        },
+    ]));
+    // The quarantine is read live for the selected account only (one small
+    // file), the claude detail's live `has_live_session`/`session_token` read
+    // precedent: the `login [ needs re-login ]` row must not lag a verdict
+    // planted since the last 1 s codex snapshot refresh.
+    if crate::codex_auth::read_quarantine(row.name.as_str()).is_some() {
+        lines.push(Line::from(
+            [
+                vec![Span::styled(
+                    key_cell("login", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+                    theme::label(),
+                )],
+                pill("needs re-login".to_string(), theme::danger().bold()),
+            ]
+            .concat(),
+        ));
+    }
+    lines.push(Line::from(""));
+
+    let rows = CodexDetailRow::ALL;
+    let cursor = app.config_action_cursor.min(rows.len().saturating_sub(1));
+    let mut starts = Vec::with_capacity(rows.len());
+    let mut focus = (lines.len(), lines.len() + 1);
+    for (i, row_kind) in rows.iter().enumerate() {
+        let selected = actions_focused && i == cursor;
+        starts.push(lines.len());
+        let arrow = if selected {
+            Span::styled("❯ ", theme::accent().bold())
+        } else {
+            Span::raw("  ")
+        };
+        let (label, style) = match row_kind {
+            CodexDetailRow::ReLogin => {
+                ("re-login".to_string(), bold_when(theme::accent(), selected))
+            }
+            CodexDetailRow::Delete => {
+                let label = if app.codex_detail_armed {
+                    "press again to delete".to_string()
+                } else {
+                    "delete account".to_string()
+                };
+                (label, theme::danger().bold())
+            }
+        };
+        if selected {
+            focus.0 = lines.len();
+        }
+        let line = Line::from(vec![arrow, Span::styled(label, style)]);
+        // The focused action row takes the claude detail's full-width tint.
+        lines.push(if selected {
+            highlight_row(line, inner.width as usize)
+        } else {
+            line
+        });
+        if selected {
+            focus.1 = lines.len();
+        }
+    }
+
+    app.setup_detail_viewport.set(inner.height as usize);
+    app.setup_detail_total.set(lines.len());
+    app.setup_detail_row_starts.replace(starts);
+    app.setup_detail_block_ends
+        .replace(rows.iter().map(|_| 1).collect::<Vec<_>>());
+    app.setup_detail_tips.replace(vec![0; rows.len()]);
+    draw_scrolled_lines(frame, inner, lines, focus, Some(&app.setup_detail_offset));
+}
+
+/// The pool detail pane: static `type`/`family`/`provider`/`plan` rows, one
+/// `status` pill (first that holds: needs re-login, paused, disabled, cooldown;
+/// none while available), then the action rows — `refresh` (claude and
+/// antigravity) and `remove` (every routed family), none for kimi or an
+/// unknown auth mode.
+fn draw_pool_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let actions_focused = app.config_focus == ConfigFocus::Actions;
+    let Some((pi, ai)) = app.setup_pool_pair() else {
+        return;
+    };
+    let Some((account, auth)) = app.shunt_pool_row(pi, ai) else {
+        return;
+    };
+    let title = escape_control(&account.name);
+    let block = section_box_verbatim(&title, actions_focused, false, area.width);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            key_cell("type", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+            theme::label(),
+        ),
+        Span::styled("shunt", theme::accent()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            key_cell("family", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+            theme::label(),
+        ),
+        Span::styled(pool_auth_label(auth), theme::accent()),
+    ]));
+    let providers = app.pool_providers_for(auth, &account.name);
+    if !providers.is_empty() {
+        // The value column opens after the key cell; a join wider than it ends
+        // in `…` (grapheme-safe), never a mid-word cut.
+        let value_width = inner
+            .width
+            .saturating_sub((DETAIL_KEY_W + DETAIL_KEY_GUTTER) as u16)
+            as usize;
+        lines.push(Line::from(vec![
+            Span::styled(
+                key_cell("provider", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+                theme::label(),
+            ),
+            Span::styled(
+                truncate(&providers.join(" · "), value_width),
+                theme::accent(),
+            ),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(
+            key_cell("plan", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+            theme::label(),
+        ),
+        match account.plan.as_deref() {
+            Some(plan) => Span::styled(escape_control(plan), theme::accent()),
+            None => Span::styled(NO_DATA.to_string(), theme::faint()),
+        },
+    ]));
+    // The status pill is the first that holds; none while the account is
+    // available, so a clean row carries no status word.
+    let status = if account.needs_relogin {
+        Some(("needs re-login", theme::danger().bold()))
+    } else if account.paused {
+        Some(("paused", theme::dim().bold()))
+    } else if account.disabled {
+        Some(("disabled", theme::dim().bold()))
+    } else if account.cooldown_secs_remaining.is_some() {
+        Some(("cooldown", theme::warning().bold()))
+    } else {
+        None
+    };
+    if let Some((label, style)) = status {
+        lines.push(Line::from(
+            [
+                vec![Span::styled(
+                    key_cell("status", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+                    theme::label(),
+                )],
+                pill(label.to_string(), style),
+            ]
+            .concat(),
+        ));
+    }
+    lines.push(Line::from(""));
+
+    let rows = app.pool_detail_rows();
+    let cursor = app.config_action_cursor.min(rows.len().saturating_sub(1));
+    // The action row whose job runs takes the braille spinner in its caret slot
+    // (a running remove never lights the refresh row, and a codex-family
+    // remove — rows `[remove]` only — still shows its cue).
+    let running_kind = app
+        .pool_mutation_row
+        .as_ref()
+        .zip(app.pool_mutation_kind)
+        .and_then(|((family, name), kind)| {
+            (auth.clone().family() == Some(*family) && account.name == name.as_str())
+                .then_some(kind)
+        });
+    let mut starts = Vec::with_capacity(rows.len());
+    let mut focus = (lines.len(), lines.len() + 1);
+    for (i, row_kind) in rows.iter().enumerate() {
+        let selected = actions_focused && i == cursor;
+        starts.push(lines.len());
+        let arrow = match (row_kind, running_kind) {
+            (PoolDetailRow::Refresh, Some(PoolMutationKind::Refresh))
+            | (PoolDetailRow::Remove, Some(PoolMutationKind::Remove)) => Span::styled(
+                format!("{} ", spinner_frame(app.tick_count)),
+                theme::accent(),
+            ),
+            _ if selected => Span::styled("❯ ", theme::accent().bold()),
+            _ => Span::raw("  "),
+        };
+        let (label, style) = match row_kind {
+            PoolDetailRow::Refresh => ("refresh".to_string(), bold_when(theme::accent(), selected)),
+            PoolDetailRow::Remove => {
+                let label = if app.pool_detail_armed {
+                    "press again to remove".to_string()
+                } else {
+                    "remove".to_string()
+                };
+                (label, theme::danger().bold())
+            }
+        };
+        if selected {
+            focus.0 = lines.len();
+        }
+        let line = Line::from(vec![arrow, Span::styled(label, style)]);
+        lines.push(if selected {
+            highlight_row(line, inner.width as usize)
+        } else {
+            line
+        });
+        if selected {
+            focus.1 = lines.len();
+        }
+    }
+
+    app.setup_detail_viewport.set(inner.height as usize);
+    app.setup_detail_total.set(lines.len());
+    app.setup_detail_row_starts.replace(starts);
+    app.setup_detail_block_ends
+        .replace(rows.iter().map(|_| 1).collect::<Vec<_>>());
+    app.setup_detail_tips.replace(vec![0; rows.len()]);
+    draw_scrolled_lines(frame, inner, lines, focus, Some(&app.setup_detail_offset));
 }
 
 /// CLA-SPLIT status row (`token`): a profile carrying a long-lived-token sidecar

@@ -1896,6 +1896,22 @@ fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
     Ok(true)
 }
 
+/// The CLI's `--force` tail on the codex live-session refusal: the typed
+/// refusal plus the escape hatch, as one leaf sentence. The wrapped refusal
+/// itself has no chain (its `Display` is the whole sentence), so this wrapper
+/// carries no `source()` — a chain would print the refusal twice under
+/// `{e:?}` (`Caused by:` repeating the base sentence the tail already holds).
+#[derive(Debug)]
+struct CodexLiveSessionTail(actions::CodexLiveSession);
+
+impl std::fmt::Display for CodexLiveSessionTail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}, pass --force to remove it anyway", self.0)
+    }
+}
+
+impl std::error::Error for CodexLiveSessionTail {}
+
 /// The codex leg of [`cmd_delete`]: resolve against the codex roster, then the
 /// same confirm gate, the same rotation guard, and the codex delete. The
 /// postscript names what a codex profile installs globally — the operator's
@@ -1909,7 +1925,18 @@ fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> R
         return Ok(());
     }
     let rotation = actions::rotation_guard_for_mutation(&ProfileName::from(canonical.as_str()))?;
-    let detached = actions::delete_codex_profile(&canonical, force, &rotation)?;
+    // The shared refusal sentence names no CLI flag; this caller's escape hatch
+    // is `--force`, appended only to the TYPED live-session refusal (never a
+    // second `has_live_session` read, which would tag an unrelated failure with
+    // a flag that cannot fix it).
+    let detached = actions::delete_codex_profile(&canonical, force, &rotation).map_err(|e| {
+        match e.downcast::<actions::CodexLiveSession>() {
+            // Raised only when `force` is false (`delete_codex_profile`'s
+            // guard), so an `Ok` here is always the tail-bearing refusal.
+            Ok(session) => anyhow::Error::new(CodexLiveSessionTail(session)),
+            Err(e) => e,
+        }
+    })?;
     outln!("clauth: removed codex profile '{canonical}'.");
     if let Some(slot) = detached {
         outln!(

@@ -1845,10 +1845,7 @@ fn delete_codex_refuses_a_live_session_unforced() {
 
     let err = delete_codex_profile("busy", false, &rotation_guard("busy"))
         .expect_err("live session blocks");
-    assert_eq!(
-        err.to_string(),
-        "'busy' has a live session, pass --force to remove it anyway"
-    );
+    assert_eq!(err.to_string(), "'busy' has a live session");
     let state = crate::codex_profiles::CodexState::load().expect("load");
     assert!(state.holds("busy"), "the refused delete leaves the record");
 
@@ -6684,10 +6681,7 @@ fn delete_codex_detaches_only_the_slot_adopted_onto_it() {
     let pid = crate::testutil::arm_live_session(home.home(), "cx1");
     let err = delete_codex_profile("cx1", false, &rotation_guard("cx1"))
         .expect_err("a live session refuses");
-    assert_eq!(
-        err.to_string(),
-        "'cx1' has a live session, pass --force to remove it anyway"
-    );
+    assert_eq!(err.to_string(), "'cx1' has a live session");
     assert_eq!(
         std::fs::read_link(&slot).expect("still adopted"),
         store,

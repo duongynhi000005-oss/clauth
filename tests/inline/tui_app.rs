@@ -38372,3 +38372,1814 @@ fn set_tps_nudges_the_tokens_worker_when_a_fresh_snapshot_drops_a_day() {
     app.set_tps(Some(tps_snap(1_000, two_days)));
     assert!(rx.try_recv().is_err(), "the kept day reads as no drop");
 }
+
+// ── B3: Setup's list is the Overview's item list ─────────────────────────────
+//
+// Design record "Overview shunt section, pool-account actions", its third
+// bullet: Setup lists the Overview's own items (bands, headings, order, a pool
+// account under each provider serving it, the `c` filter ignored), `+ new`
+// last, with a codex and a pool detail pane.
+
+/// One pool account `name` with every flag clear.
+fn b3_pool_account(name: &str) -> crate::gateway_admin::PoolAccount {
+    crate::gateway_admin::PoolAccount {
+        name: name.to_string(),
+        available: true,
+        near_quota: false,
+        cooldown_secs_remaining: None,
+        needs_relogin: false,
+        paused: false,
+        disabled: false,
+        utilization_5h: None,
+        reset_5h: None,
+        utilization_7d: None,
+        reset_7d: None,
+        plan: None,
+        status: None,
+    }
+}
+
+/// Claude accounts `acct-one`, `acct-two`; codex account `cdx-one` (with a
+/// store); the pool as given; an adopted gateway on disk; the Setup tab shown.
+fn b3_setup_app(home: &crate::testutil::HomeSandbox, pool: super::ShuntPool) -> App {
+    crate::testutil::write_adopted_record(home, false, "[server]\nbind = \"127.0.0.1:9\"\n");
+    crate::testutil::write_codex_roster(&["cdx-one"]);
+    crate::testutil::write_codex_store(
+        "cdx-one",
+        &crate::testutil::codex_auth_body("acc.1", "refresh.cdx-one"),
+    );
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("acct-one")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("acct-two")),
+    ]);
+    app.shunt_pool = pool;
+    app.tab = Tab::Setup;
+    app
+}
+
+/// Provider `claude-main` (claude auth) serving `pool-one`.
+fn b3_claude_pool() -> super::ShuntPool {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    super::ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![b3_pool_account("pool-one")],
+    }])
+}
+
+/// The Setup selector pane: the first 30 cells of each row of a 100×60 frame
+/// (the selector is 30% of the body), trimmed, blank rows dropped.
+fn b3_setup_list(app: &App) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|r| r.chars().take(30).collect::<String>().trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect()
+}
+
+/// Whether some rendered row holds `seq` as consecutive whitespace tokens.
+fn b3_row_holds(rows: &[String], seq: &[&str]) -> bool {
+    rows.iter().any(|r| {
+        let tokens: Vec<&str> = r.split_whitespace().collect();
+        tokens.windows(seq.len()).any(|w| w == seq)
+    })
+}
+
+fn b3_press(app: &mut App, code: KeyCode, times: usize) {
+    for _ in 0..times {
+        super::handle_key(app, crate::testutil::key(code));
+    }
+}
+
+/// Moves the detail focus down until the focused row reads `label` (the caret
+/// `❯` directly before its words); panics naming the label when no row does.
+fn b3_focus_detail_row(app: &mut App, label: &[&str]) {
+    let mut seq = vec!["❯"];
+    seq.extend_from_slice(label);
+    for _ in 0..8 {
+        if b3_row_holds(&render_rows(app), &seq) {
+            return;
+        }
+        b3_press(app, KeyCode::Down, 1);
+    }
+    panic!("no detail row reads {label:?} under the caret");
+}
+
+#[test]
+fn setup_lists_the_overview_items_in_band_order_with_new_last() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    let order = [
+        "acct-one",
+        "acct-two",
+        "codex",
+        "cdx-one",
+        "shunt (claude-main)",
+        "pool-one",
+        "+ new",
+    ];
+    let check = |app: &App, why: &str| {
+        let list = b3_setup_list(app);
+        let positions: Vec<Option<usize>> = order
+            .iter()
+            .map(|needle| list.iter().position(|row| row.contains(needle)))
+            .collect();
+        assert!(
+            positions.iter().all(Option::is_some) && positions.windows(2).all(|w| w[0] < w[1]),
+            "{why}: Setup lists {order:?} in this order, got {list:#?}"
+        );
+    };
+    check(&app, "unfiltered");
+    app.harness_filter = super::HarnessFilter::Codex;
+    check(&app, "the Overview's `c` filter does not reach Setup");
+}
+
+#[test]
+fn an_unread_pool_names_its_reason_in_the_setup_list() {
+    let home = crate::testutil::HomeSandbox::new();
+    let app = b3_setup_app(
+        &home,
+        super::ShuntPool::NotRead("the gateway is not running".to_string()),
+    );
+    let list = b3_setup_list(&app);
+    assert!(
+        list.iter().any(|row| row.contains("shunt — not read")),
+        "an unread listing heads the pool band with its reason: {list:#?}"
+    );
+}
+
+#[test]
+fn a_codex_row_in_setup_shows_its_codex_detail() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    let rows = render_rows(&app);
+    assert!(b3_row_holds(&rows, &["type", "codex"]), "{rows:#?}");
+    assert!(
+        rows.iter()
+            .any(|r| r.split_whitespace().any(|t| t == "plan")),
+        "{rows:#?}"
+    );
+    assert!(rows.iter().any(|r| r.contains("re-login")), "{rows:#?}");
+    assert!(
+        rows.iter().any(|r| r.contains("delete account")),
+        "{rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("needs re-login")),
+        "a live chain shows no login row: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("base url")),
+        "a codex account shows none of the claude rows: {rows:#?}"
+    );
+}
+
+#[test]
+fn a_quarantined_codex_row_in_setup_reads_needs_relogin() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    crate::codex_auth::quarantine_for_test("cdx-one", "reused", "refresh.cdx-one");
+    super::on_tick(&mut app);
+    b3_press(&mut app, KeyCode::Down, 2);
+    let rows = render_rows(&app);
+    assert!(
+        b3_row_holds(&rows, &["login", "[", "needs", "re-login", "]"]),
+        "a quarantined chain reads `login  [ needs re-login ]`: {rows:#?}"
+    );
+}
+
+#[test]
+fn a_pool_row_in_setup_shows_its_pool_detail() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let pool = super::ShuntPool::Read(vec![
+        PoolProvider {
+            name: "claude-main".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![b3_pool_account("pool-one")],
+        },
+        PoolProvider {
+            name: "claude-alt".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![b3_pool_account("pool-one")],
+        },
+    ]);
+    let mut app = b3_setup_app(&home, pool);
+    let list = b3_setup_list(&app);
+    assert_eq!(
+        list.iter().filter(|row| row.contains("pool-one")).count(),
+        2,
+        "an account lists under each provider serving it: {list:#?}"
+    );
+    b3_press(&mut app, KeyCode::Down, 3);
+    let rows = render_rows(&app);
+    assert!(b3_row_holds(&rows, &["type", "shunt"]), "{rows:#?}");
+    assert!(b3_row_holds(&rows, &["family", "claude"]), "{rows:#?}");
+    assert!(
+        b3_row_holds(&rows, &["provider", "claude-main", "·", "claude-alt"]),
+        "the provider row joins every provider serving the account: {rows:#?}"
+    );
+    assert!(rows.iter().any(|r| r.contains("refresh")), "{rows:#?}");
+    assert!(rows.iter().any(|r| r.contains("remove")), "{rows:#?}");
+    // the detail pane only: the tab bar always carries a `status` tab
+    assert!(
+        !rows
+            .iter()
+            .filter(|r| r.starts_with('│'))
+            .map(|r| r.chars().skip(30).collect::<String>())
+            .any(|detail| detail.split_whitespace().any(|t| t == "status")),
+        "an available account carries no status row: {rows:#?}"
+    );
+}
+
+#[test]
+fn a_paused_pool_row_in_setup_reads_its_status_pill() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let mut account = b3_pool_account("pool-one");
+    account.paused = true;
+    let pool = super::ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![account],
+    }]);
+    let mut app = b3_setup_app(&home, pool);
+    b3_press(&mut app, KeyCode::Down, 3);
+    let rows = render_rows(&app);
+    assert!(
+        b3_row_holds(&rows, &["status", "[", "paused", "]"]),
+        "{rows:#?}"
+    );
+}
+
+#[test]
+fn a_codex_pool_row_in_setup_offers_remove_but_no_refresh() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let pool = super::ShuntPool::Read(vec![PoolProvider {
+        name: "codex-pool".to_string(),
+        auth: PoolAuth::Codex,
+        accounts: vec![b3_pool_account("pool-one")],
+    }]);
+    let mut app = b3_setup_app(&home, pool);
+    b3_press(&mut app, KeyCode::Down, 3);
+    let rows = render_rows(&app);
+    assert!(b3_row_holds(&rows, &["family", "codex"]), "{rows:#?}");
+    assert!(rows.iter().any(|r| r.contains("remove")), "{rows:#?}");
+    assert!(
+        !rows.iter().any(|r| r.contains("refresh")),
+        "shunt has no codex refresh route: {rows:#?}"
+    );
+}
+
+#[test]
+fn a_kimi_pool_row_in_setup_shows_facts_only() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let pool = super::ShuntPool::Read(vec![PoolProvider {
+        name: "kimi-pool".to_string(),
+        auth: PoolAuth::Kimi,
+        accounts: vec![b3_pool_account("pool-one")],
+    }]);
+    let mut app = b3_setup_app(&home, pool);
+    b3_press(&mut app, KeyCode::Down, 3);
+    let rows = render_rows(&app);
+    assert!(b3_row_holds(&rows, &["type", "shunt"]), "{rows:#?}");
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.contains("refresh") || r.contains("remove")),
+        "a kimi account carries no action row: {rows:#?}"
+    );
+}
+
+#[test]
+fn setup_deletes_a_codex_account_by_inline_two_step() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["delete", "account"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        renders(&app, "press again to delete"),
+        "the first ⏎ arms the delete"
+    );
+    assert!(
+        crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .holds("cdx-one"),
+        "an armed delete deletes nothing"
+    );
+    b3_press(&mut app, KeyCode::Enter, 1);
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    assert!(
+        !crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .holds("cdx-one"),
+        "the second ⏎ deletes the codex account"
+    );
+}
+
+#[test]
+fn setup_removes_a_pool_account_by_inline_two_step() {
+    use crate::gateway_admin::{PoolFamily, ShuntAccountName};
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 3);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["remove"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        renders(&app, "press again to remove"),
+        "the first ⏎ arms the remove"
+    );
+    assert_eq!(app.pool_mutation_row, None, "an armed remove sends nothing");
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert_eq!(
+        app.pool_mutation_row,
+        Some((
+            PoolFamily::Claude,
+            ShuntAccountName::new("pool-one").expect("valid name")
+        )),
+        "the second ⏎ runs the Overview's remove on that account"
+    );
+    super::join_test_workers();
+}
+
+/// A claude create lands Setup on the new account and the shared cursor puts
+/// the Overview on it too. Pins behaviour the baseline may already have for
+/// the claude arm (codex and shunt creates come with the typed form).
+#[test]
+fn a_claude_create_lands_setup_and_the_overview_on_the_new_row() {
+    use super::{DraftLogin, MainItemKind, build_draft_new, commit_new_account};
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    // the Overview last rested on the codex row, so landing on the new claude
+    // row is the create's doing, never where the cursor already sat
+    app.overview_remembered = Some(MainItemKind::Codex(0));
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("acct-new");
+    draft.captured_login = Some(DraftLogin::Mint(Box::new(login_outcome(
+        "minted",
+        Some("uuid-minted"),
+    ))));
+    app.config_draft = Some(draft);
+    commit_new_account(&mut app);
+    let rows = render_rows(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("─ acct-new ─")),
+        "Setup's detail pane is titled after the new account: {rows:#?}"
+    );
+    let idx = (0..app.profile_count())
+        .find(|i| {
+            app.profile_name_at(*i)
+                .is_some_and(|n| n.as_str() == "acct-new")
+        })
+        .expect("the create saved acct-new");
+    super::switch_tab(&mut app, Tab::Overview);
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Profile(idx)),
+        "the Overview lands on the new account"
+    );
+}
+
+// ── B3 implementer pins ────────────────────────────────────────────────────
+
+/// The detail pane's inner rows (the Setup detail rect at 100×60, x 31..99),
+/// trimmed and blank rows dropped — the exact-row pin's extractor.
+fn b3_detail_inner(app: &App) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    rows.into_iter()
+        .enumerate()
+        .filter(|(y, _)| (4..58).contains(y))
+        .map(|(_, r)| {
+            r.chars()
+                .skip(31)
+                .take(68)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .filter(|r| !r.is_empty())
+        .collect()
+}
+
+/// The fg colour the first rendered cell of `needle` carries, or `None` when
+/// nothing renders it.
+fn b3_needle_fg(app: &App, needle: &str) -> Option<ratatui::style::Color> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let row_idx = rows.iter().position(|r| r.contains(needle))?;
+    let byte = rows[row_idx].find(needle)?;
+    let col = rows[row_idx][..byte].chars().count();
+    Some(buf.content[row_idx * 100 + col].fg)
+}
+
+/// The codex `re-login` row starts the codex browser login (its own session +
+/// modal), and that modal offers `r` and `c` with no paste door — codex's
+/// callback answers on this machine alone.
+#[test]
+fn codex_relogin_starts_the_browser_login_with_a_pasteless_modal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2); // cdx-one
+    b3_press(&mut app, KeyCode::Enter, 1); // descend onto `re-login`
+    b3_press(&mut app, KeyCode::Enter, 1); // run re-login
+    assert!(
+        app.codex_login.is_some(),
+        "re-login starts the codex browser login"
+    );
+    assert_eq!(
+        app.codex_login.as_ref().map(|s| s.name.as_str()),
+        Some("cdx-one"),
+        "the login is for the selected account"
+    );
+    let rows = render_rows(&app);
+    assert!(
+        b3_row_holds(&rows, &["r", "open", "the", "browser", "again"]),
+        "the modal offers r: {rows:#?}"
+    );
+    assert!(
+        b3_row_holds(&rows, &["c", "copy", "link"]),
+        "the modal offers c: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("paste code")),
+        "codex has no paste door: {rows:#?}"
+    );
+    super::join_test_workers();
+}
+
+/// An injected codex-login success lands the chain on the worker (the store's
+/// refresh token changes) and toasts once `on_tick`'s `drain_codex_login`
+/// folds the outcome into the UI (F12a): dropping that drain call must leave
+/// the TOAST unsent — the worker already wrote the store.
+#[test]
+fn codex_login_lands_an_injected_success_and_toasts() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.codex_login_worker = |_announce, _cancel| {
+        Ok(crate::codex_login::CodexLoginOutcome {
+            auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+            account_id: Some("acc".to_string()),
+        })
+    };
+    super::start_codex_login(&mut app, "cdx-one");
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    assert!(
+        crate::testutil::read_codex_store("cdx-one").contains("refresh.new"),
+        "the minted chain lands in the store"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("logged in 'cdx-one'")),
+        "a success toasts: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// An injected codex-login failure toasts and leaves the store unchanged.
+#[test]
+fn codex_login_an_injected_failure_toasts_and_leaves_the_store() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    let before = crate::testutil::read_codex_store("cdx-one");
+    app.codex_login_worker = |_announce, _cancel| Err("boom".to_string());
+    super::start_codex_login(&mut app, "cdx-one");
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    assert_eq!(
+        crate::testutil::read_codex_store("cdx-one"),
+        before,
+        "a failure leaves the store untouched"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("login for 'cdx-one' failed")),
+        "a failure toasts: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A refusal from the shared landing function (a live codex session) toasts
+/// its sentence and leaves the store unchanged.
+#[test]
+fn codex_login_landing_refuses_a_live_session_and_toasts_its_sentence() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    let _live = crate::testutil::arm_live_session(home.home(), "cdx-one");
+    let before = crate::testutil::read_codex_store("cdx-one");
+    app.codex_login_worker = |_announce, _cancel| {
+        Ok(crate::codex_login::CodexLoginOutcome {
+            auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+            account_id: Some("acc".to_string()),
+        })
+    };
+    super::start_codex_login(&mut app, "cdx-one");
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("has a live codex session")),
+        "the landing fn's refusal toasts: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        crate::testutil::read_codex_store("cdx-one"),
+        before,
+        "a refusal leaves the store untouched"
+    );
+}
+
+/// The pool `refresh` row runs the Overview's refresh job for that
+/// `(family, name)`, and an antigravity account offers it too.
+#[test]
+fn pool_refresh_row_runs_the_refresh_job_for_claude_and_antigravity() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 3); // pool-one
+    b3_press(&mut app, KeyCode::Enter, 1); // descend onto `refresh`
+    b3_press(&mut app, KeyCode::Enter, 1); // run refresh
+    assert_eq!(
+        app.pool_mutation_row,
+        Some((
+            crate::gateway_admin::PoolFamily::Claude,
+            crate::gateway_admin::ShuntAccountName::new("pool-one").expect("valid name")
+        )),
+        "refresh runs the job for (claude, pool-one)"
+    );
+    super::join_test_workers();
+
+    let pool = super::ShuntPool::Read(vec![PoolProvider {
+        name: "anti-main".to_string(),
+        auth: PoolAuth::Antigravity,
+        accounts: vec![b3_pool_account("pool-one")],
+    }]);
+    let mut app = b3_setup_app(&home, pool);
+    b3_press(&mut app, KeyCode::Down, 3);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    let rows = render_rows(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("refresh")),
+        "an antigravity account offers refresh: {rows:#?}"
+    );
+}
+
+/// The pool detail's action row shows the braille spinner in its caret slot
+/// while ITS job runs — a running refresh lights `refresh`, a running remove
+/// lights `remove` (F9: never the wrong neighbour row).
+#[test]
+fn pool_refresh_row_shows_the_spinner_while_its_mutation_runs() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.pool_mutation_row = Some((
+        crate::gateway_admin::PoolFamily::Claude,
+        crate::gateway_admin::ShuntAccountName::new("pool-one").expect("valid name"),
+    ));
+    app.pool_mutation_kind = Some(super::PoolMutationKind::Refresh);
+    b3_press(&mut app, KeyCode::Down, 3);
+    let rows = render_rows(&app);
+    assert!(
+        b3_row_holds(&rows, &["⠋", "refresh"]),
+        "the running refresh row shows the spinner: {rows:#?}"
+    );
+    assert!(
+        !b3_row_holds(&rows, &["⠋", "remove"]),
+        "a running refresh does not light the remove row: {rows:#?}"
+    );
+
+    // A running remove lights `remove`, not `refresh`.
+    app.pool_mutation_kind = Some(super::PoolMutationKind::Remove);
+    let rows = render_rows(&app);
+    assert!(
+        b3_row_holds(&rows, &["⠋", "remove"]),
+        "the running remove row shows the spinner: {rows:#?}"
+    );
+    assert!(
+        !b3_row_holds(&rows, &["⠋", "refresh"]),
+        "a running remove does not light the refresh row: {rows:#?}"
+    );
+}
+
+/// The pool status pill: the first that holds of needs re-login (DANGER),
+/// paused/disabled (neutral dim), cooldown (WARNING), and none while available.
+/// Each ADJACENT pair is pinned (F12d), so a reordered ladder reds whichever
+/// pair it flips.
+#[test]
+fn pool_status_pill_words_and_precedence() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let pill = |account: crate::gateway_admin::PoolAccount| {
+        let mut app = b3_setup_app(
+            &home,
+            super::ShuntPool::Read(vec![PoolProvider {
+                name: "claude-main".to_string(),
+                auth: PoolAuth::Claude,
+                accounts: vec![account],
+            }]),
+        );
+        b3_press(&mut app, KeyCode::Down, 3);
+        app
+    };
+
+    let mut cooldown = b3_pool_account("pool-one");
+    cooldown.cooldown_secs_remaining = Some(30);
+    let app = pill(cooldown);
+    let rows = render_rows(&app);
+    assert!(
+        b3_row_holds(&rows, &["status", "[", "cooldown", "]"]),
+        "a cooldown reads its pill: {rows:#?}"
+    );
+    assert_eq!(
+        b3_needle_fg(&app, "cooldown"),
+        crate::tui::theme::warning().fg,
+        "the cooldown pill is WARNING"
+    );
+
+    // needs re-login > cooldown.
+    let mut both = b3_pool_account("pool-one");
+    both.needs_relogin = true;
+    both.cooldown_secs_remaining = Some(30);
+    let app = pill(both);
+    let rows = render_rows(&app);
+    assert!(
+        b3_row_holds(&rows, &["status", "[", "needs", "re-login", "]"]),
+        "needs re-login outranks cooldown: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("cooldown")),
+        "a losing cooldown renders nothing: {rows:#?}"
+    );
+    assert_eq!(
+        b3_needle_fg(&app, "needs re-login"),
+        crate::tui::theme::danger().fg,
+        "the needs re-login pill is DANGER"
+    );
+
+    // needs re-login > paused.
+    let mut relogin_paused = b3_pool_account("pool-one");
+    relogin_paused.needs_relogin = true;
+    relogin_paused.paused = true;
+    let app = pill(relogin_paused);
+    let rows = render_rows(&app);
+    assert!(
+        b3_row_holds(&rows, &["status", "[", "needs", "re-login", "]"]),
+        "needs re-login outranks paused: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("paused")),
+        "a losing paused renders nothing: {rows:#?}"
+    );
+
+    // paused > disabled (both neutral dim).
+    let mut paused_disabled = b3_pool_account("pool-one");
+    paused_disabled.paused = true;
+    paused_disabled.disabled = true;
+    let app = pill(paused_disabled);
+    let rows = render_rows(&app);
+    assert!(
+        b3_row_holds(&rows, &["status", "[", "paused", "]"]),
+        "paused outranks disabled: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("disabled")),
+        "a losing disabled renders nothing: {rows:#?}"
+    );
+    assert_eq!(
+        b3_needle_fg(&app, "paused"),
+        crate::tui::theme::dim().fg,
+        "the paused pill is neutral dim"
+    );
+
+    // disabled > cooldown, and disabled itself reads neutral dim.
+    let mut disabled_cooldown = b3_pool_account("pool-one");
+    disabled_cooldown.disabled = true;
+    disabled_cooldown.cooldown_secs_remaining = Some(30);
+    let app = pill(disabled_cooldown);
+    let rows = render_rows(&app);
+    assert!(
+        b3_row_holds(&rows, &["status", "[", "disabled", "]"]),
+        "disabled outranks cooldown: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("cooldown")),
+        "a losing cooldown renders nothing: {rows:#?}"
+    );
+    assert_eq!(
+        b3_needle_fg(&app, "disabled"),
+        crate::tui::theme::dim().fg,
+        "the disabled pill is neutral dim"
+    );
+}
+
+/// ↑ on the first Setup row wraps to `+ new`; a codex selection leaves the
+/// Overview's remembered row alone; a claude selection IS `profile_cursor`.
+#[test]
+fn setup_selection_wraps_and_keeps_the_overview_alone() {
+    use super::MainItemKind;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.overview_remembered = Some(MainItemKind::Profile(0));
+    // ↑ on the first row wraps to `+ new`.
+    b3_press(&mut app, KeyCode::Up, 1);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::New,
+        "↑ on the first Setup row wraps to + new"
+    );
+    // ↓ wraps back to the first row.
+    b3_press(&mut app, KeyCode::Down, 1);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(MainItemKind::Profile(0)),
+        "↓ from + new wraps to the first row"
+    );
+    // Moving onto a codex row leaves the shared cursor where the last claude
+    // row put it, and the Overview's remembered row alone.
+    b3_press(&mut app, KeyCode::Down, 2); // acct-two, cdx-one
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(MainItemKind::Codex(0)),
+        "the codex row is selected"
+    );
+    assert_eq!(
+        app.profile_cursor, 1,
+        "a codex selection does not move the shared cursor past acct-two"
+    );
+    assert_eq!(
+        app.overview_remembered,
+        Some(MainItemKind::Profile(0)),
+        "a codex selection leaves the Overview's remembered row alone"
+    );
+    // A claude row selected in Setup IS `profile_cursor`.
+    b3_press(&mut app, KeyCode::Up, 1); // back onto acct-two
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(MainItemKind::Profile(1)),
+        "up lands on a claude row"
+    );
+    assert_eq!(
+        app.profile_cursor, 1,
+        "a claude selection IS profile_cursor"
+    );
+}
+
+/// The pool poll runs while Setup shows (a read lands with only Setup shown).
+#[test]
+fn setup_pool_poll_runs_while_setup_shows() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.tab = Tab::Setup;
+    super::poll_shunt_pool(&mut app);
+    assert!(
+        app.last_shunt_pool_refresh.is_some(),
+        "the pool poll ran with only Setup shown"
+    );
+}
+
+/// The codex detail pane, exact-match.
+#[test]
+fn setup_codex_detail_is_exact() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    assert_eq!(
+        b3_detail_inner(&app),
+        vec![
+            "type            codex".to_string(),
+            "plan            —".to_string(),
+            "re-login".to_string(),
+            "delete account".to_string(),
+        ],
+        "the codex detail pane is these rows, exactly"
+    );
+}
+
+/// The pool detail pane, exact-match.
+#[test]
+fn setup_pool_detail_is_exact() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let pool = super::ShuntPool::Read(vec![
+        PoolProvider {
+            name: "claude-main".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![b3_pool_account("pool-one")],
+        },
+        PoolProvider {
+            name: "claude-alt".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![b3_pool_account("pool-one")],
+        },
+    ]);
+    let mut app = b3_setup_app(&home, pool);
+    b3_press(&mut app, KeyCode::Down, 3);
+    assert_eq!(
+        b3_detail_inner(&app),
+        vec![
+            "type            shunt".to_string(),
+            "family          claude".to_string(),
+            "provider        claude-main · claude-alt".to_string(),
+            "plan            —".to_string(),
+            "refresh".to_string(),
+            "remove".to_string(),
+        ],
+        "the pool detail pane is these rows, exactly"
+    );
+}
+
+/// The bg of the first cell of `needle` at or past column `from`.
+fn b3_bg_at(app: &App, needle: &str, from: usize) -> Option<ratatui::style::Color> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    for (y, row) in rows.iter().enumerate() {
+        let tail: String = row.chars().skip(from).collect();
+        if let Some(byte) = tail.find(needle) {
+            let col = from + tail[..byte].chars().count();
+            return Some(buf.content[y * 100 + col].bg);
+        }
+    }
+    None
+}
+
+/// Whether any frame cell holds `c`.
+fn b3_frame_holds(app: &App, c: char) -> bool {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    term.backend()
+        .buffer()
+        .content
+        .iter()
+        .any(|cell| cell.symbol().contains(c))
+}
+
+/// `+ new` holds the one caret — the last item row and the `+ new` row never
+/// both carry it (F1).
+#[test]
+fn the_new_row_holds_one_caret() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Up, 1);
+    assert_eq!(app.setup_selection(), super::SetupSelection::New);
+    let list = b3_setup_list(&app);
+    let carets = list.iter().filter(|r| r.contains('❯')).count();
+    assert_eq!(carets, 1, "one caret while + new is selected: {list:#?}");
+}
+
+/// The codex 2-step arms an IDENTITY: a roster change that keeps the account
+/// moves its row, and the second ⏎ deletes the armed account, never the row
+/// now at its old index (F2).
+#[test]
+fn setup_delete_hits_the_armed_codex_account_across_a_roster_change() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    crate::testutil::write_codex_roster(&["cdx-one", "cdx-two", "cdx-three"]);
+    for n in ["cdx-two", "cdx-three"] {
+        crate::testutil::write_codex_store(
+            n,
+            &crate::testutil::codex_auth_body("acc.1", &format!("refresh.{n}")),
+        );
+    }
+    app.codex_rows = super::codex_rows();
+    b3_press(&mut app, KeyCode::Down, 3);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Codex(1))
+    );
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["delete", "account"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(renders(&app, "press again to delete"), "armed on cdx-two");
+    // another terminal deletes cdx-one; the roster poll lands it
+    crate::testutil::write_codex_roster(&["cdx-two", "cdx-three"]);
+    app.last_codex_rows_refresh = None;
+    super::poll_codex_rows(&mut app);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    super::join_test_workers();
+    let st = crate::codex_profiles::CodexState::load().expect("load");
+    assert!(
+        st.holds("cdx-three") && !st.holds("cdx-two"),
+        "the confirm deletes the armed cdx-two only: holds cdx-two={} cdx-three={}",
+        st.holds("cdx-two"),
+        st.holds("cdx-three")
+    );
+}
+
+/// The pool 2-step arms a `(provider, account)` identity: a re-read without the
+/// row above it moves the row, and the second ⏎ removes the armed account
+/// (F2).
+#[test]
+fn setup_remove_hits_the_armed_pool_account_across_a_relisting() {
+    use crate::gateway_admin::{PoolAuth, PoolFamily, PoolProvider, ShuntAccountName};
+    let home = crate::testutil::HomeSandbox::new();
+    let three = |names: &[&str]| {
+        super::ShuntPool::Read(vec![PoolProvider {
+            name: "claude-main".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: names.iter().map(|n| b3_pool_account(n)).collect(),
+        }])
+    };
+    let mut app = b3_setup_app(&home, three(&["pool-a", "pool-b", "pool-c"]));
+    b3_press(&mut app, KeyCode::Down, 4); // acct-two, cdx-one, pool-a, pool-b
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Shunt(0, 1))
+    );
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["remove"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(renders(&app, "press again to remove"), "armed on pool-b");
+    // the re-read lands a listing without pool-a (removed elsewhere)
+    app.shunt_pool = three(&["pool-b", "pool-c"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    let ran = app.pool_mutation_row.clone();
+    let kind = app.pool_mutation_kind;
+    super::join_test_workers();
+    assert_eq!(
+        ran,
+        Some((
+            PoolFamily::Claude,
+            ShuntAccountName::new("pool-b").expect("valid")
+        )),
+        "the confirm removes the armed pool-b"
+    );
+    assert_eq!(kind, Some(super::PoolMutationKind::Remove));
+}
+
+/// A pool that goes unread ascends the descended selection, shows the first
+/// row, and holds the identity separately (`setup_remembered`, like the
+/// Overview's `overview_remembered`) for the read's return (F3/N4).
+#[test]
+fn an_unread_pool_ascends_and_keeps_its_selection() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 3); // pool-one
+    b3_press(&mut app, KeyCode::Enter, 1); // descend
+    assert_eq!(app.config_focus, super::ConfigFocus::Actions);
+    app.shunt_pool = super::ShuntPool::NotRead("the gateway is not running".to_string());
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Profiles,
+        "the descended selection ascends"
+    );
+    assert_eq!(
+        app.setup_position(),
+        0,
+        "the selection shows on the first row"
+    );
+    assert!(
+        app.setup_remembered.is_some(),
+        "the identity is held separately for the next read"
+    );
+    // The read returns (no move since): the selection is the pool row again.
+    app.shunt_pool = b3_claude_pool();
+    super::on_tick(&mut app);
+    assert!(
+        matches!(
+            app.setup_selection(),
+            super::SetupSelection::Item(super::MainItemKind::Shunt(..))
+        ),
+        "the identity comes back: {:?}",
+        app.setup_selection()
+    );
+}
+
+/// A collapsed codex re-login cancels on esc (and on q, which never arms the
+/// 2-step quit around it) — F5a/b.
+#[test]
+fn esc_and_q_cancel_a_collapsed_codex_login() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_press(&mut app, KeyCode::Enter, 1); // re-login
+    b3_press(&mut app, KeyCode::Esc, 1); // collapse the modal
+    let cancel_advertised = renders(&app, "esc cancel");
+    b3_press(&mut app, KeyCode::Esc, 2);
+    let still = app.codex_login.is_some();
+    super::join_test_workers();
+    assert!(
+        !still,
+        "the footer advertised `esc cancel` ({cancel_advertised}); esc left the login running"
+    );
+
+    // And a fresh login: q three times cancels it without quitting.
+    b3_press(&mut app, KeyCode::Enter, 1); // descend onto the codex detail
+    b3_press(&mut app, KeyCode::Enter, 1); // re-login again
+    b3_press(&mut app, KeyCode::Esc, 1); // collapse
+    b3_press(&mut app, KeyCode::Char('q'), 3);
+    let quit = app.quit;
+    super::join_test_workers();
+    assert!(!quit, "q quit the TUI around a live codex login");
+}
+
+/// A second ⏎ on `re-login` while one runs reopens its modal (F5c).
+#[test]
+fn a_second_enter_on_relogin_reopens_the_running_login() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_press(&mut app, KeyCode::Enter, 1); // re-login: modal opens
+    b3_press(&mut app, KeyCode::Esc, 1); // collapse
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::CodexLogin))
+    );
+    b3_press(&mut app, KeyCode::Enter, 1); // re-login row again
+    let reopened = app
+        .modals
+        .iter()
+        .any(|m| matches!(m, super::Modal::CodexLogin));
+    super::join_test_workers();
+    assert!(reopened, "a second ⏎ reopens the running login's modal");
+}
+
+/// The announced authorize URL reaches the session and `c` copies it by
+/// equality (F12e).
+#[test]
+fn codex_login_copies_the_announced_authorize_link() {
+    static HANDED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    let url = "https://auth.openai.com/oauth/authorize?state=x".to_string();
+    app.codex_login = Some(super::CodexLoginSession {
+        name: "cdx-one".to_string(),
+        generation: 1,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+    });
+    super::open_codex_login_modal(&mut app);
+    app.codex_login_url_tx.send((1, url.clone())).unwrap();
+    super::drain_codex_login(&mut app);
+    app.clipboard = |link| {
+        HANDED.lock().expect("handed").push(link.to_string());
+        Ok(())
+    };
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(
+        HANDED.lock().expect("handed").as_slice(),
+        [url.as_str()],
+        "c copies the announced link by equality"
+    );
+}
+
+/// A duplicate is a create: Setup lands on the copy and the Overview's
+/// remembered row moves onto it (F13).
+#[test]
+fn duplicating_an_account_lands_the_overview_on_the_copy() {
+    use super::MainItemKind;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.overview_remembered = Some(MainItemKind::Codex(0));
+    b3_press(&mut app, KeyCode::Down, 1); // acct-two
+    super::duplicate_profile_into(
+        &mut app,
+        &crate::profile::ProfileName::from("acct-two"),
+        &crate::profile::ProfileName::from("acct-zzz"),
+    );
+    let idx = (0..app.profile_count())
+        .find(|i| {
+            app.profile_name_at(*i)
+                .is_some_and(|n| n.as_str() == "acct-zzz")
+        })
+        .expect("the duplicate saved acct-zzz");
+    super::switch_tab(&mut app, Tab::Overview);
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Profile(idx)),
+        "after a create the Overview lands on the new row"
+    );
+}
+
+/// A codex delete refusal never names a CLI flag (F15).
+#[test]
+fn a_codex_delete_refusal_never_names_a_cli_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    let _live = crate::testutil::arm_live_session(home.home(), "cdx-one");
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["delete", "account"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("'cdx-one' has a live session")),
+        "the live-session refusal reads: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    assert!(
+        !app.toasts.iter().any(|t| t.body.contains("--force")),
+        "a TUI refusal never names a CLI flag: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A TUI re-login of an account deleted while the browser ran refuses — it
+/// never recreates the account (F18).
+#[test]
+fn a_codex_relogin_refuses_an_account_deleted_while_the_browser_ran() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.codex_login_worker = |_announce, _cancel| {
+        // The account is deleted while the browser round-trip runs.
+        crate::testutil::write_codex_roster(&[]);
+        Ok(crate::codex_login::CodexLoginOutcome {
+            auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+            account_id: Some("acc".to_string()),
+        })
+    };
+    super::start_codex_login(&mut app, "cdx-one");
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("no longer exists")),
+        "the deleted account refuses: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    assert!(
+        !crate::codex_profiles::CodexState::load().is_ok_and(|s| s.holds("cdx-one")),
+        "the account was never recreated"
+    );
+}
+
+/// Deleting the only codex row hands the selection to the row now at its flat
+/// index — the pool after it, across bands — never wherever `profile_cursor`
+/// sat (F19/M1).
+#[test]
+fn deleting_the_last_codex_row_lands_at_its_flat_index() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2); // cdx-one (the only codex row)
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["delete", "account"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    super::join_test_workers();
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Shunt(0, 0)),
+        "the row now at the only codex row's flat index is pool-one"
+    );
+    assert_eq!(app.config_focus, super::ConfigFocus::Profiles);
+}
+
+/// esc disarms the codex 2-step and restores the label (F17).
+#[test]
+fn esc_disarms_the_codex_delete() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["delete", "account"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(renders(&app, "press again to delete"));
+    b3_press(&mut app, KeyCode::Esc, 1);
+    assert_eq!(app.config_focus, super::ConfigFocus::Profiles);
+    assert!(
+        !renders(&app, "press again to delete"),
+        "esc cancels the 2-step and restores the label"
+    );
+}
+
+/// A facts-only kimi pool detail advertises no dead `↵ edit / toggle` key (F4).
+#[test]
+fn a_kimi_pool_detail_footer_offers_no_dead_key() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let pool = super::ShuntPool::Read(vec![PoolProvider {
+        name: "kimi-pool".to_string(),
+        auth: PoolAuth::Kimi,
+        accounts: vec![b3_pool_account("pool-one")],
+    }]);
+    let mut app = b3_setup_app(&home, pool);
+    b3_press(&mut app, KeyCode::Down, 3);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    let rows = render_rows(&app);
+    let footer = rows.last().cloned().unwrap_or_default();
+    assert!(
+        !footer.contains("edit / toggle"),
+        "a facts-only pool detail advertises ↵ edit / toggle: {footer:?}"
+    );
+}
+
+/// Setup's selector escapes a bidi pool name off the wire (F7).
+#[test]
+fn setup_escapes_a_bidi_pool_name() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let pool = super::ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![b3_pool_account("ab\u{202e}cd")],
+    }]);
+    let app = b3_setup_app(&home, pool);
+    assert!(
+        !b3_frame_holds(&app, '\u{202e}'),
+        "Setup's selector writes a raw U+202E: {:#?}",
+        b3_setup_list(&app)
+    );
+}
+
+/// The provider join at a narrow width reads whole or ends in `…`, never a
+/// mid-word cut (F10).
+#[test]
+fn a_narrow_provider_join_ends_in_an_ellipsis() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let pool = super::ShuntPool::Read(vec![
+        PoolProvider {
+            name: "claude-provider-alpha".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![b3_pool_account("pool-one")],
+        },
+        PoolProvider {
+            name: "claude-provider-bravo".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![b3_pool_account("pool-one")],
+        },
+    ]);
+    let mut app = b3_setup_app(&home, pool);
+    b3_press(&mut app, KeyCode::Down, 3);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 40)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let row = rows
+        .iter()
+        .find(|r| r.contains("provider"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        row.contains("claude-provider-alpha · claude-provider-bravo")
+            || row
+                .trim_end()
+                .trim_end_matches('│')
+                .trim_end()
+                .ends_with('…'),
+        "the provider join at 60 cells reads whole or ends in …: {row:?}\n{rows:#?}"
+    );
+}
+
+/// Deleting a codex account that detaches the operator's `~/.codex/auth.json`
+/// slot toasts the CLI's warning that their own codex is logged out (F14).
+#[test]
+fn deleting_a_codex_account_detaching_the_operators_slot_toasts_the_warning() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join("operator-codex");
+    std::fs::create_dir_all(&operator).expect("mkdir operator home");
+    let _cx_home = crate::testutil::CodexHomeSandbox::new(&home, &operator);
+    let slot = operator.join("auth.json");
+    std::fs::write(
+        &slot,
+        crate::testutil::codex_auth_body("acc.1", "refresh.op"),
+    )
+    .expect("write");
+    crate::actions::codex_login_capture("cdx-one").expect("capture");
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["delete", "account"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    super::join_test_workers();
+    assert!(
+        app.toasts.iter().any(|t| t.body.contains("has no login")),
+        "the detach warning toasts: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// The focused codex action row takes the claude detail's full-width tint (F8).
+#[test]
+fn a_codex_action_row_takes_the_tint() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert_eq!(
+        b3_bg_at(&app, "re-login", 31),
+        crate::tui::theme::selected_row().bg,
+        "the codex detail's selected action row is tinted like the claude detail's"
+    );
+}
+
+/// The provider row keeps to the account's family (F6).
+#[test]
+fn the_provider_row_keeps_to_the_accounts_family() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let pool = super::ShuntPool::Read(vec![
+        PoolProvider {
+            name: "claude-main".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![b3_pool_account("work")],
+        },
+        PoolProvider {
+            name: "codex-main".to_string(),
+            auth: PoolAuth::Codex,
+            accounts: vec![b3_pool_account("work")],
+        },
+    ]);
+    let mut app = b3_setup_app(&home, pool);
+    b3_press(&mut app, KeyCode::Down, 3); // claude-main / work
+    let detail = b3_detail_inner(&app);
+    assert!(
+        detail.iter().any(|r| r == "provider        claude-main"),
+        "the claude account's provider row names only the claude provider: {detail:#?}"
+    );
+}
+
+/// The pool detail's second ⏎ on `remove` runs the REMOVE job, not a refresh
+/// (F12b).
+#[test]
+fn a_pool_remove_runs_the_remove_job() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 3); // pool-one
+    b3_press(&mut app, KeyCode::Enter, 1); // descend onto refresh
+    b3_focus_detail_row(&mut app, &["remove"]);
+    b3_press(&mut app, KeyCode::Enter, 1); // arm
+    b3_press(&mut app, KeyCode::Enter, 1); // confirm
+    assert_eq!(
+        app.pool_mutation_kind,
+        Some(super::PoolMutationKind::Remove),
+        "the inline 2-step runs the remove job"
+    );
+    super::join_test_workers();
+}
+
+// ── B3 round-3 pins ──────────────────────────────────────────────────────────
+
+/// The browser callback lands just after the user cancels (the token exchange
+/// was in flight): the worker's pre-landing cancel check drops the minted chain
+/// unwritten, so the store is unchanged and the cancel toast already said so
+/// (N1).
+#[test]
+fn a_cancel_before_the_landing_drops_the_minted_chain_unwritten() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    let before = crate::testutil::read_codex_store("cdx-one");
+    app.codex_login_worker = |_announce, cancel| {
+        let t = std::time::Instant::now();
+        while !cancel.is_canceled() && t.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(crate::codex_login::CodexLoginOutcome {
+            auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+            account_id: Some("acc".to_string()),
+        })
+    };
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_press(&mut app, KeyCode::Enter, 1); // re-login
+    b3_press(&mut app, KeyCode::Esc, 1); // collapse
+    b3_press(&mut app, KeyCode::Esc, 1); // cancel
+    let canceled = app.codex_login.is_none();
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    let after = crate::testutil::read_codex_store("cdx-one");
+    assert!(canceled, "esc canceled the login");
+    assert_eq!(after, before, "a canceled login wrote the store: {after}");
+}
+
+/// A cancel that arrives while the landing is already in flight must not drop
+/// the outcome: the store is written and the landed toast still fires (N1).
+#[test]
+fn a_cancel_during_the_landing_still_toasts_the_landed_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.codex_login_worker = |_announce, _cancel| {
+        Ok(crate::codex_login::CodexLoginOutcome {
+            auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+            account_id: Some("acc".to_string()),
+        })
+    };
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_press(&mut app, KeyCode::Enter, 1); // re-login
+    super::join_test_workers(); // the worker already landed the store
+    b3_press(&mut app, KeyCode::Esc, 1); // collapse
+    b3_press(&mut app, KeyCode::Esc, 1); // cancel (arrived during the landing)
+    super::on_tick(&mut app);
+    assert!(
+        crate::testutil::read_codex_store("cdx-one").contains("refresh.new"),
+        "the landing wrote the store"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("logged in 'cdx-one'")),
+        "the landed outcome toasts even after the cancel: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A codex row deleted elsewhere hands the selection to the row now at its
+/// FLAT index, across bands (M1): `cdx-three` at flat 4 lands on `pool-one`.
+#[test]
+fn a_dropped_codex_row_clamps_to_its_index() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    crate::testutil::write_codex_roster(&["cdx-one", "cdx-two", "cdx-three"]);
+    for n in ["cdx-two", "cdx-three"] {
+        crate::testutil::write_codex_store(
+            n,
+            &crate::testutil::codex_auth_body("acc.1", &format!("refresh.{n}")),
+        );
+    }
+    app.codex_rows = super::codex_rows();
+    b3_press(&mut app, KeyCode::Down, 4); // acct-two, cdx-one, cdx-two, cdx-three
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Codex(2))
+    );
+    crate::testutil::write_codex_roster(&["cdx-one", "cdx-two"]);
+    app.last_codex_rows_refresh = None;
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Shunt(0, 0)),
+        "the row now at cdx-three's flat index is pool-one"
+    );
+}
+
+/// The only codex row dropped hands the selection to the row now at its flat
+/// index (the pool after it), never the last claude row by accident (M1).
+#[test]
+fn a_dropped_codex_row_lands_at_its_flat_index_across_bands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    // `cdx-one` is the only codex row, at flat index 2 (acct-one, acct-two).
+    b3_press(&mut app, KeyCode::Down, 2);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Codex(0))
+    );
+    crate::testutil::write_codex_roster(&[]);
+    app.last_codex_rows_refresh = None;
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Shunt(0, 0)),
+        "the row now at the only codex row's flat index is pool-one"
+    );
+}
+
+/// A pool account dropped from its provider hands the selection to the row now
+/// at its flat index (here, within the same provider: the only band after the
+/// codex one), never the codex band by accident (N3/M1).
+#[test]
+fn a_dropped_pool_row_clamps_to_its_index() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let three = |names: &[&str]| {
+        super::ShuntPool::Read(vec![PoolProvider {
+            name: "claude-main".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: names.iter().map(|n| b3_pool_account(n)).collect(),
+        }])
+    };
+    let mut app = b3_setup_app(&home, three(&["pool-a", "pool-b", "pool-c"]));
+    b3_press(&mut app, KeyCode::Down, 4); // pool-b
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Shunt(0, 1))
+    );
+    app.shunt_pool = three(&["pool-a", "pool-c"]);
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Shunt(0, 1)),
+        "the row now at pool-b's index is pool-c"
+    );
+}
+
+/// A pool account dropped from its provider lands on the row now at its FLAT
+/// index across providers: the last account of `p-zero` dropped falls to
+/// `p-one`'s first account, the row now at that flat index (M1).
+#[test]
+fn a_dropped_pool_row_lands_at_its_flat_index_across_providers() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let two = || {
+        super::ShuntPool::Read(vec![
+            PoolProvider {
+                name: "p-zero".to_string(),
+                auth: PoolAuth::Claude,
+                accounts: vec![b3_pool_account("pool-a"), b3_pool_account("pool-b")],
+            },
+            PoolProvider {
+                name: "p-one".to_string(),
+                auth: PoolAuth::Claude,
+                accounts: vec![b3_pool_account("pool-c")],
+            },
+        ])
+    };
+    let mut app = b3_setup_app(&home, two());
+    b3_press(&mut app, KeyCode::Down, 4); // pool-b
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Shunt(0, 1))
+    );
+    app.shunt_pool = super::ShuntPool::Read(vec![
+        PoolProvider {
+            name: "p-zero".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![b3_pool_account("pool-a")],
+        },
+        PoolProvider {
+            name: "p-one".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![b3_pool_account("pool-c")],
+        },
+    ]);
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Shunt(1, 0)),
+        "the row now at pool-b's flat index is p-one's pool-c"
+    );
+}
+
+/// A pool hiding while the user is on the Overview must not move the shared
+/// claude cursor the Overview's highlighted claude row is (M2).
+#[test]
+fn a_hide_off_setup_leaves_the_shared_claude_cursor() {
+    use super::MainItemKind;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 1); // acct-two: profile_cursor 1
+    b3_press(&mut app, KeyCode::Down, 2); // cdx-one, pool-one
+    assert_eq!(app.profile_cursor, 1);
+    app.overview_remembered = Some(MainItemKind::Profile(1));
+    super::switch_tab(&mut app, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(1)));
+    app.shunt_pool = super::ShuntPool::NotRead("the gateway is not running".to_string());
+    super::on_tick(&mut app);
+    let menu = super::build_action_menu(&app);
+    assert_eq!(
+        (
+            app.profile_cursor,
+            app.current_main_item(),
+            menu.context.clone()
+        ),
+        (
+            1,
+            Some(MainItemKind::Profile(1)),
+            Some("acct-two".to_string())
+        ),
+        "a background pool read moved the shared claude cursor under the Overview"
+    );
+}
+
+/// A move of the shared claude selection elsewhere (the Overview) after the
+/// hide replaces the held identity; a read returning while Setup shows must
+/// not restore it over the user's later pick (M3).
+#[test]
+fn a_move_elsewhere_replaces_the_held_identity() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 3); // pool-one
+    app.shunt_pool = super::ShuntPool::NotRead("the gateway is not running".to_string());
+    super::on_tick(&mut app); // Setup now shows acct-one (row 0), identity held
+    super::switch_tab(&mut app, Tab::Overview);
+    b3_press(&mut app, KeyCode::Down, 1); // the user picks acct-two on the Overview
+    let picked = app.profile_cursor;
+    super::switch_tab(&mut app, Tab::Setup); // back before the read returns
+    app.shunt_pool = b3_claude_pool(); // the read returns while Setup shows
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Profile(picked)),
+        "the read restored the held pool row over the user's later pick (profile_cursor {picked})"
+    );
+}
+
+/// A create or duplicate landing while the identity is hidden replaces it; the
+/// read must not restore the held pool over the new row (M3).
+#[test]
+fn a_duplicate_while_hidden_does_not_restore_the_held_pool() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 3); // pool-one
+    app.shunt_pool = super::ShuntPool::NotRead("the gateway is not running".to_string());
+    super::on_tick(&mut app); // hidden: setup_remembered holds pool-one
+    assert!(app.setup_remembered.is_some());
+    super::duplicate_profile_into(
+        &mut app,
+        &crate::profile::ProfileName::from("acct-one"),
+        &crate::profile::ProfileName::from("acct-dup"),
+    );
+    let dup_idx = (0..app.profile_count())
+        .find(|i| {
+            app.profile_name_at(*i)
+                .is_some_and(|n| n.as_str() == "acct-dup")
+        })
+        .expect("the duplicate saved acct-dup");
+    app.shunt_pool = b3_claude_pool();
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Profile(dup_idx)),
+        "the read restored the held pool row over the duplicate's new row"
+    );
+}
+
+/// While an unread pool hides the held row, the first row IS the selection;
+/// descending into it and the pool reading again must not swap the pane under
+/// the open claude draft (N4).
+#[test]
+fn a_returning_pool_keeps_the_descended_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 3); // pool-one
+    app.shunt_pool = super::ShuntPool::NotRead("the gateway is not running".to_string());
+    super::on_tick(&mut app);
+    b3_press(&mut app, KeyCode::Enter, 1); // descend into the row shown selected
+    let editing = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone());
+    let before = app.setup_selection();
+    app.shunt_pool = b3_claude_pool();
+    super::on_tick(&mut app);
+    let after = app.setup_selection();
+    assert_eq!(
+        after, before,
+        "the pane swapped under the open draft ({editing:?}, focus {:?})",
+        app.config_focus
+    );
+}
+
+/// The N4 ruling's second leg: a Setup move after the hide replaces the held
+/// identity, so the read returning keeps the moved-to row (BL2).
+#[test]
+fn a_setup_move_after_the_hide_keeps_the_moved_to_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 3); // pool-one
+    app.shunt_pool = super::ShuntPool::NotRead("the gateway is not running".to_string());
+    super::on_tick(&mut app);
+    b3_press(&mut app, KeyCode::Down, 1); // acct-two
+    app.shunt_pool = b3_claude_pool();
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Profile(1))
+    );
+}
+
+/// Entering Setup while a held pool row is hidden: the entry itself places the
+/// selection on the row the rehome picks (acct-one), before the first frame
+/// and before any key — a ⏎ then opens that row, and the next tick changes
+/// nothing (M6).
+#[test]
+fn entering_setup_while_hidden_places_before_the_first_key() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 1); // acct-two
+    b3_press(&mut app, KeyCode::Down, 2); // cdx-one, pool-one
+    super::switch_tab(&mut app, Tab::Overview);
+    app.shunt_pool = super::ShuntPool::NotRead("the gateway is not running".to_string());
+    super::on_tick(&mut app); // off Setup: no placement
+    super::switch_tab(&mut app, Tab::Setup);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Profile(0)),
+        "entry shows the profile_cursor fallback, not the rehomed first row"
+    );
+    b3_press(&mut app, KeyCode::Enter, 1); // descend into the row shown
+    let opened = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone());
+    super::on_tick(&mut app);
+    assert_eq!(
+        (app.config_focus, app.setup_selection()),
+        (
+            super::ConfigFocus::Actions,
+            super::SetupSelection::Item(super::MainItemKind::Profile(0))
+        ),
+        "the tick after entry ascended out of {opened:?} and moved the selection"
+    );
+}
+
+/// Entering Setup after the held pool row was dropped while another tab showed:
+/// the entry lands on the row now at the flat index it held (the last item
+/// dropped clamps to the new last item), before the first frame (M6).
+#[test]
+fn entering_setup_while_a_row_was_dropped_places_at_its_flat_index() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 3); // pool-one, flat 3 (the last item)
+    super::switch_tab(&mut app, Tab::Overview);
+    app.shunt_pool = super::ShuntPool::Read(vec![]); // pool-one dropped elsewhere
+    super::on_tick(&mut app); // off Setup: no placement
+    super::switch_tab(&mut app, Tab::Setup);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Codex(0)),
+        "entry shows the stale pool row instead of the row now at flat 3"
+    );
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Codex(0)),
+        "the tick after entry moved the selection off the clamped row"
+    );
+}
+
+/// Opening a modal disarms the codex 2-step: help, then esc, then ⏎ deletes
+/// nothing (N5).
+#[test]
+fn a_modal_between_the_presses_disarms_the_codex_delete() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["delete", "account"]);
+    b3_press(&mut app, KeyCode::Enter, 1); // arm
+    b3_press(&mut app, KeyCode::Char('?'), 1); // help modal
+    b3_press(&mut app, KeyCode::Esc, 1); // close it
+    b3_press(&mut app, KeyCode::Enter, 1);
+    let st = crate::codex_profiles::CodexState::load().expect("load");
+    assert!(
+        st.holds("cdx-one"),
+        "a modal between the presses still deleted cdx-one"
+    );
+}
+
+/// `a` still opens a menu on a codex detail, so its hint stays; when the menu
+/// empties (daemon control busy, no shunt verb) the hint goes too (N6).
+#[test]
+fn the_codex_detail_footer_derives_a_actions_from_the_menu() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    let menu = super::build_action_menu(&app).items.len();
+    let rows = render_rows(&app);
+    let footer = rows.last().cloned().unwrap_or_default();
+    assert!(
+        menu == 0 || footer.contains("a actions"),
+        "`a` opens {menu} items but the footer drops `a actions`: {footer:?}"
+    );
+    app.daemon_control_busy = true;
+    app.services.shunt_action.running = true;
+    let rows = render_rows(&app);
+    let footer = rows.last().cloned().unwrap_or_default();
+    assert!(
+        !footer.contains("a actions"),
+        "an empty menu still advertises `a actions`: {footer:?}"
+    );
+}
+
+/// A pool row whose name fails shunt's grammar is still a selectable row that
+/// ↑↓ pass through; its detail shows facts only, no action rows (N7).
+#[test]
+fn an_ungrammatical_pool_name_does_not_trap_the_cursor() {
+    use crate::gateway_admin::{PoolAuth, PoolProvider};
+    let home = crate::testutil::HomeSandbox::new();
+    let pool = super::ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![b3_pool_account("pool-a"), b3_pool_account("Bad Name")],
+    }]);
+    let mut app = b3_setup_app(&home, pool);
+    b3_press(&mut app, KeyCode::Down, 5); // acct-two, cdx-one, pool-a, Bad Name, + new
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::New,
+        "five ↓ reach + new"
+    );
+    b3_press(&mut app, KeyCode::Up, 1); // back onto Bad Name
+    b3_press(&mut app, KeyCode::Enter, 1); // descend
+    assert_eq!(
+        app.pool_detail_rows(),
+        Vec::new(),
+        "a name outside shunt's grammar shows no action rows"
+    );
+}

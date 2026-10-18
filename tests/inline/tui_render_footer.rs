@@ -635,6 +635,7 @@ fn modal_index(modal: &Modal) -> usize {
         Modal::NamePrompt(_) => 12,
         Modal::Rebind(_) => 13,
         Modal::Login => 14,
+        Modal::CodexLogin => 15,
     }
 }
 
@@ -642,11 +643,11 @@ fn modal_index(modal: &Modal) -> usize {
 /// Bumped with `modal_index` — the coverage test reds when an index has no
 /// case. That guard fires only once `MODAL_COUNT` is bumped past the new arm's
 /// index.
-const MODAL_COUNT: usize = 15;
+const MODAL_COUNT: usize = 16;
 
-/// Every `Modal` variant has a case driving its row; the login modal is the
-/// one variant a case cannot cover (its live-stage line owns the footer), so
-/// its index is skipped.
+/// Every `Modal` variant has a case driving its row; the two login modals are
+/// the variants a case cannot cover (their login-in-flight lines own the
+/// footer), so their indexes are skipped.
 #[test]
 fn the_modal_case_list_covers_every_variant() {
     let mut covered = [false; MODAL_COUNT];
@@ -654,9 +655,10 @@ fn the_modal_case_list_covers_every_variant() {
         covered[modal_index(&case.modal)] = true;
     }
     let login = modal_index(&Modal::Login);
+    let codex_login = modal_index(&Modal::CodexLogin);
     for (index, is_covered) in covered.iter().enumerate() {
         assert!(
-            *is_covered || index == login,
+            *is_covered || index == login || index == codex_login,
             "no modal case covers variant index {index}"
         );
     }
@@ -696,6 +698,7 @@ fn modal_selection(app: &App) -> String {
         Some(Modal::Help) => format!("{}", app.help_scroll),
         Some(Modal::CheckOutput(_)) => format!("{}", app.check_output_scroll),
         Some(Modal::Login) => String::new(),
+        Some(Modal::CodexLogin) => String::new(),
         None => String::new(),
     }
 }
@@ -1443,6 +1446,112 @@ fn the_login_footer_shows_the_open_modals_row() {
             app.modals.push(modal.clone());
             let footer = settled_footer(&app, w, h);
             assert_eq!(footer, expected, "{name} login footer at {w}x{h}");
+        }
+    }
+}
+
+/// A codex re-login in flight keeps its lead line and reads `q back` while its
+/// modal is open (the collapse key; `r`/`c` live in the modal body) and `esc
+/// cancel` once collapsed — the [`draw_login`] shape without the paste door.
+#[test]
+fn the_codex_login_footer_names_only_its_modal_keys() {
+    use crate::tui::app::CodexLoginSession;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let session = || CodexLoginSession {
+        name: "cdx-one".into(),
+        generation: 0,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+    };
+
+    let mut open = bare_app();
+    open.codex_login = Some(session());
+    open.modals.push(Modal::CodexLogin);
+    assert_eq!(
+        settled_footer(&open, 80, 24),
+        "⠋ logging in 'cdx-one'   q back",
+        "the open codex login modal's footer"
+    );
+
+    let mut collapsed = bare_app();
+    collapsed.codex_login = Some(session());
+    assert_eq!(
+        settled_footer(&collapsed, 80, 24),
+        "⠋ logging in 'cdx-one'   esc cancel",
+        "the collapsed codex login's footer"
+    );
+}
+
+/// A codex re-login in flight keeps the claude login line's open-modal rule:
+/// any open non-login modal's own keys ride behind the codex lead, never
+/// `q back` where `q` types (the name prompt). Mirrors
+/// `the_login_footer_shows_the_open_modals_row` with `codex_login` set.
+#[test]
+fn the_codex_login_footer_shows_the_open_modals_row() {
+    use crate::tui::app::{
+        ActionMenuAction, ActionMenuState, CodexLoginSession, ConfirmAction, ConfirmScroll,
+        ConfirmState, InputState, NamePromptAction, NamePromptForm,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let session = || CodexLoginSession {
+        name: "cdx-one".into(),
+        generation: 0,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+    };
+    let confirm = Modal::Confirm(ConfirmState {
+        message: "rotate 'x'?".into(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RotateOne("x".into()),
+    });
+    let action_menu = Modal::ActionMenu(ActionMenuState::new(
+        vec![ActionMenuAction::TogglePace],
+        vec![],
+        None,
+    ));
+    let name_prompt = Modal::NamePrompt(NamePromptForm {
+        input: InputState::new(""),
+        action: NamePromptAction::DuplicateProfile("src".into()),
+    });
+
+    let cases: Vec<(&str, Modal, &str, &str)> = vec![
+        (
+            "help",
+            Modal::Help,
+            "⠋ logging in 'cdx-one'   ↑↓ scroll   q back",
+            "⠋ logging in 'cdx-one'   ↑↓ scroll   q back",
+        ),
+        (
+            "confirm",
+            confirm,
+            "⠋ logging in 'cdx-one'   ←→ pick   ↵ choose   q back",
+            "⠋ logging in 'cdx-one'   ←→ pick   q back",
+        ),
+        (
+            "action menu",
+            action_menu,
+            "⠋ logging in 'cdx-one'   ↑↓ pick   ↵ choose   q back",
+            "⠋ logging in 'cdx-one'   ↑↓ pick   q back",
+        ),
+        (
+            "name prompt",
+            name_prompt,
+            "⠋ logging in 'cdx-one'   ↵ save   ←→ caret   esc back",
+            "⠋ logging in 'cdx-one'   ↵ save   esc back",
+        ),
+    ];
+
+    for (name, modal, row_80, row_45) in cases {
+        for (w, h, expected) in [(80u16, 24u16, row_80), (45u16, 24u16, row_45)] {
+            let mut app = bare_app();
+            app.codex_login = Some(session());
+            app.modals.push(modal.clone());
+            let footer = settled_footer(&app, w, h);
+            assert_eq!(footer, expected, "{name} codex login footer at {w}x{h}");
         }
     }
 }
