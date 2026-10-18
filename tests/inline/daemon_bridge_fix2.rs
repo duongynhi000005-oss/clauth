@@ -76,11 +76,13 @@ fn serve_poll_once(
     session: &str,
 ) -> String {
     let (mut a, b) = UnixStream::pair().expect("pair");
+    // Set before the peer end is served and dropped: macOS refuses
+    // SO_RCVTIMEO (EINVAL) on a socket whose peer already closed.
+    a.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
     a.write_all(format!("GET /poll?session={session} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
         .expect("write request");
     serve_claimed(b, hub, events, parked, Limits::default());
-    a.set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("read timeout");
     let mut out = String::new();
     let _ = a.read_to_string(&mut out);
     out
@@ -413,6 +415,10 @@ fn a_connection_over_the_event_budget_is_refused_with_a_503() {
     let (mut a, b) = UnixStream::pair().expect("pair");
     let events = AtomicUsize::new(MAX_EVENT_CONNECTIONS);
     let lines = crate::logline::LogLines::new();
+    // Set before the peer end is served and dropped: macOS refuses
+    // SO_RCVTIMEO (EINVAL) on a socket whose peer already closed.
+    a.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
     let _capture = lines.capture_here();
     assert!(
         claim_event(b, &events, Limits::default()).is_none(),
@@ -424,8 +430,6 @@ fn a_connection_over_the_event_budget_is_refused_with_a_503() {
         "the refused claim must not leak a slot"
     );
     let mut out = String::new();
-    a.set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("timeout");
     let _ = a.read_to_string(&mut out);
     assert!(out.starts_with("HTTP/1.1 503"), "got {out:?}");
     assert_eq!(
@@ -443,13 +447,15 @@ fn a_poll_over_the_park_budget_is_refused_with_a_503() {
     let parked = AtomicUsize::new(MAX_PARKED_POLLS);
     let (_t, r) = table(&[(std::process::id(), instance("s-self", "1"))]);
     let hub = Hub::new(true, r);
+    // Set before the peer end is served and dropped: macOS refuses
+    // SO_RCVTIMEO (EINVAL) on a socket whose peer already closed.
+    a.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
     let lines = crate::logline::LogLines::new();
     let _capture = lines.capture_here();
     let _ = a.write_all(b"GET /poll?session=s-self HTTP/1.1\r\nHost: x\r\n\r\n");
     serve_claimed(b, &hub, &events, &parked, Limits::default());
     let mut out = String::new();
-    a.set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("timeout");
     let _ = a.read_to_string(&mut out);
     assert!(out.starts_with("HTTP/1.1 503"), "got {out:?}");
     assert_eq!(
@@ -472,6 +478,10 @@ fn a_parked_poll_leaves_the_event_budget() {
     let hub = Hub::new(true, r);
     let _ = a.write_all(b"GET /poll?session=s-self HTTP/1.1\r\nHost: x\r\n\r\n");
     let hub2 = Arc::clone(&hub);
+    // Set before the peer end is served and dropped: macOS refuses
+    // SO_RCVTIMEO (EINVAL) on a socket whose peer already closed.
+    a.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
     let events2 = Arc::clone(&events);
     let parked2 = Arc::clone(&parked);
     let server = std::thread::spawn(move || {
@@ -497,8 +507,6 @@ fn a_parked_poll_leaves_the_event_budget() {
     ));
     let _ = server.join();
     let mut out = String::new();
-    a.set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("timeout");
     let _ = a.read_to_string(&mut out);
     assert!(out.starts_with("HTTP/1.1 200"), "got {out:?}");
 }
