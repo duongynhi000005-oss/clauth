@@ -23,13 +23,13 @@ An account is exhausted when either window is past its line.
 | Window | Line | Set by |
 |--------|------|--------|
 | 5h | `95%` | per account, Fallback tab `rotate at` / `fallback_threshold` |
-| 7d aggregate | `98%` | Config tab `weekly limit`, per account `weekly at` / `weekly_threshold` |
+| 7d aggregate (else a monthly-only account's 30d) | `98%` | Config tab `weekly limit`, per account `weekly at` / `weekly_threshold` |
 | 7d, per model | same as aggregate | the same values, checked per model window |
-| 7d hard cap | `100%` | not configurable |
+| 7d hard cap (else a monthly-only account's 30d) | `100%` | not configurable |
 
 The weekly lines are deliberately below 100. Topping out a week bricks an account for days rather than hours, so clauth moves off while there is still room to land the hop. The 100% hard cap blocks an account regardless of every toggle below.
 
-API-key accounts are judged on the same lines, using whatever 5h / 7d windows their provider publishes — Z.ai and MiniMax today. Before, only OAuth accounts could ever be exhausted, so a `fallback_threshold` on an api-key member never fired. A window a provider does not publish simply has no line to cross, and a best-effort scan of an unrecognised endpoint never counts: its numbers are guessed from the response shape, and parking an account on a guess is worse than not switching. Windows on any other schedule (z.ai's 30d ceiling, Alibaba's monthly) render as bars but are not judged — the chain only knows the 5h and 7d lines, so an Alibaba account with only a monthly reading has no line to cross.
+API-key accounts are judged on the same lines, using whatever 5h / 7d windows their provider publishes — Z.ai and MiniMax today — plus Alibaba's monthly quota as the long window. Before, only OAuth accounts could ever be exhausted, so a `fallback_threshold` on an api-key member never fired. A window a provider does not publish simply has no line to cross, and a best-effort scan of an unrecognised endpoint never counts: its numbers are guessed from the response shape, and parking an account on a guess is worse than not switching. An unmarked month-long bar (z.ai's MCP web-tools ceiling) renders as a bar but is not judged — the weekly line reads the 7d window, else Alibaba's monthly quota, so an Alibaba account with only a monthly reading still has that line to cross.
 
 Per-model weekly windows (a "7d fable" window, say) gate the same way: an account whose scoped week is past the line stays out of rotation, since a session of the capped model landed there would strand, and the walk cannot know which model your next session runs. A session that has not started yet is the one case where the model *is* knowable, which is what [`start --auto`](Auto-Switch#choosing-where-a-session-starts) uses.
 
@@ -49,10 +49,12 @@ The walk skips a member for any of these, worst first. The Overview and Fallback
 | `auth broken` | a refresh was rejected for good; the login needs `clauth login <name>` (a codex chain: `clauth login <name> --codex --browser`) |
 | `key rejected` | a third-party provider rejected the inference api key; re-enter it on the Setup tab |
 | `weekly spent` | 7d at 100%, dead until the week resets |
+| `30d spent` | a monthly-only account's 30d quota at 100%, dead until it resets |
 | `claude code blocked` | the messages limiter keeps refusing this account, twice running, with quota still ahead |
 | `extra usage spent` | out of subscription quota and out of the spend ceiling below |
 | `5h <pct>%` | 5h past its line |
 | `weekly <pct>%` / `<model> <pct>%` | past a weekly line, per the gates above |
+| `30d <pct>%` | a monthly-only account's 30d quota past the weekly line |
 
 Being dead is its own switch trigger. An active account marked `auth broken`, `key rejected`, `canceled`, or `claude code blocked` is walked off instead of wedging on the corpse, and a rejected-key member is never picked as a target or as switch-off recovery. Alibaba's lapsed console login is different: it suppresses only the usage poll because the api key can still serve, so the account stays in the chain.
 
@@ -63,8 +65,8 @@ Two radio toggles on a member's Fallback card. Marking one clears it on every ot
 - **`last resort`** is the parking spot: chosen only once every other member is past its line, and never switched away from. Claude Code then surfaces its own out-of-limit message when that account runs dry too.
 - **`preferred`** is the home account. Once it reads clear and fresh, clauth walks back to it on its own, from wherever the chain left you.
 - **`walk order`** (Config tab) reorders each accept pass among the members it already accepts. Ties keep chain position, every other gate is unchanged, and the default `chain` is today's walk exactly.
-  - `soonest weekly reset`: the member whose 7d window resets soonest drains first, so less quota expires unspent; a member with no readable reset ranks last. With no `preferred` set, a healthy active walks home to the soonest-reset clear+fresh member and parks there.
-  - `most weekly headroom`: a hop lands on the member whose 7d window is least used, 5h breaking a tie, so the week spreads across the chain instead of always landing on the next slot. A window past its reset or with no reset yet counts as unused, and so does a missing 5h window; a member with no weekly window to read ranks last, and a healthy active never moves for it.
+  - `soonest weekly reset`: the member whose 7d window (a monthly-only account: its 30d quota) resets soonest drains first, so less quota expires unspent; a member with no readable reset ranks last. With no `preferred` set, a healthy active walks home to the soonest-reset clear+fresh member and parks there.
+  - `most weekly headroom`: a hop lands on the member whose 7d window (a monthly-only account: its 30d quota) is least used, 5h breaking a tie, so the week spreads across the chain instead of always landing on the next slot. A window past its reset or with no reset yet counts as unused, and so does a missing 5h window; a member with no weekly window to read ranks last, and a healthy active never moves for it.
 
 Which account is home can also depend on the day. A `preferred_days` list in a profile's `config.toml` ([Configuration](Configuration#configtoml)) names the weekdays that account is home, in local time, and those days are claimed against every account: a plain `preferred` elsewhere stands down on them and holds the rest. Only chain members that could actually serve are home at all: a list on an account that is off the chain, disabled, auth-broken, or carrying a rejected api key is inert, so it never leaves a day with nobody home, and a plain `preferred` on such an account is inert too rather than marking a homecoming the walk cannot make. One line on the weekend account is the whole weekday / weekend split, and the rollover needs no restart. The list reaches the claude chain only — the codex chain has no home account, so `preferred_days` does nothing there.
 

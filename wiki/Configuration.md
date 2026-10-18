@@ -27,9 +27,9 @@ Five providers get typed usage panels:
 | Provider | Base URL | Shows |
 |----------|----------|-------|
 | DeepSeek | `https://api.deepseek.com` | balance rows per currency: api balance, granted, topped up |
-| Z.ai | `https://api.z.ai` | percentage bars per limit window (5h / 7d / 30d), per-tool rows, plan level, 7-day per-model token totals |
+| Z.ai | `https://api.z.ai` | percentage bars per limit window (5h / 7d) plus an `mcp tools` bar (the MCP web tools' monthly quota), per-tool rows, plan level, 7-day per-model token totals |
 | OpenRouter | `https://openrouter.ai` | wallet rows from the credits endpoint: api balance (remaining credits, red when overdrawn), used, purchased; then today / this week / this month usage, per-key cap rows when set, free-tier flag |
-| Alibaba Model Studio | the Qwen preset endpoint below and the four Model Studio hosts (`token-plan.ap-southeast-1.maas.aliyuncs.com`, `token-plan.cn-beijing.maas.aliyuncs.com`, `coding-intl.dashscope.aliyuncs.com`, `coding.dashscope.aliyuncs.com`) | a 30d bar carrying your tier's monthly allowance, a 5h bar when the API reports one, plan tier, subscription status and days left |
+| Alibaba Model Studio | the Qwen preset endpoint below and the four Model Studio hosts (`token-plan.ap-southeast-1.maas.aliyuncs.com`, `token-plan.cn-beijing.maas.aliyuncs.com`, `coding-intl.dashscope.aliyuncs.com`, `coding.dashscope.aliyuncs.com`) | a 30d bar carrying your tier's monthly allowance, gated at the weekly line, a 5h bar when the API reports one, plan tier, subscription status and days left |
 | MiniMax | `https://api.minimax.io` | Token Plan bars for the 5h interval and the 7d window, plus a remaining row per plan bucket. The bars follow `general`, the bucket Claude Code bills against — or the lone bucket when the account has exactly one; with more than one bucket and no `general`, no bars are drawn. `video` and any other bucket ride as rows only. The mainland-China endpoint is not covered — it is a separate account on a different host, so it falls to the best-effort scan below |
 
 Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage, fraction-left window, or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable is rescanned at most once every five minutes (or once per refresh interval, whichever is longer), and <kbd>r</kbd> forces a rescan immediately. A dead api key stops polling the same way, on any endpoint: the provider rejected it — a 401 on most endpoints, an in-band code inside an HTTP 200 on MiniMax — so the Usage tab reads `api key rejected, re-enter it on the setup tab` (a `[ key rejected ]` chip beside cached numbers instead) and `clauth list` marks the account `(key rejected)`.
@@ -150,11 +150,11 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `auto_start_queue` | bool | `false` | interleave the `auto_start` ping so windows open `5h / N` apart |
 | `preemptive_rotation` | bool | `true` | rotate OAuth ahead of expiry; `false` waits for a rejection |
 | `preserve_non_login_keys` | bool | `true` | keep what Claude Code stores beside each account's login (a `/design-login`) with that account across switches and relinks, and carry MCP-server logins into a setup token's sidecar too ([Security](Security#design-logins-and-other-keys-beside-the-login)); `false` is the behavior before the key existed. An unreadable profiles.toml counts as `true` |
-| `weekly_switch_threshold` | float | `98.0` | chain-wide 7d exhaustion line, 50-100; the codex chain has its own copy of this key in `codex-profiles.toml` ([below](Configuration#codex-profilestoml)) |
+| `weekly_switch_threshold` | float | `98.0` | chain-wide 7d exhaustion line (a monthly-only account's 30d quota gates on it instead), 50-100; the codex chain has its own copy of this key in `codex-profiles.toml` ([below](Configuration#codex-profilestoml)) |
 | `burn_aware_switching` | bool | `false` | project usage forward instead of comparing to the threshold |
 | `burn_switch_floor_pct` | float | `98.0` | earliest point burn-aware may switch, 90-100 |
 | `burn_horizon_cap_ms` | int | `60000` | how far ahead burn-aware projects |
-| `walk_order` | string | `chain` | order each accept pass by chain position, the soonest-resetting 7d window or the least-used 7d window: `chain`, `soonest-weekly-reset` or `most-weekly-headroom` |
+| `walk_order` | string | `chain` | order each accept pass by chain position, the soonest-resetting 7d window or the least-used 7d window (a monthly-only account: its 30d quota): `chain`, `soonest-weekly-reset` or `most-weekly-headroom` |
 | `bell_command` | string | none | the program the daemon runs once each time an account's 5h usage reaches its `bell_threshold` ([below](Configuration#configtoml)), with `%s` standing for the alert's text (`alert: work at 95%`). Split by shell quoting rules and run without a shell: `notify-send 'clauth' %s`, or `sh -c 'logger "$1"' sh %s` when you want a shell (the text stays one argument). A Windows path goes in single quotes (`'C:\tools\notify.exe' %s`). An unbalanced quote, a trailing backslash or an empty value is logged and runs nothing. Hand-edited only; unset means no headless alert |
 | `wrap_off` | bool | `false` | switch off all accounts once the chain is out of quota |
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
@@ -206,7 +206,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `auto_start` | bool | `false` | the 1-token window-opening ping (alias `kick_timer`) |
 | `disabled` | bool | `false` | hide from auto-switch, polling, and the status feed |
 | `fallback_threshold` | float | `95.0` | 5h utilization % that switches away from this account |
-| `weekly_threshold` | float | chain value | per-account override of the 7d line, 50-100 |
+| `weekly_threshold` | float | chain value | per-account override of the 7d line (a monthly-only account's 30d quota gates on it instead), 50-100 |
 | `check_weekly` | bool | `true` | count the aggregate weekly window against this account |
 | `check_scoped` | bool | `true` | count per-model weekly windows against this account |
 | `last_resort` | bool | `false` | the chain's parking spot |

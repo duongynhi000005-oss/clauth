@@ -6,7 +6,7 @@
 
 | Tab | Holds | You can |
 |-----|-------|---------|
-| **Overview** | account table, live 5h / 7d bars, chain position, selectable codex and pool accounts | switch or reorder Claude Code accounts, browse codex and pool accounts, refresh or remove a pool account, pick which harness shows |
+| **Overview** | account table, live 5h / long-window bars (7d, or Alibaba's monthly quota), chain position, selectable codex and pool accounts | switch or reorder Claude Code accounts, browse codex and pool accounts, refresh or remove a pool account, pick which harness shows |
 | **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend, peak-rate state | refresh one account, toggle estimates and the pace marker, edit the account's note |
 | **Tokens** | global Claude Code token stats and API-equivalent cost | drill into models, move between dashboard cards, change the period lens, count cache tokens |
 | **Setup** | per-account endpoint, key, env, model routing, auto-start, 5h alert | edit any of it, log in, log out, disable, delete |
@@ -149,7 +149,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `auto-start queue` | space `auto_start` accounts' 5h window opens `5h / N` apart | off |
 | `rotation` | `lazy`, `preemptive` | `preemptive` |
 | `auto-update` | checks for updates at launch, unless `CLAUTH_NO_UPDATE=1` | on |
-| `weekly limit` | chain-wide 7d exhaustion line, 50-100% | `98%` |
+| `weekly limit` | chain-wide 7d exhaustion line (a monthly-only account's 30d quota gates on it instead), 50-100% | `98%` |
 | `switch mode` | `static`, `burn-aware` | `static` |
 | `burn floor` | earliest projected-switch point: 97 / 98 / 99 / 100% | `98%` |
 | `burn horizon` | how far ahead burn-aware projects | `60s` |
