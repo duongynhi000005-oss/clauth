@@ -386,53 +386,101 @@ fn a_manifest_reads_back_typed() {
     );
 }
 
-/// A `sleep 60` the stub left running, its pid in `path`: killed when the
-/// test unwinds while that pid still names a `sleep` (the stub `exec`s it, so
-/// the recorded pid is the sleep's own; a pid recycled to anything but a
-/// `sleep` is left alone). Reads `path` at drop, so a guard armed before the
-/// stub ran still holds; best-effort, never asserts.
+/// The guard signals a pid that still carries the start time its stub
+/// recorded, through the real recorder shared with the four stub bodies, and
+/// it signals with SIGKILL. The recorder is driven here the way the stubs
+/// drive it — `record_start` then `exec sleep 60` — so the recorded value is
+/// the stub's own, never a parse the test computed.
 #[cfg(unix)]
-struct SleepGuard(std::path::PathBuf);
+#[test]
+fn the_sleep_guard_kills_a_pid_that_still_carries_its_start_time() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pid_file = dir.path().join("pid");
+    let mut start_name = pid_file.as_os_str().to_os_string();
+    start_name.push(".start");
+    let start_file = std::path::PathBuf::from(start_name);
+    let mut owned = crate::testutil::Owned(
+        std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "{}\necho $$ > '{}'; record_start $$ '{}'; exec sleep 60",
+                    crate::testutil::RECORD_START_SH,
+                    pid_file.display(),
+                    start_file.display(),
+                ),
+            ])
+            .spawn()
+            .expect("spawn a recorder stub"),
+    );
 
-#[cfg(unix)]
-impl Drop for SleepGuard {
-    fn drop(&mut self) {
-        let Some(pid) = fs::read_to_string(&self.0)
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-        else {
-            return;
-        };
-        if !names_sleep(pid) {
-            return;
+    // The recorder writes the pid then the start time asynchronously; wait for
+    // the start file (written second) before dropping the guard, so the guard
+    // reads a complete record instead of an empty one.
+    let recorder_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if std::fs::read_to_string(&start_file).is_ok_and(|text| !text.trim().is_empty()) {
+            break;
         }
-        let _ = std::process::Command::new("kill")
-            .args(["-s", "KILL", &pid.to_string()])
-            .status();
+        assert!(
+            std::time::Instant::now() < recorder_deadline,
+            "the recorder never wrote the start time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    drop(crate::testutil::SleepGuard(pid_file));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = owned.0.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the guard did not kill the sleep it recorded"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(status.signal(), Some(9), "the guard SIGKILLed the sleep");
 }
 
-/// Whether `pid`'s command line still names `sleep` as its first whole word:
-/// the pid may have been recycled, so it is only the stub's sleep while it
-/// names `sleep`.
+/// The guard never signals a pid whose start time no longer matches the
+/// stub's record: a recycled pid carries a different start time and is left
+/// alone. The test proves the guard sent nothing by sending SIGTERM itself
+/// and reading the exit signal — a guard SIGKILL would read 9, the SIGTERM
+/// reads 15 — instead of waiting out a clock.
 #[cfg(unix)]
-fn names_sleep(pid: u32) -> bool {
-    let Ok(output) = std::process::Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-    else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .next()
-        == Some("sleep")
+#[test]
+fn the_sleep_guard_skips_a_pid_whose_start_time_moved() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut owned = crate::testutil::Owned(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn a sleep"),
+    );
+    let pid = owned.0.id();
+    let pid_file = dir.path().join("pid");
+    fs::write(&pid_file, format!("{pid}\n")).expect("pid");
+    let mut start_name = pid_file.as_os_str().to_os_string();
+    start_name.push(".start");
+    // Zero is no live pid's start time: the guard must not signal it.
+    fs::write(std::path::PathBuf::from(start_name), "0\n").expect("a wrong start time");
+
+    drop(crate::testutil::SleepGuard(pid_file));
+    let sent = std::process::Command::new("kill")
+        .args(["-s", "TERM", &pid.to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(sent.success(), "SIGTERM sent");
+    let status = owned.0.wait().expect("reap");
+    assert_eq!(
+        status.signal(),
+        Some(15),
+        "the guard sent nothing; the exit signal is the SIGTERM, not the guard's SIGKILL"
+    );
 }
 
 /// A `manifest` that outruns its bound is killed and reaped, never left
@@ -444,12 +492,18 @@ fn a_manifest_that_outruns_its_bound_is_stopped_and_refused() {
     let home = HomeSandbox::new();
     let dir = home.home().join("bin");
     fs::create_dir_all(&dir).expect("dir");
+    let pid_file = dir.join("pid");
     let binary = crate::testutil::write_shim(
         &dir,
         "clauth-zcode-proxy",
-        &format!("echo $$ > '{}'; exec sleep 60", dir.join("pid").display()),
+        &format!(
+            "{}\necho $$ > '{}'; record_start $$ '{}.start'; exec sleep 60",
+            crate::testutil::RECORD_START_SH,
+            pid_file.display(),
+            pid_file.display()
+        ),
     );
-    let _sleep = SleepGuard(dir.join("pid"));
+    let _sleep = crate::testutil::SleepGuard(pid_file);
     let started = std::time::Instant::now();
 
     let err = read_manifest_within(&service("zcode"), &binary, Duration::from_secs(2))
@@ -1251,9 +1305,9 @@ fn every_admin_token_refusal_names_its_fix() {
     }
 }
 
-/// A non-UTF-8 token file gets the one `read_admin_token` refusal from both
-/// `enable` and `check <service>`, naming the fix, so one input never splits
-/// into two different refusals.
+/// A non-UTF-8 token file gets the one `read_admin_token_optional` refusal
+/// from both `enable` and `check <service>`, naming the fix, so one input
+/// never splits into two different refusals.
 #[cfg(unix)]
 #[test]
 fn a_non_utf8_token_file_is_refused_the_same_by_enable_and_check() {
@@ -1388,8 +1442,9 @@ fn enable_beside_two_refused_rows_names_the_first_in_name_order() {
 }
 
 /// A `proxies.toml` that is not UTF-8 refuses the read by name — it never
-/// parses to nothing — and `enable` of another service leaves its bytes
-/// untouched: the unreadable registry is never rewritten.
+/// parses to nothing — and `enable` of another service refuses with the same
+/// `failed to read`, before any manifest spawn, leaving its bytes untouched:
+/// the unreadable registry is never rewritten.
 #[test]
 fn a_non_utf8_registry_refuses_the_read_and_enable_leaves_the_bytes() {
     let _home = HomeSandbox::new();
@@ -1398,18 +1453,49 @@ fn a_non_utf8_registry_refuses_the_read_and_enable_leaves_the_bytes() {
     fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     fs::write(&path, bytes).expect("write a non-UTF-8 registry");
 
-    let err = Registry::load().unwrap_err();
-    assert!(
-        format!("{err:#}").starts_with(&format!("failed to read {}", path.display())),
-        "the read refusal names the read, got {err:#}"
+    let want = format!(
+        "failed to read {}: {}",
+        path.display(),
+        fs::read_to_string(&path).expect_err("non-UTF-8 does not read")
     );
-
-    enable("qwen", None, None).expect_err("an unreadable registry refuses any write");
+    assert_eq!(
+        format!("{:#}", Registry::load().unwrap_err()),
+        want,
+        "the read refusal names the read and its cause"
+    );
+    let err = enable("qwen", None, None).expect_err("an unreadable registry refuses any write");
+    assert_eq!(
+        format!("{err:#}"),
+        want,
+        "enable refuses with the same failed-to-read"
+    );
     assert_eq!(
         fs::read(&path).expect("read"),
         bytes,
         "the bytes are untouched"
     );
+
+    // Unix only: pin the order too — `enable` reads the registry before it
+    // spawns any manifest, so a stub on PATH is never run. The stub is a
+    // `#!/bin/sh` shim (`write_shim` is unix-only).
+    #[cfg(unix)]
+    {
+        let bin = _home.home().join("bin");
+        let ran = bin.join("manifest-ran");
+        fs::create_dir_all(&bin).expect("bin");
+        crate::testutil::write_shim(
+            &bin,
+            "clauth-qwen-proxy",
+            &format!(
+                "if [ \"$1\" = manifest ]; then touch '{}'; printf '%s\\n' '{}'; exit 0; fi\nexit 2",
+                ran.display(),
+                ZCODE_MANIFEST.replace("\"zcode\"", "\"qwen\"")
+            ),
+        );
+        enable("qwen", None, Some(bin.as_os_str()))
+            .expect_err("an unreadable registry refuses any write");
+        assert!(!ran.exists(), "no manifest ran for an unreadable registry");
+    }
 }
 
 /// A row carrying several unknown keys names every one, in key order; a

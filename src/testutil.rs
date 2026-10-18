@@ -2380,6 +2380,81 @@ pub(crate) fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// The POSIX-sh `record_start <pid> <file>` function a stub body splices in
+/// to record a pid's start time in exactly the spelling
+/// [`crate::daemon::gateway::process_start_time`] returns for the same pid,
+/// so a [`SleepGuard`]'s drop-time comparison agrees with it on every unix. A
+/// failed record leaves the file empty and never touches the stub's stderr (a
+/// check reads that stderr to its bound), so a missing `/proc` or `ps` reds
+/// nothing.
+#[cfg(all(test, unix, target_os = "linux"))]
+pub(crate) const RECORD_START_SH: &str = r#"record_start() { p=$1; f=$2; sed 's/.*) //' "/proc/$p/stat" 2>/dev/null | awk '{print $20}' > "$f" 2>/dev/null; }"#;
+
+/// macOS and the BSDs: `ps -o lstart=` under `LC_ALL=C TZ=UTC0`, trimmed the
+/// way [`crate::daemon::gateway::process_start_time`] trims its `lstart`.
+#[cfg(all(test, unix, not(target_os = "linux")))]
+pub(crate) const RECORD_START_SH: &str = r#"record_start() { p=$1; f=$2; v=$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$p" 2>/dev/null); v=${v#${v%%[![:space:]]*}}; v=${v%${v##*[![:space:]]}}; printf '%s' "$v" > "$f" 2>/dev/null; }"#;
+
+/// A `sleep` a stub left running, its pid in `path` and its start time in the
+/// sibling file named by appending `.start` to `path` (the stub records both
+/// with [`RECORD_START_SH`]: a stub that `exec`s the sleep shares its pid and
+/// `exec` keeps the start time, and one that backgrounds it writes the sleep's
+/// own). Killed when the test unwinds while that pid is still live AND its
+/// [`crate::daemon::gateway::process_start_time`] still equals the recorded
+/// start, so a pid recycled to any other process — a `sleep` included — is
+/// never signalled. Reads the files at drop, so a guard armed before the stub
+/// ran still holds; best-effort, never asserts.
+#[cfg(all(test, unix))]
+pub(crate) struct SleepGuard(pub PathBuf);
+
+#[cfg(all(test, unix))]
+impl Drop for SleepGuard {
+    fn drop(&mut self) {
+        let Some(pid) = std::fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        else {
+            return;
+        };
+        // A missing or empty record reads as "no verified pid to signal":
+        // skip, never fail-loud — the guard is best-effort and a `Drop` that
+        // asserts aborts the whole test binary.
+        let recorded = match std::fs::read_to_string(start_file(&self.0)) {
+            Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
+            _ => return,
+        };
+        if crate::daemon::gateway::process_start_time(pid).as_deref() != Some(recorded.as_str()) {
+            return;
+        }
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", &pid.to_string()])
+            .status();
+    }
+}
+
+/// `path` with `.start` appended to its file name — never replacing an
+/// extension — the [`SleepGuard`]'s recorded-start sibling.
+#[cfg(all(test, unix))]
+fn start_file(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".start");
+    PathBuf::from(name)
+}
+
+/// A process the test owns outright, killed and reaped when the test unwinds,
+/// so a red before its own kill leaks nothing. Never asserts (`Drop` runs
+/// while a test unwinds; a panic there aborts the whole binary).
+#[cfg(all(test, unix))]
+pub(crate) struct Owned(pub std::process::Child);
+
+#[cfg(all(test, unix))]
+impl Drop for Owned {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// A `git` shim answering `ls-remote --tags` with `$TAGS_OUTPUT` (the real
 /// git's output shape) and recording every argv into `git.log`.
 #[cfg(unix)]

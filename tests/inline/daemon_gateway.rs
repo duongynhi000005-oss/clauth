@@ -588,10 +588,11 @@ impl Rig {
     fn arm_check_stub(&self) {
         let script = format!(
             "#!/bin/sh\n\
+             {record}\n\
              d='{d}'\n\
              if [ \"$1\" = \"check\" ]; then\n\
              \x20 echo check >> \"$d/checks\"\n\
-             \x20 if [ -e \"$d/check-slow\" ]; then echo $$ > \"$d/check-slow-pid\"; exec sleep 60; fi\n\
+             \x20 if [ -e \"$d/check-slow\" ]; then echo $$ > \"$d/check-slow-pid\"; record_start $$ \"$d/check-slow-pid.start\"; exec sleep 60; fi\n\
              \x20 if [ -e \"$d/check-fail\" ]; then echo 'config error: boom' >&2; exit 1; fi\n\
              \x20 exit 0\n\
              fi\n\
@@ -618,6 +619,7 @@ impl Rig {
              \x20 wait $!\n\
              \x20 i=$((i + 1))\n\
              done\n",
+            record = crate::testutil::RECORD_START_SH,
             d = self.dir.display(),
         );
         fs::write(&self.binary, script).expect("arm the check stub");
@@ -657,18 +659,6 @@ impl std::ops::DerefMut for Supervised {
 impl Drop for Supervised {
     fn drop(&mut self) {
         self.0.kill_for_test();
-    }
-}
-
-/// A process the test owns outright, killed and reaped at the end.
-#[cfg(unix)]
-struct Owned(Child);
-
-#[cfg(unix)]
-impl Drop for Owned {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 
@@ -1703,6 +1693,7 @@ fn a_check_that_times_out_keeps_the_child() {
     let rig = Rig::new("0.49.1");
     rig.arm_check_stub();
     rig.touch("check-slow");
+    let _slow_guard = crate::testutil::SleepGuard(rig.dir.join("check-slow-pid"));
     let mut supervisor = rig.supervisor();
     let t0 = t0();
     supervisor.step(t0);
@@ -1899,6 +1890,7 @@ fn a_check_cancelled_before_it_starts_is_cancelled_not_a_timeout_and_never_resta
     let rig = Rig::new("0.49.1");
     rig.arm_check_stub();
     rig.touch("check-slow");
+    let _slow_guard = crate::testutil::SleepGuard(rig.dir.join("check-slow-pid"));
 
     // By value: a cancel already set when the check starts yields the
     // cancellation outcome, never `CheckTimedOut`.
@@ -3219,7 +3211,7 @@ fn an_orphan_matching_its_recorded_start_is_stopped_before_a_fresh_spawn() {
     before.step(t0);
     rig.server.wait_serving(true);
     // The daemon dies hard: its gateway and marker stay behind.
-    let mut orphan = Owned(before.abandon().expect("a running gateway"));
+    let mut orphan = crate::testutil::Owned(before.abandon().expect("a running gateway"));
     let orphan_pid = orphan.0.id();
 
     let mut after = rig.supervisor();
@@ -3253,7 +3245,7 @@ fn an_orphan_matching_its_recorded_start_is_stopped_before_a_fresh_spawn() {
 #[test]
 fn a_recorded_pid_whose_start_differs_is_never_signalled() {
     let rig = Rig::new("0.49.1");
-    let mut stranger = Owned(
+    let mut stranger = crate::testutil::Owned(
         Command::new(&rig.binary)
             .args(["run", "--config", "stranger.toml"])
             .stdout(std::process::Stdio::null())
@@ -3319,7 +3311,7 @@ fn a_stop_left_running_by_an_exiting_daemon_is_finished_at_its_recorded_deadline
     });
     let recorded = read_marker().expect("read").expect("a marker");
     let deadline_ms = recorded.stop_deadline_ms.expect("the stop's deadline");
-    let mut orphan = Owned(before.abandon().expect("still running"));
+    let mut orphan = crate::testutil::Owned(before.abandon().expect("still running"));
 
     let mut after = rig.supervisor();
     let early = Tick {
@@ -3949,7 +3941,7 @@ fn the_stub_teardown_never_signals_a_pid_that_no_longer_names_the_stub() {
     );
 
     // A process of this test's own making that is not the stub: a sleep.
-    let mut sleeper = Owned(
+    let mut sleeper = crate::testutil::Owned(
         Command::new("sleep")
             .arg("30")
             .spawn()
@@ -3963,7 +3955,7 @@ fn the_stub_teardown_never_signals_a_pid_that_no_longer_names_the_stub() {
     // One whose command line holds the stub's path inside another word: the
     // stub is an argv word, never a substring of the line.
     let lookalike_arg0 = format!("{}.old", rig.binary.display());
-    let mut lookalike = Owned(
+    let mut lookalike = crate::testutil::Owned(
         Command::new("sleep")
             .arg0(&lookalike_arg0)
             .arg("30")

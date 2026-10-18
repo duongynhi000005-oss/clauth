@@ -181,6 +181,17 @@ pub(crate) fn read_admin_token_optional(path: &Path) -> Result<Option<Secret>> {
             ));
         }
     };
+    admin_token_from_text(path, text)
+}
+
+/// The post-read leg of [`read_admin_token_optional`]: validate a token file
+/// whose text was already read, routing a validation error through
+/// [`refuse_admin_token_validation`] (never the read refusal). Split out so a
+/// test can pin that route over an input where the two refusals differ — as a
+/// non-root process a file that is both owner-unreadable and others-readable
+/// (`0o044`) never reaches this leg through the reader, but the seam is called
+/// with its text directly.
+fn admin_token_from_text(path: &Path, text: String) -> Result<Option<Secret>> {
     let secret = match validate_secret_text(path, "admin token", text) {
         Ok(secret) => secret,
         Err(e) => return Err(refuse_admin_token_validation(path, e)),

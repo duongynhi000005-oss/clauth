@@ -1509,6 +1509,30 @@ fn the_admin_token_refusal_mapping_decides_each_order_once() {
     );
 }
 
+/// The validation branch of the admin-token rule routes through the
+/// validation refusal, never the read refusal. The two refusals differ only
+/// on a file that is both owner-unreadable and others-readable (`0o044`): the
+/// validation error already names `chmod 600` (the others-readable rule runs
+/// first inside `validate_secret_text`), so the read refusal would append the
+/// advice a second time. A non-root process cannot read a `0o044` file, so
+/// the test drives the post-read seam with the text it wrote, over the same
+/// path the mode checks read.
+#[cfg(unix)]
+#[test]
+fn a_whitespace_admin_token_open_to_others_names_chmod_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = secret_file(dir.path(), "t", "adm has a space\n", 0o044);
+
+    let err = admin_token_from_text(&path, "adm has a space\n".to_string()).unwrap_err();
+
+    assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
+    assert_eq!(
+        err.to_string(),
+        format!("admin token file {path:?} is accessible by other users; run `chmod 600` on it"),
+        "one chmod clause: the validation refusal, never the read refusal's doubled advice"
+    );
+}
+
 /// A token path that is a symlink loop fails the read before any mode
 /// question: the refusal is the bare read error, never `chmod 600`, which
 /// cannot fix a path that does not resolve.
@@ -1522,14 +1546,14 @@ fn a_symlink_loop_token_names_the_bare_read_refusal_not_chmod() {
     let err = read_admin_token_optional(&path).unwrap_err();
 
     assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
-    assert!(
-        err.to_string()
-            .starts_with(&format!("cannot read admin token file {path:?}")),
-        "the refusal is the bare read error: {err}"
-    );
-    assert!(
-        !err.to_string().contains("chmod 600"),
-        "a path that does not resolve cannot be fixed by chmod: {err}"
+    let read_err = std::fs::read_to_string(&path).expect_err("the loop does not read");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "cannot read admin token file {path:?} ({})",
+            read_err.kind()
+        ),
+        "the whole refusal is the bare read error, never `chmod 600`"
     );
 }
 

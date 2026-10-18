@@ -386,18 +386,6 @@ fn a_daemon_stop_sends_each_proxy_exactly_one_sigterm() {
     assert_eq!(stub::terms(&rig.dir), [pid], "exactly one SIGTERM");
 }
 
-/// A process the test owns outright, killed and reaped at the end.
-#[cfg(unix)]
-struct Owned(std::process::Child);
-
-#[cfg(unix)]
-impl Drop for Owned {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 #[cfg(unix)]
 #[test]
 fn a_proxy_still_draining_is_finished_by_the_next_daemon_at_its_deadline() {
@@ -415,7 +403,7 @@ fn a_proxy_still_draining_is_finished_by_the_next_daemon_at_its_deadline() {
     });
     let recorded = read_marker_at_for(&rig).expect("a marker");
     let deadline_ms = recorded.stop_deadline_ms.expect("the stop's deadline");
-    let mut orphan = Owned(before.abandon().expect("still running"));
+    let mut orphan = crate::testutil::Owned(before.abandon().expect("still running"));
 
     let mut after = rig.supervisor();
     after.step(Tick {
@@ -783,7 +771,7 @@ fn an_unreadable_registry_is_logged_once_per_distinct_error() {
 /// (pid + start time, no stop asked for), under a `state` row (enabled,
 /// disabled or removed).
 #[cfg(unix)]
-fn orphan_rig(state: &str) -> (HomeSandbox, Owned) {
+fn orphan_rig(state: &str) -> (HomeSandbox, crate::testutil::Owned) {
     let home = HomeSandbox::new();
     let dir = home.home().join("stub");
     stub::write_proxy_stub(&dir, "zcode");
@@ -799,7 +787,7 @@ fn orphan_rig(state: &str) -> (HomeSandbox, Owned) {
         }
         other => panic!("{other}"),
     }
-    let orphan = Owned(
+    let orphan = crate::testutil::Owned(
         std::process::Command::new("sleep")
             .arg("60")
             .spawn()
@@ -1856,7 +1844,7 @@ fn stop_left_behind_proxies_stops_a_marker_only_orphan() {
     let port = stub::free_port();
     crate::proxy::enable("zcode", Some(port), Some(dir.as_os_str())).expect("enable");
     let service = Service::parse("zcode").expect("a service");
-    let mut orphan = Owned(
+    let mut orphan = crate::testutil::Owned(
         std::process::Command::new("sleep")
             .arg("60")
             .spawn()
