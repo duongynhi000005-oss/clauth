@@ -13,6 +13,8 @@
 //! two schedulers from double-firing.
 
 pub(crate) mod api;
+#[cfg(unix)]
+pub(crate) mod bridge;
 pub(crate) mod gateway;
 pub(crate) mod log_rotate;
 mod probe;

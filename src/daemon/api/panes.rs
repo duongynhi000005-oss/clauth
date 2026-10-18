@@ -57,6 +57,21 @@ pub(crate) enum HerdrProbeOut {
 pub(crate) type PaneProbe =
     Box<dyn Fn(&[&str], std::time::Duration) -> HerdrProbeOut + Send + Sync>;
 
+/// One bounded `herdr pane list` call through the seam, reduced to the panes
+/// it listed, or the fixed reason herdr was absent. `panes()` needs the reason
+/// for its `present: false` body, and `session_pane`/`herdr_session_ids` map
+/// any absence to no pane, so the probe-and-parse ladder lives once (B#6).
+pub(crate) fn listed_panes(ctx: &ApiContext) -> Result<Vec<HerdrPane>, &'static str> {
+    match (ctx.herdr_probe)(&["pane", "list"], crate::herdr::PROBE_TIMEOUT) {
+        HerdrProbeOut::NotInstalled => Err(NOT_INSTALLED),
+        HerdrProbeOut::Ran(None) => Err(NO_SERVER),
+        HerdrProbeOut::Ran(Some(out)) if !out.success => Err(NO_SERVER),
+        HerdrProbeOut::Ran(Some(out)) => {
+            crate::herdr::parse_pane_list(&out.stdout).ok_or(NO_SERVER)
+        }
+    }
+}
+
 /// The real probe: [`crate::herdr::resolved_bin`] + the daemon-scoped
 /// [`crate::herdr::daemon_bounded_output_deadline`] (session env stripped) at
 /// the call's own deadline.
@@ -214,22 +229,9 @@ pub(crate) enum SessionKind {
 )]
 pub(crate) fn panes(ctx: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
     let rows = crate::live_sessions::list();
-    let herdr_panes = match (ctx.herdr_probe)(&["pane", "list"], crate::herdr::PROBE_TIMEOUT) {
-        HerdrProbeOut::NotInstalled => {
-            return Response::serialize(200, &absent_body(NOT_INSTALLED));
-        }
-        HerdrProbeOut::Ran(None) => {
-            return Response::serialize(200, &absent_body(NO_SERVER));
-        }
-        HerdrProbeOut::Ran(Some(out)) => {
-            if !out.success {
-                return Response::serialize(200, &absent_body(NO_SERVER));
-            }
-            match crate::herdr::parse_pane_list(&out.stdout) {
-                None => return Response::serialize(200, &absent_body(NO_SERVER)),
-                Some(panes) => panes,
-            }
-        }
+    let herdr_panes = match listed_panes(ctx) {
+        Ok(panes) => panes,
+        Err(reason) => return Response::serialize(200, &absent_body(reason)),
     };
     let rows = newest_per_pid(&rows);
     let mut panes = Vec::with_capacity(herdr_panes.len());

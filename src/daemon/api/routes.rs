@@ -80,6 +80,9 @@ pub(crate) struct Route {
 /// The one path-parameter spelling a row may carry, utoipa's own, so the
 /// route table and the document compare by the same string.
 const ID_SEGMENT: &str = "{id}";
+/// The second parameter, on the ask route: bound like [`ID_SEGMENT`], through
+/// the same decoder, as the second element of the bound list.
+const ASK_SEGMENT: &str = "{ask}";
 
 /// A bound path segment as the client meant it: `%XX` pairs decoded to their
 /// bytes, once, at the binding. The PWA's generator runtime (`openapi-fetch`)
@@ -93,20 +96,19 @@ pub(crate) fn decode_segment(segment: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Whether `path` is an instance of `template`: the same segments, with an
-/// [`ID_SEGMENT`] matching any non-empty request segment that
-/// [`decode_segment`] accepts. `Some(bound)` on a match, the bound id `None`
-/// for a row that names no parameter; the terminal bridge binds its pane id
-/// through the same decoder.
-fn match_template(template: &str, path: &str) -> Option<Option<String>> {
+/// Whether `path` is an instance of `template`: the same segments, with a
+/// `{id}` or `{ask}` segment matching any non-empty request segment that
+/// [`decode_segment`] accepts. The bound segments return in template order,
+/// decoded; the terminal bridge binds its pane id through the same decoder.
+fn match_template(template: &str, path: &str) -> Option<Vec<String>> {
     let mut want = template.split('/');
     let mut have = path.split('/');
-    let mut bound = None;
+    let mut bound = Vec::new();
     loop {
         match (want.next(), have.next()) {
             (None, None) => return Some(bound),
-            (Some(ID_SEGMENT), Some(segment)) if !segment.is_empty() => {
-                bound = Some(decode_segment(segment)?);
+            (Some(ID_SEGMENT | ASK_SEGMENT), Some(segment)) if !segment.is_empty() => {
+                bound.push(decode_segment(segment)?);
             }
             (Some(expected), Some(segment)) if expected == segment => {}
             _ => return None,
@@ -254,6 +256,24 @@ pub(crate) static ROUTES: &[Route] = &[
         handler: agent::keys,
     },
     Route {
+        method: "POST",
+        path: "/sessions/{id}/prompt",
+        access: Access::Control,
+        handler: agent::session_prompt,
+    },
+    Route {
+        method: "POST",
+        path: "/sessions/{id}/interrupt",
+        access: Access::Control,
+        handler: agent::session_interrupt,
+    },
+    Route {
+        method: "POST",
+        path: "/sessions/{id}/asks/{ask}",
+        access: Access::Control,
+        handler: agent::session_answer,
+    },
+    Route {
         method: "GET",
         path: "/gateway",
         access: Access::View,
@@ -319,6 +339,9 @@ pub(crate) struct Caller<'a> {
     /// The request segment the row's [`ID_SEGMENT`] bound — the pane or
     /// session the request names; `None` on a row without one.
     pub(crate) target: Option<&'a str>,
+    /// The request segment the row's [`ASK_SEGMENT`] bound — the ask the
+    /// request answers; `None` on a row without one.
+    pub(crate) ask: Option<&'a str>,
 }
 
 impl Caller<'_> {
@@ -371,11 +394,19 @@ pub(crate) struct ApiContext {
     /// test spawns a fixture script, and the default refuses so no test ever
     /// runs a real herdr.
     pub(crate) terminal_spawn: super::terminal::TerminalSpawn,
+    /// The mod bridge hub, when a `--listen` daemon bound the socket and built
+    /// this context with it. `None` in tests without a bridge and on platforms
+    /// with no bridge (Windows).
+    #[cfg(unix)]
+    pub(crate) bridge: Option<Arc<crate::daemon::bridge::Hub>>,
 }
 
 impl ApiContext {
     /// The daemon's constructor: both herdr seams are passed explicitly, the
-    /// pane probe for `GET /panes` and the socket resolver for `GET /events`.
+    /// pane probe for `GET /panes` and the socket resolver for `GET /events`,
+    /// and the mod bridge hub (unix) — `None` when the bind failed or a test
+    /// runs without one (SB-1).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: ConfigHandle,
         status_path: PathBuf,
@@ -384,6 +415,7 @@ impl ApiContext {
         herdr_probe: PaneProbe,
         herdr: HerdrSeam,
         terminal_spawn: super::terminal::TerminalSpawn,
+        #[cfg(unix)] bridge: Option<Arc<crate::daemon::bridge::Hub>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             config,
@@ -394,6 +426,8 @@ impl ApiContext {
             herdr_probe,
             herdr,
             terminal_spawn,
+            #[cfg(unix)]
+            bridge,
         })
     }
 
@@ -415,6 +449,29 @@ impl ApiContext {
             herdr_probe,
             Arc::new(|| None),
             super::terminal::unspawnable_terminal(),
+            #[cfg(unix)]
+            None,
+        )
+    }
+
+    /// The test constructor over a bridge hub: the bridge the tests drive and a
+    /// pane probe that answers nothing by default.
+    #[cfg(all(test, unix))]
+    pub(crate) fn for_tests_with_bridge(
+        config: ConfigHandle,
+        status_path: PathBuf,
+        herdr_probe: PaneProbe,
+        bridge: Arc<crate::daemon::bridge::Hub>,
+    ) -> Arc<Self> {
+        Self::new(
+            config,
+            status_path,
+            None,
+            None,
+            herdr_probe,
+            Arc::new(|| None),
+            super::terminal::unspawnable_terminal(),
+            Some(bridge),
         )
     }
 }
@@ -468,10 +525,10 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
             (route.method == req.method)
                 .then(|| match_template(route.path, path))
                 .flatten()
-                .map(|target| (route, target))
+                .map(|bound| (route, bound))
         })
     });
-    if let Some((route, target)) = &route
+    if let Some((route, bound)) = &route
         && route.access == Access::None
     {
         return Handled {
@@ -481,7 +538,8 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
                 &Caller {
                     peer,
                     device: None,
-                    target: target.as_deref(),
+                    target: bound.first().map(String::as_str),
+                    ask: bound.get(1).map(String::as_str),
                 },
             ),
             device: None,
@@ -521,14 +579,15 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
     }
 
     let response = match route {
-        Some((route, target)) => match authorize(&device.tier, route.access) {
+        Some((route, bound)) => match authorize(&device.tier, route.access) {
             Grant::Allowed => (route.handler)(
                 ctx,
                 req,
                 &Caller {
                     peer,
                     device: Some(&device),
-                    target: target.as_deref(),
+                    target: bound.first().map(String::as_str),
+                    ask: bound.get(1).map(String::as_str),
                 },
             ),
             Grant::NeedsControl => Response::refused(403, "control_required", CONTROL_REQUIRED),
@@ -1044,7 +1103,7 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 /// endpoint cannot ship undocumented.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, gateway::gateway, proxies::proxies, push::key, push::subscribe, push::unsubscribe),
+    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, agent::session_prompt, agent::session_interrupt, agent::session_answer, gateway::gateway, proxies::proxies, push::key, push::subscribe, push::unsubscribe),
     modifiers(&BearerScheme)
 )]
 struct ApiDoc;

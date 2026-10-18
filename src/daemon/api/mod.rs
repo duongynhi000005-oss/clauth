@@ -244,6 +244,29 @@ pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Pre
     Ok(Prepared { listen, tls_config })
 }
 
+/// Build the mod bridge and the API context together (unix): a bridge bind or
+/// spawn failure leaves `bridge` `None` and the daemon still serving (SB-1).
+/// Split from [`serve_prepared`] so a test drives the failure without a TLS
+/// identity.
+#[cfg(unix)]
+pub(crate) fn build_context(
+    config: ConfigHandle,
+    status_path: PathBuf,
+    live: super::LiveStores,
+    memory_stores: crate::usage::MemoryStores,
+) -> Arc<ApiContext> {
+    ApiContext::new(
+        config,
+        status_path,
+        Some(live),
+        Some(memory_stores),
+        panes::real_probe(),
+        events::production_herdr_resolver(),
+        terminal::real_terminal_spawn(),
+        crate::daemon::bridge::start(),
+    )
+}
+
 /// Bind the listener [`prepare`] set up, fold in the legacy token, and start
 /// serving on it.
 ///
@@ -270,15 +293,24 @@ pub(crate) fn serve_prepared(
         .with_context(|| format!("failed to bind the REST API to {listen}"))?;
     devices::import_legacy()?;
     devices::note_at_start();
-    let ctx = ApiContext::new(
-        config,
-        status_path,
-        Some(live),
-        Some(memory_stores),
-        panes::real_probe(),
-        events::production_herdr_resolver(),
-        terminal::real_terminal_spawn(),
-    );
+    let ctx = {
+        #[cfg(unix)]
+        {
+            build_context(config, status_path, live, memory_stores)
+        }
+        #[cfg(not(unix))]
+        {
+            ApiContext::new(
+                config,
+                status_path,
+                Some(live),
+                Some(memory_stores),
+                panes::real_probe(),
+                events::production_herdr_resolver(),
+                terminal::real_terminal_spawn(),
+            )
+        }
+    };
 
     let spawned = std::thread::Builder::new()
         .name("clauth-api-accept".into())

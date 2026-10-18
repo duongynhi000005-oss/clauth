@@ -55,6 +55,7 @@ mod proxy_check;
 mod proxy_list;
 mod push;
 mod runtime;
+mod session_record;
 mod sessions;
 mod sessions_cli;
 mod settings_sync;

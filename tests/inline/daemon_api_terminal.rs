@@ -76,6 +76,8 @@ fn ctx(script: &str) -> Arc<ApiContext> {
         }),
         Arc::new(|| None),
         spawn,
+        #[cfg(unix)]
+        None,
     )
 }
 
@@ -222,6 +224,8 @@ fn absent_herdr_answers_503() {
         Box::new(|_, _| HerdrProbeOut::NotInstalled),
         Arc::new(|| None),
         super::unspawnable_terminal(),
+        #[cfg(unix)]
+        None,
     );
     let resp = call(
         &ctx,
@@ -758,6 +762,8 @@ fn a_forged_device_name_cannot_write_audit_lines() {
         }),
         Arc::new(|| None),
         sh_spawn(&script),
+        #[cfg(unix)]
+        None,
     );
     let Some(served) = served(ctx) else { return };
     let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");

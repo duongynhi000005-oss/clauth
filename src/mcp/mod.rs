@@ -4487,29 +4487,10 @@ fn host_session(pid: u32) -> Option<String> {
     let sessions = crate::which::session_config_dir_or_global().map(|dir| dir.join("sessions"));
     Some(
         sessions
-            .and_then(|dir| session_record_id(&dir, pid))
+            .and_then(|dir| crate::session_record::session_record(&dir, pid))
+            .map(|record| record.session_id)
             .unwrap_or(started_under),
     )
-}
-
-/// The `sessionId` the Claude Code session record `<pid>.json` in `dir`
-/// carries, when that record names `pid` itself and a non-empty id.
-fn session_record_id(dir: &std::path::Path, pid: u32) -> Option<String> {
-    let path = dir.join(format!("{pid}.json"));
-    // Claude Code rewrites the record in place, so one read can land mid-write
-    // and the stamp is never re-taken: a second read decides.
-    let record = (0..2)
-        .find_map(|_| serde_json::from_slice::<SessionRecord>(&std::fs::read(&path).ok()?).ok())?;
-    (record.pid == pid && !record.session_id.is_empty()).then_some(record.session_id)
-}
-
-/// The fields of a Claude Code session record (`<config dir>/sessions/<pid>.json`)
-/// clauth reads.
-#[derive(serde::Deserialize)]
-struct SessionRecord {
-    #[serde(rename = "sessionId")]
-    session_id: String,
-    pid: u32,
 }
 
 /// The `claude` process hosting this server, resolved once ([`serve`] primes
@@ -4555,7 +4536,9 @@ fn session_record_pid(dir: &std::path::Path, session_id: &str) -> Option<u32> {
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| std::fs::read(e.path()).ok())
-        .filter_map(|bytes| serde_json::from_slice::<SessionRecord>(&bytes).ok())
+        .filter_map(|bytes| {
+            serde_json::from_slice::<crate::session_record::SessionRecord>(&bytes).ok()
+        })
         .filter(|r| r.session_id == session_id);
     let pid = matching.next()?.pid;
     matching.next().is_none().then_some(pid)

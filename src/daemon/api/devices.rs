@@ -321,6 +321,22 @@ pub(super) fn read_store() -> Result<Store> {
     Ok(store)
 }
 
+/// Whether a control-tier device is paired, read fresh: the flag the bridge's
+/// `remote`/`hold` answers and the mod's hold decision rides (SB-9, MB-1). An
+/// unreadable store reads as "no" — a poll answers `remote: false` rather than
+/// failing. The bridge is unix-only, so on Windows nothing reads it.
+#[cfg(unix)]
+pub(crate) fn has_control_device() -> bool {
+    read_store()
+        .map(|store| {
+            store
+                .devices
+                .iter()
+                .any(|device| device.tier == Tier::Control)
+        })
+        .unwrap_or(false)
+}
+
 /// Replace the store, and have it on disk before returning.
 ///
 /// Durable because two callers delete something right after: the pairing

@@ -495,6 +495,29 @@ fn session_marker_paths(
     Ok([marker(LinkMode::Real)?, marker(LinkMode::Fake)?])
 }
 
+/// The two runtime trees a live-sessions row's session could use as its
+/// `CLAUDE_CONFIG_DIR` — the [`LinkMode::Real`] per-session layout and the
+/// [`LinkMode::Fake`] fallback — derived from [`paired_dir_names`] so no other
+/// module rebuilds the layout. The bridge reads the peer's session record
+/// under whichever tree holds its `sessions` dir.
+#[cfg(unix)]
+pub(crate) fn session_runtime_trees(
+    profile: &ProfileName,
+    isolated: bool,
+    session_id: &str,
+) -> Result<[PathBuf; 2]> {
+    let isolation = if isolated {
+        Isolation::Isolated
+    } else {
+        Isolation::Shared
+    };
+    let tree = |mode| -> Result<PathBuf> {
+        let (runtime_name, _) = paired_dir_names(isolation, session_id, mode);
+        profile_subpath(profile, &runtime_name)
+    };
+    Ok([tree(LinkMode::Real)?, tree(LinkMode::Fake)?])
+}
+
 /// Whether the session a registry row names is still running. `true` on anything
 /// the probe could not decide, keeping [`is_session_alive`]'s direction: a row
 /// wrongly read as live costs one wasted registry write, while one wrongly read as

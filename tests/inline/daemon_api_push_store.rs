@@ -401,6 +401,7 @@ fn a_put_from_a_pairing_revoked_since_it_authenticated_writes_nothing() {
             peer: peer(),
             device: Some(&device),
             target: None,
+            ask: None,
         },
     );
 
@@ -504,6 +505,7 @@ fn a_delete_from_a_pairing_revoked_since_it_authenticated_drops_nothing() {
             peer: peer(),
             device: Some(&old),
             target: None,
+            ask: None,
         },
     );
 
