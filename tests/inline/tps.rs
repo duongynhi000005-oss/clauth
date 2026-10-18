@@ -1138,21 +1138,13 @@ fn a_plain_save_failure_retries_and_lands_once_writable() {
     };
     write_cache(home.home(), &snap);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&clauth, std::fs::Permissions::from_mode(0o500)).unwrap();
-    }
+    let unwritable = crate::testutil::UnwritableDir::new(&clauth);
     let mut p = Producer::new();
     p.tick(ms("2026-09-22T00:01:00.000Z"));
     assert!(p.days.contains_key("2026-09-20"), "t1 keeps it");
     p.tick(ms("2026-09-22T00:02:00.000Z"));
     assert!(p.days.contains_key("2026-09-20"), "t2 keeps it");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&clauth, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    drop(unwritable);
     p.tick(ms("2026-09-22T00:03:00.000Z"));
     assert!(!p.days.contains_key("2026-09-20"), "t3 folds it");
     let speed = crate::token_ledger::SpeedLedger::load(&clauth);

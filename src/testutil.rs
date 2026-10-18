@@ -738,6 +738,103 @@ pub(crate) fn block_credentials_write(name: &crate::profile::ProfileName) {
     std::fs::create_dir(&path).expect("block the credentials path with a directory");
 }
 
+/// Make `dir` refuse to create or write files for the guard's lifetime, so a
+/// test can drive a save failure without root: on Unix the dir's mode drops to
+/// 0o500 (no write bit), on Windows a deny ACE for Everyone removes add-file /
+/// add-subdir (`(WD,AD)`). The constructor probes a real write so a fault that
+/// never bites fails by name instead of greening the test; `Drop` restores
+/// best-effort and never asserts.
+#[cfg(test)]
+pub(crate) struct UnwritableDir {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl UnwritableDir {
+    pub(crate) fn new(path: &Path) -> Self {
+        let guard = Self {
+            path: path.to_path_buf(),
+        };
+        guard.arm();
+        guard.probe();
+        guard
+    }
+
+    #[cfg(unix)]
+    fn arm(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o500))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "UnwritableDir: chmod 0o500 {} failed: {e}",
+                    self.path.display()
+                )
+            });
+    }
+
+    #[cfg(windows)]
+    fn arm(&self) {
+        let out = Command::new(icacls())
+            .arg(&self.path)
+            .arg("/deny")
+            .arg("*S-1-1-0:(WD,AD)")
+            .output()
+            .unwrap_or_else(|e| panic!("UnwritableDir: spawn icacls failed: {e}"));
+        if !out.status.success() {
+            panic!(
+                "UnwritableDir: icacls /deny {} failed: {}",
+                self.path.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    fn probe(&self) {
+        let probe = self
+            .path
+            .join(format!(".unwritable-probe-{}", std::process::id()));
+        match std::fs::write(&probe, b"probe") {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                panic!(
+                    "UnwritableDir({}) accepted a probe write",
+                    self.path.display()
+                );
+            }
+            Err(e) => panic!(
+                "UnwritableDir({}) probe: expected PermissionDenied, got {e}",
+                self.path.display()
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for UnwritableDir {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o700));
+        }
+        #[cfg(windows)]
+        {
+            let _ = Command::new(icacls())
+                .arg(&self.path)
+                .arg("/remove:d")
+                .arg("*S-1-1-0")
+                .output();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn icacls() -> PathBuf {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    PathBuf::from(root).join("System32").join("icacls.exe")
+}
+
 /// RAII pin redirecting every Anthropic endpoint the rotation legs touch —
 /// `/usage`, the token endpoint, and the `/v1/messages` kick — at one loopback
 /// listener, and clearing them on drop even if the test panics. Also resets the
