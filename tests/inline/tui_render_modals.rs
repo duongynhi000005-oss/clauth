@@ -1955,6 +1955,7 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
         reviewing_overwrite: false,
         confirm_overwrite: false,
         max_scroll: std::cell::Cell::new(0),
+        max_scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
         viewport: std::cell::Cell::new(0),
         overwrite_needs_review: std::cell::Cell::new(false),
     };
@@ -2049,6 +2050,7 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
         reviewing_overwrite: true,
         confirm_overwrite: false,
         max_scroll: std::cell::Cell::new(0),
+        max_scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
         viewport: std::cell::Cell::new(0),
         overwrite_needs_review: std::cell::Cell::new(true),
     };
@@ -2394,6 +2396,7 @@ fn selectors_and_modals_page_by_hand_pinned_cursors() {
         reviewing_overwrite: true,
         confirm_overwrite: false,
         max_scroll: std::cell::Cell::new(0),
+        max_scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
         viewport: std::cell::Cell::new(0),
         overwrite_needs_review: std::cell::Cell::new(false),
     }));

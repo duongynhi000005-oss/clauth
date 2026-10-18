@@ -969,6 +969,17 @@ impl LossWarningDrop {
     }
 }
 
+/// What a published scroll bound was computed for: the frame's width and height
+/// and the modal-open generation. The footer trusts a bound only while both
+/// still match the current frame, so a bound left over from a resize or a
+/// closed-and-reopened modal never shows a dead `↑↓ scroll`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ScrollStamp {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) generation: u64,
+}
+
 /// The scroll a confirm modal's body carries. `offset` is the key handler's
 /// own state; `max_scroll` and `viewport` are what the last render drew, so a
 /// resize changes the page step on the next press. `Default` keeps the many
@@ -978,6 +989,7 @@ pub(crate) struct ConfirmScroll {
     pub(crate) offset: u16,
     pub(crate) max_scroll: std::cell::Cell<u16>,
     pub(crate) viewport: std::cell::Cell<u16>,
+    pub(crate) stamp: std::cell::Cell<ScrollStamp>,
 }
 
 /// The three buttons of the apply-preset confirm, left to right.
@@ -1459,6 +1471,7 @@ pub(crate) struct EnvCollisionForm {
     pub(crate) reviewing_overwrite: bool,
     pub(crate) confirm_overwrite: bool,
     pub(crate) max_scroll: std::cell::Cell<u16>,
+    pub(crate) max_scroll_stamp: std::cell::Cell<ScrollStamp>,
     pub(crate) viewport: std::cell::Cell<usize>,
     pub(crate) overwrite_needs_review: std::cell::Cell<bool>,
 }
@@ -4058,16 +4071,21 @@ pub(crate) struct App {
     /// row. Read-only after construction — the mode is decided once at launch.
     pub(crate) herdr_mode: bool,
     pub(crate) modals: Vec<Modal>,
+    /// Bumped on every modal open and close, so a scroll bound stamped with an
+    /// older generation is never trusted as this frame's.
+    pub(crate) modal_generation: std::cell::Cell<u64>,
     /// First help-modal row on screen (↑↓ scrolls). Reset when the modal opens.
     pub(crate) help_scroll: u16,
     /// Max valid `help_scroll` from the last help render (`total - viewport`).
     /// Interior mutability because the render pass takes `&App`; clamping there
     /// stops a held ↓ from inflating `help_scroll` past the end.
     pub(crate) help_max_scroll: std::cell::Cell<u16>,
+    pub(crate) help_max_scroll_stamp: std::cell::Cell<ScrollStamp>,
     /// First `check output`-modal row on screen (↑↓ scrolls). Reset on open.
     pub(crate) check_output_scroll: u16,
     /// Max valid `check_output_scroll` from the last `check output` render.
     pub(crate) check_output_max_scroll: std::cell::Cell<u16>,
+    pub(crate) check_output_max_scroll_stamp: std::cell::Cell<ScrollStamp>,
     /// Visible `check output`-modal rows from the last render — the key
     /// handler's page step, published like `help_viewport`.
     pub(crate) check_output_viewport: std::cell::Cell<u16>,
@@ -4819,10 +4837,13 @@ impl App {
             harness_filter: HarnessFilter::default(),
             herdr_mode: false,
             modals: Vec::new(),
+            modal_generation: std::cell::Cell::new(0),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
+            help_max_scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
             check_output_scroll: 0,
             check_output_max_scroll: std::cell::Cell::new(0),
+            check_output_max_scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
             check_output_viewport: std::cell::Cell::new(0),
             help_viewport: std::cell::Cell::new(0),
             profile_cursor: 0,
@@ -5983,7 +6004,21 @@ impl App {
     /// action closed one.
     pub(crate) fn open_modal(&mut self, modal: Modal) {
         self.services.land_on_herdr = false;
+        self.modal_generation
+            .set(self.modal_generation.get().wrapping_add(1));
         self.modals.push(modal);
+    }
+
+    /// Every modal closes here. The [`open_modal`] bump alone carries the
+    /// scroll soundness (a reopen bumps the generation past any bound published
+    /// before it), so the close bump is belt-and-braces.
+    pub(crate) fn pop_modal(&mut self) -> Option<Modal> {
+        let popped = self.modals.pop();
+        if popped.is_some() {
+            self.modal_generation
+                .set(self.modal_generation.get().wrapping_add(1));
+        }
+        popped
     }
 
     /// Every write of [`App::gateway_state`] after construction lands here.
@@ -16315,7 +16350,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 ) as u16;
             }
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q') => {
-                app.modals.pop();
+                app.pop_modal();
             }
             _ => {}
         },
@@ -16349,7 +16384,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 ) as u16;
             }
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                app.modals.pop();
+                app.pop_modal();
             }
             _ => {}
         },
@@ -16416,7 +16451,7 @@ fn handle_login_modal_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
         }
         _ => {}
     }
@@ -16779,7 +16814,7 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
             .find(|item| item.hotkey == Some(ch_lower))
             .map(|item| item.action.clone());
         if let Some(action) = action {
-            app.modals.pop();
+            app.pop_modal();
             dispatch_action_menu_action(app, action);
             return;
         }
@@ -16787,7 +16822,7 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
         }
         KeyCode::Up => {
             let Some(Modal::ActionMenu(state)) = app.modals.last_mut() else {
@@ -16858,7 +16893,7 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
                 .items
                 .get(state.cursor)
                 .map(|item| item.action.clone());
-            app.modals.pop();
+            app.pop_modal();
             if let Some(action) = action {
                 dispatch_action_menu_action(app, action);
             }
@@ -18350,7 +18385,12 @@ fn open_login_modal(app: &mut App) {
 
 /// Drop the login progress modal (login finished, failed, or was canceled).
 fn close_login_modal(app: &mut App) {
+    let before = app.modals.len();
     app.modals.retain(|m| !matches!(m, Modal::Login));
+    if app.modals.len() != before {
+        app.modal_generation
+            .set(app.modal_generation.get().wrapping_add(1));
+    }
 }
 
 /// Arm an account-action row (`Delete`, `ClearSessionToken`, or `Disabled` in
@@ -19044,6 +19084,7 @@ fn env_collision_form(
         reviewing_overwrite: false,
         confirm_overwrite: false,
         max_scroll: std::cell::Cell::new(0),
+        max_scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
         viewport: std::cell::Cell::new(0),
         overwrite_needs_review: std::cell::Cell::new(false),
     }
@@ -19099,7 +19140,7 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
                 if state.confirm_overwrite {
                     let name = ProfileName::from(state.profile.clone());
                     let pending = state.key.clone();
-                    app.modals.pop();
+                    app.pop_modal();
                     run_env_collision_choice(
                         app,
                         &name,
@@ -19133,7 +19174,7 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let choice = EnvCollisionForm::options()[state.cursor.min(last)];
@@ -19146,7 +19187,7 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
             let name = ProfileName::from(state.profile.clone());
             let pending = state.key.clone();
             let existing_idx = state.existing_idx;
-            app.modals.pop();
+            app.pop_modal();
             run_env_collision_choice(app, &name, &pending, existing_idx, choice);
         }
         _ => {}
@@ -19719,7 +19760,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
         // input editor. (The other modals' `q` shortcut doesn't apply to a
         // text field.)
         KeyCode::Esc => {
-            app.modals.pop();
+            app.pop_modal();
         }
         KeyCode::Enter => {
             let name = form.input.trimmed().to_string();
@@ -19731,7 +19772,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                         app.toast(ToastKind::Danger, format!("{e}"));
                         return;
                     }
-                    app.modals.pop();
+                    app.pop_modal();
                     duplicate_profile_into(
                         app,
                         &ProfileName::from(source),
@@ -19752,7 +19793,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                         );
                         return;
                     }
-                    app.modals.pop();
+                    app.pop_modal();
                     if crate::presets::preset_exists(&name) {
                         app.open_modal(Modal::Confirm(ConfirmState {
                             message: format!("preset '{name}' already exists."),
@@ -19781,7 +19822,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
     let last = state.presets.len().saturating_sub(1);
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
             undo_preset_picker_open(app);
         }
         KeyCode::Up => {
@@ -19840,7 +19881,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 toast_builtin_preset(app, &preset.name);
                 return;
             }
-            app.modals.pop();
+            app.pop_modal();
             // The picker is gone, so no preset will be applied: undo the
             // open-side effect before the delete confirm.
             undo_preset_picker_open(app);
@@ -19855,7 +19896,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             let picked = state.presets.get(state.cursor.min(last)).cloned();
             let target = state.target.clone();
-            app.modals.pop();
+            app.pop_modal();
             if let Some(preset) = picked {
                 offer_preset_apply(app, target, &preset);
             }
@@ -20237,7 +20278,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             let is_preset = matches!(&state.on_confirm, ConfirmAction::ApplyPresetOver(..));
-            app.modals.pop();
+            app.pop_modal();
             if is_preset {
                 undo_preset_picker_open(app);
             }
@@ -20246,7 +20287,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
             let confirmed = state.choice;
             let action = state.on_confirm.clone();
             let is_preset = matches!(&action, ConfirmAction::ApplyPresetOver(..));
-            app.modals.pop();
+            app.pop_modal();
             if confirmed {
                 run_confirm_action(app, action);
             } else if is_preset {
@@ -20270,13 +20311,13 @@ fn handle_loss_warning_key(app: &mut App, key: KeyEvent) {
             state.choice = !state.choice;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let discard = state.choice;
             let target = state.target;
             let drop = state.drop;
-            app.modals.pop();
+            app.pop_modal();
             if !discard {
                 return;
             }
@@ -20357,7 +20398,7 @@ fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
             ) as u16;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
             undo_preset_picker_open(app);
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
@@ -20368,7 +20409,7 @@ fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
             };
             let (target, preset) = (form.target.clone(), form.preset.clone());
             let (replaces, leaves) = (form.replaces.clone(), form.leaves.clone());
-            app.modals.pop();
+            app.pop_modal();
             if let Some(leftover) = leftover {
                 apply_preset_to(app, &target, &preset, leftover, &replaces, &leaves);
             } else {
@@ -20440,13 +20481,13 @@ fn handle_rebind_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             let form = form.clone();
-            app.modals.pop();
+            app.pop_modal();
             store_rebind_digest(app, &form.digest);
         }
         KeyCode::Enter => {
             let apply = form.choice;
             let form = form.clone();
-            app.modals.pop();
+            app.pop_modal();
             if apply {
                 apply_rebind(app, form);
             } else {
@@ -21031,12 +21072,12 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') => {
             // Just close — the prompt is on-demand now; the non-blocking
             // banner keeps carrying the signal until the divergence resolves.
-            app.modals.pop();
+            app.pop_modal();
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let action = actions[state.cursor.min(last)].clone();
             let active = state.active.clone();
-            app.modals.pop();
+            app.pop_modal();
             match action {
                 DivergenceAction::SwitchToOwner(owner) => {
                     // Same confirmed path as the "save elsewhere" picker: the
@@ -21151,16 +21192,15 @@ fn open_divergence_target_picker(app: &mut App) {
         begin_capture(app, true);
         return;
     }
-    app.modals
-        .push(Modal::DivergenceTarget(DivergenceTargetForm {
-            targets,
-            cursor: preselect,
-            scroll: std::cell::Cell::new(0),
-            viewport: std::cell::Cell::new(0),
-            starts: std::cell::RefCell::new(Vec::new()),
-            block_ends: std::cell::RefCell::new(Vec::new()),
-            total: std::cell::Cell::new(0),
-        }));
+    app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        targets,
+        cursor: preselect,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    }));
 }
 
 /// Rows: 0 = `+ new profile` (→ capture-name), 1.. = existing profiles
@@ -21219,11 +21259,11 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             form.cursor = next;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let cursor = form.cursor;
-            let Some(Modal::DivergenceTarget(form)) = app.modals.pop() else {
+            let Some(Modal::DivergenceTarget(form)) = app.pop_modal() else {
                 return;
             };
             if cursor == 0 {
@@ -21314,11 +21354,11 @@ fn handle_token_picker_key(app: &mut App, key: KeyEvent) {
             form.cursor = next;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let cursor = form.cursor;
-            let Some(Modal::TokenPicker(form)) = app.modals.pop() else {
+            let Some(Modal::TokenPicker(form)) = app.pop_modal() else {
                 return;
             };
             if cursor == 0 {
@@ -21340,7 +21380,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
     };
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.modals.pop();
+            app.pop_modal();
         }
         KeyCode::Enter => {
             let name = form.input.trimmed().to_string();
@@ -21362,7 +21402,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 let cfg = app.config();
                 cfg.canonical_name(&name)
             };
-            let Some(Modal::CaptureName(form)) = app.modals.pop() else {
+            let Some(Modal::CaptureName(form)) = app.pop_modal() else {
                 return;
             };
             let CaptureNameForm {

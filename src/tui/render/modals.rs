@@ -13,8 +13,8 @@ use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
     DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
     LoginStage, LossWarningState, Modal, NamePromptForm, PaneState, PresetApplyButton,
-    PresetApplyForm, PresetPickerForm, RebindForm, StatusFocus, Tab, TokenPickerForm, TokenView,
-    pane_state, token_model_count,
+    PresetApplyForm, PresetPickerForm, RebindForm, ScrollStamp, StatusFocus, Tab, TokenPickerForm,
+    TokenView, pane_state, token_model_count,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -29,21 +29,52 @@ use super::panes::{
 use super::prose::{self, cmd_lit, key_lit};
 use crate::fallback::BlockedReason;
 
+/// The stamp a published scroll bound carries: the frame area it was computed
+/// for plus the modal-open generation, so the footer can tell this frame's
+/// bound from a resize's or a reopen's leftover.
+fn stamp(area: Rect, app: &App) -> ScrollStamp {
+    ScrollStamp {
+        width: area.width,
+        height: area.height,
+        generation: app.modal_generation.get(),
+    }
+}
+
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) {
     match modal {
-        Modal::Confirm(state) => draw_confirm(frame, area, state),
+        Modal::Confirm(state) => {
+            draw_confirm(frame, area, state);
+            state.scroll.stamp.set(stamp(area, app));
+        }
         Modal::Divergence(form) => draw_divergence(frame, area, form),
         Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input),
         Modal::NamePrompt(form) => draw_name_prompt(frame, area, form),
         Modal::PresetPicker(form) => draw_preset_picker(frame, area, form),
-        Modal::PresetApply(form) => draw_preset_apply(frame, area, form),
+        Modal::PresetApply(form) => {
+            draw_preset_apply(frame, area, form);
+            form.scroll.stamp.set(stamp(area, app));
+        }
         Modal::DivergenceTarget(form) => draw_divergence_target(frame, area, form),
         Modal::TokenPicker(form) => draw_token_picker(frame, area, form),
-        Modal::Help => draw_help(frame, area, app),
+        Modal::Help => {
+            draw_help(frame, area, app);
+            app.help_max_scroll_stamp.set(stamp(area, app));
+        }
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
-        Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
+        Modal::EnvCollision(form) => {
+            draw_env_collision(frame, area, form);
+            // Only a review-stage frame published a bound: the list stage must
+            // not re-stamp the review stage's leftover, or a resize while the
+            // list is open would read the old bound as this frame's.
+            if form.reviewing_overwrite {
+                form.max_scroll_stamp.set(stamp(area, app));
+            }
+        }
         Modal::Login => draw_login_progress(frame, area, app),
-        Modal::CheckOutput(body) => draw_check_output(frame, area, body, app),
+        Modal::CheckOutput(body) => {
+            draw_check_output(frame, area, body, app);
+            app.check_output_max_scroll_stamp.set(stamp(area, app));
+        }
         Modal::Rebind(form) => draw_rebind(frame, area, form),
         Modal::LossWarning(state) => draw_loss_warning(frame, area, state),
     }

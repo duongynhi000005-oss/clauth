@@ -1044,6 +1044,123 @@ fn a_three_row_toast_renders_whole() {
     );
 }
 
+/// The footer hint bar never paints over a toast's glass: in the base frame
+/// order toasts draw after the footer, so at 60x11 three 3-row DANGER toasts
+/// stack down to the footer row and the last row's toast cells keep the
+/// toast's glyphs and glass background — never the hint text.
+#[test]
+fn the_footer_never_paints_over_a_toast() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{Tab, ToastKind};
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Overview;
+    let wide = "x".repeat(53);
+    for name in ["one", "two", "three"] {
+        app.toast(ToastKind::Danger, format!("{name}\n{wide}\n{name} tail"));
+    }
+
+    let (w, h) = (60u16, 11u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+
+    let bar_x = (0..w)
+        .find(|&x| buf[(x, 2)].symbol() == "┃")
+        .expect("a toast bar on row 2");
+    let last = h - 1;
+    let glass = crate::tui::theme::blend_over(
+        crate::tui::theme::bg(),
+        crate::tui::theme::bg_sunken(),
+        0.75,
+    );
+
+    // The third toast's last line lands on the footer row; its cells keep the
+    // toast's glyphs and glass bg, never the hint text.
+    let shown: String = (bar_x..bar_x + 56)
+        .map(|x| buf[(x, last)].symbol().to_string())
+        .collect();
+    assert_eq!(
+        shown,
+        format!("┃ three tail{}", " ".repeat(44)),
+        "the last row's toast cells show the toast, not the hint text"
+    );
+    assert_eq!(
+        buf[(bar_x, last)].fg,
+        crate::tui::theme::danger_color(),
+        "the toast bar keeps its danger foreground"
+    );
+    assert_eq!(
+        buf[(bar_x + 2, last)].fg,
+        crate::tui::theme::text_dim_color(),
+        "the toast detail keeps its dim foreground"
+    );
+    for x in bar_x..bar_x + 56 {
+        assert_eq!(
+            buf[(x, last)].style().bg,
+            Some(glass),
+            "toast cell {x} on the footer row keeps its glass background"
+        );
+    }
+}
+
+/// An open modal covers a live toast: in the base frame order the modal draws
+/// last, so the toast's cells under it do not show. This is the base stacking —
+/// a later toast task changes it.
+#[test]
+fn an_open_modal_covers_a_toast() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{Modal, Tab, ToastKind};
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Overview;
+    // One 3-row toast, 53 cells wide → columns 22..77, rows 2..4 at 80 wide.
+    let wide = "x".repeat(53);
+    app.toast(ToastKind::Danger, format!("head\n{wide}\ntail"));
+    // A check-output modal whose body is 30 lines, one 70 cells wide → the
+    // modal is 76 cells wide and 20 rows tall, covering the whole toast stack.
+    let mut lines: Vec<String> = vec!["m".repeat(70)];
+    lines.extend((0..29).map(|i| format!("line {i}")));
+    app.modals.push(Modal::CheckOutput(lines.join("\n")));
+
+    let (w, h) = (80u16, 24u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+
+    let bar_x = bar_column(53);
+    let glass = crate::tui::theme::blend_over(
+        crate::tui::theme::bg(),
+        crate::tui::theme::bg_sunken(),
+        0.75,
+    );
+
+    // Row 4 is inside both the modal (its first body line) and the toast's tail
+    // row; the modal draws last, so its body wins the cell — the toast's bar
+    // and glass never show through.
+    assert_eq!(
+        buf[(bar_x, 4)].symbol(),
+        "m",
+        "the modal's body covers the toast bar"
+    );
+    assert_eq!(
+        buf[(bar_x + 2, 4)].symbol(),
+        "m",
+        "the modal's body covers the toast detail"
+    );
+    assert_ne!(
+        buf[(bar_x, 4)].style().bg,
+        Some(glass),
+        "the modal's base background covers the toast's glass"
+    );
+}
+
 /// An in-flight OAuth login at the waiting stage with its paste door open, plus
 /// the receiver its worker would hold (dropping it would close the door). The
 /// links are built by hand: nothing here needs a bound listener.
@@ -4098,9 +4215,10 @@ fn setup_app() -> App {
 }
 
 /// A modal owns every key, so `←`/`→` never switch the tab under one and the
-/// hint bar drops `←→ tabs` while it is open: the help sheet, a confirm (whose
-/// `←→` flip its choice) and a name prompt (whose `←→` walk its caret). Every
-/// modal checked before any assertion fires.
+/// hint bar never reads `←→ tabs` while it is open: the help sheet, a confirm
+/// (whose footer names `←→ pick` for its choice) and a name prompt (whose
+/// footer names `←→ caret` for its text). Every modal checked before any
+/// assertion fires.
 #[test]
 fn a_modal_owns_the_arrows_so_the_footer_drops_the_tab_hint() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -4141,7 +4259,7 @@ fn a_modal_owns_the_arrows_so_the_footer_drops_the_tab_hint() {
             continue;
         }
         let under = footer_of(&dump(&app, 120, 30)).to_string();
-        if under.contains("←→") {
+        if under.contains("←→ tabs") {
             wrong.push(format!("[{label}] under the modal: {under:?}"));
         }
         handle_key(&mut app, key(KeyCode::Right));

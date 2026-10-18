@@ -9,14 +9,14 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
-    HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, PaneState, ServiceFix,
+    HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, PaneState, ScrollStamp, ServiceFix,
     ServicesFocus, ShuntFieldEdit, ShuntFieldKey, ShuntFocus, ShuntSaveKey, StatusFocus, Tab,
     TokenView, build_action_menu, config_rows, fallback_hint, field_locked, fix_verb,
     has_sub_focus, herdr_config_writable, is_cycle_field, keyboard_owner, pane_state,
     token_model_count,
 };
 use super::super::theme;
-use super::format::spinner_frame;
+use super::format::{spinner_frame, truncate};
 use super::prose;
 
 const TAB_NAV: (&str, &str) = ("←→", "tabs");
@@ -59,7 +59,65 @@ const NOTE_EDITOR_FIELD: &[(&str, &str)] = &[
     ("esc", "cancel"),
 ];
 
+/// The help modal's own keys while its keymap overflows: ↑↓ scrolls, `q` (or
+/// `esc` / `?`) closes. The modal's own sections already document both, so the
+/// footer keeps the two discoverable keys alone; while the body fits, `q back`
+/// alone acts — a key that scrolls nothing advertises nothing.
+const HELP_KEYS: &[(&str, &str)] = &[("↑↓", "scroll"), ("q", "back")];
+
+/// The read-only `check output` modal scrolls and closes like the help modal.
+const CHECK_OUTPUT_KEYS: &[(&str, &str)] = &[("↑↓", "scroll"), ("q", "back")];
+
+/// The lone `q back` of a scroll modal whose body fits.
+const Q_BACK: &[(&str, &str)] = &[("q", "back")];
+
+/// A two-button confirm: ←→ (or tab) moves the highlight between the buttons,
+/// ↵ / space commit the highlighted one, `q` backs out.
+const BUTTON_KEYS: &[(&str, &str)] = &[("←→", "pick"), ("↵", "choose"), ("q", "back")];
+
+/// The same confirm with `↑↓ scroll` after the choose keys when its body
+/// overflows, so a narrow terminal sheds the scroll hint before the choice
+/// keys.
+const BUTTON_SCROLL_KEYS: &[(&str, &str)] = &[
+    ("←→", "pick"),
+    ("↵", "choose"),
+    ("↑↓", "scroll"),
+    ("q", "back"),
+];
+
+/// A vertical option list: ↑↓ moves the cursor, ↵ picks the row under it,
+/// `q` backs out.
+const LIST_KEYS: &[(&str, &str)] = &[("↑↓", "pick"), ("↵", "choose"), ("q", "back")];
+
+/// The preset picker adds `d` (delete a saved preset; the body also teaches
+/// it) and ↵ applies the picked preset. A built-in row has no file to drop, so
+/// its footer drops `d delete` — the same predicate the `d` handler reads.
+const PRESET_PICKER_KEYS: &[(&str, &str)] = &[
+    ("↑↓", "pick"),
+    ("↵", "apply"),
+    ("d", "delete"),
+    ("q", "back"),
+];
+
+/// The preset picker over a built-in row: no `d delete`.
+const PRESET_PICKER_BUILTIN_KEYS: &[(&str, &str)] =
+    &[("↑↓", "pick"), ("↵", "apply"), ("q", "back")];
+
+/// A name-entry modal that closes on `q`: ↵ saves the name, ←→ moves the
+/// caret, `q` backs out.
+const CAPTURE_NAME_KEYS: &[(&str, &str)] = &[("↵", "save"), ("←→", "caret"), ("q", "back")];
+
+/// A name-entry modal where `q` is data: ↵ saves the name, ←→ moves the
+/// caret, `esc` goes back (closes it) — `back`, never `cancel`, so beside a
+/// login in flight the word can't read as cancelling the login.
+const NAME_PROMPT_KEYS: &[(&str, &str)] = &[("↵", "save"), ("←→", "caret"), ("esc", "back")];
+
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // The footer row is the last full-width row of the frame it belongs to;
+    // the scroll-bound stamps record that frame's area, so the footer compares
+    // against it and drops a resize's stale bound.
+    let frame_area = Rect::new(0, 0, area.width, area.y + area.height);
+
     // 1-col breathing room on each side; the alert row (which replaces this in
     // place) shares the same inset so the left margin never jumps.
     let area = inset_x(area, 1);
@@ -71,10 +129,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(session) = &app.login {
         // An open editor takes esc/q before the login's cancel does, so its own
         // grammar is the hint. Any open modal owns esc/q too (the login modal
-        // collapses, others handle their own keys), so the hint flips to
-        // `q back` for the whole stack; the login modal's open code field is
+        // collapses, others handle their own keys), so the hint is that modal's
+        // own row behind the login lead; the login modal's open code field is
         // the exception, where `q` is data and ↵ submits.
-        let keys = match owner.and_then(|o| owner_hints(o, app)) {
+        let keys = match owner.and_then(|o| owner_hints(o, app, frame_area)) {
             Some(hints) => LoginKeys::Owner(hints),
             None => match app.modals.last() {
                 Some(Modal::Login) if session.paste_field.is_some() => LoginKeys::Paste,
@@ -96,29 +154,30 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // the whole row: `q` only where the editor itself binds it, `? help` only
     // where it lets `?` through. Every owner takes the arrows, so `←→ tabs`
     // rides only while nothing owns the keyboard.
-    let mut hints: Vec<(&str, &str)> = match owner.zip(owner.and_then(|o| owner_hints(o, app))) {
-        Some((owner, own)) => {
-            let mut hints = own.to_vec();
-            if !owner.claims(app, KeyCode::Char('?')) {
-                let at = hints
-                    .iter()
-                    .position(|(key, _)| *key == "q")
-                    .unwrap_or(hints.len());
-                hints.insert(at, ("?", "help"));
+    let mut hints: Vec<(&str, &str)> =
+        match owner.zip(owner.and_then(|o| owner_hints(o, app, frame_area))) {
+            Some((owner, own)) => {
+                let mut hints = own.to_vec();
+                if !owner.claims(app, KeyCode::Char('?')) {
+                    let at = hints
+                        .iter()
+                        .position(|(key, _)| *key == "q")
+                        .unwrap_or(hints.len());
+                    hints.insert(at, ("?", "help"));
+                }
+                hints
             }
-            hints
-        }
-        None => owner
-            .is_none()
-            .then_some(if pane_state(app) == PaneState::Rest {
-                TAB_NAV
-            } else {
-                ("←", "back")
-            })
-            .into_iter()
-            .chain(tab_hints(app))
-            .collect(),
-    };
+            None => owner
+                .is_none()
+                .then_some(if pane_state(app) == PaneState::Rest {
+                    TAB_NAV
+                } else {
+                    ("←", "back")
+                })
+                .into_iter()
+                .chain(tab_hints(app))
+                .collect(),
+        };
 
     // `a` opens nothing where the menu is empty: a tab with no action of its
     // own while a daemon start or stop is in flight and no shunt verb
@@ -149,18 +208,104 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+/// A published scroll bound is this frame's only when its stamp still matches
+/// the frame's area and the modal-open generation: a resize changes the area,
+/// and an open or close changes the generation, so a bound left over from
+/// either errs the footer to the bound's no-scroll row.
+fn bound_is_current(stamp: ScrollStamp, area: Rect, app: &App) -> bool {
+    stamp.width == area.width
+        && stamp.height == area.height
+        && stamp.generation == app.modal_generation.get()
+}
+
 /// An owner's own grammar, the whole hint row while it holds the keyboard
-/// bar the `? help` that [`draw`] derives from what the owner claims. `None`
-/// for every modal but the re-bind confirm, which has three screen hints and
-/// lets `?` fall through so the derived `? help` sits beside them; the other
-/// modals leave the screen's hints under them.
-fn owner_hints(owner: KeyOwner, app: &App) -> Option<&'static [(&'static str, &'static str)]> {
+/// bar the `? help` that [`draw`] derives from what the owner claims. For the
+/// modal owner the row is read off the top modal's real handler, one arm per
+/// modal, so a new modal that skips its arm fails to compile. `None` only for
+/// the login modal, whose live-stage footer [`draw_login`] owns (the open code
+/// field, an open editor and the collapsed state each name their own keys).
+fn owner_hints(
+    owner: KeyOwner,
+    app: &App,
+    area: Rect,
+) -> Option<&'static [(&'static str, &'static str)]> {
     match owner {
         KeyOwner::Modal => match app.modals.last() {
-            Some(Modal::Rebind(_)) => {
-                Some(&[("space", "toggle"), ("↵", "choose"), ("q", "not now")])
+            // `↑↓ scroll` rides only while the body actually overflows — the
+            // same published bound the scroll handler clamps against — and the
+            // bound is this frame's, so a key that scrolls nothing, or a bound
+            // a resize or reopen left stale, advertises nothing.
+            Some(Modal::Help)
+                if app.help_max_scroll.get() > 0
+                    && bound_is_current(app.help_max_scroll_stamp.get(), area, app) =>
+            {
+                Some(HELP_KEYS)
             }
-            _ => None,
+            Some(Modal::Help) => Some(Q_BACK),
+            Some(Modal::CheckOutput(_))
+                if app.check_output_max_scroll.get() > 0
+                    && bound_is_current(app.check_output_max_scroll_stamp.get(), area, app) =>
+            {
+                Some(CHECK_OUTPUT_KEYS)
+            }
+            Some(Modal::CheckOutput(_)) => Some(Q_BACK),
+            Some(Modal::Confirm(state))
+                if state.scroll.max_scroll.get() > 0
+                    && bound_is_current(state.scroll.stamp.get(), area, app) =>
+            {
+                Some(BUTTON_SCROLL_KEYS)
+            }
+            Some(Modal::Confirm(_)) => Some(BUTTON_KEYS),
+            // The loss warning's two buttons never scroll: it stays the plain
+            // button row.
+            Some(Modal::LossWarning(_)) => Some(BUTTON_KEYS),
+            Some(Modal::PresetApply(form))
+                if form.scroll.max_scroll.get() > 0
+                    && bound_is_current(form.scroll.stamp.get(), area, app) =>
+            {
+                Some(BUTTON_SCROLL_KEYS)
+            }
+            Some(Modal::PresetApply(_)) => Some(BUTTON_KEYS),
+            Some(Modal::EnvCollision(state)) => {
+                if state.reviewing_overwrite {
+                    if state.max_scroll.get() > 0
+                        && bound_is_current(state.max_scroll_stamp.get(), area, app)
+                    {
+                        Some(BUTTON_SCROLL_KEYS)
+                    } else {
+                        Some(BUTTON_KEYS)
+                    }
+                } else {
+                    Some(LIST_KEYS)
+                }
+            }
+            Some(Modal::Divergence(_) | Modal::DivergenceTarget(_) | Modal::TokenPicker(_)) => {
+                Some(LIST_KEYS)
+            }
+            Some(Modal::ActionMenu(_)) => Some(LIST_KEYS),
+            // `d delete` drops on a built-in row, whose `d` only toasts a
+            // refusal — the same predicate the `d` handler reads.
+            Some(Modal::PresetPicker(state))
+                if state
+                    .presets
+                    .get(state.cursor.min(state.presets.len().saturating_sub(1)))
+                    .is_some_and(|p| !p.builtin) =>
+            {
+                Some(PRESET_PICKER_KEYS)
+            }
+            Some(Modal::PresetPicker(_)) => Some(PRESET_PICKER_BUILTIN_KEYS),
+            Some(Modal::CaptureName(_)) => Some(CAPTURE_NAME_KEYS),
+            Some(Modal::NamePrompt(_)) => Some(NAME_PROMPT_KEYS),
+            // The re-bind confirm walks an account list the cursor steps over,
+            // so its ruled copy leads `↑↓ row`; `?` falls through it so
+            // [`draw`] derives `? help` beside the row.
+            Some(Modal::Rebind(_)) => Some(&[
+                ("↑↓", "row"),
+                ("space", "toggle"),
+                ("↵", "choose"),
+                ("q", "not now"),
+            ]),
+            Some(Modal::Login) | None => None,
         },
         KeyOwner::SetupField
         | KeyOwner::MemberField
@@ -200,7 +345,8 @@ fn owner_hints(owner: KeyOwner, app: &App) -> Option<&'static [(&'static str, &'
 }
 
 /// The screen's own keys, then `q`: the row under `←→ tabs` while nothing owns
-/// the keyboard, and under a modal.
+/// the keyboard. A modal's row comes from [`owner_hints`] instead, so this
+/// never renders under one.
 fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     // `q` label: "back" in a sub-focus, "quit" at top level.
     // (While armed the alert row shows instead, so this label stays "quit".)
@@ -476,20 +622,35 @@ fn shed_to_width(hints: &mut Vec<(&str, &str)>, width: usize) {
             .sum();
         cells + hints.len().saturating_sub(1) * 3
     };
-    let essential = |(key, label): &(&str, &str)| {
-        matches!(
-            (*key, *label),
-            ("←→", "tabs" | "day") | ("?" | "q" | "esc", _)
-        ) || label.starts_with("confirm")
-    };
     while row_width(hints) > width {
-        match hints.iter().rposition(|h| !essential(h)) {
+        match hints.iter().rposition(|h| !essential_hint(h)) {
             Some(i) => {
                 hints.remove(i);
             }
             None => break,
         }
     }
+}
+
+/// A hint the row keeps under every shed: the screen's only way out or around,
+/// discoverability, and armed confirms. [`draw_login`] mirrors this when it
+/// caps a profile name, so a long name never crowds these out.
+fn essential_hint(hint: &(&str, &str)) -> bool {
+    let (key, label) = *hint;
+    matches!(
+        (key, label),
+        ("←→", "tabs" | "day") | ("?" | "q" | "esc", _)
+    ) || label.starts_with("confirm")
+}
+
+/// The cells the essential groups alone occupy — the width [`shed_to_width`]
+/// can never go below.
+fn essential_hint_width(hints: &[(&str, &str)]) -> usize {
+    let kept: Vec<_> = hints.iter().copied().filter(essential_hint).collect();
+    kept.iter()
+        .map(|(k, l)| k.chars().count() + 1 + l.chars().count())
+        .sum::<usize>()
+        + kept.len().saturating_sub(1) * 3
 }
 
 /// Services tab hints under the fix grammar: `↵ <verb>` on a focused fix line
@@ -562,7 +723,7 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     // The shunt detail walks its actionable lines one at a time: `↑↓ row`
     // while a press would move focus (there are ≥2 stops), `↑↓ scroll` while
     // a press would only scroll the read-only text, and no `↑↓` at all when
-    // neither applies (a fitting one-stop card, audit N4). `space/↵` act only
+    // neither applies (a fitting one-stop card). `space/↵` act only
     // on the focused line, and drop while an action runs or nothing holds
     // focus; `f next fix` stays while the walk can move — derived from the
     // same gates the handlers read, never copied per branch.
@@ -773,14 +934,14 @@ fn draw_alert(frame: &mut Frame<'_>, area: Rect, alert: &FooterAlert) {
 /// What esc/q/↵ do this frame for the login line's trailing hint.
 #[derive(Clone, Copy)]
 enum LoginKeys {
-    /// A modal is open: `q` steps back out of it.
+    /// The login modal is open (collapsed stage): `q` collapses it.
     Back,
     /// The login modal is collapsed: `esc` cancels the login.
     Cancel,
     /// The login modal's code field is open: `↵` submits, `esc` restores the
     /// `p  paste code` row; `q` is data.
     Paste,
-    /// An open editor takes the keys first: its own grammar.
+    /// An open editor or a non-login modal takes the keys first: its own row.
     Owner(&'static [(&'static str, &'static str)]),
 }
 
@@ -788,9 +949,9 @@ enum LoginKeys {
 /// clears alerts never hides it. The live stage renders in the login modal;
 /// this row is the collapsed view and carries the name alone. The trailing
 /// hint tracks what esc/q actually do this frame: an open editor takes them
-/// first (its own row); with any modal open they go to the modal (`q back`;
-/// the open code field takes `↵ submit   esc back`); collapsed, both cancel
-/// the login (`esc cancel`).
+/// first (its own row); with any non-login modal open the hint is that modal's
+/// own row behind the login lead; the login modal's open code field takes
+/// `↵ submit   esc back`; collapsed, both cancel the login (`esc cancel`).
 fn draw_login(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -804,9 +965,16 @@ fn draw_login(
         LoginKeys::Paste => &[("↵", "submit"), ("esc", "back")],
         LoginKeys::Owner(hints) => hints,
     };
+    // The name's budget is the row width minus the spinner, the `logging in ''`
+    // envelope and the essential hints' cells, so a long profile name never
+    // crowds out the one key that leaves the modal.
+    let name_budget = (area.width as usize)
+        .saturating_sub(1 + 1 + "logging in ''".len() + 3)
+        .saturating_sub(essential_hint_width(hints));
+    let name = truncate(&session.name, name_budget);
     let mut spans = vec![
         Span::styled(format!("{} ", spinner_frame(tick)), theme::accent()),
-        Span::styled(format!("logging in '{}'", session.name), theme::dim()),
+        Span::styled(format!("logging in '{name}'"), theme::dim()),
     ];
     // Each hint here carries a 3-space lead, while `shed_to_width` counts a gap
     // only between groups: the name and one lead come off its budget.
