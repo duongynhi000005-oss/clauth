@@ -390,13 +390,15 @@ fn a_manifest_reads_back_typed() {
 /// recorded, through the real recorder shared with the four stub bodies, and
 /// it signals with SIGKILL. The recorder is driven here the way the stubs
 /// drive it — `record_start` then `exec sleep 60` — so the recorded value is
-/// the stub's own, never a parse the test computed.
+/// the stub's own, never a parse the test computed. The pid file carries an
+/// extension, so a guard that replaced it (`sleep.start`) instead of appending
+/// `.start` (`sleep.pid.start`) finds no record and kills nothing.
 #[cfg(unix)]
 #[test]
 fn the_sleep_guard_kills_a_pid_that_still_carries_its_start_time() {
     use std::os::unix::process::ExitStatusExt as _;
     let dir = tempfile::tempdir().expect("tempdir");
-    let pid_file = dir.path().join("pid");
+    let pid_file = dir.path().join("sleep.pid");
     let mut start_name = pid_file.as_os_str().to_os_string();
     start_name.push(".start");
     let start_file = std::path::PathBuf::from(start_name);
