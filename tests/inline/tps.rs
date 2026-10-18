@@ -12,12 +12,15 @@ use crate::testutil::HomeSandbox;
 
 /// The record's measured response: 1222 output tokens from the latest user
 /// line `20:46:09.417` (an earlier prompt at `20:45:50.000` is not the start)
-/// to the first line carrying them, `20:46:23.014` (the id's second line 5 ms
-/// later is not the end).
+/// to the id's last line, the text block at `20:46:23.019` (its thinking block,
+/// carrying the same 1222, landed 5 ms earlier at `END`).
 const FIXTURE: &str = include_str!("../fixtures/tps-one-response.jsonl");
 const FIXTURE_SESSION: &str = "0c1f6a52-7d4e-4b0a-9a51-3f2b8e6c1d01";
 const START: &str = "2026-09-22T20:46:09.417Z";
+/// The fixture's first block line; the synthetic one-line responses below end
+/// here, so their span is 13.597 s.
 const END: &str = "2026-09-22T20:46:23.014Z";
+const FIXTURE_END: &str = "2026-09-22T20:46:23.019Z";
 const MODEL: &str = "claude-opus-5-5";
 
 fn ms(iso: &str) -> u64 {
@@ -88,7 +91,7 @@ fn append_lines(path: &Path, lines: &[String]) {
     }
 }
 
-/// One 1222-token response, 13.597 s from its user line to its end, landed as
+/// One 1222-token response, 13.602 s from its user line to its end, landed as
 /// a transcript in the global store with no owner anywhere.
 fn seed_fixture(home: &Path) {
     let path = global_store(home).join(format!("{FIXTURE_SESSION}.jsonl"));
@@ -103,8 +106,10 @@ fn close(actual: f64, want: f64, what: &str) {
     );
 }
 
-// 1222 / 13.597 = 89.8727…
+// 1222 / 13.597 = 89.8727…, a synthetic one-line response ending at `END`.
 const SPEED: f64 = 1222.0 / 13.597;
+// 1222 / 13.602 = 89.8397…, the fixture ending at its last line.
+const FIXTURE_SPEED: f64 = 1222.0 / 13.602;
 
 #[test]
 fn a_fixture_response_pins_speed_and_each_window_rate() {
@@ -112,14 +117,14 @@ fn a_fixture_response_pins_speed_and_each_window_rate() {
     seed_fixture(home.home());
 
     // 4 s after the end, the 10 s live window [end-6 s, end+4 s] holds 6 s of
-    // the 13.597 s span: 1222 * 6 / 13.597 = 539.236 tokens -> 53.924 tok/s.
-    let snap = Producer::new().tick(ms(END) + 4_000);
+    // the 13.602 s span: 1222 * 6 / 13.602 = 539.038 tokens -> 53.904 tok/s.
+    let snap = Producer::new().tick(ms(FIXTURE_END) + 4_000);
     let s = &snap.sessions[FIXTURE_SESSION];
-    close(s.figures.live.speed.unwrap(), SPEED, "live speed");
+    close(s.figures.live.speed.unwrap(), FIXTURE_SPEED, "live speed");
     assert_eq!(format_figure(s.figures.live.speed.unwrap()), "90");
     close(
         s.figures.live.rate,
-        1222.0 * 6.0 / 13.597 / 10.0,
+        1222.0 * 6.0 / 13.602 / 10.0,
         "live rate",
     );
     // The whole span sits inside 5 min and 1 h.
@@ -127,12 +132,12 @@ fn a_fixture_response_pins_speed_and_each_window_rate() {
     assert_eq!(format_figure(s.figures.m5.rate), "4.1");
     close(s.figures.h1.rate, 1222.0 / 3600.0, "1 h rate");
     assert_eq!(format_figure(s.figures.h1.rate), "0.3");
-    close(s.figures.m5.speed.unwrap(), SPEED, "5 min speed");
+    close(s.figures.m5.speed.unwrap(), FIXTURE_SPEED, "5 min speed");
     assert_eq!(snap.total, s.figures, "one session: the total is it");
     assert_eq!(snap.version, CACHE_VERSION);
 
     // 11 s after the end the live window no longer touches the span.
-    let later = Producer::new().tick(ms(END) + 11_000);
+    let later = Producer::new().tick(ms(FIXTURE_END) + 11_000);
     let s = &later.sessions[FIXTURE_SESSION];
     assert_eq!(s.figures.live.speed, None, "no response touches live");
     close(s.figures.live.rate, 0.0, "live rate past the window");
@@ -349,7 +354,8 @@ fn a_truncated_transcript_restarts_that_file_at_byte_zero() {
 }
 
 /// A restart loads the persisted day sums and re-reads today's lines; the
-/// response must not be added to the day twice.
+/// response, two block lines both before the watermark, must not be added to
+/// the day twice (nor its second line's span past the first).
 #[test]
 fn a_restart_does_not_double_count_day_sums() {
     let home = HomeSandbox::new();
@@ -365,6 +371,7 @@ fn a_restart_does_not_double_count_day_sums() {
         &iso_store.join("restart.jsonl"),
         &[
             user(START, "restart"),
+            assistant(&iso(ms(END) - 3_000), "restart", "msg_restart", 1222),
             assistant(END, "restart", "msg_restart", 1222),
         ],
     );
@@ -397,7 +404,7 @@ fn a_restart_does_not_double_count_day_sums() {
 }
 
 /// One transcript's whole-life sums over every finished response: the fixture's
-/// single response is 1222 output over 13 597 ms.
+/// single response is 1222 output over 13 602 ms.
 #[test]
 fn transcript_speed_sums_the_fixture_response() {
     let home = HomeSandbox::new();
@@ -408,7 +415,325 @@ fn transcript_speed_sums_the_fixture_response() {
         transcript_speed(&global_store(home.home()).join(format!("{FIXTURE_SESSION}.jsonl"))),
         Some(DaySum {
             output: 1222,
-            gen_ms: 13_597
+            gen_ms: 13_602
+        })
+    );
+}
+
+/// A tool-use turn in a main-session transcript: Claude Code writes one line
+/// per content block, each carrying the message's final `output_tokens`, the
+/// tool_use block landing once its input has streamed (seconds after the
+/// thinking block, measured 2026-10-18), and an earlier tool's result can land
+/// between them. Lines here: thinking at +10 s, a tool_result user line at
+/// +12 s, tool_use at +30 s, both block lines 1000 tokens; the parser reads no
+/// block kind, so `assistant` stands in for both. The span runs from the user
+/// line before the id's first line to its last line: 1000 / 30 s.
+fn tool_use_turn(session: &str, id: &str) -> [String; 4] {
+    let start = ms(START);
+    [
+        user(START, session),
+        assistant(&iso(start + 10_000), session, id, 1000),
+        user(&iso(start + 12_000), session),
+        assistant(&iso(start + 30_000), session, id, 1000),
+    ]
+}
+
+#[test]
+fn a_tool_use_block_streamed_after_the_thinking_ends_the_span() {
+    let home = HomeSandbox::new();
+    reg(None);
+    write_lines(
+        &iso_kerry(home.home()).join("tool.jsonl"),
+        &tool_use_turn("tool", "msg_tool"),
+    );
+    let snap = Producer::new().tick(ms(START) + 31_000);
+    close(
+        snap.sessions["tool"].figures.m5.speed.unwrap(),
+        1000.0 / 30.0,
+        "speed spans the tool_use block",
+    );
+    assert_eq!(
+        snap.days["2026-09-22"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 30_000
+        }
+    );
+}
+
+/// A tick landing between two block lines of one id folds a 10 s span, and
+/// the tool_use line read on the next tick extends it to 30 s. The day sum
+/// takes the extension once: 30 000 ms, never 10 000 nor 40 000.
+#[test]
+fn a_block_line_landing_after_a_tick_extends_the_folded_span_once() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let path = iso_kerry(home.home()).join("tool.jsonl");
+    let [u, thinking, result, tool_use] = tool_use_turn("tool", "msg_tool");
+    write_lines(&path, &[u, thinking]);
+    let mut p = Producer::new();
+    let mid = p.tick(ms(START) + 11_000);
+    assert_eq!(
+        mid.days["2026-09-22"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 10_000
+        },
+        "mid-stream the span ends at the thinking line"
+    );
+    append_lines(&path, &[result, tool_use]);
+    let snap = p.tick(ms(START) + 31_000);
+    assert_eq!(
+        snap.days["2026-09-22"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 30_000
+        }
+    );
+    close(
+        snap.sessions["tool"].figures.m5.speed.unwrap(),
+        1000.0 / 30.0,
+        "the live figure reads the extended span",
+    );
+}
+
+/// A producer restart (a lease handoff, a TUI reopened) between the two block
+/// lines: the previous producer counted the 10 s span and its cache's
+/// `generated_at` sits between the lines; the restarted one re-reads the turn
+/// and folds only the extension: 30 000 ms once, never 10 000 nor 40 000.
+#[test]
+fn a_restart_between_two_block_lines_extends_the_counted_span_once() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let path = iso_kerry(home.home()).join("tool.jsonl");
+    let [u, thinking, result, tool_use] = tool_use_turn("tool", "msg_tool");
+    write_lines(&path, &[u, thinking]);
+    let before = Producer::new().tick(ms(START) + 11_000);
+    assert_eq!(
+        before.days["2026-09-22"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 10_000
+        }
+    );
+    write_cache(home.home(), &before);
+    append_lines(&path, &[result, tool_use]);
+    let snap = Producer::new().tick(ms(START) + 31_000);
+    assert_eq!(
+        snap.days["2026-09-22"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 30_000
+        }
+    );
+}
+
+/// The same restart with the turn straddling UTC midnight: the previous
+/// producer put the 5 s span on 09-22 (the thinking line's day); the restarted
+/// one moves it to 09-23 with the extension, so 09-22 keeps nothing of it and
+/// 09-23 holds 1000 over 30 000 ms.
+#[test]
+fn a_restart_between_block_lines_across_midnight_moves_the_counted_span() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let path = iso_kerry(home.home()).join("midtool.jsonl");
+    write_lines(
+        &path,
+        &[
+            user("2026-09-22T23:59:50.000Z", "midtool"),
+            assistant("2026-09-22T23:59:55.000Z", "midtool", "msg_mt", 1000),
+        ],
+    );
+    let before = Producer::new().tick(ms("2026-09-22T23:59:57.000Z"));
+    assert_eq!(
+        before.days["2026-09-22"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 5_000
+        }
+    );
+    write_cache(home.home(), &before);
+    append_lines(
+        &path,
+        &[assistant(
+            "2026-09-23T00:00:20.000Z",
+            "midtool",
+            "msg_mt",
+            1000,
+        )],
+    );
+    let snap = Producer::new().tick(ms("2026-09-23T00:00:21.000Z"));
+    assert_eq!(
+        snap.days["2026-09-23"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 30_000
+        }
+    );
+    let left = snap
+        .days
+        .get("2026-09-22")
+        .and_then(|d| d.get("kerry"))
+        .and_then(|m| m.get(MODEL));
+    assert!(
+        left.is_none_or(|s| *s == DaySum::default()),
+        "09-22 keeps nothing of the moved turn: {left:?}"
+    );
+}
+
+/// A restart between two block lines of a span-less response (no user line in
+/// its file) that crosses midnight: the previous producer never put it in the
+/// day sums, so the move takes nothing off 09-22's other response and adds
+/// nothing to 09-23.
+#[test]
+fn a_restart_moves_nothing_for_a_spanless_response_crossing_midnight() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let other = iso_kerry(home.home()).join("other.jsonl");
+    write_lines(
+        &other,
+        &[
+            user("2026-09-22T23:59:00.000Z", "other"),
+            assistant("2026-09-22T23:59:30.000Z", "other", "msg_sp", 500),
+        ],
+    );
+    let bare = iso_kerry(home.home()).join("bare.jsonl");
+    write_lines(
+        &bare,
+        &[assistant(
+            "2026-09-22T23:59:55.000Z",
+            "bare",
+            "msg_bare",
+            1000,
+        )],
+    );
+    let before = Producer::new().tick(ms("2026-09-22T23:59:57.000Z"));
+    write_cache(home.home(), &before);
+    append_lines(
+        &bare,
+        &[assistant(
+            "2026-09-23T00:00:20.000Z",
+            "bare",
+            "msg_bare",
+            1000,
+        )],
+    );
+    let snap = Producer::new().tick(ms("2026-09-23T00:00:21.000Z"));
+    assert_eq!(
+        snap.days["2026-09-22"]["kerry"][MODEL],
+        DaySum {
+            output: 500,
+            gen_ms: 30_000
+        }
+    );
+    assert!(
+        !snap.days.contains_key("2026-09-23"),
+        "a span-less response adds no day row: {:?}",
+        snap.days.get("2026-09-23")
+    );
+}
+
+/// A restart whose baseline lines already crossed midnight: the previous
+/// producer moved the 15 s span to 09-23; the restarted one folds only the
+/// extension there and never takes the span off 09-22 a second time.
+#[test]
+fn a_restart_after_the_baseline_crossed_midnight_folds_only_the_extension() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let other = iso_kerry(home.home()).join("other.jsonl");
+    write_lines(
+        &other,
+        &[
+            user("2026-09-22T23:59:00.000Z", "other"),
+            assistant("2026-09-22T23:59:30.000Z", "other", "msg_o", 500),
+        ],
+    );
+    let path = iso_kerry(home.home()).join("midb.jsonl");
+    write_lines(
+        &path,
+        &[
+            user("2026-09-22T23:59:50.000Z", "midb"),
+            assistant("2026-09-22T23:59:55.000Z", "midb", "msg_b", 1000),
+            assistant("2026-09-23T00:00:05.000Z", "midb", "msg_b", 1000),
+        ],
+    );
+    let before = Producer::new().tick(ms("2026-09-23T00:00:06.000Z"));
+    assert_eq!(
+        before.days["2026-09-23"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 15_000
+        }
+    );
+    write_cache(home.home(), &before);
+    append_lines(
+        &path,
+        &[assistant("2026-09-23T00:00:20.000Z", "midb", "msg_b", 1000)],
+    );
+    let snap = Producer::new().tick(ms("2026-09-23T00:00:21.000Z"));
+    assert_eq!(
+        snap.days["2026-09-23"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 30_000
+        }
+    );
+    assert_eq!(
+        snap.days["2026-09-22"]["kerry"][MODEL],
+        DaySum {
+            output: 500,
+            gen_ms: 30_000
+        },
+        "09-22 keeps only the other response"
+    );
+}
+
+/// A block line read later but stamped earlier never moves the end back: the
+/// end is the latest stamp among the id's largest-output lines.
+#[test]
+fn a_line_read_later_with_an_earlier_stamp_never_moves_the_end_back() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let start = ms(START);
+    let lines = [
+        user(START, "ooo"),
+        assistant(&iso(start + 30_000), "ooo", "msg_ooo", 1000),
+        assistant(&iso(start + 10_000), "ooo", "msg_ooo", 1000),
+    ];
+    let path = iso_kerry(home.home()).join("ooo.jsonl");
+    write_lines(&path, &lines);
+    let snap = Producer::new().tick(start + 31_000);
+    assert_eq!(
+        snap.days["2026-09-22"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 30_000
+        }
+    );
+    close(
+        snap.sessions["ooo"].figures.m5.speed.unwrap(),
+        1000.0 / 30.0,
+        "the live figure keeps the later end",
+    );
+    assert_eq!(
+        transcript_speed(&path),
+        Some(DaySum {
+            output: 1000,
+            gen_ms: 30_000
+        })
+    );
+}
+
+#[test]
+fn transcript_speed_ends_a_tool_use_turn_at_its_last_block() {
+    let home = HomeSandbox::new();
+    let path = global_store(home.home()).join("tool.jsonl");
+    write_lines(&path, &tool_use_turn("tool", "msg_tool"));
+    assert_eq!(
+        transcript_speed(&path),
+        Some(DaySum {
+            output: 1000,
+            gen_ms: 30_000
         })
     );
 }
@@ -881,8 +1206,9 @@ fn a_cold_file_joins_at_len_and_reads_only_the_appended_tail() {
 // ── round-4 fixes ─────────────────────────────────────────────────────────────
 
 /// An out-of-order subagent reply (read after the parent's later reply) keeps
-/// its member across a restart: the sorted interval's `from` is lowered to the
-/// earliest reply it covers.
+/// its member across a restart: both replies end before the restart watermark,
+/// so the restarted producer re-reads them as counted and adds neither under
+/// the new member.
 #[test]
 fn out_of_order_subagent_reply_keeps_its_member_after_a_restart() {
     let home = HomeSandbox::new();

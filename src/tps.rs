@@ -99,14 +99,17 @@ struct Resp {
     /// Latest `user` line before this response's first line; `None` when there
     /// is none, which leaves the response without a measurable span.
     start_ms: Option<u64>,
-    /// Timestamp of the first line carrying the largest output seen so far.
+    /// Timestamp of the last line carrying the largest output seen so far.
     end_ms: u64,
     /// Largest output seen so far.
     output: u64,
-    /// The UTC day frozen at first read (the day sums are additive).
+    /// The UTC day its sums sit on: its end line's day, moved when the end
+    /// crosses midnight.
     day: String,
-    /// Whether this response's output/gen_ms are folded into `days`. False for
-    /// a restart re-read (its first line ended at or before the watermark).
+    /// False while every line read so far sits at or before the restart
+    /// watermark (those lines are the previous producer's counted baseline);
+    /// turns true at the first later line, from which on its deltas fold into
+    /// `days`.
     added: bool,
     /// The output already folded into `days`.
     added_output: u64,
@@ -163,12 +166,23 @@ pub(crate) struct Producer {
     session_path: HashMap<String, PathBuf>,
     /// `session_profiles.json` mtime, refreshed once per tick.
     store_mtime: u64,
-    /// The previous cache's `generated_at` (epoch ms): a response whose FIRST
-    /// line ended at or before it was already counted (or was mid-stream at
-    /// shutdown — that residual is never re-added), so its day sums are not
-    /// re-added on a restart. A new file inside the ≤ 5 s discovery lag and
+    /// The previous cache's `generated_at` (epoch ms): lines at or before it
+    /// were counted by the previous producer (they set the baseline); only
+    /// lines after it fold. A new file inside the ≤ 5 s discovery lag and
     /// lines landing between the tail and the last write are the same class of
-    /// residual: they are never counted.
+    /// residual: they are never counted. A baseline built from lines the
+    /// previous producer never read (the residual lines above) lets the
+    /// response's later lines fold only their extension; the extension of a
+    /// response straddling the restart folds under the session's member at
+    /// re-read, so a member swap between the previous producer's read and the
+    /// restart puts the extension on the new member, and when that later line
+    /// also crosses midnight and the new member has a row that day, the move
+    /// takes the baseline off it and adds it to the next, so the turn counts
+    /// under both members (with no row, the turn splits between them); a
+    /// restart on the second UTC day or later after a turn straddled midnight,
+    /// the last cache write before that midnight, skips the turn's pre-cutoff
+    /// lines, so its later line folds as a new response while the old day
+    /// folds into the speed ledger: that turn counts twice.
     watermark_ms: u64,
     /// The speed ledger the producer folds each finalized day into at rollover.
     speed_ledger: crate::token_ledger::SpeedLedger,
@@ -437,8 +451,7 @@ impl Producer {
             } else if len == offset {
                 continue;
             } else {
-                // A read starting at 0 is a first read: apply the cutoff skip
-                // and attribute by the persisted intervals.
+                // A read starting at 0 is a first read: apply the cutoff skip.
                 (offset, offset == 0)
             };
             let new_offset = self.read_append(&path, start, now_ms, first);
@@ -512,87 +525,89 @@ impl Producer {
                 let account = attr
                     .map(str::to_owned)
                     .unwrap_or_else(|| UNATTRIBUTED.to_owned());
-                let resp = self.responses.entry(msg_key).or_insert_with(|| Resp {
-                    session: key.to_owned(),
-                    account,
-                    model,
-                    start_ms,
-                    end_ms: ts,
-                    output,
-                    day: day_of_ms(ts),
-                    // A response whose FIRST line ended at or before the restart
-                    // watermark was already counted (or was mid-stream at shutdown
-                    // — that residual is never re-added).
-                    added: ts > self.watermark_ms,
-                    added_output: 0,
-                    added_gen_ms: 0,
-                });
-                if output > resp.output {
-                    resp.output = output;
-                    resp.end_ms = ts;
-                }
-                // A growing partial whose end crossed UTC midnight moves its
-                // already-added sums to the end day (the ledger keys by end).
-                if resp.added {
-                    let end_day = day_of_ms(resp.end_ms);
-                    if end_day != resp.day {
-                        let had = resp.added_output > 0 || resp.added_gen_ms > 0;
-                        if had {
-                            let old = self
-                                .days
-                                .get_mut(&resp.day)
-                                .and_then(|a| a.get_mut(&resp.account))
-                                .and_then(|m| m.get_mut(&resp.model));
-                            if let Some(old) = old {
-                                old.output = old.output.saturating_sub(resp.added_output);
-                                old.gen_ms = old.gen_ms.saturating_sub(resp.added_gen_ms);
-                                let entry = self
-                                    .days
-                                    .entry(end_day.clone())
-                                    .or_default()
-                                    .entry(resp.account.clone())
-                                    .or_default()
-                                    .entry(resp.model.clone())
-                                    .or_default();
-                                entry.output = entry.output.saturating_add(resp.added_output);
-                                entry.gen_ms = entry.gen_ms.saturating_add(resp.added_gen_ms);
-                            }
-                        }
-                        resp.day = end_day;
-                    }
-                }
-                // Additive day sums: fold only the delta (growing partials count
-                // once), under the account and day frozen at first read. A
-                // span-less response is out of day sums entirely (a day sum is a
-                // speed basis: output paired with gen_ms).
-                if resp.added {
-                    let Some((_, span)) = resp.span() else {
-                        return;
-                    };
-                    let d_out = resp.output.saturating_sub(resp.added_output);
-                    let d_gen = span.saturating_sub(resp.added_gen_ms);
-                    if d_out > 0 || d_gen > 0 {
-                        let entry = self
-                            .days
-                            .entry(resp.day.clone())
-                            .or_default()
-                            .entry(resp.account.clone())
-                            .or_default()
-                            .entry(resp.model.clone())
-                            .or_default();
-                        entry.output = entry.output.saturating_add(d_out);
-                        entry.gen_ms = entry.gen_ms.saturating_add(d_gen);
+                let resp = upsert_response(
+                    &mut self.responses,
+                    msg_key,
+                    Resp {
+                        session: key.to_owned(),
+                        account,
+                        model,
+                        start_ms,
+                        end_ms: ts,
+                        output,
+                        day: day_of_ms(ts),
+                        added: false,
+                        added_output: 0,
+                        added_gen_ms: 0,
+                    },
+                );
+                // Lines at or before the watermark were counted by the previous
+                // producer: record this response's counted baseline (its output,
+                // span and the day those sums sit on) without touching `days`.
+                if ts <= self.watermark_ms && !resp.added {
+                    if let Some((_, span)) = resp.span() {
                         resp.added_output = resp.output;
                         resp.added_gen_ms = span;
                     }
+                    resp.day = day_of_ms(resp.end_ms);
+                    return;
+                }
+                resp.added = true;
+                // A response whose end crossed UTC midnight moves its already-added
+                // sums to the end day (the ledger keys by end).
+                let end_day = day_of_ms(resp.end_ms);
+                if end_day != resp.day {
+                    let had = resp.added_output > 0 || resp.added_gen_ms > 0;
+                    if had {
+                        let old = self
+                            .days
+                            .get_mut(&resp.day)
+                            .and_then(|a| a.get_mut(&resp.account))
+                            .and_then(|m| m.get_mut(&resp.model));
+                        if let Some(old) = old {
+                            old.output = old.output.saturating_sub(resp.added_output);
+                            old.gen_ms = old.gen_ms.saturating_sub(resp.added_gen_ms);
+                            let entry = self
+                                .days
+                                .entry(end_day.clone())
+                                .or_default()
+                                .entry(resp.account.clone())
+                                .or_default()
+                                .entry(resp.model.clone())
+                                .or_default();
+                            entry.output = entry.output.saturating_add(resp.added_output);
+                            entry.gen_ms = entry.gen_ms.saturating_add(resp.added_gen_ms);
+                        }
+                    }
+                    resp.day = end_day;
+                }
+                // A later line folds only its delta, under the account frozen at
+                // first read and the response's current day. A span-less
+                // response is out of day sums entirely (a day sum is a speed
+                // basis: output paired with gen_ms).
+                let Some((_, span)) = resp.span() else {
+                    return;
+                };
+                let d_out = resp.output.saturating_sub(resp.added_output);
+                let d_gen = span.saturating_sub(resp.added_gen_ms);
+                if d_out > 0 || d_gen > 0 {
+                    let entry = self
+                        .days
+                        .entry(resp.day.clone())
+                        .or_default()
+                        .entry(resp.account.clone())
+                        .or_default()
+                        .entry(resp.model.clone())
+                        .or_default();
+                    entry.output = entry.output.saturating_add(d_out);
+                    entry.gen_ms = entry.gen_ms.saturating_add(d_gen);
+                    resp.added_output = resp.output;
+                    resp.added_gen_ms = span;
                 }
             }
         }
     }
 
-    /// Fold this response's output/gen_ms delta into the day sums, under the
-    /// account and day it was first counted on. Growing partials add only the
-    /// delta, so a response is counted once.
     fn build_snapshot(&mut self, now_ms: u64) -> Snapshot {
         let h1_start = now_ms.saturating_sub(H1_WINDOW_MS);
         // 1. which sessions are h1-touched (owned, so the borrow ends here).
@@ -877,15 +892,23 @@ fn response_key(session: &str, id: Option<&str>, user_ts: u64) -> String {
 }
 
 /// The shared fold both [`process_line`] and [`transcript_speed`] drive, so the
-/// span/attribution/partial rules cannot drift between them.
-fn upsert_response(responses: &mut HashMap<String, Resp>, key: String, candidate: Resp) {
+/// span/attribution/partial rules cannot drift between them. A line whose output
+/// is at least the largest seen so far updates `output` and moves `end_ms` to the
+/// later of the stored end and this line's timestamp; a smaller output changes
+/// nothing.
+fn upsert_response(
+    responses: &mut HashMap<String, Resp>,
+    key: String,
+    candidate: Resp,
+) -> &mut Resp {
     let output = candidate.output;
     let end_ms = candidate.end_ms;
     let resp = responses.entry(key).or_insert(candidate);
-    if output > resp.output {
+    if output >= resp.output {
         resp.output = output;
-        resp.end_ms = end_ms;
+        resp.end_ms = resp.end_ms.max(end_ms);
     }
+    resp
 }
 
 /// RFC 3339 (with or without a `Z`/offset, milliseconds) → epoch milliseconds.

@@ -9079,7 +9079,7 @@ fn the_finished_speed_resolver_walks_once_and_backs_off() {
 
 /// A finished delegate whose transcript sits in the global store resolves to
 /// its own average through the producer's `transcript_speed`: the fixture's
-/// one 1222-token response over 13.597 s reads 89.87 t/s.
+/// one 1222-token response over 13.602 s reads 89.84 t/s.
 #[test]
 fn a_finished_jobs_speed_resolves_from_its_transcript() {
     let home = crate::testutil::HomeSandbox::new();
@@ -9121,7 +9121,7 @@ fn a_finished_jobs_speed_resolves_from_its_transcript() {
 
     let speed = app.delegate_speed_cache.get("d-fix").copied();
     assert!(
-        speed.is_some_and(|s| (s - 1222.0 / 13.597).abs() < 1e-3),
+        speed.is_some_and(|s| (s - 1222.0 / 13.602).abs() < 1e-3),
         "the job's own average: {speed:?}"
     );
     assert!(
