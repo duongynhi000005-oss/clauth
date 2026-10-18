@@ -407,7 +407,7 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
         ),
     ];
     for (name, app, section, expected) in cases {
-        let mut term = Terminal::new(TestBackend::new(100, 60)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(130, 60)).unwrap();
         term.draw(|f| draw_help(f, f.area(), app)).unwrap();
         let rows = crate::testutil::buffer_rows(term.backend().buffer());
         let section_row = rows
@@ -487,7 +487,7 @@ fn help_tabs_and_screen_sections_follow_descended_detail_focus() {
         ),
     ];
     for (name, app, screen) in cases {
-        let mut term = Terminal::new(TestBackend::new(100, 60)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(130, 60)).unwrap();
         term.draw(|f| draw_help(f, f.area(), app)).unwrap();
         let rows = crate::testutil::buffer_rows(term.backend().buffer());
         let tabs = rows
@@ -767,7 +767,7 @@ fn the_help_modal_scrolls_its_overflow_instead_of_dropping_it() {
 
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut app = empty_app(Tab::Overview);
-    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(130, 30)).unwrap();
 
     term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
@@ -868,7 +868,7 @@ fn a_help_modal_that_fits_renders_without_a_scrollbar() {
 
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let app = empty_app(Tab::Overview);
-    let mut term = Terminal::new(TestBackend::new(100, 60)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(130, 60)).unwrap();
     term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let (left, right) = rows
@@ -994,7 +994,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
 
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let app = empty_app(Tab::Overview);
-    let mut term = Terminal::new(TestBackend::new(100, 60)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(130, 60)).unwrap();
     term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
     let buf = term.backend().buffer().clone();
     let rows = crate::testutil::buffer_rows(&buf);
@@ -1299,7 +1299,7 @@ fn add_chain_candidate_modal_pins_body_and_named_confirm_button() {
         scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::AddChainCandidate("test_name".into()),
     };
-    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(200, 20)).unwrap();
     term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
     let screen: String = crate::testutil::buffer_rows(term.backend().buffer())
         .into_iter()
@@ -1646,20 +1646,23 @@ fn the_daemon_start_confirm_renders_its_rows_and_spans() {
     assert_eq!(
         rows,
         vec![
-            "╭─ CONFIRM ──────────────────────────────────────────╮".to_string(),
-            "│                                                    │".to_string(),
-            "│  start daemon?                                     │".to_string(),
-            "│  spawns the clauth daemon detached: clauth daemon  │".to_string(),
-            "│  logfile at ~/.clauth/daemon.log.                  │".to_string(),
-            "│                                                    │".to_string(),
-            "│                                 cancel     start   │".to_string(),
-            "│                                                    │".to_string(),
-            "╰────────────────────────────────────────────────────╯".to_string(),
+            "╭─ CONFIRM ────────────────────────────────────╮".to_string(),
+            "│                                              │".to_string(),
+            "│  start daemon?                               │".to_string(),
+            "│  spawns the clauth daemon detached: clauth   │".to_string(),
+            "│  daemon                                      │".to_string(),
+            "│  logfile at ~/.clauth/daemon.log.            │".to_string(),
+            "│                                              │".to_string(),
+            "│                             cancel   start   │".to_string(),
+            "│                                              │".to_string(),
+            "╰──────────────────────────────────────────────╯".to_string(),
         ],
     );
     let fg = |x: usize, y: usize| modal_cell(&buf, origin, x, y).fg;
     // Content starts at column 3: the border plus two cells of padding.
     assert_eq!(fg(3, 2), theme::text_color(), "the message is TEXT");
+    // The detail wraps between words at 42 cells: the dim prefix, then the
+    // ACCENT command split across the wrap.
     for x in 3..38 {
         assert_eq!(
             fg(x, 3),
@@ -1667,7 +1670,7 @@ fn the_daemon_start_confirm_renders_its_rows_and_spans() {
             "the prefix is TEXT_DIM at {x}"
         );
     }
-    for x in 38..51 {
+    for x in 38..44 {
         let cell = modal_cell(&buf, origin, x, 3);
         assert_eq!(
             cell.fg,
@@ -1676,24 +1679,32 @@ fn the_daemon_start_confirm_renders_its_rows_and_spans() {
         );
         assert!(!cell.modifier.contains(Modifier::BOLD), "never bold at {x}");
     }
+    for x in 3..9 {
+        let cell = modal_cell(&buf, origin, x, 4);
+        assert_eq!(
+            cell.fg,
+            theme::accent_color(),
+            "the wrapped command tail is ACCENT at {x}"
+        );
+    }
     for x in 3..35 {
         assert_eq!(
-            fg(x, 4),
+            fg(x, 5),
             theme::text_dim_color(),
             "the logfile line is TEXT_DIM at {x}"
         );
     }
-    // ` cancel ` spans columns 33..41, ` start ` 44..51.
-    for x in 33..41 {
-        let cell = modal_cell(&buf, origin, x, 6);
+    // ` cancel ` spans columns 29..37, ` start ` 38..45.
+    for x in 29..37 {
+        let cell = modal_cell(&buf, origin, x, 7);
         assert_eq!(
             (cell.fg, cell.bg),
             (theme::bg(), theme::text_color()),
             "cancel is the focused inverse block at {x}"
         );
     }
-    for x in 44..51 {
-        assert_eq!(fg(x, 6), theme::text_dim_color(), "start is neutral at {x}");
+    for x in 38..45 {
+        assert_eq!(fg(x, 7), theme::text_dim_color(), "start is neutral at {x}");
     }
 }
 
@@ -1714,25 +1725,26 @@ fn the_stop_shunt_confirm_renders_its_rows_and_a_danger_stop() {
         scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::StopShunt,
     };
-    // 120 columns hold the 103-cell detail on one row.
+    // 120 columns cap the modal at 72 (60%), so the 103-cell detail wraps.
     let (buf, rows, origin) = render_confirm(&state, 120, 24);
     assert_eq!(
         rows,
         vec![
-            "╭─ CONFIRM ─────────────────────────────────────────────────────────────────────────────────────────────────╮".to_string(),
-            "│                                                                                                           │".to_string(),
-            "│  stop shunt?                                                                                              │".to_string(),
-            "│  2 live sessions use it; in-flight requests drain, then the gateway stays off until the daemon restarts.  │".to_string(),
-            "│                                                                                                           │".to_string(),
-            "│                                                                                         cancel     stop   │".to_string(),
-            "│                                                                                                           │".to_string(),
-            "╰───────────────────────────────────────────────────────────────────────────────────────────────────────────╯".to_string(),
+            "╭─ CONFIRM ────────────────────────────────────────────────────────────╮".to_string(),
+            "│                                                                      │".to_string(),
+            "│  stop shunt?                                                         │".to_string(),
+            "│  2 live sessions use it; in-flight requests drain, then the gateway  │".to_string(),
+            "│  stays off until the daemon restarts.                                │".to_string(),
+            "│                                                                      │".to_string(),
+            "│                                                      cancel   stop   │".to_string(),
+            "│                                                                      │".to_string(),
+            "╰──────────────────────────────────────────────────────────────────────╯".to_string(),
         ],
     );
-    // ` stop ` spans the last six inner columns of the button row, 100..106.
-    for x in 100..106 {
+    // ` stop ` spans the last six inner columns of the button row, 63..69.
+    for x in 63..69 {
         assert_eq!(
-            modal_cell(&buf, origin, x, 5).fg,
+            modal_cell(&buf, origin, x, 6).fg,
             crate::tui::theme::danger_color(),
             "stop is DANGER unfocused at {x}"
         );
@@ -2027,8 +2039,9 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
         .unwrap();
     let rows = crate::testutil::buffer_rows(narrow.backend().buffer());
     assert!(
-        rows.iter().any(|row| row.contains("laude/sett"))
-            && rows.iter().any(|row| row.contains("ings.json")),
+        rows.iter().any(|row| row.contains("~/.claude"))
+            && rows.iter().any(|row| row.contains("settings.j"))
+            && rows.iter().any(|row| row.contains("son")),
         "overwrite confirmation hid its consequence ending: {rows:?}"
     );
     assert!(
@@ -2054,7 +2067,7 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
         viewport: std::cell::Cell::new(0),
         overwrite_needs_review: std::cell::Cell::new(true),
     };
-    let mut wide = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    let mut wide = Terminal::new(TestBackend::new(130, 24)).unwrap();
     wide.draw(|f| draw_env_collision(f, f.area(), &full))
         .unwrap();
     let consequence: Vec<_> = crate::testutil::buffer_rows(wide.backend().buffer())
@@ -2647,10 +2660,11 @@ fn the_check_output_modal_ascii_body_renders_unchanged() {
         (
             80,
             &[
-                "│                                                                  │",
-                "│  abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789  │",
-                "│  short                                                           │",
-                "│                                                                  │",
+                "│                                              │",
+                "│  abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP  │",
+                "│  QRSTUVWXYZ0123456789                        │",
+                "│  short                                       │",
+                "│                                              │",
             ],
         ),
     ];
@@ -2776,7 +2790,7 @@ fn render_rebind(form: &crate::tui::app::RebindForm, width: u16, height: u16) ->
 #[test]
 fn the_rebind_confirm_renders_its_grouped_body() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let rows = render_rebind(&rebind_render_form(), 200, 40);
+    let rows = render_rebind(&rebind_render_form(), 300, 40);
     assert_eq!(
         rows,
         [
@@ -2801,7 +2815,7 @@ fn the_rebind_confirm_renders_its_grouped_body() {
             "│    ─● DS1                                                                                                                                                             │",
             "│                                                                                                                                                                       │",
             "│                                                                                                                                                                       │",
-            "│                                                                                                                                                   not now     apply   │",
+            "│                                                                                                                                                     not now   apply   │",
             "│                                                                                                                                                                       │",
             "╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
         ],
@@ -2932,8 +2946,8 @@ fn up_into_a_later_blocks_first_account_shows_its_rows() {
 }
 
 /// The loss warning renders its WARNING title, its sentence-case body (one
-/// line per sentence, whole words at 80 columns), and a right-aligned
-/// `go back` / `discard` pair for both the Setup- and the Fallback-held body
+/// line per sentence so a sentence never shares a row), and a right-aligned
+/// `go back` / `discard` pair for both the Setup- and the Fallback-held body.
 /// Exact rows at 80×24, the size the body once split `acc`/`ount.`.
 #[test]
 fn the_loss_warning_renders_its_title_body_and_buttons() {
@@ -2945,26 +2959,27 @@ fn the_loss_warning_renders_its_title_body_and_buttons() {
         (
             LossWarningDrop::SetupDraft,
             "╭─ WARNING ───────────────────────────────────╮",
-            [
+            vec![
                 "",
                 "  Discard the unsaved edit?",
                 "  There are unsaved edits on the Setup tab.",
                 "  Fallback also edits this account.",
                 "",
-                "                       go back     discard",
+                "                         go back   discard",
                 "",
             ],
         ),
         (
             LossWarningDrop::FallbackEdit,
-            "╭─ WARNING ──────────────────────────────────────╮",
-            [
+            "╭─ WARNING ────────────────────────────────────╮",
+            vec![
                 "",
                 "  Discard the unsaved edit?",
-                "  There are unsaved edits on the Fallback tab.",
+                "  There are unsaved edits on the Fallback",
+                "  tab.",
                 "  Setup also edits this account.",
                 "",
-                "                          go back     discard",
+                "                          go back   discard",
                 "",
             ],
         ),
@@ -3043,7 +3058,7 @@ fn the_new_account_draft_warning_renders_its_body() {
             "  There are unsaved edits on the Setup tab.",
             "  Services also edits the new account form.",
             "",
-            "                       go back     discard",
+            "                         go back   discard",
             "",
         ],
         "the body and button rows"
@@ -3059,7 +3074,7 @@ fn the_help_global_section_names_the_switch_keys() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let app = empty_app(Tab::Overview);
-    let mut term = Terminal::new(TestBackend::new(100, 60)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(130, 60)).unwrap();
     term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let inner: Vec<String> = rows
@@ -3140,4 +3155,874 @@ fn the_help_editable_descended_block_names_the_inert_keys() {
         "│    → · tab · ⇧tab      stays on detail",
         "│",
     ]);
+}
+
+// ── modal sizing, button gap, word wrap ────────────────────────────────────
+
+/// The modal's width in cells, read off its top border.
+fn modal_width(rows: &[String]) -> u16 {
+    let top = rows
+        .iter()
+        .find(|r| r.contains('\u{256d}'))
+        .expect("modal top border");
+    let left = top.chars().position(|c| c == '\u{256d}').unwrap();
+    let right = top.chars().position(|c| c == '\u{256e}').unwrap();
+    (right - left + 1) as u16
+}
+
+/// The modal's rows sliced to its own columns, border to border.
+fn slice_modal(rows: &[String]) -> Vec<String> {
+    let top = rows
+        .iter()
+        .position(|r| r.contains('\u{256d}'))
+        .expect("modal top border");
+    let bottom = rows
+        .iter()
+        .position(|r| r.contains('\u{2570}'))
+        .expect("modal bottom border");
+    let left = rows[top].chars().position(|c| c == '\u{256d}').unwrap();
+    let right = rows[top].chars().position(|c| c == '\u{256e}').unwrap();
+    rows[top..=bottom]
+        .iter()
+        .map(|r| r.chars().skip(left).take(right - left + 1).collect())
+        .collect()
+}
+
+/// Draw one frame at `width`×`height` through `draw` and return the buffer rows.
+fn render_rows(
+    width: u16,
+    height: u16,
+    draw: &dyn Fn(&mut ratatui::Frame<'_>, ratatui::layout::Rect),
+) -> Vec<String> {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    term.draw(|f| draw(f, f.area())).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// The button row's content, borders and alignment padding stripped: the last
+/// non-blank interior row (the buttons sit pinned at the modal's bottom).
+fn button_tail(rows: &[String]) -> String {
+    let row = rows
+        .iter()
+        .rev()
+        .find(|r| {
+            let t = r.trim_matches('\u{2502}').trim();
+            !t.is_empty() && !t.starts_with('\u{2570}') && !t.starts_with('\u{256d}')
+        })
+        .expect("button row");
+    row.trim_matches('\u{2502}').trim().to_string()
+}
+
+/// The text of one line, spans concatenated.
+fn line_text(line: &ratatui::text::Line<'_>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// from 80 columns up a modal caps at 60% of the terminal width
+/// (integer floor: 80→48, 100→60, 160→96); below 80 it caps at
+/// `terminal − 4`; a short modal still fits its content.
+#[test]
+fn the_modal_caps_at_sixty_percent_from_eighty_columns() {
+    use crate::tui::app::{
+        ActionItem, ActionMenuAction, ActionMenuState, ConfirmAction, ConfirmScroll, ConfirmState,
+        EnvCollisionForm,
+    };
+    use ratatui::layout::Rect;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let shunt = ConfirmState {
+        message: "stop shunt?".into(),
+        detail: Some(
+            "2 live sessions use it; in-flight requests drain, then the gateway stays off until the daemon restarts."
+                .into(),
+        ),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::StopShunt,
+    };
+    for (w, want) in [
+        (80u16, 48u16),
+        (81, 48),
+        (99, 59),
+        (100, 60),
+        (160, 96),
+        (79, 75),
+        (45, 41),
+    ] {
+        let (_buf, rows, _origin) = render_confirm(&shunt, w, 24);
+        let got = rows[0].chars().count() as u16;
+        assert_eq!(got, want, "stop shunt? modal width at {w} cols");
+    }
+
+    let ack = ConfirmState {
+        message: "account in use".into(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::Acknowledge,
+    };
+    let (_buf, rows, _origin) = render_confirm(&ack, 80, 24);
+    assert_eq!(
+        rows[0].chars().count(),
+        20,
+        "a short acknowledge stays content-sized at 80: {}",
+        rows[0]
+    );
+
+    let env = EnvCollisionForm {
+        profile: "work".into(),
+        key: "ENDPOINT".into(),
+        reason: "a very long setting name that wraps across the narrow modal content field".into(),
+        existing_idx: None,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        reviewing_overwrite: false,
+        confirm_overwrite: false,
+        max_scroll: std::cell::Cell::new(0),
+        max_scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
+        viewport: std::cell::Cell::new(0),
+        overwrite_needs_review: std::cell::Cell::new(false),
+    };
+    let rows = render_rows(80, 24, &|f: &mut ratatui::Frame<'_>, a: Rect| {
+        draw_env_collision(f, a, &env)
+    });
+    assert_eq!(modal_width(&rows), 48, "env collision modal caps at 60%");
+    let rows = render_rows(45, 24, &|f: &mut ratatui::Frame<'_>, a: Rect| {
+        draw_env_collision(f, a, &env)
+    });
+    assert_eq!(
+        modal_width(&rows),
+        41,
+        "env collision modal keeps width-4 below 80"
+    );
+
+    let menu = ActionMenuState {
+        items: vec![ActionItem {
+            label: "this is a very long action label that overflows sixty percent",
+            hotkey: Some('x'),
+            action: ActionMenuAction::ReloadTokenStats,
+        }],
+        scoped_len: 0,
+        context: None,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    };
+    let rows = render_rows(80, 24, &|f: &mut ratatui::Frame<'_>, a: Rect| {
+        draw_action_menu(f, a, &menu)
+    });
+    assert_eq!(modal_width(&rows), 48, "the action menu shares the 60% cap");
+}
+
+/// every button group keeps a 1-cell gap between buttons; the always-on
+/// ` label ` insets and right alignment stay. Pinned by the exact button row.
+#[test]
+fn the_modal_button_groups_keep_a_one_cell_gap() {
+    use crate::tui::app::{
+        ConfirmAction, ConfirmScroll, ConfirmState, EnvCollisionForm, LossWarningDrop,
+        LossWarningState, PresetApplyButton, PresetApplyForm, PresetTarget, Tab,
+    };
+    use ratatui::layout::Rect;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let shunt = ConfirmState {
+        message: "stop shunt?".into(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::StopShunt,
+    };
+    let (_buf, rows, _origin) = render_confirm(&shunt, 80, 24);
+    assert_eq!(
+        button_tail(&rows),
+        "cancel   stop",
+        "two-button confirm gap"
+    );
+
+    let apply = PresetApplyForm {
+        target: PresetTarget::NewAccount,
+        preset: crate::presets::Preset {
+            name: "p".into(),
+            base_url: None,
+            models: Default::default(),
+            builtin: false,
+        },
+        message: "apply preset p?".into(),
+        replaces: vec!["base url"],
+        leaves: vec!["models"],
+        focus: PresetApplyButton::Cancel,
+        scroll: ConfirmScroll::default(),
+    };
+    let rows = slice_modal(&render_rows(
+        80,
+        24,
+        &|f: &mut ratatui::Frame<'_>, a: Rect| draw_preset_apply(f, a, &apply),
+    ));
+    assert_eq!(
+        button_tail(&rows),
+        "cancel   keep them   clear them",
+        "preset apply gap"
+    );
+
+    let env = EnvCollisionForm {
+        profile: "work".into(),
+        key: "ENDPOINT".into(),
+        reason: "your ~/.claude/settings.json".into(),
+        existing_idx: None,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        reviewing_overwrite: true,
+        confirm_overwrite: false,
+        max_scroll: std::cell::Cell::new(0),
+        max_scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
+        viewport: std::cell::Cell::new(0),
+        overwrite_needs_review: std::cell::Cell::new(true),
+    };
+    let rows = slice_modal(&render_rows(
+        80,
+        24,
+        &|f: &mut ratatui::Frame<'_>, a: Rect| draw_env_collision(f, a, &env),
+    ));
+    assert_eq!(button_tail(&rows), "cancel   add", "env collision gap");
+    // The review group's pair also right-aligns to the inner-right edge, pinned
+    // by the whole row: `│` + 2-cell padding + 28 alignment cells (42 - 14) +
+    // ` cancel   add ` + 2-cell padding + `│`.
+    let want = format!("│{}cancel   add{}│", " ".repeat(31), " ".repeat(3));
+    let button_row = rows
+        .iter()
+        .rev()
+        .find(|r| r.contains("cancel"))
+        .expect("button row");
+    assert_eq!(
+        button_row.as_str(),
+        want,
+        "env collision review right-aligns the pair"
+    );
+
+    let loss = LossWarningState {
+        choice: false,
+        target: Tab::Overview,
+        drop: LossWarningDrop::SetupDraft,
+    };
+    let rows = slice_modal(&render_rows(
+        80,
+        24,
+        &|f: &mut ratatui::Frame<'_>, a: Rect| draw_loss_warning(f, a, &loss),
+    ));
+    assert_eq!(button_tail(&rows), "go back   discard", "loss warning gap");
+
+    let rows = render_rebind(&rebind_render_form(), 80, 40);
+    assert_eq!(button_tail(&rows), "not now   apply", "rebind gap");
+}
+
+/// `chunk_line` wraps at word boundaries, still splits a word
+/// longer than the row by display cell between graphemes, measures wide glyphs
+/// by cells, and keeps each span's style across the break.
+#[test]
+fn chunk_line_wraps_between_words_and_splits_long_words_by_cells() {
+    use crate::tui::theme;
+    use ratatui::style::Style;
+    use ratatui::text::{Line, Span};
+
+    let rows = chunk_line(Line::from("a b c d e"), 5);
+    assert!(
+        rows.iter().all(|r| r.width() <= 5),
+        "no row wider than the inner width: {rows:?}"
+    );
+    let joined = rows.iter().map(line_text).collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        joined, "a b c d e",
+        "the source joins back whole, break spaces restored"
+    );
+
+    let rows = chunk_line(Line::from("abcdefghij"), 4);
+    assert_eq!(
+        rows.iter().map(line_text).collect::<Vec<_>>().concat(),
+        "abcdefghij",
+        "a long word splits by cell and loses nothing"
+    );
+    assert!(rows.iter().all(|r| r.width() <= 4));
+
+    let rows = chunk_line(Line::from("日本語"), 4);
+    assert_eq!(rows.len(), 2, "a wide glyph is measured by its cells");
+    assert_eq!(rows[0].width(), 4);
+    assert_eq!(rows[1].width(), 2);
+    assert_eq!(
+        rows.iter().map(line_text).collect::<Vec<_>>().concat(),
+        "日本語"
+    );
+
+    let line = Line::from(vec![
+        Span::styled("aa ", Style::default().fg(theme::accent_color())),
+        Span::styled("bb cc dd", Style::default().fg(theme::text_dim_color())),
+    ]);
+    let rows = chunk_line(line, 5);
+    assert_eq!(
+        rows[0].spans.len(),
+        2,
+        "the break keeps the styled spans apart"
+    );
+    assert_eq!(rows[0].spans[0].content, "aa ");
+    assert_eq!(rows[0].spans[0].style.fg, Some(theme::accent_color()));
+    assert_eq!(rows[0].spans[1].content, "bb");
+    assert_eq!(rows[0].spans[1].style.fg, Some(theme::text_dim_color()));
+    assert_eq!(rows[1].spans[0].content, "cc dd");
+    assert_eq!(rows[1].spans[0].style.fg, Some(theme::text_dim_color()));
+}
+
+/// The word-wrap invariants hold for every short input. Enumerating all strings
+/// over `{a, b, space, tab, 漢, NBSP, NNBSP, figure space}` up to length 7 at
+/// every width 1..=6: no row exceeds the width (a wider grapheme takes a row
+/// of its own), the rows walk the tab-normalised source exactly (break
+/// whitespace skipped only between rows, nothing else dropped, reordered or
+/// duplicated), no row is empty, and no whitespace-only row follows a row that
+/// carries content. The named probes and a multi-span probe then pin the exact
+/// rows and each grapheme's span style.
+#[test]
+fn chunk_line_wraps_any_input_without_overrun_or_loss() {
+    use crate::tui::theme;
+    use ratatui::style::Style;
+    use ratatui::text::{Line, Span};
+
+    // Break points are whitespace minus the glue U+00A0/U+202F/U+2007; a tab is
+    // one break space.
+    fn is_break_space(c: char) -> bool {
+        c.is_whitespace() && !matches!(c, '\u{a0}' | '\u{202f}' | '\u{2007}')
+    }
+    fn cell_w(c: char) -> usize {
+        Span::raw(c.to_string()).width()
+    }
+    fn flatten_styled(line: &Line<'static>) -> Vec<(String, Style)> {
+        let mut v = Vec::new();
+        for span in &line.spans {
+            for g in Span::raw(span.content.as_ref()).styled_graphemes(Style::default()) {
+                v.push((g.symbol.to_string(), span.style));
+            }
+        }
+        v
+    }
+    fn check_wrap_invariants(s: &str, w: usize, rows: &[Line<'static>]) {
+        // (c) no empty row unless the source is empty.
+        if !s.is_empty() {
+            for (i, r) in rows.iter().enumerate() {
+                assert!(!line_text(r).is_empty(), "empty row {i} for {s:?} at w={w}");
+            }
+        }
+        // (a) a row may exceed `w` only as a single grapheme wider than `w`.
+        for r in rows {
+            if r.width() > w {
+                assert!(
+                    line_text(r).chars().count() == 1,
+                    "{} cells in one row for {s:?} at w={w}: {r:?}",
+                    r.width()
+                );
+            }
+        }
+        // (b) the rows walk the tab-normalised source exactly: break whitespace
+        // is skipped only between rows, nothing else is dropped, reordered or
+        // duplicated, and no row loses or gains whitespace mid-row.
+        let source: String = s.chars().map(|c| if c == '\t' { ' ' } else { c }).collect();
+        let mut it = source.chars().peekable();
+        for (i, r) in rows.iter().enumerate() {
+            let row_text = line_text(r);
+            let leads_with_ws = row_text.chars().next().is_some_and(is_break_space);
+            if i > 0 && !leads_with_ws {
+                while it.peek().is_some_and(|&c| is_break_space(c)) {
+                    it.next();
+                }
+            }
+            for c in row_text.chars() {
+                assert_eq!(
+                    it.next(),
+                    Some(c),
+                    "mid-row content changed for {s:?} at w={w}: {rows:?}"
+                );
+            }
+        }
+        while it.peek().is_some_and(|&c| is_break_space(c)) {
+            it.next();
+        }
+        assert!(
+            it.next().is_none(),
+            "content dropped for {s:?} at w={w}: {rows:?}"
+        );
+        // (c') a whitespace-only leading row is allowed only while the indent
+        // leaves no room for the word's first grapheme (or the source line is
+        // all whitespace); a whitespace-only row after content reds.
+        if let Some(first) = s.chars().find(|&c| !is_break_space(c)) {
+            let indent: usize = s
+                .chars()
+                .take_while(|&c| is_break_space(c))
+                .map(cell_w)
+                .sum();
+            let first_ws_only = line_text(&rows[0]).chars().all(is_break_space);
+            assert!(
+                !first_ws_only || indent + cell_w(first) > w,
+                "whitespace-only first row for {s:?} at w={w}: {rows:?}"
+            );
+        }
+        let mut seen_content = false;
+        for (i, r) in rows.iter().enumerate() {
+            let ws_only = line_text(r).chars().all(is_break_space);
+            assert!(
+                !(ws_only && seen_content),
+                "whitespace-only row {i} for {s:?} at w={w}: {rows:?}"
+            );
+            seen_content |= !ws_only;
+        }
+    }
+
+    let alphabet = [
+        'a', 'b', ' ', '\t', '漢', '\u{a0}', '\u{202f}', '\u{2007}', '\u{3000}',
+    ];
+    let mut checked = 0usize;
+    for len in 0..=7usize {
+        let total = alphabet.len().pow(len as u32);
+        let mut buf = vec![' '; len];
+        for mut n in 0..total {
+            for slot in &mut buf {
+                *slot = alphabet[n % alphabet.len()];
+                n /= alphabet.len();
+            }
+            let s: String = buf.iter().collect();
+            for w in 1..=6usize {
+                check_wrap_invariants(&s, w, &chunk_line(Line::from(s.as_str()), w));
+                checked += 1;
+            }
+            // (f) `w == 0` keeps the early return: the line, whole (tabs as
+            // one space).
+            let rows = chunk_line(Line::from(s.as_str()), 0);
+            assert_eq!(rows.len(), 1, "w=0 keeps the line whole for {s:?}");
+            let normalized: String = s.chars().map(|c| if c == '\t' { ' ' } else { c }).collect();
+            assert_eq!(
+                line_text(&rows[0]),
+                normalized,
+                "w=0 keeps the content for {s:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 2_000_000, "the sweep covered {checked} cases");
+
+    // The named probes, pinned row for row.
+    let probes: [(&str, usize, &[&str]); 18] = [
+        (" abcd漢", 5, &[" abcd", "漢"]),
+        (" abcdefgh", 5, &[" abcd", "efgh"]),
+        ("  abcd", 5, &["  abc", "d"]),
+        ("abcd   efgh", 5, &["abcd", "efgh"]),
+        ("abcd  efgh   ", 5, &["abcd", "efgh "]),
+        ("abcde ", 5, &["abcde"]),
+        ("abcd ", 4, &["abcd"]),
+        ("a ", 1, &["a"]),
+        ("ab\u{3000}", 2, &["ab"]),
+        ("     ", 4, &["    ", " "]),
+        ("漢字", 1, &["漢", "字"]),
+        ("abc\u{a0}def ghi", 5, &["abc\u{a0}d", "ef", "ghi"]),
+        ("a\u{202f}b c", 3, &["a\u{202f}b", "c"]),
+        ("a\u{2007}bcd e", 4, &["a\u{2007}bc", "d e"]),
+        ("    ab", 4, &["    ", "ab"]),
+        ("    漢b", 4, &["    ", "漢b"]),
+        ("\u{3000}ab", 2, &["\u{3000}", "ab"]),
+        (" \tab", 2, &["  ", "ab"]),
+    ];
+    for (s, w, want) in probes {
+        let rows = chunk_line(Line::from(s), w);
+        let got: Vec<String> = rows.iter().map(line_text).collect();
+        let want: Vec<String> = want.iter().map(|x| (*x).to_string()).collect();
+        assert_eq!(got, want, "probe {s:?} at w={w}");
+    }
+
+    // (d) every grapheme keeps the style of its source span across a split.
+    let split = Line::from(vec![
+        Span::styled("abcd", Style::default().fg(theme::accent_color())),
+        Span::styled("efgh", Style::default().fg(theme::text_dim_color())),
+    ]);
+    let out: Vec<(String, Style)> = chunk_line(split.clone(), 3)
+        .iter()
+        .flat_map(flatten_styled)
+        .collect();
+    assert_eq!(
+        out,
+        flatten_styled(&split),
+        "every grapheme keeps its span style across the split"
+    );
+}
+
+/// A tab in a body line is one break space: it wraps like a space and never
+/// vanishes or glues its neighbours.
+#[test]
+fn chunk_line_treats_a_tab_as_one_break_space() {
+    use crate::tui::theme;
+    use ratatui::style::Style;
+    use ratatui::text::{Line, Span};
+
+    let rows = chunk_line(Line::from("key\tvalue and more words here"), 10);
+    assert_eq!(
+        rows.iter().map(line_text).collect::<Vec<_>>(),
+        ["key value", "and more", "words here"],
+        "a tab wraps like a space"
+    );
+
+    // a leading tab is indent glue, exactly a leading space.
+    let tab_indent = chunk_line(Line::from("\tab"), 2);
+    let sp_indent = chunk_line(Line::from(" ab"), 2);
+    assert_eq!(
+        tab_indent.iter().map(line_text).collect::<Vec<_>>(),
+        sp_indent.iter().map(line_text).collect::<Vec<_>>(),
+        "a leading tab indents like a leading space"
+    );
+
+    // a tab-only line is all whitespace: it splits by cell like spaces.
+    assert_eq!(
+        chunk_line(Line::from("\t\t\t\t"), 3)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>(),
+        ["   ", " "],
+        "a tab-only line splits by cell"
+    );
+
+    // a tab at a span boundary is one space in the first span, breakable there.
+    let line = Line::from(vec![
+        Span::styled("tab\t", Style::default().fg(theme::accent_color())),
+        Span::styled("ended", Style::default().fg(theme::text_dim_color())),
+    ]);
+    let rows = chunk_line(line, 5);
+    assert_eq!(
+        rows.iter().map(line_text).collect::<Vec<_>>(),
+        ["tab", "ended"],
+        "a tab ending a span breaks there"
+    );
+    assert_eq!(
+        rows[0].spans[0].style.fg,
+        Some(theme::accent_color()),
+        "the break keeps the first span's style"
+    );
+    assert_eq!(
+        rows[1].spans[0].style.fg,
+        Some(theme::text_dim_color()),
+        "the break keeps the second span's style"
+    );
+}
+
+/// A check-output body keeps the tab between stderr fields as one space: the
+/// field names never glue.
+#[test]
+fn the_check_output_modal_keeps_a_space_between_tab_separated_fields() {
+    use crate::tui::app::{Modal, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = empty_app(Tab::Services);
+    app.open_modal(Modal::CheckOutput("name\tvalue".to_string()));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+    term.draw(|fr| crate::tui::render::draw(fr, &app)).unwrap();
+    let got = check_output_body_rows(&term);
+    // content-fit: 10-cell body + 6 chrome = 16, but the title pins 17 -> a
+    // 17-wide modal, 15 interior, 11 content cells; "name value" fills 10.
+    let blank = format!("│{}│", " ".repeat(15));
+    let want = vec![
+        blank.clone(),
+        format!("│  name value{}│", " ".repeat(3)),
+        blank,
+    ];
+    assert_eq!(got, want, "the tab renders as one space at 80×30");
+}
+
+/// Trailing whitespace that would run past the row end is dropped, so a line
+/// that ends in spaces draws no blank row before the next line.
+#[test]
+fn the_check_output_modal_drops_trailing_whitespace_that_overflows() {
+    use crate::tui::app::{Modal, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let body = "error: the config file failed to parse ok   \nnext line";
+    let mut app = empty_app(Tab::Services);
+    app.open_modal(Modal::CheckOutput(body.to_string()));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+    term.draw(|fr| crate::tui::render::draw(fr, &app)).unwrap();
+    let got = check_output_body_rows(&term);
+    // 80 cols -> 48-wide modal, 46 interior, 42 content cells. The 44-cell
+    // line keeps the one trailing space that fits and drops the two that
+    // straddle the row end, so no blank row sits before `next line`.
+    let blank = format!("│{}│", " ".repeat(46));
+    let want = vec![
+        blank.clone(),
+        format!("│  {}  │", "error: the config file failed to parse ok "),
+        format!("│  next line{}│", " ".repeat(35)),
+        blank,
+    ];
+    assert_eq!(
+        got, want,
+        "trailing whitespace past the row end draws no blank row"
+    );
+}
+
+/// The help modal's wrapped shape at the common 80-column width (a 48-wide
+/// modal): a long description wraps onto the next row under the key column.
+/// One exact pin here, beside the widened (content-fit) help pins above.
+#[test]
+fn the_help_modal_wraps_long_rows_at_the_common_width() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = empty_app(Tab::Overview);
+    let mut term = Terminal::new(TestBackend::new(80, 60)).unwrap();
+    term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let sliced = slice_modal(&rows);
+    let want: Vec<String> = [
+        "╭─ KEYS ───────────────────────────────────────╮",
+        "│                                              │",
+        "│  THIS MODAL                                ┃ │",
+        "│                                            ┃ │",
+        "│    ↑ ↓                 scroll              ┃ │",
+        "│    esc · q · ?         close               ┃ │",
+        "│                                            ┃ │",
+        "│  ACCOUNTS                                  ┃ │",
+        "│                                            ┃ │",
+        "│    ↑ ↓                 move cursor         ┃ │",
+        "│    ↵                   switch to selected  ┃ │",
+        "│  account (confirm)                         ┃ │",
+        "│    shift ↑ ↓           reorder account up /┃ │",
+        "│  down                                      ┃ │",
+        "│                                            ┃ │",
+        "│  GLOBAL                                    ┃ │",
+        "│                                            ┃ │",
+        "│    n                   new account         ┃ │",
+        "│    r                   refresh usage now   ┃ │",
+        "│    t                   rotate all tokens   ┃ │",
+        "│    d                   resolve credential  ┃ │",
+        "│  divergence (when flagged)                 ┃ │",
+        "│    ?                   toggle this help    ┃ │",
+        "│    a                   actions             ┃ │",
+        "│    x                   dismiss toast /     ┃ │",
+        "│  alert                                     ┃ │",
+        "│    q                   back / quit         ┃ │",
+        "│    ← →                 switch screen       ┃ │",
+        "│    tab                 next screen         ┃ │",
+        "│    ⇧tab                previous screen     ┃ │",
+        "│    ⌥1-9                jump to tab         ┃ │",
+        "│    esc                 back within a       ┃ │",
+        "│  sub-view (no-op at the top level)         ┃ │",
+        "│    page up / page down  scroll a page      ┃ │",
+        "│    ⌃c                  quit from anywhere  ┃ │",
+        "│                                            ┃ │",
+        "│  GLYPHS                                    ┃ │",
+        "│                                            ┃ │",
+        "│    ●                   the active account  ┃ │",
+        "│    ⇄                   a live session here ┃ │",
+        "│  follows the fallback chain                ┃ │",
+        "│    ↲                   the chain switches  ┃ │",
+        "│  to this account next                      ┃ │",
+        "│    ⊖                   disabled            ┃ │",
+        "│    ⊖                   canceled            ┃ │",
+        "│    ×                   auth broken         ┃ │",
+        "│    ×                   key rejected        ┃ │",
+        "│    ⊘                   weekly spent        ┃ │",
+        "│    ⧗                   claude code blocked ┃ │",
+        "│    $                   extra usage spent   ┃ │",
+        "│    ◔                   5h window spent     ┃ │",
+        "│    ⊘                   one model's week    ┊ │",
+        "│  spent, other models ok                    ┊ │",
+        "│    ~                   past the weekly     ┊ │",
+        "│                                              │",
+        "╰──────────────────────────────────────────────╯",
+    ]
+    .into_iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(sliced, want, "the wrapped help modal at 80×60");
+}
+
+/// the `stop shunt?` detail at 80 columns breaks between words,
+/// no row exceeds the inner width, and both buttons stay visible one cell apart.
+#[test]
+fn the_stop_shunt_confirm_wraps_its_detail_between_words() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let state = ConfirmState {
+        message: "stop shunt?".into(),
+        detail: Some(
+            "2 live sessions use it; in-flight requests drain, then the gateway stays off until the daemon restarts."
+                .into(),
+        ),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::StopShunt,
+    };
+    let (_buf, rows, _origin) = render_confirm(&state, 80, 24);
+    assert_eq!(
+        rows[0].chars().count(),
+        48,
+        "the modal is 48 wide at 80 cols"
+    );
+    let inner_w = 42usize;
+    let source = "2 live sessions use it; in-flight requests drain, then the gateway stays off until the daemon restarts.";
+    let detail_rows = &rows[3..6];
+    for row in detail_rows {
+        assert!(
+            row.trim_matches('\u{2502}').trim().chars().count() <= inner_w,
+            "no detail row exceeds the inner width: {row}"
+        );
+    }
+    let rejoined = detail_rows
+        .iter()
+        .map(|r| r.trim_matches('\u{2502}').trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        rejoined, source,
+        "the detail breaks between words, losing nothing"
+    );
+    assert_eq!(
+        button_tail(&rows),
+        "cancel   stop",
+        "both buttons, one cell apart"
+    );
+}
+
+/// a modal text field (the shared name prompt) keeps the caret on its
+/// input cell while a typed value overruns the window, at 80 and 45 columns,
+/// frame to frame. A regression guard: word wrap must never fold the field.
+#[test]
+fn the_modal_field_keeps_its_caret_on_the_input_across_typed_overflow() {
+    use crate::testutil::{draw_caret, key, right_border, symbol_at};
+    use crate::tui::app::{InputState, Modal, NamePromptAction, NamePromptForm, Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for w in [80u16, 45u16] {
+        let mut app = empty_app(Tab::Overview);
+        app.open_modal(Modal::NamePrompt(NamePromptForm {
+            input: InputState::new(""),
+            action: NamePromptAction::DuplicateProfile("src".into()),
+        }));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 20)).unwrap();
+        for ch in "a".repeat(60).chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+            let (caret, buf) = draw_caret(&mut term, |f| crate::tui::render::draw(f, &app));
+            let border = right_border(&buf, caret.y);
+            assert!(
+                caret.x + 2 <= border,
+                "[{w}] caret {caret:?} leaves the field before border {border}"
+            );
+        }
+        handle_key(&mut app, key(KeyCode::Left));
+        let (caret, buf) = draw_caret(&mut term, |f| crate::tui::render::draw(f, &app));
+        assert!(
+            symbol_at(&buf, caret.x, caret.y) != " ",
+            "[{w}] the caret sits on an input cell"
+        );
+    }
+}
+
+/// a confirm whose word-wrapped body outgrows a 14-row terminal still
+/// scrolls by the rendered viewport and reaches its tail, with the buttons
+/// pinned; the offset persists across frames (draw, key, draw). PageDown and
+/// PageUp step one `page_step(viewport)` each, so every body row appears in
+/// some frame — a step that skips rows (a `viewport + 2` arm) must red here.
+#[test]
+fn a_word_wrapped_confirm_scrolls_to_its_tail_on_a_short_terminal() {
+    use crate::testutil::key;
+    use crate::tui::app::{
+        App, ConfirmAction, ConfirmScroll, ConfirmState, Modal, Tab, handle_key, page_step,
+    };
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::KeyCode;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = empty_app(Tab::Overview);
+    let detail = (0..60)
+        .map(|i| format!("word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: "replace the stored credentials?".into(),
+        detail: Some(format!("{detail} and the tail word is TAILMARK")),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RotateAll,
+    }));
+    let mut term = ratatui::Terminal::new(TestBackend::new(80, 14)).unwrap();
+    let scroll = |app: &App| -> (usize, usize, usize) {
+        match app.modals.last() {
+            Some(Modal::Confirm(state)) => (
+                state.scroll.offset as usize,
+                state.scroll.max_scroll.get() as usize,
+                state.scroll.viewport.get() as usize,
+            ),
+            _ => panic!("confirm modal expected"),
+        }
+    };
+    let draw = |app: &App, term: &mut ratatui::Terminal<TestBackend>| {
+        term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    };
+    draw(&app, &mut term);
+    let before = crate::testutil::buffer_rows(term.backend().buffer()).concat();
+    assert!(!before.contains("TAILMARK"), "the tail starts offscreen");
+    let (offset, max, viewport) = scroll(&app);
+    assert_eq!(offset, 0, "starts at the top");
+    assert!(max > 0, "the body overflows");
+    let step = page_step(viewport);
+    let mut seen = vec![false; max + viewport];
+    let mark = |offset: usize, seen: &mut [bool]| {
+        let end = (offset + viewport).min(seen.len());
+        for s in seen.iter_mut().take(end).skip(offset) {
+            *s = true;
+        }
+    };
+    mark(offset, &mut seen);
+
+    // Page down to the tail: every step is one page, nothing is skipped.
+    let mut offset = offset;
+    while offset < max {
+        handle_key(&mut app, key(KeyCode::PageDown));
+        draw(&app, &mut term);
+        let (next, _, _) = scroll(&app);
+        if next < max {
+            assert_eq!(next - offset, step, "PageDown steps one page");
+        } else {
+            assert!(
+                next - offset <= step,
+                "the last PageDown clamps to the tail"
+            );
+        }
+        offset = next;
+        mark(offset, &mut seen);
+    }
+    assert!(
+        crate::testutil::buffer_rows(term.backend().buffer())
+            .concat()
+            .contains("TAILMARK"),
+        "the tail is on screen at the bottom"
+    );
+
+    // Page up to the top, symmetric.
+    while offset > 0 {
+        handle_key(&mut app, key(KeyCode::PageUp));
+        draw(&app, &mut term);
+        let (next, _, _) = scroll(&app);
+        if next > 0 {
+            assert_eq!(offset - next, step, "PageUp steps one page");
+        }
+        offset = next;
+        mark(offset, &mut seen);
+    }
+    assert_eq!(offset, 0, "PageUp returns to the top");
+    assert!(
+        seen.iter().all(|&s| s),
+        "every body row appears in some frame"
+    );
+
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter().any(|r| r.contains("cancel")),
+        "the buttons stay pinned while the wrapped body scrolls"
+    );
 }

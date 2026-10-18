@@ -208,8 +208,18 @@ fn draw_codex_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_modal_scrolled(frame, area, "LOGIN", lines, 0, None, None);
 }
 
+/// The modal width cap: 60% of the terminal width (integer floor) from 80
+/// columns up, `area.width - 4` below — a short modal still fits its content.
+fn modal_width_cap(area_w: u16) -> u16 {
+    if area_w >= 80 {
+        (u32::from(area_w) * 60 / 100) as u16
+    } else {
+        area_w.saturating_sub(4)
+    }
+}
+
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let w = width.min(area.width.saturating_sub(4));
+    let w = width.min(modal_width_cap(area.width));
     let h = height.min(area.height.saturating_sub(4));
     Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
@@ -268,11 +278,12 @@ fn draw_modal_focused(
 /// Modal sized to content: snaps to widest line/title, exact line count.
 /// Chrome = rounded border (1) + `Padding::new(2,2,1,1)` = 6 cols, 4 rows.
 ///
-/// A line wider than the modal's inner width (only possible on a terminal
+/// A line wider than the modal's inner width (a capped modal, or a terminal
 /// too narrow for the content) is pre-split into inner-width rows by
-/// [`chunk_line`], so the height is exact by construction — ratatui's own
+/// [`chunk_line`] — between words, a word wider than the row still splitting
+/// by grapheme — so the height is exact by construction; ratatui's own
 /// word-wrap may use MORE rows than any cheap estimate and silently clip the
-/// tail. On any terminal wide enough for the content nothing splits.
+/// tail. On a modal wide enough for the content nothing splits.
 ///
 /// The content scrolls to start at row `scroll`, returning
 /// a [`ModalDraw`] — the largest offset the content allows (so a caller holding
@@ -342,14 +353,18 @@ fn draw_modal_scrolled(
     focus: Option<(std::ops::Range<usize>, &std::cell::Cell<usize>, FocusEnd)>,
     extra: Option<ModalExtra<'_>>,
 ) -> ModalDraw {
-    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let content_w = lines
+        .iter()
+        .map(|line| normalize_tabs(line).width())
+        .max()
+        .unwrap_or(0) as u16;
     let button_w = match &extra {
         Some(ModalExtra::Buttons(buttons)) => buttons.width() as u16,
         _ => 0,
     };
     let w = (content_w.max(button_w) + 6)
         .max(modal_title_w(title))
-        .min(area.width.saturating_sub(4));
+        .min(modal_width_cap(area.width));
     let inner_w = (w.saturating_sub(6) as usize).max(1);
     let line_count = lines.len();
     let mut caret_row = None;
@@ -483,58 +498,179 @@ fn draw_modal_scrolled(
     }
 }
 
-/// Split one styled line into `w`-column rows between graphemes, measured in
+/// A tab in a modal body is one break space: ratatui drops control characters
+/// from both its grapheme iterator and the buffer, so a raw tab would glue its
+/// neighbours, never wrap, and render as nothing. Map `\t` to one space up
+/// front so the width, the break logic and the render all agree.
+fn normalize_tabs(line: &Line<'_>) -> Line<'static> {
+    let mut out = Line::from(
+        line.spans
+            .iter()
+            .map(|s| Span::styled(s.content.replace('\t', " "), s.style))
+            .collect::<Vec<_>>(),
+    )
+    .style(line.style);
+    out.alignment = line.alignment;
+    out
+}
+
+/// Split one styled line into `w`-column rows between words, measured in
 /// display cells, preserving span styles and the line's alignment/style: modal
 /// bodies can carry a failed check's real stderr, and a CJK or emoji grapheme
 /// counted as one char would overrun its row, which ratatui cuts with no `…`.
-/// A grapheme wider than `w` takes a row of its own, whole.
+/// A word wider than `w` splits by grapheme, whole; a grapheme wider than `w`
+/// takes a row of its own, whole. A tab is one break space. Only a break's
+/// whitespace run is dropped: a leading indent is kept, trailing whitespace
+/// that fits stays and the overflow drops, and a non-breaking space
+/// (U+00A0/U+202F/U+2007) is never a break point.
 fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
-    let own = |l: &Line<'_>| -> Line<'static> {
-        let mut out = Line::from(
-            l.spans
-                .iter()
-                .map(|s| Span::styled(s.content.to_string(), s.style))
-                .collect::<Vec<_>>(),
-        )
-        .style(l.style);
-        out.alignment = l.alignment;
-        out
-    };
+    let line = normalize_tabs(&line);
     if w == 0 || line.width() <= w {
-        return vec![own(&line)];
+        return vec![line];
     }
 
+    // Flatten to (grapheme, cells, style), so a word spanning styled spans
+    // still wraps as one word and each broken row re-coalesces its styles.
+    let mut flat: Vec<(String, usize, Style)> = Vec::new();
+    for span in &line.spans {
+        for grapheme in Span::raw(span.content.as_ref()).styled_graphemes(Style::default()) {
+            flat.push((
+                grapheme.symbol.to_string(),
+                Span::raw(grapheme.symbol).width(),
+                span.style,
+            ));
+        }
+    }
+    // Break points are whitespace minus the glue U+00A0/U+202F/U+2007.
+    let is_break_space = |sym: &str| {
+        !sym.is_empty()
+            && sym
+                .chars()
+                .all(|c| c.is_whitespace() && !matches!(c, '\u{a0}' | '\u{202f}' | '\u{2007}'))
+    };
+
+    // Split into alternating runs of break whitespace and words (everything
+    // else, the glue non-breaking spaces included).
+    #[derive(Clone)]
+    enum Atom {
+        Space(Vec<(String, usize, Style)>),
+        Word(Vec<(String, usize, Style)>),
+    }
+    let mut atoms: Vec<Atom> = Vec::new();
+    let mut idx = 0;
+    while idx < flat.len() {
+        let spacey = is_break_space(&flat[idx].0);
+        let mut run: Vec<(String, usize, Style)> = Vec::new();
+        while idx < flat.len() && is_break_space(&flat[idx].0) == spacey {
+            run.push(flat[idx].clone());
+            idx += 1;
+        }
+        atoms.push(if spacey {
+            Atom::Space(run)
+        } else {
+            Atom::Word(run)
+        });
+    }
+    // A leading indent glues to the first word: when the two don't fit one row
+    // the word splits by cell and keeps the indent on its first row, unless the
+    // indent leaves no room for the first grapheme of the word — then the indent
+    // takes whitespace-only leading rows and the word starts the next.
+    if atoms.len() >= 2
+        && let Atom::Space(indent) = atoms[0].clone()
+        && let Atom::Word(mut word) = atoms[1].clone()
+    {
+        let mut merged = indent;
+        merged.append(&mut word);
+        atoms[0] = Atom::Word(merged);
+        atoms.remove(1);
+    }
+
+    let line_style = line.style;
+    let alignment = line.alignment;
     let mut rows: Vec<Line<'static>> = Vec::new();
-    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur: Vec<(String, usize, Style)> = Vec::new();
     let mut used = 0usize;
-    let mut flush = |cur: &mut Vec<Span<'static>>| {
-        let mut row = Line::from(std::mem::take(cur)).style(line.style);
-        row.alignment = line.alignment;
+
+    let flush = |rows: &mut Vec<Line<'static>>, cur: &mut Vec<(String, usize, Style)>| {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (sym, _, style) in cur.drain(..) {
+            match spans.last_mut() {
+                Some(last) if last.style == style => last.content.to_mut().push_str(&sym),
+                _ => spans.push(Span::styled(sym, style)),
+            }
+        }
+        let mut row = Line::from(spans).style(line_style);
+        row.alignment = alignment;
         rows.push(row);
     };
-    for span in &line.spans {
-        let mut buf = String::new();
-        let mut buf_w = 0usize;
-        for grapheme in Span::raw(span.content.as_ref()).styled_graphemes(Style::default()) {
-            let gw = Span::raw(grapheme.symbol).width();
-            if used + buf_w > 0 && used + buf_w + gw > w {
-                if !buf.is_empty() {
-                    cur.push(Span::styled(std::mem::take(&mut buf), span.style));
-                    buf_w = 0;
-                }
-                flush(&mut cur);
-                used = 0;
+    let push = |g: (String, usize, Style),
+                used: &mut usize,
+                cur: &mut Vec<(String, usize, Style)>,
+                rows: &mut Vec<Line<'static>>| {
+        let gw = g.1;
+        if *used + gw <= w {
+            cur.push(g);
+            *used += gw;
+        } else {
+            if !cur.is_empty() {
+                flush(rows, cur);
+                *used = 0;
             }
-            buf.push_str(grapheme.symbol);
-            buf_w += gw;
+            cur.push(g);
+            *used += gw;
         }
-        if !buf.is_empty() {
-            cur.push(Span::styled(buf, span.style));
-            used += buf_w;
+    };
+
+    let mut atoms = atoms.into_iter().peekable();
+    while let Some(atom) = atoms.next() {
+        match atom {
+            Atom::Word(word) => {
+                for g in word {
+                    push(g, &mut used, &mut cur, &mut rows);
+                }
+            }
+            Atom::Space(space) => {
+                let sp_w: usize = space.iter().map(|(_, cw, _)| *cw).sum();
+                match atoms.peek() {
+                    Some(Atom::Word(next)) => {
+                        let next_w: usize = next.iter().map(|(_, cw, _)| *cw).sum();
+                        if used + sp_w + next_w <= w {
+                            for g in space {
+                                let gw = g.1;
+                                cur.push(g);
+                                used += gw;
+                            }
+                        } else {
+                            flush(&mut rows, &mut cur);
+                            used = 0;
+                        }
+                    }
+                    // Trailing whitespace is not a break: a run that fits the
+                    // row stays, and the rest straddles the row end and drops
+                    // (it would draw a blank row). An all-whitespace line
+                    // keeps the cell split.
+                    _ => {
+                        let all_ws = cur.is_empty() && rows.is_empty();
+                        for g in space {
+                            if all_ws {
+                                push(g, &mut used, &mut cur, &mut rows);
+                            } else {
+                                let gw = g.1;
+                                if used + gw <= w {
+                                    cur.push(g);
+                                    used += gw;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     if !cur.is_empty() {
-        flush(&mut cur);
+        flush(&mut rows, &mut cur);
     }
     rows
 }
@@ -682,7 +818,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
         Line::from(modal_button(" ok ", true))
     } else {
-        choice_buttons(state.choice, "cancel", destructive, &confirm_label, "   ")
+        choice_buttons(state.choice, "cancel", destructive, &confirm_label)
     };
 
     // The body scrolls (`↑`/`↓` one line, `PageUp`/`PageDown` one page) while
@@ -711,13 +847,12 @@ fn draw_loss_warning(frame: &mut Frame<'_>, area: Rect, state: &LossWarningState
         "Discard the unsaved edit?",
         theme::body(),
     ))];
-    // One line per sentence: the body reads whole at 80 columns instead of
-    // chunking a word across rows.
+    // One line per sentence so a sentence never shares a row with the next.
     for sentence in state.drop.detail_lines() {
         lines.push(Line::from(prose::spans(sentence, theme::dim())));
     }
 
-    let buttons = choice_buttons(state.choice, "go back", true, "discard", "   ");
+    let buttons = choice_buttons(state.choice, "go back", true, "discard");
 
     draw_modal_scrolled(
         frame,
@@ -813,7 +948,7 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
 
     let buttons = Line::from(vec![
         modal_button(" not now ", !form.choice),
-        Span::raw("   "),
+        Span::raw(" "),
         modal_button(" apply ", form.choice),
     ])
     .alignment(Alignment::Right);
@@ -849,13 +984,12 @@ fn choice_buttons(
     cancel_label: &str,
     destructive_confirm: bool,
     confirm_label: &str,
-    gap: &'static str,
 ) -> Line<'static> {
     let cancel = format!(" {cancel_label} ");
     let label = format!(" {confirm_label} ");
     Line::from(vec![
         modal_button(&cancel, !choice),
-        Span::raw(gap),
+        Span::raw(" "),
         if destructive_confirm {
             danger_button(&label, choice)
         } else {
@@ -1131,7 +1265,7 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
             form.scroll.get().min(u16::MAX as usize) as u16,
             None,
             Some(ModalExtra::Buttons(
-                choice_buttons(form.confirm_overwrite, "cancel", true, "add", " ")
+                choice_buttons(form.confirm_overwrite, "cancel", true, "add")
                     .alignment(Alignment::Right),
             )),
         );
@@ -1175,10 +1309,14 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
         ]));
     }
 
-    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let content_w = lines
+        .iter()
+        .map(|line| normalize_tabs(line).width())
+        .max()
+        .unwrap_or(0) as u16;
     let width = (content_w + 6)
         .max("KEY IN USE".len() as u16 + 4)
-        .min(area.width.saturating_sub(4));
+        .min(modal_width_cap(area.width));
     let inner_w = width.saturating_sub(6).max(1) as usize;
     let viewport = area.height.saturating_sub(8) as usize;
     let selected_rows = lines[2..4]
@@ -1844,7 +1982,7 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
     });
     let w = (content_w + 6)
         .max(modal_title_w(title) + meta_w as u16)
-        .min(area.width.saturating_sub(4));
+        .min(modal_width_cap(area.width));
     // items rows + the rule + 4 chrome (border + padding)
     let h = (state.items.len() as u16 + u16::from(rule_at.is_some()) + 4)
         .min(area.height.saturating_sub(4));

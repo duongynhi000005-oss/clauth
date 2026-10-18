@@ -15989,7 +15989,8 @@ fn apply_preset_on_new_offers_keep_or_clear_for_typed_buffers() {
         [
             "",
             "apply 'zz-custom' to the new account?",
-            "the preset leaves base url, model, fable, sonnet, haiku, subagent unset.",
+            "the preset leaves base url, model, fable, sonnet,",
+            "haiku, subagent unset.",
             "",
             "cancel   keep them   clear them",
             "",
@@ -28907,9 +28908,9 @@ fn the_bind_restart_confirm_labels_the_restart_button() {
         "the confirm's affirmative button reads restart: {button_row}"
     );
     // The `restart` button renders DANGER (unfocused: DANGER fg), like `stop`.
-    // The button row spells `cancel     restart` (five spaces), so `needle_cells`
+    // The button row spells `cancel   restart` (one gap cell), so `needle_cells`
     // finds the button's own `restart`, never the message row's `restart shunt?`.
-    let cells = crate::testutil::needle_cells(term.backend().buffer(), "cancel     restart")
+    let cells = crate::testutil::needle_cells(term.backend().buffer(), "cancel   restart")
         .unwrap_or_else(|| panic!("no restart button:\n{}", rows.join("\n")));
     for cell in &cells[cells.len() - "restart".chars().count()..] {
         assert_eq!(
@@ -28949,7 +28950,7 @@ fn the_rename_confirm_labels_the_rename_button() {
         .find(|s| s.contains("cancel"))
         .expect("the button segment");
     assert_eq!(
-        interior, "cancel     rename",
+        interior, "cancel   rename",
         "the confirm's button row reads exactly cancel then rename: {button_row}"
     );
 }
