@@ -81,21 +81,14 @@ pub(crate) mod rank {
     }
 
     ranks! {
-        // Test-only scaffolding locks, ranked OUTERMOST (below every production
-        // rank): the RAII sandboxes that hold them (`testutil::HomeSandbox` /
-        // `TierSandbox`, runtime's `with_fake_home`)
-        // wrap the whole test, so the code under test still legally acquires any
-        // production lock inside them. Two ranks, not one, so a future test that
-        // needs both cannot invert them into a deadlock: acquire `HomeTest`
-        // before `TierTest`, both before any real lock.
+        // Test-only scaffolding lock, ranked OUTERMOST (below every production
+        // rank): the RAII sandboxes that hold it (`testutil::HomeSandbox`,
+        // runtime's `with_fake_home`) wrap the whole test, so the code under
+        // test still legally acquires any production lock inside it.
         /// `profile::HOME_TEST_LOCK` — serializes `home_dir()` redirects across
         /// the threads a `cargo test` fallback shares.
         #[cfg(test)]
         HomeTest = 20;
-        /// `theme::TIER_TEST_LOCK` — serializes color-tier pins across those
-        /// same threads.
-        #[cfg(test)]
-        TierTest = 40;
         /// The REST API's in-process switch gate (`daemon::api`). One
         /// `POST /api/v1/switch` at a time: a second concurrent request gets an
         /// immediate 409 instead of parking 25s on the cross-process state flock

@@ -819,8 +819,8 @@ fn row2_is_tabs_only() {
 
 #[test]
 fn the_daemon_chip_is_always_present_and_maps_health_to_color() {
-    // `HomeSandbox` outermost: its `HOME_TEST_LOCK` must not be taken while a
-    // RankedMutex (here `TierSandbox`'s) is held.
+    // `HomeSandbox` outermost per the ranked-lock rule: `HOME_TEST_LOCK` before
+    // any ranked guard.
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::daemon::DaemonHealth;

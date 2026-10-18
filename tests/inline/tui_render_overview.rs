@@ -1169,9 +1169,9 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
 fn disabled_row_type_cell_does_not_pulse() {
     let _home = crate::testutil::HomeSandbox::new();
     // The wave is a Full-tier effect: `pulse_name_spans` returns flat spans
-    // below it. The tier auto-detects from `$COLORTERM`, which CI leaves unset,
-    // so an unpinned tier renders every row flat. That makes the assertion
-    // below vacuous and fails its control.
+    // below it. A test build's tier defaults to `Full`, and the sandbox pins it
+    // explicitly, so the wave renders and the disabled-vs-enabled control below
+    // is real.
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
     let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
@@ -1233,8 +1233,8 @@ const KIND_SPAN: usize = 5;
 #[test]
 fn no_tier_type_cell_does_not_pulse() {
     let _home = crate::testutil::HomeSandbox::new();
-    // The wave is Full-tier only; an unpinned tier renders every row flat and
-    // makes the equality below vacuous. Same guard the disabled-row pin carries.
+    // The wave is Full-tier only; the test build defaults to `Full` and the
+    // sandbox pins it explicitly. Same guard the disabled-row pin carries.
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
     // `something_new` is a claim clauth cannot classify, so the row has no tier
     // at all; `max` is the same row WITH one.

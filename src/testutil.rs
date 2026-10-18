@@ -1229,27 +1229,25 @@ pub(crate) fn seed_broken_plugin_registration() {
     .expect("installed");
 }
 
-/// RAII tier pin: acquires `TIER_TEST_LOCK` and forces the process-global color
-/// tier for its lifetime, putting the previous pin back on drop (even on panic).
-/// Required for any test asserting on a tier-dependent style, since the tier is
-/// process-global and otherwise auto-detects from the ambient `$COLORTERM`.
+/// RAII tier pin: forces the thread-local color tier for its lifetime, putting
+/// the previous pin back on drop (even on panic). Required for a test asserting
+/// a non-Full tier's style; in test builds the tier is per-thread and defaults
+/// to `Full`, so an unsandboxed Full-tier assertion needs no pin. `!Send` by
+/// construction: a pin is a claim on the thread that installed it, and one
+/// carried to another thread would restore that thread's empty slot and leave
+/// the installing thread pinned.
 pub(crate) struct TierSandbox {
-    // Drop order: this type's `drop` restores under the lock, which the field
-    // then releases.
-    _guard: crate::lockorder::RankedGuard<'static, ()>,
     prev: Option<crate::tui::theme::Tier>,
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl TierSandbox {
     pub(crate) fn new(tier: crate::tui::theme::Tier) -> Self {
-        let guard = crate::tui::theme::TIER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let prev = crate::tui::theme::tier_override();
         crate::tui::theme::set_tier(tier);
         Self {
-            _guard: guard,
             prev,
+            _not_send: std::marker::PhantomData,
         }
     }
 }

@@ -4018,8 +4018,8 @@ fn the_enabled_row_renders_the_theme_toggle_glyph() {
 /// separate colours — `full` track `LINE` + knob `ACCENT`/`TEXT_DIM`;
 /// `compatible` brackets `TEXT_DIM` + `on` `ACCENT` / `off` `TEXT_DIM`. The one
 /// helper feeds the shunt `enabled` row and the herdr toggles, so both change
-/// together. Both tiers are pinned under a `TierSandbox` (the tier is
-/// process-global, so a plant on either arm reds this test on any box).
+/// together. Both tiers are pinned explicitly under a `TierSandbox`, so a plant
+/// on either arm reds this test on any box.
 #[test]
 fn the_toggle_paints_its_parts_in_the_contract_colours() {
     let home = crate::testutil::HomeSandbox::new();

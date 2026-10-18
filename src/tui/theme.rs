@@ -12,6 +12,9 @@
 //! atomic so a re-selection re-renders in the new palette on the next frame
 //! without a process restart. Renders read it via the accessor fns below.
 
+#[cfg(test)]
+use std::cell::Cell;
+#[cfg(not(test))]
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use ratatui::style::{Color, Modifier, Style};
@@ -29,8 +32,8 @@ pub(crate) enum Tier {
 }
 
 impl Tier {
-    /// Stable atomic encoding. `0` doubles as "uninitialized" so the accessor
-    /// can fall back to auto-detect before [`init`] runs.
+    /// Stable code. `0` doubles as "uninitialized": the production accessor
+    /// falls back to auto-detect, the test accessor to `Full`.
     fn as_code(self) -> u8 {
         match self {
             Tier::Full => 1,
@@ -47,9 +50,17 @@ impl Tier {
     }
 }
 
-/// Process-global tier as an atomic code (`0` = unset → auto-detect). Seeded by
-/// [`init`] and swappable at runtime via [`set_tier`] for the live theme picker.
+/// Tier holder. In production builds a process-global atomic code (`0` = unset
+/// → auto-detect), seeded by [`init`] and swappable at runtime via [`set_tier`]
+/// for the live theme picker. In test builds a thread-local cell, so a
+/// `TierSandbox` on one test thread never changes another thread's tier.
+#[cfg(not(test))]
 static TIER: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static TIER: Cell<u8> = const { Cell::new(0) };
+}
 
 /// Detect the tier from `$COLORTERM`:
 /// `truecolor` or `24bit` → [`Tier::Full`]; anything else → [`Tier::Compatible`].
@@ -73,35 +84,38 @@ pub(crate) fn init(override_tier: Option<Tier>) {
 /// Swap the active tier at runtime. The next render reads the new value, so the
 /// Config tab's theme selector applies immediately.
 pub(crate) fn set_tier(tier: Tier) {
+    #[cfg(not(test))]
     TIER.store(tier.as_code(), Ordering::Relaxed);
+    #[cfg(test)]
+    TIER.with(|c| c.set(tier.as_code()));
 }
 
-/// Return the active tier. Falls back to auto-detect if [`init`] was not called.
+/// Return the active tier. Falls back to auto-detect if [`init`] was not called;
+/// in test builds an unset tier is `Full`, independent of the ambient
+/// `$COLORTERM`.
 #[inline]
 pub(crate) fn tier() -> Tier {
-    Tier::from_code(TIER.load(Ordering::Relaxed)).unwrap_or_else(detect)
+    #[cfg(not(test))]
+    {
+        Tier::from_code(TIER.load(Ordering::Relaxed)).unwrap_or_else(detect)
+    }
+    #[cfg(test)]
+    {
+        Tier::from_code(TIER.with(|c| c.get())).unwrap_or(Tier::Full)
+    }
 }
 
-/// Serializes tests that pin the tier. Every `tests/inline/*.rs` module compiles
-/// into the one bin target, so under `cargo test` they run as threads sharing
-/// this `TIER`. `testutil::TierSandbox` acquires it as an RAII guard.
-#[cfg(test)]
-pub(crate) static TIER_TEST_LOCK: crate::lockorder::RankedMutex<
-    (),
-    crate::lockorder::rank::TierTest,
-> = crate::lockorder::RankedMutex::new(());
-
-/// Read the stored pin, `None` for unset. [`tier`] collapses unset into a
-/// detected tier, which a restore would then write back as a real pin.
+/// Read the stored pin, `None` for unset. [`tier`] collapses unset into the
+/// test default `Full`, which a restore would then write back as a real pin.
 #[cfg(test)]
 pub(crate) fn tier_override() -> Option<Tier> {
-    Tier::from_code(TIER.load(Ordering::Relaxed))
+    Tier::from_code(TIER.with(|c| c.get()))
 }
 
 /// Put back a [`tier_override`] reading.
 #[cfg(test)]
 pub(crate) fn restore_tier(snapshot: Option<Tier>) {
-    TIER.store(snapshot.map_or(0, Tier::as_code), Ordering::Relaxed);
+    TIER.with(|c| c.set(snapshot.map_or(0, Tier::as_code)));
 }
 
 // ── Palette tables ────────────────────────────────────────────────────────────

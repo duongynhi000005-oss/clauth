@@ -10155,6 +10155,55 @@ fn theme_set_tier_round_trips() {
     assert_eq!(theme::tier(), Tier::Full);
 }
 
+/// A tier pin is a claim on the thread that installed it; the
+/// `PhantomData<*const ()>` field is the whole of what prevents the move.
+#[test]
+fn a_tier_sandbox_guard_cannot_be_carried_to_another_thread() {
+    use crate::testutil::{NotSend as _, Probe};
+
+    assert!(
+        !Probe::<TierSandbox>::is_send(),
+        "a pin that can cross threads restores the wrong thread's tier"
+    );
+}
+
+/// The tier must be per-thread under `cargo test` (one process, many threads):
+/// a `TierSandbox` on one test thread may never change what a sandbox-less
+/// sibling thread reads. Bounded handshake so a regression fails by assertion,
+/// never by hang.
+#[test]
+fn a_thread_without_a_sandbox_reads_full_not_a_siblings_compatible_pin() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(&home, &[("COLORTERM", None)]);
+    assert_eq!(
+        theme::tier_override(),
+        None,
+        "no pin is set, so the tier is the fixed test default, not an ambient read"
+    );
+    assert_eq!(
+        theme::tier(),
+        Tier::Full,
+        "an unset tier reads the fixed Full default"
+    );
+    let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let sibling = std::thread::spawn(move || {
+        let _pin = TierSandbox::new(Tier::Compatible);
+        pinned_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    pinned_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the sibling pinned Compatible");
+    assert_eq!(
+        theme::danger_color(),
+        ratatui::style::Color::Rgb(243, 139, 168),
+        "a sandbox-less thread reads the fixed Full default, never a sibling's pin"
+    );
+    release_tx.send(()).unwrap();
+    sibling.join().unwrap();
+}
+
 #[test]
 fn global_config_cursor_wraps() {
     let _home = crate::testutil::HomeSandbox::new();
