@@ -1335,8 +1335,12 @@ fn missed_budget_lines(rig: &Rig) -> Vec<String> {
 }
 
 /// A stop whose child outlives its deadline answers before it writes: a
-/// stderr stalled for a second (traced up to 977 ms on a loaded box) at the
-/// "still stopping" line neither reads as a missed budget nor logs one.
+/// stderr stalled at the "still stopping" line neither reads as a missed
+/// budget nor logs one. The stall (2 s) is more than twice the answer wait
+/// (the 300 ms budget plus the 500 ms answer grace, 800 ms): the defect, the
+/// stall before the answer, answers at the 2.3 s budget-plus-stall, 1.5 s
+/// past the wait, while the correct order answers at its deadline wake, inside
+/// the grace.
 #[cfg(unix)]
 #[test]
 fn a_write_stall_after_the_deadline_is_never_a_missed_budget() {
@@ -1356,10 +1360,10 @@ fn a_write_stall_after_the_deadline_is_never_a_missed_budget() {
     let pid = rig.only_call().pid;
     let _stall = crate::daemon::gateway::probe_seam::stall_stop_writes(
         "zz-stall-deadline",
-        Duration::from_secs(1),
+        Duration::from_secs(2),
     );
-    // 300 ms budget + the 500 ms answer grace: the stalled write alone
-    // overruns it whenever it sits before the answer.
+    // 2 s stall over the 300 ms budget + 500 ms grace: the stalled write alone
+    // overruns the answer wait whenever it sits before the answer.
     let answered = thread.shutdown(Duration::from_millis(300));
     stub::signal(pid, "KILL");
     assert!(
@@ -1373,8 +1377,11 @@ fn a_write_stall_after_the_deadline_is_never_a_missed_budget() {
 }
 
 /// A stop whose child exits inside its budget answers before it logs the
-/// exit and removes the marker: a stall at those writes longer than the
-/// budget and the grace together is never a missed budget.
+/// exit and removes the marker: a stall at those writes never reads as a
+/// missed budget. The stall (5 s) is twice the answer wait (the 2 s budget
+/// plus the 500 ms answer grace, 2.5 s): the defect answers 5 s after the
+/// child's exit, 2.5 s past the wait, while the correct order answers once the
+/// child exits.
 #[cfg(unix)]
 #[test]
 fn a_write_stall_after_the_child_exits_is_never_a_missed_budget() {
@@ -1391,11 +1398,13 @@ fn a_write_stall_after_the_child_exits_is_never_a_missed_budget() {
         stub::invocations(&rig.dir).len() == 1
     });
     let pid = rig.only_call().pid;
-    // The stub exits on its SIGTERM at once, well inside the 2 s budget;
-    // 3 s of stall overruns the budget plus the 500 ms answer grace.
+    // The stub exits on its SIGTERM at once, well inside the 2 s budget; 5 s
+    // of stall is twice the 2.5 s answer wait (the budget plus the grace), so
+    // the stalled write alone overruns the wait whenever it sits before the
+    // answer.
     let _stall = crate::daemon::gateway::probe_seam::stall_stop_writes(
         "zz-stall-exit",
-        Duration::from_secs(3),
+        Duration::from_secs(5),
     );
     let answered = thread.shutdown(Duration::from_secs(2));
     assert!(
@@ -1415,11 +1424,17 @@ fn a_write_stall_after_the_child_exits_is_never_a_missed_budget() {
 
 /// The clamp a stop applies to its last sleep, pinned two ways: by equality
 /// on hand-computed inputs through the pure [`stop_sleep`], then driven
-/// through the real loop with a 130 ms budget (not a multiple of the 50 ms
-/// poll, so the clamp matters), asserting every requested sleep stays inside
-/// the remaining time it clamped to. The record holds each request beside its
-/// remaining, so the pin holds at any dispatch latency or real-sleep
-/// oversleep; it never counts polls.
+/// through the real loop, asserting the loop slept through the clamp and each
+/// requested sleep stayed inside the remaining time it clamped to. The loop's
+/// one sleep line sleeps `stop_poll`'s output, and the seam records that
+/// `(remaining, request)` pair without sleeping, so the pin holds at any
+/// dispatch latency or real-sleep oversleep and never counts polls, and a
+/// call site that sleeps the poll regardless records nothing. The 2030 ms
+/// budget (40 polls plus a 30 ms remainder, not a multiple of the 50 ms poll)
+/// is ~2x the >=1 s latency a loaded box has shown between the budget's start
+/// and the loop (`begin_stop`'s `kill` spawn and marker write), so the loop
+/// always sleeps at least once; the 30 ms remainder puts the last remaining
+/// below the poll unless an oversleep jumps it.
 #[cfg(unix)]
 #[test]
 fn the_stop_wait_clamps_its_last_sleep_to_the_deadline() {
@@ -1444,15 +1459,16 @@ fn the_stop_wait_clamps_its_last_sleep_to_the_deadline() {
     });
     let pid = rig.only_call().pid;
     let _arm = crate::daemon::gateway::probe_seam::arm_stop_sleeps("zz-clamp");
-    let answered = thread.shutdown(Duration::from_millis(130));
+    let answered = thread.shutdown(Duration::from_millis(2030));
     stub::signal(pid, "KILL");
     assert!(answered, "the stop answers");
     let sleeps = crate::daemon::gateway::probe_seam::stop_sleeps();
     assert!(
-        sleeps
-            .iter()
-            .all(|(remaining, request)| *request <= *remaining),
-        "no requested sleep ends past its remaining time: {sleeps:?}"
+        !sleeps.is_empty()
+            && sleeps
+                .iter()
+                .all(|(remaining, request)| *request <= *remaining),
+        "the loop slept through the clamp, each sleep inside its remaining time: {sleeps:?}"
     );
     stub::wait_until("the child is reaped, not a zombie", secs(5), || {
         proc_state("ps", pid).expect("ps").is_none()
@@ -1552,6 +1568,14 @@ fn a_daemon_killed_during_the_stopping_line_leaves_the_deadline_and_no_second_si
             .expect("clock")
             .as_millis() as u64;
         let _ = crate::daemon::gateway::stop_left_behind(&path, "probe", now_ms);
+        // A "nothing happens" window the negative needs: `terminate_pid` waits
+        // on `kill`'s exit, so when `stop_left_behind` sends the second
+        // SIGTERM (the defect) it is already pending when this window opens,
+        // and the window only has to cover the stub's trap scheduling plus its
+        // record append. A replica of the stub's TERM trap recorded a second
+        // SIGTERM within 0.6 ms in 300 of 300 runs at load ~19 (linux,
+        // 2026-10-18), so 300 ms is ~500x that; the stop's own timing is
+        // already synced by the SIGTERM and marker waits above.
         std::thread::sleep(Duration::from_millis(300));
         let second = stub::terms(&rig.dir).len();
         // KILL inside the scope, before the join, so the supervisor answers at

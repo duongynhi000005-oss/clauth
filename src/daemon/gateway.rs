@@ -106,8 +106,8 @@ const STOP_MARGIN: Duration = Duration::from_secs(5);
 /// poll) still sees the flock go. The budget plus [`STOP_ANSWER_GRACE`] bounds
 /// the supervisor's answer; the daemon then joins the stop thread through its
 /// deferred log and marker writes with no bound. Every child is sent its one
-/// SIGTERM first, then all are waited for within this one aggregate bound —
-/// never N serial waits. A child still draining past it is left running with
+/// SIGTERM first, then all are waited for within this one budget — never N
+/// serial waits. A child still draining past it is left running with
 /// its stop deadline in its child marker; the next daemon start waits out the
 /// rest and kills it there.
 pub(crate) const DAEMON_STOP_BUDGET: Duration = REPLACE_WAIT.saturating_sub(Duration::from_secs(1));
@@ -120,6 +120,18 @@ pub(crate) const STOP_POLL: Duration = Duration::from_millis(50);
 /// never up to one poll past it.
 pub(crate) fn stop_sleep(remaining: Duration) -> Duration {
     STOP_POLL.min(remaining)
+}
+
+/// The stop loop's next sleep: [`stop_sleep`]'s clamp of `remaining`, passed
+/// through the seam's record so the loop's one sleep line consumes the
+/// recorded value in every build. A call site that sleeps [`STOP_POLL`]
+/// regardless never records, so the clamp pin reds on the empty record; the
+/// one thing the pin cannot see is this fn returning other than `request`.
+fn stop_poll(remaining: Duration) -> Duration {
+    let request = stop_sleep(remaining);
+    #[cfg(all(test, unix))]
+    probe_seam::record_stop_sleep(remaining, request);
+    request
 }
 
 /// How long past its budget a stop waits for the supervisor's answer before
@@ -909,10 +921,7 @@ impl<K: Supervised> Supervisor<K> {
                 return Some(StopWrites::StillStopping { pid });
             }
             let remaining = deadline - now;
-            let sleep = stop_sleep(remaining);
-            #[cfg(all(test, unix))]
-            probe_seam::record_stop_sleep(remaining, sleep);
-            std::thread::sleep(sleep);
+            std::thread::sleep(stop_poll(remaining));
         }
     }
 
@@ -2977,8 +2986,11 @@ pub(crate) fn stop_on_signal(
             let Some(signal) = signals.forever().next() else {
                 return;
             };
-            // One aggregate bound: send every child its stop first (each on
-            // its own thread, so they drain concurrently), then join them all.
+            // Send every child its stop first (each on its own thread, so they
+            // drain concurrently), then join them all: the wait for each answer
+            // ends within one `DAEMON_STOP_BUDGET` plus `STOP_ANSWER_GRACE`,
+            // never N serial budgets, and each join after an answer then waits
+            // out that stop's deferred log and marker writes with no bound.
             let gateway = gateway
                 .map(|gateway| std::thread::spawn(move || gateway.shutdown(DAEMON_STOP_BUDGET)));
             let proxies = std::thread::spawn(move || proxies.shutdown());
@@ -3279,8 +3291,12 @@ pub(super) mod probe_seam {
         }
     }
 
-    /// Record one sleep the stop loop requested, beside the remaining it
-    /// clamped to, when the calling thread carries the armed name.
+    /// Record the `(remaining, request)` pair the stop loop's next poll will
+    /// sleep, for the armed supervisor thread. Only the record: the caller
+    /// sleeps `request` after this returns, outside the record's lock, so this
+    /// never sleeps and never holds the lock across a sleep. A call site that
+    /// sleeps the poll regardless never reaches this, so the clamp pin reds on
+    /// the empty record.
     pub fn record_stop_sleep(remaining: Duration, request: Duration) {
         let mut record = STOP_SLEEPS
             .lock()
