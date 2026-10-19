@@ -554,3 +554,151 @@ fn known_paths_reach_per_session_copies_and_still_exclude_isolated() {
     );
     assert_eq!(paths.len(), 4, "no member beyond those four: {paths:#?}");
 }
+
+// ── credit-billed model families (#93) ───────────────────────────────────────
+//
+// Claude Code bills Fable against usage credits always, and every family its
+// cached `tengu_calm_seal` flag lists (CC 2.1.302 `X6`/`ike`, compared
+// case-insensitively). The set is lowercase, Fable first, deduped.
+
+#[test]
+fn credit_billed_families_are_fable_alone_without_a_flag() {
+    assert_eq!(credit_billed_families_from(None), vec!["fable".to_string()]);
+}
+
+#[test]
+fn credit_billed_families_add_every_family_the_flag_lists() {
+    assert_eq!(
+        credit_billed_families_from(Some(&json!(["Mythos"]))),
+        vec!["fable".to_string(), "mythos".to_string()]
+    );
+    assert_eq!(
+        credit_billed_families_from(Some(&json!([
+            "fable", "MYTHOS", " mythos ", "", 7, null, "Opus"
+        ]))),
+        vec![
+            "fable".to_string(),
+            "mythos".to_string(),
+            "opus".to_string()
+        ]
+    );
+}
+
+#[test]
+fn a_flag_that_is_not_a_list_adds_nothing() {
+    for flag in [
+        json!(true),
+        json!("Mythos"),
+        json!(null),
+        json!({"Mythos": true}),
+    ] {
+        assert_eq!(
+            credit_billed_families_from(Some(&flag)),
+            vec!["fable".to_string()],
+            "flag {flag}"
+        );
+    }
+}
+
+#[test]
+fn credit_billed_families_follow_the_cached_flag_on_disk() {
+    let _home = HomeSandbox::new();
+    let path = home_dir().expect("sandboxed home").join(".claude.json");
+    assert_eq!(
+        credit_billed_families(),
+        vec!["fable".to_string()],
+        "no file"
+    );
+
+    write_json(
+        &path,
+        &json!({"cachedGrowthBookFeatures": {"tengu_calm_seal": ["Mythos"]}, "numStartups": 3}),
+    );
+    assert_eq!(
+        credit_billed_families(),
+        vec!["fable".to_string(), "mythos".to_string()]
+    );
+
+    // CC rewrites its flag cache: the next read follows it.
+    write_json(
+        &path,
+        &json!({"cachedGrowthBookFeatures": {"tengu_calm_seal": ["Mythos", "Opus"]}}),
+    );
+    set_mtime(
+        &path,
+        std::time::SystemTime::now() + Duration::from_secs(10),
+    );
+    assert_eq!(
+        credit_billed_families(),
+        vec![
+            "fable".to_string(),
+            "mythos".to_string(),
+            "opus".to_string()
+        ]
+    );
+
+    fs::write(&path, b"{\"cachedGrowthBookFeatures\": {\"tengu_calm").expect("write");
+    set_mtime(
+        &path,
+        std::time::SystemTime::now() + Duration::from_secs(20),
+    );
+    // A file CC is caught mid-writing is skipped like the sync engine skips it:
+    // the last good parse still answers, so the set never flaps for a tick.
+    assert_eq!(
+        credit_billed_families(),
+        vec![
+            "fable".to_string(),
+            "mythos".to_string(),
+            "opus".to_string()
+        ],
+        "a torn read keeps the last good flag"
+    );
+
+    // Once the file parses again, its own flag answers.
+    write_json(
+        &path,
+        &json!({"cachedGrowthBookFeatures": {"tengu_calm_seal": []}}),
+    );
+    set_mtime(
+        &path,
+        std::time::SystemTime::now() + Duration::from_secs(30),
+    );
+    assert_eq!(credit_billed_families(), vec!["fable".to_string()]);
+}
+
+#[test]
+fn a_failed_read_keeps_the_last_good_flag() {
+    let _home = HomeSandbox::new();
+    let path = home_dir().expect("sandboxed home").join(".claude.json");
+    write_json(
+        &path,
+        &json!({"cachedGrowthBookFeatures": {"tengu_calm_seal": ["Mythos"]}}),
+    );
+    assert_eq!(
+        credit_billed_families(),
+        vec!["fable".to_string(), "mythos".to_string()]
+    );
+
+    // A read that fails for any reason but absence (a directory here: EISDIR
+    // on unix, os error 5 on Windows, where a concurrent rename replace also
+    // fails an open) is no evidence the flag changed.
+    fs::remove_file(&path).expect("remove");
+    fs::create_dir(&path).expect("a directory where the file was");
+    assert_eq!(
+        credit_billed_families(),
+        vec!["fable".to_string(), "mythos".to_string()],
+        "a failed read keeps the last good flag"
+    );
+
+    // Absence is a real answer: no file, no flag.
+    fs::remove_dir(&path).expect("remove the directory");
+    assert_eq!(credit_billed_families(), vec!["fable".to_string()]);
+}
+
+#[test]
+fn a_torn_first_read_with_nothing_parsed_yet_is_fable_alone() {
+    let _home = HomeSandbox::new();
+    let path = home_dir().expect("sandboxed home").join(".claude.json");
+    fs::write(&path, b"{\"cachedGrowthBookFeatures\": {\"tengu_calm").expect("write");
+    assert_eq!(credit_billed_families(), vec!["fable".to_string()]);
+}

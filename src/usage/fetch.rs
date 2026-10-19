@@ -347,6 +347,49 @@ impl SpendInfo {
     pub(crate) fn is_visible(&self) -> bool {
         self.enabled || self.limit.is_some()
     }
+
+    /// True iff the pay-as-you-go cap is spent: billing is ON and the amounts
+    /// read past the limit (when both are read), else the wire's own `percent`
+    /// reads 100+. A billing-off account carrying a stale limit (kerry,
+    /// 2026-07-17: enabled false, limit $50, used $31.07) is never capped —
+    /// the flag gates the figures, never the other way round. Nothing read is
+    /// no evidence of a cap.
+    pub(crate) fn is_capped(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match (self.used, self.limit) {
+            (Some(used), Some(limit)) => used >= limit,
+            _ => self.percent.is_some_and(|p| p >= 100.0),
+        }
+    }
+}
+
+impl ExtraUsage {
+    /// True iff the legacy credit block is capped: billing is ON and the
+    /// block's own `utilization` reads 100+, else both amounts read past the
+    /// limit. Nothing read is no evidence of a cap.
+    pub(crate) fn is_capped(&self) -> bool {
+        if !self.is_enabled {
+            return false;
+        }
+        if let Some(utilization) = self.utilization {
+            return utilization >= 100.0;
+        }
+        match (self.used_credits, self.monthly_limit) {
+            (Some(used), Some(limit)) => used >= limit,
+            _ => false,
+        }
+    }
+}
+
+impl UsageInfo {
+    /// Either credit block is capped ([`SpendInfo::is_capped`] /
+    /// [`ExtraUsage::is_capped`]) — the cap verdict the status feed publishes.
+    pub(crate) fn credit_capped(&self) -> bool {
+        self.spend.as_ref().is_some_and(SpendInfo::is_capped)
+            || self.extra_usage.as_ref().is_some_and(ExtraUsage::is_capped)
+    }
 }
 
 /// Canonical account tier, computed once at fetch time. The single source of

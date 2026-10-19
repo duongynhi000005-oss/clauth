@@ -2415,3 +2415,110 @@ fn humanize_duration_five_minutes_and_up_stays_coarse() {
     assert_eq!(humanize_duration(90 * 60), "1h 30m");
     assert_eq!(humanize_duration(25 * 3600), "1d 1h");
 }
+
+// ── the usage-credit spend cap (#93) ─────────────────────────────────────────
+//
+// Claude Code refuses a credit-billed model once the account's credit cap is
+// spent. `credit_capped` is the one predicate every account pick keys on; a
+// billing-off account carrying a stale limit (kerry, 2026-07-17: enabled false,
+// limit $50, used $31.07) is never capped, whatever its figures say.
+
+fn spend(enabled: bool, used: Option<f64>, limit: Option<f64>, percent: Option<f64>) -> SpendInfo {
+    SpendInfo {
+        enabled,
+        used,
+        limit,
+        percent,
+        currency: Some("USD".to_string()),
+    }
+}
+
+fn extra(
+    is_enabled: bool,
+    used_credits: Option<f64>,
+    monthly_limit: Option<f64>,
+    utilization: Option<f64>,
+) -> ExtraUsage {
+    ExtraUsage {
+        is_enabled,
+        monthly_limit,
+        used_credits,
+        utilization,
+        currency: Some("USD".to_string()),
+        ..ExtraUsage::default()
+    }
+}
+
+#[test]
+fn a_spend_block_with_billing_off_is_never_capped() {
+    assert!(!spend(false, Some(50.0), Some(50.0), Some(100.0)).is_capped());
+    assert!(!spend(false, Some(31.07), Some(50.0), Some(62.0)).is_capped());
+    assert!(!spend(false, None, None, Some(100.0)).is_capped());
+}
+
+#[test]
+fn a_spend_block_is_capped_once_used_reaches_the_limit() {
+    assert!(spend(true, Some(50.0), Some(50.0), Some(100.0)).is_capped());
+    assert!(spend(true, Some(60.0), Some(50.0), Some(100.0)).is_capped());
+    // The amounts decide when both are read: 49.75 of 50 is 99.5%, which the
+    // wire's integer `percent` rounds up to 100.
+    assert!(!spend(true, Some(49.75), Some(50.0), Some(100.0)).is_capped());
+    assert!(!spend(true, Some(6.0), Some(50.0), Some(12.0)).is_capped());
+}
+
+#[test]
+fn a_spend_block_without_both_amounts_falls_back_to_its_percent() {
+    assert!(spend(true, None, None, Some(100.0)).is_capped());
+    assert!(spend(true, Some(50.0), None, Some(100.0)).is_capped());
+    assert!(spend(true, None, Some(50.0), Some(100.0)).is_capped());
+    assert!(!spend(true, None, None, Some(99.0)).is_capped());
+    // Nothing read is no evidence of a cap.
+    assert!(!spend(true, None, None, None).is_capped());
+}
+
+#[test]
+fn an_extra_usage_block_is_capped_once_its_utilization_reaches_100() {
+    assert!(extra(true, None, None, Some(100.0)).is_capped());
+    assert!(extra(true, None, None, Some(100.4)).is_capped());
+    assert!(!extra(true, None, None, Some(99.99)).is_capped());
+    assert!(!extra(false, None, None, Some(100.0)).is_capped());
+    // With no utilization read, the amounts decide.
+    assert!(extra(true, Some(25.0), Some(25.0), None).is_capped());
+    assert!(!extra(true, Some(24.0), Some(25.0), None).is_capped());
+    assert!(!extra(true, None, None, None).is_capped());
+}
+
+#[test]
+fn credit_capped_reads_either_block() {
+    let base = UsageInfo::default();
+    assert!(!base.credit_capped(), "no block at all is no cap");
+
+    let spend_capped = UsageInfo {
+        spend: Some(spend(true, Some(50.0), Some(50.0), Some(100.0))),
+        extra_usage: Some(extra(true, None, None, Some(12.428))),
+        ..UsageInfo::default()
+    };
+    assert!(spend_capped.credit_capped());
+
+    let extra_capped = UsageInfo {
+        spend: Some(spend(true, Some(6.0), Some(50.0), Some(12.0))),
+        extra_usage: Some(extra(true, None, None, Some(100.0))),
+        ..UsageInfo::default()
+    };
+    assert!(extra_capped.credit_capped());
+
+    // kerry's live shape on 2026-10-18: 12% of the cap, nowhere near it.
+    let kerry = UsageInfo {
+        spend: Some(spend(true, None, None, Some(12.0))),
+        extra_usage: Some(extra(true, None, None, Some(12.428))),
+        ..UsageInfo::default()
+    };
+    assert!(!kerry.credit_capped());
+
+    let stale = UsageInfo {
+        spend: Some(spend(false, Some(50.0), Some(50.0), Some(100.0))),
+        extra_usage: Some(extra(false, None, None, Some(100.0))),
+        ..UsageInfo::default()
+    };
+    assert!(!stale.credit_capped(), "billing off on both blocks");
+}

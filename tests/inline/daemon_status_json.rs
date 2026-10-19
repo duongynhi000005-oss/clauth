@@ -86,6 +86,9 @@ fn build_status_top_level_shape_and_active() {
             "clauth_version",
             "codex_fallback_chain",
             "codex_wrap_off",
+            // Additive (#93): the model families Claude Code bills against
+            // usage credits.
+            "credit_billed_families",
             "gateway",
             "generated_at",
             "pending_switch",
@@ -117,6 +120,9 @@ fn build_status_top_level_shape_and_active() {
             "auto_start_queue",
             "base_url",
             "bell_threshold",
+            // Additive (#93): the usage-credit cap, no dollar amounts.
+            "credit_capped",
+            "extra_usage",
             "fallback",
             "fetch_status",
             "fetched_at",
@@ -126,6 +132,7 @@ fn build_status_top_level_shape_and_active() {
             "next_refresh_at",
             "provider",
             "rolling_token",
+            "spend",
             "stale",
             "third_party",
             "tier",
@@ -1855,6 +1862,7 @@ fn status_body_matches_legacy_json_bytes() {
         gateway: None,
         proxies: Vec::new(),
         tps: None,
+        credit_billed_families: vec!["fable".to_string(), "mythos".to_string()],
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -1895,6 +1903,15 @@ fn status_body_matches_legacy_json_bytes() {
                 ],
                 long_window_label: Some("7d"),
                 third_party: Some(ThirdPartyAvailability { available: true }),
+                spend: Some(CapBlock {
+                    enabled: true,
+                    percent: Some(62.0),
+                }),
+                extra_usage: Some(CapBlock {
+                    enabled: true,
+                    percent: Some(12.428),
+                }),
+                credit_capped: false,
             },
             ProfileEntry {
                 name: "all-none".into(),
@@ -1917,6 +1934,9 @@ fn status_body_matches_legacy_json_bytes() {
                 windows: vec![],
                 long_window_label: None,
                 third_party: None,
+                spend: None,
+                extra_usage: None,
+                credit_capped: false,
             },
             ProfileEntry {
                 name: "null-stamp".into(),
@@ -1942,6 +1962,9 @@ fn status_body_matches_legacy_json_bytes() {
                 windows: vec![],
                 long_window_label: None,
                 third_party: None,
+                spend: None,
+                extra_usage: None,
+                credit_capped: false,
             },
         ],
     };
@@ -1949,7 +1972,8 @@ fn status_body_matches_legacy_json_bytes() {
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":"work","#,
         r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
         r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
-        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"profiles":["#,
+        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
+        r#""credit_billed_families":["fable","mythos"],"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
@@ -1958,17 +1982,19 @@ fn status_body_matches_legacy_json_bytes() {
         r#""bell_threshold":92.345678901,"fallback":{"position":1,"threshold":92.345678901,"armed":true},"#,
         r#""windows":[{"label":"5h","utilization_pct":42.123456789,"resets_at":"2026-09-13T05:00:00Z"},"#,
         r#"{"label":"7d","utilization_pct":13.123456789,"resets_at":null}],"#,
-        r#""third_party":{"available":true}},"#,
+        r#""third_party":{"available":true},"spend":{"enabled":true,"percent":62.0},"#,
+        r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false},"#,
         r#"{"name":"all-none","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"claude","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":false,"auto_start_queue":null,"bell_threshold":null,"fallback":null,"#,
-        r#""windows":[],"third_party":null},"#,
+        r#""windows":[],"third_party":null,"spend":null,"extra_usage":null,"credit_capped":false},"#,
         r#"{"name":"null-stamp","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"codex","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":true,"auto_start_queue":{"position":2,"next_open_at":null},"#,
-        r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null}]}"#,
+        r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null,"spend":null,"#,
+        r#""extra_usage":null,"credit_capped":false}]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 
@@ -1986,13 +2012,15 @@ fn status_body_matches_legacy_json_bytes() {
         gateway: None,
         proxies: Vec::new(),
         tps: None,
+        credit_billed_families: Vec::new(),
         profiles: vec![],
     };
     let expected = concat!(
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":null,"#,
         r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
-        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"profiles":[]}"#,
+        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
+        r#""credit_billed_families":[],"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -2582,6 +2610,17 @@ fn status_schema_agrees_with_the_serialized_body() {
         five_hour: Some(window(42.0, 3)),
         seven_day: Some(window(13.0, 72)),
         fetched_at: Some(crate::usage::now_ms() - 60_000),
+        // Both credit blocks, one with an unread percent, so the walk reads
+        // `CapBlock` with a number and with a `null`.
+        spend: Some(crate::usage::SpendInfo {
+            enabled: true,
+            percent: Some(12.0),
+            ..Default::default()
+        }),
+        extra_usage: Some(crate::usage::ExtraUsage {
+            is_enabled: true,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     crate::profile_cache::write_profile_cache(
@@ -2635,8 +2674,24 @@ fn status_schema_agrees_with_the_serialized_body() {
         body.profiles.iter().any(|e| !e.windows.is_empty()),
         "fixture never populates a window"
     );
-
     let value = serde_json::to_value(&body).unwrap();
+    assert!(
+        value["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["spend"]["percent"].is_number()),
+        "fixture never populates a credit block with a percent"
+    );
+    assert!(
+        value["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["extra_usage"].is_object() && p["extra_usage"]["percent"].is_null()),
+        "fixture never populates a credit block with an unread percent"
+    );
+
     schema_agrees_with_type::<StatusBody>(&value);
 }
 
@@ -3072,4 +3127,175 @@ fn build_status_republishes_the_tps_cache_as_an_additive_slot() {
     assert!(tps.get("days").is_none(), "days stay in the cache: {tps}");
     let age = tps["age_secs"].as_u64().expect("age_secs is a number");
     assert!((3..=5).contains(&age), "age off generated_at: {age}");
+}
+
+// ── the usage-credit cap (#93) ───────────────────────────────────────────────
+
+/// Each profile publishes its `spend` and `extra_usage` blocks as
+/// `{enabled, percent}` (null without the block) plus the derived
+/// `credit_capped`, and the body names the credit-billed families. No dollar
+/// amount reaches the feed (wiki/Daemon.md: names, tiers, percentages,
+/// timestamps only).
+#[test]
+fn build_status_publishes_the_credit_cap_without_amounts() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            oauth_profile("capped"),
+            oauth_profile("stale"),
+            oauth_profile("stale-full"),
+            oauth_profile("unread"),
+            oauth_profile("bare"),
+        ],
+    };
+    crate::testutil::register_names(&["capped", "stale", "stale-full", "unread", "bare"]);
+    let spend = |enabled, used, limit, percent| crate::usage::SpendInfo {
+        enabled,
+        used: Some(used),
+        limit: Some(limit),
+        percent: Some(percent),
+        currency: Some("USD".to_string()),
+    };
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("capped"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            spend: Some(spend(true, 50.0, 50.0, 100.0)),
+            extra_usage: Some(crate::usage::ExtraUsage {
+                is_enabled: true,
+                monthly_limit: Some(25.0),
+                used_credits: Some(3.107),
+                utilization: Some(12.428),
+                currency: Some("USD".to_string()),
+                ..Default::default()
+            }),
+            fetched_at: Some(now_ms()),
+            ..Default::default()
+        },
+    );
+    // kerry's billing-off shape (2026-07-17): a stale limit, never a cap.
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("stale"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            spend: Some(spend(false, 31.07, 50.0, 62.0)),
+            fetched_at: Some(now_ms()),
+            ..Default::default()
+        },
+    );
+    // The same billing-off account with its stale limit fully used: every
+    // figure reads spent, and `enabled` alone says it is no cap. Its
+    // `extra_usage` block is on with nothing read.
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("stale-full"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            spend: Some(spend(false, 50.0, 50.0, 100.0)),
+            extra_usage: Some(crate::usage::ExtraUsage {
+                is_enabled: true,
+                ..Default::default()
+            }),
+            fetched_at: Some(now_ms()),
+            ..Default::default()
+        },
+    );
+    // Billing on, nothing read: no figure to publish, no cap to claim.
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("unread"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            spend: Some(crate::usage::SpendInfo {
+                enabled: true,
+                ..Default::default()
+            }),
+            fetched_at: Some(now_ms()),
+            ..Default::default()
+        },
+    );
+    std::fs::write(
+        crate::profile::home_dir().unwrap().join(".claude.json"),
+        br#"{"cachedGrowthBookFeatures":{"tengu_calm_seal":["Mythos"]}}"#,
+    )
+    .unwrap();
+
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(v["schema"], 2, "an additive field never bumps the schema");
+    assert_eq!(
+        v["credit_billed_families"],
+        serde_json::json!(["fable", "mythos"])
+    );
+    let entry = |name: &str| {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()
+            .clone()
+    };
+
+    let capped = entry("capped");
+    assert_eq!(
+        capped["spend"],
+        serde_json::json!({"enabled": true, "percent": 100.0})
+    );
+    assert_eq!(
+        capped["extra_usage"],
+        serde_json::json!({"enabled": true, "percent": 12.428})
+    );
+    assert_eq!(capped["credit_capped"], true);
+
+    let stale = entry("stale");
+    assert_eq!(
+        stale["spend"],
+        serde_json::json!({"enabled": false, "percent": 62.0})
+    );
+    assert!(
+        stale["extra_usage"].is_null(),
+        "no block, no object: {stale}"
+    );
+    assert_eq!(stale["credit_capped"], false);
+
+    let stale_full = entry("stale-full");
+    assert_eq!(
+        stale_full["spend"],
+        serde_json::json!({"enabled": false, "percent": 100.0})
+    );
+    assert_eq!(
+        stale_full["extra_usage"],
+        serde_json::json!({"enabled": true, "percent": null}),
+        "an unread percent publishes null, never a fabricated 0"
+    );
+    assert_eq!(stale_full["credit_capped"], false, "billing off is no cap");
+
+    let unread = entry("unread");
+    assert_eq!(
+        unread["spend"],
+        serde_json::json!({"enabled": true, "percent": null}),
+        "an unread spend percent publishes null, never a fabricated 0"
+    );
+    assert_eq!(unread["credit_capped"], false, "nothing read is no cap");
+
+    let bare = entry("bare");
+    assert!(bare["spend"].is_null(), "no cache, no object: {bare}");
+    assert!(bare["extra_usage"].is_null(), "no cache, no object: {bare}");
+    assert_eq!(bare["credit_capped"], false);
+
+    let body = serde_json::to_string(&v).unwrap();
+    for amount in [
+        "31.07",
+        "3.107",
+        "25.0",
+        "50.0",
+        "monthly_limit",
+        "used_credits",
+        "\"used\"",
+        "\"limit\"",
+    ] {
+        assert!(
+            !body.contains(amount),
+            "no dollar amount reaches the feed: {amount}"
+        );
+    }
 }

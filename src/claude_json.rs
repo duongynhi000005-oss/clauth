@@ -20,8 +20,9 @@
 //! fails to parse and is simply skipped until the next tick. The merge itself
 //! lives in [`crate::jsonsync`], shared with the `settings.json` reconciler.
 
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -87,6 +88,13 @@ const PER_PROFILE_FIELDS: &[&str] = &[
 /// Newest mtime from the last [`sync_once`] that did work; the key for
 /// [`crate::jsonsync::run_with_cache`]'s fast path.
 static LAST_SYNCED: Mutex<Option<SystemTime>> = Mutex::new(None);
+
+/// The last good credit-billed family set per `.claude.json` path, so a file
+/// CC is caught mid-writing (unparseable) keeps the previous successful parse
+/// for that path — the sync engine's own "skip until the next tick" torn-read
+/// rule. A `Mutex` leaf held for one map operation, never across the file read.
+static CREDIT_BILLED_FAMILIES: LazyLock<Mutex<HashMap<PathBuf, Vec<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Every `.claude.json` clauth reconciles: the global file plus each SHARED
 /// per-session runtime copy, via [`crate::jsonsync::runtime_files_under`].
@@ -169,6 +177,80 @@ pub(crate) fn strip_home_oauth_account() -> Result<()> {
     let bytes = serde_json::to_vec_pretty(&Value::Object(obj))
         .context("failed to serialize .claude.json after stripping oauthAccount")?;
     atomic_write(&path, &bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// The model families Claude Code bills against usage credits, derived from
+/// the cached `tengu_calm_seal` flag: `fable` always, then every family the
+/// flag's array lists, trimmed + lowercased, empty and non-string entries
+/// skipped, deduped, order-stable. A non-array flag adds nothing.
+pub(crate) fn credit_billed_families_from(flag: Option<&Value>) -> Vec<String> {
+    let mut families = vec!["fable".to_string()];
+    let Some(Value::Array(items)) = flag else {
+        return families;
+    };
+    for item in items {
+        let Some(s) = item.as_str() else {
+            continue;
+        };
+        let s = s.trim().to_lowercase();
+        if s.is_empty() || families.contains(&s) {
+            continue;
+        }
+        families.push(s);
+    }
+    families
+}
+
+/// The credit-billed families off `home_dir()/.claude.json`'s
+/// `cachedGrowthBookFeatures.tengu_calm_seal`, read with the same discipline
+/// as [`home_oauth_account_uuid`]: a missing file is never created and reads
+/// no flag. Reads ONLY that key — `oauthAccount` beside it is never logged,
+/// printed or copied. A fresh read per call (the file is ~100 KB), so a flag
+/// CC just rewrote is seen on the next call; a file caught mid-write
+/// (unparseable) answers with this path's last good parse instead of flapping,
+/// and a path never parsed yet answers `fable` alone. A read that fails for
+/// any reason but absence (a directory, EACCES, ...) is no evidence the flag
+/// changed, so it answers like the torn parse; absence itself answers `fable`
+/// alone and never creates the file.
+pub(crate) fn credit_billed_families() -> Vec<String> {
+    let Some(path) = home_dir().ok().map(|h| h.join(".claude.json")) else {
+        return credit_billed_families_from(None);
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(obj)) => {
+                let flag = obj
+                    .get("cachedGrowthBookFeatures")
+                    .and_then(|f| f.get("tengu_calm_seal"));
+                let families = credit_billed_families_from(flag);
+                CREDIT_BILLED_FAMILIES
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(path, families.clone());
+                families
+            }
+            // Unparseable (CC mid-write): keep the last good parse for this
+            // path, exactly as the sync engine skips the torn file until the
+            // next tick.
+            _ => last_good_families(&path),
+        },
+        // Absence is a real answer: no file, no flag, never create it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => credit_billed_families_from(None),
+        // Any other read failure is no evidence the flag changed, so it answers
+        // exactly like the torn parse: the last good set for this path.
+        Err(_) => last_good_families(&path),
+    }
+}
+
+/// The last good credit-billed family set for `path`, else `fable` alone when
+/// this path has never parsed yet. One lock, one map lookup — a leaf.
+fn last_good_families(path: &Path) -> Vec<String> {
+    CREDIT_BILLED_FAMILIES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(path)
+        .cloned()
+        .unwrap_or_else(|| credit_billed_families_from(None))
 }
 
 #[cfg(test)]

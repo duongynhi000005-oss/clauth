@@ -833,6 +833,7 @@ fn a_status_frame_frames_the_pretty_feed_line_by_line() {
         gateway: None,
         proxies: Vec::new(),
         tps: None,
+        credit_billed_families: Vec::new(),
         profiles: Vec::new(),
     };
     let bytes = serde_json::to_vec_pretty(&body).expect("pretty feed");

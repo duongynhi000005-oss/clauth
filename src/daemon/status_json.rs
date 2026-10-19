@@ -186,6 +186,18 @@ pub(crate) struct ThirdPartyAvailability {
     pub(crate) available: bool,
 }
 
+/// One `spend`/`extra_usage` cap block as published per profile: `enabled`
+/// plus the block's own `percent` (its `utilization` for `extra_usage`). A
+/// dollar amount never reaches the feed; `percent` is `null` when the wire
+/// sent none (never a fabricated 0). The whole object is `null` when the
+/// cached usage carries no such block.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct CapBlock {
+    pub(crate) enabled: bool,
+    #[schema(required = true)]
+    pub(crate) percent: Option<f64>,
+}
+
 /// One `profiles[]` entry of the published `status.json` body — the shape both
 /// the writer ([`build_profile_entries`], serialized by [`build_status`]) and
 /// the reader (`clauth list`'s table rows) derive from, so a reader's field
@@ -276,6 +288,20 @@ pub(crate) struct ProfileEntry {
     /// accounts.
     #[schema(required = true)]
     pub(crate) third_party: Option<ThirdPartyAvailability>,
+    /// The usage-credit `spend` block as `{enabled, percent}` — `null` when
+    /// the cached usage carries no `spend` block. `default` so a reader stays
+    /// additive-tolerant of an older writer.
+    #[serde(default)]
+    pub(crate) spend: Option<CapBlock>,
+    /// The legacy credit `extra_usage` block as `{enabled, percent}`
+    /// (`percent` = its `utilization`) — `null` without the block.
+    #[serde(default)]
+    pub(crate) extra_usage: Option<CapBlock>,
+    /// Derived (#93): either block is capped
+    /// ([`crate::usage::UsageInfo::credit_capped`]). Never required: an older
+    /// daemon's body lacks it, so a reader defaults it to `false`.
+    #[serde(default)]
+    pub(crate) credit_capped: bool,
 }
 
 /// The per-profile entries [`build_status`] publishes — typed, so a reader
@@ -554,6 +580,25 @@ pub(crate) fn build_profile_entries(
                 None
             };
             let (windows, long_window_label) = published_windows_with_label(name);
+            // The credit cap: the block the cache already loaded carries
+            // (`oauth_usage`), published as `{enabled, percent}` — never a
+            // dollar amount, and `percent` stays `null` when the wire sent
+            // none. `credit_capped` is the feed's cap verdict.
+            let spend = oauth_usage
+                .as_ref()
+                .and_then(|u| u.spend.as_ref())
+                .map(|s| CapBlock {
+                    enabled: s.enabled,
+                    percent: s.percent,
+                });
+            let extra_usage = oauth_usage
+                .as_ref()
+                .and_then(|u| u.extra_usage.as_ref())
+                .map(|e| CapBlock {
+                    enabled: e.is_enabled,
+                    percent: e.utilization,
+                });
+            let credit_capped = oauth_usage.as_ref().is_some_and(UsageInfo::credit_capped);
 
             ProfileEntry {
                 name: name.clone(),
@@ -585,6 +630,9 @@ pub(crate) fn build_profile_entries(
                 windows,
                 long_window_label,
                 third_party,
+                spend,
+                extra_usage,
+                credit_capped,
             }
         })
         .collect()
@@ -662,6 +710,12 @@ pub(crate) fn build_codex_entries(
                 // directly (no monthly), so the presence label is never needed.
                 long_window_label: None,
                 third_party: None,
+                // The credit cap is a claude-side reading (the `/usage` spend
+                // and `extra_usage` blocks); a codex entry publishes its
+                // no-data form rather than a fabricated one.
+                spend: None,
+                extra_usage: None,
+                credit_capped: false,
             }
         })
         .collect()
@@ -710,6 +764,12 @@ pub(crate) struct StatusBody {
     /// `default` so a reader stays additive-tolerant of an older writer.
     #[serde(default)]
     pub(crate) tps: Option<TpsSlot>,
+    /// Additive (#93): the model families Claude Code bills against usage
+    /// credits, `["fable", …]` from
+    /// [`crate::claude_json::credit_billed_families`]. `default` so a reader
+    /// stays additive-tolerant of an older writer.
+    #[serde(default)]
+    pub(crate) credit_billed_families: Vec<String>,
     pub(crate) profiles: Vec<ProfileEntry>,
 }
 
@@ -833,6 +893,7 @@ pub(crate) fn build_status_impl(
         gateway: Some(slot_or_record(live.and_then(|s| s.gateway))),
         proxies: super::proxies::entries(live.and_then(|s| s.proxies)),
         tps: if include_tps { tps_slot() } else { None },
+        credit_billed_families: crate::claude_json::credit_billed_families(),
         profiles,
     };
     (body, codex)
