@@ -15,8 +15,7 @@ use crate::actions::{switch_off_locked, switch_profile_locked};
 use crate::logline::logline;
 use crate::profile::{ProfileName, load_config, reload_fingerprint};
 use crate::usage::{
-    PendingSwitchTarget, collect_third_party_entries, collect_tokens, current_key_rejected_names,
-    is_idle, now_ms, queued_switch_away_is_stale,
+    PendingSwitchTarget, current_key_rejected_names, is_idle, now_ms, queued_switch_away_is_stale,
 };
 
 use super::{SwitchBackoff, active_diverged_unsaved, switch_backoff_ms};
@@ -152,11 +151,20 @@ impl super::Daemon {
     /// switch or a reload). Drops the `config` guard before taking the token
     /// lists — `TOKENS` is outer of `CONFIG`, so folding them inverts lock order.
     fn rebuild_tokens(&self) {
+        // Snapshot under the config guard, then read each profile's anchor +
+        // stored token off disk AFTER it drops — the anchor read must not widen
+        // the config-lock hold.
+        let (seeds, third_party) = {
+            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+            let cfg = self.config.lock().expect("config poisoned");
+            (
+                crate::usage::collect_token_seeds(&cfg),
+                crate::usage::collect_third_party_entries(&cfg.profiles),
+            )
+        };
+        let tokens = crate::usage::build_token_entries(seeds);
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         {
-            let tokens = collect_tokens(&self.config.lock().expect("config poisoned"));
-            let third_party =
-                collect_third_party_entries(&self.config.lock().expect("config poisoned").profiles);
             *self.usage_tokens.lock().expect("usage_tokens poisoned") = tokens;
             *self
                 .third_party_tokens
@@ -183,11 +191,15 @@ impl super::Daemon {
                     *c = new_config;
                 }
                 // The reload DID reload config, so it adopts the fingerprint no
-                // matter what the compare found, then runs the compare before
-                // the token rebuild.
+                // matter what the compare found. The token list is rebuilt
+                // BEFORE the compare's forget (the epoch bump): a partition
+                // landing between the two must clone the REBUILT entry, never
+                // the old entry under a post-bump epoch — that pairing stamps
+                // cadence for the old credential and delays the new login's
+                // first fetch (N1).
+                self.rebuild_tokens();
                 crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
                 self.last_reload_fp = current;
-                self.rebuild_tokens();
                 logline!("clauth daemon: reloaded config after an external change");
             }
             Err(e) => {

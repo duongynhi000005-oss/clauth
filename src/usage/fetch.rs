@@ -8,7 +8,8 @@ use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{AccountId, ProfileName};
 use crate::profile_cache::{
-    ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, load_profile_cache, remove_profile_cache,
+    ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache,
+    remove_profile_cache, write_profile_cache,
 };
 
 use super::scheduler::{ActivityStore, MAX_RETRY_AFTER_MS, ProfileActivity, mark_activity};
@@ -1291,28 +1292,70 @@ fn last_profile_attempt(name: &ProfileName) -> Option<u64> {
 /// also re-stamps the bogus clock back to sanity. Saturating the age to `0` here
 /// would instead mute `/profile` until wall-clock caught up, and — now that the
 /// stamp outlives the process — it would stay muted across every restart.
-pub(crate) fn take_profile_fetch(name: &ProfileName, force: bool, now: u64) -> bool {
+/// Decide whether to fetch `/profile` this round, WITHOUT writing anything — the
+/// worker's one-per-run decision, reusable by the rotation retry. Fetches when
+/// `force` is set (a rotation retry holding no plan yet), on first load (no
+/// stamp on disk either), or once the hourly TTL lapses. A manual single-profile
+/// refresh arrives here as a lapsed clock, not a force: it calls
+/// [`expire_profile_ttl`] first. The stamp and memo writes moved to the landing
+/// ([`stamp_profile_fetch`] / [`note_profile_memo`]) so a landing the credential
+/// changed under writes none.
+pub(crate) fn decide_profile_fetch(name: &ProfileName, force: bool, now: u64) -> bool {
     let fresh = last_profile_attempt(name)
         .and_then(|t| now.checked_sub(t))
         .is_some_and(|age| age < PROFILE_TTL_MS);
-    let want = force || !fresh;
-    if want {
-        let durable_landed = crate::profile_cache::write_profile_cache_reported(
-            name,
-            PROFILE_FETCHED_CACHE_FILE,
-            &now,
+    force || !fresh
+}
+
+/// Write the durable `/profile` attempt stamp, returning whether it landed.
+/// Called by section 1 on an identity match (a failing `/profile` on a match
+/// still stamps — the rate cap), and inside the re-anchor's hold after the
+/// anchor write (whose `forget_disk` removed the stamp).
+pub(crate) fn stamp_profile_fetch(name: &ProfileName, now: u64) -> bool {
+    crate::profile_cache::write_profile_cache_reported(name, PROFILE_FETCHED_CACHE_FILE, &now)
+}
+
+/// Write the in-memory `/profile` memo. Called by section 2 on a match, and on a
+/// mismatch or timeout only while the epoch has not moved — the memo is cadence,
+/// so a stale snapshot never re-fetches every tick.
+pub(crate) fn note_profile_memo(name: &ProfileName, now: u64, durable_landed: bool) {
+    if let Ok(mut m) = PROFILE_FETCHED.lock() {
+        m.insert(
+            name.to_string(),
+            ProfileStamp {
+                at_ms: now,
+                durable_landed,
+            },
         );
-        if let Ok(mut m) = PROFILE_FETCHED.lock() {
-            m.insert(
-                name.to_string(),
-                ProfileStamp {
-                    at_ms: now,
-                    durable_landed,
-                },
-            );
-        }
     }
-    want
+}
+
+/// Test-only combined helper: decide, then stamp + memo when elected. Pins the
+/// TTL decision AND both write halves without driving a landing; the production
+/// fetch path calls the split halves so the writes gate on the landing identity.
+#[cfg(test)]
+pub(crate) fn take_profile_fetch(name: &ProfileName, force: bool, now: u64) -> bool {
+    if decide_profile_fetch(name, force, now) {
+        let durable_landed = stamp_profile_fetch(name, now);
+        note_profile_memo(name, now, durable_landed);
+        true
+    } else {
+        false
+    }
+}
+
+/// What the worker's `/profile` leg decided this run, carried to the drain so
+/// the durable stamp and memo gate on the landing's identity rather than the
+/// worker's own writes.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ProfileFetchDecision {
+    /// [`decide_profile_fetch`] elected a `/profile` fetch.
+    pub(crate) wanted: bool,
+    /// The attempt instant the durable stamp + memo record, when `wanted`.
+    pub(crate) attempted_at: Option<u64>,
+    /// The ride-along re-anchored the stored login to another account (A→B): the
+    /// drain forgets the old account's memory after the hold.
+    pub(crate) reanchored: bool,
 }
 
 /// Map an already-parsed `/profile` body to a [`PlanInfo`] (tier + raw
@@ -1350,15 +1393,19 @@ fn plan_from_profile(p: &RawProfile) -> PlanInfo {
 /// surfaces its cancellation.
 /// Never bypasses the hourly cap unless `force_profile` (the rotation retry
 /// holding no plan yet).
-fn fetch_profile_plan(
+pub(crate) fn fetch_profile_plan(
     name: &ProfileName,
     access_token: &str,
     force_profile: bool,
     activity: Option<&ActivityStore>,
+    decision: &mut ProfileFetchDecision,
 ) -> Option<PlanInfo> {
-    if !take_profile_fetch(name, force_profile, now_ms()) {
+    let now = now_ms();
+    if !decide_profile_fetch(name, force_profile, now) {
         return None;
     }
+    decision.wanted = true;
+    decision.attempted_at = Some(now);
     // Ask about the STORED login, not the fetcher's in-memory token: after a
     // copy-back the work-list token is stale, and a `/profile` read with it
     // would be refused by the stored-token guard and defer the re-anchor a full
@@ -1379,12 +1426,71 @@ fn fetch_profile_plan(
     let p: RawProfile = serde_json::from_str(&text).ok()?;
     // Both ride-alongs in ONE state-flock hold behind ONE stored-token check:
     // the anchor reconcile and the rate-limit tier stamp share the body's guard.
+    // A re-anchor (A→B) additionally runs the plan's forget order inside the
+    // same hold: `forget_disk`, the disk seed of this body's plan, the anchor
+    // write, then the `/profile` stamp re-written (its `forget_disk` removed it).
     let tier = raw_rate_limit_tier(&p);
     let ride_along = crate::lock::with_state_lock(|held| {
         if !crate::profile::stored_token_matches(name, &token) {
             return Ok(());
         }
-        reconcile_identity_anchor_held(name, &p, held);
+        let uuid = p
+            .account
+            .as_ref()
+            .and_then(|a| a.uuid.as_deref())
+            .map(str::trim)
+            .filter(|u| !u.is_empty());
+        if let Some(uuid) = uuid {
+            let (before, unreadable) = crate::usage::read_oauth_for_compare(name);
+            let after = crate::usage::OAuthIdentity::for_values(
+                Some(&AccountId::from(uuid.to_string())),
+                Some(&token),
+            );
+            if unreadable {
+                // An unreadable stored identity takes the mismatch path: no
+                // forget order AND no anchor write (N7) — a torn store must
+                // read as RETRY, never as "re-anchor from what we could not
+                // compare".
+            } else if crate::usage::oauth_changed(&before, &after) {
+                crate::usage::forget_disk(name, crate::usage::Half::OAuth);
+                // The throughput identity of an OAuth-only profile is its anchor
+                // digest, so A→B moves it too: forget the throughput file when its
+                // own identity changed (the change sites' `forget_disk_plan`
+                // shape). A hybrid's endpoint auth keeps one identity, so nothing
+                // is forgotten there.
+                let endpoint = crate::profile::stored_endpoint_identity(name);
+                let (base_url, api_key, env_token_owned) = match &endpoint {
+                    Some(e) => (
+                        e.base_url.as_deref(),
+                        e.api_key.as_deref(),
+                        crate::profile::inference_env_token(&e.env),
+                    ),
+                    None => (None, None, None),
+                };
+                let env_token = env_token_owned.as_deref();
+                let throughput_before =
+                    crate::usage::throughput_identity(&before, base_url, api_key, env_token);
+                let throughput_after =
+                    crate::usage::throughput_identity(&after, base_url, api_key, env_token);
+                if throughput_before != throughput_after {
+                    crate::usage::forget_disk(name, crate::usage::Half::Throughput);
+                }
+                let plan = plan_from_profile(&p);
+                write_profile_cache(
+                    name,
+                    USAGE_CACHE_FILE,
+                    &UsageInfo {
+                        plan: Some(plan),
+                        ..Default::default()
+                    },
+                );
+                reconcile_identity_anchor_held(name, &p, held);
+                stamp_profile_fetch(name, now);
+                decision.reanchored = true;
+            } else {
+                reconcile_identity_anchor_held(name, &p, held);
+            }
+        }
         if let Some(tier) = &tier {
             match crate::profile::stamp_rate_limit_tier_if_missing_held(name, tier, held) {
                 Ok(true) => {
@@ -1460,6 +1566,7 @@ pub(crate) fn fetch_raw(
     prev_plan: Option<PlanInfo>,
     force_profile: bool,
     activity: Option<&ActivityStore>,
+    decision: &mut ProfileFetchDecision,
 ) -> std::result::Result<UsageInfo, FetchError> {
     let usage = get_json(
         usage_endpoint().as_ref(),
@@ -1469,7 +1576,7 @@ pub(crate) fn fetch_raw(
         AuthClient::Usage,
     );
     assemble_usage(usage, prev_plan, || {
-        fetch_profile_plan(name, access_token, force_profile, activity)
+        fetch_profile_plan(name, access_token, force_profile, activity, decision)
     })
 }
 

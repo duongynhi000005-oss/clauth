@@ -91,6 +91,10 @@ impl HomeSandbox {
         let guard = crate::profile::HOME_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // A prior test that panicked mid-override leaks it into this one: clear
+        // it here (and on drop) so a parallel test never inherits a shortened
+        // lock deadline it did not set.
+        crate::lock::set_state_lock_timeout_override(None);
         let tmp = tempfile::tempdir().expect("create home sandbox");
         let home = tmp.path().to_path_buf();
         crate::profile::set_home_override(home.clone());
@@ -154,7 +158,13 @@ impl Drop for HomeSandbox {
         // armed hook would reach the next test.
         crate::usage::reset_pending_forgets_for_test();
         crate::usage::clear_seed_hooks_for_test();
+        crate::usage::clear_codex_compare_hooks_for_test();
         crate::profile::clear_home_override();
+        // Clear the process-wide lock-timeout override after the joins above
+        // (a worker's last wait still needs the shortened deadline it was
+        // posed under), so a test that forgot to clear it cannot leak it into
+        // the next one.
+        crate::lock::set_state_lock_timeout_override(None);
         // Restore the user's own value, after the joins above for the same
         // reason the home override is cleared there: a still-running worker that
         // sees it back resolves outside the sandbox.

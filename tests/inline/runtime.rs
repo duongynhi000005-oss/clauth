@@ -1829,16 +1829,24 @@ fn link_mode_of_reads_the_transport_off_the_existing_tree() {
 /// Redirect `home_dir()` into `root` for the duration of `f`, serialized on
 /// `profile::HOME_TEST_LOCK`. Uses the process-global `HOME_OVERRIDE` rather
 /// than `$HOME` so resolution matches on Windows too, where `dirs::home_dir()`
-/// reads `USERPROFILE`, not `HOME`. The override is cleared on drop so a
-/// panicking test can't leak it into the next test.
+/// reads `USERPROFILE`, not `HOME`. The home override is cleared on drop so a
+/// panicking test can't leak it into the next test; the process-wide lock
+/// timeout override is cleared on entry and on drop the same way `HomeSandbox`
+/// does, so a test that panicked mid-override cannot leak a shortened lock
+/// deadline into every later `with_fake_home` test.
 fn with_fake_home<T>(root: &Path, f: impl FnOnce() -> T) -> T {
     let _lock = crate::profile::HOME_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // A prior test that panicked mid-override leaks it into this one: clear it
+    // here (and on drop) so a later test never inherits a shortened lock
+    // deadline it did not set.
+    crate::lock::set_state_lock_timeout_override(None);
     struct ClearOnDrop;
     impl Drop for ClearOnDrop {
         fn drop(&mut self) {
             crate::profile::clear_home_override();
+            crate::lock::set_state_lock_timeout_override(None);
         }
     }
     crate::profile::set_home_override(root.to_path_buf());

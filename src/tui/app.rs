@@ -4703,6 +4703,9 @@ struct WorkerHandles {
     fetch_lease: Arc<crate::daemon::FetchLease>,
     bootstrap_active: Arc<AtomicBool>,
     startup_sender: StartupSender,
+    snapshot: Arc<
+        crate::lockorder::RankedMutex<crate::usage::SnapshotMap, crate::lockorder::rank::Snapshot>,
+    >,
 }
 
 impl WorkerHandles {
@@ -4735,6 +4738,7 @@ impl WorkerHandles {
             fetch_lease: Arc::clone(&app.fetch_lease),
             bootstrap_active: Arc::clone(&app.bootstrap_active),
             startup_sender: app.startup_sender.clone(),
+            snapshot: Arc::clone(&app.snapshot),
         }
     }
 }
@@ -5437,13 +5441,15 @@ impl App {
             // `third_party_entries` are the enabled-only work-lists that drive
             // that marking — a display-only name is never queued for a fetch it
             // will never get.
-            let (snapshot, third_party_entries) = {
+            let (seeds, third_party_entries) = {
                 let cfg = Self::lock_config(&h.config);
                 (
-                    collect_tokens(&cfg),
-                    collect_third_party_entries(&cfg.profiles),
+                    crate::usage::collect_token_seeds(&cfg),
+                    crate::usage::collect_third_party_entries(&cfg.profiles),
                 )
             };
+            // Anchor + stored-token reads run after the guard drops.
+            let snapshot = crate::usage::build_token_entries(seeds);
             let interval_ms = h.refresh_interval.load(Ordering::Relaxed);
 
             // Seeded-but-due and stale/missing profiles are fetched by the
@@ -5771,6 +5777,7 @@ impl App {
             // Pinned by construction, not a test: no test drives this call site
             // (`spawn_refresher` builds its own state under `cfg!(test)`).
             true,
+            h.snapshot,
         );
     }
 
@@ -6029,32 +6036,48 @@ impl App {
             let profile_names: Vec<ProfileName> =
                 fresh.profiles.iter().map(|p| p.name.clone()).collect();
             *self.config() = fresh;
-            // The reload DID reload config, so it adopts the fingerprint no
-            // matter what the compare found, and it runs the compare BEFORE the
-            // store seeds and the broken-verdict union-add below: the union-add
-            // must re-add a re-keyed name's verdict AFTER the compare cleared
-            // it, so the seeded verdict survives the reload.
-            crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
-            self.last_reload_fp = current;
-            // Collect under the config guard, then DROP it before locking the
-            // token mutexes — TOKENS/THIRD_PARTY rank OUTSIDE CONFIG, so writing
-            // them while config is held inverts the global lock order (same shape
-            // as `refresh_tokens`).
-            let (tokens, third_party, third_party_seed_names, names, broken_seed) = {
+            // Snapshot under the config guard, then DROP it before the disk
+            // reads AND before locking the token mutexes — the anchor read must
+            // not widen the config-lock hold, and TOKENS/THIRD_PARTY rank
+            // OUTSIDE CONFIG, so writing them while config is held inverts the
+            // global lock order (same shape as `refresh_tokens`).
+            let (seeds, third_party, third_party_seed_names, names, broken_seed) = {
                 let cfg = self.config();
-                let tokens = collect_tokens(&cfg);
-                let third_party = collect_third_party_entries(&cfg.profiles);
-                let third_party_seed_names = collect_third_party_seed_names(&cfg);
-                let names: Vec<String> = cfg.profiles.iter().map(|p| p.name.to_string()).collect();
-                let broken_seed = Self::durable_key_rejected_seed(&cfg);
                 (
-                    tokens,
-                    third_party,
-                    third_party_seed_names,
-                    names,
-                    broken_seed,
+                    crate::usage::collect_token_seeds(&cfg),
+                    crate::usage::collect_third_party_entries(&cfg.profiles),
+                    collect_third_party_seed_names(&cfg),
+                    cfg.profiles
+                        .iter()
+                        .map(|p| p.name.to_string())
+                        .collect::<Vec<String>>(),
+                    Self::durable_key_rejected_seed(&cfg),
                 )
             };
+            let tokens = crate::usage::build_token_entries(seeds);
+            // The reload DID reload config, so it adopts the fingerprint no
+            // matter what the compare found. The token list is rebuilt BEFORE
+            // the compare's forget (the epoch bump): a partition landing
+            // between the two must clone the REBUILT entry, never the old entry
+            // under a post-bump epoch — that pairing stamps cadence for the old
+            // credential and delays the new login's first fetch (N1).
+            #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+            {
+                *self
+                    .usage_tokens
+                    .lock()
+                    .expect("usage_tokens mutex poisoned") = tokens;
+                *self
+                    .third_party_tokens
+                    .lock()
+                    .expect("third_party_tokens mutex poisoned") = third_party;
+            }
+            // The compare runs after the token-list write, and BEFORE the store
+            // seeds and the broken-verdict union-add below: the union-add must
+            // re-add a re-keyed name's verdict AFTER the compare cleared it, so
+            // the seeded verdict survives the reload.
+            crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
+            self.last_reload_fp = current;
             // Seed from disk the display-superset names the store lacks (a
             // profile added since the last load). A name the store already
             // holds keeps its live reading, status and cadence stamp: the disk
@@ -6080,27 +6103,16 @@ impl App {
                 &[],
                 self.refresh_interval.load(Ordering::Relaxed),
             );
-            #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-            {
-                *self
-                    .usage_tokens
-                    .lock()
-                    .expect("usage_tokens mutex poisoned") = tokens;
-                *self
-                    .third_party_tokens
-                    .lock()
-                    .expect("third_party_tokens mutex poisoned") = third_party;
-                // Union-add the durable seed: it can only ADD names whose record
-                // matches the CURRENT fingerprint, and a re-keyed name still
-                // drops at the intersection in `key_rejected_names`. A recovered
-                // name can flicker back in for at most one sync interval — the
-                // fetcher's error arm updates the live map before it clears the
-                // durable record, so a sync landing in that gap re-reads the
-                // still-standing record — and the next `sync_broken_verdicts`
-                // pass drops it again.
-                if let Ok(mut broken) = self.third_party_broken.lock() {
-                    broken.extend(broken_seed);
-                }
+            // Union-add the durable seed: it can only ADD names whose record
+            // matches the CURRENT fingerprint, and a re-keyed name still
+            // drops at the intersection in `key_rejected_names`. A recovered
+            // name can flicker back in for at most one sync interval — the
+            // fetcher's error arm updates the live map before it clears the
+            // durable record, so a sync landing in that gap re-reads the
+            // still-standing record — and the next `sync_broken_verdicts`
+            // pass drops it again.
+            if let Ok(mut broken) = self.third_party_broken.lock() {
+                broken.extend(broken_seed);
             }
             self.session_tokens = collect_session_tokens(&names);
             self.refresh_unsaved_live_login();
@@ -6112,10 +6124,17 @@ impl App {
     }
 
     pub(crate) fn refresh_tokens(&self) {
-        // Drop `config` lock before taking `usage_tokens` — folding them would
-        // invert lock order (TOKENS is outer of CONFIG).
-        let tokens = collect_tokens(&self.config());
-        let third_party = collect_third_party_entries(&self.config().profiles);
+        // Snapshot under the config lock, drop it, THEN read each profile's
+        // anchor + stored token off disk — the anchor read must not widen the
+        // config-lock hold.
+        let (seeds, third_party) = {
+            let cfg = self.config();
+            (
+                crate::usage::collect_token_seeds(&cfg),
+                crate::usage::collect_third_party_entries(&cfg.profiles),
+            )
+        };
+        let tokens = crate::usage::build_token_entries(seeds);
         #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         {
             *self

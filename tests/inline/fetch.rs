@@ -177,7 +177,13 @@ fn a_profile_read_asks_about_the_stored_login() {
         (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
     });
     let _sandbox = EndpointSandbox::new(&_home, &base);
-    let _ = fetch_profile_plan(&name, "at-a", true, None);
+    let _ = fetch_profile_plan(
+        &name,
+        "at-a",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    );
     let seen = handle.join().expect("join stub");
     let bearer = seen
         .iter()
@@ -318,7 +324,13 @@ fn a_store_moved_mid_read_writes_no_anchor() {
         (200, r#"{"account":{"uuid":"uuid-a"}}"#.to_string())
     });
     let _sandbox = EndpointSandbox::new(&_home, &base);
-    let _ = fetch_profile_plan(&name, "at-a", true, None);
+    let _ = fetch_profile_plan(
+        &name,
+        "at-a",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    );
     handle.join().expect("join stub");
     assert_eq!(
         load_profile_cache::<String>(&name, ACCOUNT_ID_CACHE_FILE),
@@ -521,7 +533,13 @@ fn a_failed_profile_read_keeps_the_anchor() {
 
     let (base, handle) = serve_endpoints_raw(1, |_p, _i| (500, String::new()));
     let _sandbox = EndpointSandbox::new(&_home, &base);
-    let _ = fetch_profile_plan(&name, "at-a", true, None);
+    let _ = fetch_profile_plan(
+        &name,
+        "at-a",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    );
     handle.join().expect("join stub");
 
     assert_eq!(
@@ -648,7 +666,14 @@ fn the_poll_backfills_the_tier_through_the_profile_leg() {
     let _sandbox = EndpointSandbox::new(&_home, &base);
 
     let name = crate::profile::ProfileName::from(name);
-    let plan = fetch_profile_plan(&name, "at-poll", true, None).expect("the /profile leg parses");
+    let plan = fetch_profile_plan(
+        &name,
+        "at-poll",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    )
+    .expect("the /profile leg parses");
     assert!(
         matches!(plan.tier, PlanTier::Team),
         "the plan still maps alongside the backfill"
@@ -663,7 +688,14 @@ fn the_poll_backfills_the_tier_through_the_profile_leg() {
     );
     let before = std::fs::read(&cred_path).expect("read store");
 
-    fetch_profile_plan(&name, "at-poll", true, None).expect("second pull");
+    fetch_profile_plan(
+        &name,
+        "at-poll",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    )
+    .expect("second pull");
     assert_eq!(
         std::fs::read(&cred_path).expect("read store"),
         before,
@@ -720,7 +752,14 @@ fn a_corrupt_store_refuses_the_ride_along_without_failing_the_fetch() {
     let _sandbox = EndpointSandbox::new(&_home, &base);
 
     let name = crate::profile::ProfileName::from(name);
-    let plan = fetch_profile_plan(&name, "at-poll", true, None).expect("the /profile leg parses");
+    let plan = fetch_profile_plan(
+        &name,
+        "at-poll",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    )
+    .expect("the /profile leg parses");
     assert!(
         matches!(plan.tier, PlanTier::Team),
         "a corrupt store never fails the fetch"
@@ -2521,4 +2560,149 @@ fn credit_capped_reads_either_block() {
         ..UsageInfo::default()
     };
     assert!(!stale.credit_capped(), "billing off on both blocks");
+}
+
+/// F8/M5+M6 (A7 re-anchor): a `clauth start` copy-back of a different account's
+/// login leaves the profile anchored to A holding B's token; the next `/profile`
+/// re-anchors A→B inside its hold — the usage cache is re-seeded with ONLY that
+/// body's plan, the durable stamp is re-written, and the decision flags the
+/// re-anchor for the drain's memory forget.
+#[test]
+fn a_profile_read_reanchors_and_seeds_only_the_body_plan() {
+    use crate::profile_cache::{
+        ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache,
+    };
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p3");
+    crate::testutil::register_names(&["p3"]);
+    let tok = |a: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: a.to_string(),
+            refresh_token: Some(format!("{a}-rt")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    // A copy-back of account B's login: the store holds B's token while the
+    // anchor still names account A.
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(tok("at-b"));
+    crate::profile::save_profile(&profile).expect("save");
+    seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("u-a".to_string())),
+    );
+    assert_eq!(
+        load_profile_cache::<crate::profile::AccountId>(&name, ACCOUNT_ID_CACHE_FILE)
+            .as_deref()
+            .map(|u| u.to_string()),
+        Some("u-a".to_string()),
+        "precondition: the copy-back left the anchor at A"
+    );
+    // Seed a throughput cache on the plain-OAuth profile: its throughput
+    // identity is the anchor digest, so A→B moves it and the re-anchor must
+    // forget the file too (R2).
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::throughput::THROUGHPUT_CACHE_FILE,
+        &0u64,
+    );
+
+    // `/profile` answers uuid u-b: the stored token at-b authenticates as B.
+    let (base, handle) = serve_endpoints_raw(1, |_path, _i| {
+        (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
+    });
+    let _sandbox = EndpointSandbox::new(&_home, &base);
+    let mut decision = ProfileFetchDecision::default();
+    let _ = fetch_profile_plan(&name, "at-b", true, None, &mut decision);
+    let _ = handle.join().expect("join stub");
+
+    assert!(decision.reanchored, "the read re-anchors A→B");
+    assert_eq!(
+        load_profile_cache::<crate::profile::AccountId>(&name, ACCOUNT_ID_CACHE_FILE)
+            .as_deref()
+            .map(|u| u.to_string()),
+        Some("u-b".to_string()),
+        "the anchor moved to B"
+    );
+    assert!(
+        !crate::profile_cache::profile_cache_path(&name, crate::throughput::THROUGHPUT_CACHE_FILE)
+            .is_some_and(|p| p.exists()),
+        "the re-anchor forgets the throughput cache when its identity moved"
+    );
+    let cache = load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+        .expect("the re-anchor seeded the usage cache");
+    assert!(
+        cache.five_hour.is_none() && cache.seven_day.is_none(),
+        "the re-anchor seed holds only the body's plan, never a stale reading"
+    );
+    assert!(cache.plan.is_some(), "the plan comes from that body");
+    assert!(
+        crate::profile_cache::profile_cache_path(&name, PROFILE_FETCHED_CACHE_FILE)
+            .is_some_and(|p| p.exists()),
+        "the re-anchor re-writes the durable /profile stamp"
+    );
+}
+
+/// F6/R2 (keyed arm): a hybrid's throughput identity is its endpoint auth
+/// (base_url + key), which an OAuth re-anchor does not move — the throughput
+/// cache is kept, unlike a plain-OAuth profile's anchor-digest identity.
+#[test]
+fn a_reanchor_keeps_a_hybrids_throughput_cache() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p4");
+    crate::testutil::register_names(&["p4"]);
+    let mut profile = crate::profile::Profile::new(
+        "p4".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("key".to_string()),
+    );
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-b".to_string(),
+            refresh_token: Some("at-b-rt".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    crate::usage::seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("u-a".to_string())),
+    );
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::throughput::THROUGHPUT_CACHE_FILE,
+        &0u64,
+    );
+
+    let (base, handle) = serve_endpoints_raw(1, |_path, _i| {
+        (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
+    });
+    let _sandbox = EndpointSandbox::new(&_home, &base);
+    let mut decision = ProfileFetchDecision::default();
+    let _ = fetch_profile_plan(&name, "at-b", true, None, &mut decision);
+    let _ = handle.join().expect("join stub");
+
+    assert!(decision.reanchored, "the read re-anchors A→B");
+    assert_eq!(
+        load_profile_cache::<crate::profile::AccountId>(&name, ACCOUNT_ID_CACHE_FILE)
+            .as_deref()
+            .map(|u| u.to_string()),
+        Some("u-b".to_string()),
+        "the anchor moved to B"
+    );
+    assert!(
+        crate::profile_cache::profile_cache_path(&name, crate::throughput::THROUGHPUT_CACHE_FILE)
+            .is_some_and(|p| p.exists()),
+        "a hybrid's endpoint-auth throughput identity survives an OAuth re-anchor"
+    );
 }

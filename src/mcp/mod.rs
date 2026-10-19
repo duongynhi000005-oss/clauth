@@ -48,6 +48,7 @@ use crate::providers::ThirdPartyStats;
 use crate::runtime::{Isolation, ProfileRuntime};
 use crate::usage::{
     UsageInfo, UsageWindow, now_epoch_secs, now_ms, profile_credential_fingerprint,
+    read_third_party_for_compare, third_party_identity,
 };
 use digest::{DigestMode, DigestTracker};
 use render::{ProfileSnapshot, RosterRank};
@@ -3588,6 +3589,19 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let target = config
         .find(&profile_name)
         .ok_or_else(|| profile_not_found(opts.profile, ProfileNotFoundFix::CallProfiles))?;
+    // Capture the identities the delegate-end records gate on, from the SAME
+    // `target` the env is built from: a record firing after another process
+    // edited the credential writes nothing. The throughput capture applies the
+    // spawn OAuth identity rule — the disk anchor is adopted only when the
+    // stored token still equals the in-memory token, else the unanchored digest
+    // is carried and the record compares as changed (F1).
+    let spawn_throughput = crate::usage::throughput_identity_for_spawn(&profile_name, target);
+    let spawn_third_party = third_party_identity(
+        target.provider,
+        target.api_key.as_deref(),
+        target.console.as_ref(),
+        target.base_url.as_deref(),
+    );
     // Mirrors `disable_profile`'s own live-session refusal from the other
     // direction: that guard stops disabling a profile mid-session, this one
     // stops opening a brand-new session on one already disabled. Also the
@@ -3911,19 +3925,20 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                     opts.model,
                     retry_after_s,
                     now,
+                    spawn_throughput,
                 );
             }
             // The dead-key write is the recording half of the clause
             // `classify_run` appended: the run's scan proved the key dead, so
             // the balance marker it advertised goes with it.
             if let Some(fp) = dead_key_fingerprint(&throttle_scan, dead_key_fp) {
-                record_dead_key(&profile_name, fp);
+                record_dead_key(&profile_name, fp, spawn_third_party);
             }
             Ok(envelope)
         }
         RunOutcome::Unparseable(envelope, throttle_scan) => {
             if let Some(fp) = dead_key_fingerprint(&throttle_scan, dead_key_fp) {
-                record_dead_key(&profile_name, fp);
+                record_dead_key(&profile_name, fp, spawn_third_party);
             }
             Ok(envelope)
         }
@@ -3946,16 +3961,23 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                         opts.model,
                         retry_after_s,
                         now,
+                        spawn_throughput,
                     );
                 }
                 // An in-band 401 rides the same recording the failure arms run
                 // (660): a clean exit with an is_error envelope is still the
                 // provider refusing the key, so the balance marker goes with it.
                 if let Some(fp) = dead_key_fingerprint(&throttle_scan, dead_key_fp) {
-                    record_dead_key(&profile_name, fp);
+                    record_dead_key(&profile_name, fp, spawn_third_party);
                 }
             } else {
-                record_throughput_from_envelope(opts.profile, opts.model, &envelope, now);
+                record_throughput_from_envelope(
+                    opts.profile,
+                    opts.model,
+                    &envelope,
+                    now,
+                    spawn_throughput,
+                );
             }
             Ok(envelope)
         }
@@ -5281,6 +5303,7 @@ fn record_throughput_from_envelope(
     model: Option<&str>,
     envelope: &serde_json::Value,
     now: i64,
+    captured: Option<u64>,
 ) {
     let output_tokens = envelope
         .get("usage")
@@ -5298,6 +5321,7 @@ fn record_throughput_from_envelope(
         output_tokens,
         duration_ms,
         now,
+        captured,
     );
 }
 
@@ -5414,7 +5438,14 @@ fn dead_key_clause(name: &str) -> String {
 /// lock taken. The marker self-heals: the next successful fetch re-writes the
 /// cache and clears the verdict, and a re-login changes the fingerprint so a
 /// stale verdict stops applying on its own (`profile_cache.rs`'s contract).
-fn record_dead_key(name: &ProfileName, fp: u64) {
+fn record_dead_key(name: &ProfileName, fp: u64, captured_third_party: Option<u64>) {
+    // Gate on the third-party identity the delegate was launched with: a dead
+    // key fired for the OLD key must not drop a NEW key's cache. An identity
+    // file that exists but will not read writes nothing.
+    let (disk, unreadable) = read_third_party_for_compare(name);
+    if unreadable || disk != captured_third_party {
+        return;
+    }
     // The balance-marker drop is `forget_disk`'s third-party arm; the
     // fingerprint-bound verdict write stays here (a fetch-landing concern).
     crate::usage::forget_disk(name, crate::usage::Half::ThirdParty);

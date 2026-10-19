@@ -1415,6 +1415,155 @@ fn reload_if_changed_fires_on_external_mtime_change() {
     );
 }
 
+/// S2: a stale entry produced by a FAILED load (a broken sibling config.toml
+/// keeps the token list from rebuilding after a peer re-login) is NOT fetched
+/// while it stays stale — two ticks send zero `/usage` requests — and once the
+/// broken file is repaired and the reload rebuilds the token list, the very
+/// next tick fetches it (no cadence delays the new login). Drives the real
+/// `Daemon::reload_if_changed`; the fetch count is the endpoint server's
+/// `/api/oauth/usage` requests. Port of the reviewer's
+/// `probe_r4_a_failed_load_leaves_a_stale_entry_with_no_reload_coming`.
+#[test]
+fn a_stale_entry_is_not_fetched_until_the_token_list_is_rebuilt() {
+    use std::time::{Duration, SystemTime};
+    let _home = HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints(4, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"five_hour":{"utilization":1.0,"resets_at":"2099-01-01T00:00:00+00:00"}}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
+
+    let a = crate::profile::ProfileName::from("a");
+    let b = crate::profile::ProfileName::from("b");
+    let config = persist(
+        vec![profile_with_creds("a", "access-A"), blank_profile(&b)],
+        Some("a"),
+        90_000,
+    );
+    let mut daemon = daemon_for(config);
+
+    // Another process re-logs `a`; `b`'s config.toml is torn so the next load
+    // fails and the token list cannot rebuild (the failed load adopts the
+    // fingerprint regardless, so no later reload rebuilds until the file is
+    // fixed).
+    save_profile(&profile_with_creds("a", "access-A2")).expect("peer re-login");
+    let cred = crate::profile::profile_subpath(&a, "credentials.json").expect("cred path");
+    set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
+    let b_cfg = crate::profile::profile_subpath(&b, "config.toml").expect("cfg path");
+    std::fs::write(&b_cfg, "not = [valid toml").expect("break b");
+    set_mtime(&b_cfg, SystemTime::now() + Duration::from_secs(5));
+    daemon.reload_if_changed();
+    daemon.reload_if_changed();
+
+    let state = crate::usage::SchedulerState::over_shared(
+        daemon.config.clone(),
+        daemon.usage_tokens.clone(),
+        daemon.usage_store.clone(),
+        daemon.usage_status.clone(),
+        daemon.last_fetched.clone(),
+        daemon.poll_streaks.clone(),
+        daemon.snapshot.clone(),
+    );
+    // Two ticks over the stale entry: neither fetches it (it is dropped at the
+    // partition, not spawned).
+    crate::usage::tick(&state);
+    crate::usage::tick(&state);
+
+    // Repair `b`'s config: the next reload succeeds and rebuilds the token list
+    // with `a`'s NEW credential, which matches the snapshot half.
+    save_profile(&blank_profile(&b)).expect("repair b");
+    daemon.reload_if_changed();
+    crate::usage::tick(&state);
+
+    drop(_endpoints);
+    let paths = server.join().expect("listener");
+    assert_eq!(
+        paths.iter().filter(|p| *p == "/api/oauth/usage").count(),
+        1,
+        "exactly the rebuilt entry's fetch lands — the two stale ticks sent nothing"
+    );
+    assert!(
+        daemon.usage_store.lock().unwrap().contains_key("a"),
+        "the rebuilt entry's fetch lands a reading"
+    );
+}
+
+/// S3: a `forget_memory` whose identity read is unreadable (a torn identity
+/// file) still keeps the snapshot from lagging its epoch — it marks the half
+/// unknown, so the partition skips every entry of that name until the next
+/// compare writes a real value. A tick over the unknown half fetches nothing;
+/// a repaired file + reload clears the mark and the next tick fetches.
+#[test]
+fn a_forget_over_a_torn_identity_file_skips_the_entry_until_the_next_compare() {
+    use std::time::{Duration, SystemTime};
+    let _home = HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints(4, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"five_hour":{"utilization":1.0,"resets_at":"2099-01-01T00:00:00+00:00"}}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
+
+    let a = crate::profile::ProfileName::from("a");
+    let config = persist(vec![profile_with_creds("a", "access-A")], Some("a"), 90_000);
+    let mut daemon = daemon_for(config);
+
+    // Tear the identity file, then forget: the read is unreadable, so the half
+    // is marked unknown (the snapshot must not keep a value its epoch outran).
+    let cred = crate::profile::profile_subpath(&a, "credentials.json").expect("cred path");
+    std::fs::write(&cred, "{ torn json").expect("tear credentials");
+    crate::usage::forget_memory(&daemon.memory_stores(), &a, crate::usage::Half::OAuth);
+
+    let state = crate::usage::SchedulerState::over_shared(
+        daemon.config.clone(),
+        daemon.usage_tokens.clone(),
+        daemon.usage_store.clone(),
+        daemon.usage_status.clone(),
+        daemon.last_fetched.clone(),
+        daemon.poll_streaks.clone(),
+        daemon.snapshot.clone(),
+    );
+    // A tick over the unknown half fetches nothing: every entry of that name
+    // is skipped while the half is unknown.
+    crate::usage::tick(&state);
+
+    // Repair the file and reload: the compare writes the real identity and
+    // clears the unknown mark, so the next tick fetches.
+    save_profile(&profile_with_creds("a", "access-A")).expect("repair credentials");
+    set_mtime(&cred, SystemTime::now() + Duration::from_secs(5));
+    daemon.reload_if_changed();
+    crate::usage::tick(&state);
+
+    drop(_endpoints);
+    let paths = server.join().expect("listener");
+    assert_eq!(
+        paths.iter().filter(|p| *p == "/api/oauth/usage").count(),
+        1,
+        "only the post-repair fetch lands — the tick over the unknown half sent nothing"
+    );
+    assert!(
+        daemon.usage_store.lock().unwrap().contains_key("a"),
+        "the repaired entry's fetch lands a reading"
+    );
+}
+
 /// A non-reload re-baseline that forgets an external change keeps the OLD
 /// fingerprint, so the next reload re-reads config and rebuilds the token list
 /// with the new credential.
@@ -1743,6 +1892,94 @@ fn a_daemon_reload_forgets_nothing_on_a_noop_resave() {
         epoch_value(&crate::profile::ProfileName::from("a"), Half::OAuth),
         base,
         "the epoch does not move on an anchor backfill"
+    );
+}
+
+/// N1: the reload writes the rebuilt token list BEFORE the compare's forget
+/// (the epoch bump). A seed-hook park during the re-seed — which runs after the
+/// bump inside `reload_and_forget` — observes the token list already holding the
+/// new entry. On the old order (bump before rebuild) the park would still see
+/// the old token, and a tick partitioning there would clone the old entry under
+/// the post-bump epoch.
+#[test]
+fn a_reload_rebuilds_the_token_list_before_it_bumps_the_epoch() {
+    use crate::profile::save_profile;
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::usage::Half;
+    use std::sync::mpsc;
+    use std::time::{Duration, SystemTime};
+
+    let _home = HomeSandbox::new();
+    let a = profile_with_creds("a", "access-A");
+    let config = persist(vec![a.clone()], Some("a"), 90_000);
+    let mut daemon = daemon_for(config);
+
+    // A cache present for `a` so the reload's re-seed reads it and fires the
+    // seed hook (a removed cache would short-circuit the re-seed before the
+    // hook).
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo::default(),
+    );
+
+    // Another process re-logs `a`.
+    let a_b = profile_with_creds("a", "access-B");
+    save_profile(&a_b).expect("persist a's new login");
+    let cred = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("a"),
+        "credentials.json",
+    )
+    .expect("credentials path");
+    set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
+
+    let tokens = daemon.usage_tokens.clone();
+    // Baseline the epoch BEFORE the reload: the map is process-global and never
+    // reset, so a prior test in the same process may already have forgotten `a`.
+    let epoch_before =
+        crate::usage::epoch_value(&crate::profile::ProfileName::from("a"), Half::OAuth);
+    let (parked_tx, parked_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    crate::usage::set_seed_hook(
+        crate::usage::SeedPhase::PostCompare,
+        crate::usage::Half::OAuth,
+        move |_name| {
+            let _ = parked_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+        },
+    );
+
+    struct Release(mpsc::Sender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    std::thread::scope(|scope| {
+        // Releases the parked re-seed on ANY exit (success or a red), so the
+        // scope's join never hangs.
+        let _release = Release(release_tx);
+        scope.spawn(|| daemon.reload_if_changed());
+        parked_rx.recv().expect("the reload parks in the re-seed");
+        let token = tokens
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.name.as_str() == "a")
+            .map(|t| t.access_token.clone());
+        assert_eq!(
+            token.as_deref(),
+            Some("access-B"),
+            "the token list is rebuilt before the epoch bump (N1)"
+        );
+    });
+
+    assert_eq!(
+        crate::usage::epoch_value(&crate::profile::ProfileName::from("a"), Half::OAuth),
+        epoch_before + 1,
+        "the external re-login still bumps the epoch exactly once"
     );
 }
 

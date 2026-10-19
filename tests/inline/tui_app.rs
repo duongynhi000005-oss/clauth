@@ -905,7 +905,7 @@ fn the_delegates_detail_names_rate_limited_traffic() {
         ..AppState::default()
     })
     .expect("persist app state");
-    crate::throughput::record_rate_limit(&profile.name, None, None, now_secs);
+    crate::throughput::record_rate_limit(&profile.name, None, None, now_secs, None);
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: vec![profile],
@@ -2707,6 +2707,165 @@ fn reload_if_state_changed_does_not_invert_config_over_token_locks() {
     assert!(
         reloaded,
         "the reload branch must run so the token-mutex writes are exercised"
+    );
+}
+
+/// P1: a peer re-logs `a`, then this process's own change site (on `y`) runs a
+/// non-reload re-baseline. The compare forgets `a` (epoch bump + snapshot
+/// refresh) while the token list still holds the OLD entry; the partition must
+/// read the snapshot and DROP that stale entry (no spawn at all), so nothing
+/// lands — no reading, cadence or streak — and the new login's first fetch is
+/// not delayed.
+#[test]
+fn a_rebaseline_that_forgets_a_peer_login_stamps_nothing_for_the_stale_entry() {
+    use crate::profile::{AppState, save_app_state, save_profile};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = oauth_profile("a", "access-A", None, None);
+    let y = oauth_profile("y", "y-A", None, None);
+    save_app_state(&AppState {
+        profiles: vec![a.name.clone(), y.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&a).expect("persist a");
+    save_profile(&y).expect("persist y");
+    let (base, server) = crate::testutil::serve_endpoints(8, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"five_hour":{"utilization":1.0,"resets_at":"2099-01-01T00:00:00+00:00"}}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
+
+    let mut app = app_with(vec![a.clone(), y.clone()]);
+    app.refresh_tokens();
+    // Another process re-logs `a` to a different token.
+    save_profile(&oauth_profile("a", "access-B", None, None)).expect("peer re-login");
+    // This process's own change site (on `y`) re-baselines without a reload.
+    app.rebaseline_and_forget(crate::profile::reload_fingerprint());
+
+    let state = crate::usage::SchedulerState::over_shared(
+        Arc::clone(&app.config),
+        Arc::clone(&app.usage_tokens),
+        Arc::clone(&app.usage_store),
+        Arc::clone(&app.usage_status),
+        Arc::clone(&app.last_fetched),
+        Arc::clone(&app.poll_streaks),
+        Arc::clone(&app.snapshot),
+    );
+    crate::usage::tick(&state);
+    let _ = server.join().expect("listener");
+
+    assert!(
+        app.usage_store.lock().unwrap().contains_key("y"),
+        "control: the unchanged account's landing writes its reading"
+    );
+    assert!(
+        !app.usage_store.lock().unwrap().contains_key("a"),
+        "the stale entry's landing writes no reading"
+    );
+    assert!(
+        !app.poll_streaks.lock().unwrap().contains_key("a"),
+        "the stale entry's landing stamps no streak"
+    );
+    let a_key = crate::usage::FetchLeg::OAuth.key(ProfileName::from("a"));
+    assert!(
+        !app.last_fetched.lock().unwrap().contains_key(&a_key),
+        "the stale entry's landing stamps no cadence"
+    );
+}
+
+// ── round 3: TUI reload ordering (P6) ───────────────────────────────────────
+
+/// P6 (TUI twin of the daemon reload-order test): `reload_if_state_changed`
+/// writes the rebuilt token list BEFORE the compare's forget, so a partition
+/// landing between the two clones the REBUILT entry. The seed hook parks the
+/// reload in the re-seed (after the compare's forget ran) and asserts the token
+/// list already holds the new entry. Q1 (move the compare before the write)
+/// reds it.
+#[test]
+fn a_tui_reload_rebuilds_the_token_list_before_it_bumps_the_epoch() {
+    use crate::profile::{AppState, save_app_state, save_profile};
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::testutil::set_mtime;
+    use std::sync::mpsc;
+    use std::time::{Duration, SystemTime};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = oauth_profile("a", "access-A", None, None);
+    save_app_state(&AppState {
+        profiles: vec![a.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&a).expect("persist a");
+    // A cache for `a` so the reload's re-seed reads it and fires the hook.
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo::default(),
+    );
+
+    let mut app = app_with(vec![a.clone()]);
+    app.refresh_tokens();
+
+    // Another process re-logs `a` and touches the fingerprint.
+    save_profile(&oauth_profile("a", "access-B", None, None)).expect("peer re-login");
+    let cred = crate::profile::profile_subpath(&ProfileName::from("a"), "credentials.json")
+        .expect("credentials path");
+    set_mtime(&cred, SystemTime::now() + Duration::from_secs(60));
+
+    let epoch_before =
+        crate::usage::epoch_value(&ProfileName::from("a"), crate::usage::Half::OAuth);
+    let (parked_tx, parked_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    crate::usage::set_seed_hook(
+        crate::usage::SeedPhase::PostCompare,
+        crate::usage::Half::OAuth,
+        move |_name| {
+            let _ = parked_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+        },
+    );
+
+    struct Release(mpsc::Sender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    let tokens = Arc::clone(&app.usage_tokens);
+    std::thread::scope(|scope| {
+        let _release = Release(release_tx);
+        scope.spawn(|| app.reload_if_state_changed());
+        parked_rx.recv().expect("the reload parks in the re-seed");
+        let token = tokens
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.name.as_str() == "a")
+            .map(|t| t.access_token.clone());
+        assert_eq!(
+            token.as_deref(),
+            Some("access-B"),
+            "the TUI token list is rebuilt before the epoch bump (N1 twin)"
+        );
+    });
+
+    assert_eq!(
+        crate::usage::epoch_value(&ProfileName::from("a"), crate::usage::Half::OAuth),
+        epoch_before + 1,
+        "the external re-login still bumps the epoch exactly once"
     );
 }
 
@@ -13936,6 +14095,7 @@ fn already_expired() -> i64 {
 #[test]
 fn collect_tokens_carries_the_auth_broken_flag() {
     use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken};
+    let _home = crate::testutil::HomeSandbox::new();
     let creds = |name: &str| ClaudeCredentials {
         claude_ai_oauth: Some(OAuthToken {
             access_token: format!("at-{name}"),

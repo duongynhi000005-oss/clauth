@@ -1295,6 +1295,7 @@ impl Daemon {
             // Pinned by construction, not a test: no test drives this call site
             // (`spawn_refresher` builds its own state under `cfg!(test)`).
             false,
+            Arc::clone(&self.snapshot),
         );
     }
 

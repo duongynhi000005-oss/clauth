@@ -6254,7 +6254,7 @@ fn record_dead_key_drops_the_balance_cache_and_records_the_fingerprint_verdict()
     .expect("cache path");
     assert!(cache.exists(), "the precondition: a cached balance exists");
 
-    super::record_dead_key(&name, 42);
+    super::record_dead_key(&name, 42, None);
 
     assert!(
         !cache.exists(),
@@ -6267,6 +6267,51 @@ fn record_dead_key_drops_the_balance_cache_and_records_the_fingerprint_verdict()
     assert!(
         !crate::profile_cache::auth_expired_matches(&name, 43),
         "a verdict for any other credential is inert"
+    );
+}
+
+/// F8/M4: the dead-key gate drops a NEW key's cache only when the delegate was
+/// launched under that key — a dead key fired for K1 after an edit to K2 keeps
+/// K2's balance cache.
+#[test]
+fn record_dead_key_keeps_a_newer_keys_cache() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    crate::testutil::register_names(&["work"]);
+    let k1 = crate::profile::Profile::new(
+        "work".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("k1".to_string()),
+    );
+    crate::profile::save_profile(&k1).expect("save k1");
+    let spawn_third_party = crate::usage::third_party_identity(
+        k1.provider,
+        k1.api_key.as_deref(),
+        k1.console.as_ref(),
+        k1.base_url.as_deref(),
+    );
+    // Another process edits the key to K2 before the delegate finishes.
+    let k2 = crate::profile::Profile::new(
+        "work".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("k2".to_string()),
+    );
+    crate::profile::save_profile(&k2).expect("save k2");
+    crate::testutil::write_captured_third_party_cache(
+        "work",
+        crate::testutil::DEEPSEEK_CACHE_BYTES,
+    );
+    let cache = crate::profile_cache::profile_cache_path(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+
+    super::record_dead_key(&name, 42, spawn_third_party);
+
+    assert!(
+        cache.exists(),
+        "the newer key's balance cache must survive a stale dead-key drop"
     );
 }
 
@@ -7309,7 +7354,7 @@ fn the_dead_key_recording_forward_survives_each_completion_arm() {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert_eq!(
-            dense, "record_dead_key(&profile_name,fp);",
+            dense, "record_dead_key(&profile_name,fp,spawn_third_party);",
             "each gate's whole body is the recording forward, nothing else: {dense}"
         );
         sites += 1;
@@ -8420,6 +8465,7 @@ fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
         Some("default"),
         Some(10),
         1_000,
+        None,
     );
     assert_eq!(
         throughput_note("defaulted", 1_000),
@@ -8433,6 +8479,7 @@ fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
         Some(""),
         Some(10),
         1_000,
+        None,
     );
     assert_eq!(
         throughput_note("blank", 1_000),
@@ -8443,6 +8490,7 @@ fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
         Some("   "),
         Some(10),
         1_000,
+        None,
     );
     assert_eq!(
         throughput_note("spacey", 1_000),
@@ -8456,6 +8504,7 @@ fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
         Some("  claude-opus-4  "),
         Some(10),
         1_000,
+        None,
     );
     assert_eq!(
         throughput_note("padded", 1_000),
@@ -8470,6 +8519,7 @@ fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
         100,
         1_000,
         1_000,
+        None,
     );
     crate::throughput::record_success(
         &crate::profile::ProfileName::from("named"),
@@ -8477,6 +8527,7 @@ fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
         10,
         1_000,
         1_000,
+        None,
     );
     crate::throughput::record_success(
         &crate::profile::ProfileName::from("named"),
@@ -8484,6 +8535,7 @@ fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
         10,
         1_000,
         1_000,
+        None,
     );
     assert_eq!(
         throughput_note("named", 1_000),

@@ -1943,6 +1943,7 @@ fn fold_fanout_rows_ages_a_rate_limit_off_after_the_recent_window() {
         Some("claude-opus"),
         Some(10),
         1_000,
+        None,
     );
     let names = vec!["solo".to_string()];
     let envelope = || Ok(serde_json::json!({ "result": "boom" }));

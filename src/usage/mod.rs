@@ -23,12 +23,21 @@ mod forget;
 )]
 mod inference;
 mod scheduler;
+// The partition/tick pair is unreachable in production (`mod scheduler` is
+// private and this re-export is `#[cfg(test)]`); tests in other modules drive
+// it through here, so the shipped binary's reachability stays as the base had
+// it (S5) — the same `pub(crate)` + private-mod + cfg(test) re-export pattern
+// `scan_auto_switch` already uses.
+#[cfg(test)]
+pub(crate) use scheduler::{SchedulerState, tick};
 
 pub(crate) use burn::{
     BURN_GAP_CUT_MS, BURN_LOOKBACK_MS, BURN_MIN_SAMPLES, WalletRate, WalletSample,
     compute_burn_rates_from_history, funded_wallet_rate, project_utilization,
 };
 pub(crate) use codex::fetch_codex_usage;
+#[cfg(test)]
+pub(crate) use codex::{clear_codex_usage_url_override, set_codex_usage_url_override};
 // The mapping is exercised directly by the codex chain tests, which drive a real
 // wham/usage body through the walk rather than hand-building a UsageInfo.
 #[cfg(test)]
@@ -36,12 +45,14 @@ pub(crate) use codex::map_usage as map_codex_usage;
 #[allow(unused_imports)]
 pub(crate) use fetch::{
     ANTHROPIC_ORIGIN, AccountEmail, ExtraPeriod, ExtraUsage, LABEL_5H, LABEL_7D, LABEL_30D,
-    LoginProfile, PlanInfo, PlanTier, ScopedWindow, SpendInfo, UsageInfo, UsageWindow,
-    WindowDollars, await_request_slot, cli_user_agent, epoch_secs_to_iso, expire_profile_ttl,
-    fetch_account_uuid, five_hour_live, forget_profile_memo, http_agent, humanize_duration,
-    ideal_pace_pct, iso_to_epoch_secs, long_window_live, mark_profile_read_stale, now_epoch_secs,
-    now_ms, parse_retry_after, parse_retry_after_at, probe_login_profile, seed_login_anchor,
-    spent_resume_in_secs, window_avg_pace_per_day, window_duration_secs, windows_maxed,
+    LoginProfile, PlanInfo, PlanTier, ProfileFetchDecision, ScopedWindow, SpendInfo, UsageInfo,
+    UsageWindow, WindowDollars, await_request_slot, cli_user_agent, decide_profile_fetch,
+    epoch_secs_to_iso, expire_profile_ttl, fetch_account_uuid, fetch_profile_plan, five_hour_live,
+    forget_profile_memo, http_agent, humanize_duration, ideal_pace_pct, iso_to_epoch_secs,
+    long_window_live, mark_profile_read_stale, note_profile_memo, now_epoch_secs, now_ms,
+    parse_retry_after, parse_retry_after_at, probe_login_profile, seed_login_anchor,
+    spent_resume_in_secs, stamp_profile_fetch, window_avg_pace_per_day, window_duration_secs,
+    windows_maxed,
 };
 pub(crate) use scheduler::{
     ActivityStore, FetchLeg, FetchStatus, KickBlock, KickBlocks, LastFetchedAt, LegKey,
@@ -50,15 +61,15 @@ pub(crate) use scheduler::{
     StartupReceiver, StartupSender, StartupSignal, StatusStore, StreakCounts,
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
     ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, WeeklyResetKicks, any_busy,
-    any_fetch_leg_polls, bootstrap_fetch, bootstrap_third_party, clear_activity,
-    collect_oauth_seed_names, collect_third_party_entries, collect_third_party_seed_names,
-    collect_tokens, current_key_rejected_names, decision_fresh_any, end_rotation,
-    fill_chain_snapshot_stores, is_idle, is_stuck_rate_limited, is_stuck_streak,
-    kick_block_switch_grade, mark_activity, mark_fetch_activity, polled_third_party_names,
-    profile_credential_fingerprint, queued_switch_away_is_stale, reading_is_polled,
-    rotation_into_fetch, selected_activity, selected_next_refresh, spawn_refresher,
-    switch_gate_in_flight, switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts,
-    third_party_credentialed,
+    any_fetch_leg_polls, bootstrap_fetch, bootstrap_third_party, build_token_entries,
+    clear_activity, collect_oauth_seed_names, collect_third_party_entries,
+    collect_third_party_seed_names, collect_token_seeds, collect_tokens,
+    current_key_rejected_names, decision_fresh_any, end_rotation, fill_chain_snapshot_stores,
+    is_idle, is_stuck_rate_limited, is_stuck_streak, kick_block_switch_grade, mark_activity,
+    mark_fetch_activity, polled_third_party_names, profile_credential_fingerprint,
+    queued_switch_away_is_stale, reading_is_polled, rotation_into_fetch, selected_activity,
+    selected_next_refresh, spawn_refresher, switch_gate_in_flight,
+    switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts, third_party_credentialed,
 };
 // The queue's history-pair classifier stays module-private — reached by
 // `usage::auto_start_queue`'s own tests through `super::` — while the gap arithmetic is
@@ -83,10 +94,14 @@ pub(crate) use scheduler::ACTIVE_CAP_MAX_STREAK;
 pub(crate) use scheduler::DEGRADED_GAP_CEILING_MS;
 pub(crate) use scheduler::MAX_RETRY_AFTER_MS;
 #[cfg(test)]
+pub(crate) use scheduler::clear_codex_compare_hooks_for_test;
+#[cfg(test)]
 pub(crate) use scheduler::clear_seed_hooks_for_test;
 #[cfg(test)]
 pub(crate) use scheduler::scan_auto_switch;
 pub(crate) use scheduler::token_clock_expired;
+#[cfg(test)]
+pub(crate) use scheduler::{SeedPhase, set_seed_hook};
 // Test-only: reset the per-host request-spacing slots so a real-bytes wire test
 // driving a builder through `await_request_slot` doesn't sleep out the window,
 // and read one back so a leg's reservation is assertable without that sleep.
@@ -111,10 +126,12 @@ pub(crate) use fetch::take_profile_fetch;
 
 pub(crate) use forget::{
     ForgetPlan, Half, MemoryStores, OAuthIdentity, SnapshotMap, apply_pending_forgets,
-    endpoint_identity_plan, epoch_guard_if_current, epoch_value, forget_disk, forget_disk_plan,
-    new_snapshot, note_forget, note_forget_plan, note_rename, oauth_changed,
-    read_before_identities, read_codex_identity, register_memory_stores, reload_and_forget,
-    third_party_identity, throughput_for_endpoint, throughput_identity,
+    endpoint_identity_plan, epoch_guard, epoch_guard_if_current, epoch_value, forget_disk,
+    forget_disk_plan, forget_memory, new_snapshot, note_forget, note_forget_plan, note_rename,
+    oauth_changed, read_before_identities, read_codex_for_compare, read_codex_identity,
+    read_oauth_for_compare, read_third_party_for_compare, read_throughput_for_compare,
+    register_memory_stores, reload_and_forget, spawn_oauth_identity, third_party_identity,
+    throughput_for_endpoint, throughput_identity, throughput_identity_for_spawn,
 };
 #[cfg(test)]
 pub(crate) use forget::{bump_epoch, reset_pending_forgets_for_test, try_lock_epoch_for_test};

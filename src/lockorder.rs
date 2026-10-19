@@ -203,6 +203,11 @@ pub(crate) mod rank {
         Activity = 600;
         // Standalone leaves — never nested with another tracked lock.
         NextRefresh = 1100;
+        /// Codex poll-cadence memo (`usage::scheduler::CODEX_POLLED_AT`). Taken
+        /// alone by `forget_codex_polled`, and under the epoch guard (160) by the
+        /// codex landing's section 2, which also takes the usage stores (300/350)
+        /// — so it ranks above them all as a leaf.
+        CodexPolled = 1150;
         RefetchQueue = 1200;
         /// Process-lifetime `access token digest → account uuid` memo behind the
         /// adopt's identity gate (`usage::scheduler::memoized_identity`). A true

@@ -110,6 +110,35 @@ impl OAuthIdentity {
     }
 }
 
+/// The profile's stored claude OAuth access token, following the loader's
+/// staged-pair rule: a live `credentials.json.staged` pair is the chain head,
+/// so it is the stored token even while memory and the store lag it. `None` on
+/// an absent/unparseable store or a login-less chain.
+fn stored_token_with_stage(name: &ProfileName) -> Option<String> {
+    let raw = crate::oauth::read_raw_store(name).ok().flatten();
+    crate::oauth::live_stage_credentials(name, raw.as_ref())
+        .and_then(|c| c.access_token().map(str::to_string))
+        .or_else(|| raw.and_then(|c| c.access_token().map(str::to_string)))
+}
+
+/// The OAuth identity a spawn captures for the in-memory token `access_token`.
+///
+/// The disk anchor is adopted ONLY when the stored token (read with the
+/// loader's staged-pair rule) still equals the in-memory token; otherwise the
+/// unanchored in-memory digest is carried, which compares as changed against
+/// any other stored token and discards the landing. The anchor is read BEFORE
+/// the stored-token read, so a peer's install landing between the two reads
+/// shows up as a token change — never a stale anchor paired with a newer token
+/// (which `oauth_changed`'s anchored arm would let through).
+pub(crate) fn spawn_oauth_identity(name: &ProfileName, access_token: &str) -> OAuthIdentity {
+    let anchor = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE);
+    let adopt_anchor = stored_token_with_stage(name).as_deref() == Some(access_token);
+    OAuthIdentity::for_values(
+        adopt_anchor.then_some(anchor).flatten().as_ref(),
+        Some(access_token),
+    )
+}
+
 /// Read `name`'s stored OAuth identity from the raw files (`account_id.json`,
 /// `credentials.json`).
 pub(crate) fn read_oauth_identity(name: &ProfileName) -> OAuthIdentity {
@@ -294,6 +323,7 @@ pub(crate) fn read_snapshot_identities(name: &ProfileName) -> SnapshotIdentities
         oauth: before.oauth,
         third_party: before.third_party,
         codex: read_codex_identity(name),
+        ..SnapshotIdentities::default()
     }
 }
 
@@ -335,6 +365,7 @@ fn read_for_compare(name: &ProfileName) -> (SnapshotIdentities, CompareSkips) {
             oauth,
             third_party,
             codex,
+            ..SnapshotIdentities::default()
         },
         CompareSkips {
             oauth: oauth_skip,
@@ -347,7 +378,7 @@ fn read_for_compare(name: &ProfileName) -> (SnapshotIdentities, CompareSkips) {
 /// The OAuth half's identity plus its unreadable flag, off ONE read of
 /// `credentials.json`. A store that exists but fails to read or parse is
 /// unreadable; a store that parses with no login is genuinely "no credential".
-fn read_oauth_for_compare(name: &ProfileName) -> (OAuthIdentity, bool) {
+pub(crate) fn read_oauth_for_compare(name: &ProfileName) -> (OAuthIdentity, bool) {
     let Ok(path) = crate::profile::profile_subpath(name, "credentials.json") else {
         return (OAuthIdentity::default(), false);
     };
@@ -370,7 +401,7 @@ fn read_oauth_for_compare(name: &ProfileName) -> (OAuthIdentity, bool) {
 /// The third-party half's identity plus its unreadable flag. The identity comes
 /// off one `config.toml` read; a store that exists but fails to read or parse
 /// is unreadable, never "no credential".
-fn read_third_party_for_compare(name: &ProfileName) -> (Option<u64>, bool) {
+pub(crate) fn read_third_party_for_compare(name: &ProfileName) -> (Option<u64>, bool) {
     let Ok(path) = crate::profile::profile_subpath(name, "config.toml") else {
         return (None, false);
     };
@@ -393,7 +424,7 @@ fn read_third_party_for_compare(name: &ProfileName) -> (Option<u64>, bool) {
 /// The codex half's identity plus its unreadable flag. `auth.json` is rewritten
 /// in place by codex outside clauth's state flock, so a torn read here is the
 /// live case: it reads unreadable, never "no credential".
-fn read_codex_for_compare(name: &ProfileName) -> (Option<String>, bool) {
+pub(crate) fn read_codex_for_compare(name: &ProfileName) -> (Option<String>, bool) {
     let Ok(path) = crate::profile::profile_subpath(name, "auth.json") else {
         return (None, false);
     };
@@ -402,6 +433,63 @@ fn read_codex_for_compare(name: &ProfileName) -> (Option<String>, bool) {
         None if path.exists() => (None, true),
         None => (None, false),
     }
+}
+
+/// The throughput half's identity plus its unreadable flag, for the MCP
+/// delegate-end compare. Reads `credentials.json` and `config.toml` lock-free;
+/// either file existing but unreadable/unparseable marks the half unreadable, so
+/// a torn write reads RETRY (write nothing) rather than "no credential".
+pub(crate) fn read_throughput_for_compare(name: &ProfileName) -> (Option<u64>, bool) {
+    let (oauth, oauth_unreadable) = read_oauth_for_compare(name);
+    let (base_url, api_key, env_token, endpoint_unreadable) =
+        match crate::profile::profile_subpath(name, "config.toml") {
+            Ok(path) => match crate::profile::stored_endpoint_identity(name) {
+                Some(e) => (
+                    e.base_url,
+                    e.api_key,
+                    crate::profile::inference_env_token(&e.env),
+                    false,
+                ),
+                None if path.exists() => (None, None, None, true),
+                None => (None, None, None, false),
+            },
+            Err(_) => (None, None, None, false),
+        };
+    let identity = throughput_identity(
+        &oauth,
+        base_url.as_deref(),
+        api_key.as_deref(),
+        env_token.as_deref(),
+    );
+    (identity, oauth_unreadable || endpoint_unreadable)
+}
+
+/// The throughput identity a delegate launch on `p` records under, applying the
+/// spawn OAuth identity rule: `name`'s disk anchor is adopted only when the
+/// stored token still equals the in-memory token. Reads the anchor and stored
+/// token itself, so the capture is one consistent read — a delegate spawned
+/// under a stale in-memory profile records an identity that compares as changed
+/// against the stored credential.
+pub(crate) fn throughput_identity_for_spawn(
+    name: &ProfileName,
+    p: &crate::profile::Profile,
+) -> Option<u64> {
+    let access = p
+        .credentials
+        .as_ref()
+        .and_then(|c| c.claude_ai_oauth.as_ref())
+        .map(|o| o.access_token.as_str());
+    let oauth = match access {
+        Some(access) => spawn_oauth_identity(name, access),
+        None => OAuthIdentity::default(),
+    };
+    let env_token = crate::profile::inference_env_token(&p.env);
+    throughput_identity(
+        &oauth,
+        p.base_url.as_deref(),
+        p.api_key.as_deref(),
+        env_token.as_deref(),
+    )
 }
 
 /// Whether `half` differs between two snapshots. The OAuth half uses the stored
@@ -531,8 +619,10 @@ pub(crate) fn epoch_value(name: &ProfileName, half: Half) -> u64 {
 }
 
 /// Acquire the epoch guard, held from a seed's compare through its writes so a
-/// forget cannot bump the epoch between check and write.
-fn epoch_guard() -> crate::lockorder::RankedGuard<'static, EpochMap> {
+/// forget cannot bump the epoch between check and write. Also held by the
+/// tick's partition across the token-list clone + epoch capture, so a forget
+/// cannot land between them and stamp a stale entry's landing as unmoved.
+pub(crate) fn epoch_guard() -> crate::lockorder::RankedGuard<'static, EpochMap> {
     EPOCH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -676,6 +766,25 @@ pub(crate) struct SnapshotIdentities {
     pub(crate) oauth: OAuthIdentity,
     pub(crate) third_party: Option<u64>,
     pub(crate) codex: Option<String>,
+    /// A half whose refresh read could not be read (a torn identity file):
+    /// its stored identity is unknown, so the partition skips every entry of
+    /// that name (S2) until the next compare writes a real value (S3). The
+    /// identity value beside it stays the last-known one — a torn write is
+    /// RETRY, never "no credential". Codex has no token list (its leg compares
+    /// `auth.json` itself), so it carries no unknown mark.
+    pub(crate) oauth_unknown: bool,
+    pub(crate) third_party_unknown: bool,
+}
+
+impl SnapshotIdentities {
+    /// Whether `half` is marked unknown — the partition's skip signal.
+    pub(crate) fn unknown(&self, half: Half) -> bool {
+        match half {
+            Half::OAuth => self.oauth_unknown,
+            Half::ThirdParty => self.third_party_unknown,
+            Half::Codex | Half::Throughput => false,
+        }
+    }
 }
 
 pub(crate) type SnapshotMap = HashMap<String, SnapshotIdentities>;
@@ -760,6 +869,12 @@ fn forget_memory_with_identity(
     half: Half,
     refreshed: Option<HalfIdentity>,
 ) {
+    // Snapshot half FIRST: the tick's partition decides "moved" by comparing
+    // each entry's identity against this snapshot half while holding the epoch
+    // guard, so the half must never lag its epoch — write it before the bump,
+    // else a partition landing between the two reads a stale snapshot against
+    // the post-bump epoch and pairs the old entry with it (P1).
+    refresh_snapshot_half(stores, name, half, refreshed);
     bump_epoch(name, half);
     clear_memory(stores, name, half);
     let interval_ms = stores.interval_ms.load(Ordering::Relaxed);
@@ -793,7 +908,6 @@ fn forget_memory_with_identity(
         }
         Half::Throughput => {}
     }
-    refresh_snapshot_half(stores, name, half, refreshed);
 }
 
 /// One half's identity read before a forget's re-seed — the value the snapshot
@@ -844,25 +958,48 @@ fn half_identity_from_reads(
 
 /// Store the half's pre-forget identity into the snapshot, so this process's
 /// own change reads as "already seen" at the next compare and is forgotten
-/// exactly once. Runs after the store locks above are released.
+/// exactly once. Runs BEFORE the epoch bump (the snapshot half must never lag
+/// its epoch: the partition reads both under the epoch guard, so a half written
+/// after the bump pairs an old entry with the post-bump epoch).
+///
+/// `refreshed = None` means the half's identity could not be read (a torn
+/// identity file): the snapshot half is then marked UNKNOWN rather than left
+/// with a stale value, so the partition skips every entry of that name (S2)
+/// until the next compare writes a real value (S3). `Throughput` has no
+/// snapshot entry, so its `None` is nothing to mark.
 fn refresh_snapshot_half(
     stores: &MemoryStores,
     name: &ProfileName,
     half: Half,
     refreshed: Option<HalfIdentity>,
 ) {
-    let Some(refreshed) = refreshed else {
-        return; // Throughput has no snapshot entry.
-    };
     let mut snap = stores
         .snapshot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let entry = snap.entry(name.to_string()).or_default();
+    let Some(refreshed) = refreshed else {
+        if half != Half::Throughput {
+            match half {
+                Half::OAuth => entry.oauth_unknown = true,
+                Half::ThirdParty => entry.third_party_unknown = true,
+                Half::Codex | Half::Throughput => {}
+            }
+        }
+        return;
+    };
     match (half, refreshed) {
-        (Half::OAuth, HalfIdentity::OAuth(v)) => entry.oauth = v,
-        (Half::ThirdParty, HalfIdentity::ThirdParty(v)) => entry.third_party = v,
-        (Half::Codex, HalfIdentity::Codex(v)) => entry.codex = v,
+        (Half::OAuth, HalfIdentity::OAuth(v)) => {
+            entry.oauth = v;
+            entry.oauth_unknown = false;
+        }
+        (Half::ThirdParty, HalfIdentity::ThirdParty(v)) => {
+            entry.third_party = v;
+            entry.third_party_unknown = false;
+        }
+        (Half::Codex, HalfIdentity::Codex(v)) => {
+            entry.codex = v;
+        }
         _ => {}
     }
 }
@@ -1063,7 +1200,8 @@ pub(crate) fn reload_and_forget(stores: &MemoryStores, config: &[ProfileName]) -
 /// read (compare-and-set), so a concurrent forget's refresh is kept rather than
 /// overwritten. A half the compare marked unreadable is not written: its
 /// snapshot half keeps its current value (a torn write is RETRY, never
-/// "no credential").
+/// "no credential"). A half the compare DID write clears the unknown mark (S3):
+/// the next compare's read is the value the partition can trust again.
 fn write_snapshot_half_cas(
     snap: &mut SnapshotMap,
     name: &str,
@@ -1074,9 +1212,11 @@ fn write_snapshot_half_cas(
     let entry = snap.entry(name.to_string()).or_default();
     if !unreadable.oauth && entry.oauth == before.oauth {
         entry.oauth = after.oauth.clone();
+        entry.oauth_unknown = false;
     }
     if !unreadable.third_party && entry.third_party == before.third_party {
         entry.third_party = after.third_party;
+        entry.third_party_unknown = false;
     }
     if !unreadable.codex && entry.codex == before.codex {
         entry.codex = after.codex.clone();
@@ -1298,16 +1438,19 @@ mod tests {
             oauth: oa(None, Some("access-A")),
             third_party: None,
             codex: None,
+            ..SnapshotIdentities::default()
         };
         let after = SnapshotIdentities {
             oauth: oa(None, Some("access-B")),
             third_party: None,
             codex: None,
+            ..SnapshotIdentities::default()
         };
         let concurrent = SnapshotIdentities {
             oauth: oa(None, Some("access-C")),
             third_party: None,
             codex: None,
+            ..SnapshotIdentities::default()
         };
 
         let mut snap: HashMap<String, SnapshotIdentities> = HashMap::new();
@@ -1319,6 +1462,33 @@ mod tests {
             snap.get(&name),
             Some(&concurrent),
             "a half whose entry moved since the diff keeps the concurrent writer's value"
+        );
+    }
+
+    /// P1's snapshot-before-epoch order: `forget_memory_with_identity` refreshes
+    /// the snapshot half BEFORE it bumps the epoch, so a partition reading both
+    /// under the epoch guard never pairs a stale snapshot with the post-bump
+    /// epoch. Pinned by source scan — the order is only observable through a
+    /// concurrent partition in the window between the two writes, which no test
+    /// can stage deterministically.
+    #[test]
+    fn the_snapshot_half_is_refreshed_before_the_epoch_bump() {
+        let body = include_str!("forget.rs")
+            .split_once("fn forget_memory_with_identity(")
+            .expect("the forget body is defined")
+            .1
+            .split_once("fn clear_memory(")
+            .expect("the forget body ends where clear_memory begins")
+            .0;
+        let refresh = body
+            .find("refresh_snapshot_half(stores, name, half, refreshed);")
+            .expect("the refresh runs in the forget body");
+        let bump = body
+            .find("bump_epoch(name, half);")
+            .expect("the bump runs in the forget body");
+        assert!(
+            refresh < bump,
+            "the snapshot half is refreshed BEFORE the epoch bump"
         );
     }
 }
