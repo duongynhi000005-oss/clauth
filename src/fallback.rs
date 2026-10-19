@@ -1528,26 +1528,35 @@ pub(crate) fn start_block(
 /// One chain member as the start walk judged it, with enough to render the
 /// `--explain` row: the verdict, the cache age (for the staleness cell), whether
 /// that age reads stale, and whether the reading is DATED and fresh (pass one's
-/// preference).
+/// preference). `demand` is the member's own model-family demand — the one its
+/// per-model judgment ran under, printed when it is the pick; the refusal
+/// header names it only when every judged member carries the same demand
+/// ([`shared_demand`]).
 pub(crate) struct StartCandidate {
     pub(crate) name: ProfileName,
     pub(crate) block: Option<StartBlock>,
     pub(crate) age: crate::profile_json::OauthAge,
     pub(crate) stale: bool,
     pub(crate) fresh: bool,
+    pub(crate) demand: Vec<String>,
 }
 
 /// The `--auto` walk: every resolvable fallback-chain member in chain order,
-/// each judged by [`start_block`] with the models a launch is about to run, plus
-/// the index of the first clear member (freshness PREFERRED in pass one, any
+/// each judged by [`start_block`] with the models THAT member's session will
+/// run (its own runtime overlay plus the process-env pair passed in and the
+/// passthrough args — see [`crate::start::member_launch_models`]), plus the
+/// index of the first clear member (freshness PREFERRED in pass one, any
 /// freshness accepted in pass two — the same preference the switch walk gives
-/// its target in [`next_auto_switch_target`]). Each pass follows the
-/// `walk_order` mode: chain position by default, the soonest-resetting weekly
-/// window under `soonest-weekly-reset`, the least-used week under
-/// `most-weekly-headroom`.
+/// its target in [`next_auto_switch_target`]). `env_models` is the process-env
+/// model pair, read once by `cmd_start`, so this walk never reads the process
+/// environment itself. Each pass follows the `walk_order` mode: chain position
+/// by default, the soonest-resetting weekly window under `soonest-weekly-reset`,
+/// the least-used week under `most-weekly-headroom`.
 pub(crate) fn start_walk(
     config: &AppConfig,
-    families: Option<&[String]>,
+    isolation: crate::runtime::Isolation,
+    claude_args: &[String],
+    env_models: [Option<String>; 2],
     needs_oauth: bool,
 ) -> (Vec<StartCandidate>, Option<usize>) {
     let weekly_pct = config.state.weekly_switch_threshold_pct();
@@ -1559,6 +1568,11 @@ pub(crate) fn start_walk(
     // judgment (`chain_member.preferred`) reads the durable verdict — once,
     // not once per candidate.
     let key_rejected = durable_key_rejected(config);
+    // The outgoing profile's env keys strip the base settings before the member
+    // overlay re-adds its own — the same set, builder and base choice the
+    // runtime write uses, so the demand's settings-derived models are exactly
+    // the runtime's `settings.json` models.
+    let stale_env_keys = crate::actions::outgoing_env_keys(config);
     let mut rows: Vec<StartCandidate> = Vec::with_capacity(names.len());
     // The reading each row's walk-order ranking reads, built in the same loop
     // as the rows (parallel vec, same indices) so the walk below can order
@@ -1592,6 +1606,14 @@ pub(crate) fn start_walk(
         let stale = windows.stale();
         let fresh = windows.fresh();
         let kick_rejected = kick.iter().any(|k| k == name);
+        let demand = demand_from(crate::start::member_launch_models(
+            profile,
+            isolation,
+            &stale_env_keys,
+            claude_args,
+            &env_models,
+        ));
+        let families = (!demand.is_empty()).then_some(demand.as_slice());
         let block = start_block(
             config,
             &member,
@@ -1612,6 +1634,7 @@ pub(crate) fn start_walk(
             age,
             stale,
             fresh,
+            demand,
         });
     }
     if rows.is_empty() {
@@ -1625,6 +1648,63 @@ pub(crate) fn start_walk(
         .find(|&i| rows[i].block.is_none() && rows[i].fresh)
         .or_else(|| order.iter().copied().find(|&i| rows[i].block.is_none()));
     (rows, pick)
+}
+
+/// The refusal header's model suffix demand: `Some` only when every judged
+/// member carries the same non-empty set of model families (one member, or
+/// members that agree) in any order — the same families still run whichever
+/// order they arrive in. The first member's order is kept. Mixed demands — or
+/// an empty walk — yield `None`, because naming one family would be false for
+/// the members judged against another, so the header falls back to the
+/// template's own no-demand form.
+pub(crate) fn shared_demand(rows: &[StartCandidate]) -> Option<Vec<String>> {
+    let first = rows.first()?;
+    if first.demand.is_empty() {
+        return None;
+    }
+    if rows.iter().skip(1).any(|row| {
+        row.demand.len() != first.demand.len()
+            || row.demand.iter().any(|f| !first.demand.contains(f))
+    }) {
+        return None;
+    }
+    Some(first.demand.clone())
+}
+
+/// The `--auto` start's pick: the picked member's name, the walk's rows, the
+/// pick index, and the demand its pick/launch line prints.
+pub(crate) type StartPick = (ProfileName, Vec<StartCandidate>, Option<usize>, Vec<String>);
+
+/// The `--auto` start's pick-and-demand: walk the fallback chain, refuse when
+/// no member has headroom, and return the picked member's name and the demand
+/// its pick/launch line prints. Held as a function — not inline in `cmd_start`
+/// — so the arm's `rows[pick]` choice is pinned at its real call site (see
+/// `tests/inline/fallback.rs`), not a hand-built-rows stand-in. `env_models`
+/// is the process-env model pair, read once by `cmd_start`, so this never
+/// reads the process environment itself.
+pub(crate) fn start_pick(
+    config: &AppConfig,
+    isolation: crate::runtime::Isolation,
+    claude_args: &[String],
+    env_models: [Option<String>; 2],
+    follows_chain: bool,
+) -> Result<StartPick> {
+    anyhow::ensure!(
+        !config.state.fallback_chain.is_empty(),
+        "--auto picks from the fallback chain and it is empty; add accounts on the \
+         fallback tab, or name one"
+    );
+    let (rows, pick) = start_walk(config, isolation, claude_args, env_models, follows_chain);
+    let Some(pick) = pick else {
+        let demand = shared_demand(&rows);
+        anyhow::bail!(
+            "{}",
+            crate::format::start_refusal(demand.as_deref().unwrap_or(&[]), &rows)
+        );
+    };
+    let name = rows[pick].name.clone();
+    let demand = rows[pick].demand.clone();
+    Ok((name, rows, Some(pick), demand))
 }
 
 /// Whether `profile`'s durable per-credential verdict names a dead api KEY (the

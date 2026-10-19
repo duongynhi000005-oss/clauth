@@ -694,6 +694,7 @@ fn render_start_walk_matches_the_approved_layout() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
+            demand: Vec::new(),
         },
         StartCandidate {
             name: crate::profile::ProfileName::from("D2"),
@@ -701,6 +702,7 @@ fn render_start_walk_matches_the_approved_layout() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
+            demand: Vec::new(),
         },
         StartCandidate {
             name: crate::profile::ProfileName::from("D3"),
@@ -708,6 +710,7 @@ fn render_start_walk_matches_the_approved_layout() {
             age: OauthAge::Dated(10_800_000),
             stale: true,
             fresh: false,
+            demand: Vec::new(),
         },
     ];
     assert_eq!(
@@ -728,6 +731,7 @@ fn start_lines_match_the_approved_copy() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
+            demand: Vec::new(),
         },
         StartCandidate {
             name: crate::profile::ProfileName::from("D2"),
@@ -735,6 +739,7 @@ fn start_lines_match_the_approved_copy() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
+            demand: Vec::new(),
         },
     ];
     let two = ["opus".to_owned(), "sonnet".to_owned()];

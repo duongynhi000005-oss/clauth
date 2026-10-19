@@ -4669,6 +4669,16 @@ pub(crate) fn scrub_profile_env(command: &mut std::process::Command, stale_env_k
     }
 }
 
+/// Whether a process-env `key` survives [`scrub_profile_env`] into the spawned
+/// child: false for every [`MANAGED_ENV_KEYS`] key (the subagent model among
+/// them) and for an outgoing activation's custom env key (`stale_env_keys`),
+/// true otherwise. The start demand's process-env leg derives from this same
+/// definition, so a scrubbed variable never names a model the session does not
+/// run.
+pub(crate) fn env_survives_scrub(key: &str, stale_env_keys: &[String]) -> bool {
+    !MANAGED_ENV_KEYS.contains(&key) && !stale_env_keys.iter().any(|k| k == key)
+}
+
 /// True when `dir` resolves to the real `$HOME`. `CLAUDE_CONFIG_DIR` only
 /// relocates Claude Code's USER-tier settings source; the PROJECT tier is a
 /// wholly separate `<cwd>/.claude/settings.json` lookup with no ancestor walk,
@@ -5080,6 +5090,19 @@ fn unlink_link(path: &Path, label: &str) {
     }
 }
 
+/// The `settings.json` base the runtime overlay builds on for `isolation`: the
+/// live `~/.claude/settings.json` under shared isolation, none under isolated
+/// (the overlay starts from `{}`). One helper for both the runtime write
+/// ([`write_merged_settings`]) and the start demand's derived model read
+/// ([`crate::start::member_launch_models`]), so the two cannot drift on which
+/// isolation keeps the global settings.
+pub(crate) fn settings_base(claude_home: &Path, isolation: Isolation) -> Option<PathBuf> {
+    match isolation {
+        Isolation::Shared => Some(claude_home.join("settings.json")),
+        Isolation::Isolated => None,
+    }
+}
+
 /// Compute this profile's merged `settings.json` and write it into the runtime
 /// tree only when absent or byte-different, so a rebuild over an existing tree
 /// leaves an already-correct file's mtime alone (the reconcilers below key on
@@ -5106,12 +5129,8 @@ fn write_merged_settings(
     isolation: Isolation,
     stale_env_keys: &[String],
 ) -> Result<()> {
-    let settings_src = claude_home.join("settings.json");
-    let base = match isolation {
-        Isolation::Shared => Some(settings_src.as_path()),
-        Isolation::Isolated => None,
-    };
-    let merged = build_claude_settings_json(base, profile, stale_env_keys)?;
+    let base = settings_base(claude_home, isolation);
+    let merged = build_claude_settings_json(base.as_deref(), profile, stale_env_keys)?;
     let settings_dst = runtime.join("settings.json");
     // This file carries the api-key profile's top-level `apiKeyHelper` command
     // string (plus the base_url/model env keys), so it must land 0o600 like

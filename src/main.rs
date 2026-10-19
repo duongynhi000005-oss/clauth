@@ -763,20 +763,13 @@ fn cmd_start(
             };
             (ProfileName::from(canonical), Vec::new(), None, Vec::new())
         }
-        cli::StartTarget::Auto => {
-            anyhow::ensure!(
-                !config.state.fallback_chain.is_empty(),
-                "--auto picks from the fallback chain and it is empty; add accounts on the \
-                 fallback tab, or name one"
-            );
-            let demand = fallback::demand_from(start::launch_models(rest));
-            let families = (!demand.is_empty()).then_some(demand.as_slice());
-            let (rows, pick) = fallback::start_walk(&config, families, follows_chain);
-            let Some(pick) = pick else {
-                anyhow::bail!("{}", format::start_refusal(&demand, &rows));
-            };
-            (rows[pick].name.clone(), rows, Some(pick), demand)
-        }
+        cli::StartTarget::Auto => fallback::start_pick(
+            &config,
+            isolation,
+            rest,
+            start::process_model_env(),
+            follows_chain,
+        )?,
     };
 
     if explain_only {

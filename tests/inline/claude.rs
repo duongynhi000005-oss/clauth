@@ -4694,31 +4694,38 @@ fn the_sign_out_skips_its_destructive_read_degrade_only_over_a_locked_keychain()
     ));
 }
 
-/// The settings reader the start walk's demand draws from: top-level `model`,
-/// the `fallbackModel` array (non-string entries skipped), then the subagent
-/// env key, in that order — absent file, a scalar `fallbackModel`, and
-/// unreadable entries all answer empty, never an error.
+/// The model read the start walk's per-member demand draws from: the runtime
+/// overlay's top-level `model`, the `fallbackModel` array (non-string entries
+/// skipped), then the subagent env key, in that order. A profile with no
+/// `[models] default` (and no subagent) drops the base model knobs — the
+/// overlay removes them — so no model comes from that source: the demand
+/// follows the session, not the global live settings.
 #[test]
-fn claude_settings_models_reads_model_fallbacks_and_the_subagent_key() {
-    let sb = HomeSandbox::new();
-    let dir = sb.home().join(".claude");
-    fs::create_dir_all(&dir).unwrap();
-
+fn runtime_models_reads_the_runtime_models_and_drops_a_missing_default() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json");
     fs::write(
-        dir.join("settings.json"),
+        &base,
         r#"{"model":"opus","fallbackModel":["claude-sonnet-5",7,null,"haiku"],"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"claude-haiku-4-5"}}"#,
     )
-    .unwrap();
+    .expect("seed base settings");
+
+    let mut profile = crate::profile::Profile::new("p".to_string(), None, None);
+    profile.models.default = Some("opus".to_string());
+    profile.models.subagent = Some("claude-haiku-4-5".to_string());
     assert_eq!(
-        claude_settings_models().unwrap(),
+        runtime_models(Some(base.as_path()), &profile, &[]).0,
         ["opus", "claude-sonnet-5", "haiku", "claude-haiku-4-5"]
     );
 
-    fs::remove_file(dir.join("settings.json")).unwrap();
-    assert!(claude_settings_models().unwrap().is_empty());
+    let no_default = crate::profile::Profile::new("p".to_string(), None, None);
+    assert_eq!(
+        runtime_models(Some(base.as_path()), &no_default, &[]).0,
+        ["claude-sonnet-5", "haiku"],
+        "no [models] default (or subagent) drops the base model knobs the session drops"
+    );
 
-    fs::write(dir.join("settings.json"), r#"{"fallbackModel":"sonnet"}"#).unwrap();
-    assert!(claude_settings_models().unwrap().is_empty());
+    assert!(runtime_models(None, &no_default, &[]).0.is_empty());
 }
 
 // ── preserve_non_login_keys: every non-login key stays with its account ─────

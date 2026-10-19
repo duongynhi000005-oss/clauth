@@ -4379,6 +4379,349 @@ fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
     );
 }
 
+// ── `--auto` judges each member for the models ITS session will run ─────────
+//
+// A runtime's `settings.json` takes `model` from the member's own `[models]
+// default` and drops the global one when the member has none (the overlay in
+// `claude::build_claude_settings_json`; measured 2026-10-18: global `"opus"`,
+// cld's runtime copies `null`). The demand a start judges a member by follows
+// the same overlay, and reads a process-env model only where the session
+// keeps it (`runtime::scrub_profile_env` drops `CLAUDE_CODE_SUBAGENT_MODEL`).
+
+/// One chain member: its `[models] default`, its `[env]`, and the per-model
+/// week it has spent (99% against the default 98 scoped line).
+struct StartMember {
+    name: &'static str,
+    default: Option<&'static str>,
+    env: &'static [(&'static str, &'static str)],
+    spent: &'static str,
+}
+
+/// The chain in order, each member's other windows clear, under a global
+/// `settings.json` holding `global`.
+fn seed_start_members(global: serde_json::Value, members: &[StartMember]) {
+    let names: Vec<crate::profile::ProfileName> = members.iter().map(|m| m.name.into()).collect();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: names.clone(),
+        fallback_chain: names,
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    for m in members {
+        let name = crate::profile::ProfileName::from(m.name);
+        let mut profile = crate::testutil::blank_profile(&name);
+        profile.models.default = m.default.map(str::to_owned);
+        for (k, v) in m.env {
+            profile.env.insert((*k).to_owned(), (*v).to_owned());
+        }
+        crate::profile::save_profile(&profile).unwrap();
+        let mut usage = cmd_start_usage();
+        usage.weekly_scoped = vec![crate::usage::ScopedWindow {
+            label: m.spent.to_string(),
+            window: crate::usage::UsageWindow {
+                utilization: 99.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            },
+        }];
+        crate::profile_cache::write_profile_cache(
+            &name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &usage,
+        );
+    }
+    let claude = crate::profile::claude_dir().unwrap();
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::write(
+        claude.join("settings.json"),
+        serde_json::to_vec(&global).unwrap(),
+    )
+    .unwrap();
+}
+
+/// One chain member `a` on `[models] default`, its Fable week spent, under a
+/// global `settings.json` naming `global_model`.
+fn seed_fable_spent_member(member_default: Option<&'static str>, global_model: &str) {
+    seed_start_members(
+        serde_json::json!({ "model": global_model }),
+        &[StartMember {
+            name: "a",
+            default: member_default,
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+}
+
+/// The developer's shell may export either model variable; every `--auto`
+/// demand test pins both unset unless it sets one itself.
+fn no_model_env(home: &crate::testutil::HomeSandbox) -> crate::testutil::EnvPin<'_> {
+    crate::testutil::EnvPin::new(
+        home,
+        &[
+            ("ANTHROPIC_MODEL", None),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", None),
+        ],
+    )
+}
+
+fn cmd_start_auto(isolation: Isolation) -> anyhow::Result<()> {
+    cmd_start(&crate::cli::StartTarget::Auto, &[], isolation, false, true)
+}
+
+#[test]
+fn cmd_start_auto_judges_a_member_by_its_own_default_model_over_the_global_one() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(Some("fable"), "opus");
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("the member's session runs fable, and its fable week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_takes_a_member_whose_own_default_skips_the_spent_family() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(Some("opus"), "fable");
+
+    cmd_start_auto(Isolation::Shared).expect("the member's session runs opus, which has headroom");
+}
+
+#[test]
+fn cmd_start_auto_never_judges_a_member_by_a_global_model_its_session_drops() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(None, "opus");
+
+    // No `[models] default`: the runtime drops the global `model`, the session
+    // runs Claude Code's own default, and an unresolved demand keeps the blanket
+    // per-model judgment (`check_scoped`, on by default).
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("an unknown model is judged against every per-model week");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_never_judges_a_member_by_a_subagent_model_the_session_scrubs() {
+    let sb = crate::testutil::HomeSandbox::new();
+    // The launching shell exports a subagent model; `start::run` removes it
+    // from the child, so the session never runs it.
+    let _env = crate::testutil::EnvPin::new(
+        &sb,
+        &[
+            ("ANTHROPIC_MODEL", None),
+            (
+                "CLAUDE_CODE_SUBAGENT_MODEL",
+                Some(std::ffi::OsStr::new("sonnet")),
+            ),
+        ],
+    );
+    seed_fable_spent_member(None, "opus");
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("a scrubbed variable is no demand, so the blanket judgment holds");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_judges_a_member_by_the_model_its_own_env_sets() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    // `[env] ANTHROPIC_MODEL` lands in the runtime `settings.json` `env`, and
+    // Claude Code runs it.
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[("ANTHROPIC_MODEL", "claude-fable-5")],
+            spent: "7d fable",
+        }],
+    );
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("the member's session runs fable, and its fable week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_refusal_names_no_family_when_the_members_demands_differ() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    // a runs fable and spent its fable week; b runs opus and spent its opus
+    // week. No one family is what every member was refused for.
+    seed_start_members(
+        serde_json::json!({}),
+        &[
+            StartMember {
+                name: "a",
+                default: Some("fable"),
+                env: &[],
+                spent: "7d fable",
+            },
+            StartMember {
+                name: "b",
+                default: Some("opus"),
+                env: &[],
+                spent: "7d opus",
+            },
+        ],
+    );
+
+    let err = cmd_start_auto(Isolation::Shared).expect_err("each member's own family is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d fable 99%, other models ok   usage 4m ago\n  b  7d opus 99%, other models ok    usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_judges_a_member_by_the_model_its_passthrough_names() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    // The member runs opus by default; `--model fable` adds fable to what the
+    // session may run, and its fable week is spent.
+    seed_start_members(
+        serde_json::json!({}),
+        &[StartMember {
+            name: "a",
+            default: Some("opus"),
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+
+    let err = cmd_start(
+        &crate::cli::StartTarget::Auto,
+        &["--model".to_string(), "fable".to_string()],
+        Isolation::Shared,
+        false,
+        true,
+    )
+    .expect_err("the passthrough model's week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for opus + fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// Makes `x` the active account, outside the chain, carrying `env`: the
+/// outgoing activation whose `[env]` keys `start::run` scrubs from the child.
+fn activate_outside_chain(env: &[(&str, &str)]) {
+    let x = crate::profile::ProfileName::from("x");
+    let mut profile = crate::testutil::blank_profile(&x);
+    for (k, v) in env {
+        profile.env.insert((*k).to_owned(), (*v).to_owned());
+    }
+    crate::profile::save_profile(&profile).unwrap();
+    let mut state = crate::profile::load_app_state().unwrap();
+    state.profiles.push(x.clone());
+    state.active_profile = Some(x);
+    crate::profile::save_app_state(&state).unwrap();
+}
+
+#[test]
+fn cmd_start_auto_never_judges_a_member_by_an_inherited_model_its_runtime_env_overrides() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &sb,
+        &[
+            ("ANTHROPIC_MODEL", Some(std::ffi::OsStr::new("opus"))),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", None),
+        ],
+    );
+    // The shell's `opus` survives the scrub (the active `x` sets no such key),
+    // but the member's runtime `settings.json` `env` sets its own, which
+    // Claude Code applies over the inherited one: the session runs fable.
+    seed_start_members(
+        serde_json::json!({}),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[("ANTHROPIC_MODEL", "claude-fable-5")],
+            spent: "7d opus",
+        }],
+    );
+    activate_outside_chain(&[]);
+
+    cmd_start_auto(Isolation::Shared).expect("the session runs fable, whose week is clear");
+}
+
+#[test]
+fn cmd_start_auto_never_judges_a_member_by_an_inherited_model_the_outgoing_profile_owned() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &sb,
+        &[
+            (
+                "ANTHROPIC_MODEL",
+                Some(std::ffi::OsStr::new("claude-fable-5")),
+            ),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", None),
+        ],
+    );
+    // The shell's model is one the active `x` owns in its `[env]`: `start::run`
+    // scrubs it from the child, so the session runs Claude Code's default.
+    seed_start_members(
+        serde_json::json!({}),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+    activate_outside_chain(&[("ANTHROPIC_MODEL", "claude-opus-4-8")]);
+    // With the per-model gate off, an unresolved demand judges no week, so
+    // only a demand wrongly naming fable could refuse `a`.
+    let a = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&a).unwrap();
+    profile.check_scoped = false;
+    crate::profile::save_profile(&profile).unwrap();
+
+    cmd_start_auto(Isolation::Shared).expect("a scrubbed variable is no demand");
+}
+
+#[test]
+fn cmd_start_auto_reads_the_global_fallback_model_only_where_the_runtime_keeps_it() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    // A shared runtime builds on the global `settings.json` and keeps its
+    // `fallbackModel`; an isolated one builds on nothing.
+    seed_start_members(
+        serde_json::json!({ "model": "opus", "fallbackModel": ["fable"] }),
+        &[StartMember {
+            name: "a",
+            default: Some("opus"),
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("the shared session may fall back to fable, whose week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for opus + fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+    cmd_start_auto(Isolation::Isolated).expect("the isolated session runs opus alone");
+}
+
 // ── the claude-only verbs and a codex name ────────────────────────────────────
 
 /// `disable`/`enable`/`rolling-token`/`static-token` take claude names alone.

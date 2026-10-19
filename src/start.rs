@@ -160,26 +160,64 @@ pub(crate) fn admit<'a>(
     Ok(profile)
 }
 
-/// The model strings a launch may run, from every source a launcher can see
-/// before the session exists: the live `settings.json`, the process environment,
-/// and an explicit `--model` passthrough. A UNION, not a resolution — a `Task`
-/// subagent shares the parent's process-wide credential memo, so it spends the
-/// same account on whatever model it runs, and selecting for the headline model
-/// alone strands it (see [`crate::fallback::start_walk`]).
-pub(crate) fn launch_models(claude_args: &[String]) -> Vec<String> {
+/// The process-env model overrides a launcher can inherit, in pair order: the
+/// headline model, then the subagent model. The pair order is the contract
+/// between [`process_model_env`] and [`member_launch_models`]' scrub filter, so
+/// reading and filtering cannot drift.
+const PROCESS_MODEL_ENV_KEYS: [&str; 2] = ["ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"];
+
+/// The process-env model pair, read once per `cmd_start`.
+/// [`crate::fallback::start_walk`] takes the pair as an argument rather than
+/// reading the process environment itself, so its tests pass an explicit empty
+/// pair and stay hermetic.
+pub(crate) fn process_model_env() -> [Option<String>; 2] {
+    PROCESS_MODEL_ENV_KEYS.map(|key| std::env::var(key).ok())
+}
+
+/// The model strings one chain member's session may run, from every source a
+/// launcher can see before the session exists: the member's RUNTIME
+/// `settings.json` overlay (built through the same builder and base choice the
+/// runtime write applies, so the two cannot drift), the process environment
+/// pair (only the keys the spawned child keeps after the scrub, and an
+/// inherited `ANTHROPIC_MODEL` only while the built `env` carries none — Claude
+/// Code applies settings `env` over the inherited value), and an explicit
+/// `--model` passthrough. Per-member form of the launch union — the GLOBAL live
+/// settings do not name what a member's session runs, because the overlay drops
+/// a global `model` the member's `[models] default` does not carry. A UNION,
+/// not a resolution — a `Task` subagent shares the parent's process-wide
+/// credential memo, so it spends the same account on whatever model it runs,
+/// and selecting for the headline model alone strands it (see
+/// [`crate::fallback::start_walk`]).
+pub(crate) fn member_launch_models(
+    profile: &Profile,
+    isolation: Isolation,
+    stale_env_keys: &[String],
+    claude_args: &[String],
+    env_models: &[Option<String>; 2],
+) -> Vec<String> {
+    let base = crate::profile::claude_dir()
+        .ok()
+        .and_then(|home| crate::runtime::settings_base(&home, isolation));
+    let (settings, env_sets_anthropic_model) =
+        crate::claude::runtime_models(base.as_deref(), profile, stale_env_keys);
     launch_models_from(
-        crate::claude::claude_settings_models().unwrap_or_default(),
+        settings,
         [
-            std::env::var("ANTHROPIC_MODEL").ok(),
-            std::env::var("CLAUDE_CODE_SUBAGENT_MODEL").ok(),
+            (crate::runtime::env_survives_scrub(PROCESS_MODEL_ENV_KEYS[0], stale_env_keys)
+                && !env_sets_anthropic_model)
+                .then(|| env_models[0].clone())
+                .flatten(),
+            crate::runtime::env_survives_scrub(PROCESS_MODEL_ENV_KEYS[1], stale_env_keys)
+                .then(|| env_models[1].clone())
+                .flatten(),
         ],
         claude_args,
     )
 }
 
 /// The union of the three model sources a launcher can see, held here so the
-/// union is testable without a home or a process environment: the live
-/// `settings.json` strings, the two process-env strings (in order), and the
+/// union is testable without a home or a process environment: the runtime
+/// overlay's model strings, the two process-env strings (in order), and the
 /// passthrough args. An empty env value is dropped, never a family.
 pub(crate) fn launch_models_from(
     settings: Vec<String>,
@@ -194,7 +232,7 @@ pub(crate) fn launch_models_from(
 
 /// The `--model` and `--fallback-model` values in a passthrough arg list, in
 /// both spellings. A `--fallback-model` value is a comma-separated list of
-/// models, split and trimmed here. Split out of [`launch_models`] so the
+/// models, split and trimmed here. Split out of the launch-union helpers so the
 /// parsing is testable without a home (its siblings read `settings.json` and
 /// the environment, which resolve the operator's real home outside a sandbox).
 pub(crate) fn models_from_args(claude_args: &[String]) -> Vec<String> {

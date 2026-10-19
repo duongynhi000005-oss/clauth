@@ -20,7 +20,7 @@ pub(crate) fn claude_credentials_path() -> Result<PathBuf> {
     Ok(claude_dir()?.join(".credentials.json"))
 }
 
-fn claude_settings_path() -> Result<PathBuf> {
+pub(crate) fn claude_settings_path() -> Result<PathBuf> {
     Ok(claude_dir()?.join("settings.json"))
 }
 
@@ -2947,21 +2947,29 @@ pub(crate) fn claude_settings_env_keys() -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
-/// The model strings the live `~/.claude/settings.json` puts in effect: the
-/// top-level `model`, the top-level `fallbackModel` array, and the subagent
-/// override in its `env` block.
-///
-/// Read rather than resolved — [`crate::start::launch_models`] wants every family the next
-/// session MAY run, and all of these are separately reachable inside one
-/// session. Absent file, absent keys and unreadable JSON all answer empty: a
-/// launcher must never fail over a settings file it only wanted a hint from.
-pub(crate) fn claude_settings_models() -> Result<Vec<String>> {
-    let path = claude_settings_path()?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let Ok(settings) = read_json_file::<serde_json::Value>(&path) else {
-        return Ok(Vec::new());
+/// The model strings a runtime for `profile` would put in effect, and whether
+/// the built `env` carries its own `ANTHROPIC_MODEL` (Claude Code applies that
+/// over an inherited value, so the caller drops the inherited one when true).
+/// Build the runtime's `settings.json` through the SAME overlay the runtime
+/// write applies ([`build_claude_settings_json`] over `base`, the live
+/// `settings.json` under shared isolation and none under isolated), then read
+/// the model keys off the result — top-level `model`, the `fallbackModel`
+/// entries, and the `env.ANTHROPIC_MODEL` / `env.CLAUDE_CODE_SUBAGENT_MODEL`
+/// overrides, in that order. A member with no `[models] default` drops the base
+/// `model` (the overlay removes it), so no model comes from that source,
+/// exactly as its session would; a member `[env] ANTHROPIC_MODEL` lands in the
+/// built `env` and is read here, as Claude Code runs it. Best-effort: a base the
+/// overlay also refuses degrades to an empty hint, never a failed start.
+pub(crate) fn runtime_models(
+    base: Option<&Path>,
+    profile: &Profile,
+    stale_env_keys: &[String],
+) -> (Vec<String>, bool) {
+    let Ok(json) = build_claude_settings_json(base, profile, stale_env_keys) else {
+        return (Vec::new(), false);
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return (Vec::new(), false);
     };
     let mut out = Vec::new();
     if let Some(m) = settings["model"].as_str() {
@@ -2970,10 +2978,14 @@ pub(crate) fn claude_settings_models() -> Result<Vec<String>> {
     if let Some(fb) = settings["fallbackModel"].as_array() {
         out.extend(fb.iter().filter_map(|v| v.as_str()).map(str::to_owned));
     }
+    let env_anthropic_model = settings["env"]["ANTHROPIC_MODEL"].as_str();
+    if let Some(m) = env_anthropic_model {
+        out.push(m.to_owned());
+    }
     if let Some(m) = settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"].as_str() {
         out.push(m.to_owned());
     }
-    Ok(out)
+    (out, env_anthropic_model.is_some())
 }
 
 /// Patch `settings.json` `env` with profile's endpoint keys and env map;
