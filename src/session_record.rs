@@ -18,11 +18,11 @@ pub(crate) struct SessionRecord {
     pub(crate) pid: u32,
     /// The process start time the record carries, as the record spells it. Only
     /// the bridge's linux resolver compares it (against `/proc/<pid>/stat` field
-    /// 22, measured equal, `docs/domain-knowledge-claude-code.md`); the macOS
-    /// form is unmeasured, so nothing there compares it. `default` is the
-    /// upgrade gate: a record written before the field existed reads empty and
-    /// fails the linux compare rather than being trusted. The bridge is
-    /// unix-only, so Windows reads no field beyond `session_id` and `pid`.
+    /// 22, measured equal); the macOS form is unmeasured, so nothing there
+    /// compares it. `default` is the upgrade gate: a record written before the
+    /// field existed reads empty and fails the linux compare rather than being
+    /// trusted. The bridge is unix-only, so Windows reads no field beyond
+    /// `session_id` and `pid`.
     ///
     /// Read leniently: every other caller parses this struct for `session_id`/
     /// `pid`, and a future Claude Code version writing `procStart` as a

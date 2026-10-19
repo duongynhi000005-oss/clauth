@@ -340,12 +340,7 @@ fn session_pane(ctx: &ApiContext, id: &str) -> PaneFallback {
     };
     let mut matching = panes
         .into_iter()
-        .filter(|pane| {
-            pane.agent_session
-                .as_ref()
-                .and_then(|session| session.session_id())
-                == Some(id)
-        })
+        .filter(|pane| pane.agent_session_id() == Some(id))
         .map(|pane| pane.pane_id);
     match (matching.next(), matching.next()) {
         (Some(pane), None) => PaneFallback::Pane(pane),
@@ -605,7 +600,7 @@ struct AnswerBody {
     path = "/api/v1/sessions/{id}/asks/{ask}",
     params(
         ("id" = String, Path, description = "the session id, as `GET /api/v1/sessions` lists it"),
-        ("ask" = String, Path, description = "the ask id the mod minted and posted with `ask.opened`")
+        ("ask" = String, Path, description = "the ask id the mod minted and posted with `ask_opened`")
     ),
     request_body = AnswerBody,
     responses(

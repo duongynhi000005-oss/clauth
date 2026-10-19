@@ -62,7 +62,13 @@ pub(crate) type PaneProbe =
 /// for its `present: false` body, and `session_pane`/`herdr_session_ids` map
 /// any absence to no pane, so the probe-and-parse ladder lives once (B#6).
 pub(crate) fn listed_panes(ctx: &ApiContext) -> Result<Vec<HerdrPane>, &'static str> {
-    match (ctx.herdr_probe)(&["pane", "list"], crate::herdr::PROBE_TIMEOUT) {
+    listed_panes_probe(&ctx.herdr_probe)
+}
+
+/// [`listed_panes`] over an explicit probe, so a caller without an
+/// [`ApiContext`] (the mod bridge's push dedup) reads the same ladder.
+fn listed_panes_probe(probe: &PaneProbe) -> Result<Vec<HerdrPane>, &'static str> {
+    match probe(&["pane", "list"], crate::herdr::PROBE_TIMEOUT) {
         HerdrProbeOut::NotInstalled => Err(NOT_INSTALLED),
         HerdrProbeOut::Ran(None) => Err(NO_SERVER),
         HerdrProbeOut::Ran(Some(out)) if !out.success => Err(NO_SERVER),
@@ -70,6 +76,17 @@ pub(crate) fn listed_panes(ctx: &ApiContext) -> Result<Vec<HerdrPane>, &'static 
             crate::herdr::parse_pane_list(&out.stdout).ok_or(NO_SERVER)
         }
     }
+}
+
+/// The agent session running in the `pane_id`'s own listing, from one bounded
+/// `pane list` probe. `None` when the pane has no session herdr could read by
+/// id, the pane is gone from the listing, or the probe failed: the follower
+/// then treats the pane as mod-less and pushes as base did (WP-8).
+#[cfg(unix)]
+pub(crate) fn pane_session_id(probe: &PaneProbe, pane_id: &str) -> Option<String> {
+    let panes = listed_panes_probe(probe).ok()?;
+    let pane = panes.iter().find(|pane| pane.pane_id == pane_id)?;
+    pane.agent_session_id().map(str::to_owned)
 }
 
 /// The real probe: [`crate::herdr::resolved_bin`] + the daemon-scoped
@@ -267,7 +284,7 @@ fn absent_body(reason: &str) -> PanesBody {
 
 /// Newest row wins per pid: a recycled pid can match a stale row and a live one
 /// at once, and the dead row's profile must not show as a ghost session.
-fn newest_per_pid(rows: &[LiveSession]) -> Vec<&LiveSession> {
+pub(crate) fn newest_per_pid(rows: &[LiveSession]) -> Vec<&LiveSession> {
     let mut newest: HashMap<u32, &LiveSession> = HashMap::new();
     for row in rows {
         match newest.entry(row.pid) {
@@ -360,6 +377,7 @@ fn is_clauth_session(entry: &ProcessEntry) -> bool {
 }
 
 fn pane_entry(pane: HerdrPane, group_id: Option<u32>, sessions: Vec<PaneSession>) -> PaneEntry {
+    let agent_session_id = pane.agent_session_id().map(str::to_owned);
     PaneEntry {
         pane_id: pane.pane_id,
         workspace_id: pane.workspace_id,
@@ -372,11 +390,7 @@ fn pane_entry(pane: HerdrPane, group_id: Option<u32>, sessions: Vec<PaneSession>
         tag: pane.tokens.and_then(|tokens| tokens.clauth),
         foreground_process_group_id: group_id,
         sessions,
-        agent_session_id: pane
-            .agent_session
-            .as_ref()
-            .and_then(|session| session.session_id())
-            .map(str::to_owned),
+        agent_session_id,
     }
 }
 

@@ -276,12 +276,7 @@ fn herdr_session_ids(ctx: &ApiContext) -> std::collections::HashSet<String> {
     };
     panes
         .into_iter()
-        .filter_map(|pane| {
-            pane.agent_session
-                .as_ref()
-                .and_then(|session| session.session_id())
-                .map(str::to_owned)
-        })
+        .filter_map(|pane| pane.agent_session_id().map(str::to_owned))
         .collect()
 }
 

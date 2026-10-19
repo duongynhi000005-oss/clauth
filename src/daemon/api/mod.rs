@@ -58,10 +58,12 @@ use routes::ApiContext;
 /// each retry re-resolves the socket through one bounded herdr call.
 const PUSH_FOLLOW_RETRY: Duration = Duration::from_secs(15);
 
-/// Start Web Push for the daemon's life: the sending thread, and the herdr
-/// follower turning a pane's move into `blocked` into a push. `None` when the
-/// sender cannot start: the API serves on, and nothing is pushed.
-pub(crate) fn start_push() -> Option<crate::push::Queue> {
+/// Start Web Push for the daemon's life: the sending thread, the herdr
+/// follower turning a pane's move into `blocked` into a push, and the wiring
+/// that hands the bridge hub the sender's inbox. `None` when the sender cannot
+/// start: the API serves on, and nothing is pushed.
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub(crate) fn start_push(ctx: &ApiContext) -> Option<crate::push::Queue> {
     let queue = match crate::push::spawn(panes::real_probe()) {
         Ok(queue) => queue,
         Err(e) => {
@@ -69,12 +71,23 @@ pub(crate) fn start_push() -> Option<crate::push::Queue> {
             return None;
         }
     };
+    #[cfg(unix)]
+    if let Some(bridge) = &ctx.bridge {
+        bridge.wire_push(queue.clone());
+    }
     let follower = queue.clone();
+    #[cfg(unix)]
+    let bridge = ctx.bridge.clone();
+    #[cfg(unix)]
+    let probe = std::sync::Arc::new(panes::real_probe());
     let spawned = std::thread::Builder::new()
         .name("clauth-push-herdr".to_string())
         .spawn(move || {
             let resolve = events::production_herdr_resolver();
             events::follow_blocked(resolve.as_ref(), PUSH_FOLLOW_RETRY, None, &mut |pane_id| {
+                #[cfg(unix)]
+                on_pane_blocked(bridge.as_deref(), probe.as_ref(), &follower, pane_id);
+                #[cfg(not(unix))]
                 follower.send(crate::push::Trigger::Blocked { pane_id });
                 std::ops::ControlFlow::Continue(())
             });
@@ -85,6 +98,29 @@ pub(crate) fn start_push() -> Option<crate::push::Queue> {
         );
     }
     Some(queue)
+}
+
+/// The follower's one blocked pane: skip the push when the hub holds a live
+/// mod instance on the pane's agent session — the mod is the only `blocked`
+/// push source for its session (WP-8) — else push as base did, as the pane's
+/// own. A failed or empty probe (no session id readable) treats the pane as
+/// mod-less and pushes.
+#[cfg(unix)]
+fn on_pane_blocked(
+    bridge: Option<&crate::daemon::bridge::Hub>,
+    probe: &panes::PaneProbe,
+    queue: &crate::push::Queue,
+    pane_id: String,
+) {
+    let has_mod = panes::pane_session_id(probe, &pane_id)
+        .is_some_and(|session| bridge.is_some_and(|hub| hub.has_live_instance(&session)));
+    if has_mod {
+        return;
+    }
+    // Ruled exception (WP-8): a pane whose session id the probe could not read
+    // pushes as base did, mod-less, even when the pane is a live mod session
+    // that already announced — herdr's miss can double one push.
+    queue.send(crate::push::Trigger::Blocked { pane_id });
 }
 
 /// Concurrent connections served at once. The cap is what stops a connection
@@ -255,6 +291,7 @@ pub(crate) fn build_context(
     live: super::LiveStores,
     memory_stores: crate::usage::MemoryStores,
 ) -> Arc<ApiContext> {
+    let bridge = crate::daemon::bridge::start();
     ApiContext::new(
         config,
         status_path,
@@ -263,7 +300,7 @@ pub(crate) fn build_context(
         panes::real_probe(),
         events::production_herdr_resolver(),
         terminal::real_terminal_spawn(),
-        crate::daemon::bridge::start(),
+        bridge,
     )
 }
 
@@ -287,7 +324,7 @@ pub(crate) fn serve_prepared(
     status_path: PathBuf,
     live: super::LiveStores,
     memory_stores: crate::usage::MemoryStores,
-) -> Result<()> {
+) -> Result<Arc<ApiContext>> {
     let Prepared { listen, tls_config } = prepared;
     let listener = TcpListener::bind(listen)
         .with_context(|| format!("failed to bind the REST API to {listen}"))?;
@@ -312,13 +349,14 @@ pub(crate) fn serve_prepared(
         }
     };
 
+    let accept_ctx = Arc::clone(&ctx);
     let spawned = std::thread::Builder::new()
         .name("clauth-api-accept".into())
-        .spawn(move || accept_loop(&listener, &tls_config, &ctx));
+        .spawn(move || accept_loop(&listener, &tls_config, &accept_ctx));
     spawned.context("failed to spawn the REST API accept thread")?;
 
     logline!("clauth daemon: REST API listening on https://{listen}");
-    Ok(())
+    Ok(ctx)
 }
 
 fn accept_loop(

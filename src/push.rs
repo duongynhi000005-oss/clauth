@@ -60,6 +60,13 @@ pub(crate) enum Trigger {
     /// A herdr pane moved into `blocked`. The account is resolved at send,
     /// off the daemon's tick.
     Blocked { pane_id: String },
+    /// A mod session's ask opened: the session's own `blocked` transition
+    /// (WP-8). The account is resolved by the bridge hub from the session's
+    /// joined `live_sessions` row, else the globally active profile. Only the
+    /// bridge (unix) ever constructs this variant, so non-unix targets lift the
+    /// dead-code lint.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    SessionBlocked { account: Option<String> },
     /// An account entered a failed login or key state.
     Account { profile: String },
     /// A chain member's 5h or 7d window reached its chain line.
@@ -69,7 +76,7 @@ pub(crate) enum Trigger {
 impl Trigger {
     fn event(&self) -> PushEvent {
         match self {
-            Self::Blocked { .. } => PushEvent::Blocked,
+            Self::Blocked { .. } | Self::SessionBlocked { .. } => PushEvent::Blocked,
             Self::Account { .. } => PushEvent::Account,
             Self::Window { .. } => PushEvent::Window,
         }
@@ -80,7 +87,7 @@ impl Trigger {
     /// within the hour; a failing login stays true until someone fixes it.
     fn ttl_and_urgency(&self) -> (u32, &'static str) {
         match self {
-            Self::Blocked { .. } => (60 * 60, "high"),
+            Self::Blocked { .. } | Self::SessionBlocked { .. } => (60 * 60, "high"),
             Self::Account { .. } => (24 * 60 * 60, "normal"),
             Self::Window { .. } => (60 * 60, "normal"),
         }
@@ -202,7 +209,7 @@ pub(crate) struct BlockedLatch {
 }
 
 /// herdr's agent status for a pane waiting on its user.
-const BLOCKED: &str = "blocked";
+pub(crate) const BLOCKED: &str = "blocked";
 
 impl BlockedLatch {
     /// One pane's status changed: `true` when it moved into `blocked`.
@@ -526,6 +533,7 @@ impl Sender {
             Trigger::Blocked { pane_id } => {
                 crate::daemon::api::panes::pane_profile(&self.herdr_probe, pane_id)
             }
+            Trigger::SessionBlocked { account } => account.clone(),
             Trigger::Account { profile } | Trigger::Window { profile } => Some(profile.clone()),
         };
         let body = payload(event, account.as_deref());

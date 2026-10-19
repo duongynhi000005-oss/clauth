@@ -470,14 +470,14 @@ pub(crate) fn serve(
         logline!("clauth daemon: {NO_API_ENV}=1 is set; not serving the REST API on {addr}");
     }
     if let Some(prepared) = prepared {
-        api::serve_prepared(
+        let ctx = api::serve_prepared(
             prepared,
             Arc::clone(&daemon.config),
             daemon.status_path.clone(),
             daemon.live_stores(),
             daemon.memory_stores(),
         )?;
-        daemon.push = api::start_push();
+        daemon.push = api::start_push(&ctx);
     }
 
     // After the listener, the last start step that can fail, so a start that

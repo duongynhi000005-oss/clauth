@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use crate::daemon::api::devices::{self, Tier};
 use crate::daemon::api::http::{Request, Response};
 use crate::daemon::api::routes::{self, ApiContext};
+use crate::daemon::bridge::{Hub, Instance, PeerResolver};
 use crate::profile::{AppConfig, AppState, ConfigHandle};
 use crate::testutil::HomeSandbox;
 
@@ -587,12 +588,210 @@ fn a_keepalive_is_written_after_the_injected_interval() {
         &path,
         none.as_ref(),
         &config,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     let text = String::from_utf8(sink).expect("utf8");
     assert!(
         text.contains(": keepalive\n\n"),
         "a keepalive comment lands when nothing else does: {text:?}"
+    );
+}
+
+/// The bridge half of the stream: a connect opens with `session.snapshot` after
+/// the herdr frame, and a live `session.ask` frame is relayed, every data line
+/// one JSON value.
+#[test]
+fn a_bridge_snapshot_then_a_relayed_ask_are_single_line() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+
+    let resolver: PeerResolver = Box::new(|_| {
+        Some(Instance {
+            session_id: "s-one".to_string(),
+            proc_start: "1".to_string(),
+        })
+    });
+    let hub = Hub::new(true, resolver);
+    let bridge_event = |body: serde_json::Value| {
+        let (status, answer) = hub.event(100, body.to_string().as_bytes());
+        assert_eq!(status, 200, "{answer}");
+    };
+    bridge_event(serde_json::json!({
+        "session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true
+    }));
+
+    let sink = SharedSink::new();
+    let stream_sink = sink.clone();
+    let stream_path = path.clone();
+    let stream_resolve = Arc::clone(&none);
+    let stream_hub = Arc::clone(&hub);
+    let stream = std::thread::spawn(move || {
+        let mut sink = stream_sink;
+        run_stream_with_config(
+            &mut sink,
+            // A generous backstop, never the end of the test: the stream is
+            // ended on the ask frame below, so the ask's relay pass never
+            // races a wall-clock deadline.
+            Instant::now() + Duration::from_secs(30),
+            &stream_path,
+            stream_resolve.as_ref(),
+            &StreamConfig::DEFAULT,
+            #[cfg(unix)]
+            Some(stream_hub.as_ref()),
+        )
+    });
+
+    wait_until(
+        || {
+            parse_frames(&sink.bytes())
+                .iter()
+                .any(|f| f.0 == "session.snapshot")
+        },
+        Duration::from_secs(2),
+    );
+
+    bridge_event(serde_json::json!({
+        "session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "a1",
+        "tool": "Bash", "input": {"command": "ls"}
+    }));
+    wait_until(
+        || {
+            parse_frames(&sink.bytes())
+                .iter()
+                .any(|f| f.0 == "session.ask")
+        },
+        Duration::from_secs(2),
+    );
+
+    // End the stream on the ask frame, not on a deadline: dropping the hub's
+    // subscriptions makes the stream return `Ok` on its next read.
+    hub.drop_subscriptions();
+    let _ = stream.join().expect("stream thread");
+
+    let frames = parse_frames(&sink.bytes());
+    let snapshot = frames
+        .iter()
+        .find(|f| f.0 == "session.snapshot")
+        .expect("a snapshot frame");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&snapshot.2).expect("snapshot json")["sessions"],
+        serde_json::json!([{"session": "s-one", "cwd": "/w/app", "interactive": true}])
+    );
+    let ask = frames
+        .iter()
+        .find(|f| f.0 == "session.ask")
+        .expect("an ask frame");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&ask.2).expect("ask json"),
+        serde_json::json!({"session": "s-one", "ask": "a1", "state": "opened", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null})
+    );
+    // The snapshot sits right after the herdr frame and before the first status
+    // frame, so a client sees the sessions before the feed or any relayed frame.
+    let herdr_idx = frames
+        .iter()
+        .position(|f| f.0 == "herdr")
+        .expect("a herdr frame");
+    let snapshot_idx = frames
+        .iter()
+        .position(|f| f.0 == "session.snapshot")
+        .expect("a snapshot frame");
+    let status_idx = frames
+        .iter()
+        .position(|f| f.0 == "status")
+        .expect("a status frame");
+    assert_eq!(
+        snapshot_idx,
+        herdr_idx + 1,
+        "the snapshot follows the herdr frame"
+    );
+    assert!(
+        snapshot_idx < status_idx,
+        "the snapshot precedes the first status frame"
+    );
+    assert_single_line_data(&sink.bytes());
+}
+
+/// A stream whose subscription is dropped (its channel filled by a client that
+/// is not draining) returns `Ok` rather than running to its deadline (SB-10).
+#[test]
+fn a_dropped_subscription_ends_the_stream() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+
+    let resolver: PeerResolver = Box::new(|_| {
+        Some(Instance {
+            session_id: "s-one".to_string(),
+            proc_start: "1".to_string(),
+        })
+    });
+    let hub = Hub::new(true, resolver);
+    hub.event(
+        100,
+        serde_json::json!({
+            "session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true
+        })
+        .to_string()
+        .as_bytes(),
+    );
+
+    let sink = SharedSink::new();
+    let stream_sink = sink.clone();
+    let stream_resolve = Arc::clone(&none);
+    let stream_hub = Arc::clone(&hub);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_stream = Arc::clone(&done);
+    let stream = std::thread::spawn(move || {
+        let mut sink = stream_sink;
+        let result = run_stream_with_config(
+            &mut sink,
+            Instant::now() + Duration::from_secs(5),
+            &path,
+            stream_resolve.as_ref(),
+            &StreamConfig::DEFAULT,
+            #[cfg(unix)]
+            Some(stream_hub.as_ref()),
+        );
+        done_stream.store(true, Ordering::SeqCst);
+        result
+    });
+
+    wait_until(
+        || {
+            parse_frames(&sink.bytes())
+                .iter()
+                .any(|f| f.0 == "session.snapshot")
+        },
+        Duration::from_secs(2),
+    );
+
+    // Fill the subscription and keep filling until the stream observes the
+    // drop: the stream's drain is polled, so one burst may race it.
+    let started = Instant::now();
+    let mut seq = 2u64;
+    while !done.load(Ordering::SeqCst) {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the stream did not end on a dropped subscription within 3s"
+        );
+        hub.event(
+            100,
+            serde_json::json!({"session": "s-one", "seq": seq, "kind": "turn_start", "turn": "t"})
+                .to_string()
+                .as_bytes(),
+        );
+        seq += 1;
+    }
+    let _ = stream.join().expect("stream thread");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the stream ended on the drop, not the deadline: {:?}",
+        started.elapsed()
     );
 }
 
@@ -761,6 +960,8 @@ fn a_pane_created_mid_stream_resubscribes_and_a_pane_closed_reopens_silently() {
         &path,
         seam.as_ref(),
         &config,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");
@@ -903,6 +1104,8 @@ fn a_failed_reopen_keeps_the_live_connection_and_retries() {
         &path,
         seam.as_ref(),
         &config,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");
@@ -997,6 +1200,8 @@ fn a_retry_after_absence_hands_back_the_snapshot() {
         &path,
         seam.as_ref(),
         &config,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");
@@ -1063,6 +1268,8 @@ fn the_herdr_socket_is_resolved_once_even_as_retries_keep_connecting() {
         &path,
         seam.as_ref(),
         &config,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");
@@ -1142,6 +1349,8 @@ fn the_snapshot_carries_only_the_status_fields_of_a_pane() {
         &path,
         seam.as_ref(),
         &StreamConfig::DEFAULT,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");

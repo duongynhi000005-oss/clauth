@@ -620,6 +620,15 @@ impl HerdrAgentSession {
     }
 }
 
+impl HerdrPane {
+    /// The pane's `agent_session_id`: the session id herdr detected by id, when
+    /// it detected one. The one accessor every "pane whose agent session is X"
+    /// predicate shares.
+    pub(crate) fn agent_session_id(&self) -> Option<&str> {
+        self.agent_session.as_ref().and_then(|s| s.session_id())
+    }
+}
+
 /// `herdr pane list`'s `result.panes`, or `None` when the stdout is not the
 /// envelope. The caller checks the call succeeded first.
 pub(crate) fn parse_pane_list(stdout: &[u8]) -> Option<Vec<HerdrPane>> {
