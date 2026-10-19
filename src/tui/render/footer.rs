@@ -631,6 +631,7 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ],
             FallbackHint::DetailCheckWeekly
             | FallbackHint::DetailCheckScoped
+            | FallbackHint::DetailCheckCreditCap
             | FallbackHint::DetailLastResort
             | FallbackHint::DetailPreferred => &[
                 ("↑↓", "row"),

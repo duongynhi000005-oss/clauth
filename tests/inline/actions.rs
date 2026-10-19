@@ -10272,3 +10272,28 @@ fn a_proven_install_writes_its_anchor_inside_the_hold() {
         "the proven anchor was written inside the hold before the state write failed"
     );
 }
+
+/// A duplicate carries every per-account usage gate off the source.
+#[test]
+fn a_duplicate_carries_the_usage_gates() {
+    let _home = HomeSandbox::new();
+    let mut source = crate::testutil::blank_profile(&ProfileName::from("src"));
+    source.check_scoped = false;
+    source.check_credit_cap = false;
+    save_profile(&source).expect("save the source");
+    crate::testutil::register_names(&["src"]);
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("src")],
+            ..AppState::default()
+        },
+        profiles: vec![source],
+    };
+    duplicate_profile(&mut config, &ProfileName::from("src"), "dup".to_string())
+        .expect("duplicate");
+    let dup = config
+        .find(&ProfileName::from("dup"))
+        .expect("the duplicate exists");
+    assert!(!dup.check_scoped, "the scoped gate is carried");
+    assert!(!dup.check_credit_cap, "the credit gate is carried");
+}

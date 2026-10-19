@@ -13083,7 +13083,10 @@ fn fallback_last_resort_toggle_persists_and_refreshes_tokens() {
     app.tab = Tab::Fallback;
     app.fallback_focus = super::FallbackFocus::Detail;
     app.chain_cursor = 0;
-    app.fallback_detail_cursor = 4; // FALLBACK_ROWS[4] == LastResort
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == super::FallbackRow::LastResort)
+        .unwrap();
 
     assert!(
         !app.config()
@@ -13138,7 +13141,10 @@ fn fallback_last_resort_is_exclusive_across_the_chain() {
     app.tab = Tab::Fallback;
     app.fallback_focus = super::FallbackFocus::Detail;
     app.chain_cursor = 0; // member "a"
-    app.fallback_detail_cursor = 4; // FALLBACK_ROWS[4] == LastResort
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == super::FallbackRow::LastResort)
+        .unwrap();
 
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
 
@@ -15734,6 +15740,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,
@@ -26914,7 +26921,10 @@ fn a_chain_toggle_never_rewinds_a_pair_another_process_landed() {
     app.tab = Tab::Fallback;
     app.fallback_focus = super::FallbackFocus::Detail;
     app.chain_cursor = 0;
-    app.fallback_detail_cursor = 4; // FALLBACK_ROWS[4] == LastResort
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == super::FallbackRow::LastResort)
+        .unwrap();
 
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
 
@@ -40496,4 +40506,33 @@ fn an_ungrammatical_pool_name_does_not_trap_the_cursor() {
         Vec::new(),
         "a name outside shunt's grammar shows no action rows"
     );
+}
+
+// The credit gate (#93) flips and persists through its own toggle row, leaving
+// the other usage gates alone.
+#[test]
+fn fallback_credit_gate_toggle_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == super::FallbackRow::CheckCreditCap)
+        .expect("the credit gate is a Fallback row");
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("a"))
+            .map(|p| (p.check_weekly, p.check_scoped, p.check_credit_cap)),
+        Some((true, true, false)),
+        "space flips only the credit gate"
+    );
+    let reloaded = crate::profile::load_profile(&crate::profile::ProfileName::from("a"))
+        .expect("reload profile");
+    assert!(!reloaded.check_credit_cap, "the off state is on disk");
 }

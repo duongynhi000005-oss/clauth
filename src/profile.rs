@@ -405,6 +405,10 @@ pub(crate) struct Profile {
     /// windows are ignored here: the account stays in rotation for use with
     /// other models. Default on.
     pub(crate) check_scoped: bool,
+    /// Whether auto-switching checks this account's usage-credit cap
+    /// (fallback chain only). On, a spent cap keeps this account out of the
+    /// walk's target passes; off, the cap is ignored there. Default on.
+    pub(crate) check_credit_cap: bool,
     /// 5h utilization % at/above which the alert fires: the TUI toast and the
     /// daemon's `bell_command`.
     /// None = no alert for this profile.
@@ -444,6 +448,7 @@ impl Profile {
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
@@ -1738,6 +1743,8 @@ struct ProfileConfig {
     check_weekly: Option<bool>,
     #[serde(default)]
     check_scoped: Option<bool>,
+    #[serde(default)]
+    check_credit_cap: Option<bool>,
     #[serde(default)]
     bell_threshold: Option<f64>,
     #[serde(default)]
@@ -3653,6 +3660,7 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
             .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 }),
         check_weekly: config.check_weekly.unwrap_or(true),
         check_scoped: config.check_scoped.unwrap_or(true),
+        check_credit_cap: config.check_credit_cap.unwrap_or(true),
         bell_threshold: finite_pct(config.bell_threshold),
         disabled: config.disabled,
         console: console_credential(&config.console),
@@ -3691,6 +3699,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 // on disk normalizes away on the next rewrite.
                 check_weekly: (!profile.check_weekly).then_some(false),
                 check_scoped: (!profile.check_scoped).then_some(false),
+                check_credit_cap: (!profile.check_credit_cap).then_some(false),
                 bell_threshold: profile.bell_threshold,
                 disabled: profile.disabled,
                 console: console_config(profile.console.as_ref()),
@@ -4306,6 +4315,15 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("# check_scoped = false\n");
     } else {
         out.push_str("check_scoped = false\n");
+    }
+    out.push('\n');
+    out.push_str("# Whether auto-switching keeps off this account while its usage-credit cap\n");
+    out.push_str("# is spent (Claude Code then refuses credit-billed models such as Fable).\n");
+    out.push_str("# Set false to keep it in rotation for other models.\n");
+    if profile.check_credit_cap {
+        out.push_str("# check_credit_cap = false\n");
+    } else {
+        out.push_str("check_credit_cap = false\n");
     }
     out.push('\n');
 

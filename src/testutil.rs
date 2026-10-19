@@ -1295,6 +1295,7 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,

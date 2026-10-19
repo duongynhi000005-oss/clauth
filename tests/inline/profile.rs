@@ -2357,6 +2357,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,
@@ -4787,5 +4788,56 @@ fn a_stale_legacy_pending_goes_without_waiting_on_the_flock() {
     assert!(
         !pending_path.exists(),
         "a stale sidecar goes without the flock"
+    );
+}
+
+// The credit gate (#93) defaults ON: an absent key in every config.toml
+// written before it existed keeps the cap checked, only `false` renders live,
+// and the load boundary turns absence into ON.
+#[test]
+fn the_credit_gate_defaults_on_and_round_trips_through_config_toml() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.check_credit_cap, None);
+
+    let mut profile = Profile::new("p".to_string(), None, None);
+    assert!(
+        profile.check_credit_cap,
+        "a new profile checks its credit cap"
+    );
+    profile.check_credit_cap = false;
+    let rendered = render_config_toml(&profile);
+    assert!(
+        rendered.contains("\ncheck_credit_cap = false\n"),
+        "{rendered}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.check_credit_cap, Some(false));
+
+    let stock = render_config_toml(&Profile::new("p".to_string(), None, None));
+    assert!(
+        stock.contains(
+            "\n\n# Whether auto-switching keeps off this account while its usage-credit cap\n\
+             # is spent (Claude Code then refuses credit-billed models such as Fable).\n\
+             # Set false to keep it in rotation for other models.\n\
+             # check_credit_cap = false\n"
+        ),
+        "the key carries its own comment block (cloudy, 2026-10-19): {stock}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&stock).expect("parse stock toml");
+    assert_eq!(parsed.check_credit_cap, None);
+
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("credit-gate");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let config_path = profile_subpath(&name, "config.toml").expect("config path");
+    std::fs::write(&config_path, "").expect("write empty config.toml");
+    assert!(
+        load_profile(&name).expect("load").check_credit_cap,
+        "absent loads as ON"
+    );
+    std::fs::write(&config_path, "check_credit_cap = false\n").expect("write config.toml");
+    assert!(
+        !load_profile(&name).expect("load").check_credit_cap,
+        "an explicit false survives"
     );
 }

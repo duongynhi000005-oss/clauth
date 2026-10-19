@@ -467,6 +467,16 @@ fn scoped_blocked_from_usage(member: &ChainMember, usage: &HashMap<String, Usage
         })
 }
 
+/// Store-side credit gate: reads from the walk's one usage snapshot, gated by
+/// the member's `check_credit_cap` toggle. An absent entry fails safe to "not
+/// blocked" (the member is then judged by the aggregate gates alone).
+fn credit_capped_from_usage(member: &ChainMember, usage: &HashMap<String, UsageInfo>) -> bool {
+    member.check_credit_cap
+        && usage
+            .get(member.name.as_str())
+            .is_some_and(UsageInfo::credit_capped)
+}
+
 /// [`weekly_blocked_info`] + live-5h-over-threshold at the HARD weekly cap: can
 /// this account literally serve right now? Sink passes, halt gates, and the
 /// all-exhausted premise key on this — a member's soft-line override/gates
@@ -908,6 +918,9 @@ pub(crate) struct ChainMember {
     /// Mirrors `Profile::check_scoped` — whether per-model weekly windows
     /// (e.g. "7d fable") keep this member out of rotation.
     pub(crate) check_scoped: bool,
+    /// Mirrors `Profile::check_credit_cap` — whether a spent usage-credit cap
+    /// keeps this member out of the walk's target passes.
+    pub(crate) check_credit_cap: bool,
 }
 
 /// In-memory snapshot of the fields `next_auto_switch_target` needs: active
@@ -1010,10 +1023,12 @@ pub(crate) fn snapshot_chain(
 /// and the per-profile knobs (last_resort, preferred, max_spend, per-member
 /// thresholds) simply do not exist on this harness yet.
 ///
-/// `check_scoped` is DISARMED for every codex member, per the delivery spec:
-/// per-model weekly windows are a claude concept (`"7d fable"` and friends come
-/// from the anthropic `limits[]` array), and `wham/usage` has no equivalent. An
-/// armed gate would judge codex members against windows that can never appear.
+/// `check_scoped` and `check_credit_cap` are DISARMED for every codex member,
+/// per the delivery spec: per-model weekly windows and the usage-credit cap
+/// verdict are claude concepts (`"7d fable"` and friends come from the
+/// anthropic `limits[]` array, the cap from its `spend`/`extra_usage` blocks),
+/// and `wham/usage` has no equivalent. An armed gate would judge codex members
+/// against windows or a cap that can never appear.
 ///
 /// `broken` and `kick_rejected` are filled HERE, where the claude builder
 /// leaves the second to the scheduler's scan: the codex verdicts live beside
@@ -1052,6 +1067,7 @@ pub(crate) fn snapshot_codex_chain(
                 weekly_line: weekly_pct,
                 scoped_line: weekly_pct,
                 check_scoped: false,
+                check_credit_cap: false,
             })
             .collect(),
         switch_off_when_spent: state.switch_off_when_spent(),
@@ -1156,6 +1172,7 @@ fn chain_member(
             .map(|p| member_scoped_line(p, weekly_pct))
             .unwrap_or(weekly_pct),
         check_scoped: profile.is_none_or(|p| p.check_scoped),
+        check_credit_cap: profile.is_none_or(|p| p.check_credit_cap),
     }
 }
 
@@ -2079,7 +2096,9 @@ fn next_auto_switch_target_core(
     // gates AND — per the member's own `check_scoped` gate — every per-model
     // weekly window (see `scoped_weekly_blocked_info`).
     let clear = |m: &ChainMember| {
-        !is_exhausted_from_usage(m, usage, m.weekly_line) && !scoped_blocked_from_usage(m, usage)
+        !is_exhausted_from_usage(m, usage, m.weekly_line)
+            && !scoped_blocked_from_usage(m, usage)
+            && !credit_capped_from_usage(m, usage)
     };
 
     if !active_broken
@@ -2247,11 +2266,12 @@ fn next_auto_switch_target_core(
         return None;
     }
     if let Some(name) = walk(&|m| {
-        spend_armed(
-            usage.get(m.name.as_str()),
-            snapshot.spend_budget,
-            m.max_spend,
-        )
+        !credit_capped_from_usage(m, usage)
+            && spend_armed(
+                usage.get(m.name.as_str()),
+                snapshot.spend_budget,
+                m.max_spend,
+            )
     }) {
         return Some(SwitchAction::To(name));
     }
@@ -2353,6 +2373,7 @@ pub(crate) fn find_recovered_member(
                 && (!require_scoped_clear
                     || !member.check_scoped
                     || !scoped_weekly_blocked_info(info, now, member.scoped_line))
+                && (!require_scoped_clear || !member.check_credit_cap || !info.credit_capped())
                 && (!five_hour_live(info, now)
                     || info
                         .five_hour

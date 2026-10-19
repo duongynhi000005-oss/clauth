@@ -3,10 +3,10 @@
 //! member name in orange. Right: the selected member's rotation card — labeled
 //! key:value rows (`5h usage` gauge with a threshold tick, `rotate at`
 //! threshold stepper, `weekly at` per-account weekly-line override, `weekly
-//! gate` + `scoped gate` per-account usage-check toggles, `last resort` +
-//! `preferred` toggles, `preferred days` preset cycle + 7-day chip picker,
-//! `max spend` ceiling, `remove`) — or,
-//! on `+ add`, a candidate picker. Order = priority (reorder with ⇧↑↓). The
+//! gate` + `scoped gate` + `credit gate` per-account usage-check toggles,
+//! `last resort` + `preferred` toggles, `preferred days` preset cycle + 7-day
+//! chip picker, `max spend` ceiling, `remove`) — or, on `+ add`, a candidate
+//! picker. Order = priority (reorder with ⇧↑↓). The
 //! chain-global wrap-off and spend-budget settings live on the Config tab, not
 //! here. Editing happens in place: ⏎ on the left drops focus into the right
 //! pane, `+` / `-` step the threshold (or ⏎ on it to type a value), space/⏎
@@ -799,6 +799,14 @@ fn member_row_hint(
             }
             .to_string(),
         ),
+        FallbackRow::CheckCreditCap => Some(
+            if profile.check_credit_cap {
+                "a spent usage-credit cap keeps auto-switch off this account, except as last resort or when recovering from a switch-off"
+            } else {
+                "auto-switch can move onto this account even with its usage-credit cap spent"
+            }
+            .to_string(),
+        ),
         FallbackRow::LastResort => Some(last_resort_hint(cfg, name, profile.last_resort)),
         FallbackRow::Preferred => Some(preferred_hint(cfg, name, profile.preferred, key_rejected)),
         FallbackRow::PreferredDays => {
@@ -1027,6 +1035,7 @@ fn member_detail(
                 weekly_default: cfg.state.weekly_switch_threshold_pct(),
                 check_weekly: profile.check_weekly,
                 check_scoped: profile.check_scoped,
+                check_credit_cap: profile.check_credit_cap,
                 last_resort: profile.last_resort,
                 preferred: profile.preferred,
                 preferred_days: &profile.preferred_days,
@@ -1078,28 +1087,16 @@ fn member_detail(
         // The gate toggles hint the CURRENT state — what the walk does with
         // this account right now — so flipping reads as choosing the other
         // sentence.
-        if *row == FallbackRow::CheckWeekly && selected {
-            lines.extend(help_tooltip_lines(
-                &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
-                    .unwrap_or_default(),
-                width,
-            ));
-        }
-        if *row == FallbackRow::CheckScoped && selected {
-            lines.extend(help_tooltip_lines(
-                &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
-                    .unwrap_or_default(),
-                width,
-            ));
-        }
-        if *row == FallbackRow::LastResort && selected {
-            lines.extend(help_tooltip_lines(
-                &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
-                    .unwrap_or_default(),
-                width,
-            ));
-        }
-        if *row == FallbackRow::Preferred && selected {
+        if selected
+            && matches!(
+                *row,
+                FallbackRow::CheckWeekly
+                    | FallbackRow::CheckScoped
+                    | FallbackRow::CheckCreditCap
+                    | FallbackRow::LastResort
+                    | FallbackRow::Preferred
+            )
+        {
             lines.extend(help_tooltip_lines(
                 &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
                     .unwrap_or_default(),
@@ -1328,6 +1325,7 @@ struct MemberRow<'a> {
     weekly_default: f64,
     check_weekly: bool,
     check_scoped: bool,
+    check_credit_cap: bool,
     last_resort: bool,
     preferred: bool,
     preferred_days: &'a [Weekday],
@@ -1370,6 +1368,7 @@ fn detail_row(
         weekly_default,
         check_weekly,
         check_scoped,
+        check_credit_cap,
         last_resort,
         preferred,
         preferred_days,
@@ -1523,11 +1522,13 @@ fn detail_row(
         }
         FallbackRow::CheckWeekly
         | FallbackRow::CheckScoped
+        | FallbackRow::CheckCreditCap
         | FallbackRow::LastResort
         | FallbackRow::Preferred => {
             let (key, on) = match row {
                 FallbackRow::CheckWeekly => ("weekly gate", check_weekly),
                 FallbackRow::CheckScoped => ("scoped gate", check_scoped),
+                FallbackRow::CheckCreditCap => ("credit gate", check_credit_cap),
                 FallbackRow::Preferred => ("preferred", preferred),
                 _ => ("last resort", last_resort),
             };

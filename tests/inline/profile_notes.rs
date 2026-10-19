@@ -33,6 +33,7 @@ fn mini_profile(name: &str) -> Profile {
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,

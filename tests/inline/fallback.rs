@@ -101,6 +101,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
@@ -1189,6 +1190,7 @@ fn walk_order_soonest_recovery_orders_both_passes_unless_preferred_wins() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let recovered_usage = |seven_reset: String| {
         usage_both(
@@ -1238,6 +1240,7 @@ fn walk_order_snapshot_walk_matches_the_config_walk_in_both_directions() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "gamma".into(),
@@ -1297,6 +1300,7 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let snap = |order: WalkOrder, burn_aware: bool| ChainSnapshot {
         active: "gamma".into(),
@@ -1483,6 +1487,7 @@ fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "gamma".into(),
@@ -1537,6 +1542,7 @@ fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "gamma".into(),
@@ -1597,6 +1603,7 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let snap = |order: WalkOrder, fresh: Vec<ProfileName>| ChainSnapshot {
         active: "gamma".into(),
@@ -1676,6 +1683,7 @@ fn walk_order_soonest_recomputed_home_parks_once_landed_on_the_soonest_member() 
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "beta".into(),
@@ -1820,6 +1828,7 @@ fn headroom_member(name: &str, preferred: bool) -> ChainMember {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     }
 }
 
@@ -2197,6 +2206,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
         },
         ChainMember {
             name: "b".into(),
@@ -2207,6 +2217,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
@@ -2239,6 +2250,7 @@ fn find_recovered_skips_exhausted_members() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
         },
         ChainMember {
             name: "b".into(),
@@ -2249,6 +2261,7 @@ fn find_recovered_skips_exhausted_members() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
@@ -2270,6 +2283,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
         },
         ChainMember {
             name: "b".into(),
@@ -2280,6 +2294,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
         },
     ];
     let store = store_with_utils(&[]); // no usage data for any member
@@ -2301,6 +2316,7 @@ fn find_recovered_uses_threshold_per_member() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
         }, // 95% util ≥ 90 → exhausted
         ChainMember {
             name: "b".into(),
@@ -2311,6 +2327,7 @@ fn find_recovered_uses_threshold_per_member() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
         }, // 94% util < 95 → recovered
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
@@ -2334,6 +2351,7 @@ fn find_recovered_recovers_when_window_expired() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     }];
     let store = store_with_infos(vec![(
         "a",
@@ -2358,6 +2376,7 @@ fn find_recovered_recovers_when_windowless() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
@@ -2379,6 +2398,7 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(
@@ -4407,6 +4427,7 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let snap = ChainSnapshot {
         active: "a".into(),
@@ -4492,6 +4513,7 @@ fn a_third_party_active_never_projects_its_burn() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let snap = ChainSnapshot {
         active: "a".into(),
@@ -4672,6 +4694,7 @@ fn weekly_dead_member_never_recovers() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     }];
     let dead = store_with_infos(vec![(
         "b",
@@ -5886,6 +5909,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 weekly_line: 98.0,
                 scoped_line: 98.0,
                 check_scoped: true,
+                check_credit_cap: true,
             },
             ChainMember {
                 name: "b".into(),
@@ -5896,6 +5920,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 weekly_line: 98.0,
                 scoped_line: 98.0,
                 check_scoped: true,
+                check_credit_cap: true,
             },
             ChainMember {
                 name: "c".into(),
@@ -5906,6 +5931,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 weekly_line: 98.0,
                 scoped_line: 98.0,
                 check_scoped: true,
+                check_credit_cap: true,
             },
         ],
         switch_off_when_spent: true,
@@ -5976,6 +6002,7 @@ fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
 
     // Per-predicate-lock simulation (the pre-snapshot shape): each call
@@ -6665,6 +6692,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
         },
         ChainMember {
             name: "c".into(),
@@ -6675,6 +6703,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            check_credit_cap: true,
         },
     ];
     let store = store_with_infos(vec![
@@ -6711,6 +6740,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     }];
     assert_eq!(
         find_recovered_member_for_test(&chain_b, &store, &[], WalkOrder::Chain),
@@ -6736,6 +6766,7 @@ fn find_recovered_prefers_the_preferred_member_over_a_scoped_clear_one() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let chain = vec![
         mkmember("a", false),
@@ -6791,6 +6822,7 @@ fn recovery_respects_each_members_gates() {
         weekly_line: if check_weekly { 98.0 } else { 100.0 },
         scoped_line: 98.0,
         check_scoped,
+        check_credit_cap: true,
     };
     let chain = vec![member("b", true, false), member("c", false, true)];
     let store = store_with_infos(vec![
@@ -8000,6 +8032,7 @@ fn start_block_treats_a_key_rejected_third_party_member_as_auth_broken() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let config = AppConfig {
         state: AppState::default(),
@@ -8106,6 +8139,7 @@ fn start_block_leaves_a_console_lapsed_alibaba_member_pickable() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let config = AppConfig {
         state: AppState::default(),
@@ -8236,6 +8270,7 @@ fn an_alibaba_member_without_a_console_is_not_key_rejected() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let profile = config.find(&ProfileName::from("ali")).unwrap();
     assert_eq!(
@@ -8540,6 +8575,7 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        check_credit_cap: true,
     };
     let snap = ChainSnapshot {
         active: "gamma".into(),
@@ -8599,4 +8635,212 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
         None,
         "a hybrid's provider window never pairs its OAuth burn history"
     );
+}
+
+// ── the `credit gate` (`Profile::check_credit_cap`, #93) ─────────────────────
+//
+// A member whose usage-credit cap is spent refuses credit-billed models only,
+// so the global walk (which knows no model) keeps it out of the TARGET passes
+// while its gate is on; it never moves an account off the chain by itself.
+
+/// Every window clear, the usage-credit cap spent (billing on, used == limit).
+fn usage_credit_capped() -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(0.0, Some(live_reset()))),
+        seven_day: Some(window(10.0, Some(week_reset()))),
+        spend: Some(SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: None,
+        }),
+        ..UsageInfo::default()
+    }
+}
+
+#[test]
+fn auto_switch_skips_a_credit_capped_member_while_its_gate_is_on() {
+    let (config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_credit_capped()),
+        ("c", usage_with_scoped(10.0, 18.0, vec![])),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "the capped member is passed over for the next clear one"
+    );
+
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_credit_capped()),
+        ("c", usage_info(Some(window(100.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a capped member is never the target while its gate is on"
+    );
+}
+
+#[test]
+fn auto_switch_takes_a_credit_capped_member_once_its_gate_is_off() {
+    let (mut config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[1].check_credit_cap = false;
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_credit_capped()),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+#[test]
+fn a_credit_capped_active_with_headroom_never_switches_away_by_itself() {
+    let (config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_credit_capped()),
+        ("b", usage_with_scoped(10.0, 18.0, vec![])),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+#[test]
+fn a_billing_off_stale_limit_never_trips_the_credit_gate() {
+    let (config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let mut stale = usage_credit_capped();
+    if let Some(s) = stale.spend.as_mut() {
+        s.enabled = false;
+    }
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", stale),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+/// Recovery mirrors the scoped gate (cloudy, 2026-10-19): an uncapped
+/// recovered member is relinked first, and a capped one only when it is the
+/// only member recovered (relinking beats leaving every session signed out).
+#[test]
+fn find_recovered_prefers_a_member_whose_credit_cap_is_not_spent() {
+    let member = |name: &str| ChainMember {
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        preferred: false,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+        check_credit_cap: true,
+    };
+    let chain = vec![member("b"), member("c")];
+    let store = store_with_infos(vec![
+        ("b", usage_credit_capped()),
+        ("c", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::Chain),
+        Some("c".to_string()),
+        "recovery relinks the uncapped member first"
+    );
+    let store = store_with_infos(vec![("b", usage_credit_capped())]);
+    assert_eq!(
+        find_recovered_member_for_test(&[member("b")], &store, &[], WalkOrder::Chain),
+        Some("b".to_string()),
+        "with only the capped member recovered, it is still taken"
+    );
+}
+
+/// The pay-as-you-go pass never lands on a member `credit_capped()` calls
+/// spent, even when its `spend` block alone still shows room.
+#[test]
+fn the_spend_pass_never_lands_on_a_credit_capped_member() {
+    let (mut config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            spend_member("b", 10.0, 1.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let mut b = usage_spent_with_spend(spend_block(true, 1.0, Some(50.0)));
+    b.extra_usage = Some(crate::usage::ExtraUsage {
+        is_enabled: true,
+        utilization: Some(100.0),
+        ..Default::default()
+    });
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", b.clone()),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "an extra_usage-capped member is no spend target"
+    );
+
+    // Control: the same member with its extra_usage block under the cap IS
+    // the spend pass's target, so the assertion above binds the cap.
+    b.extra_usage = Some(crate::usage::ExtraUsage {
+        is_enabled: true,
+        utilization: Some(12.0),
+        ..Default::default()
+    });
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", b),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+/// Codex has no spend reading (`wham/usage`), so no codex member arms the
+/// credit gate.
+#[test]
+fn codex_members_never_arm_the_credit_gate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = codex_state("cx1", &["cx1", "cx2"], false, None);
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert!(snap.chain.iter().all(|m| !m.check_credit_cap));
 }

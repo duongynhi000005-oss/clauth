@@ -43,6 +43,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
@@ -532,7 +533,10 @@ fn last_resort_hint_names_the_currently_marked_member() {
         &crate::profile::ProfileName::from("a"),
         MemberCard {
             focused: true,
-            row_cursor: 4,
+            row_cursor: FALLBACK_ROWS
+                .iter()
+                .position(|r| *r == FallbackRow::LastResort)
+                .unwrap(),
             width: 80,
             ..Default::default()
         },
@@ -2091,6 +2095,7 @@ fn edit_glyph_is_bold_like_the_selection_caret() {
             weekly_default: 98.0,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             last_resort: false,
             preferred: false,
             preferred_days: &[],
@@ -2417,6 +2422,7 @@ fn the_five_hour_figure_drops_to_its_own_line_when_the_gauge_leaves_no_room() {
             "  weekly at       98%",
             "  weekly gate     ─●",
             "  scoped gate     ─●",
+            "  credit gate     ─●",
             "  last resort     ○─",
             "  preferred       ○─",
             "  preferred days",
@@ -2446,10 +2452,11 @@ fn the_member_card_toggle_rows_read_on_off_on_the_compatible_tier() {
         &readings,
     );
     assert_eq!(
-        &card_texts(&lines)[6..10],
+        &card_texts(&lines)[6..11],
         [
             "  weekly gate     [on]",
             "  scoped gate     [on]",
+            "  credit gate     [on]",
             "  last resort     [off]",
             "  preferred       [off]",
         ]
@@ -3116,6 +3123,7 @@ fn the_remove_value_drops_to_its_own_line_when_narrow() {
             "  weekly at       98%",
             "  weekly gate     ─●",
             "  scoped gate     ─●",
+            "  credit gate     ─●",
             "  last resort     ○─",
             "  preferred       ○─",
             "  preferred days  ",
@@ -3185,6 +3193,7 @@ fn the_rotate_reminder_drops_to_its_own_line_when_narrow() {
             "  weekly at       98%",
             "  weekly gate     ─●",
             "  scoped gate     ─●",
+            "  credit gate     ─●",
             "  last resort     ○─",
             "  preferred       ○─",
             "  preferred days  never",
@@ -3438,9 +3447,9 @@ fn the_member_card_keeps_two_rounded_decimals_at_every_width() {
             2,
             28,
             &[
-                "│   [ 5h 100% ]  2h 30m    │",
-                "│                 100% us… │",
-                "│                 0% unti… │",
+                "│   [ 5h 100% ]  2h 30m   ┃│",
+                "│                 100% us…┃│",
+                "│                 0% unti…┃│",
             ],
         ),
         (
@@ -3641,10 +3650,10 @@ fn p1_scoped_app(label: &str) -> App {
 fn a_dropped_scoped_pill_cuts_its_name_never_the_reading() {
     let _home = crate::testutil::HomeSandbox::new();
     let want: &[(&str, u16, &str)] = &[
-        ("7d sonnet 4.5", 28, "│   [ 7d sonnet … 73.42% ] │"),
-        ("7d opus 4.1 fast", 28, "│   [ 7d opus 4.… 73.42% ] │"),
-        ("7d sonnet 4.5", 29, "│   [ 7d sonnet 4… 73.42% ] │"),
-        ("7d opus 4.1 fast", 29, "│   [ 7d opus 4.1… 73.42% ] │"),
+        ("7d sonnet 4.5", 28, "│   [ 7d sonnet … 73.42% ]┃│"),
+        ("7d opus 4.1 fast", 28, "│   [ 7d opus 4.… 73.42% ]┃│"),
+        ("7d sonnet 4.5", 29, "│   [ 7d sonnet 4… 73.42% ]┃│"),
+        ("7d opus 4.1 fast", 29, "│   [ 7d opus 4.1… 73.42% ]┃│"),
     ];
     for (label, w, row) in want {
         let app = p1_scoped_app(label);
@@ -3788,5 +3797,49 @@ fn a_body_caret_hides_under_an_open_modal_but_a_modal_field_keeps_its_caret() {
     assert!(
         term.backend().cursor_visible(),
         "a modal field keeps its caret under the blocker"
+    );
+}
+
+// The credit gate row (#93): a toggle whose hint states the walk's current
+// behaviour for this account, in the approved copy (cloudy, 2026-10-19).
+#[test]
+fn the_credit_gate_row_hints_the_current_state() {
+    let row = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::CheckCreditCap)
+        .expect("the credit gate is a Fallback row");
+    assert_eq!(
+        FALLBACK_ROWS[row - 1],
+        FallbackRow::CheckScoped,
+        "it sits right after the scoped gate"
+    );
+    let hint = |check_credit_cap: bool| {
+        let (mut p, p_readings) = profile("a", 95.0, 20.0, 3600);
+        p.check_credit_cap = check_credit_cap;
+        let (cfg, readings) = config_with(vec![(p, p_readings)], Some("a"), vec!["a"]);
+        let lines = member_detail(
+            &cfg,
+            &crate::profile::ProfileName::from("a"),
+            MemberCard {
+                focused: true,
+                row_cursor: row,
+                width: 120,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        )
+        .0;
+        hint_after(&lines, "credit gate")
+    };
+    assert_eq!(
+        hint(true).as_deref(),
+        Some(
+            "a spent usage-credit cap keeps auto-switch off this account, except as last resort or when recovering from a switch-off"
+        )
+    );
+    assert_eq!(
+        hint(false).as_deref(),
+        Some("auto-switch can move onto this account even with its usage-credit cap spent")
     );
 }

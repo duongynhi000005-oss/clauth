@@ -396,8 +396,8 @@ pub(crate) struct NoteEditor {
 
 /// One interactive line in the Fallback tab's detail pane for a chain member.
 /// `Threshold` is a stepper (±5 on `+`/`-`); `CheckWeekly`/`CheckScoped`/
-/// `LastResort`/`Preferred` are boolean toggles (space/⏎, per the
-/// enumerated-row grammar);
+/// `CheckCreditCap`/`LastResort`/`Preferred` are boolean toggles (space/⏎,
+/// per the enumerated-row grammar);
 /// `Remove` arms then confirms. The chain-global wrap-off setting lives on the
 /// program-wide Config tab, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,6 +417,10 @@ pub(crate) enum FallbackRow {
     /// e.g. "7d fable" (`Profile::check_scoped`, on by default). Off, the
     /// account stays in rotation for use with other models.
     CheckScoped,
+    /// Whether auto-switching checks this account's usage-credit cap
+    /// (`Profile::check_credit_cap`, on by default). Off, the account stays in
+    /// rotation even with its cap spent.
+    CheckCreditCap,
     LastResort,
     /// Whether this member is the chain's preferred (home) account
     /// (`Profile::preferred`, off by default). A pure on/off toggle, exclusive
@@ -15152,11 +15156,12 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
 
 /// Detail rows for a chain member: threshold stepper, last-resort/preferred
 /// toggles, preferred-days presets + day picker, remove.
-pub(crate) const FALLBACK_ROWS: [FallbackRow; 9] = [
+pub(crate) const FALLBACK_ROWS: [FallbackRow; 10] = [
     FallbackRow::Threshold,
     FallbackRow::WeeklyAt,
     FallbackRow::CheckWeekly,
     FallbackRow::CheckScoped,
+    FallbackRow::CheckCreditCap,
     FallbackRow::LastResort,
     FallbackRow::Preferred,
     FallbackRow::PreferredDays,
@@ -15443,6 +15448,7 @@ pub(crate) enum FallbackHint {
     DetailWeeklyAt,
     DetailCheckWeekly,
     DetailCheckScoped,
+    DetailCheckCreditCap,
     DetailLastResort,
     DetailPreferred,
     DetailPreferredDays,
@@ -15473,6 +15479,7 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
                 FallbackRow::WeeklyAt => FallbackHint::DetailWeeklyAt,
                 FallbackRow::CheckWeekly => FallbackHint::DetailCheckWeekly,
                 FallbackRow::CheckScoped => FallbackHint::DetailCheckScoped,
+                FallbackRow::CheckCreditCap => FallbackHint::DetailCheckCreditCap,
                 FallbackRow::LastResort => FallbackHint::DetailLastResort,
                 FallbackRow::Preferred => FallbackHint::DetailPreferred,
                 FallbackRow::PreferredDays => FallbackHint::DetailPreferredDays,
@@ -16342,8 +16349,9 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
                 open_card_edit(app, CardEdit::Weekly(InputState::new(&seed)));
             }
         }
-        FallbackRow::CheckWeekly => toggle_member_flag(app, MemberFlag::CheckWeekly),
-        FallbackRow::CheckScoped => toggle_member_flag(app, MemberFlag::CheckScoped),
+        FallbackRow::CheckWeekly => toggle_member_flag(app, MemberFlag::Weekly),
+        FallbackRow::CheckScoped => toggle_member_flag(app, MemberFlag::Scoped),
+        FallbackRow::CheckCreditCap => toggle_member_flag(app, MemberFlag::CreditCap),
         FallbackRow::LastResort => toggle_last_resort(app),
         FallbackRow::Preferred => toggle_preferred(app),
         // ⏎ only: space is the preset stepper and never reaches here for this row.
@@ -16761,22 +16769,13 @@ fn adjust_weekly(app: &mut App, delta: f64) {
     write_weekly_override(app, &name, Some(next));
 }
 
-/// ⏎/space on the `last resort` row: flip `Profile::last_resort` and persist.
-/// The chain has ONE parking spot, so turning the mark on here clears it on
-/// every other profile (radio). The target saves first (the user's intent);
-/// each cleared profile then saves on its own, and a failed clear reverts only
-/// that profile — the chain walk tolerates a transiently double-marked chain
-/// (first marked member after the active wins), so nothing lies about disk.
-/// The `refresh_tokens()` kick is not load-bearing here (the chain snapshot
-/// reads the shared config directly, unlike `auto_start` which lives in the
-/// `TokenList`); it's kept so every per-profile toggle path re-derives the
-/// scheduler snapshot the same way.
-/// Which per-member usage gate a toggle row flips (`Profile::check_weekly` /
-/// `Profile::check_scoped`).
+/// A per-member usage gate a toggle row flips (`Profile::check_weekly` /
+/// `Profile::check_scoped` / `Profile::check_credit_cap`).
 #[derive(Clone, Copy)]
 enum MemberFlag {
-    CheckWeekly,
-    CheckScoped,
+    Weekly,
+    Scoped,
+    CreditCap,
 }
 
 /// Flip a per-member usage gate and persist it; rolls back in memory when the
@@ -16796,8 +16795,9 @@ fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
         };
         fn field(p: &mut crate::profile::Profile, flag: MemberFlag) -> &mut bool {
             match flag {
-                MemberFlag::CheckWeekly => &mut p.check_weekly,
-                MemberFlag::CheckScoped => &mut p.check_scoped,
+                MemberFlag::Weekly => &mut p.check_weekly,
+                MemberFlag::Scoped => &mut p.check_scoped,
+                MemberFlag::CreditCap => &mut p.check_credit_cap,
             }
         }
         *field(profile, flag) = !*field(profile, flag);
@@ -16815,6 +16815,16 @@ fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
     }
 }
 
+/// ⏎/space on the `last resort` row: flip `Profile::last_resort` and persist.
+/// The chain has ONE parking spot, so turning the mark on here clears it on
+/// every other profile (radio). The target saves first (the user's intent);
+/// each cleared profile then saves on its own, and a failed clear reverts only
+/// that profile — the chain walk tolerates a transiently double-marked chain
+/// (first marked member after the active wins), so nothing lies about disk.
+/// The `refresh_tokens()` kick is not load-bearing here (the chain snapshot
+/// reads the shared config directly, unlike `auto_start` which lives in the
+/// `TokenList`); it's kept so every per-profile toggle path re-derives the
+/// scheduler snapshot the same way.
 fn toggle_last_resort(app: &mut App) {
     enum Outcome {
         Missing,

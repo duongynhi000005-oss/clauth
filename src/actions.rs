@@ -2077,6 +2077,7 @@ pub(crate) fn duplicate_profile(
         profile.max_auto_spend = src.max_auto_spend;
         profile.check_weekly = src.check_weekly;
         profile.check_scoped = src.check_scoped;
+        profile.check_credit_cap = src.check_credit_cap;
         profile.bell_threshold = src.bell_threshold;
         profile.disabled = src.disabled;
         // A fresh name holds no login; a reused name (delete-then-recreate)

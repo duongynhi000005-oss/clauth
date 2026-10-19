@@ -52,6 +52,7 @@ fn the_usage_hints_advertise_the_note_key() {
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,

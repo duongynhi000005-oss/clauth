@@ -6236,6 +6236,7 @@ fn scan_recovery(
                             .map(|p| crate::fallback::member_scoped_line(p, weekly_pct))
                             .unwrap_or(weekly_pct),
                         check_scoped: profile.is_none_or(|p| p.check_scoped),
+                        check_credit_cap: profile.is_none_or(|p| p.check_credit_cap),
                     }
                 })
                 .collect(),
