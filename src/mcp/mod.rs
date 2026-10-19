@@ -5745,19 +5745,28 @@ pub(crate) fn await_job() -> ! {
             render::envelope_prose(envelope)
         );
     }
-    if delivered.is_empty() {
-        std::process::exit(0); // every id already gone: nothing was delivered
+    let (exit_code, reminder) = await_job_verdict(!delivered.is_empty(), &pending);
+    if let Some(reminder) = reminder {
+        outln!("{reminder}");
+    }
+    std::process::exit(exit_code);
+}
+
+/// Choose the hook's exit code and reminder after the delivery window ends.
+fn await_job_verdict(delivered: bool, pending: &[String]) -> (i32, Option<String>) {
+    if !delivered && pending.is_empty() {
+        return (0, None); // every id already gone: nothing was delivered
     }
     if pending.is_empty() {
-        std::process::exit(2); // wake the model with the result(s)
+        return (2, None); // wake the model with the result(s)
     }
     let noun = if pending.len() == 1 { "job" } else { "jobs" };
-    outln!(
+    let reminder = format!(
         "delegate {noun} `{}` still running; call `monitor` to retrieve {}",
         pending.join("`, `"),
         if pending.len() == 1 { "it" } else { "them" }
     );
-    std::process::exit(2);
+    (2, Some(reminder))
 }
 
 /// Poll every id in `job_ids` until each is `done` or gone, or `deadline`
