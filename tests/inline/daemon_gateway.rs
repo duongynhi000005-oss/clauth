@@ -26,7 +26,6 @@ use crate::testutil::HomeSandbox;
 #[cfg(unix)]
 use crate::testutil::no_shunt_env;
 
-#[cfg(unix)]
 #[path = "../support/gateway_stub.rs"]
 pub(crate) mod stub;
 

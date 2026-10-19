@@ -6,25 +6,20 @@
 //! daemon at its recorded deadline. Every test drives a stub
 //! `clauth-<service>-proxy` under a `HomeSandbox`.
 
-#[cfg(unix)]
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::Arc;
-#[cfg(unix)]
 use std::time::Duration;
 
-#[cfg(unix)]
 use super::*;
 #[cfg(unix)]
 use crate::daemon::gateway::{
     DAEMON_STOP_BUDGET, Supervised as _, Supervisor, Tick, start_kind, stop_sleep,
 };
-#[cfg(unix)]
 use crate::testutil::HomeSandbox;
 
-#[cfg(unix)]
 use crate::daemon::gateway::tests::stub;
 
 #[cfg(unix)]
@@ -1900,4 +1895,141 @@ fn stop_left_behind_proxies_stops_a_marker_only_orphan() {
         Some(15),
         "one SIGTERM"
     );
+}
+
+// ── a removed row's reap stops its running child, cross-platform ──────────
+
+/// The proxy's `/health` body, matching the stub's manifest (`1.2.0`, `1.0`).
+const PROXY_HEALTH: &str =
+    r#"{"status":"ok","service":"alpha","version":"1.2.0","contract":"1.0"}"#;
+
+/// Write the stub `clauth-<service>-proxy` into `dir`, before `enable` runs
+/// its `manifest` subprocess. Unix reuses the `/bin/sh` stub, steered off
+/// serving `/health` so the test process answers on every OS.
+#[cfg(unix)]
+fn write_stub(dir: &std::path::Path, service: &str) {
+    stub::write_proxy_stub(dir, service);
+}
+
+/// The Windows stub is a `cmd` script (a file `Command::new` routes through
+/// `cmd.exe`): it answers `manifest`, then lives until it is force-killed. The
+/// loop counts iterations, not seconds, so a stub a failing test left behind
+/// ends on its own after about 120 s, more under load.
+#[cfg(windows)]
+fn write_stub(dir: &std::path::Path, service: &str) {
+    std::fs::create_dir_all(dir).expect("stub dir");
+    let path = dir.join(format!("clauth-{service}-proxy.cmd"));
+    let script = format!(
+        "@echo off\r\n\
+         if /i \"%~1\"==\"manifest\" (\r\n\
+         echo {{\"service\":\"{service}\",\"display_name\":\"\",\"version\":\"1.2.0\",\"contract\":\"1.0\",\"capabilities\":[],\"drain_secs\":0}}\r\n\
+         exit /b 0\r\n\
+         )\r\n\
+         set /a i=0\r\n\
+         :loop\r\n\
+         if %i% geq 120 exit /b 0\r\n\
+         ping -n 2 127.0.0.1 >nul\r\n\
+         set /a i=i+1\r\n\
+         goto loop\r\n",
+        service = service,
+    );
+    std::fs::write(&path, script).expect("write the cmd stub");
+}
+
+/// A removed row's reap stops its supervisor's running child on every OS: the
+/// coordinator starts the proxy and the slot reads healthy with its pid and
+/// start time tied to the child marker, then the row is removed and the test
+/// waits for that pid's recorded start time to stop matching (the child is
+/// dead, never a recycled pid reading as alive). The removal round asserts the
+/// coordinator dropped alpha's supervisor, so the reap that never runs fails
+/// on that assert rather than passing on the supervisor's own idle-stop of an
+/// `Absent` row. The residuals this test cannot see both leave the child
+/// stopped by another stopper (the idle-stop, or the supervisor's own `Drop`),
+/// so the final wait stays green: a leak inside the
+/// reaper's joiner (never shutting its supervisor down), and a supervisor
+/// removed from `threads` but never handed to a joiner. Every prior test here
+/// is `#[cfg(unix)]`, so this is the one that runs the reap on Windows.
+#[test]
+fn a_removed_rows_supervisor_stops_its_running_child() {
+    let home = HomeSandbox::new();
+    crate::profile::mkdir_700(&crate::profile::clauth_dir().expect("clauth dir")).expect("mkdir");
+    let slots = new_slots();
+    let dir = home.home().join("stub");
+    let port = stub::free_port();
+    write_stub(&dir, "alpha");
+    // The `/bin/sh` stub serves `/health` through its named pipe unless this
+    // steers it off; the test process answers on every OS.
+    #[cfg(unix)]
+    std::fs::write(dir.join("no-health"), "").expect("no-health");
+    crate::proxy::enable("alpha", Some(port), Some(dir.as_os_str())).expect("enable");
+
+    let alpha = Service::parse("alpha").expect("alpha");
+    let mut coordinator = Coordinator {
+        threads: BTreeMap::new(),
+        reaping: BTreeMap::new(),
+    };
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+    let marker_path = crate::proxy::child_marker_path(&alpha).expect("marker path");
+    stub::wait_until(
+        "alpha's child marker is written",
+        Duration::from_secs(10),
+        || marker_path.exists(),
+    );
+
+    // Only once the child is spawned may the answerer bind: the supervisor's
+    // pre-spawn foreign probe refuses to start the child beside an answerer
+    // already answering `/health` on the port.
+    let _health = stub::HttpAnswer::bind(port, 200, PROXY_HEALTH);
+
+    stub::wait_until(
+        "alpha reads healthy before its removal",
+        Duration::from_secs(15),
+        || {
+            super::slots(&slots)
+                .iter()
+                .any(|slot| slot.service == alpha.as_str() && slot.state == ProxyState::Healthy)
+        },
+    );
+
+    // Read the marker only after the slot reads healthy, and tie the child to
+    // that slot: its pid is the marker's pid and its recorded start still
+    // matches, so the removal stops a child that is really alive at that
+    // moment, never one that exited on its own within the wait.
+    let marker: crate::daemon::gateway::ChildMarker =
+        serde_json::from_slice(&std::fs::read(&marker_path).expect("read the marker"))
+            .expect("parse the marker");
+    let pid = marker.pid;
+    let start = marker
+        .start
+        .expect("the marker records the child's start time");
+    let slot = super::slots(&slots)
+        .into_iter()
+        .find(|slot| slot.service == alpha.as_str())
+        .expect("alpha's slot is published");
+    assert_eq!(slot.state, ProxyState::Healthy, "the slot reads healthy");
+    assert_eq!(
+        slot.pid,
+        Some(pid),
+        "the healthy slot's pid is the marker's pid"
+    );
+    assert_eq!(
+        crate::daemon::gateway::process_start_time(pid).as_deref(),
+        Some(start.as_str()),
+        "the child is alive at its recorded start time before the removal"
+    );
+
+    // Remove alpha's row: the next round's reap stops the child off the
+    // coordinator thread.
+    std::fs::write(crate::proxy::registry_path().expect("registry path"), "").expect("remove");
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+    assert!(
+        !coordinator.threads.contains_key(&alpha),
+        "the removal drops alpha's supervisor"
+    );
+    stub::wait_until(
+        "the removed row's child is stopped",
+        Duration::from_secs(10),
+        || crate::daemon::gateway::process_start_time(pid).as_deref() != Some(start.as_str()),
+    );
+    shutdown_threads(coordinator.threads, coordinator.reaping);
 }
