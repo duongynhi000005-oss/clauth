@@ -43,11 +43,9 @@ fn embedded_tree_is_baked_in() {
 /// The delegate hook's wake-notification title: the bundled manifest names the
 /// event in `rewakeSummary` instead of letting the host render its internal
 /// "Stop hook feedback" placeholder, which reads as an empty notification. The
-/// value must stay true for BOTH exit-2 shapes the hook produces — a delivered
-/// fan-out and a mixed one with jobs still running — so a copy that claims
-/// readiness for the whole set ("result ready") contradicts the still-running
-/// clause the body prints. Pinned as a literal so a manifest edit cannot drift
-/// the summary without redding here.
+/// summary and message must cover completed jobs, pending jobs, and a mixture
+/// of both. A pending-only wake has no result yet. These literals prevent the
+/// notification from claiming completion when the body only contains a reminder.
 #[test]
 fn the_delegate_hook_names_its_wake_summary_instead_of_the_host_placeholder() {
     let hooks: serde_json::Value =
@@ -55,12 +53,16 @@ fn the_delegate_hook_names_its_wake_summary_instead_of_the_host_placeholder() {
             .expect("plugins/hooks/hooks.json parses");
     let (_, entry) = await_job_hook(&hooks);
     assert_eq!(
-        entry["rewakeSummary"], "clauth delegate results",
+        entry["rewakeSummary"], "clauth delegate update",
         "the manifest names the wake notification instead of the host's placeholder"
     );
     assert_ne!(
         entry["rewakeSummary"], "Stop hook feedback",
         "the host's internal placeholder must never be the shipped summary"
+    );
+    assert_eq!(
+        entry["rewakeMessage"], "A clauth delegate result or status update follows.",
+        "the wake message must also describe a pending-only reminder"
     );
 }
 
