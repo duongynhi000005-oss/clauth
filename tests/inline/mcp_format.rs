@@ -9,6 +9,39 @@
 use super::*;
 use crate::testutil::HomeSandbox;
 
+fn drive<F>(fut: F) -> CallToolResult
+where
+    F: std::future::Future<Output = Result<CallToolResult, ErrorData>>,
+{
+    // `monitor`'s wait loops sleep on tokio timers, which a bare current-thread
+    // runtime does not arm.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    rt.block_on(fut)
+        .expect("tool returns a tool result, never a transport error")
+}
+
+fn first_text(result: &CallToolResult) -> String {
+    result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("first content block is text")
+}
+
+fn assert_one_prose_block(result: &CallToolResult) -> String {
+    assert_eq!(result.content.len(), 1, "a reply is a single content block");
+    let text = first_text(result);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&text).is_err(),
+        "the reply must be prose, not a JSON blob: {text}",
+    );
+    text
+}
+
 #[test]
 fn await_job_verdict_wakes_for_pending_jobs_without_a_delivery() {
     assert_eq!(
@@ -44,39 +77,6 @@ fn await_job_verdict_wakes_for_a_delivery_without_pending_jobs() {
 #[test]
 fn await_job_verdict_stays_silent_when_every_job_is_gone() {
     assert_eq!(await_job_verdict(false, &[]), (0, None));
-}
-
-fn drive<F>(fut: F) -> CallToolResult
-where
-    F: std::future::Future<Output = Result<CallToolResult, ErrorData>>,
-{
-    // `monitor`'s wait loops sleep on tokio timers, which a bare current-thread
-    // runtime does not arm.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .expect("runtime");
-    rt.block_on(fut)
-        .expect("tool returns a tool result, never a transport error")
-}
-
-fn first_text(result: &CallToolResult) -> String {
-    result
-        .content
-        .first()
-        .and_then(|c| c.as_text())
-        .map(|t| t.text.clone())
-        .expect("first content block is text")
-}
-
-fn assert_one_prose_block(result: &CallToolResult) -> String {
-    assert_eq!(result.content.len(), 1, "a reply is a single content block");
-    let text = first_text(result);
-    assert!(
-        serde_json::from_str::<serde_json::Value>(&text).is_err(),
-        "the reply must be prose, not a JSON blob: {text}",
-    );
-    text
 }
 
 #[test]

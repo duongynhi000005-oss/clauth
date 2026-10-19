@@ -5752,7 +5752,7 @@ pub(crate) fn await_job() -> ! {
     std::process::exit(exit_code);
 }
 
-/// Choose the hook's exit code and reminder after the delivery window ends.
+/// Choose the hook's exit code and reminder after the wait returns.
 fn await_job_verdict(delivered: bool, pending: &[String]) -> (i32, Option<String>) {
     if !delivered && pending.is_empty() {
         return (0, None); // every id already gone: nothing was delivered
