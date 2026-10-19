@@ -581,6 +581,230 @@ fn a_restart_between_block_lines_across_midnight_moves_the_counted_span() {
     );
 }
 
+/// A swap from `kerry` to `mommy` lands between the previous producer's read
+/// of the thinking line and the restart: the turn stays on `kerry` (the member
+/// it was frozen to), its extension included, and `mommy` gets nothing.
+#[test]
+fn a_swap_before_a_restart_keeps_the_in_flight_turn_on_its_member() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let path = iso_kerry(home.home()).join("tool.jsonl");
+    let [u, thinking, result, tool_use] = tool_use_turn("tool", "msg_tool");
+    write_lines(&path, &[u, thinking]);
+    let before = Producer::new().tick(ms(START) + 11_000);
+    write_cache(home.home(), &before);
+    reg(Some("mommy"));
+    append_lines(&path, &[result, tool_use]);
+    let snap = Producer::new().tick(ms(START) + 31_000);
+    assert_eq!(
+        snap.days["2026-09-22"].keys().collect::<Vec<_>>(),
+        vec!["kerry"],
+        "mommy gets no row: {:?}",
+        snap.days["2026-09-22"]
+    );
+    assert_eq!(
+        snap.days["2026-09-22"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 30_000
+        }
+    );
+    assert_eq!(
+        snap.accounts.keys().collect::<Vec<_>>(),
+        vec!["kerry"],
+        "the live figures keep the turn on kerry"
+    );
+}
+
+/// The same swap, with no producer running for 15 minutes before the restart
+/// (both block lines landed 20 s apart, long before it): the turn still stays
+/// on `kerry`, so the frozen map is bounded by the response's age at the
+/// previous write, never by how long the restart took.
+#[test]
+fn a_swap_before_a_late_restart_keeps_the_in_flight_turn_on_its_member() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let path = iso_kerry(home.home()).join("tool.jsonl");
+    let [u, thinking, result, tool_use] = tool_use_turn("tool", "msg_tool");
+    write_lines(&path, &[u, thinking]);
+    let before = Producer::new().tick(ms(START) + 11_000);
+    write_cache(home.home(), &before);
+    reg(Some("mommy"));
+    append_lines(&path, &[result, tool_use]);
+    let snap = Producer::new().tick(ms(START) + 11_000 + 15 * 60_000);
+    assert_eq!(
+        snap.days["2026-09-22"].keys().collect::<Vec<_>>(),
+        vec!["kerry"],
+        "mommy gets no row: {:?}",
+        snap.days["2026-09-22"]
+    );
+    assert_eq!(
+        snap.days["2026-09-22"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 30_000
+        }
+    );
+}
+
+/// The same swap, with the turn's transcript missing on the restart's first
+/// tick (moved away, as a file replaced mid-walk or a failed open leaves it)
+/// and back by the next discovery walk: the turn still stays on `kerry`, so
+/// no tick of the restart forgets the previous producer's frozen members.
+/// An unattributed session in the global store keeps the restart's first
+/// tick from reading an empty tree.
+#[test]
+fn a_transcript_missing_on_the_restarts_first_tick_keeps_its_member() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let path = iso_kerry(home.home()).join("tool.jsonl");
+    let [u, thinking, result, tool_use] = tool_use_turn("tool", "msg_tool");
+    write_lines(&path, &[u, thinking]);
+    write_lines(
+        &global_store(home.home()).join("other.jsonl"),
+        &[
+            user(START, "other"),
+            assistant(&iso(ms(START) + 5_000), "other", "msg_other", 500),
+        ],
+    );
+    let before = Producer::new().tick(ms(START) + 11_000);
+    write_cache(home.home(), &before);
+    reg(Some("mommy"));
+    append_lines(&path, &[result, tool_use]);
+    let away = path.with_extension("away");
+    std::fs::rename(&path, &away).unwrap();
+    let mut p = Producer::new();
+    p.tick(ms(START) + 31_000);
+    std::fs::rename(&away, &path).unwrap();
+    let snap = p.tick(ms(START) + 31_000 + DISCOVER_INTERVAL_MS);
+    let day = &snap.days["2026-09-22"];
+    assert!(!day.contains_key("mommy"), "mommy gets no row: {day:?}");
+    assert_eq!(
+        day["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 30_000
+        }
+    );
+}
+
+/// The same swap with the turn straddling UTC midnight while `mommy` already
+/// has a counted 09-22 turn: the move takes the baseline off `kerry`'s 09-22
+/// row, never `mommy`'s, so `mommy` keeps its sums and the turn counts once.
+#[test]
+fn a_swap_before_a_restart_across_midnight_moves_the_turn_on_its_member() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let path = iso_kerry(home.home()).join("midtool.jsonl");
+    write_lines(
+        &path,
+        &[
+            user("2026-09-22T23:59:50.000Z", "midtool"),
+            assistant("2026-09-22T23:59:55.000Z", "midtool", "msg_mt", 1000),
+        ],
+    );
+    let mut before = Producer::new().tick(ms("2026-09-22T23:59:57.000Z"));
+    let mommys = DaySum {
+        output: 500,
+        gen_ms: 7_000,
+    };
+    before
+        .days
+        .get_mut("2026-09-22")
+        .unwrap()
+        .entry("mommy".to_owned())
+        .or_default()
+        .insert(MODEL.to_owned(), mommys);
+    write_cache(home.home(), &before);
+    reg(Some("mommy"));
+    append_lines(
+        &path,
+        &[assistant(
+            "2026-09-23T00:00:20.000Z",
+            "midtool",
+            "msg_mt",
+            1000,
+        )],
+    );
+    let snap = Producer::new().tick(ms("2026-09-23T00:00:21.000Z"));
+    assert_eq!(
+        snap.days["2026-09-22"]["mommy"][MODEL], mommys,
+        "mommy's own 09-22 turn keeps its sums"
+    );
+    let kerry_old = snap
+        .days
+        .get("2026-09-22")
+        .and_then(|d| d.get("kerry"))
+        .and_then(|m| m.get(MODEL));
+    assert!(
+        kerry_old.is_none_or(|s| *s == DaySum::default()),
+        "09-22 keeps nothing of the moved turn: {kerry_old:?}"
+    );
+    assert_eq!(
+        snap.days["2026-09-23"].keys().collect::<Vec<_>>(),
+        vec!["kerry"],
+        "the turn lands on kerry alone: {:?}",
+        snap.days["2026-09-23"]
+    );
+    assert_eq!(
+        snap.days["2026-09-23"]["kerry"][MODEL],
+        DaySum {
+            output: 1000,
+            gen_ms: 30_000
+        }
+    );
+}
+
+/// The cache lists a response's frozen member only while the response ended
+/// inside the last 10 minutes: one ended exactly 10 min ago is listed, one
+/// ended 10 min 1 ms ago is not, so the cache stays bounded.
+#[test]
+fn the_cache_lists_a_responses_member_for_ten_minutes() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let end = ms(START) + 10_000;
+    write_lines(
+        &iso_kerry(home.home()).join("old.jsonl"),
+        &[
+            user(START, "old"),
+            assistant(&iso(end), "old", "msg_old", 1000),
+        ],
+    );
+    let listed = Producer::new().tick(end + 600_000);
+    assert_eq!(
+        serde_json::to_value(&listed).unwrap()["frozen"],
+        serde_json::json!({"msg_old": "kerry"}),
+        "a response ended exactly 10 min ago is listed with its member"
+    );
+    let aged = Producer::new().tick(end + 600_001);
+    assert_eq!(
+        serde_json::to_value(&aged).unwrap()["frozen"],
+        serde_json::json!({}),
+        "a response ended over 10 min ago is not listed"
+    );
+}
+
+/// A v1 cache written before the `frozen` field existed still loads: the field
+/// is additive (`#[serde(default)]`), so an older producer's cache is never
+/// dropped on upgrade.
+#[test]
+fn an_old_cache_without_the_frozen_field_still_loads() {
+    let home = HomeSandbox::new();
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth).unwrap();
+    std::fs::write(
+        clauth.join(TPS_CACHE_FILE),
+        r#"{"version":1,"generated_at":"2026-09-22T20:46:27.014+00:00","total":{"live":{"rate":0.0,"speed":null},"m5":{"rate":0.0,"speed":null},"h1":{"rate":0.0,"speed":null}},"accounts":{},"sessions":{},"days":{}}"#,
+    )
+    .unwrap();
+    let snap = load_cache().unwrap();
+    assert!(
+        snap.frozen.is_empty(),
+        "the default is an empty map: {:?}",
+        snap.frozen
+    );
+}
+
 /// A restart between two block lines of a span-less response (no user line in
 /// its file) that crosses midnight: the previous producer never put it in the
 /// day sums, so the move takes nothing off 09-22's other response and adds

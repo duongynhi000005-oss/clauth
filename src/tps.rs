@@ -19,6 +19,10 @@ pub(crate) const CACHE_VERSION: u16 = 1;
 pub(crate) const LIVE_WINDOW_MS: u64 = 10_000;
 pub(crate) const M5_WINDOW_MS: u64 = 5 * 60_000;
 pub(crate) const H1_WINDOW_MS: u64 = 60 * 60_000;
+/// A response whose `end_ms` is within this of the snapshot's `now_ms` keeps
+/// its frozen member in [`Snapshot::frozen`], so a restart re-freezes it to the
+/// same member across a swap.
+const FROZEN_WINDOW_MS: u64 = 10 * 60_000;
 /// A cache older than this reads as no producer.
 pub(crate) const STALE_AFTER_MS: u64 = 30_000;
 
@@ -75,6 +79,13 @@ pub(crate) struct Snapshot {
     pub(crate) accounts: BTreeMap<String, Figures>,
     pub(crate) sessions: BTreeMap<String, SessionFigures>,
     pub(crate) days: DaySums,
+    /// Response key → the member its `Resp` was frozen to, listed only while the
+    /// response's `end_ms` is within [`FROZEN_WINDOW_MS`] of the snapshot's
+    /// `now_ms`. A restarted producer reads it before the current member, so an
+    /// in-flight response keeps its member across a swap. A `BTreeMap` so the
+    /// scheduler's byte-for-byte rewrite check sees a deterministic order.
+    #[serde(default)]
+    pub(crate) frozen: BTreeMap<String, String>,
 }
 
 impl Snapshot {
@@ -92,8 +103,13 @@ impl Snapshot {
 #[derive(Debug, Clone)]
 struct Resp {
     session: String,
-    /// The member that spent this response, frozen at first read (or `*` for an
-    /// unattributed session).
+    /// The member that spent this response, frozen at first read this run — the
+    /// current member, or the previous producer's member for a response re-read
+    /// after a restart (or `*` for an unattributed session). Residual: the
+    /// 1 h live figure groups by this field, so responses that ended 10-60 min
+    /// before the last write read under the new member there for up to 50 min
+    /// after a restart (accepted live-figure residual; day sums are
+    /// unaffected).
     account: String,
     model: String,
     /// Latest `user` line before this response's first line; `None` when there
@@ -152,6 +168,14 @@ pub(crate) struct Producer {
     responses: HashMap<String, Resp>,
     /// Accumulated day sums (additive), loaded from the cache on start.
     days: DaySums,
+    /// Response key → member, loaded from the previous cache's `frozen` map:
+    /// consulted once per response, at its `Resp`'s first creation this run, so
+    /// a response re-read after a restart keeps the member the previous producer
+    /// froze it to. Loaded once and never grown, so it stays bounded; an entry
+    /// is consumed on use. Residual: an id-less response the previous producer
+    /// keyed `session@0` (its file joined cold, no user line seen) keys
+    /// `session@<ts>` on re-read, so its entry never matches.
+    inherited: BTreeMap<String, String>,
     /// Latest user line per transcript PATH, for the next response's span start.
     last_user: HashMap<PathBuf, u64>,
     /// Store fallback owners, memoized on `session_profiles.json`'s mtime.
@@ -172,17 +196,16 @@ pub(crate) struct Producer {
     /// lines landing between the tail and the last write are the same class of
     /// residual: they are never counted. A baseline built from lines the
     /// previous producer never read (the residual lines above) lets the
-    /// response's later lines fold only their extension; the extension of a
-    /// response straddling the restart folds under the session's member at
-    /// re-read, so a member swap between the previous producer's read and the
-    /// restart puts the extension on the new member, and when that later line
-    /// also crosses midnight and the new member has a row that day, the move
-    /// takes the baseline off it and adds it to the next, so the turn counts
-    /// under both members (with no row, the turn splits between them); a
+    /// response's later lines fold only their extension. Residuals: a response
+    /// that ended more than [`FROZEN_WINDOW_MS`] before the previous producer's
+    /// last write is not in the frozen map, so a later line after a swap and the
+    /// restart folds under the re-read member, and across midnight the move then
+    /// takes the baseline off the new member's old-day row when it has one (the
+    /// turn counts twice; with none, it splits between them); a
     /// restart on the second UTC day or later after a turn straddled midnight,
     /// the last cache write before that midnight, skips the turn's pre-cutoff
-    /// lines, so its later line folds as a new response while the old day
-    /// folds into the speed ledger: that turn counts twice.
+    /// lines, so its later line folds as a new response while the old day folds
+    /// into the speed ledger: that turn counts twice.
     watermark_ms: u64,
     /// The speed ledger the producer folds each finalized day into at rollover.
     speed_ledger: crate::token_ledger::SpeedLedger,
@@ -210,6 +233,7 @@ impl Producer {
             .as_ref()
             .and_then(|s| parse_ts(&s.generated_at))
             .unwrap_or(0);
+        let inherited = cache.as_ref().map(|s| s.frozen.clone()).unwrap_or_default();
         let speed_ledger = crate::profile::clauth_dir()
             .ok()
             .map(|d| crate::token_ledger::SpeedLedger::load(&d))
@@ -218,6 +242,7 @@ impl Producer {
             files: HashMap::new(),
             responses: HashMap::new(),
             days,
+            inherited,
             last_user: HashMap::new(),
             owner_cache: HashMap::new(),
             store_owners: HashMap::new(),
@@ -522,8 +547,16 @@ impl Producer {
                 let user_ts = self.last_user.get(path).copied().unwrap_or(0);
                 let msg_key = response_key(key, id.as_deref(), user_ts);
                 let start_ms = self.last_user.get(path).copied();
-                let account = attr
-                    .map(str::to_owned)
+                // A response re-read after a restart keeps the member the
+                // previous producer froze it to; a response first seen this run
+                // freezes to the current member. Attribution is at read time,
+                // not line time: a response whose lines all landed after the
+                // previous producer's last write and before a swap is read only
+                // after the restart, so it freezes to the new member.
+                let account = self
+                    .inherited
+                    .remove(&msg_key)
+                    .or_else(|| attr.map(str::to_owned))
                     .unwrap_or_else(|| UNATTRIBUTED.to_owned());
                 let resp = upsert_response(
                     &mut self.responses,
@@ -646,13 +679,18 @@ impl Producer {
         let mut by_account: BTreeMap<String, Vec<&Resp>> = BTreeMap::new();
         let mut by_session: BTreeMap<&str, Vec<&Resp>> = BTreeMap::new();
         let mut all: Vec<&Resp> = Vec::new();
-        for r in self.responses.values() {
+        let frozen_cutoff = now_ms.saturating_sub(FROZEN_WINDOW_MS);
+        let mut frozen = BTreeMap::new();
+        for (key, r) in &self.responses {
             all.push(r);
             if r.end_ms >= h1_start {
                 by_session.entry(r.session.as_str()).or_default().push(r);
                 if r.account != UNATTRIBUTED {
                     by_account.entry(r.account.clone()).or_default().push(r);
                 }
+            }
+            if r.end_ms >= frozen_cutoff {
+                frozen.insert(key.clone(), r.account.clone());
             }
         }
         let mut sessions = BTreeMap::new();
@@ -676,6 +714,7 @@ impl Producer {
             accounts,
             sessions,
             days: self.days.clone(),
+            frozen,
         }
     }
 
@@ -929,12 +968,11 @@ fn iso_ms_utc(ms: u64) -> String {
         .unwrap_or_default()
 }
 
-/// The oldest timestamp a cold-start read retains: the earlier of "now - 1 h"
-/// and yesterday's UTC midnight — every line the live/5m/1h windows or today's
-/// and yesterday's day sums need.
+/// The oldest timestamp a cold-start read retains: yesterday's UTC midnight.
+/// It is always below `now - 1 h`, so it covers every line the live/5m/1h
+/// windows or today's and yesterday's day sums need.
 fn cutoff_ms(now_ms: u64) -> u64 {
-    let today_midnight = now_ms - (now_ms % DAY_MS);
-    (today_midnight - DAY_MS).min(now_ms.saturating_sub(H1_WINDOW_MS))
+    now_ms - (now_ms % DAY_MS) - DAY_MS
 }
 
 fn mtime_of(meta: &std::fs::Metadata) -> u64 {
