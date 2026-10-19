@@ -684,6 +684,152 @@ fn a_memory_dir_in_any_settings_file_suppresses_ours() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_memory_dir_in_the_git_root_local_tier_suppresses_ours() {
+    // On unix Claude Code reads the local tier at the git root, with the
+    // launch dir's file merged beneath it as legacy local settings.
+    let l = layout(true);
+    let dir = l.root.join("work/repo/.claude");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("settings.local.json"),
+        "{\"autoMemoryDirectory\":\"/elsewhere\"}",
+    )
+    .unwrap();
+    let a = apply(&l, &[]);
+    assert_eq!(
+        a.settings,
+        Some(json!({ "hooks": { "PreToolUse": [our_hook()] } }))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_memory_dir_in_the_git_root_local_tier_does_not_suppress_ours_on_windows() {
+    // Windows has no uids for Claude Code's ownership check, so its local tier
+    // stays at the launch dir and a root file is never read from `sub`.
+    let l = layout(true);
+    let dir = l.root.join("work/repo/.claude");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("settings.local.json"),
+        "{\"autoMemoryDirectory\":\"/elsewhere\"}",
+    )
+    .unwrap();
+    let a = apply(&l, &[]);
+    assert_eq!(
+        a.settings.unwrap()["autoMemoryDirectory"],
+        json!(memory_dir(&l))
+    );
+}
+
+#[test]
+fn a_memory_dir_in_the_git_root_project_tier_does_not_suppress_ours() {
+    // Only the local tier moves to the git root; the project tier stays at
+    // the launch dir, so a root `settings.json` is never read from `sub`.
+    let l = layout(true);
+    let dir = l.root.join("work/repo/.claude");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("settings.json"),
+        "{\"autoMemoryDirectory\":\"/elsewhere\"}",
+    )
+    .unwrap();
+    let a = apply(&l, &[]);
+    assert_eq!(
+        a.settings.unwrap()["autoMemoryDirectory"],
+        json!(memory_dir(&l))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_memory_dir_in_a_worktrees_main_checkout_local_tier_suppresses_ours() {
+    // A linked worktree at `work/wt` of `work/repo`: `memory_base` resolves it
+    // to the main checkout, whose local tier is the one Claude Code keys.
+    let l = layout(true);
+    worktree(
+        &l.root.join("work"),
+        "wt",
+        "repo/.git",
+        &l.root.join("work/wt/.git"),
+    );
+    fs::create_dir_all(l.root.join("work/repo/.claude")).unwrap();
+    fs::write(
+        l.root.join("work/repo/.claude/settings.local.json"),
+        "{\"autoMemoryDirectory\":\"/elsewhere\"}",
+    )
+    .unwrap();
+    let mut command = Command::new("claude");
+    apply_spawn_settings(
+        &mut command,
+        &l.runtime,
+        &l.root.join("work/wt"),
+        &[],
+        HOOK,
+        &l.settings_file,
+    );
+    let settings: Value =
+        serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
+    assert_eq!(settings, json!({ "hooks": { "PreToolUse": [our_hook()] } }));
+}
+
+#[test]
+fn a_memory_dir_in_a_worktrees_own_root_local_tier_does_not_suppress_ours() {
+    // From `work/wt/sub` Claude Code reads the main checkout's local tier and
+    // the launch dir's legacy one, never the worktree root's.
+    let l = layout(true);
+    worktree(
+        &l.root.join("work"),
+        "wt",
+        "repo/.git",
+        &l.root.join("work/wt/.git"),
+    );
+    fs::create_dir_all(l.root.join("work/wt/.claude")).unwrap();
+    fs::write(
+        l.root.join("work/wt/.claude/settings.local.json"),
+        "{\"autoMemoryDirectory\":\"/elsewhere\"}",
+    )
+    .unwrap();
+    let cwd = l.root.join("work/wt/sub");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut command = Command::new("claude");
+    apply_spawn_settings(&mut command, &l.runtime, &cwd, &[], HOOK, &l.settings_file);
+    let settings: Value =
+        serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
+    assert_eq!(settings["autoMemoryDirectory"], json!(memory_dir(&l)));
+}
+
+#[test]
+fn a_memory_dir_in_the_home_local_tier_does_not_suppress_ours_from_a_subdir() {
+    // Claude Code never moves the local tier to a git root that is the real
+    // `$HOME`, so `<home>/.claude/settings.local.json` is not read from a
+    // subdir of home.
+    let l = layout(true);
+    let home = crate::testutil::node_path(l.home.home());
+    fs::create_dir_all(home.join(".git")).unwrap();
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::write(
+        home.join(".claude/settings.local.json"),
+        "{\"autoMemoryDirectory\":\"/elsewhere\"}",
+    )
+    .unwrap();
+    let cwd = home.join("sub");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut command = Command::new("claude");
+    apply_spawn_settings(&mut command, &l.runtime, &cwd, &[], HOOK, &l.settings_file);
+    let settings: Value =
+        serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
+    let key = home
+        .to_string_lossy()
+        .replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    assert_eq!(
+        settings["autoMemoryDirectory"],
+        json!(l.store.join(key).join("memory").to_string_lossy())
+    );
+}
+
 #[test]
 fn a_project_tier_claude_code_skips_at_home_does_not_suppress_ours() {
     // At the real `$HOME` the spawn gets `--setting-sources user`, so the

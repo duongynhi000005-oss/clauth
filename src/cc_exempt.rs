@@ -299,15 +299,26 @@ pub(crate) fn apply_spawn_settings(
 
     // `autoMemoryDirectory` is ours only when no settings source or env var
     // already keys it. At the real `$HOME` the spawn gets `--setting-sources
-    // user`, so the `<cwd>/.claude` project tier is never read.
+    // user`, so the `<cwd>/.claude` project tier is never read. On unix Claude
+    // Code reads the local tier at `memory_base` (a linked worktree's main
+    // checkout) unless that root is the real `$HOME`, and still reads
+    // `<cwd>/.claude/settings.local.json` beside it as legacy local settings.
+    // Claude Code also skips a root unless the root, its `.git` and its
+    // `.claude` are owned by the euid; that check is not mirrored here, so a
+    // foreign-owned root's file still suppresses ours and its memory writes
+    // prompt, where mirroring it would need the euid (`unsafe` or a new dep).
     let at_home = crate::runtime::cwd_is_real_home(cwd);
+    let base = memory_base(cwd);
     let mut suppressed = sets_memory(&settings);
     if !suppressed {
         suppressed = settings_file_sets_memory(&config_dir.join("settings.json"));
     }
     if !suppressed && !at_home {
         suppressed = settings_file_sets_memory(&cwd.join(".claude").join("settings.json"))
-            || settings_file_sets_memory(&cwd.join(".claude").join("settings.local.json"));
+            || settings_file_sets_memory(&cwd.join(".claude").join("settings.local.json"))
+            || (cfg!(unix)
+                && !crate::runtime::cwd_is_real_home(&base)
+                && settings_file_sets_memory(&base.join(".claude").join("settings.local.json")));
     }
     if !suppressed {
         // CC tests it for truthiness (`if(process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR)`),
@@ -321,7 +332,6 @@ pub(crate) fn apply_spawn_settings(
     }
     if !suppressed {
         let store = crate::canonical::claude_code_spelling(&real.to_string_lossy());
-        let base = memory_base(cwd);
         let key = project_key(&crate::canonical::claude_code_spelling(
             &base.to_string_lossy(),
         ));
