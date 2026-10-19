@@ -13,6 +13,7 @@
 //! `X-OpenAI-Fedramp` rides only when the stored tokens carry
 //! `chatgpt_account_is_fedramp`, the same field codex reads it from.
 
+#[cfg(not(test))]
 use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -82,6 +83,7 @@ fn codex_user_agent_now() -> String {
 
 /// The installed codex's version, parsed off `codex --version`'s first line:
 /// its last whitespace token that reads as a version (`codex-cli 0.145.0`).
+#[cfg(not(test))]
 fn codex_version() -> Option<String> {
     let output = crate::runtime::codex_command()
         .arg("--version")
@@ -95,6 +97,15 @@ fn codex_version() -> Option<String> {
     }
     let line = String::from_utf8_lossy(&output.stdout);
     codex_version_from(line.lines().next()?)
+}
+
+/// Test builds never spawn the real `codex`: a whole-suite run would otherwise
+/// execute the user's `codex --version` and leave `$HOME/.codex` behind. The UA
+/// is process-constant, so a fixed version stands in — the probe has nothing
+/// real to learn in a test anyway.
+#[cfg(test)]
+fn codex_version() -> Option<String> {
+    Some("0.0.0-test".to_string())
 }
 
 fn codex_version_from(line: &str) -> Option<String> {
