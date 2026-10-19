@@ -998,13 +998,15 @@ fn a_cut_line_does_not_widen_its_toast() {
 #[test]
 fn a_toast_ellipsis_takes_its_row_style() {
     let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::tui::app::ToastKind;
     use ratatui::style::Modifier;
 
-    // A head long enough to fill all three rows: the `…` is head-styled.
-    // A detail row's `…` is detail-styled.
+    // A head long enough to fill all three rows: the `…` sits on the third
+    // row, a continuation, so it is TEXT without bold — only displayed row 1
+    // of a toast is bold. A detail row's `…` is detail-styled.
     for (body, fg, bold) in [
-        ("y".repeat(200), crate::tui::theme::text_color(), true),
+        ("y".repeat(200), crate::tui::theme::text_color(), false),
         (
             format!("move failed\n{}", "x".repeat(200)),
             crate::tui::theme::text_dim_color(),
@@ -1107,58 +1109,245 @@ fn the_footer_never_paints_over_a_toast() {
     }
 }
 
-/// An open modal covers a live toast: in the base frame order the modal draws
-/// last, so the toast's cells under it do not show. This is the base stacking —
-/// a later toast task changes it.
+/// A toast draws over an open modal: toasts render last in the frame, so the
+/// toast's cells under the modal show through and its glass covers the modal's
+/// base background. Run once per tier with a hand-computed glass — full
+/// `Rgb(20,20,32)` (0.75·(17,17,27) + 0.25·(30,30,46)), compatible
+/// `Indexed(234)` (the same RGB snapped) — never the code under test.
 #[test]
-fn an_open_modal_covers_a_toast() {
+fn a_toast_draws_over_an_open_modal() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{Modal, Tab, ToastKind};
+    use ratatui::style::Color;
 
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![],
-    });
-    app.tab = Tab::Overview;
-    // One 3-row toast, 53 cells wide → columns 22..77, rows 2..4 at 80 wide.
-    let wide = "x".repeat(53);
-    app.toast(ToastKind::Danger, format!("head\n{wide}\ntail"));
-    // A check-output modal whose body is 30 lines, one 70 cells wide → the
-    // modal is 76 cells wide and 20 rows tall, covering the whole toast stack.
-    let mut lines: Vec<String> = vec!["m".repeat(70)];
-    lines.extend((0..29).map(|i| format!("line {i}")));
-    app.modals.push(Modal::CheckOutput(lines.join("\n")));
+    for tier in [
+        crate::tui::theme::Tier::Full,
+        crate::tui::theme::Tier::Compatible,
+    ] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let glass = match tier {
+            crate::tui::theme::Tier::Full => Color::Rgb(20, 20, 32),
+            crate::tui::theme::Tier::Compatible => Color::Indexed(234),
+        };
 
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        });
+        app.tab = Tab::Overview;
+        // One 3-row toast, 53 cells wide → columns 22..77, rows 2..4 at 80 wide.
+        let wide = "x".repeat(53);
+        app.toast(ToastKind::Danger, format!("head\n{wide}\ntail"));
+        // A check-output modal whose body is 30 lines, one 70 cells wide → the
+        // modal is 76 cells wide and 20 rows tall, covering the whole toast stack.
+        let mut lines: Vec<String> = vec!["m".repeat(70)];
+        lines.extend((0..29).map(|i| format!("line {i}")));
+        app.modals.push(Modal::CheckOutput(lines.join("\n")));
+
+        let (w, h) = (80u16, 24u16);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+
+        let bar_x = bar_column(53);
+
+        // Row 4 is inside both the modal and the toast's tail row; the toast
+        // draws last, so its bar, detail and glass win the cell over the modal.
+        assert_eq!(
+            buf[(bar_x, 4)].symbol(),
+            "┃",
+            "[{tier:?}] the toast bar draws over the modal body"
+        );
+        assert_eq!(
+            buf[(bar_x + 2, 4)].symbol(),
+            "t",
+            "[{tier:?}] the toast detail draws over the modal body"
+        );
+        assert_eq!(
+            buf[(bar_x, 4)].style().bg,
+            Some(glass),
+            "[{tier:?}] the toast's glass covers the modal's base background"
+        );
+    }
+}
+
+/// Render a two-row `head\ndetail` toast over a manually-painted beneath: the
+/// toast's first row (row 2) sits on `BG_HOVER`, its second row stays
+/// unpainted. Returns the bar column and the buffer.
+fn glass_buffer(app: &App, w: u16, h: u16) -> (u16, ratatui::buffer::Buffer) {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| {
+        // The toast anchors top-right; its first row is row 2. Paint that row
+        // BG_HOVER so the first toast row's beneath is a selected-row tint, and
+        // leave row 3 unpainted.
+        let buf = f.buffer_mut();
+        for x in 0..w {
+            if let Some(cell) = buf.cell_mut((x, 2)) {
+                cell.set_bg(crate::tui::theme::bg_hover());
+            }
+        }
+        super::toasts::draw(f, f.area(), app);
+    })
+    .unwrap();
+    let buf = term.backend().buffer().clone();
+    let bar_x = (0..w)
+        .find(|&x| buf[(x, 2)].symbol() == "┃")
+        .expect("a toast bar on row 2");
+    (bar_x, buf)
+}
+
+#[test]
+fn the_compatible_tier_glass_blends_and_snaps_to_the_nearest_xterm_index() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    use crate::tui::app::ToastKind;
+    use ratatui::style::Color;
+
+    let app = toast_app(ToastKind::Danger, "head\ndetail".to_string());
+    let (bar_x, buf) = glass_buffer(&app, 30, 8);
+    // Widest row "detail" = 6 cells, +3 chrome → the toast is 9 cells wide.
+    for x in bar_x..bar_x + 9 {
+        // BG_HOVER beneath: 0.75·(17,17,27) + 0.25·(40,40,56) = (23,23,34) → 234.
+        assert_eq!(
+            buf[(x, 2)].style().bg,
+            Some(Color::Indexed(234)),
+            "glass over a painted BG_HOVER cell at {x}"
+        );
+        // On the compatible tier an unpainted beneath counts as BG:
+        // 0.75·(17,17,27) + 0.25·(30,30,46) = (20,20,32) → 234.
+        assert_eq!(
+            buf[(x, 3)].style().bg,
+            Some(Color::Indexed(234)),
+            "glass over an unpainted cell at {x}"
+        );
+    }
+    // Two beneaths whose glass snaps away from 234, so a blend ignoring the
+    // beneath would survive the checks above: a focused modal button
+    // (text_color 189 → glass (64,66,81) → 238) and a focused border
+    // (line_strong 240 → glass (30,31,43) → 235).
+    let (w, h) = (30u16, 8u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| {
+        let buf = f.buffer_mut();
+        for x in 0..w {
+            if let Some(cell) = buf.cell_mut((x, 2)) {
+                cell.set_bg(crate::tui::theme::text_color());
+            }
+            if let Some(cell) = buf.cell_mut((x, 3)) {
+                cell.set_bg(crate::tui::theme::line_strong_color());
+            }
+        }
+        super::toasts::draw(f, f.area(), &app);
+    })
+    .unwrap();
+    let buf = term.backend().buffer();
+    for x in bar_x..bar_x + 9 {
+        assert_eq!(
+            buf[(x, 2)].style().bg,
+            Some(Color::Indexed(238)),
+            "glass over a focused-button cell at {x}"
+        );
+        assert_eq!(
+            buf[(x, 3)].style().bg,
+            Some(Color::Indexed(235)),
+            "glass over a focused-border cell at {x}"
+        );
+    }
+}
+
+#[test]
+fn the_full_tier_keeps_the_rgb_glass_blend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    use crate::tui::app::ToastKind;
+    use ratatui::style::Color;
+
+    let app = toast_app(ToastKind::Danger, "head\ndetail".to_string());
+    let (bar_x, buf) = glass_buffer(&app, 30, 8);
+    for x in bar_x..bar_x + 9 {
+        assert_eq!(
+            buf[(x, 2)].style().bg,
+            Some(Color::Rgb(23, 23, 34)),
+            "glass over a painted BG_HOVER cell at {x}"
+        );
+        // A non-RGB beneath does not blend on the full tier: `over` survives.
+        assert_eq!(
+            buf[(x, 3)].style().bg,
+            Some(Color::Rgb(17, 17, 27)),
+            "flat bg_sunken over an unpainted cell at {x}"
+        );
+    }
+}
+
+#[test]
+fn every_toast_cell_keeps_the_glass_and_never_flat_bg_sunken() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    use crate::tui::app::ToastKind;
+    use ratatui::style::Color;
+
+    // Both rows sit on a painted selected row, so every cell — bar, text and
+    // pad — carries the cell-level glass blend. This pins the glass, not the
+    // spans: the glass pass overwrites every cell's bg after the spans, so a
+    // span bg is invisible here — that contract is pinned at span level in
+    // tui_render_toasts.rs.
+    let app = toast_app(ToastKind::Danger, "head\ndetail".to_string());
+    let (w, h) = (30u16, 8u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| {
+        let buf = f.buffer_mut();
+        for x in 0..w {
+            for y in 2..4 {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(crate::tui::theme::bg_hover());
+                }
+            }
+        }
+        super::toasts::draw(f, f.area(), &app);
+    })
+    .unwrap();
+    let buf = term.backend().buffer().clone();
+    let bar_x = (0..w)
+        .find(|&x| buf[(x, 2)].symbol() == "┃")
+        .expect("a toast bar on row 2");
+    for y in 2..4 {
+        for x in bar_x..bar_x + 9 {
+            assert_eq!(
+                buf[(x, y)].style().bg,
+                Some(Color::Rgb(23, 23, 34)),
+                "toast cell ({x},{y}) keeps the glass"
+            );
+        }
+    }
+}
+
+#[test]
+fn only_the_first_displayed_row_of_a_toast_is_bold() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    use crate::tui::app::ToastKind;
+    use ratatui::style::Modifier;
+
+    // A title wrapping onto a second row: the continuation stays TEXT without
+    // bold, the detail dims.
+    let app = toast_app(ToastKind::Danger, format!("{}\ndetail", "y".repeat(60)));
     let (w, h) = (80u16, 24u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
     let buf = term.backend().buffer();
 
-    let bar_x = bar_column(53);
-    let glass = crate::tui::theme::blend_over(
-        crate::tui::theme::bg(),
-        crate::tui::theme::bg_sunken(),
-        0.75,
+    // Budget 57: "y"*60 wraps as "y"*57 + "yyy", then the detail row.
+    let bar_x = bar_column(57);
+    let bold = |x: u16, y: u16| buf[(x, y)].modifier.contains(Modifier::BOLD);
+    assert!(bold(bar_x + 2, 2), "displayed row 1 is bold");
+    assert_eq!(buf[(bar_x + 2, 2)].fg, crate::tui::theme::text_color());
+    assert!(
+        !bold(bar_x + 2, 3),
+        "the title continuation is TEXT, not bold"
     );
-
-    // Row 4 is inside both the modal (its first body line) and the toast's tail
-    // row; the modal draws last, so its body wins the cell — the toast's bar
-    // and glass never show through.
-    assert_eq!(
-        buf[(bar_x, 4)].symbol(),
-        "m",
-        "the modal's body covers the toast bar"
-    );
-    assert_eq!(
-        buf[(bar_x + 2, 4)].symbol(),
-        "m",
-        "the modal's body covers the toast detail"
-    );
-    assert_ne!(
-        buf[(bar_x, 4)].style().bg,
-        Some(glass),
-        "the modal's base background covers the toast's glass"
-    );
+    assert_eq!(buf[(bar_x + 2, 3)].fg, crate::tui::theme::text_color());
+    assert!(!bold(bar_x + 2, 4), "the detail row is dim, not bold");
+    assert_eq!(buf[(bar_x + 2, 4)].fg, crate::tui::theme::text_dim_color());
 }
 
 /// An in-flight OAuth login at the waiting stage with its paste door open, plus

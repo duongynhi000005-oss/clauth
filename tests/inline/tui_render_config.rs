@@ -550,7 +550,18 @@ fn setup_status_row_renders_only_while_disabled() {
             profiles: Vec::new(),
         });
         term.draw(|f| {
-            draw_settings_rows(f, f.area(), &app, &[], 0, &snap, false);
+            draw_settings_rows(
+                f,
+                f.area(),
+                &app,
+                &[],
+                0,
+                &snap,
+                SettingsRowsTail {
+                    actions_focused: false,
+                    toast_rects: &[],
+                },
+            );
         })
         .unwrap();
         crate::testutil::buffer_rows(term.backend().buffer())
@@ -603,8 +614,21 @@ fn email_header(
         profiles: Vec::new(),
     });
     let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
-    term.draw(|f| draw_settings_rows(f, f.area(), &app, &[], 0, &snap, false))
-        .unwrap();
+    term.draw(|f| {
+        draw_settings_rows(
+            f,
+            f.area(),
+            &app,
+            &[],
+            0,
+            &snap,
+            SettingsRowsTail {
+                actions_focused: false,
+                toast_rects: &[],
+            },
+        )
+    })
+    .unwrap();
     let buf = term.backend().buffer().clone();
     (crate::testutil::buffer_rows(&buf), buf)
 }
@@ -1363,8 +1387,21 @@ fn stalled_rolling_fix_line_uses_the_title_that_survives_a_draft() {
         state: AppState::default(),
         profiles: Vec::new(),
     });
-    term.draw(|f| draw_settings_rows(f, f.area(), &app, &[], 0, &snap, false))
-        .unwrap();
+    term.draw(|f| {
+        draw_settings_rows(
+            f,
+            f.area(),
+            &app,
+            &[],
+            0,
+            &snap,
+            SettingsRowsTail {
+                actions_focused: false,
+                toast_rects: &[],
+            },
+        )
+    })
+    .unwrap();
     let joined = crate::testutil::buffer_rows(term.backend().buffer())
         .join(" ")
         .split_whitespace()
@@ -2095,4 +2132,66 @@ fn the_alert_editor_caret_stays_inside_the_field_on_a_narrow_pane() {
             "[{w}] the unit trails the caret"
         );
     }
+}
+
+/// A Setup form field's caret that lands inside a drawn toast hides the native
+/// cursor this frame, and it hides under an open modal too. Three stacked
+/// DANGER toasts cover the `base url` field's caret column at 45x14.
+#[test]
+fn a_toast_over_a_setup_field_caret_hides_the_native_cursor() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::tui::app::{LossWarningDrop, LossWarningState, Modal, Tab, ToastKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+
+    let mut draft = crate::tui::app::build_draft_new();
+    draft.base_url = InputState::new("https://api.example.com");
+    draft.active = Some(ConfigRow::BaseUrl);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::BaseUrl)
+        .expect("the new-account form lists base url");
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "the setup caret shows with no toasts"
+    );
+
+    let wide = "x".repeat(53);
+    for name in ["one", "two", "three"] {
+        app.toast(ToastKind::Danger, format!("{name}\n{wide}\n{name} tail"));
+    }
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "[45x14] the setup caret hides under a toast"
+    );
+
+    // While a modal is open the whole frame is the blocker, so the body caret
+    // must hide too instead of blinking on the modal; the blocker ignores
+    // which modal is open.
+    app.toasts.clear();
+    app.open_modal(Modal::LossWarning(LossWarningState {
+        choice: false,
+        target: Tab::Fallback,
+        drop: LossWarningDrop::NewAccountDraft { require: false },
+    }));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "the setup caret hides under an open modal"
+    );
 }

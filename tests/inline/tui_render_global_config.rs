@@ -1241,6 +1241,71 @@ fn refresh_app(draft: Option<&str>) -> crate::tui::app::App {
     app
 }
 
+/// A body text editor's caret that lands inside a drawn toast hides the native
+/// cursor this frame (it would blink through the toast's glass); clear of the
+/// stack, the caret shows on its cell. It also hides under an open modal. The
+/// Config tab's `refresh` custom field ("45") sits at a fixed column, so three
+/// stacked DANGER toasts cover it at every probe size.
+#[test]
+fn a_toast_over_a_body_editor_caret_hides_the_native_cursor() {
+    use crate::tui::app::{Modal, ToastKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+
+    let mut app = refresh_app(Some("45"));
+
+    // Baseline: no toasts → the caret shows on the field.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "the refresh caret shows with no toasts"
+    );
+    let baseline = term.backend().cursor_position();
+
+    let wide = "x".repeat(53);
+    for name in ["one", "two", "three"] {
+        app.toast(ToastKind::Danger, format!("{name}\n{wide}\n{name} tail"));
+    }
+
+    // The caret sits under the stack at every probe size → no native cursor.
+    for (w, h) in [(45u16, 14u16), (60u16, 12u16), (80u16, 24u16)] {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+        assert!(
+            !term.backend().cursor_visible(),
+            "[{w}x{h}] the body caret hides under a toast"
+        );
+    }
+
+    // A single short toast anchored top-right stays clear of the caret: it
+    // still lands on the field cell.
+    let mut clear = refresh_app(Some("45"));
+    clear.toast(ToastKind::Danger, "boom");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &clear)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "the caret shows clear of a short toast"
+    );
+    assert_eq!(
+        term.backend().cursor_position(),
+        baseline,
+        "the caret stays on the field cell"
+    );
+
+    // While a modal is open the whole frame is the blocker, so the body caret
+    // must hide too instead of blinking on the modal.
+    app.toasts.clear();
+    app.open_modal(Modal::Help);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "the refresh caret hides under an open modal"
+    );
+}
+
 /// S10: a refresh buffer wider than its field scrolls inside the row: End
 /// keeps the caret inside the pane right after the last digit, one ← moves it
 /// one cell and leaves the row alone, Home shows the first digit again.

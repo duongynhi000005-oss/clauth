@@ -1,7 +1,7 @@
 //! Modal dialogs — stacking layer above the screen.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::Style;
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
@@ -24,7 +24,8 @@ use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
     DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, META_RULE_MIN, bold_when,
     draw_scrollbar, draw_scrolled_lines, field_window, follow_scroll_offset,
-    follow_scroll_offset_tail, head_cols, key_cell, meta_line, right_meta_fits, title_label,
+    follow_scroll_offset_tail, head_cols, key_cell, meta_line, place_caret, right_meta_fits,
+    title_label,
 };
 use super::prose::{self, cmd_lit, key_lit};
 use crate::fallback::BlockedReason;
@@ -40,15 +41,21 @@ fn stamp(area: Rect, app: &App) -> ScrollStamp {
     }
 }
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) {
+pub(super) fn draw(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    modal: &Modal,
+    toast_rects: &[Rect],
+) {
     match modal {
         Modal::Confirm(state) => {
             draw_confirm(frame, area, state);
             state.scroll.stamp.set(stamp(area, app));
         }
         Modal::Divergence(form) => draw_divergence(frame, area, form),
-        Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input),
-        Modal::NamePrompt(form) => draw_name_prompt(frame, area, form),
+        Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input, toast_rects),
+        Modal::NamePrompt(form) => draw_name_prompt(frame, area, form, toast_rects),
         Modal::PresetPicker(form) => draw_preset_picker(frame, area, form),
         Modal::PresetApply(form) => {
             draw_preset_apply(frame, area, form);
@@ -70,7 +77,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
                 form.max_scroll_stamp.set(stamp(area, app));
             }
         }
-        Modal::Login => draw_login_progress(frame, area, app),
+        Modal::Login => draw_login_progress(frame, area, app, toast_rects),
         Modal::CodexLogin => draw_codex_login_progress(frame, area, app),
         Modal::CheckOutput(body) => {
             draw_check_output(frame, area, body, app);
@@ -90,7 +97,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
 /// wrapped ~440-char authorize URL isn't clickable and clips in compact mode,
 /// and `c` hands it over whole. Once a door delivered a code the stage line is
 /// the whole story, whichever door it was.
-fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect]) {
     let Some(session) = app.login.as_ref() else {
         return; // login ended this frame; the modal pops on the next drain
     };
@@ -154,7 +161,18 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         lines.pop();
     }
-    draw_modal_scrolled(frame, area, "LOGIN", lines, 0, None, field);
+    draw_modal_scrolled(
+        frame,
+        area,
+        "LOGIN",
+        lines,
+        0,
+        None,
+        ModalTail {
+            extra: field,
+            toast_rects,
+        },
+    );
 }
 
 /// The login modal's code field label.
@@ -205,7 +223,18 @@ fn draw_codex_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("  copy link", theme::dim()),
         ]),
     ];
-    draw_modal_scrolled(frame, area, "LOGIN", lines, 0, None, None);
+    draw_modal_scrolled(
+        frame,
+        area,
+        "LOGIN",
+        lines,
+        0,
+        None,
+        ModalTail {
+            extra: None,
+            toast_rects: &[],
+        },
+    );
 }
 
 /// The modal width cap: 60% of the terminal width (integer floor) from 80
@@ -253,7 +282,10 @@ fn draw_modal_focused(
         lines,
         0,
         Some((focus, follow.saved, FocusEnd::Head)),
-        None,
+        ModalTail {
+            extra: None,
+            toast_rects: &[],
+        },
     );
     follow.viewport.set(d.viewport as usize);
     if let Some(g) = follow.geometry {
@@ -344,6 +376,14 @@ enum FocusEnd {
     Tail,
 }
 
+/// The trailing inputs [`draw_modal_scrolled`] takes past the argument-count
+/// lint: the optional field/buttons extra, and the toast rects a field caret
+/// must not land under.
+struct ModalTail<'a> {
+    extra: Option<ModalExtra<'a>>,
+    toast_rects: &'a [Rect],
+}
+
 fn draw_modal_scrolled(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -351,14 +391,14 @@ fn draw_modal_scrolled(
     lines: Vec<Line<'_>>,
     scroll: u16,
     focus: Option<(std::ops::Range<usize>, &std::cell::Cell<usize>, FocusEnd)>,
-    extra: Option<ModalExtra<'_>>,
+    tail: ModalTail<'_>,
 ) -> ModalDraw {
     let content_w = lines
         .iter()
         .map(|line| normalize_tabs(line).width())
         .max()
         .unwrap_or(0) as u16;
-    let button_w = match &extra {
+    let button_w = match &tail.extra {
         Some(ModalExtra::Buttons(buttons)) => buttons.width() as u16,
         _ => 0,
     };
@@ -372,7 +412,7 @@ fn draw_modal_scrolled(
     let mut line_starts: Vec<usize> = Vec::with_capacity(line_count);
     let mut rows: Vec<Line<'static>> = Vec::new();
     for (i, mut line) in lines.into_iter().enumerate() {
-        if let Some(ModalExtra::Field { at, label, input }) = &extra
+        if let Some(ModalExtra::Field { at, label, input }) = &tail.extra
             && *at == i
         {
             let lead = labelled_lead_w(label);
@@ -404,7 +444,7 @@ fn draw_modal_scrolled(
     // A too-narrow choice (3 spans) stacks into two rows; a narrower one-span
     // line (an `Acknowledge` confirm's ` ok `) renders as one row — reserve
     // only what the branch below actually draws.
-    let button_rows = match &extra {
+    let button_rows = match &tail.extra {
         Some(ModalExtra::Buttons(buttons))
             if buttons.width() > inner_w && buttons.spans.len() >= 3 =>
         {
@@ -446,7 +486,7 @@ fn draw_modal_scrolled(
         ..inner
     };
     draw_scrolled_lines(frame, body, lines, (scroll, scroll + viewport), None);
-    if let Some(ModalExtra::Buttons(buttons)) = &extra {
+    if let Some(ModalExtra::Buttons(buttons)) = &tail.extra {
         let button_area = Rect {
             y: inner.y + inner.height.saturating_sub(button_rows.saturating_sub(1)),
             height: button_rows.saturating_sub(1),
@@ -485,10 +525,14 @@ fn draw_modal_scrolled(
     if let Some((row, cell)) = caret_row
         && (scroll..scroll + viewport).contains(&row)
     {
-        frame.set_cursor_position((
+        let caret = (
             inner.x.saturating_add(cell as u16),
             inner.y.saturating_add((row - scroll) as u16),
-        ));
+        );
+        // A toast drawn over the caret hides it this frame (the shared placer
+        // every editor routes through): the rects were laid out before this
+        // modal drew, so the check sees the final stack.
+        place_caret(frame, tail.toast_rects, Position::new(caret.0, caret.1));
     }
     ModalDraw {
         max_scroll,
@@ -832,7 +876,10 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         lines,
         state.scroll.offset,
         None,
-        Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+        ModalTail {
+            extra: Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+            toast_rects: &[],
+        },
     );
     state.scroll.max_scroll.set(d.max_scroll);
     state.scroll.viewport.set(d.viewport);
@@ -861,7 +908,10 @@ fn draw_loss_warning(frame: &mut Frame<'_>, area: Rect, state: &LossWarningState
         lines,
         0,
         None,
-        Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+        ModalTail {
+            extra: Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+            toast_rects: &[],
+        },
     );
 }
 
@@ -966,7 +1016,10 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
         lines,
         0,
         focus,
-        Some(ModalExtra::Buttons(buttons)),
+        ModalTail {
+            extra: Some(ModalExtra::Buttons(buttons)),
+            toast_rects: &[],
+        },
     );
     form.viewport.set(d.viewport as usize);
     form.total.set(d.total);
@@ -1048,7 +1101,10 @@ fn draw_preset_apply(frame: &mut Frame<'_>, area: Rect, form: &PresetApplyForm) 
         lines,
         form.scroll.offset,
         None,
-        Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+        ModalTail {
+            extra: Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+            toast_rects: &[],
+        },
     );
     form.scroll.max_scroll.set(d.max_scroll);
     form.scroll.viewport.set(d.viewport);
@@ -1264,10 +1320,13 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
             lines,
             form.scroll.get().min(u16::MAX as usize) as u16,
             None,
-            Some(ModalExtra::Buttons(
-                choice_buttons(form.confirm_overwrite, "cancel", true, "add")
-                    .alignment(Alignment::Right),
-            )),
+            ModalTail {
+                extra: Some(ModalExtra::Buttons(
+                    choice_buttons(form.confirm_overwrite, "cancel", true, "add")
+                        .alignment(Alignment::Right),
+                )),
+                toast_rects: &[],
+            },
         );
         form.max_scroll.set(d.max_scroll);
         form.viewport.set(d.viewport as usize);
@@ -1360,24 +1419,31 @@ fn env_collision_option_text(
     }
 }
 
-fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState) {
+fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState, toast_rects: &[Rect]) {
     draw_name_field(
         frame,
         area,
         "CAPTURE",
         "stores the live ~/.claude/.credentials.json under this account.",
         input,
+        toast_rects,
     );
 }
 
 /// The Setup menu's shared name prompt, the capture prompt's shape.
-fn draw_name_prompt(frame: &mut Frame<'_>, area: Rect, form: &NamePromptForm) {
+fn draw_name_prompt(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    form: &NamePromptForm,
+    toast_rects: &[Rect],
+) {
     draw_name_field(
         frame,
         area,
         form.action.title(),
         &form.action.blurb(),
         &form.input,
+        toast_rects,
     );
 }
 
@@ -1390,6 +1456,7 @@ fn draw_name_field(
     title: &str,
     blurb: &str,
     input: &InputState,
+    toast_rects: &[Rect],
 ) {
     let lines = vec![
         Line::from(Span::styled(blurb.to_string(), theme::dim())),
@@ -1401,7 +1468,18 @@ fn draw_name_field(
         label: "name",
         input,
     };
-    draw_modal_scrolled(frame, area, title, lines, 0, None, Some(field));
+    draw_modal_scrolled(
+        frame,
+        area,
+        title,
+        lines,
+        0,
+        None,
+        ModalTail {
+            extra: Some(field),
+            toast_rects,
+        },
+    );
 }
 
 /// `apply preset` picker. Built-ins lead the list and carry a dim `built-in`
@@ -1706,7 +1784,10 @@ fn draw_check_output(frame: &mut Frame<'_>, area: Rect, body: &str, app: &App) {
         lines,
         app.check_output_scroll,
         None,
-        None,
+        ModalTail {
+            extra: None,
+            toast_rects: &[],
+        },
     );
     app.check_output_max_scroll.set(d.max_scroll);
     app.check_output_viewport.set(d.viewport);
@@ -1791,7 +1872,18 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // terminal too short for the whole modal. ↑↓ reaches the legend from there.
     lines.extend(glyph_section("glyphs", glyph_rows()));
     lines.pop(); // trim trailing blank from last section
-    let d = draw_modal_scrolled(frame, area, title, lines, app.help_scroll, None, None);
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        title,
+        lines,
+        app.help_scroll,
+        None,
+        ModalTail {
+            extra: None,
+            toast_rects: &[],
+        },
+    );
     app.help_max_scroll.set(d.max_scroll);
     app.help_viewport.set(d.viewport);
 }

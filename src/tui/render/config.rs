@@ -5,7 +5,7 @@
 //! pane into a create form. No popups.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
@@ -22,18 +22,24 @@ use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, MIN_VALUE_W, bold_when, cycle_row_lines,
     draw_following_list, draw_scrolled_lines, head_cols, help_tooltip_lines, highlight_row,
     invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, picker_row, pill,
-    section_box, section_box_verbatim, value_caret,
+    place_caret, section_box, section_box_verbatim, value_caret,
 };
 use super::prose::{cmd, cmd_lit, key_lit, spans as prose_spans};
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
+pub(super) fn draw(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    readings: &ReadingsSnapshot,
+    toast_rects: &[Rect],
+) {
     // +1 for the trailing `+ new` picker row.
     let items = app.setup_items().len() + 1;
     let (selector, settings) = master_detail(area, items);
 
     let profiles_focused = app.config_focus == ConfigFocus::Profiles;
     draw_selector(frame, selector, app, profiles_focused);
-    draw_settings(frame, settings, app, readings);
+    draw_settings(frame, settings, app, readings, toast_rects);
 }
 
 fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
@@ -454,7 +460,13 @@ fn login_email(
     (email.account == anchor).then(|| escape_control(&email.address))
 }
 
-fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
+fn draw_settings(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    readings: &ReadingsSnapshot,
+    toast_rects: &[Rect],
+) {
     // The codex and pool detail panes render their own rows and actions.
     match app.setup_selection() {
         SetupSelection::Item(MainItemKind::Codex(_)) => {
@@ -487,7 +499,18 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Readin
     let rows = config_rows(app);
     let cursor = app.config_action_cursor.min(rows.len().saturating_sub(1));
 
-    draw_settings_rows(frame, inner, app, &rows, cursor, &snap, actions_focused);
+    draw_settings_rows(
+        frame,
+        inner,
+        app,
+        &rows,
+        cursor,
+        &snap,
+        SettingsRowsTail {
+            actions_focused,
+            toast_rects,
+        },
+    );
 }
 
 /// The codex detail pane: `type`/`plan` (and `login  [ needs re-login ]` only
@@ -836,6 +859,14 @@ fn session_token_lines(
     }
 }
 
+/// The trailing inputs [`draw_settings_rows`] takes past the argument-count
+/// lint: whether the action rows hold focus, and the toast rects a field caret
+/// avoids.
+struct SettingsRowsTail<'a> {
+    actions_focused: bool,
+    toast_rects: &'a [Rect],
+}
+
 fn draw_settings_rows(
     frame: &mut Frame<'_>,
     inner: Rect,
@@ -843,8 +874,12 @@ fn draw_settings_rows(
     rows: &[ConfigRow],
     cursor: usize,
     snap: &Snap,
-    actions_focused: bool,
+    tail: SettingsRowsTail<'_>,
 ) {
+    let SettingsRowsTail {
+        actions_focused,
+        toast_rects,
+    } = tail;
     let draft = app.config_draft.as_ref();
     let editing = draft.and_then(|d| d.active);
     let armed_action = draft.and_then(|d| d.armed_action);
@@ -1006,7 +1041,7 @@ fn draw_settings_rows(
     {
         let cx = inner.x.saturating_add((lead + head_cols(&input)) as u16);
         let cy = inner.y.saturating_add(visible as u16);
-        frame.set_cursor_position((cx, cy));
+        place_caret(frame, toast_rects, Position::new(cx, cy));
     }
 }
 

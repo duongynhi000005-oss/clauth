@@ -14,7 +14,7 @@
 //! confirms. No popups.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use std::collections::HashSet;
 
@@ -32,7 +32,8 @@ use super::panes::{
     DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when, cycle_row_lines,
     draw_scrolled_lines_with_footnote, draw_selector_list, head_cols, help_tooltip_lines,
     highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill,
-    rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret, wrap_words,
+    place_caret, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
+    wrap_words,
 };
 use super::prose::{cmd, key};
 use crate::fallback::{
@@ -47,7 +48,13 @@ use chrono::Weekday;
 /// Wide enough to read a threshold tick.
 const GAUGE_W: usize = 22;
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
+pub(super) fn draw(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    readings: &ReadingsSnapshot,
+    toast_rects: &[Rect],
+) {
     let (selector, detail) = master_detail(area, chain_items(app).len());
     // The live key-rejected set, read once per frame (never per candidate)
     // before either pane locks the config guard.
@@ -55,7 +62,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
 
     let chain_focused = app.fallback_focus == FallbackFocus::Chain;
     draw_chain_selector(frame, selector, app, chain_focused, &key_rejected, readings);
-    draw_chain_detail(frame, detail, app, &key_rejected, readings);
+    draw_chain_detail(frame, detail, app, &key_rejected, readings, toast_rects);
 }
 
 fn draw_chain_selector(
@@ -186,6 +193,7 @@ fn draw_chain_detail(
     app: &App,
     key_rejected: &HashSet<crate::profile::ProfileName>,
     readings: &ReadingsSnapshot,
+    toast_rects: &[Rect],
 ) {
     let detail_focused = app.fallback_focus == FallbackFocus::Detail;
     let inner_w = section_box("", detail_focused, false, area.width)
@@ -426,7 +434,7 @@ fn draw_chain_detail(
             typed_value_col(inner.width as usize, unit) + unit_cols + head_cols(draft);
         let cx = inner.x.saturating_add(prefix_cols as u16);
         let cy = inner.y.saturating_add((at - scroll) as u16);
-        frame.set_cursor_position((cx, cy));
+        place_caret(frame, toast_rects, Position::new(cx, cy));
     }
 }
 

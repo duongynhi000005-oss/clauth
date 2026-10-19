@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -19,8 +19,8 @@ use super::format::{
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
     cells_window, draw_profile_selector, draw_scrollbar, edit_slot_block, empty_state,
-    follow_window, grapheme_cells_before, key_cell, master_detail, pill, rail_hint_lines,
-    scroll_offset, section_box, section_box_verbatim, wrap_words,
+    follow_window, grapheme_cells_before, key_cell, master_detail, pill, place_caret,
+    rail_hint_lines, scroll_offset, section_box, section_box_verbatim, wrap_words,
 };
 use super::prose::{self, cmd, cmd_lit, key_lit};
 use crate::format::{account_tier, format_pct};
@@ -95,7 +95,13 @@ struct HeaderState {
     queue_slot: Option<QueueSlot>,
 }
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
+pub(super) fn draw(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    readings: &ReadingsSnapshot,
+    toast_rects: &[Rect],
+) {
     let items = app.config().profiles.len();
     let (selector, detail) = master_detail(area, items);
 
@@ -106,7 +112,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
         app.profile_cursor,
         app.usage_detail_focus == StatusFocus::List,
     );
-    draw_usage_detail(frame, detail, app, readings);
+    draw_usage_detail(frame, detail, app, readings, toast_rects);
 }
 
 /// Which reading source the shown profile's stuck judgment took — the one that
@@ -142,7 +148,13 @@ fn effective_rate_limit(
     }
 }
 
-fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
+fn draw_usage_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    readings: &ReadingsSnapshot,
+    toast_rects: &[Rect],
+) {
     // Streak snapshot up front: POLL_STREAK (220) ranks below CONFIG
     // (400), so it can't be taken while `cfg` is held below.
     let streaks: HashMap<String, StreakCounts> = app
@@ -330,7 +342,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Re
     frame.render_widget(paragraph.style(theme::base()), content_area);
     draw_scrollbar(frame, content_area, total, scroll, viewport);
     if let Some(editor) = slot {
-        draw_note_slot(frame, slot_area.unwrap_or(inner), &editor.buf);
+        draw_note_slot(frame, slot_area.unwrap_or(inner), &editor.buf, toast_rects);
     }
 }
 
@@ -2005,7 +2017,7 @@ const NOTE_SLOT_MAX_ROWS: usize = 8;
 /// cursor-first once it passes [`NOTE_SLOT_MAX_ROWS`]. The caret is measured
 /// in display cells; a line wider than the slot scrolls the draft sideways
 /// with the caret ([`follow_window`]), every row through the same window.
-fn draw_note_slot(frame: &mut Frame<'_>, area: Rect, buf: &NoteBuffer) {
+fn draw_note_slot(frame: &mut Frame<'_>, area: Rect, buf: &NoteBuffer, toast_rects: &[Rect]) {
     let block = edit_slot_block();
     let slot_inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2045,10 +2057,11 @@ fn draw_note_slot(frame: &mut Frame<'_>, area: Rect, buf: &NoteBuffer) {
     let x = slot_inner.x + (ccol as u16).min(slot_inner.width.saturating_sub(1));
     let vis_row = crow.checked_sub(offset).unwrap_or(usize::MAX);
     if vis_row < slot_inner.height as usize {
-        frame.set_cursor_position(ratatui::layout::Position {
-            x,
-            y: slot_inner.y + vis_row as u16,
-        });
+        place_caret(
+            frame,
+            toast_rects,
+            Position::new(x, slot_inner.y + vis_row as u16),
+        );
     }
 }
 

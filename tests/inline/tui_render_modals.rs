@@ -2005,7 +2005,7 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
         .last()
         .expect("overwrite needs a second confirmation");
     narrow
-        .draw(|f| super::draw(f, f.area(), &app, confirm))
+        .draw(|f| super::draw(f, f.area(), &app, confirm, &[]))
         .unwrap();
     let rows = crate::testutil::buffer_rows(narrow.backend().buffer());
     let buttons: Vec<_> = rows
@@ -2028,14 +2028,14 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
     press(&mut app, ratatui::crossterm::event::KeyCode::Enter);
     let confirm = app.modals.last().unwrap();
     narrow
-        .draw(|f| super::draw(f, f.area(), &app, confirm))
+        .draw(|f| super::draw(f, f.area(), &app, confirm, &[]))
         .unwrap();
     for _ in 0..20 {
         press(&mut app, ratatui::crossterm::event::KeyCode::Down);
     }
     let confirm = app.modals.last().unwrap();
     narrow
-        .draw(|f| super::draw(f, f.area(), &app, confirm))
+        .draw(|f| super::draw(f, f.area(), &app, confirm, &[]))
         .unwrap();
     let rows = crate::testutil::buffer_rows(narrow.backend().buffer());
     assert!(
@@ -2991,7 +2991,7 @@ fn the_loss_warning_renders_its_title_body_and_buttons() {
             drop,
         });
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| draw(f, f.area(), &app, &modal)).unwrap();
+        term.draw(|f| draw(f, f.area(), &app, &modal, &[])).unwrap();
         let rows = crate::testutil::buffer_rows(term.backend().buffer());
         let box_rows: Vec<&str> = rows
             .iter()
@@ -3031,7 +3031,7 @@ fn the_new_account_draft_warning_renders_its_body() {
         drop: LossWarningDrop::NewAccountDraft { require: false },
     });
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-    term.draw(|f| draw(f, f.area(), &app, &modal)).unwrap();
+    term.draw(|f| draw(f, f.area(), &app, &modal, &[])).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let box_rows: Vec<&str> = rows
         .iter()
@@ -3919,6 +3919,68 @@ fn the_modal_field_keeps_its_caret_on_the_input_across_typed_overflow() {
             "[{w}] the caret sits on an input cell"
         );
     }
+}
+
+/// A modal text field whose caret lands inside a drawn toast hides the native
+/// cursor this frame (it would blink through the toast's glass); clear of the
+/// stack, the caret shows as before.
+#[test]
+fn a_toast_over_the_modal_caret_hides_the_native_cursor() {
+    use crate::actions::{AnchorAction, CaptureSnapshot};
+    use crate::tui::app::{CaptureNameForm, InputState, Modal, ToastKind};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+
+    let mut app = empty_app(Tab::Overview);
+    app.modals.push(Modal::CaptureName(CaptureNameForm {
+        snapshot: Box::new(CaptureSnapshot {
+            credentials: None,
+            base_url: Some("https://new.example.com".to_string()),
+            api_key: Some("new-key".to_string()),
+            anchor: AnchorAction::Unproven,
+        }),
+        input: InputState::new("a name typed into the field"),
+        from_divergence: false,
+    }));
+
+    // At 80x24 the caret is clear of the stack: it lands on the same cell it
+    // lands on with no toasts.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "the field caret shows with no toasts"
+    );
+    let baseline = term.backend().cursor_position();
+
+    let wide = "x".repeat(53);
+    for name in ["one", "two", "three"] {
+        app.toast(ToastKind::Danger, format!("{name}\n{wide}\n{name} tail"));
+    }
+
+    // The capture modal's name caret sits under the toast stack on these two
+    // sizes, so no native cursor is placed.
+    for (w, h) in [(45u16, 14u16), (60u16, 12u16)] {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+        assert!(
+            !term.backend().cursor_visible(),
+            "[{w}x{h}] the caret hides under a toast"
+        );
+    }
+
+    // At 80x24 the caret is clear of the stack and stays on the field cell.
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "the caret shows clear of the toast"
+    );
+    assert_eq!(
+        term.backend().cursor_position(),
+        baseline,
+        "the caret stays on the field cell"
+    );
 }
 
 /// a confirm whose word-wrapped body outgrows a 14-row terminal still

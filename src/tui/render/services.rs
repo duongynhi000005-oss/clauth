@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
@@ -43,8 +43,8 @@ use super::panes::{
     MIN_VALUE_W, bold_when, chunk_graphemes, cycle_row_lines, draw_following_list, draw_scrollbar,
     draw_scrolled_lines, draw_scrolled_lines_with_footnote, empty_state, empty_state_lines,
     footnote_lines, footnote_split, head_cols, help_tooltip_lines, help_tooltip_lines_at,
-    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, section_box,
-    select_line, value_caret, wrap_words,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, place_caret,
+    section_box, select_line, value_caret, wrap_words,
 };
 use super::prose;
 use crate::gateway_edit::{
@@ -55,10 +55,10 @@ use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
 use crate::profile::{HerdrSettings, PopupWidth};
 use crate::usage::humanize_duration;
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect]) {
     let (selector, detail) = master_detail(area, app.services.row_count());
     draw_selector(frame, selector, app);
-    draw_detail(frame, detail, app);
+    draw_detail(frame, detail, app, toast_rects);
 }
 
 // ── Left panel: service rows selector ──────────────────────────────────────────
@@ -221,7 +221,7 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
 
 // ── Right panel: selected-row detail ────────────────────────────────────────────
 
-fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect]) {
     let focused = app.services.focus == ServicesFocus::Detail;
 
     let Some(check) = app.services.selected_check() else {
@@ -247,7 +247,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // the MOVE PLAN copy holds a literal `: ` that the shared `key: value`
     // splitter would misread.
     if check.label == "shunt" {
-        draw_shunt_detail(frame, inner, app, check);
+        draw_shunt_detail(frame, inner, app, check, toast_rects);
         return;
     }
 
@@ -306,7 +306,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let fix_focus = problem_focus
             .and_then(|i| check.problems.get(i))
             .map(|p| p.line);
-        draw_herdr_detail(frame, inner, app, lines, fix_focus);
+        draw_herdr_detail(frame, inner, app, lines, fix_focus, toast_rects);
         return;
     }
 
@@ -384,7 +384,13 @@ fn draw_diagnostic_lines(frame: &mut Frame<'_>, inner: Rect, app: &App, lines: V
 /// the caret + hover only while that stop is in view. It publishes the
 /// geometry the key handler walks over (each stop's rendered row, the pane
 /// height, `detail_max_scroll`).
-fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Check) {
+fn draw_shunt_detail(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    app: &App,
+    check: &Check,
+    toast_rects: &[Rect],
+) {
     let action_start = check.shunt_action_start.unwrap_or(check.detail.len());
     let width = inner.width as usize;
 
@@ -661,10 +667,14 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
     if let Some((row, lead, caret)) = edit_caret
         && let Some(visible) = row.checked_sub(scroll as usize).filter(|v| *v < viewport)
     {
-        frame.set_cursor_position((
-            inner.x.saturating_add((lead + caret) as u16),
-            inner.y.saturating_add(visible as u16),
-        ));
+        place_caret(
+            frame,
+            toast_rects,
+            Position::new(
+                inner.x.saturating_add((lead + caret) as u16),
+                inner.y.saturating_add(visible as u16),
+            ),
+        );
     }
 }
 
@@ -2049,6 +2059,7 @@ fn draw_herdr_detail(
     app: &App,
     mut lines: Vec<Line<'static>>,
     fix_focus: Option<usize>,
+    toast_rects: &[Rect],
 ) {
     let focused = app.services.focus == ServicesFocus::Detail;
 
@@ -2146,7 +2157,11 @@ fn draw_herdr_detail(
             .checked_sub(offset)
             .filter(|v| *v < inner.height as usize)
     {
-        frame.set_cursor_position((cx, inner.y.saturating_add(visible as u16)));
+        place_caret(
+            frame,
+            toast_rects,
+            Position::new(cx, inner.y.saturating_add(visible as u16)),
+        );
     }
 }
 

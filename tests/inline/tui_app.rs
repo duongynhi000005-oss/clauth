@@ -13598,6 +13598,110 @@ fn capture_name_collision_opens_overwrite_confirm_instead_of_erroring() {
     }
 }
 
+/// `x` dismisses the topmost toast even while a modal owns input — except in a
+/// typed-entry modal (name entry, the login code field), where `x` stays data.
+#[test]
+fn x_dismisses_a_toast_under_a_modal_but_stays_data_in_name_entry() {
+    use super::{
+        ConfirmAction, ConfirmScroll, ConfirmState, KeyCode, Modal, ToastKind, handle_key,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // A confirm modal over a live toast: `x` dismisses the toast, the modal stays.
+    let mut app = bare_app();
+    app.toast(ToastKind::Danger, "boom");
+    app.modals.push(Modal::Confirm(ConfirmState {
+        message: "restart the daemon?".into(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::Acknowledge,
+    }));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('x')));
+    assert!(
+        app.toasts.is_empty(),
+        "`x` dismissed the toast under a confirm modal"
+    );
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Confirm(_))),
+        "the confirm modal stays open"
+    );
+
+    // A name-entry modal over a live toast: `x` is typed, the toast stays.
+    let mut app = bare_app();
+    app.toast(ToastKind::Danger, "boom");
+    app.modals.push(Modal::CaptureName(super::CaptureNameForm {
+        snapshot: Box::new(crate::actions::CaptureSnapshot {
+            credentials: None,
+            base_url: Some("https://new.example.com".to_string()),
+            api_key: Some("new-key".to_string()),
+            anchor: crate::actions::AnchorAction::Unproven,
+        }),
+        input: super::InputState::new("acme"),
+        from_divergence: false,
+    }));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('x')));
+    match app.modals.last() {
+        Some(Modal::CaptureName(form)) => {
+            assert_eq!(
+                form.input.value, "acmex",
+                "`x` was typed into the name field"
+            );
+        }
+        other => panic!("expected the capture-name modal, got {other:?}"),
+    }
+    assert_eq!(
+        app.toasts.len(),
+        1,
+        "the toast stays while a name entry types `x`"
+    );
+
+    // The login modal's open code field over a live toast: `x` is typed into
+    // the field (a pasted OAuth code is base64url and can hold `x`), the toast
+    // stays.
+    let (mut app, _rx) = app_with_open_login_modal();
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('p')));
+    assert!(
+        paste_field(&app).value.is_empty(),
+        "the paste door opens the code field"
+    );
+    app.toast(ToastKind::Danger, "boom");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('x')));
+    assert_eq!(
+        paste_field(&app).value,
+        "x",
+        "`x` lands in the login code field"
+    );
+    assert_eq!(
+        app.toasts.len(),
+        1,
+        "the toast stays while the login code field types `x`"
+    );
+
+    // The name-prompt modal over a live toast: `x` is typed, the toast stays.
+    let mut app = bare_app();
+    app.toast(ToastKind::Danger, "boom");
+    app.modals.push(Modal::NamePrompt(super::NamePromptForm {
+        input: super::InputState::new("acme"),
+        action: super::NamePromptAction::DuplicateProfile("src".into()),
+    }));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('x')));
+    match app.modals.last() {
+        Some(Modal::NamePrompt(form)) => {
+            assert_eq!(
+                form.input.value, "acmex",
+                "`x` was typed into the name-prompt field"
+            );
+        }
+        other => panic!("expected the name-prompt modal, got {other:?}"),
+    }
+    assert_eq!(
+        app.toasts.len(),
+        1,
+        "the toast stays while a name prompt types `x`"
+    );
+}
+
 /// Cancelling the overwrite confirm must leave everything untouched: the
 /// captured snapshot is dropped, config.toml/profiles.toml are byte-identical,
 /// and the previously active profile stays active.

@@ -162,7 +162,7 @@ fn app_with_checks(checks: Vec<Check>) -> App {
 
 fn render(app: &App) -> (Vec<String>, ratatui::buffer::Buffer) {
     let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
     let buf = term.backend().buffer().clone();
     (crate::testutil::buffer_rows(&buf), buf)
 }
@@ -3374,7 +3374,7 @@ fn herdr_popup_width_row_wraps_between_options_in_a_narrow_pane() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = herdr_options_app(healthy_config());
     let mut term = Terminal::new(TestBackend::new(70, 40)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let screen = rows.join("\n");
     let at = rows
@@ -5057,7 +5057,7 @@ fn assert_config_detail(
 ) {
     let app = config_view_app(view, expanded);
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 40)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert_eq!(
         config_detail_rows(&rows),
@@ -5076,7 +5076,7 @@ fn render_config_section(
 ) -> Vec<String> {
     let app = config_view_app(view, expanded);
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 40)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let detail = config_detail_rows(&rows);
     let at = detail.iter().position(|r| r == "SERVER").expect("SERVER");
@@ -5087,7 +5087,7 @@ fn render_config_section(
 /// save in flight, a focus), so a saving row's spinner/`checking` is pinable.
 fn render_app_config_rows(app: &App) -> Vec<String> {
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     config_detail_rows(&rows)
 }
@@ -5543,7 +5543,7 @@ fn assert_config_detail_with(
 ) {
     let app = config_draft_app(view, expanded, drafts);
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 40)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert_eq!(
         config_detail_rows(&rows),
@@ -5825,7 +5825,7 @@ use ratatui::crossterm::event::KeyCode;
 /// (the key handler walks over the geometry this render publishes).
 fn render_tall(app: &App) {
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
 }
 
 /// `↵` expands a focused entry and `space` collapses it, the disclosure
@@ -6425,7 +6425,7 @@ fn a_saving_row_trails_checking_in_text_dim() {
     });
     app.tick_count = 0;
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let buf = term.backend().buffer().clone();
     let cells = crate::testutil::needle_cells(&buf, "checking").expect("checking renders");
     let dim = crate::tui::theme::text_dim_color();
@@ -6538,7 +6538,7 @@ fn a_focused_wrapped_cycle_row_highlights_every_line() {
         rows.join("\n")
     );
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let buf = term.backend().buffer().clone();
     // The `❯` caret, the bracketed held option and an option on the run's
     // continuation line all sit on the BG_HOVER tint: the focus treatment spans
@@ -6595,7 +6595,7 @@ fn a_typed_editor_places_the_native_cursor_at_the_caret() {
         refusal: None,
     });
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let caret = term.get_cursor_position().expect("the native cursor");
     let buf = term.backend().buffer().clone();
     let rows = crate::testutil::buffer_rows(&buf);
@@ -6664,7 +6664,7 @@ fn a_control_character_value_keeps_the_shunt_editor_caret_aligned() {
         refusal: None,
     });
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let caret = term.get_cursor_position().expect("the native cursor");
     let buf = term.backend().buffer().clone();
     let rows = crate::testutil::buffer_rows(&buf);
@@ -6720,7 +6720,7 @@ fn a_saving_value_carries_the_shimmer_crest() {
         entry: None,
     });
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let buf = term.backend().buffer().clone();
     let cells = crate::testutil::needle_cells(&buf, "high").expect("the saving value");
     assert!(
@@ -6866,7 +6866,7 @@ fn the_shunt_config_read_failure_names_the_reason_or_the_refusal() {
     let mut app = app_with(card);
     app.services.shunt_config = Some(ShuntConfigRead::Unread(UnreadConfig::Unparsed));
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 40)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert_eq!(
         config_detail_rows(&rows),
@@ -6894,7 +6894,7 @@ fn the_shunt_config_read_failure_names_the_reason_or_the_refusal() {
         "a shape clauth does not edit".to_string(),
     ));
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 40)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert_eq!(
         config_detail_rows(&rows),
@@ -7517,7 +7517,7 @@ fn the_shunt_config_entry_styles_follow_the_design_contract() {
             occurrence: 0,
         })));
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let buf = term.backend().buffer().clone();
 
     // Collapsed-blurred entry: glyph dim, label dim (no bold), summary dim.
@@ -7577,7 +7577,7 @@ fn the_shunt_config_entry_styles_follow_the_design_contract() {
 
     // The list taking focus back returns the held group's eyebrow to rest.
     app.services.focus = ServicesFocus::List;
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     assert_eyebrow(term.backend().buffer(), "UPSTREAMS", EYEBROW_AT_REST);
 }
 
@@ -7958,7 +7958,7 @@ fn the_group_eyebrow_stays_active_on_the_add_save_and_remove_rows() {
 /// cue (`TEXT + bold`, never underlined).
 fn assert_upstreams_eyebrow_active(app: &App) {
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
     assert_eyebrow(term.backend().buffer(), "UPSTREAMS", EYEBROW_ACTIVE);
 }
 
@@ -8094,7 +8094,7 @@ fn a_stays_action_keeps_a_cjk_reason_whole() {
 /// The content width is `width - 4` (two borders, two padding cells).
 fn stacked_token_rows(app: &App, width: u16) -> Vec<String> {
     let mut term = Terminal::new(TestBackend::new(width, 60)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
     let rows: Vec<String> = crate::testutil::buffer_rows(term.backend().buffer())
         .into_iter()
         .map(|r| {
@@ -8351,7 +8351,7 @@ fn a_focused_dropped_chip_renders_as_the_focused_inverse_block() {
     app.services
         .set_shunt_focus(Some(ShuntFocusLine::Token("alice".into())));
     let mut term = Terminal::new(TestBackend::new(18, 60)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
     let buffer = term.backend().buffer();
     let rows = crate::testutil::buffer_rows(buffer);
     let caret = rows
@@ -8475,7 +8475,7 @@ fn an_over_wide_typed_shunt_value_scrolls_inside_its_row() {
         };
     let mut term = Terminal::new(TestBackend::new(W, 60)).unwrap();
 
-    let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+    let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &[]));
     let border = right_border(&buf, end.y);
     assert!(
         end.x + 2 <= border,
@@ -8489,7 +8489,7 @@ fn an_over_wide_typed_shunt_value_scrolls_inside_its_row() {
     let end_row = crate::testutil::buffer_rows(&buf)[end.y as usize].clone();
 
     step_left(&mut app);
-    let (left, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+    let (left, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &[]));
     assert_eq!(
         left,
         ratatui::layout::Position::new(end.x - 2, end.y),
@@ -8511,7 +8511,7 @@ fn an_over_wide_typed_shunt_value_scrolls_inside_its_row() {
 /// scrolls, so frames compare row for row.
 fn herdr_frame(app: &App) -> Vec<String> {
     let mut term = Terminal::new(TestBackend::new(W, 60)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
     crate::testutil::buffer_rows(term.backend().buffer())
 }
 
@@ -8560,7 +8560,7 @@ fn an_over_wide_tag_refresh_buffer_scrolls_inside_its_row() {
     }
     let mut term = Terminal::new(TestBackend::new(W, 60)).unwrap();
 
-    let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+    let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &[]));
     let border = right_border(&buf, end.y);
     assert!(
         end.x + 2 <= border,
@@ -8574,7 +8574,7 @@ fn an_over_wide_tag_refresh_buffer_scrolls_inside_its_row() {
     let end_row = crate::testutil::buffer_rows(&buf)[end.y as usize].clone();
 
     draft(&mut app).left();
-    let (left, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+    let (left, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &[]));
     assert_eq!(
         left,
         ratatui::layout::Position::new(end.x - 1, end.y),
@@ -8587,7 +8587,7 @@ fn an_over_wide_tag_refresh_buffer_scrolls_inside_its_row() {
     );
 
     draft(&mut app).home();
-    let (home, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+    let (home, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &[]));
     assert_eq!(home.y, end.y, "Home stays on the field row");
     assert_eq!(
         symbol_at(&buf, home.x, home.y),
@@ -8632,7 +8632,7 @@ fn a_typed_editor_on_a_wrapped_cycle_row_moves_the_rows_below_up() {
         .set_shunt_focus(Some(ShuntFocusLine::Field(key.clone())));
     let frame = |app: &App| {
         let mut term = Terminal::new(TestBackend::new(W, 60)).unwrap();
-        term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
         crate::testutil::buffer_rows(term.backend().buffer())
     };
     let resting = frame(&app);
@@ -8699,7 +8699,7 @@ fn a_typed_shunt_field_keeps_its_caret_inside_on_a_narrow_pane() {
             refusal: None,
         });
         let mut term = Terminal::new(TestBackend::new(w, 100)).unwrap();
-        let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+        let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &[]));
         let border = right_border(&buf, end.y);
         assert!(
             end.x + 2 <= border,
@@ -8725,7 +8725,7 @@ fn a_typed_herdr_tag_refresh_keeps_its_caret_inside_on_a_narrow_pane() {
         app.services.herdr_options_cursor = 2;
         app.services.herdr_tag_draft = Some(crate::tui::app::InputState::new("5"));
         let mut term = Terminal::new(TestBackend::new(w, 100)).unwrap();
-        let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app));
+        let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &[]));
         let border = right_border(&buf, end.y);
         assert!(
             end.x + 2 <= border,
@@ -8749,7 +8749,7 @@ fn the_resting_herdr_rows_keep_their_full_labels_at_28_cols() {
         let mut app = herdr_options_app(healthy_config());
         app.services.herdr_options_cursor = 5;
         let mut term = Terminal::new(TestBackend::new(w, 100)).unwrap();
-        term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
         let rows = crate::testutil::buffer_rows(term.backend().buffer());
         let row = rows
             .iter()
@@ -8810,7 +8810,7 @@ fn a_typed_shunt_field_keeps_the_label_gap_and_escapes_it() {
             refusal: None,
         });
         let mut term = Terminal::new(TestBackend::new(w, 60)).unwrap();
-        term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
         let rows = crate::testutil::buffer_rows(term.backend().buffer());
         let row = rows
             .iter()
@@ -8843,7 +8843,7 @@ fn the_resting_tag_refresh_row_keeps_its_full_label_on_narrow_panes() {
         app.services.herdr_options_cursor = 2;
         assert!(app.services.herdr_tag_draft.is_none(), "the row rests");
         let mut term = Terminal::new(TestBackend::new(w, 100)).unwrap();
-        term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
         let rows = crate::testutil::buffer_rows(term.backend().buffer());
         let expect = if w == 16 { "tag refres" } else { "tag refresh" };
         let row = rows.iter().find(|r| r.contains(expect)).unwrap_or_else(|| {
@@ -9127,5 +9127,105 @@ fn a_finished_jobs_speed_resolves_from_its_transcript() {
     assert!(
         app.delegate_speed_retry.is_empty(),
         "a resolved job keeps no back-off"
+    );
+}
+
+/// A shunt config field's caret that lands inside a drawn toast hides the
+/// native cursor this frame, and it hides under an open modal too. Three
+/// stacked DANGER toasts cover the bind field's caret column at 45x14.
+#[test]
+fn a_toast_over_a_shunt_field_caret_hides_the_native_cursor() {
+    use crate::tui::app::{
+        InputState, Modal, ServicesFocus, ShuntFieldEdit, ShuntFieldEditState, ShuntFieldKey,
+        ShuntFocusLine, ToastKind,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+
+    let mut app = config_view_app(base_view(), std::collections::HashSet::new());
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(ShuntFieldKey::Bind)));
+    app.services.shunt_field_edit = Some(ShuntFieldEditState {
+        key: ShuntFieldKey::Bind,
+        edit: ShuntFieldEdit::Typed {
+            input: InputState::new("127.0.0.1:3001"),
+            saved: None,
+        },
+        refusal: None,
+    });
+    // The bind row sits below the card header; scroll it to the top so its
+    // caret is in view at 45x14.
+    app.services.detail_scroll = 11;
+
+    let mut term = Terminal::new(TestBackend::new(45, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "the shunt caret shows at 45x14 with no toasts"
+    );
+
+    let wide = "x".repeat(53);
+    for label in ["one", "two", "three"] {
+        app.toast(ToastKind::Danger, format!("{label}\n{wide}\n{label} tail"));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(45, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "[45x14] the shunt caret hides under a toast"
+    );
+
+    app.toasts.clear();
+    app.open_modal(Modal::Help);
+    let mut term = Terminal::new(TestBackend::new(45, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "[45x14] the shunt caret hides under an open modal"
+    );
+}
+
+/// A herdr tag-refresh field's caret that lands inside a drawn toast hides the
+/// native cursor this frame, and it hides under an open modal too. Three
+/// stacked DANGER toasts cover the tag field's caret column at 45x14.
+#[test]
+fn a_toast_over_the_herdr_tag_field_caret_hides_the_native_cursor() {
+    use crate::tui::app::{Modal, Tab, ToastKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+
+    let mut app = herdr_options_app(healthy_config());
+    app.tab = Tab::Services;
+    app.services.herdr_options_cursor = 2;
+    app.services.herdr_tag_draft = Some(crate::tui::app::InputState::new("5"));
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "the herdr tag caret shows with no toasts"
+    );
+
+    let wide = "x".repeat(53);
+    for label in ["one", "two", "three"] {
+        app.toast(ToastKind::Danger, format!("{label}\n{wide}\n{label} tail"));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(45, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "[45x14] the herdr tag caret hides under a toast"
+    );
+
+    app.toasts.clear();
+    app.open_modal(Modal::Help);
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "the herdr tag caret hides under an open modal"
     );
 }

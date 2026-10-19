@@ -4,7 +4,7 @@
 use std::cell::Cell;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
@@ -15,6 +15,17 @@ use super::super::theme;
 use super::format::{fixed_split, grapheme_cells, truncate};
 use super::prose;
 use crate::profile::AppConfig;
+
+/// Place the native terminal cursor at `caret` unless a blocker rect covers
+/// the cell: a drawn toast, or the whole frame while a modal owns input (body
+/// editors only). Every editor — modal fields and body text editors — routes
+/// its caret through here, so a body caret under a modal, and any caret under
+/// a toast, stays hidden this frame.
+pub(super) fn place_caret(frame: &mut Frame<'_>, toast_rects: &[Rect], caret: Position) {
+    if !super::toasts::covers(toast_rects, caret) {
+        frame.set_cursor_position(caret);
+    }
+}
 
 /// Account-picker column width for a master-detail tab: ~30% of the body,
 /// clamped 20-40 cells.

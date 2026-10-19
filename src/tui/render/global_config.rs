@@ -17,7 +17,7 @@
 //! global.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 
 use crate::format::format_threshold_tokens;
@@ -37,7 +37,8 @@ use super::super::theme::{self, Tier};
 use super::format::truncate;
 use super::panes::{
     MIN_VALUE_W, cycle_row_lines, draw_scrolled_lines, head_cols, help_tooltip_lines,
-    highlight_row, invalid_tooltip_lines, key_cell, label_style, section_box, value_caret,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, place_caret, section_box,
+    value_caret,
 };
 
 /// Width of the key column: the longest keys (`allow extra usage` /
@@ -48,7 +49,7 @@ const KEY_W: usize = 17;
 /// Fixed gap between the padded key and the value column.
 const KEY_GUTTER: usize = 2;
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect]) {
     let block = section_box("settings", true, true, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -203,7 +204,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .checked_sub(offset)
             .filter(|v| *v < inner.height as usize)
     {
-        frame.set_cursor_position((cx, inner.y.saturating_add(visible as u16)));
+        place_caret(
+            frame,
+            toast_rects,
+            Position::new(cx, inner.y.saturating_add(visible as u16)),
+        );
     }
 }
 

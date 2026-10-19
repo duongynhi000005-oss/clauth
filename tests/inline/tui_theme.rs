@@ -1,0 +1,140 @@
+use ratatui::style::Color;
+
+use crate::testutil::TierSandbox;
+
+#[test]
+fn full_tier_blends_two_rgb_colors() {
+    let _tier = TierSandbox::new(super::Tier::Full);
+    // 0.75 · (17,17,27) + 0.25 · (40,40,56) = (23,23,34)
+    assert_eq!(
+        super::blend_over(Color::Rgb(40, 40, 56), Color::Rgb(17, 17, 27), 0.75),
+        Color::Rgb(23, 23, 34),
+    );
+}
+
+#[test]
+fn full_tier_returns_over_unchanged_when_either_side_is_not_rgb() {
+    let _tier = TierSandbox::new(super::Tier::Full);
+    // A non-RGB under-bg does not blend on the full tier; `over` survives.
+    assert_eq!(
+        super::blend_over(Color::Reset, Color::Rgb(17, 17, 27), 0.75),
+        Color::Rgb(17, 17, 27),
+    );
+    assert_eq!(
+        super::blend_over(Color::Rgb(40, 40, 56), Color::Reset, 0.75),
+        Color::Reset,
+    );
+}
+
+#[test]
+fn compatible_tier_blends_in_rgb_and_snaps_to_the_nearest_index() {
+    let _tier = TierSandbox::new(super::Tier::Compatible);
+    // A painted BG_HOVER cell: 0.75·(17,17,27) + 0.25·(40,40,56) = (23,23,34),
+    // nearest xterm-256 index 234.
+    assert_eq!(
+        super::blend_over(Color::Indexed(236), Color::Indexed(233), 0.75),
+        Color::Indexed(234),
+    );
+    // An unknown/Reset under-bg counts as BG (30,30,46): 0.75·(17,17,27) +
+    // 0.25·(30,30,46) = (20,20,32), nearest index 234.
+    assert_eq!(
+        super::blend_over(Color::Reset, Color::Indexed(233), 0.75),
+        Color::Indexed(234),
+    );
+    // A painted BG cell blends to the same (20,20,32) → 234.
+    assert_eq!(
+        super::blend_over(Color::Indexed(235), Color::Indexed(233), 0.75),
+        Color::Indexed(234),
+    );
+    // Two beneaths whose glass snaps away from 234, so a blend that dropped the
+    // beneath would red here. A focused modal button (TEXT 189): 0.75·(17,17,27)
+    // + 0.25·(205,214,244) = (64,66,81), nearest index 238. A focused border
+    // (LINE_STRONG 240): 0.75·(17,17,27) + 0.25·(69,71,90) = (30,31,43),
+    // nearest index 235.
+    assert_eq!(
+        super::blend_over(Color::Indexed(189), Color::Indexed(233), 0.75),
+        Color::Indexed(238),
+    );
+    assert_eq!(
+        super::blend_over(Color::Indexed(240), Color::Indexed(233), 0.75),
+        Color::Indexed(235),
+    );
+}
+
+#[test]
+fn nearest_index_never_targets_a_terminal_defined_ansi_index() {
+    // Indices 0..15 are terminal-defined, so the snap must land on 16..=255
+    // even for an RGB exactly matching one of them.
+    for (i, &(r, g, b)) in super::ANSI_RGB.iter().enumerate() {
+        let snap = super::nearest_index((r, g, b));
+        assert!(snap >= 16, "ANSI index {i} ({r},{g},{b}) snapped to {snap}");
+    }
+}
+
+#[test]
+fn nearest_index_matches_an_independent_bruteforce_over_a_sampled_set() {
+    // The exhaustive 16.7M-point equality against an independent search is too
+    // slow in a debug test; it was checked out-of-band (0 diffs). This sampled
+    // pin walks every 997th RGB against a reference that rebuilds the palette
+    // from the xterm-256 formula instead of the module's tables.
+    fn reference_palette(i: u8) -> (u8, u8, u8) {
+        let cube = [0u8, 1, 2, 3, 4, 5].map(|n| if n == 0 { 0 } else { 55 + 40 * n });
+        match i {
+            16..=231 => {
+                let n = i - 16;
+                (
+                    cube[usize::from(n / 36)],
+                    cube[usize::from((n / 6) % 6)],
+                    cube[usize::from(n % 6)],
+                )
+            }
+            _ => {
+                let v = 8 + (i - 232) * 10;
+                (v, v, v)
+            }
+        }
+    }
+    let reference = |(r, g, b): (u8, u8, u8)| -> u8 {
+        let mut best = 16u8;
+        let mut best_d = u32::MAX;
+        for i in 16..=u8::MAX {
+            let (pr, pg, pb) = reference_palette(i);
+            let dr = i32::from(r) - i32::from(pr);
+            let dg = i32::from(g) - i32::from(pg);
+            let db = i32::from(b) - i32::from(pb);
+            let d = (dr * dr + dg * dg + db * db) as u32;
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+        }
+        best
+    };
+    let mut checked = 0usize;
+    for v in (0..16_777_216usize).step_by(997) {
+        let rgb = ((v >> 16) as u8, (v >> 8) as u8, v as u8);
+        assert_eq!(super::nearest_index(rgb), reference(rgb), "rgb {rgb:?}");
+        checked += 1;
+    }
+    assert!(checked > 16_000, "sampled {checked} points");
+}
+
+#[test]
+fn indexed_rgb_resolves_the_theme_tokens_to_their_rgb_column() {
+    // The surface tokens the toast blend reads: an index stands in for the RGB
+    // its accessor pairs with it, never the terminal's generic value for it.
+    assert_eq!(super::indexed_rgb(233), (17, 17, 27));
+    assert_eq!(super::indexed_rgb(235), (30, 30, 46));
+    assert_eq!(super::indexed_rgb(236), (40, 40, 56));
+}
+
+#[test]
+fn nearest_index_matches_the_grayscale_surfaces() {
+    // Toast blends stay near the grayscale ramp, where squared distance and the
+    // theme's nearest-index column agree.
+    assert_eq!(super::nearest_index((17, 17, 27)), 233);
+    assert_eq!(super::nearest_index((30, 30, 46)), 235);
+    assert_eq!(super::nearest_index((40, 40, 56)), 236);
+    assert_eq!(super::nearest_index((20, 20, 32)), 234);
+    assert_eq!(super::nearest_index((23, 23, 34)), 234);
+}

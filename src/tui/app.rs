@@ -6938,6 +6938,16 @@ impl KeyOwner {
         {
             return false;
         }
+        // `x` dismisses the topmost toast even while a modal owns input, so a
+        // toast drawn over the modal is still dismissable; the typed-entry
+        // modals keep `x` as data (name entry, the login code field).
+        if self == Self::Modal
+            && code == KeyCode::Char('x')
+            && !app.toasts.is_empty()
+            && !modal_types_x_as_data(app)
+        {
+            return false;
+        }
         if self == Self::ShuntField
             && app
                 .services
@@ -6949,6 +6959,17 @@ impl KeyOwner {
             return false;
         }
         true
+    }
+}
+
+/// Whether the top modal types `x` into a field (data) rather than letting it
+/// dismiss a toast: the name-entry modals and the login modal's open code
+/// field.
+fn modal_types_x_as_data(app: &App) -> bool {
+    match app.modals.last() {
+        Some(Modal::CaptureName(_) | Modal::NamePrompt(_)) => true,
+        Some(Modal::Login) => app.login.as_ref().is_some_and(|s| s.paste_field.is_some()),
+        _ => false,
     }
 }
 

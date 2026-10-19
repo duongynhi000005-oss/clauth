@@ -246,7 +246,7 @@ fn detail_of(row: &str) -> &str {
 /// Render the Fallback body (not the full app frame) at `(w, h)`.
 fn render_chain(app: &App, w: u16, h: u16) -> Vec<String> {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), app, &app.readings_snapshot(), &[]))
         .unwrap();
     crate::testutil::buffer_rows(term.backend().buffer())
 }
@@ -1006,7 +1006,7 @@ fn disabled_chain_member_dims_its_name_and_takes_the_blocked_reason_marker() {
 
     let (w, h) = (100u16, 14u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let buf = term.backend().buffer();
     let rows = crate::testutil::buffer_rows(buf);
@@ -1517,7 +1517,7 @@ fn typed_threshold_caret_lands_on_the_rotate_at_row_at_every_header_height() {
             state: CardEdit::Threshold(InputState::new("80")),
         });
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+        term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
             .unwrap();
         let caret = term
             .get_cursor_position()
@@ -1588,7 +1588,7 @@ fn typed_threshold_row_scrolls_into_view_and_carries_the_caret() {
     // exactly that clip).
     let (w, h) = (26u16, 17u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
 
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
@@ -1635,7 +1635,7 @@ fn typed_max_spend_caret_lands_on_its_row_under_a_wrapped_day_list() {
     });
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let day_row = rows
@@ -1677,7 +1677,7 @@ fn remove_row_stays_reachable_on_a_40x24_pane() {
         .unwrap();
 
     let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
@@ -1767,7 +1767,7 @@ fn selector_rail_shows_hash_n_at_constant_width() {
 
     let (w, h) = (100u16, 20u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     // Both panes share every physical row and the detail card repeats the
     // selected member's name in its TITLE (on a border row, which carries no
@@ -2187,7 +2187,7 @@ fn a_chain_row_carries_no_live_session_tally() {
 /// a glyph that got appended past the pane and clipped.
 fn chain_selector_pane(app: &App, w: u16, h: u16) -> Vec<String> {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), app, &app.readings_snapshot(), &[]))
         .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let pane_w = rows
@@ -2485,7 +2485,7 @@ fn the_fallback_tab_reads_the_apps_live_session_tally() {
     );
 
     let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     // The padded key cell, not the bare word: `live` is short enough that a
@@ -3254,7 +3254,9 @@ fn an_over_wide_threshold_buffer_scrolls_inside_its_row() {
     let (mut app, readings) = threshold_app(Some("1234567890123456"));
     let mut term = Terminal::new(TestBackend::new(34, 40)).unwrap();
 
-    let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &readings));
+    let (end, buf) = draw_caret(&mut term, |f| {
+        super::draw(f, f.area(), &app, &readings, &[])
+    });
     let border = right_border(&buf, end.y);
     assert!(
         end.x + 2 <= border,
@@ -3268,7 +3270,9 @@ fn an_over_wide_threshold_buffer_scrolls_inside_its_row() {
     let end_row = crate::testutil::buffer_rows(&buf)[end.y as usize].clone();
 
     threshold_draft(&mut app).left();
-    let (left, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &readings));
+    let (left, buf) = draw_caret(&mut term, |f| {
+        super::draw(f, f.area(), &app, &readings, &[])
+    });
     assert_eq!(
         left,
         ratatui::layout::Position::new(end.x - 1, end.y),
@@ -3281,7 +3285,9 @@ fn an_over_wide_threshold_buffer_scrolls_inside_its_row() {
     );
 
     threshold_draft(&mut app).home();
-    let (home, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &readings));
+    let (home, buf) = draw_caret(&mut term, |f| {
+        super::draw(f, f.area(), &app, &readings, &[])
+    });
     assert_eq!(home.y, end.y, "Home stays on the field row");
     assert_eq!(
         symbol_at(&buf, home.x, home.y),
@@ -3300,7 +3306,7 @@ fn the_threshold_editor_swaps_its_hint_for_its_range_while_typing() {
     for (w, delta) in [(34u16, -2isize), (45, -1), (80, -1)] {
         let frame = |app: &App, readings: &ReadingsSnapshot| {
             let mut term = Terminal::new(TestBackend::new(w, 60)).unwrap();
-            term.draw(|f| super::draw(f, f.area(), app, readings))
+            term.draw(|f| super::draw(f, f.area(), app, readings, &[]))
                 .unwrap();
             crate::testutil::buffer_rows(term.backend().buffer())
         };
@@ -3369,7 +3375,9 @@ fn a_typed_fallback_row_keeps_its_caret_inside_on_a_narrow_pane() {
         for w in [16u16, 18, 20, 22, 28, 34] {
             let (app, readings) = member_typed_app(row, value);
             let mut term = Terminal::new(TestBackend::new(w, 100)).unwrap();
-            let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &readings));
+            let (end, buf) = draw_caret(&mut term, |f| {
+                super::draw(f, f.area(), &app, &readings, &[])
+            });
             let border = right_border(&buf, end.y);
             assert!(
                 end.x + 2 <= border,
@@ -3695,5 +3703,90 @@ fn a_later_dropped_pill_gets_no_empty_rail_row() {
         rows.iter().filter(|r| r.contains("[ disabled ]")).count(),
         1,
         "the first pill stays on the key row"
+    );
+}
+
+/// A Fallback member field's caret that lands inside a drawn toast hides the
+/// native cursor this frame. Three stacked DANGER toasts cover the `rotate at`
+/// field's caret column at 45x14.
+#[test]
+fn a_toast_over_a_fallback_field_caret_hides_the_native_cursor() {
+    use crate::tui::app::{Tab, ToastKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+
+    let (mut app, _readings) = member_typed_app(FallbackRow::Threshold, "80");
+    app.tab = Tab::Fallback;
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "the fallback caret shows with no toasts"
+    );
+
+    let wide = "x".repeat(53);
+    for name in ["one", "two", "three"] {
+        app.toast(ToastKind::Danger, format!("{name}\n{wide}\n{name} tail"));
+    }
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "[45x14] the fallback caret hides under a toast"
+    );
+}
+
+/// While a modal is open, a body editor under it must not leave its caret
+/// visible on the modal (it would blink on the modal's border); a modal text
+/// field still places its own caret. The Fallback `rotate at` field stays open
+/// under the loss warning, and its caret would land on the modal's border row.
+#[test]
+fn a_body_caret_hides_under_an_open_modal_but_a_modal_field_keeps_its_caret() {
+    use crate::actions::{AnchorAction, CaptureSnapshot};
+    use crate::tui::app::{
+        CaptureNameForm, InputState, LossWarningDrop, LossWarningState, Modal, Tab,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+
+    // A body editor with the loss warning open: no caret on the modal border.
+    let (mut body, _readings) = member_typed_app(FallbackRow::Threshold, "80");
+    body.tab = Tab::Fallback;
+    body.modals.push(Modal::LossWarning(LossWarningState {
+        choice: false,
+        target: Tab::Setup,
+        drop: LossWarningDrop::FallbackEdit,
+    }));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &body)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "a body caret hides under an open modal"
+    );
+
+    // A modal text field still places its caret (the blocker must not reach
+    // the modal's own draw).
+    let mut app = crate::tui::app::App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Overview;
+    app.modals.push(Modal::CaptureName(CaptureNameForm {
+        snapshot: Box::new(CaptureSnapshot {
+            credentials: None,
+            base_url: Some("https://new.example.com".to_string()),
+            api_key: Some("new-key".to_string()),
+            anchor: AnchorAction::Unproven,
+        }),
+        input: InputState::new("a name typed into the field"),
+        from_divergence: false,
+    }));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "a modal field keeps its caret under the blocker"
     );
 }

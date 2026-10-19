@@ -212,19 +212,132 @@ pub(crate) fn bg_warning_color() -> Color {
 }
 
 /// Per-channel RGB blend of `over` onto `beneath`, weighted by `alpha`
-/// (the weight of `over`, clamped to `0.0..=1.0`).
-/// Blends only on the full truecolor tier with both colors RGB-resolvable;
-/// otherwise returns `over` unchanged.
+/// (the weight of `over`, clamped to `0.0..=1.0`). The full tier blends two
+/// `Color::Rgb`s and returns `over` unchanged otherwise — the call shape the
+/// identity-wave crest uses. The compatible tier resolves both colors to RGB
+/// (an indexed color to the RGB its xterm index stands in for, an unknown or
+/// `Reset` one to `BG`), blends, and snaps to the nearest xterm-256 index.
 pub(crate) fn blend_over(beneath: Color, over: Color, alpha: f64) -> Color {
-    let (Color::Rgb(br, bg, bb), Color::Rgb(or, og, ob)) = (beneath, over) else {
-        return over;
-    };
-    if tier() != Tier::Full {
-        return over;
-    }
     let a = alpha.clamp(0.0, 1.0);
     let mix = |o: u8, b: u8| -> u8 { (a * f64::from(o) + (1.0 - a) * f64::from(b)).round() as u8 };
-    Color::Rgb(mix(or, br), mix(og, bg), mix(ob, bb))
+    match tier() {
+        Tier::Full => {
+            let (Color::Rgb(br, bg, bb), Color::Rgb(or, og, ob)) = (beneath, over) else {
+                return over;
+            };
+            Color::Rgb(mix(or, br), mix(og, bg), mix(ob, bb))
+        }
+        Tier::Compatible => {
+            let (br, bg, bb) = rgb_of(beneath);
+            let (or, og, ob) = rgb_of(over);
+            Color::Indexed(nearest_index((mix(or, br), mix(og, bg), mix(ob, bb))))
+        }
+    }
+}
+
+/// The RGB a color resolves to for the compatible-tier blend. An indexed color
+/// resolves to the RGB its xterm index stands in for; an unknown or `Reset`
+/// one counts as `BG`.
+fn rgb_of(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(i) => indexed_rgb(i),
+        _ => (30, 30, 46),
+    }
+}
+
+/// The RGB column of the theme token whose nearest xterm-256 index is `i` —
+/// the same RGB the accessors above pair with that index. An index the theme
+/// did not mint resolves from the standard xterm-256 palette instead.
+fn indexed_rgb(i: u8) -> (u8, u8, u8) {
+    match i {
+        235 => (30, 30, 46),
+        234 => (24, 24, 37),
+        233 => (17, 17, 27),
+        236 => (40, 40, 56),
+        238 => (49, 50, 68),
+        240 => (69, 71, 90),
+        189 => (205, 214, 244),
+        145 => (166, 173, 200),
+        102 => (127, 132, 156),
+        75 => (67, 171, 229),
+        173 => (217, 119, 87),
+        151 => (166, 227, 161),
+        223 => (249, 226, 175),
+        211 => (243, 139, 168),
+        117 => (116, 199, 236),
+        52 => (75, 35, 44),
+        58 => (74, 60, 33),
+        _ => standard_palette_rgb(i),
+    }
+}
+
+/// The VGA/web 16-color set `standard_palette_rgb` maps to indices 0–15. Those
+/// indices are terminal-defined, so [`nearest_index`] never targets them; this
+/// table only resolves a `Color::Indexed(0..=15)` beneath to a fixed RGB.
+const ANSI_RGB: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (128, 0, 0),
+    (0, 128, 0),
+    (128, 128, 0),
+    (0, 0, 128),
+    (128, 0, 128),
+    (0, 128, 128),
+    (192, 192, 192),
+    (128, 128, 128),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (0, 0, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
+
+/// The six cube levels of the standard xterm-256 palette.
+const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// The standard xterm-256 palette value for one index: 16 ANSI colors, a
+/// 6×6×6 cube, then a grayscale ramp.
+fn standard_palette_rgb(i: u8) -> (u8, u8, u8) {
+    match i {
+        0..=15 => ANSI_RGB[usize::from(i)],
+        16..=231 => {
+            let n = i - 16;
+            (
+                CUBE_LEVELS[usize::from(n / 36)],
+                CUBE_LEVELS[usize::from((n / 6) % 6)],
+                CUBE_LEVELS[usize::from(n % 6)],
+            )
+        }
+        _ => {
+            let v = 8 + (i - 232) * 10;
+            (v, v, v)
+        }
+    }
+}
+
+/// The xterm-256 index nearest to `rgb` by squared distance, the lower index
+/// winning a tie. Searches 16..=255 only: indices 0..15 are terminal-defined,
+/// so they are never a snap target.
+fn nearest_index(rgb: (u8, u8, u8)) -> u8 {
+    let (r, g, b) = rgb;
+    let distance = |(pr, pg, pb): (u8, u8, u8)| {
+        let dr = i32::from(r) - i32::from(pr);
+        let dg = i32::from(g) - i32::from(pg);
+        let db = i32::from(b) - i32::from(pb);
+        dr * dr + dg * dg + db * db
+    };
+    let mut best = 16;
+    let mut best_distance = i32::MAX;
+    for i in 16..=u8::MAX {
+        let d = distance(standard_palette_rgb(i));
+        if d < best_distance {
+            best_distance = d;
+            best = i;
+        }
+    }
+    best
 }
 
 // ── Toggle glyphs (tier-sensitive) ────────────────────────────────────────────
@@ -344,3 +457,7 @@ pub(crate) fn info() -> Style {
 pub(crate) fn success() -> Style {
     Style::default().fg(success_color())
 }
+
+#[cfg(test)]
+#[path = "../../tests/inline/tui_theme.rs"]
+mod tests;

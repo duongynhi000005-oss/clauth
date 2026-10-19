@@ -3063,7 +3063,7 @@ fn a_stuck_third_party_row_renders_the_pill_ordinal_and_hint() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
@@ -3117,7 +3117,7 @@ fn the_key_rejection_fix_copy_survives_a_narrow_usage_pane() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
@@ -3162,7 +3162,7 @@ fn the_oauth_no_login_fix_copy_survives_a_narrow_usage_pane() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
@@ -3232,7 +3232,7 @@ fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
@@ -3293,7 +3293,7 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
     app.tab = Tab::Usage;
     app.note_text = Some("last visible note".to_string());
     let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
-    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let first = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
@@ -3304,7 +3304,7 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
     for _ in 0..70 {
         handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     }
-    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let last = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
@@ -3343,7 +3343,7 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
     );
     term.backend_mut().resize(80, 40);
     term.autoresize().unwrap();
-    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     assert_eq!(
         app.usage_detail_max_scroll.get(),
@@ -3378,13 +3378,13 @@ fn usage_detail_reaches_note_after_more_than_u16_rows() {
     assert_eq!(notes_lines(app.note_text.as_deref(), 50).len(), 66_001);
     app.usage_detail_focus = StatusFocus::Detail;
     let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
-    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     app.usage_detail_scroll = usize::from(u16::MAX);
     for _ in 0..80 {
         handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
     }
-    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     assert!(
         crate::testutil::buffer_rows(term.backend().buffer())
@@ -3409,7 +3409,7 @@ fn fitting_usage_detail_has_no_scrollbar() {
     });
     app.tab = crate::tui::app::Tab::Usage;
     let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
-    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let (_, detail) = super::master_detail(ratatui::layout::Rect::new(0, 0, 80, 40), 1);
     assert_eq!(
@@ -3469,7 +3469,8 @@ fn the_note_slot_renders_the_draft_and_parks_the_caret_on_it() {
     use ratatui::backend::TestBackend;
     let buf = NoteBuffer::new("ab\ncd");
     let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
-    term.draw(|f| draw_note_slot(f, f.area(), &buf)).unwrap();
+    term.draw(|f| draw_note_slot(f, f.area(), &buf, &[]))
+        .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let screen = rows.concat();
     assert!(screen.contains("✎"), "the edit mark rides the title break");
@@ -3491,7 +3492,7 @@ fn a_note_line_wider_than_the_slot_scrolls_with_its_caret() {
     let mut buf = NoteBuffer::new(&format!("{}🚀", "m".repeat(60)));
     let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
 
-    let (end, screen) = draw_caret(&mut term, |f| draw_note_slot(f, f.area(), &buf));
+    let (end, screen) = draw_caret(&mut term, |f| draw_note_slot(f, f.area(), &buf, &[]));
     let border = right_border(&screen, end.y);
     assert!(
         end.x + 2 <= border,
@@ -3505,7 +3506,7 @@ fn a_note_line_wider_than_the_slot_scrolls_with_its_caret() {
     let end_row = crate::testutil::buffer_rows(&screen)[end.y as usize].clone();
 
     buf.left();
-    let (left, screen) = draw_caret(&mut term, |f| draw_note_slot(f, f.area(), &buf));
+    let (left, screen) = draw_caret(&mut term, |f| draw_note_slot(f, f.area(), &buf, &[]));
     assert_eq!(
         left,
         ratatui::layout::Position::new(end.x - 2, end.y),
@@ -3534,7 +3535,8 @@ fn the_note_slot_scrolls_the_draft_to_keep_the_caret_visible() {
         .join("\n");
     let buf = NoteBuffer::new(&draft);
     let mut term = Terminal::new(TestBackend::new(30, 6)).unwrap();
-    term.draw(|f| draw_note_slot(f, f.area(), &buf)).unwrap();
+    term.draw(|f| draw_note_slot(f, f.area(), &buf, &[]))
+        .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let screen = rows.concat();
     assert!(
@@ -3824,5 +3826,59 @@ fn tps_rows_reads_zero_rate_for_a_fresh_producers_absent_account() {
     assert_eq!(
         tps_line_text(&rows[1]),
         "rate      live — · 5m — · 1h — · today —"
+    );
+}
+
+/// The note editor's caret that lands inside a drawn toast hides the native
+/// cursor this frame, and it hides under an open modal too. Three stacked
+/// DANGER toasts cover the note slot's caret column at 45x14.
+#[test]
+fn a_toast_over_the_note_editor_caret_hides_the_native_cursor() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::{Modal, NoteEditor, Tab, ToastKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+
+    let name = ProfileName::from("a");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&name)],
+    });
+    app.tab = Tab::Usage;
+    app.note_editor = Some(NoteEditor {
+        profile: name.clone(),
+        buf: NoteBuffer::new("ab"),
+    });
+    app.usage_detail_focus = StatusFocus::Detail;
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "the note caret shows with no toasts"
+    );
+
+    let wide = "x".repeat(53);
+    for label in ["one", "two", "three"] {
+        app.toast(ToastKind::Danger, format!("{label}\n{wide}\n{label} tail"));
+    }
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "[45x14] the note caret hides under a toast"
+    );
+
+    app.toasts.clear();
+    app.open_modal(Modal::Help);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "the note caret hides under an open modal"
     );
 }
