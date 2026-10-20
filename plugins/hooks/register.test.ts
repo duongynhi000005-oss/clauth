@@ -1020,6 +1020,240 @@ test('R3: aborting one hold resolves only its own ask; the other stays held', { 
   await ui.unmount()
 })
 
+// An inline plugin standing for the engine above the mod. The 'ls' check settles
+// 200 ms after the mod starts holding it, as the desk's Esc does; the 'rm' check
+// settles only when `turn.abort` runs, as an aborted turn ends every check it is
+// waiting on. Either settle aborts the mod's hold.
+const engineAbort = {
+  name: 'engineabort',
+  tier: 'prepend' as const,
+  register(on: On) {
+    let endTurn: (() => void) | null = null
+    on('turn.abort', ($, e, next) => {
+      endTurn?.()
+      return { value: undefined }
+    })
+    on('tool.check', async ($, e, next) => {
+      void next(e)
+      const cmd = (e.input as { command?: string })?.command
+      await new Promise<void>(resolve => {
+        if (cmd === 'ls') setTimeout(() => resolve(), 200)
+        else endTurn = resolve
+      })
+      return { decision: 'deny' }
+    })
+  },
+}
+
+test('R3b: a hold its own interrupt aborted closes by interrupt; a desk abort closes by desk', { timeoutMs: 15000, plugins: [engineAbort] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  const closes = () => bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+
+  // The desk's Esc: the engine settles the check with no interrupt behind it.
+  const pDesk = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const deskAsk = bridge.lastAsk()!
+  await pDesk
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  expect(closes()).toEqual([{ ask: deskAsk, by: 'desk' }])
+
+  // The phone's interrupt: the mod aborts the turn, which ends the held check.
+  const pPhone = $.tool.check({ tool: 'Bash', input: { command: 'rm' } })
+  await clock.settle()
+  const phoneAsk = bridge.lastAsk()!
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await pPhone
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  expect(closes()).toEqual([
+    { ask: deskAsk, by: 'desk' },
+    { ask: phoneAsk, by: 'interrupt' },
+  ])
+})
+
+// An inline plugin holding every `ask_opened` post 300 ms in real time, standing
+// for a send chain queued behind other posts, so an interrupt can land while an
+// ask is minted but not yet held.
+const slowOpen = {
+  name: 'slowopen',
+  register(on: On) {
+    on('http.fetch', async ($, e, next) => {
+      const b = e.init?.body
+      if (b === undefined || !b.includes('"kind":"ask_opened"')) return next(e)
+      await new Promise(resolve => setTimeout(() => resolve(undefined), 300))
+      return next(e)
+    })
+  },
+}
+
+test('R3c: an interrupt landing while ask_opened is in flight still closes that ask by interrupt', { timeoutMs: 15000, plugins: [engineAbort, slowOpen] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'rm' } })
+  await new Promise(r => setTimeout(() => r(undefined), 50))
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await p
+  await new Promise(r => setTimeout(() => r(undefined), 500))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask: bridge.lastAsk(), by: 'interrupt' }])
+})
+
+// An inline plugin whose engine accepts `turn.abort` but whose abort reaches no
+// held check, so the desk still answers the hold afterwards.
+const abortReachesNothing = {
+  name: 'abortreachesnothing',
+  tier: 'prepend' as const,
+  register(on: On) {
+    on('turn.abort', ($, e, next) => ({ value: undefined }))
+  },
+}
+
+test('R3d: a desk press after an interrupt whose abort missed the hold closes by desk', { timeoutMs: 15000, plugins: [abortReachesNothing] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  await ui.press({ key: 'allow' })
+  expect(await p).toEqual({ decision: 'allow' })
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask, by: 'desk' }])
+  await ui.unmount()
+})
+
+// An inline plugin whose engine refuses `turn.abort` (it throws), and whose
+// 'ls' check the desk's Esc settles 300 ms after the mod starts holding it.
+const abortThrows = {
+  name: 'abortthrows',
+  tier: 'prepend' as const,
+  register(on: On) {
+    on('turn.abort', ($, e, next) => {
+      throw new Error('no such turn')
+    })
+    on('tool.check', async ($, e, next) => {
+      void next(e)
+      await new Promise(resolve => setTimeout(() => resolve(undefined), 300))
+      return { decision: 'deny' }
+    })
+  },
+}
+
+test('R3e: a desk Esc after an interrupt whose abort was refused closes by desk', { timeoutMs: 15000, plugins: [abortThrows] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await p
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask, by: 'desk' }])
+})
+
+// An inline plugin slowing every `$.state.set` by 50 ms in real time, standing
+// for a host round trip the aborted turn's own `turn.complete` can overtake.
+const slowStateSet = {
+  name: 'slowstateset',
+  tier: 'prepend' as const,
+  register(on: On) {
+    on('state.set', async ($, e, next) => {
+      await new Promise(resolve => setTimeout(() => resolve(undefined), 50))
+      return next(e)
+    })
+  },
+}
+
+test('R3f: the interrupt label survives the aborted turn completing before the close is posted', { timeoutMs: 15000, plugins: [engineAbort, slowStateSet] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'rm' } })
+  await clock.settle()
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  const ask = bridge.lastAsk()!
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await p
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: true, turnId: 't1' })
+  await new Promise(r => setTimeout(() => r(undefined), 300))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask, by: 'interrupt' }])
+})
+
+// An inline plugin standing for a hold that outlives its turn (a background
+// subagent's check): `turn.abort` reaches no held check, and the 'ls' check
+// settles 600 ms after the mod starts holding it, whatever turn is current then.
+const lateAbort = {
+  name: 'lateabort',
+  tier: 'prepend' as const,
+  register(on: On) {
+    on('turn.abort', ($, e, next) => ({ value: undefined }))
+    on('tool.check', async ($, e, next) => {
+      void next(e)
+      await new Promise(resolve => setTimeout(() => resolve(undefined), 600))
+      return { decision: 'deny' }
+    })
+  },
+}
+
+test('R3g: a hold aborted after its interrupted turn completed closes by desk', { timeoutMs: 15000, plugins: [lateAbort] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: true, turnId: 't1' })
+  await p
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask, by: 'desk' }])
+})
+
+test('R3h: a hold from an earlier turn aborted during a later interrupted turn closes by desk', { timeoutMs: 15000, plugins: [lateAbort] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+  await $.turn.start({ text: 'y', turnId: 't2' })
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await p
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask, by: 'desk' }])
+})
+
 // An inline plugin emulating the daemon's poll replacement: each /poll bumps an
 // epoch and parks; a newer /poll on the same instance wakes the older one empty
 // (the N1 mechanism that made two holds pumping /poll loop at ~60 polls/3 s).

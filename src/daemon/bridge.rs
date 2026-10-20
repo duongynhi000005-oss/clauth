@@ -757,6 +757,14 @@ impl Hub {
             }
             "ask_closed" => {
                 let ask = value.get("ask").and_then(Value::as_str).unwrap_or_default();
+                // Only the mod's own closers pass through: an ask its interrupt
+                // aborted posts `interrupt`; anything else it sends — `desk`, a
+                // daemon-owned stamp like `device` or `session_end`, any other
+                // string, or none — reads as the desk.
+                let by = match value.get("by").and_then(Value::as_str) {
+                    Some("interrupt") => "interrupt",
+                    _ => "desk",
+                };
                 if !live.closed_asks.contains_key(ask) {
                     live.open_asks.retain(|(id, _)| id != ask);
                     live.closed_asks.insert(ask.to_string(), Value::Null);
@@ -771,7 +779,7 @@ impl Hub {
                     self.changed.notify_all();
                     self.broadcast(
                         "session.ask",
-                        json!({"session": named, "ask": ask, "state": "closed", "by": "desk"}),
+                        json!({"session": named, "ask": ask, "state": "closed", "by": by}),
                     );
                 } else {
                     // The mod's hold was already lost (a `503 busy`, `remote:false`

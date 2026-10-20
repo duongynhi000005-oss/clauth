@@ -295,6 +295,54 @@ fn a_subagent_wake_reads_only_a_listed_stem() {
     );
 }
 
+/// The mod is the one that knows why its hold ended: an ask its own interrupt
+/// aborted closes `by: interrupt`. The daemon relays only the closers a mod can
+/// name (`desk`, `interrupt`); `device` and `session_end` are the daemon's own
+/// stamps, so a mod naming one, any other value, or none, reads as `desk`.
+#[test]
+fn a_mod_close_names_the_interrupt_and_nothing_the_daemon_owns() {
+    let _home = HomeSandbox::new();
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+
+    let cases: [(&str, Option<&str>, &str); 6] = [
+        ("a1", Some("interrupt"), "interrupt"),
+        ("a2", Some("desk"), "desk"),
+        ("a3", None, "desk"),
+        ("a4", Some("device"), "desk"),
+        ("a5", Some("session_end"), "desk"),
+        ("a6", Some("phone"), "desk"),
+    ];
+    let mut seq = 2;
+    for (ask, sent, relayed) in cases {
+        event(
+            &hub,
+            100,
+            serde_json::json!({"session": "s-one", "seq": seq, "kind": "ask_opened", "ask": ask, "tool": "Bash", "input": {}}),
+        );
+        assert_eq!(
+            next(&sub, WAIT).map(|(name, _)| name),
+            Some("session.ask".into())
+        );
+        let mut closed = serde_json::json!({"session": "s-one", "seq": seq + 1, "kind": "ask_closed", "ask": ask});
+        if let Some(by) = sent {
+            closed["by"] = serde_json::json!(by);
+        }
+        event(&hub, 100, closed);
+        assert_eq!(
+            next(&sub, WAIT),
+            Some((
+                "session.ask".into(),
+                serde_json::json!({"session": "s-one", "ask": ask, "state": "closed", "by": relayed})
+            )),
+            "a mod close sent with by {sent:?}"
+        );
+        seq += 2;
+    }
+}
+
 /// An ask reaches subscribers when opened and when closed, with who closed
 /// it: the desk through the mod's event, a device through the answer route.
 #[test]

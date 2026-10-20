@@ -33,6 +33,7 @@ type HeldEntry = {
   kind: 'decision' | 'answers'
   tool: string
   desc: string
+  turn: string | null
   resolve: (o: HoldOutcome) => void
 }
 
@@ -51,6 +52,7 @@ let nextPollAfter = 0
 let turnId: string | null = null
 let pendingPrompt: { text: string } | null = null
 let helds = new Map<string, HeldEntry>()
+let interruptedTurn: string | null = null
 let askCounter = 0
 
 const bodyBytes = (body: string): number => encoder.encode(body).length
@@ -189,17 +191,20 @@ async function resolveHold(
   ask: string,
   outcome: HoldOutcome,
   postClose: boolean,
+  aborted = false,
 ): Promise<void> {
   const entry = helds.get(ask)
   if (!entry) return
   helds.delete(ask)
+  const by =
+    aborted && interruptedTurn !== null && interruptedTurn === entry.turn ? 'interrupt' : 'desk'
   try {
     await setHeldRow($)
   } catch {
     // The drawing read is best-effort; the hold itself is over.
   }
   if (postClose) {
-    await postEvent($, 'ask_closed', { ask, by: 'desk' })
+    await postEvent($, 'ask_closed', { ask, by })
   }
   entry.resolve(outcome)
 }
@@ -261,10 +266,12 @@ async function handleCommand($: EngineInterface, cmd: Record<string, unknown>): 
       break
     case 'interrupt':
       if (turnId !== null) {
+        interruptedTurn = turnId
         try {
           await $.turn.abort({ turnId })
         } catch {
-          // The turn ended between the command and the abort; nothing to do.
+          // The abort was refused; the tag must not outlive the interrupt.
+          interruptedTurn = null
         }
       }
       break
@@ -390,6 +397,7 @@ async function holdUntilSettled(
   kind: HeldEntry['kind'],
   tool: string,
   desc: string,
+  turn: string | null,
   signal: AbortSignal | undefined,
 ): Promise<HoldOutcome> {
   let settled = false
@@ -397,13 +405,14 @@ async function holdUntilSettled(
     // An abort resolves only this ask; a wait's loss also resolves only its own
     // ask.
     const onAbort = () => {
-      void resolveHold($, ask, { type: 'loss' }, true)
+      void resolveHold($, ask, { type: 'loss' }, true, true)
     }
     signal?.addEventListener('abort', onAbort, { once: true })
     helds.set(ask, {
       kind,
       tool,
       desc,
+      turn,
       resolve: o => {
         settled = true
         signal?.removeEventListener('abort', onAbort)
@@ -455,6 +464,7 @@ export const register: Register = on => {
     socketPath = `${home}/.clauth/bridge.sock`
     interactive = e.isInteractive && e.surface !== null
     sessionId = await $.session.id()
+    interruptedTurn = null
     await $.state.set(HELD, null)
     void postEvent($, 'start', { cwd: e.cwd, interactive: e.isInteractive })
     startPollLoop($)
@@ -492,6 +502,7 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     if (!inert && e.agentId === undefined) {
       turnId = null
+      interruptedTurn = null
       void postEvent($, 'turn_end', { turn: e.turnId })
       if (pendingPrompt) {
         const p = pendingPrompt
@@ -514,6 +525,7 @@ export const register: Register = on => {
       if (v.decision !== 'ask') return v
       if (!interactive) return v
       const ask = mintAskId()
+      const turn = turnId
       const heldNow = await postAskOpened($, ask, e.tool, e.input, e.agentId)
       if (heldNow !== true) return v
       const outcome = await holdUntilSettled(
@@ -522,6 +534,7 @@ export const register: Register = on => {
         'decision',
         e.tool,
         describeInput(e.tool, e.input),
+        turn,
         next.signal,
       )
       if (outcome.type === 'loss') return v
@@ -537,6 +550,7 @@ export const register: Register = on => {
     async ($, e, next) => {
       if (inert || !interactive) return next(e)
       const ask = mintAskId()
+      const turn = turnId
       const heldNow = await postAskOpened($, ask, 'AskUserQuestion', e.questions, undefined)
       if (heldNow !== true) return next(e)
       const outcome = await holdUntilSettled(
@@ -545,6 +559,7 @@ export const register: Register = on => {
         'answers',
         'AskUserQuestion',
         firstQuestion(e.questions),
+        turn,
         next.signal,
       )
       if (outcome.type === 'answers') {
