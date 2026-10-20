@@ -20,7 +20,7 @@ To wire the server by hand instead, add this to `mcpServers` in `~/.claude.json`
 "clauth": { "type": "stdio", "command": "clauth", "args": ["mcp"] }
 ```
 
-The TUI's Services tab writes exactly that entry for you: on the `plugin` row, <kbd>f</kbd> to the `wire mcp server` line, then <kbd>⏎</kbd>. The manual route gives you the same four tools, minus the bundled hooks. Without the plugin, a backgrounded `delegate` result has to be collected with `monitor`, and a conversation is never told when the account behind it changes or its context crosses the configured threshold.
+The TUI's Services tab writes exactly that entry for you: on the `plugin` row, <kbd>f</kbd> to the `wire mcp server` line, then <kbd>⏎</kbd>. The manual route gives you the same four tools, minus the bundled hooks and module. Without the plugin, a backgrounded `delegate` result has to be collected with `monitor`, a conversation is never told when the account behind it changes or its context crosses the configured threshold, and no session reaches the clauth app through the module.
 
 ## Tools
 
@@ -62,6 +62,28 @@ Where the connect brief names a `clauth start` session's runtime directory, it k
 `switch_profile` repoints the global `~/.claude` credentials. A session running on those adopts the new account at its next token refresh, mid-task. A `clauth start` session runs against its own profile and is unaffected; the reply says which case your session is in.
 
 To use another account without disturbing the current session, use `delegate`.
+
+## Answering a session from your phone
+
+The plugin also carries a small module that runs inside every Claude Code session it loads into (Claude Code 2.1.300 or newer; Linux and macOS; on Windows it does nothing). It reports the session to the clauth daemon over `~/.clauth/bridge.sock`: when it starts and ends, when a turn starts and ends, a notice for each new transcript row (never the row itself: the daemon reads it from the transcript file), and every permission ask it could hold for you. The clauth app then lists the session, shows its transcript live, and can send it a prompt, interrupt it, or answer its asks, the same as a herdr pane, with or without herdr. A session the module reaches but herdr does not is flagged to the app with what it lacks: no live terminal, and dialogs only the desk can answer (plan approval among them).
+
+**Permission asks.** The module asks Claude Code first and steps in only where Claude Code itself would ask you; a call your rules already allow or deny never reaches your phone. When the daemon runs with `--listen` and a device paired with `--control` ([Daemon](Daemon)), the module holds that ask and draws its own row above the prompt instead of Claude Code's dialog:
+
+```
+  Bash  cargo test
+  Allow this? Answer here or on your phone.   1: Allow   2: Deny   Esc denies
+```
+
+The first answer wins, desk or phone. `1` and `2` answer once the row has the keyboard: if a digit lands in your prompt instead (the first seconds after the ask opens, while the model still streams), clear it and press Tab first. Esc denies. With no listening daemon or no control device, or if either goes away mid-wait, the module steps aside and Claude Code draws its usual dialog. A session with no one at it never holds an ask (`claude -p`, a clauth delegate); a `claude --bg` session holds like any other, since the phone may be the only place to answer it. Several asks held at once (parallel subagents) are each answerable from your phone; the desk row shows the oldest first. Past eight at once, the rest get Claude Code's own dialog.
+
+**Questions.** An `AskUserQuestion` the phone can answer is held the same way, with a row offering the desk the question instead:
+
+```
+  AskUserQuestion  Which test should I run first?
+  Answer on your phone, or here.   1: Answer here   Esc cancels
+```
+
+`1` hands the question back to Claude Code's own dialog at the desk.
 
 ## API-key profiles
 
@@ -105,8 +127,6 @@ The `cost` figure in a finished delegate's reply comes from the delegated `claud
 
 **Subagent type.** `subagent_type` runs the whole delegate as one of your agent types: the spawned `claude` gets `--agent <name>`, so the delegate's system prompt is that agent's. The definition resolves from the delegate session's `cwd` (the server's working directory by default), so a `cwd` override without the agents tree in reach fails at the spawn rather than at clauth. `@"{type} (agent)"` at the head of the prompt still works and spawns the agent inside the delegate instead. Setting `subagent_type` while `args` carries `--agent` itself is refused.
 
-**Permissions.** `allowed_tools` and `permission_mode` map to `--allowedTools` and `--permission-mode` on the spawned `claude`, for a delegate meant to edit anything. Setting either while `args` carries the matching flag itself is refused. Denials come back in a `permission_denials` array, so check that field rather than the prose result.
-
 **Result file.** `result: "file"` writes the finished envelope to disk under `~/.clauth/jobs/results/` and the reply carries its path, its sha256, and the cost line instead of the full text. The model reads the file when it wants the body, so a long result costs the conversation nothing. A write failure falls back to the inline reply, saying so.
 
 **Kill rules.** A delegate has no clauth-side deadline: a run that keeps producing output is never cut off, no matter how long it runs. The bound is the host's: Claude Code parks a long blocking call as a Task at about 120 s and delivers the result later as a notification, so the call's own slot is never lost to a slow delegate. To stop a run you regret, pass `cancel: true` to `monitor` with the job ids, or stop the parked Task itself. A killed run still returns the text it had written, in `partial_result`, along with `elapsed_secs`, and a `session_id` when the work is resumable. A run that exits non-zero, or whose output clauth cannot read as an answer, hands back the same two: the account paid for that text either way. Where there is no resume handle the reply says why, so silence never has to be read as one.
@@ -123,7 +143,7 @@ A check on a job that is still running is worth the turn it costs: it names the 
 
 **Restore.** When herdr restarts and brings its panes back, a `clauth start` pane comes back inside clauth: the hook the plugin installs tells herdr to relaunch that conversation as `clauth resume <session> --profile <account>` instead of herdr's builtin bare `claude --resume <id>`, so the restored session runs on the same account, in the same runtime wrapper, without prompting. The agent chip stays herdr's own on every pane; the resume command is clauth's only addition. When the hook reaches herdr before herdr has spotted Claude Code in the pane, herdr refuses the command and clauth sends it again on the conversation's next prompt or tool call; a re-send that fails for any other reason stops there until the session next starts, resumes or changes account. herdr refuses the same way, for good, when another tool holds the pane's state or the pane runs an agent other than Claude Code; such a pane falls back to herdr's builtin restore. A session clauth cannot attribute to an account, and anything outside a herdr pane, reports nothing and falls back to herdr's builtin restore — which loses the account and answers `No conversation found` for isolated-store sessions.
 
-**Permissions.** A delegate spawns with Claude Code's permission gate armed and nobody to answer it, so a task that writes files fails on a denial rather than doing the work. Pass `allowed_tools` or `permission_mode` when the delegate is meant to edit anything, and add `--add-dir` for reads outside `cwd` through `args`. Denials come back in a `permission_denials` array, so check that field rather than the prose result.
+**Permissions.** A delegate spawns with Claude Code's permission gate armed and nobody to answer it, so a task that writes files fails on a denial rather than doing the work. Pass `allowed_tools` or `permission_mode` (they map to `--allowedTools` and `--permission-mode` on the spawned `claude`; setting either while `args` carries the matching flag itself is refused) when the delegate is meant to edit anything, and add `--add-dir` for reads outside `cwd` through `args`. Denials come back in a `permission_denials` array, so check that field rather than the prose result.
 
 **Throughput.** clauth records observed tokens/sec per model per profile and flags an account as degraded or recently rate-limited in `profiles`. Subscription throttling is per model and absent from the usage snapshot, so this is the only signal for it.
 
