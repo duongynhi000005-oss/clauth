@@ -41104,7 +41104,8 @@ fn every_shunt_add_disabled_reason_by_equality() {
         &home,
         false,
         &format!(
-            "[server]\nbind = \"127.0.0.1:9\"\n\n[server.admin]\n[[server.admin.write_keys]]\nid = \"clauth\"\nkey = \"{key_ref}\"\n"
+            "[server]\nbind = \"127.0.0.1:9\"\n\n[server.admin]\n[[server.admin.write_keys]]\nid = \"clauth\"\nkey = {}\n",
+            toml_edit::value(key_ref.as_str())
         ),
     );
     assert_eq!(
