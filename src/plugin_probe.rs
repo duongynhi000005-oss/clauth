@@ -28,6 +28,9 @@ pub(crate) const MARKETPLACE_KEY: &str = "clauth";
 /// implicitly when spawning, but a presence *check* needs it spelled out. On
 /// Windows the usual executable extensions are tried too; on Unix the exec bit is
 /// required so a non-executable file named `clauth` doesn't read as "resolved".
+/// Under `cfg(test)` the search skips every `PATH` entry not lexically under the
+/// active `HomeSandbox`'s home, so a lookup here never answers with a binary the
+/// operator's box has installed in a plain `PATH` dir.
 pub(crate) fn on_path(binary: &str) -> Option<PathBuf> {
     let exts: &[&str] = if cfg!(windows) {
         &["", ".exe", ".cmd", ".bat"]
@@ -35,7 +38,19 @@ pub(crate) fn on_path(binary: &str) -> Option<PathBuf> {
         &[""]
     };
     let path = std::env::var_os("PATH")?;
+    // A test build's only home is the sandbox: skip every PATH entry outside
+    // it. `home_dir()` panics when no sandbox is held — the crate's one loud
+    // guard for reaching for the home in a test build — so the `else` arm is
+    // unreachable there and exists only to satisfy the `Result` type.
+    #[cfg(test)]
+    let Ok(home) = home_dir() else {
+        return None;
+    };
     std::env::split_paths(&path).find_map(|dir| {
+        #[cfg(test)]
+        if !dir.starts_with(&home) {
+            return None;
+        }
         exts.iter()
             .map(|ext| dir.join(format!("{binary}{ext}")))
             .find(|candidate| is_executable(candidate))

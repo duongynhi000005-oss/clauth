@@ -276,3 +276,43 @@ fn the_mcp_probe_marks_its_child_as_a_probe() {
         "the probe's child must be marked, got: {env:?}"
     );
 }
+
+/// A test build resolves `on_path` only inside the active `HomeSandbox`: a
+/// binary installed on the box (a `clauth-*-proxy` in `~/.local/bin`) never
+/// answers a test's lookup, while a stub the test put under its sandbox does.
+#[test]
+fn a_test_build_never_resolves_a_binary_outside_the_sandbox() {
+    let home = HomeSandbox::new();
+    let outside = tempfile::tempdir().expect("outside dir");
+    let inside = home.home().join("bin");
+    fs::create_dir_all(&inside).expect("mkdir inside");
+    let name = "clauth-pathpin-proxy";
+    for dir in [outside.path(), inside.as_path()] {
+        let bin = dir.join(name);
+        fs::write(&bin, "#!/bin/sh\n").expect("write binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+    }
+
+    let only_outside = std::env::join_paths([outside.path()]).expect("join");
+    {
+        let _path =
+            crate::testutil::EnvPin::new(&home, &[("PATH", Some(only_outside.as_os_str()))]);
+        assert_eq!(
+            on_path(name),
+            None,
+            "a binary outside the sandbox never resolves in a test build"
+        );
+    }
+
+    let both = std::env::join_paths([outside.path(), inside.as_path()]).expect("join");
+    let _path = crate::testutil::EnvPin::new(&home, &[("PATH", Some(both.as_os_str()))]);
+    assert_eq!(
+        on_path(name),
+        Some(inside.join(name)),
+        "a stub under the sandbox still resolves"
+    );
+}
