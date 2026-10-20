@@ -613,7 +613,7 @@ fn clear_bad_reads(name: &str) {
 fn restore_confirmed(name: &str, strikes: u32, first_ms: i64, now_ms: i64) -> bool {
     strikes >= 2
         && now_ms - first_ms >= BELT_CONFIRM_MS
-        && !crate::runtime::has_live_session(&ProfileName::from(name))
+        && !crate::runtime::has_live_marker(&ProfileName::from(name))
 }
 
 /// Restore the store from the belt — caller holds the rotation guard, and
@@ -903,7 +903,7 @@ pub(crate) fn standby_pass(
     //    race — stand down just inside it.
     // A stand-down consumes no kick: a chain we cannot safely touch is not one
     // two forced attempts should count against.
-    if crate::runtime::has_live_session(&ProfileName::from(name)) {
+    if crate::runtime::has_live_marker(&ProfileName::from(name)) {
         let in_window = auth
             .access_exp_ms()
             .is_some_and(|exp| exp - now_ms < CODEX_SELF_REFRESH_WINDOW_MS);

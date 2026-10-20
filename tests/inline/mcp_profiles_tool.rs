@@ -98,6 +98,49 @@ fn names_filter_selects_one_profile_case_insensitively() {
     );
 }
 
+/// The `profiles` pass reads the job store once for the whole roster, never
+/// once per row (the `gc_runtime_trees` snapshot precedent).
+#[test]
+fn the_profiles_pass_reads_the_job_store_once() {
+    let _home = HomeSandbox::new();
+    seed_two_profiles();
+
+    crate::claude_jobs::reset_job_trees_reads();
+    call_profiles(None, None);
+    assert_eq!(
+        crate::claude_jobs::job_trees_reads(),
+        1,
+        "the whole pass reads the store once, never once per row"
+    );
+}
+
+/// A job naming a tree under `solo/` makes `solo`'s roster row carry the live
+/// flag while `vendor` stays without it: the row derives liveness from the same
+/// per-pass job snapshot, not from the marker alone.
+#[test]
+fn a_job_under_one_profile_marks_only_that_profiles_row_live() {
+    let home = HomeSandbox::new();
+    seed_two_profiles();
+    let solo_dir =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("solo")).expect("solo dir");
+    let runtime = solo_dir.join("runtime-4242-0");
+    std::fs::create_dir_all(&runtime).expect("mkdir runtime tree");
+    crate::testutil::write_claude_job(home.home(), "37560ded", &runtime);
+
+    let text = first_text(&call_profiles(None, None));
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("- solo") && l.contains("live session")),
+        "a job under solo/ is a live solo session: {text}"
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.starts_with("- vendor") && l.contains("live session")),
+        "a job under solo/ is nobody's vendor session: {text}"
+    );
+}
+
 /// A name matching nothing fails loudly. Dropping it silently would answer with
 /// a roster that reads exactly like "that profile no longer exists", and the
 /// model would act on the wrong one of those two readings.

@@ -317,6 +317,7 @@ pub(crate) fn build_profile_entries(
     interval_ms: u64,
     live: Option<&LiveSignals>,
     include_disabled: bool,
+    jobs: &crate::claude_jobs::JobTrees,
 ) -> Vec<ProfileEntry> {
     let now = now_ms();
     // Interleaved auto-start queue (`usage::auto_start_queue`), hoisted so the
@@ -611,7 +612,7 @@ pub(crate) fn build_profile_entries(
                 base_url: p.base_url.clone(),
                 tier: tier_label(p),
                 harness: "claude".to_string(),
-                has_live_session: crate::runtime::has_live_session(name),
+                has_live_session: crate::runtime::has_live_session_in(name, jobs),
                 auth_status: auth_status_str(config, p, now as i64).to_string(),
                 fetch_status: fetch_status.map(str::to_string),
                 stale,
@@ -676,7 +677,7 @@ pub(crate) fn build_codex_entries(
                         .and_then(|p| p.codex_plan.as_deref()),
                 ),
                 harness: "codex".to_string(),
-                has_live_session: crate::runtime::has_live_session(name),
+                has_live_session: crate::runtime::has_live_marker(name),
                 // `broken` is the server's terminal verdict on the chain
                 // (`codex_auth::read_quarantine`), the codex twin of the claude
                 // `auth_broken` grade; `expired` has no codex reading, since the
@@ -865,7 +866,13 @@ pub(crate) fn build_status_impl(
     include_disabled: bool,
     include_tps: bool,
 ) -> (StatusBody, Option<crate::codex_profiles::CodexState>) {
-    let mut profiles = build_profile_entries(config, interval_ms, live, include_disabled);
+    let mut profiles = build_profile_entries(
+        config,
+        interval_ms,
+        live,
+        include_disabled,
+        &crate::claude_jobs::job_trees(),
+    );
     // One read feeds both the entries and the slots below, so a load error
     // publishes an empty roster AND empty slots rather than a body whose two
     // halves describe different files.

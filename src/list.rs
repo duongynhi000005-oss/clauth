@@ -35,6 +35,7 @@ pub(crate) fn run(include_disabled: bool) -> Result<()> {
         config.state.refresh_interval_ms,
         None,
         include_disabled,
+        &crate::claude_jobs::job_trees(),
     );
     out!("{}", render_table(&config, &entries));
     Ok(())

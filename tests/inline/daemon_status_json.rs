@@ -158,6 +158,64 @@ fn build_status_top_level_shape_and_active() {
     assert_eq!(home["active"], false);
 }
 
+/// The status pass builds the claude and codex entries off ONE job-store read
+/// (the `gc_runtime_trees` snapshot precedent), never one read per profile.
+#[test]
+fn the_status_pass_reads_the_job_store_once() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work"), oauth_profile("home")],
+    };
+    config.state.active_profile = Some("work".into());
+    config.state.refresh_interval_ms = 300_000;
+
+    crate::claude_jobs::reset_job_trees_reads();
+    build_status(&config, config.state.refresh_interval_ms, None, false);
+    assert_eq!(
+        crate::claude_jobs::job_trees_reads(),
+        1,
+        "the whole pass reads the store once, never once per profile"
+    );
+}
+
+/// A job naming a tree under `work/` makes `work`'s row read live while `home`
+/// stays idle: the row derives `has_live_session` from the same per-pass job
+/// snapshot, not from the marker alone.
+#[test]
+fn a_job_under_one_profile_reads_live_only_that_profiles_row() {
+    let home = HomeSandbox::new();
+    let work_dir = crate::profile::profile_dir(&ProfileName::from("work")).expect("work dir");
+    let runtime = work_dir.join("runtime-4242-0");
+    std::fs::create_dir_all(&runtime).expect("mkdir runtime tree");
+    crate::testutil::write_claude_job(home.home(), "37560ded", &runtime);
+
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work"), oauth_profile("home")],
+    };
+    let v = status_value(&config, 300_000, None, false);
+    let row = |n: &str| {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == n)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        row("work")["has_live_session"],
+        true,
+        "a job under work/ is a live work session"
+    );
+    assert_eq!(
+        row("home")["has_live_session"],
+        false,
+        "a job under work/ is nobody's home session"
+    );
+}
+
 #[test]
 fn build_status_fallback_membership_and_armed() {
     let _home = HomeSandbox::new();
@@ -1474,7 +1532,13 @@ fn the_entry_carries_the_long_window_presence_label_unpublished() {
     crate::testutil::register_names(&["qwen"]);
     crate::testutil::write_captured_third_party_cache("qwen", crate::testutil::QWEN_MONTHLY_CACHE);
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     assert_eq!(entries[0].long_window_label, Some("30d"));
 
     let v = status_value(&config, config.state.refresh_interval_ms, None, false);

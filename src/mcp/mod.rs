@@ -220,7 +220,12 @@ fn quota_payload(name: &ProfileName) -> serde_json::Value {
 /// One roster row for `p`, the shape both `profiles` scopes render through
 /// `profile_line`. The one builder keeps the all-scope roster and the
 /// session-scope row from disagreeing about what a profile is called.
-fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
+fn profile_row(
+    p: &Profile,
+    config: &AppConfig,
+    now: i64,
+    jobs: &crate::claude_jobs::JobTrees,
+) -> serde_json::Value {
     let name = &p.name;
     // One read of this account's own cache, feeding the one carrier its figures
     // ride in. Reading it twice (once to date the row, once for the headline)
@@ -248,7 +253,7 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
     // Both of these are absent unless they say something. Emitted
     // unconditionally they were 39% of a 27-profile response, nearly all of it
     // `false` and rows carrying no warning.
-    if crate::runtime::has_live_session(name) {
+    if crate::runtime::has_live_session_in(name, jobs) {
         row["has_live_session"] = serde_json::json!(true);
     }
     let warnings = throughput_warnings(name, now);
@@ -977,6 +982,7 @@ refuses only a delegate whose model bills usage credits."
             }
         };
 
+        let jobs = crate::claude_jobs::job_trees();
         let profiles: Vec<serde_json::Value> = config
             .profiles
             .iter()
@@ -985,7 +991,7 @@ refuses only a delegate whose model bills usage credits."
                     .as_ref()
                     .is_none_or(|w| w.iter().any(|n| n == p.name.as_str()))
             })
-            .map(|p| profile_row(p, &config, now))
+            .map(|p| profile_row(p, &config, now, &jobs))
             .collect();
 
         let payload = serde_json::json!({ "profiles": profiles });
@@ -1003,7 +1009,12 @@ refuses only a delegate whose model bills usage credits."
         if let Some((name, source)) = resolved.as_ref()
             && let Some(p) = config.find(&ProfileName::from(name.clone()))
         {
-            let mut row = profile_row(p, config, now_epoch_secs());
+            let mut row = profile_row(
+                p,
+                config,
+                now_epoch_secs(),
+                &crate::claude_jobs::job_trees(),
+            );
             row["source"] = serde_json::json!(source.as_str());
             rows.push(row);
         }

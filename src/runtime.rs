@@ -45,9 +45,13 @@
 //! marker `<sessions dir>/<sid>` and holds an exclusive `flock(2)` on it for
 //! its lifetime, so any other process reads liveness without cooperation.
 //! [`has_live_session`] unions every `sessions*` dir under the profile, so an
-//! isolated session counts the same as a shared one; the destructive account
-//! actions (delete, disable) gate on it everywhere. Token rotation gates on it
-//! only on macOS ([`rotation_blocked_for`]): elsewhere the session reads the
+//! isolated session counts the same as a shared one, plus any Claude Code
+//! background job naming a tree under the profile's dir; the destructive
+//! account actions (delete, disable, rename) gate on it everywhere. Token
+//! rotation gates only on macOS ([`rotation_blocked_for`]), and on the narrower
+//! terms — a live marker session holding a rotatable store
+//! ([`has_live_marker`] && [`live_session_holds_rotatable`]), or an UNFINISHED
+//! job on one: elsewhere the session reads the
 //! very credential file a rotation writes and simply follows it, while on macOS
 //! its Claude Code reads a Keychain item namespaced per `CLAUDE_CONFIG_DIR` that
 //! clauth cannot write. Teardown drops the marker and discards the tree. That
@@ -67,6 +71,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::claude::{build_claude_settings_json, create_symlink};
+use crate::claude_jobs::JobTrees;
 use crate::lock::with_state_lock;
 use crate::logline::logline;
 use crate::profile::{
@@ -602,21 +607,17 @@ fn session_marker_dirs(name: &ProfileName) -> Option<Vec<PathBuf>> {
     Some(dirs)
 }
 
-/// True iff the profile has at least one live `clauth start` session, in ANY of
-/// its marker dirs and of either flavor. Gates the destructive account actions
-/// (delete, disable) everywhere, and on macOS every rotation leg too
-/// ([`rotation_blocked_for`]).
+/// True iff the profile has a live session by its marker flock alone: a
+/// `clauth start` session holds a flock on its marker, which
+/// [`session_marker_dirs`] reads. The codex half of liveness — a codex
+/// session's carrier is the operator's `auth.json` chain, never a Claude Code
+/// job store, so the codex gates (delete, capture, the belt restore, the
+/// standby stand-down, the codex status rows) read markers only. The claude
+/// half is [`has_live_session`], which adds the job-store term.
 ///
-/// Every unknown reads as LIVE, and that asymmetry is no longer free. A false
-/// negative pulls an account out from under a running session or signs it out.
-/// A spurious true costs a refused delete the user can retry — but on macOS it
-/// ALSO freezes all four rotation legs for that profile, so a marker dir that
-/// stays unreadable means the chain never rotates and the access token simply
-/// dies at its 8h mark. Fail-closed is still the right direction (a wrongly
-/// deleted account is unrecoverable, an unrotated one is not), but the cost is
-/// a stalled profile, not an inconvenience. Only a dir that is genuinely absent
-/// counts as idle.
-pub(crate) fn has_live_session(name: &ProfileName) -> bool {
+/// Every unknown reads as LIVE (a marker dir that cannot be enumerated rules
+/// no session out), the same fail-closed direction the union takes.
+pub(crate) fn has_live_marker(name: &ProfileName) -> bool {
     match session_marker_dirs(name) {
         None => true,
         Some(dirs) => dirs
@@ -625,9 +626,53 @@ pub(crate) fn has_live_session(name: &ProfileName) -> bool {
     }
 }
 
-/// Whether a live `clauth start` session must block rotating this profile's
-/// chain. Kept PURE (the caller reads `cfg!`) so both arms run from a Linux
-/// test, like [`swap_support`].
+/// True iff the profile has at least one live session, of either flavor and in
+/// ANY of its marker dirs, OR a Claude Code background job names a tree under
+/// its dir. Gates the destructive claude account actions (delete, disable,
+/// rename) everywhere. The macOS rotation gate reads a narrower job term —
+/// UNFINISHED jobs only — through [`rotation_blocked_for`], never this.
+///
+/// Liveness has two sources. A `clauth start` session holds a flock on its
+/// marker ([`has_live_marker`]); a `clauth start <p> -- --bg` session releases
+/// its marker at once while Claude Code keeps reading its config dir, so a
+/// profile is also live while any job names a tree under its dir
+/// ([`crate::claude_jobs::JobTrees::spares_under`]). The job store is read
+/// only when the marker probe found nothing live, so a live session costs no
+/// store walk.
+///
+/// Every unknown reads as LIVE: a false negative pulls an account out from
+/// under a running session or signs it out, while a spurious true costs a
+/// refused delete the user can retry, so fail-closed is the right direction (a
+/// wrongly deleted account is unrecoverable). Only a dir that is genuinely
+/// absent counts as idle.
+pub(crate) fn has_live_session(name: &ProfileName) -> bool {
+    has_live_marker(name) || job_names_tree_under(name, &crate::claude_jobs::job_trees())
+}
+
+/// [`has_live_session`] against a job store the caller already read, so a
+/// pass-level caller reads the store once and every profile it maps shares that
+/// snapshot (the [`gc_runtime_trees`] precedent). The marker probe is always a
+/// fresh read — the snapshot covers only the job-store walk, the expensive
+/// half, and the `||` keeps that walk lazy when a marker is already live.
+pub(crate) fn has_live_session_in(name: &ProfileName, jobs: &crate::claude_jobs::JobTrees) -> bool {
+    has_live_marker(name) || job_names_tree_under(name, jobs)
+}
+
+/// A Claude Code background job naming any tree under this profile's
+/// dir is a live session too: the job's `CLAUDE_CONFIG_DIR` keeps
+/// reading a tree the marker flock never sees. Fail closed — an
+/// unreadable store, or a profile dir that cannot be resolved,
+/// counts as live.
+fn job_names_tree_under(name: &ProfileName, jobs: &crate::claude_jobs::JobTrees) -> bool {
+    profile_dir(name)
+        .map(|dir| jobs.spares_under(&dir))
+        .unwrap_or(true)
+}
+
+/// Whether a live session — marker-held and holding a rotatable store, or an
+/// UNFINISHED background job on one — must block rotating this profile's chain.
+/// Kept PURE (the caller reads `cfg!`) so both arms run from a Linux test, like
+/// [`swap_support`].
 ///
 /// macOS only, and NOT for the double-spend reason the pre-2026-07-26 code gave
 /// — a double-spend costs one failed request, not the account. The real
@@ -646,16 +691,30 @@ pub(crate) fn has_live_session(name: &ProfileName) -> bool {
 /// mid-task.
 ///
 /// A bare `claude` is deliberately NOT covered: it reads the unsuffixed item
-/// clauth does write, so rotating it propagates normally. [`has_live_session`]
-/// counts only `clauth start` sessions, so it already draws that line.
+/// clauth does write, so rotating it propagates normally. Its stand-in markers
+/// live under [`live_bare_dir`], not the profile, so the marker probes that
+/// build this predicate's verdict never see them.
 ///
 /// This dissolves the moment [`crate::keychain`] derives the namespaced service
 /// name. Every site that refuses goes
 /// through [`rotation_blocked_for`], so that fix is a one-line change here and
 /// nowhere else — keep it that way rather than re-deriving `cfg!(macos) &&
 /// has_live_session` at a call site.
-fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> bool {
-    is_macos && has_live_session
+fn rotation_blocked_by_live_session(live: bool, is_macos: bool) -> bool {
+    is_macos && live
+}
+
+/// Whether the credential file at `path` holds a refresh token — the only kind
+/// a rotation can strand. Shared by the marker term
+/// ([`live_session_holds_rotatable`], per the row's `launch_store`) and the job
+/// term (per an unfinished tree's `.credentials.json`), so both narrow the same
+/// way. Every unknown reads as YES (holds): a missing, unreadable, or
+/// unparseable file blocks. The one readable shape that allows is a file that
+/// parses with no `claudeAiOauth` block or no refresh token.
+fn credential_holds_refresh_token(path: &Path) -> bool {
+    crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(path)
+        .map(|creds| creds.refresh_token().is_some())
+        .unwrap_or(true)
 }
 
 /// Whether ANY live `clauth start` session that has run on `name` HOLDS a
@@ -685,14 +744,13 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
 /// can land in a sidecar), and a frozen bool would keep saying "refresh-less"
 /// while the file the session reads holds a live chain.
 ///
-/// EVERY unknown reads as rotatable, matching [`has_live_session`]'s own
-/// fail-closed asymmetry: an unreadable marker dir, a marker with no registry
-/// row (`acquire` tolerates a failed registration), a row from a clauth that
-/// predates `launch_store`, and an unreadable or half-written credential file
-/// all return `true` and refuse exactly as today. The one readable shape that
-/// ALLOWS is a file that parses with no `claudeAiOauth` block at all (`{}`):
-/// it holds no refresh token to strand, so permitting the rotation is the
-/// verdict, not a hole in the enumeration. Bare `claude` sessions never
+/// EVERY unknown reads as rotatable: an unreadable marker dir, a marker with no
+/// registry row (`acquire` tolerates a failed registration), and a row from a
+/// clauth that predates `launch_store` all return `true` and refuse exactly as
+/// today. The credential-file read shares [`credential_holds_refresh_token`]
+/// with the job term, so an unreadable or half-written file reads as holding
+/// there too, and the one readable shape that allows is a file that parses
+/// with no `claudeAiOauth` block at all (`{}`). Bare `claude` sessions never
 /// reach this predicate at all — their stand-in markers live under
 /// [`live_bare_dir`], not the profile — so the refusal is unchanged for them
 /// by construction rather than by this check.
@@ -712,11 +770,7 @@ fn live_session_holds_rotatable(name: &ProfileName) -> bool {
             else {
                 return true;
             };
-            let refreshless =
-                crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&store)
-                    .ok()
-                    .is_some_and(|c| c.refresh_token().is_none());
-            if !refreshless {
+            if credential_holds_refresh_token(&store) {
                 return true;
             }
         }
@@ -777,18 +831,32 @@ fn fanout_warning(
     })
 }
 
-/// [`rotation_blocked_by_live_session`] against the live host and marker state —
-/// what every rotation leg and both TUI pre-refusals call.
+/// [`rotation_blocked_by_live_session`] over the two things that strand a
+/// rotation on macOS — what every rotation leg and both TUI pre-refusals call.
 ///
-/// `cfg!` is tested FIRST so the marker probe short-circuits away off macOS:
-/// [`has_live_session`] is a `read_dir` plus an `open` + `try_lock` per marker,
-/// and passing it as an argument would pay that on every Linux poll of every
-/// profile for a value the predicate discards.
+/// The first term is a live marker session holding a rotatable store
+/// ([`has_live_marker`] && [`live_session_holds_rotatable`]); the second is an
+/// UNFINISHED Claude Code background job on a tree that holds a refresh token
+/// ([`unfinished_job_holds_rotatable`], a fresh job-store walk over
+/// [`crate::claude_jobs::JobTrees::unfinished_under`]). A finished job —
+/// `stopped`/`done`/`failed` — is not mid-task, and a job on a refresh-less
+/// tree has nothing to strand, so both free the chain.
 ///
-/// [`live_session_holds_rotatable`] is tested LAST for the same reason: it is
-/// strictly the more expensive probe (a registry read plus a credential parse
-/// per live session), and it only ever narrows an answer that is already
-/// `true`, so it is never paid by a profile that was not about to be refused.
+/// `cfg!` is tested FIRST so both probes short-circuit away off macOS:
+/// [`has_live_marker`] is a `read_dir` plus an `open` + `try_lock` per marker,
+/// and the job-store walk runs only when the marker term did not already block,
+/// so a Linux poll of every profile never pays either for a value the predicate
+/// discards.
+///
+/// [`live_session_holds_rotatable`] runs only behind a live marker for the same
+/// reason it used to run last: it is the more expensive probe (a registry read
+/// plus a credential parse per live session), and it only ever narrows an
+/// answer the marker already made `true`.
+///
+/// One unreadable job-store record blocks EVERY profile's rotation on macOS
+/// until it clears — fail-closed is deliberate, but the cost is a
+/// stalled chain at its 8h mark, not a refused delete, and the refusal copy
+/// still says "has a live clauth start session" while no session runs.
 ///
 /// The `cfg!` term is compile-time false off macOS, so a Linux test can reach
 /// neither arm through the host; the test-only override below is the one way
@@ -798,9 +866,38 @@ pub(crate) fn rotation_blocked_for(name: &ProfileName) -> bool {
     if let Some(forced) = ROTATION_BLOCKED_OVERRIDE.with(std::cell::Cell::get) {
         return forced;
     }
-    cfg!(target_os = "macos")
-        && rotation_blocked_by_live_session(has_live_session(name), true)
-        && live_session_holds_rotatable(name)
+    rotation_blocked_on(name, cfg!(target_os = "macos"))
+}
+
+/// The job term: an UNFINISHED Claude Code background job on a tree that holds
+/// a refresh token. The same exemption the marker term gets, applied per tree:
+/// each unfinished tree under the profile's dir has its `.credentials.json`
+/// read through [`credential_holds_refresh_token`], so a job on a
+/// `session-token.json` sidecar (linked or copied) frees the chain exactly like
+/// a marker session on one. A tree the read cannot judge (no file, a dangling
+/// link, unparseable bytes) holds. Fail closed: an unreadable job store, or a
+/// profile dir that cannot be resolved, blocks.
+fn unfinished_job_holds_rotatable(name: &ProfileName) -> bool {
+    let Some(dir) = profile_dir(name).ok() else {
+        return true;
+    };
+    let Some(trees) = crate::claude_jobs::job_trees().unfinished_under(&dir) else {
+        return true;
+    };
+    trees
+        .iter()
+        .any(|tree| credential_holds_refresh_token(&tree.join(".credentials.json")))
+}
+
+/// [`rotation_blocked_for`] with the host passed in, so a Linux test drives the
+/// macOS arm against real marker and job-store state.
+fn rotation_blocked_on(name: &ProfileName, is_macos: bool) -> bool {
+    is_macos
+        && rotation_blocked_by_live_session(
+            (has_live_marker(name) && live_session_holds_rotatable(name))
+                || unfinished_job_holds_rotatable(name),
+            true,
+        )
 }
 
 // Test seam posing the refusal's answer from a Linux host. Thread-local, same
@@ -878,9 +975,10 @@ pub(crate) fn live_sessions_at(sessions: &Path) -> Option<usize> {
 /// global credentials ([`live_bare_sessions`] states how tight that stand-in is),
 /// deliberately OUTSIDE `profiles/`:
 /// [`session_marker_dirs`] scans a profile dir for names starting with
-/// `SESSIONS_STEM`, so nothing here can reach [`has_live_session`] and the
-/// delete, disable, and macOS rotation gates keep counting `clauth start`
-/// sessions only. A bare session holds no credential clauth handed it and none
+/// `SESSIONS_STEM`, so nothing here can reach the marker-scanning gates —
+/// [`has_live_session`] (delete, disable, rename) and the rotation gate's
+/// marker term — which all read a live session's marker under the profile. A
+/// bare session holds no credential clauth handed it and none
 /// it could not already read, so it is a display fact, not a gate.
 fn live_bare_dir() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("live_bare"))
@@ -1059,6 +1157,20 @@ fn gc_codex_homes() {
 }
 
 fn gc_runtime_trees() {
+    // One snapshot of Claude Code's job store per sweep, before the pair loop,
+    // so the fast path never pays the walk per pair. A dead pair the snapshot
+    // did not name pays one more store read, under the state flock (the
+    // `gc_one_pair_synced` re-read). An unreadable store spares every dead pair
+    // this sweep — the fail-closed direction `is_session_alive` takes — and the
+    // log names the offending job dir, never its contents.
+    let job_trees = crate::claude_jobs::job_trees();
+    if let JobTrees::Unreadable(dir) = &job_trees {
+        logline!(
+            "clauth: spared every dead runtime tree this sweep: a Claude Code \
+             background-job record under {} could not be read",
+            dir.display()
+        );
+    }
     let Ok(root) = profiles_root_dir() else {
         return;
     };
@@ -1083,7 +1195,7 @@ fn gc_runtime_trees() {
             } else if is_runtime_dir_name(child_name)
                 && let Some(sessions) = paired_sessions_name(child_name)
             {
-                let _ = gc_one_pair(&child.path(), &profile.join(sessions));
+                let _ = gc_one_pair(&child.path(), &profile.join(sessions), &job_trees);
             } else if is_sessions_dir_name(child_name)
                 && let Some(runtime) = paired_runtime_name(child_name)
             {
@@ -1093,7 +1205,7 @@ fn gc_runtime_trees() {
                 // rather than a reused one.
                 let runtime = profile.join(runtime);
                 if runtime.symlink_metadata().is_err() {
-                    let _ = gc_one_pair(&runtime, &child.path());
+                    let _ = gc_one_pair(&runtime, &child.path(), &job_trees);
                 }
             }
         }
@@ -1851,11 +1963,33 @@ fn rescue_tombstone(tombstone: &Path) {
 }
 
 /// Collect one paired (`runtime<rest>`, `sessions<rest>`) tree when nothing holds
-/// a marker in it. The two go together; a `runtime` path that does not exist
-/// collects the orphaned marker dir alone. An isolated tree is renamed to a
-/// tombstone under the lock and rescued outside it, so the flock is never held
-/// across a tree-sized copy; a shared tree is removed under the lock as before.
-fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
+/// a marker in it and no live Claude Code background job names it. The two go
+/// together; a `runtime` path that does not exist collects the orphaned marker
+/// dir alone. An isolated tree is renamed to a tombstone under the lock and
+/// rescued outside it, so the flock is never held across a tree-sized copy; a
+/// shared tree is removed under the lock as before.
+fn gc_one_pair(runtime: &Path, sessions: &Path, job_trees: &JobTrees) -> Result<()> {
+    // The job check sits here as a FAST PATH, before the state flock
+    // `gc_one_pair_synced` takes: the store was read once above and the check
+    // is a canonicalize + set lookup, not a walk. It is not the decision — a
+    // job written after the snapshot but before the marker frees is caught by
+    // the fresh re-read `gc_one_pair_synced` makes under the lock. Spared
+    // before the flock means a named tree is never renamed to its rescue
+    // tombstone — the one order that would rescue-and-delete a tree a live job
+    // still reads.
+    if job_trees.spares(runtime) {
+        // Log only a NAMED hit: under an unreadable store `spares` is true for
+        // every pair (live ones included), and the sweep-level line already
+        // covered the Unreadable case once per sweep. A per-pair line there
+        // would claim a live job names every tree.
+        if matches!(job_trees, JobTrees::Named(_)) {
+            logline!(
+                "clauth: spared runtime tree {}: a live Claude Code background job names it",
+                runtime.display()
+            );
+        }
+        return Ok(());
+    }
     gc_one_pair_synced(runtime, sessions, || {})
 }
 
@@ -1898,6 +2032,16 @@ fn gc_one_pair_synced(
         // different process, against every profile, and under `LinkMode::Fake`
         // the tree it would remove is the one a live sibling is running out of.
         if prune_stale_sessions(sessions).unwrap_or(1) != 0 {
+            return Ok(false);
+        }
+        // The snapshot `gc_one_pair` checked was read before this lock was
+        // taken. A `clauth start <p> -- --bg` can write its job, exit, and
+        // release its marker after the snapshot but before this hold; the stale
+        // snapshot then says unnamed while the marker now reads dead. Re-read
+        // under the lock — marker found free, THEN a fresh store read — the
+        // same order Drop uses, so a named tree (or an unreadable store) is
+        // spared rather than collected.
+        if crate::claude_jobs::job_trees().spares(runtime) {
             return Ok(false);
         }
         if isolated {
@@ -4235,8 +4379,15 @@ impl ProfileRuntime {
             // under the shared tree — a whole profile's worth nobody is using.
             // Rebuild from scratch so stale symlinks/copies to entries that have
             // since vanished from ~/.claude/ don't carry over. A live sibling
-            // holds a marker here, so its tree is never the one wiped.
-            if active == 0 && runtime.symlink_metadata().is_ok() {
+            // holds a marker here, so its tree is never the one wiped. A live
+            // `claude --bg` job names its tree here too (the marker flock never
+            // sees the session), so a tree the job store names — or one an
+            // unreadable store cannot clear — is skipped as well; the store read
+            // runs only when a stale tree sits at the path.
+            if active == 0
+                && runtime.symlink_metadata().is_ok()
+                && !crate::claude_jobs::job_trees().spares(runtime)
+            {
                 std::fs::remove_dir_all(runtime)
                     .with_context(|| format!("failed to clear {}", runtime.display()))?;
             }
@@ -4319,12 +4470,13 @@ impl ProfileRuntime {
         // materialization inside `build_runtime_dir_with_active_env` (which
         // samples the chain — a byte copy under `LinkMode::Fake`, a relink plus a
         // possible adopt under `Real`), the marker `try_lock`, and the registry
-        // row. Those last two are the whole of what `rotation_blocked_for` reads
-        // — `has_live_session` walks the marker dirs, `live_session_holds_rotatable`
-        // reads the row's `launch_store` — so a rotation taking this lock one
-        // instruction after the drop already sees this session and refuses on
-        // macOS exactly as before. They are also what the `has_live_session` gate
-        // on rename and disable reads, so those two are refused in the gap by
+        // row. Those last two are the whole of what the rotation gate's marker
+        // term reads — `has_live_marker` walks the marker dirs,
+        // `live_session_holds_rotatable` reads the row's `launch_store` — so a
+        // rotation taking this lock one instruction after the drop already sees
+        // this session and refuses on macOS exactly as before. They are also
+        // what the `has_live_session` gate on rename and disable reads, so those
+        // two are refused in the gap by
         // that gate rather than by this lock. Delete is the exception and stays
         // one: `actions::delete_profile` reads that gate only when `!force`, so a
         // `--force` delete lands in the gap where the base's `try_acquire` would
@@ -4627,8 +4779,17 @@ impl Drop for ProfileRuntime {
                 self.swap.release_swapped_markers();
                 let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
                 if still_active == 0 {
-                    let _ = std::fs::remove_dir_all(&self.swap.runtime);
-                    let _ = std::fs::remove_dir(&self.sessions);
+                    // `claude --bg` handed this session to Claude Code's
+                    // background service before this teardown runs, so the
+                    // marker alone cannot say the tree is unused: re-read the
+                    // job store once and leave a tree a live job names — or one
+                    // an unreadable store cannot clear — in place with its
+                    // sessions dir.
+                    let job_trees = crate::claude_jobs::job_trees();
+                    if !job_trees.spares(&self.swap.runtime) {
+                        let _ = std::fs::remove_dir_all(&self.swap.runtime);
+                        let _ = std::fs::remove_dir(&self.sessions);
+                    }
                 }
             }
             Err(e) => logline!("clauth: drop cleanup failed: {e}"),

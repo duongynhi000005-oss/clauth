@@ -4,6 +4,7 @@ mod bell;
 mod canonical;
 mod cc_exempt;
 mod claude;
+mod claude_jobs;
 mod claude_json;
 mod cli;
 mod codex_auth;

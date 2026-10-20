@@ -90,7 +90,13 @@ fn list_table_hides_disabled_by_default_and_marks_the_active_profile() {
     config.state.active_profile = Some("work".into());
     warm_usage("work", 42.4, 17.6);
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
@@ -117,7 +123,13 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
     config.state.active_profile = Some("work".into());
     warm_usage("work", 42.4, 17.6);
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, true);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        true,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
@@ -174,7 +186,13 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -202,7 +220,13 @@ fn list_table_leaves_a_live_account_unmarked() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     assert_eq!(table.lines().collect::<Vec<_>>(), [HEADER, WORK_ROW]);
     assert!(
@@ -229,7 +253,13 @@ fn list_table_stacks_disabled_and_canceled_rather_than_letting_one_win() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -261,7 +291,13 @@ fn list_table_shows_provider_as_plan_and_the_base_url_endpoint_for_a_third_party
         profiles: vec![zai],
     };
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
@@ -297,7 +333,13 @@ fn list_table_marks_a_keyless_third_party_profile() {
         profiles: vec![zai],
     };
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
@@ -332,7 +374,13 @@ fn list_table_leaves_an_env_keyed_third_party_profile_unmarked() {
         profiles: vec![zai],
     };
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
@@ -372,7 +420,13 @@ fn list_table_renders_a_third_party_rows_own_headroom() {
         crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES,
     );
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -425,7 +479,13 @@ fn list_table_falls_through_to_the_wallet_over_a_non_canonical_bar_label() {
         &stats,
     );
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("31.45 CNY"),
@@ -466,7 +526,13 @@ fn list_table_shows_a_monthly_only_accounts_quota_in_the_long_column() {
     crate::testutil::register_names(&["qwen"]);
     crate::testutil::write_captured_third_party_cache("qwen", QWEN_MONTHLY_CACHE);
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -488,7 +554,13 @@ fn a_monthly_only_accounts_entry_publishes_a_30d_window() {
     crate::testutil::register_names(&["qwen"]);
     crate::testutil::write_captured_third_party_cache("qwen", QWEN_MONTHLY_CACHE);
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let rows: Vec<(&str, f64, bool)> = entries[0]
         .windows
         .iter()
@@ -521,7 +593,13 @@ fn an_unmarked_30d_bar_publishes_no_window() {
         crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES,
     );
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let labels: Vec<&str> = entries[0]
         .windows
         .iter()
@@ -561,7 +639,13 @@ fn an_unmarked_30d_bar_with_no_7d_fills_no_long_column() {
         &stats,
     );
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -594,7 +678,13 @@ fn list_table_shows_a_best_effort_accounts_bars_in_both_columns() {
         r#"{"is_available":true,"rows":[],"bars":[{"label":"5h","pct":20.0,"resets_at":"2026-01-01T00:00:00Z"},{"label":"7d","pct":30.0,"resets_at":"2026-01-01T00:00:00Z"}],"best_effort":true}"#,
     );
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -665,7 +755,13 @@ fn list_table_takes_the_first_live_bar_when_a_label_occurs_twice() {
         &stats,
     );
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -726,7 +822,13 @@ fn list_table_prefers_the_marked_30d_bar_over_an_unmarked_one() {
         &stats,
     );
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("30d 123.40 / 4000"),
@@ -765,7 +867,13 @@ fn list_table_falls_back_to_the_first_funded_wallet_when_no_bar_exists() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, crate::testutil::DEEPSEEK_CACHE_BYTES).unwrap();
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -802,7 +910,13 @@ fn list_table_dashes_a_lapsed_bars_last_reading() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES).unwrap();
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -842,7 +956,13 @@ fn list_table_ranks_the_first_funded_wallet_not_the_empty_first_listed() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE).unwrap();
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("498.18 CNY"),
@@ -888,7 +1008,13 @@ fn list_table_renders_a_bars_own_absolute_amounts_when_it_carries_them() {
     )
     .unwrap();
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("50 / 400"),
@@ -903,7 +1029,13 @@ fn list_table_reports_no_accounts_when_empty() {
         state: AppState::default(),
         profiles: vec![],
     };
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, true);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        true,
+        &crate::claude_jobs::job_trees(),
+    );
     assert_eq!(
         render_table(&config, &entries),
         "no accounts yet. add one with `clauth login <name>`.\n"
@@ -936,7 +1068,13 @@ fn a_dead_credential_is_named_in_the_state_suffix() {
     crate::testutil::register_names(&["qwen"]);
     crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
 
-    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        300_000,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("login expired"),
@@ -971,7 +1109,13 @@ fn a_profile_that_never_stored_a_session_is_told_it_needs_one() {
     crate::testutil::register_names(&["qwen"]);
     crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
 
-    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        300_000,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("login needed"),
@@ -1004,7 +1148,13 @@ fn a_dead_api_key_is_told_the_key_was_rejected() {
     crate::testutil::register_names(&["deepseek"]);
     crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("deepseek"), fp);
 
-    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        300_000,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("key rejected"),
@@ -1036,7 +1186,13 @@ fn list_table_marks_a_stale_reading() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     assert!(
         table.contains("(stale)"),
@@ -1068,7 +1224,13 @@ fn list_table_marks_a_stale_reading() {
     );
     let table = render_table(
         &config,
-        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     assert!(
         table.contains("(stale)"),
@@ -1094,7 +1256,13 @@ fn list_table_names_a_broken_oauth_credential() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     assert!(
         table.contains("login expired"),
@@ -1140,7 +1308,13 @@ fn list_table_stacks_both_dead_credentials_and_dedupes_the_identical_pair() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, 300_000, None, false),
+        &build_profile_entries(
+            &config,
+            300_000,
+            None,
+            false,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     assert!(
         table.contains("login expired, key rejected"),
@@ -1180,7 +1354,13 @@ fn list_table_collapses_the_identical_login_expired_pair() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, 300_000, None, false),
+        &build_profile_entries(
+            &config,
+            300_000,
+            None,
+            false,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     assert_eq!(
         table.matches("login expired").count(),
@@ -1206,7 +1386,13 @@ fn work_config() -> AppConfig {
 fn render(config: &AppConfig) -> String {
     render_table(
         config,
-        &build_profile_entries(config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     )
 }
 

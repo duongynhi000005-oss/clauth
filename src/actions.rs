@@ -1267,7 +1267,9 @@ pub(crate) fn delete_profile(
         // Refuse to pull an account out from under a running `clauth start`
         // session (either flavor), checked before any removal so a refused
         // delete is a clean no-op. `--yes` skips the confirm prompt but does NOT
-        // override this; only `force` does.
+        // override this; only `force` does. A Claude Code background job naming
+        // any tree under this profile's dir is a live session for this refusal
+        // too — `has_live_session` unions both sources.
         if !force && crate::runtime::has_live_session(name) {
             bail!("'{name}' has a live session, pass --force to delete it anyway");
         }
@@ -1427,7 +1429,7 @@ fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
 /// The typed live-session refusal [`delete_codex_profile`] raises when the
 /// profile still runs a live session and `force` was not passed. Kept
 /// downcastable so the CLI caller appends its `--force` escape-hatch tail to
-/// THIS refusal alone: a second `has_live_session` read would re-answer a
+/// THIS refusal alone: a second `has_live_marker` read would re-answer a
 /// question the delete already answered, and tag an unrelated failure (a state
 /// flock timeout) with a flag that cannot fix it.
 #[derive(Debug)]
@@ -1462,7 +1464,7 @@ pub(crate) fn delete_codex_profile(
             bail!("codex profile '{name}' not found");
         }
         let owned = ProfileName::from(name);
-        if !force && crate::runtime::has_live_session(&owned) {
+        if !force && crate::runtime::has_live_marker(&owned) {
             // One sentence source for both harnesses: the CLI caller appends its
             // `--force` tail, the TUI surfaces this alone (a TUI refusal never
             // names a CLI flag). Raised as a TYPED error so the CLI matches it,
@@ -1718,7 +1720,7 @@ pub(crate) fn codex_login_capture_at(
         if canonical != guess {
             bail!("'{trimmed}' was renamed while the capture prepared — re-run it");
         }
-        if crate::runtime::has_live_session(&ProfileName::from(canonical.as_str())) {
+        if crate::runtime::has_live_marker(&ProfileName::from(canonical.as_str())) {
             bail!(
                 "'{canonical}' has a live codex session, which holds the chain this \
                  capture would replace — close it first"
@@ -1961,7 +1963,7 @@ pub(crate) fn land_codex_login(
         if canonical != guess {
             bail!("'{trimmed}' was renamed while the login ran — re-run it");
         }
-        if crate::runtime::has_live_session(&ProfileName::from(canonical.as_str())) {
+        if crate::runtime::has_live_marker(&ProfileName::from(canonical.as_str())) {
             bail!("'{canonical}' has a live codex session — close it before re-authenticating");
         }
         if reauth {

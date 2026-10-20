@@ -2664,6 +2664,53 @@ fn app_with(profiles: Vec<crate::profile::Profile>) -> App {
     })
 }
 
+/// The Setup frame reads the job-store SNAPSHOT, never the store itself: a full
+/// draw must not walk `~/.claude/jobs` (that walk is per-tick, in
+/// `poll_live_sessions`).
+#[test]
+fn drawing_the_setup_frame_does_not_read_the_job_store() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::profile::Profile::new(
+        "acct".to_string(),
+        None,
+        None,
+    )]);
+    app.tab = super::Tab::Setup;
+
+    crate::claude_jobs::reset_job_trees_reads();
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert_eq!(
+        crate::claude_jobs::job_trees_reads(),
+        0,
+        "a frame draws from the snapshot, never the store"
+    );
+}
+
+/// The tick that refreshes the live-session view also refreshes the job-store
+/// snapshot — once per refresh, never per frame.
+#[test]
+fn the_live_session_tick_reads_the_job_store_once() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::profile::Profile::new(
+        "acct".to_string(),
+        None,
+        None,
+    )]);
+    // Defeat the 1 s throttle so the poll runs this tick.
+    app.last_live_sessions_refresh = None;
+
+    crate::claude_jobs::reset_job_trees_reads();
+    super::poll_live_sessions(&mut app);
+    assert_eq!(
+        crate::claude_jobs::job_trees_reads(),
+        1,
+        "the live-session poll refreshes the snapshot once"
+    );
+}
+
 // ── lock-order regression ───────────────────────────────────────────────────
 
 /// `reload_if_state_changed` must NOT hold the config guard while it writes the

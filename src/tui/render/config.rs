@@ -434,10 +434,11 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                     .unwrap_or_default(),
                 disabled: p.is_disabled(),
                 is_active: cfg.is_active(&p.name),
-                // Read per frame for the selected profile only, same as
-                // `session_token` below — a single small directory stat, not a
-                // per-profile loop.
-                has_live_session: crate::runtime::has_live_session(&p.name),
+                // The marker probe reads fresh for the selected profile only
+                // (same as `session_token` below), but the job-store walk comes
+                // from the per-tick snapshot in `app.job_trees` — a frame pays a
+                // marker probe plus a set lookup, never a store walk.
+                has_live_session: crate::runtime::has_live_session_in(&p.name, &app.job_trees),
                 // OAuth accounts carry a token; API accounts carry an api key. Either
                 // one flips the Login row to "re-login" and shows the log-out row.
                 // A console account's `log in` row captures the SESSION, so that

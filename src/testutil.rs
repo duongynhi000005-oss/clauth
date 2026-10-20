@@ -2765,6 +2765,56 @@ pub(crate) fn wait_for_lines(dir: &Path, want: usize, timeout: std::time::Durati
     }
 }
 
+/// A Claude Code background job record, in the key set and order a live
+/// `claude --bg` wrote on 2.1.303 (`~/.claude/jobs/<id>/state.json`, captured
+/// 2026-10-19), naming `config_dir` as the job's `providerEnv.CLAUDE_CONFIG_DIR`.
+/// Returns the job dir, which a test removes to pose `claude rm`.
+pub(crate) fn write_claude_job(home: &Path, id: &str, config_dir: &Path) -> PathBuf {
+    write_claude_job_in(home, id, config_dir, "working", None)
+}
+
+/// [`write_claude_job`] with the record's `state` and `firstTerminalAt` set.
+/// Shapes captured on 2.1.304 (2026-10-20): `claude stop` writes `"stopped"`
+/// with `firstTerminalAt` stamped, and `claude attach` on that stopped job
+/// revives it as `"running"` with the stamp kept.
+pub(crate) fn write_claude_job_in(
+    home: &Path,
+    id: &str,
+    config_dir: &Path,
+    state: &str,
+    first_terminal_at: Option<&str>,
+) -> PathBuf {
+    let dir = home.join(".claude").join("jobs").join(id);
+    std::fs::create_dir_all(dir.join("tmp")).expect("mkdir job dir");
+    let record = serde_json::json!({
+        "state": state,
+        "detail": "(idle — send a prompt to start)",
+        "tempo": "blocked",
+        "needs": "send a prompt to start",
+        "output": null,
+        "children": null,
+        "linkScanOffset": 0,
+        "template": "bg",
+        "respawnFlags": [],
+        "providerEnv": { "CLAUDE_CONFIG_DIR": config_dir.to_string_lossy() },
+        "intent": "",
+        "sessionId": format!("{id}-0a6e-4b11-883e-fca3a218ae52"),
+        "resumeSessionId": format!("{id}-0a6e-4b11-883e-fca3a218ae52"),
+        "daemonShort": id,
+        "cwd": "/home/dev/proj",
+        "createdAt": "2026-10-19T05:25:39.445Z",
+        "updatedAt": "2026-10-19T05:25:39.445Z",
+        "firstTerminalAt": first_terminal_at,
+        "backend": "daemon",
+    });
+    std::fs::write(
+        dir.join("state.json"),
+        serde_json::to_vec(&record).expect("encode job"),
+    )
+    .expect("write job");
+    dir
+}
+
 /// The `--seq` value of one recorded report line (the token after the flag).
 #[cfg(unix)]
 pub(crate) fn seq_of(line: &str) -> u64 {

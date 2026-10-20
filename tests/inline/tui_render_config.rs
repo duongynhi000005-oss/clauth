@@ -922,8 +922,44 @@ fn snap_email_names_no_one_without_an_oauth_pair() {
     assert_eq!(snap_email(Some(empty), Some("u-1"), false), None);
 }
 
-// ── CLA-SPLIT: the `token` long-lived-login status row ──────────────────────
+/// A job naming a tree under `work/` makes `work`'s Setup snapshot read live
+/// while `home` stays idle: the snapshot derives `has_live_session` from the
+/// per-tick job snapshot, not from the marker alone.
+#[test]
+fn a_job_under_one_profile_reads_live_only_that_profiles_snapshot() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+    let home = crate::testutil::HomeSandbox::new();
+    let work_dir = crate::profile::profile_dir(&ProfileName::from("work")).expect("work dir");
+    let runtime = work_dir.join("runtime-4242-0");
+    std::fs::create_dir_all(&runtime).expect("mkdir runtime tree");
+    crate::testutil::write_claude_job(home.home(), "37560ded", &runtime);
 
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec!["work".into(), "home".into()],
+            ..AppState::default()
+        },
+        profiles: vec![
+            Profile::new("work".to_string(), None, None),
+            Profile::new("home".to_string(), None, None),
+        ],
+    });
+    // Refresh the per-tick job snapshot the way poll_live_sessions does.
+    app.job_trees = crate::claude_jobs::job_trees();
+
+    app.profile_cursor = 0;
+    assert!(
+        build_snap(&app, &app.readings_snapshot(), true).has_live_session,
+        "a job under work/ is a live work session"
+    );
+    app.profile_cursor = 1;
+    assert!(
+        !build_snap(&app, &app.readings_snapshot(), true).has_live_session,
+        "a job under work/ is nobody's home session"
+    );
+}
+
+// ── CLA-SPLIT: the `token` long-lived-login status row ──────────────────────
 // A comfortable horizon is a plain accent value; the last 30 days warn as a
 // pill; expired and mis-filled escalate to a DANGER pill plus a `└` fix line
 // (the operator thinks the split is armed and it isn't). Unstamped says so.

@@ -28,14 +28,17 @@ pub(crate) struct SessionRecord {
     /// `pid`, and a future Claude Code version writing `procStart` as a
     /// non-string must not fail their parses, so a non-string reads as empty
     /// (A#16) — which the linux compare then rejects.
-    #[serde(rename = "procStart", default, deserialize_with = "proc_start_lenient")]
+    #[serde(rename = "procStart", default, deserialize_with = "lenient_string")]
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) proc_start: String,
 }
 
-/// `procStart` as a string, else empty: the bridge is the only reader, and a
-/// non-string there must not fail every other `SessionRecord` parse.
-fn proc_start_lenient<'de, D: serde::Deserializer<'de>>(
+/// A JSON string as itself, any other value (`null`, a number, an object) as
+/// empty: the one lenient-string reader shared by `procStart` and the job
+/// store's `state`, so a future Claude Code version retyping either field must
+/// not fail every record parse. A non-string degrades to empty, which the
+/// field's own rule then reads (an empty `state` is unfinished).
+pub(crate) fn lenient_string<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<String, D::Error> {
     let value = serde_json::Value::deserialize(deserializer)?;

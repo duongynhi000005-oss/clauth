@@ -1858,6 +1858,34 @@ fn delete_codex_refuses_a_live_session_unforced() {
     );
 }
 
+/// The job store is Claude Code's own statement about CLAUDE sessions; a torn
+/// record (a job dir holding only `tmp/`, no `state.json`) is a claude-side
+/// fault. A codex profile's live-session gate reads its marker flock alone, so
+/// that same unreadable store refuses neither a codex capture nor a codex
+/// delete.
+#[test]
+fn a_torn_claude_job_record_does_not_refuse_a_codex_capture() {
+    let home = HomeSandbox::new();
+    // A job dir mid-creation: `tmp/` exists, `state.json` does not yet.
+    let torn = home.home().join(".claude").join("jobs").join("torn");
+    std::fs::create_dir_all(torn.join("tmp")).expect("mkdir torn job dir");
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+
+    codex_login_capture("cx").expect("a torn claude job record is a claude-only fault");
+}
+
+/// Same fault, same gate shape, the codex delete half.
+#[test]
+fn a_torn_claude_job_record_does_not_refuse_a_codex_delete() {
+    let home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    let torn = home.home().join(".claude").join("jobs").join("torn");
+    std::fs::create_dir_all(torn.join("tmp")).expect("mkdir torn job dir");
+
+    delete_codex_profile("cx", false, &rotation_guard("cx"))
+        .expect("a torn claude job record is a claude-only fault");
+}
+
 /// The codex delete takes the guard the claude delete takes, for the race its
 /// doc names: a standby rotation racing `remove_dir_all` either resurrects an
 /// orphan `auth.json` holding the pair it minted, or loses that pair after the
@@ -4392,6 +4420,162 @@ fn delete_refuses_live_session_unless_forced() {
     );
 }
 
+/// A Claude Code background job naming any tree under a profile's dir is a live
+/// session for `delete_profile`'s refusal: `clauth start <p> -- --bg` leaves the
+/// tree under a job the marker flock never sees, and pulling the profile dir out
+/// from under it orphans the session. Same refusal, same message; `--force`
+/// still overrides.
+#[test]
+fn delete_refuses_a_profile_with_a_background_job_tree_unless_forced() {
+    let home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "busy".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+
+    // A job naming a runtime tree under the profile dir.
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("busy")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let job = home.home().join(".claude").join("jobs").join("37560ded");
+    std::fs::create_dir_all(job.join("tmp")).expect("mkdir job dir");
+    let record = serde_json::json!({
+        "providerEnv": { "CLAUDE_CONFIG_DIR": tree.to_string_lossy() },
+    });
+    std::fs::write(
+        job.join("state.json"),
+        serde_json::to_vec(&record).expect("encode job"),
+    )
+    .expect("write job");
+
+    let err = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("busy"),
+        false,
+        &rotation_guard("busy"),
+    )
+    .expect_err("a background job tree must block an unforced delete");
+    assert_eq!(
+        err.to_string(),
+        "'busy' has a live session, pass --force to delete it anyway"
+    );
+
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("busy"),
+        true,
+        &rotation_guard("busy"),
+    )
+    .expect("force overrides the background-job guard");
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("busy"))
+            .is_none(),
+        "force must remove the profile despite the background job tree"
+    );
+}
+
+/// #16: the live-session job clause scopes to the profile's own dir — a job
+/// naming a tree under a DIFFERENT profile's dir must not block deleting this
+/// one. Pins [`crate::claude_jobs::JobTrees::spares_under`]'s per-component
+/// `starts_with` (a `busy2/…` tree does not match the `busy` profile dir).
+#[test]
+fn a_job_under_another_profile_does_not_block_delete() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    for name in ["busy", "busy2"] {
+        create_blank_profile(
+            &mut config,
+            name.to_string(),
+            None,
+            None,
+            Default::default(),
+        )
+        .expect("create profile");
+    }
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("busy2")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let job = home.home().join(".claude").join("jobs").join("37560ded");
+    std::fs::create_dir_all(job.join("tmp")).expect("mkdir job dir");
+    let record = serde_json::json!({
+        "providerEnv": { "CLAUDE_CONFIG_DIR": tree.to_string_lossy() },
+    });
+    std::fs::write(
+        job.join("state.json"),
+        serde_json::to_vec(&record).expect("encode"),
+    )
+    .expect("write job");
+
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("busy"),
+        false,
+        &rotation_guard("busy"),
+    )
+    .expect("a job under busy2 must not block deleting busy");
+}
+
+/// #16: an unreadable job store is fail-closed for delete too — a torn record
+/// (caught mid-rewrite) means nothing can rule out a live background job naming
+/// a tree under this profile, so the unforced delete refuses. Pins
+/// `spares_under`'s `Unreadable` arm (the `let … else { return true }` branch).
+#[test]
+fn delete_refuses_while_a_job_record_cannot_be_read() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "busy".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let job = home.home().join(".claude").join("jobs").join("0add99ec");
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    std::fs::write(
+        job.join("state.json"),
+        br#"{"state":"working","providerEnv":{"CLAUDE_CON"#,
+    )
+    .expect("torn job record");
+
+    let err = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("busy"),
+        false,
+        &rotation_guard("busy"),
+    )
+    .expect_err("an unreadable job store must refuse the unforced delete");
+    assert_eq!(
+        err.to_string(),
+        "'busy' has a live session, pass --force to delete it anyway"
+    );
+}
+
 /// A delete landing inside a rotation's HTTP window raced it: both took only
 /// the state flock, so nothing serialized them. The delete now takes the
 /// rotation lock first and refuses on busy — ahead of the credentials unwire,
@@ -4632,6 +4816,67 @@ fn rename_refuses_a_live_session() {
             .expect("old dir")
             .exists(),
         "the refused rename must leave the directory where it was"
+    );
+}
+
+/// A Claude Code background job naming any tree under a profile's dir is a live
+/// session for `rename_profile`'s refusal too: the rename moves the whole
+/// profile dir, so a job's `CLAUDE_CONFIG_DIR` would name a path that no longer
+/// exists — the same orphan delete's clause closed. Same refusal, same message
+/// (the fold into `has_live_session` makes the call site's "same predicate and
+/// copy" claim true again).
+#[test]
+fn rename_refuses_a_profile_with_a_background_job_tree() {
+    let home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "busy".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+
+    // A job naming a runtime tree under the profile dir.
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("busy")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let job = home.home().join(".claude").join("jobs").join("37560ded");
+    std::fs::create_dir_all(job.join("tmp")).expect("mkdir job dir");
+    let record = serde_json::json!({
+        "providerEnv": { "CLAUDE_CONFIG_DIR": tree.to_string_lossy() },
+    });
+    std::fs::write(
+        job.join("state.json"),
+        serde_json::to_vec(&record).expect("encode job"),
+    )
+    .expect("write job");
+
+    let err = rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("busy"),
+        &crate::profile::ProfileName::from("calm"),
+        &rotation_guard("busy"),
+    )
+    .expect_err("a background job tree must refuse the rename");
+    assert_eq!(err.to_string(), "'busy' has a live session, close it first");
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("busy"))
+            .is_some()
+            && config
+                .find(&crate::profile::ProfileName::from("calm"))
+                .is_none(),
+        "the refused rename must leave the record under its old name"
     );
 }
 
@@ -5053,6 +5298,57 @@ fn disable_refuses_a_profile_with_a_live_session() {
 
     let err = disable_profile(&mut config, &crate::profile::ProfileName::from("busy"))
         .expect_err("a live session must be refused");
+    assert_eq!(err.to_string(), "'busy' has a live session, close it first");
+    assert!(
+        !config
+            .find(&crate::profile::ProfileName::from("busy"))
+            .unwrap()
+            .is_disabled(),
+        "a refused disable must leave the flag untouched"
+    );
+}
+
+/// A Claude Code background job naming any tree under a profile's dir is a live
+/// session for `disable_profile`'s refusal too: a disabled account must never
+/// be reachable as an active target while a background session keeps spending
+/// it. Same refusal, same message.
+#[test]
+fn disable_refuses_a_profile_with_a_background_job_tree() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "busy".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
+
+    // A job naming a runtime tree under the profile dir.
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("busy")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let job = home.home().join(".claude").join("jobs").join("37560ded");
+    std::fs::create_dir_all(job.join("tmp")).expect("mkdir job dir");
+    let record = serde_json::json!({
+        "providerEnv": { "CLAUDE_CONFIG_DIR": tree.to_string_lossy() },
+    });
+    std::fs::write(
+        job.join("state.json"),
+        serde_json::to_vec(&record).expect("encode job"),
+    )
+    .expect("write job");
+
+    let err = disable_profile(&mut config, &crate::profile::ProfileName::from("busy"))
+        .expect_err("a background job tree must refuse the disable");
     assert_eq!(err.to_string(), "'busy' has a live session, close it first");
     assert!(
         !config

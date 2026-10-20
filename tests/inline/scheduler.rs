@@ -2242,7 +2242,13 @@ fn plan_ride_preserves_fetched_at_and_stays_stale_despite_advanced_mtime() {
         state: AppState::default(),
         profiles: vec![oauth_profile_disabled("a", false)],
     };
-    let entries = crate::daemon::build_profile_entries(&config, REFRESH_INTERVAL_MS, None, false);
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        REFRESH_INTERVAL_MS,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let entry = entries
         .iter()
         .find(|e| e.name.as_str() == "a")
@@ -2322,7 +2328,13 @@ fn fresh_body_stamps_fetched_at_and_reads_not_stale() {
         state: AppState::default(),
         profiles: vec![oauth_profile_disabled("a", false)],
     };
-    let entries = crate::daemon::build_profile_entries(&config, REFRESH_INTERVAL_MS, None, false);
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        REFRESH_INTERVAL_MS,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let entry = entries
         .iter()
         .find(|e| e.name.as_str() == "a")

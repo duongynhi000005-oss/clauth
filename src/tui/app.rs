@@ -4791,6 +4791,12 @@ pub(crate) struct App {
     /// — the state a fixture writes to force a re-tally, since backdating an
     /// `Instant` panics on a host booted more recently than the interval.
     last_live_sessions_refresh: Option<Instant>,
+    /// The job-store snapshot the Setup detail's live-session field reads from,
+    /// so a frame never walks `~/.claude/jobs`. Cached like `live_sessions`:
+    /// refreshed by [`poll_live_sessions`] on its own tick, never on a config
+    /// reload (jobs come and go without touching config), and seeded in
+    /// [`App::new`] so the first frame already reads a real snapshot.
+    pub(crate) job_trees: crate::claude_jobs::JobTrees,
     /// The widest the header's `[ N live ]` chip has read `N`, in cells: the
     /// chip renders at least this wide for the TUI's lifetime.
     pub(crate) live_count_width: usize,
@@ -5402,6 +5408,7 @@ impl App {
             live_count_width: live_count_text(live_sessions.total()).chars().count(),
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
+            job_trees: crate::claude_jobs::job_trees(),
             tps: None,
             tps_rate_width: 0,
             last_tps_refresh: Instant::now(),
@@ -24614,6 +24621,10 @@ fn poll_live_sessions(app: &mut App) {
     app.last_live_sessions_refresh = Some(Instant::now());
     let tally = crate::live_sessions::LiveTally::collect(&app.config());
     app.set_live_sessions(tally);
+    // The job-store snapshot rides the same tick: refresh it here, never per
+    // frame, so the Setup detail's live-session field reads a store at most
+    // once a second.
+    app.job_trees = crate::claude_jobs::job_trees();
 }
 
 /// The header chip's number: the fleet total, or `—` for a tally that could
