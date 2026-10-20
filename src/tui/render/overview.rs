@@ -1419,7 +1419,7 @@ fn deepseek_balance_cell(
     let inner: String = balances
         .iter()
         .map(|b| match b.rsplit_once(' ') {
-            Some((amount, currency)) => format!("{amount:<amount_w$} {currency}"),
+            Some((amount, currency)) => format!("{amount:>amount_w$} {currency}"),
             None => b.clone(),
         })
         .collect::<Vec<_>>()

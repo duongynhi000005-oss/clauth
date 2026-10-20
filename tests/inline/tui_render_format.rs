@@ -646,20 +646,19 @@ fn stale_window_fades_only_fill_and_percent() {
 ///
 /// Both fixtures sit HALF A DAY off the boundary, so the wall clock cannot walk
 /// either across it between building the fixture and rendering it. The date
-/// arm renders the 2026-08-22 ruling's local prose stamp through
-/// `crate::format::local_stamp`; the expected string derives through chrono's own
-/// `format` rather than the crate's formatter, so the pin is a second
-/// derivation of the same claim, not a copy of the code's arithmetic — it
-/// holds in any zone, UTC included (local equals UTC there, and the contract
-/// is satisfied by either). The literal stamp is also pinned against a fixed
-/// epoch through the chain surface by
-/// `the_last_swap_age_renders_one_unit_and_a_date_past_thirty_days`; what this
-/// owns is the branch.
+/// arm renders the contract's absolute ISO date (`YYYY-MM-DD`, no time) in the
+/// local wall clock; the expected string derives through chrono's own `format`
+/// rather than the crate's formatter, so the pin is a second derivation of the
+/// same claim, not a copy of the code's arithmetic — it holds in any zone, UTC
+/// included (local equals UTC there, and the contract is satisfied by either).
+/// The literal date is also pinned against a fixed epoch through the chain
+/// surface by `the_last_swap_age_renders_one_unit_and_a_date_past_thirty_days`;
+/// what this owns is the branch.
 ///
 /// `relative_age` also feeds the status tab's incident ages (the list row and
 /// the detail header), so the arm protects three surfaces, not one.
 #[test]
-fn relative_age_switches_to_a_local_stamp_at_thirty_days() {
+fn relative_age_switches_to_an_iso_date_at_thirty_days() {
     const DAY_MS: u64 = 86_400_000;
     const HALF_DAY_MS: u64 = 43_200_000;
     let ago = |ms: u64| crate::usage::now_ms().saturating_sub(ms);
@@ -673,26 +672,26 @@ fn relative_age_switches_to_a_local_stamp_at_thirty_days() {
     let local = chrono::DateTime::from_timestamp((at_ms / 1000) as i64, 0)
         .unwrap()
         .with_timezone(&chrono::Local)
-        .format("%Y-%m-%d %H:%M:%S")
+        .format("%Y-%m-%d")
         .to_string();
-    assert_eq!(dated, local, "30d12h must take the local stamp arm");
+    assert_eq!(dated, local, "30d12h must take the ISO date arm");
 
-    // Where the fixture instant's local spelling differs from its UTC one,
-    // the UTC spelling must NOT be the answer: a stamp that regressed to UTC
-    // digits in the 19-char shape would still equal the local one on a UTC
-    // box, and where the two spellings coincide there is no second spelling
-    // to ban. The condition compares spellings, never the run-instant offset:
-    // a DST zone can read +00 at the fixture instant and nonzero now (the
-    // trap `sessions_cli`'s stamp pin records), and the offset read would
-    // fire the guard over two identical spellings.
+    // Where the fixture instant's local date differs from its UTC one, the UTC
+    // date must NOT be the answer: a date that regressed to UTC digits would
+    // still equal the local one on a UTC box, and where the two spellings
+    // coincide there is no second spelling to ban. The condition compares
+    // spellings, never the run-instant offset: a DST zone can read +00 at the
+    // fixture instant and nonzero now (the trap `sessions_cli`'s stamp pin
+    // records), and the offset read would fire the guard over two identical
+    // spellings.
     let utc = chrono::DateTime::from_timestamp((at_ms / 1000) as i64, 0)
         .unwrap()
-        .format("%Y-%m-%d %H:%M:%S")
+        .format("%Y-%m-%d")
         .to_string();
     if local != utc {
         assert_ne!(
             dated, utc,
-            "the arm rendered UTC digits, not local wall clock: {dated:?}"
+            "the arm rendered the UTC date, not local wall clock: {dated:?}"
         );
     }
 }

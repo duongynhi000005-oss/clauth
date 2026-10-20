@@ -133,9 +133,12 @@ fn the_status_detail_surfaces_render_whole_at_narrow_widths() {
     let app = status_app();
     // The started/update stamps render through `chrono::Local`, so the pins
     // build them with the same formatter instead of hard-coding one zone's
-    // wall clock (which red on any other box timezone).
+    // wall clock (which red on any other box timezone). The header AGE is the
+    // contract's ISO date (date only), distinct from the full `started` stamp.
     let started = crate::format::local_stamp(1_780_740_881)
         .expect("the started stamp resolves to a local wall clock");
+    let started_date = crate::format::local_date(1_780_740_881)
+        .expect("the started date resolves to a local wall clock");
     let at = crate::format::local_stamp(1_780_741_000)
         .expect("the update stamp resolves to a local wall clock");
     let stacked: Vec<(u16, Vec<String>)> = vec![
@@ -143,7 +146,7 @@ fn the_status_detail_surfaces_render_whole_at_narrow_widths() {
             27,
             vec![
                 "│ [ monitoring ]  [ minor │".to_string(),
-                format!("│   {started}   │"),
+                format!("│   {started_date}            │"),
                 "│   ongoing               │".to_string(),
                 "│ started                 │".to_string(),
                 format!("│   {started}   │"),
@@ -163,7 +166,7 @@ fn the_status_detail_surfaces_render_whole_at_narrow_widths() {
             28,
             vec![
                 "│ [ monitoring ]  [ minor  │".to_string(),
-                format!("│   {started}    │"),
+                format!("│   {started_date}             │"),
                 "│   ongoing                │".to_string(),
                 "│ started                  │".to_string(),
                 format!("│   {started}    │"),
@@ -183,7 +186,7 @@ fn the_status_detail_surfaces_render_whole_at_narrow_widths() {
             34,
             vec![
                 "│ [ monitoring ]  [ minor ]      │".to_string(),
-                format!("│   {started}          │"),
+                format!("│   {started_date}                   │"),
                 "│   ongoing                      │".to_string(),
                 "│ started                        │".to_string(),
                 format!("│   {started}          │"),
@@ -201,8 +204,7 @@ fn the_status_detail_surfaces_render_whole_at_narrow_widths() {
         (
             45,
             vec![
-                "│ [ monitoring ]  [ minor ]                 │".to_string(),
-                format!("│   {started}                     │"),
+                format!("│ [ monitoring ]  [ minor ]  {started_date}     │"),
                 "│   ongoing                                 │".to_string(),
                 format!("│ started      {started}          │"),
                 "│ components   ● claude.ai  ● 日 本 語 サ ー ビ   │".to_string(),
@@ -220,7 +222,7 @@ fn the_status_detail_surfaces_render_whole_at_narrow_widths() {
         let rows = frame_rows(&app, w, 40);
         let start = rows
             .iter()
-            .position(|r| r.contains("ELEVATED ERROR RATES"))
+            .position(|r| r.contains("╭─ elevated error rates"))
             .unwrap_or_else(|| panic!("detail title missing at {w}"));
         let end = rows[start + 1..]
             .iter()
@@ -234,6 +236,37 @@ fn the_status_detail_surfaces_render_whole_at_narrow_widths() {
             .collect();
         assert_eq!(got, expected, "status detail panel at {w} cols");
     }
+}
+
+/// The incident detail is named after the selected incident's own identity, so
+/// its title keeps the incident's original case (the Panel proper-noun
+/// exception); the no-selection fallback stays an uppercase structural title.
+#[test]
+fn the_incident_detail_title_keeps_the_incident_case() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = status_app();
+    // A real status.claude.com title is mixed case, so "keeps the case" must
+    // mean exactly these bytes — a forced lowercase would pass an all-lowercase
+    // fixture and a forced uppercase would pass a structural label.
+    app.status.incidents[0].title = "Elevated Errors on Claude.ai".into();
+    let rows = frame_rows(&app, 160, 40);
+    let title = rows
+        .iter()
+        .find(|r| r.contains("╭─ Elevated Errors on Claude.ai"))
+        .expect("the detail title renders");
+    assert!(
+        title.contains("╭─ Elevated Errors on Claude.ai ─"),
+        "the incident identity keeps its case: {title:?}"
+    );
+
+    // No selection → the structural `status` title stays uppercase.
+    let mut bare = status_app();
+    bare.status.incidents.clear();
+    let rows = frame_rows(&bare, 160, 40);
+    assert!(
+        rows.iter().any(|r| r.contains(" STATUS ")),
+        "the structural fallback title stays uppercase: {rows:?}"
+    );
 }
 
 /// A panel title wider than its top border ends in `…` inside the border
@@ -307,6 +340,8 @@ fn the_status_detail_desktop_rows_replace_the_pre_s9_clip() {
     let app = status_app();
     let started = crate::format::local_stamp(1_780_740_881)
         .expect("the started stamp resolves to a local wall clock");
+    let started_date = crate::format::local_date(1_780_740_881)
+        .expect("the started date resolves to a local wall clock");
     let at = crate::format::local_stamp(1_780_741_000)
         .expect("the update stamp resolves to a local wall clock");
     let rows = frame_rows(&app, 80, 40);
@@ -324,8 +359,10 @@ fn the_status_detail_desktop_rows_replace_the_pre_s9_clip() {
     assert_eq!(
         got,
         vec![
-            format!("│ ❯ elevated error ra… ││ [ monitoring ]  [ minor ]  {started}       │"),
-            format!("│                      ││ started      {started}                     │"),
+            format!(
+                "│ ❯ elevated error ra… ││ [ monitoring ]  [ minor ]  {started_date}        ongoing │"
+            ),
+            format!("│   [ minor ]       ●  ││ started      {started}                     │"),
             format!("│                      ││ {at} monitoring    a fix has been     │"),
             "│                      ││                                   日 …  → operational │"
                 .to_string(),
@@ -346,6 +383,8 @@ fn the_status_detail_desktop_rows_measure_by_cells() {
     let app = status_app();
     let started = crate::format::local_stamp(1_780_740_881)
         .expect("the started stamp resolves to a local wall clock");
+    let started_date = crate::format::local_date(1_780_740_881)
+        .expect("the started date resolves to a local wall clock");
     let at = crate::format::local_stamp(1_780_741_000)
         .expect("the update stamp resolves to a local wall clock");
     let rows = frame_rows(&app, 160, 40);
@@ -363,7 +402,7 @@ fn the_status_detail_desktop_rows_measure_by_cells() {
     assert_eq!(
         got,
         vec![
-            format!("│ ❯ elevated error rates on the api a… ││ [ monitoring ]  [ minor ]  {started}                                                               ongoing │"),
+            format!("│ ❯ elevated error rates on the api a… ││ [ monitoring ]  [ minor ]  {started_date}                                                                        ongoing │"),
             format!("│   [ minor ]                       ●  ││ started      {started}                                                                                     │"),
             format!("│                                      ││ {at} monitoring    a fix has been implemented and we are monitoring                                   │"),
             "│                                      ││                                   日 本 語 サ ー ビ ス   → operational                                                      │".to_string(),

@@ -426,6 +426,7 @@ impl ThirdPartyStats {
             label: String::new(),
             value: LOW_BALANCE.to_string(),
             kind: StatRowKind::Danger,
+            raw: None,
         });
         Self {
             is_available: false,
@@ -517,9 +518,25 @@ impl ThirdPartyStats {
 pub(crate) struct StatRow {
     /// Left-hand label. Empty for single-line messages (e.g. "unavailable").
     pub(crate) label: String,
-    /// Right-hand value.
+    /// Right-hand value, the compact spelling every non-TUI reader parses.
     pub(crate) value: String,
     pub(crate) kind: StatRowKind,
+    /// The full-precision figure(s) behind `value`, for the TUI's Usage detail
+    /// to render grouped. Absent for every provider but z.ai, whose producer
+    /// pre-abbreviates counts the detail pane must spell in full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) raw: Option<StatRowRaw>,
+}
+
+/// A full-precision value the TUI's Usage detail renders with thousands
+/// separators, beside the compact [`StatRow::value`] every other reader keeps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum StatRowRaw {
+    /// One bare count.
+    Count { value: u64 },
+    /// A token total with a trailing call count, rendered `N  (M calls)`.
+    Calls { value: u64, calls: u64 },
 }
 
 /// What every surface says when a provider reports the account cannot fund a

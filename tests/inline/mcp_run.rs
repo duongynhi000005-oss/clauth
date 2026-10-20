@@ -5214,6 +5214,7 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
                 label: "total".to_string(),
                 value: "1117.10 CNY".to_string(),
                 kind: crate::providers::StatRowKind::Body,
+                raw: None,
             }],
             bars: Vec::new(),
             plan: None,
@@ -5302,6 +5303,7 @@ fn roster_rank_skips_a_third_party_bar_whose_reset_has_passed() {
                 label: "total".to_string(),
                 value: "1117.10 CNY".to_string(),
                 kind: crate::providers::StatRowKind::Body,
+                raw: None,
             }],
             bars: vec![
                 bar("5h", 100.0, Some(stamp(-3600))),
@@ -5330,6 +5332,7 @@ fn roster_rank_skips_a_third_party_bar_whose_reset_has_passed() {
                 label: "total".to_string(),
                 value: "1117.10 CNY".to_string(),
                 kind: crate::providers::StatRowKind::Body,
+                raw: None,
             }],
             bars: vec![bar("5h", 100.0, Some(stamp(-3600)))],
             plan: None,
@@ -5760,6 +5763,7 @@ fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
         label: label.to_string(),
         value: value.to_string(),
         kind: StatRowKind::Body,
+        raw: None,
     };
     // DeepSeek's real shape for a dual-wallet account: USD block, then CNY.
     write_profile_cache(

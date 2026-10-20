@@ -5954,6 +5954,7 @@ fn wallet_stats(values: &[(&str, &str)]) -> crate::providers::ThirdPartyStats {
                 label: label.to_string(),
                 value: value.to_string(),
                 kind: crate::providers::StatRowKind::Body,
+                raw: None,
             })
             .collect(),
         bars: vec![],

@@ -604,6 +604,7 @@ fn a_wallet_series_renders_its_burn_rate_on_the_roster_row() {
                     label: "api balance".to_string(),
                     value: format!("{amount:.2} CNY"),
                     kind: crate::providers::StatRowKind::Body,
+                    raw: None,
                 }],
                 bars: vec![],
                 plan: None,

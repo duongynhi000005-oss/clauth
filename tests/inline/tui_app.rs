@@ -14999,6 +14999,7 @@ fn wire_wallet_stats(amount: f64) -> crate::providers::ThirdPartyStats {
             label: "api balance".to_string(),
             value: format!("{amount:.2} CNY"),
             kind: crate::providers::StatRowKind::Body,
+            raw: None,
         }],
         bars: vec![],
         plan: None,

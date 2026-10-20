@@ -395,14 +395,11 @@ fn the_age_tokens_and_cost_columns_widen_to_their_widest_cell() {
     let alpha = lines.iter().find(|l| l.contains("alpha")).unwrap();
     let beta = lines.iter().find(|l| l.contains("beta")).unwrap();
     let alpha_tail = format!(
-        "· 1d 1h ago  {}150  {}$1.05  alpha | alpha",
-        " ".repeat(8),
+        "· 1d ago  {}150  {}$1.05  alpha | alpha",
+        " ".repeat(10),
         " ".repeat(4)
     );
-    let beta_tail = format!(
-        "· 5s ago{}  12345678901  $12345.67  beta | beta",
-        " ".repeat(3)
-    );
+    let beta_tail = "· just now  12345678901  $12345.67  beta | beta".to_string();
     assert!(alpha.ends_with(&alpha_tail), "{alpha:?}");
     assert!(beta.ends_with(&beta_tail), "{beta:?}");
 }
@@ -437,7 +434,7 @@ fn the_table_stamp_renders_local_wall_clock_with_a_relative_age() {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
     assert!(
-        row.contains(&format!("{local} · 3h 12m ago")),
+        row.contains(&format!("{local} · 3h ago")),
         "the row renders the local stamp paired with its age: {row}"
     );
     assert!(
@@ -461,12 +458,12 @@ fn the_table_stamp_renders_local_wall_clock_with_a_relative_age() {
     }
 }
 
-/// The age half of the pairing: a zero or negative age renders `· now`, never
-/// `now ago` — `humanize_duration` spells ≤0 `now`, so the generic ` ago`
-/// pairing would stutter over a sub-second-fresh file or a future mtime, both
-/// routine rows. A positive age keeps the full `· 3h 12m ago` pairing.
+/// The age half of the pairing: a zero or negative age renders `· just now`,
+/// never `now ago` — the shared formatter spells ≤0 `just now`, so the generic
+/// ` ago` pairing would stutter over a sub-second-fresh file or a future mtime,
+/// both routine rows. A positive age keeps the one-unit `· 3h ago` pairing.
 #[test]
-fn the_stamp_age_renders_now_for_non_positive_ages_and_ago_for_positive() {
+fn the_stamp_age_renders_just_now_for_non_positive_ages_and_ago_for_positive() {
     let sb = HomeSandbox::new();
     let a = sb.home().join(".claude/projects/-w-a/aaaa-1111.jsonl");
     write_jsonl(&a, &[user_line("aaaa-1111", "/ws/a", "hello")]);
@@ -479,7 +476,10 @@ fn the_stamp_age_renders_now_for_non_positive_ages_and_ago_for_positive() {
     // Zero age: `now` sits exactly on the mtime, the same whole-second a
     // sub-second-fresh file truncates to.
     let zero = session_row(session, false, updated, Columns::FLOOR);
-    assert!(zero.contains("· now"), "zero age renders `now`: {zero}");
+    assert!(
+        zero.contains("· just now"),
+        "zero age renders `just now`: {zero}"
+    );
     assert!(!zero.contains("now ago"), "zero age never stutters: {zero}");
 
     // Negative age: a future mtime (the clock behind the file) is the same
@@ -487,20 +487,174 @@ fn the_stamp_age_renders_now_for_non_positive_ages_and_ago_for_positive() {
     let behind = updated - Duration::from_secs(60);
     let future = session_row(session, false, behind, Columns::FLOOR);
     assert!(
-        future.contains("· now"),
-        "a future mtime renders `now`: {future}"
+        future.contains("· just now"),
+        "a future mtime renders `just now`: {future}"
     );
     assert!(
         !future.contains("now ago"),
         "a future mtime never stutters: {future}"
     );
 
-    // Positive age: the full pairing survives the ≤0 branch.
+    // Positive age: the full one-unit pairing survives the ≤0 branch.
     let ahead = updated + Duration::from_secs(11_520);
     let positive = session_row(session, false, ahead, Columns::FLOOR);
     assert!(
-        positive.contains("· 3h 12m ago"),
-        "a positive age keeps the full pairing: {positive}"
+        positive.contains("· 3h ago"),
+        "a positive age keeps the one-unit pairing: {positive}"
+    );
+}
+
+/// The stamp-paired cell drops the age half once the age would be a date (30
+/// days and past): the full local stamp already carries the date, so a second
+/// copy reads as a duplicate. Younger rows keep the `stamp · age` pairing.
+#[test]
+fn the_stamp_cell_drops_the_age_half_once_it_would_be_a_date() {
+    let sb = HomeSandbox::new();
+    let a = sb.home().join(".claude/projects/-w-a/aaaa-1111.jsonl");
+    write_jsonl(&a, &[user_line("aaaa-1111", "/ws/a", "hello")]);
+    let updated = SystemTime::UNIX_EPOCH + Duration::from_secs(1_782_000_000);
+    set_mtime(&a, updated);
+
+    let groups = build_listing(false);
+    let session = &groups[0].sessions[0];
+    let local = chrono::DateTime::from_timestamp(1_782_000_000, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+
+    // 29 days: the one-unit age pairs with the stamp (`4w ago`, never `4w 1d`).
+    let twenty_nine = session_row(
+        session,
+        false,
+        updated + Duration::from_secs(29 * 86_400),
+        Columns::FLOOR,
+    );
+    assert!(
+        twenty_nine.contains(&format!("{local} · 4w ago")),
+        "29 days keeps the pairing: {twenty_nine}"
+    );
+
+    // 30 days: the age would repeat the stamp's own date, so the cell prints the
+    // stamp alone — no ` · ` separator, no date duplicate.
+    let thirty = session_row(
+        session,
+        false,
+        updated + Duration::from_secs(30 * 86_400),
+        Columns::FLOOR,
+    );
+    assert!(thirty.contains(&local), "the stamp survives: {thirty}");
+    assert!(
+        !thirty.contains(" · "),
+        "the age half drops once it would be a date: {thirty}"
+    );
+}
+
+/// A mixed listing — one 40-day (stamp-alone) session, one 3-hour session —
+/// keeps the stamp-alone row's token, cost and preview columns in the same
+/// cells as the `stamp · age` row's: the age column and ` · ` separator stay
+/// reserved even though the old row's age half is empty, so whole-row equality
+/// reds on a reservation that drops any of that width.
+#[test]
+fn the_stamp_alone_row_keeps_its_columns_aligned_with_its_age_sibling() {
+    let sb = HomeSandbox::new();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    for (id, text, age) in [
+        ("aaaa-1111", "alpha", 40 * 86_400),
+        ("bbbb-2222", "beta", 3 * 3600),
+    ] {
+        let path = sb.home().join(format!(".claude/projects/-w-a/{id}.jsonl"));
+        write_jsonl(&path, &[user_line(id, "/ws/a", text)]);
+        set_mtime(&path, now - Duration::from_secs(age as u64));
+    }
+    let mut groups = build_listing(false);
+    for s in &mut groups[0].sessions {
+        (s.tokens, s.cost) = if s.id == "aaaa-1111" {
+            (Some(150), Some(1.05))
+        } else {
+            (Some(12_345_678_901), Some(12_345.67))
+        };
+    }
+
+    // Columns measured over both rows: id 9 (both stems are non-uuid), profile
+    // 12, age 6 (`3h ago`), tokens 11, cost 9. The young row's usage fills both
+    // figure widths exactly, so it carries no left pad.
+    let lines = table_lines(&groups, true, now);
+    let young_stamp = chrono::DateTime::from_timestamp(1_800_000_000 - 3 * 3600, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let old_stamp = chrono::DateTime::from_timestamp(1_800_000_000 - 40 * 86_400, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let expected_young = format!(
+        "  bbbb-2222  {prof}  {stamp} · 3h ago  12345678901  $12345.67  beta | beta",
+        prof = "-".to_owned() + &" ".repeat(11),
+        stamp = young_stamp,
+    );
+    // The stamp-alone cell reserves ` · ` (3) + the age column (6), so the old
+    // row's 3-digit token total left-pads 8 into the same 11-cell column.
+    let expected_old = format!(
+        "  aaaa-1111  {prof}  {stamp}{reserve}  {tok}150  {cost}$1.05  alpha | alpha",
+        prof = "-".to_owned() + &" ".repeat(11),
+        stamp = old_stamp,
+        reserve = " ".repeat(3 + 6),
+        tok = " ".repeat(8),
+        cost = " ".repeat(4),
+    );
+    assert_eq!(
+        lines,
+        vec!["/ws/a".to_string(), expected_young, expected_old],
+        "the stamp-alone row keeps the age sibling's column starts"
+    );
+}
+
+/// A listing whose every session is ≥30 days prints the stamp alone with no
+/// reserved age column: the preview follows the stamp after the normal column
+/// gap, never `3 + age` blank cells when no row carries an age half.
+#[test]
+fn an_all_stamp_alone_listing_reserves_no_age_column() {
+    let sb = HomeSandbox::new();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    for (id, text, age) in [
+        ("aaaa-1111", "alpha", 40 * 86_400),
+        ("bbbb-2222", "beta", 31 * 86_400),
+    ] {
+        let path = sb.home().join(format!(".claude/projects/-w-a/{id}.jsonl"));
+        write_jsonl(&path, &[user_line(id, "/ws/a", text)]);
+        set_mtime(&path, now - Duration::from_secs(age as u64));
+    }
+    let groups = build_listing(false);
+    let lines = table_lines(&groups, false, now);
+    let beta_stamp = chrono::DateTime::from_timestamp(1_800_000_000 - 31 * 86_400, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let alpha_stamp = chrono::DateTime::from_timestamp(1_800_000_000 - 40 * 86_400, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    // Newest first: the 31-day session leads. Each row is the stamp plus the
+    // normal two-space column gap before the preview — no reserved age column.
+    let expected_beta = format!(
+        "  bbbb-2222  {prof}  {stamp}  beta | beta",
+        prof = "-".to_owned() + &" ".repeat(11),
+        stamp = beta_stamp,
+    );
+    let expected_alpha = format!(
+        "  aaaa-1111  {prof}  {stamp}  alpha | alpha",
+        prof = "-".to_owned() + &" ".repeat(11),
+        stamp = alpha_stamp,
+    );
+    assert_eq!(
+        lines,
+        vec!["/ws/a".to_string(), expected_beta, expected_alpha],
+        "an all-stamp-alone listing keeps only the normal column gap"
     );
 }
 
@@ -536,7 +690,7 @@ fn the_human_row_and_json_disagree_on_the_stamp_shape_by_design() {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
     assert!(
-        human.contains(&format!("{local} · 3h 12m ago")),
+        human.contains(&format!("{local} · 3h ago")),
         "the human row renders the local stamp and its age: {human}"
     );
     assert!(

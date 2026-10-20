@@ -150,6 +150,7 @@ fn rows(models: &[ModelRemains]) -> Vec<StatRow> {
         label: "remaining".to_string(),
         value: String::new(),
         kind: StatRowKind::Heading,
+        raw: None,
     }];
     for m in models {
         let pct = |p: Option<i64>| match p {
@@ -188,6 +189,7 @@ fn rows(models: &[ModelRemains]) -> Vec<StatRow> {
                 Some(0) => StatRowKind::Danger,
                 _ => StatRowKind::Body,
             },
+            raw: None,
         });
     }
     rows

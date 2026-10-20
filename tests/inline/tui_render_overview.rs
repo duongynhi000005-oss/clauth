@@ -320,12 +320,14 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
                 label: format!("{currency} balance"),
                 value: String::new(),
                 kind: crate::providers::StatRowKind::Heading,
+                raw: None,
             });
         }
         rows.push(crate::providers::StatRow {
             label: crate::providers::DEEPSEEK_BALANCE_ROW_LABEL.into(),
             value: (*t).to_string(),
             kind: crate::providers::StatRowKind::Body,
+            raw: None,
         });
     }
     let stats = crate::providers::ThirdPartyStats {
@@ -1717,6 +1719,7 @@ fn an_unpolled_row_with_stats_but_nothing_drawn_gets_no_mark() {
             label: "credits".into(),
             value: "12.00 USD".into(),
             kind: crate::providers::StatRowKind::Body,
+            raw: None,
         });
     }
     let (mut ds_empty, ds_empty_readings) = deepseek_profile("d0", &[]);
@@ -2778,6 +2781,41 @@ fn deepseek_multi_currency_shows_all_above_zero() {
         cny < usd,
         "higher balance (100.00 CNY) renders before 1.71 USD: {cell:?}"
     );
+}
+
+/// A DeepSeek balance right-aligns each amount to the widest amount (pad on the
+/// LEFT), so the currency follows exactly one space after the widest amount and
+/// a shorter amount is left-padded: `[  1.71 USD]` over `[197.50 CNY]`, never
+/// `[1.71   USD]`.
+#[test]
+fn deepseek_balance_amounts_right_align_to_the_widest() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, readings) = config_with(
+        vec![
+            deepseek_profile("short", &["1.71 USD"]),
+            deepseek_profile("long", &["197.50 CNY"]),
+        ],
+        Some("short"),
+        vec![],
+    );
+    let app = App::new(config);
+    for terminal in [80u16, 120u16] {
+        let widths = OverviewWidths::new(terminal.saturating_sub(4), &app, &readings);
+        let short_row = render_overview_row(&app, 0, &widths, false, false, &readings);
+        let long_row = render_overview_row(&app, 1, &widths, false, false, &readings);
+        let short_cell = five_hour_cell_text(&widths, true, &short_row);
+        let long_cell = five_hour_cell_text(&widths, true, &long_row);
+        assert_eq!(
+            short_cell.trim_end(),
+            "[  1.71 USD]",
+            "the short amount left-pads at {terminal} cols: {short_cell:?}"
+        );
+        assert_eq!(
+            long_cell.trim_end(),
+            "[197.50 CNY]",
+            "the widest amount anchors the column at {terminal} cols: {long_cell:?}"
+        );
+    }
 }
 
 /// When only one currency is above 0, only that one shows — the zero-balance

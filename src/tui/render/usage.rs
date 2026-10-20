@@ -25,7 +25,7 @@ use super::panes::{
 use super::prose::{self, cmd, cmd_lit, key_lit};
 use crate::format::{account_tier, format_pct};
 use crate::profile::Profile;
-use crate::providers::{Provider, StatRowKind};
+use crate::providers::{Provider, StatRow, StatRowKind, StatRowRaw};
 use crate::usage::{
     ExtraPeriod, FetchStatus, KickBlock, ProfileActivity, QueueSlot, StreakCounts, UsageWindow,
     WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak, kick_block_switch_grade,
@@ -1806,6 +1806,24 @@ fn build_tp_rows(
         if has_bars {
             lines.push(Line::from(""));
         }
+        // The widest FIGURE value, so every figure (Body, Danger, and the
+        // z.ai `total` row's leading count) left-pads to it and the right
+        // edges align (the contract's numeric-column rule); a word or no-data
+        // glyph starts at the value column unpadded.
+        let value_w = stats
+            .rows
+            .iter()
+            .filter(|r| {
+                !r.label.is_empty()
+                    && matches!(
+                        r.kind,
+                        StatRowKind::Body | StatRowKind::Danger | StatRowKind::Faint
+                    )
+            })
+            .filter(|r| is_row_figure(r))
+            .map(|r| Span::raw(&row_parts(r).0).width())
+            .max()
+            .unwrap_or(0);
         for row in &stats.rows {
             if row.label.is_empty() {
                 let style = match row.kind {
@@ -1824,7 +1842,22 @@ fn build_tp_rows(
                     StatRowKind::Faint => theme::faint(),
                     _ => theme::body(),
                 };
-                let mut spans = key_value_span(&row.label, &row.value, style);
+                let (lead, tail) = row_parts(row);
+                let pad = if matches!(
+                    row.kind,
+                    StatRowKind::Body | StatRowKind::Danger | StatRowKind::Faint
+                ) && is_row_figure(row)
+                {
+                    value_w
+                } else {
+                    0
+                };
+                let mut spans = key_value_span(&row.label, &lead, style, pad);
+                // The `total` row's `(N calls)` suffix trails outside the figure
+                // column, after its leading count has padded into it.
+                if let Some(tail) = tail {
+                    spans.push(Span::styled(tail, style));
+                }
                 // The rate rides only the funded wallet's own row — matched on
                 // (label, currency), since a two-wallet provider lists both
                 // under the same label with different currencies.
@@ -1942,11 +1975,68 @@ fn bar_amount(bar: &crate::providers::UsageBar) -> String {
 /// longest label — DeepSeek's `api balance` — plus a 1-space gap).
 const TP_KEY_W: usize = 11;
 
-fn key_value_span(key: &str, value: &str, value_style: Style) -> Vec<Span<'static>> {
+/// A labelled stat row's rendered value split for the figure column: the
+/// leading figure (the number the column measures and pads) and, for a `Calls`
+/// row, the trailing `  (N calls)` suffix that stays outside the column. The
+/// full grouped figure comes from the raw count when the producer carried one
+/// (z.ai's token totals), else the row's pre-formatted `value`.
+fn row_parts(row: &StatRow) -> (String, Option<String>) {
+    match &row.raw {
+        Some(StatRowRaw::Count { value }) => {
+            (crate::format::group_thousands(*value as f64, 0), None)
+        }
+        Some(StatRowRaw::Calls { value, calls }) => (
+            crate::format::group_thousands(*value as f64, 0),
+            Some(format!(
+                "  ({} calls)",
+                crate::format::group_thousands(*calls as f64, 0)
+            )),
+        ),
+        None => (row.value.clone(), None),
+    }
+}
+
+/// Whether a labelled row's value reads as a figure — a raw-carrying row's
+/// count is always one; a value-only row is one when its text opens with a
+/// digit (or `-` + digit) and holds no `·` / `(`.
+fn is_row_figure(row: &StatRow) -> bool {
+    match &row.raw {
+        Some(_) => true,
+        None => is_figure(&row.value),
+    }
+}
+
+/// Whether a stat-row value reads as a figure — one number (optionally signed)
+/// with an optional unit/currency word — rather than a word (`valid`) or a
+/// no-data glyph (`-`, `—`), or a `·`-joined / parenthesized composite. Figure
+/// rows left-pad to the block's widest figure; everything else starts at the
+/// value column unpadded. Residuals the predicate cannot separate without a
+/// producer to distinguish them: a leading-currency `$5` reads as a word and an
+/// ISO date (`2026-10-01`) as a figure; no current producer emits either shape.
+fn is_figure(value: &str) -> bool {
+    let mut chars = value.chars();
+    let digit_led = match chars.next() {
+        Some(c) if c.is_ascii_digit() => true,
+        Some('-') => chars.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
+    };
+    digit_led && !value.contains('·') && !value.contains('(')
+}
+
+fn key_value_span(
+    key: &str,
+    value: &str,
+    value_style: Style,
+    value_w: usize,
+) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(
         format!("  {}", key_cell(key, TP_KEY_W, KEY_GUTTER)),
         theme::faint(),
     )];
+    let pad = value_w.saturating_sub(Span::raw(value).width());
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
     spans.push(Span::styled(value.to_string(), value_style));
     spans
 }

@@ -644,6 +644,43 @@ pub(crate) fn format_threshold_tokens(v: u64) -> String {
     }
 }
 
+/// Group the integer part of non-negative `n` with `,` thousands separators,
+/// keeping `decimals` fractional digits: `(12345.6, 2)` → `12,345.60`. The one
+/// shared grouping helper behind every full-precision detail-pane count.
+pub(crate) fn group_thousands(n: f64, decimals: usize) -> String {
+    let s = format!("{n:.decimals$}");
+    let (int, frac) = s.split_once('.').map_or((s.as_str(), ""), |(i, f)| (i, f));
+    let digits = int.len();
+    let mut out = String::with_capacity(digits + digits / 3 + 1 + frac.len());
+    for (i, ch) in int.chars().enumerate() {
+        if i > 0 && (digits - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
+    }
+    out
+}
+
+/// The local wall-clock date as `YYYY-MM-DD` — the contract's absolute-age
+/// spelling (an ISO date, no time). [`local_stamp`] is this plus the time of
+/// day. Returns `None` when the instant falls outside chrono's representable
+/// range.
+pub(crate) fn local_date(epoch: i64) -> Option<String> {
+    let naive = DateTime::from_timestamp(epoch, 0)?
+        .with_timezone(&Local)
+        .naive_local();
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        naive.year(),
+        naive.month(),
+        naive.day(),
+    ))
+}
+
 /// The one LOCAL prose-stamp formatter: an epoch-seconds instant as
 /// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock. A second spelling
 /// of a LOCAL stamp is a bug in its caller, not a new helper. Machine timestamps
@@ -655,10 +692,8 @@ pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
         .with_timezone(&Local)
         .naive_local();
     Some(format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        naive.year(),
-        naive.month(),
-        naive.day(),
+        "{} {:02}:{:02}:{:02}",
+        local_date(epoch)?,
         naive.hour(),
         naive.minute(),
         naive.second(),
@@ -687,8 +722,9 @@ pub(crate) const DIAG_MONTHLY_SOFT: &str =
 pub(crate) const DIAG_STALE: &str = "stale data";
 
 /// A seconds age as the relative ladder (`4m ago`, `2h ago`, `3d ago`), open
-/// ended into weeks. The TUI's `relative_age` (`tui/render/format.rs`) calls
-/// this under its own 30-day local-stamp arm.
+/// ended into weeks. The TUI's `relative_age` (`tui/render/format.rs`) and the
+/// CLI's session/device age cells call [`spoken_age`], which switches to the
+/// local ISO date at 30 days.
 pub(crate) fn humanize_age(secs: u64) -> String {
     let mins = secs / 60;
     let hours = mins / 60;
@@ -703,6 +739,29 @@ pub(crate) fn humanize_age(secs: u64) -> String {
         format!("{days}d ago")
     } else {
         format!("{}w ago", days / 7)
+    }
+}
+
+/// The 30-day line where [`spoken_age`] switches from the relative ladder to
+/// the local ISO date. Shared so a stamp-paired cell drops its age half at the
+/// same instant the age itself becomes a date (the full stamp already carries
+/// it), and the start walk derives the same arm.
+pub(crate) fn age_takes_a_date(age_secs: u64) -> bool {
+    age_secs >= 30 * 24 * 3600
+}
+
+/// A point-in-time age as a person reads it: one relative unit under 30 days
+/// (`4m ago`, `just now` under a minute), the local ISO date (`2026-04-12`) at
+/// 30 days and beyond. `age_secs` is the elapsed seconds; `epoch` is the
+/// instant's epoch seconds, used only for the date arm. The one shared
+/// formatter behind the TUI's `relative_age` and the CLI's `clauth sessions` /
+/// `clauth devices` age cells, so every person-facing age reads the same shape.
+/// `None` when the instant falls outside chrono's representable range.
+pub(crate) fn spoken_age(age_secs: u64, epoch: i64) -> Option<String> {
+    if age_takes_a_date(age_secs) {
+        local_date(epoch)
+    } else {
+        Some(humanize_age(age_secs))
     }
 }
 
@@ -744,7 +803,13 @@ fn start_verdict(row: &StartCandidate) -> String {
 fn start_age_cell(row: &StartCandidate) -> String {
     match row.age {
         OauthAge::Dated(ms) => {
-            let cell = format!("usage {}", humanize_age(ms / 1000));
+            let age_secs = ms / 1000;
+            // The date arm is `now - age` (the reading's own instant, derived,
+            // never a fresh fetch); `now` is the walk's reference instant.
+            let cell = format!(
+                "usage {}",
+                spoken_age(age_secs, row.now - age_secs as i64).unwrap_or_else(|| "-".to_string())
+            );
             if row.stale {
                 format!("{cell} (stale)")
             } else {

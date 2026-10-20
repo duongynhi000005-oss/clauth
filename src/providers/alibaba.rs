@@ -323,6 +323,7 @@ fn stats(
             label: "subscription".to_string(),
             value: String::new(),
             kind: StatRowKind::Heading,
+            raw: None,
         });
         if !sub.status.is_empty() {
             // A non-VALID subscription is flagged rather than folded into
@@ -337,6 +338,7 @@ fn stats(
                 } else {
                     StatRowKind::Danger
                 },
+                raw: None,
             });
         }
         if let Some(days) = sub.remaining_days {
@@ -344,6 +346,7 @@ fn stats(
                 label: "remaining".to_string(),
                 value: format!("{days} day{}", if days == 1 { "" } else { "s" }),
                 kind: StatRowKind::Body,
+                raw: None,
             });
         }
     }

@@ -1556,6 +1556,9 @@ pub(crate) struct StartCandidate {
     pub(crate) stale: bool,
     pub(crate) fresh: bool,
     pub(crate) demand: Vec<String>,
+    /// The walk's reference instant (epoch seconds), so a DATED age's ISO-date
+    /// arm can be derived as `now - age` without a second clock read.
+    pub(crate) now: i64,
 }
 
 /// The `--auto` walk: every resolvable fallback-chain member in chain order,
@@ -1652,6 +1655,7 @@ pub(crate) fn start_walk(
             stale,
             fresh,
             demand,
+            now,
         });
     }
     if rows.is_empty() {

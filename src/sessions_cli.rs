@@ -529,7 +529,7 @@ impl Columns {
         sessions.into_iter().fold(Self::FLOOR, |cols, s| Self {
             id: cols.id.max(width(short_id(&s.id)).min(Self::ID_CAP)),
             profile: cols.profile.max(width(profile_cell(s))),
-            age: cols.age.max(width(&age_cell(s, now))),
+            age: cols.age.max(width(&age_half(s, now))),
             tokens: cols.tokens.max(width(&tokens_cell(s))),
             cost: cols.cost.max(width(&cost_cell(s))),
         })
@@ -540,11 +540,12 @@ impl Columns {
 /// assertable without capturing stdout: `now` arrives from the caller, never
 /// a clock read hidden inside. The `updated` cell is the 2026-08-22
 /// prose-stamp ruling's shape — LOCAL wall clock (`YYYY-MM-DD HH:MM:SS`)
-/// paired with its relative age, `2026-08-28 14:03:11 · 3h 12m ago`; the
-/// machine ISO shape lives on in the `--json` row only. The token total and
-/// its cost are blank when the annotation found none — never `0`, which
-/// would read as a real figure — and absent entirely when `tokens` never
-/// asked for them.
+/// paired with its one-unit age, `2026-08-28 14:03:11 · 3h ago`; at 30 days
+/// and past the age would repeat the stamp's own date, so the cell prints the
+/// stamp alone. The machine ISO shape lives on in the `--json` row only. The
+/// token total and its cost are blank when the annotation found none — never
+/// `0`, which would read as a real figure — and absent entirely when `tokens`
+/// never asked for them.
 fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime, cols: Columns) -> String {
     let usage = if tokens {
         format!(
@@ -566,14 +567,23 @@ fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime, cols: Columns) ->
     // dwarfs any OS's); the dash is the table's no-data glyph, never a UTC
     // fallback — a bare stamp reads as local.
     let updated = crate::format::local_stamp(secs).unwrap_or_else(|| "-".to_string());
+    // Stamp alone once the age would be a date (the age half is empty); the
+    // age column + ` · ` width stay reserved so the token/cost columns align,
+    // but only while some row carries an age half — an all-stamp-alone listing
+    // keeps the normal column gap instead of a blank age column.
+    let age = age_half(s, now);
+    let stamp_age = if age.is_empty() {
+        let reserve = if cols.age > 0 { 3 + cols.age } else { 0 };
+        format!("{updated}{}", " ".repeat(reserve))
+    } else {
+        format!("{updated} · {age:<age_w$}", age_w = cols.age)
+    };
     let mut row = format!(
-        "  {id:<id_w$}  {profile:<profile_w$}  {updated} · {age:<age_w$}{usage}  {preview}",
+        "  {id:<id_w$}  {profile:<profile_w$}  {stamp_age}{usage}  {preview}",
         id = short_id(&s.id),
         id_w = cols.id,
         profile = profile_cell(s),
         profile_w = cols.profile,
-        age = age_cell(s, now),
-        age_w = cols.age,
         preview = preview_pair(s),
     );
     // An empty preview would leave the padding as trailing blanks.
@@ -585,19 +595,26 @@ fn profile_cell(s: &SessionInfo) -> &str {
     s.last_ran_profile.as_deref().unwrap_or("-")
 }
 
-fn age_cell(s: &SessionInfo, now: SystemTime) -> String {
+/// The age half of the `updated · age` cell: the shared one-unit age, empty
+/// once the age reaches the 30-day date arm — the full local stamp already
+/// carries the date, so the cell renders the stamp alone rather than a
+/// duplicate date. The shared formatter spells a non-positive span `just now`
+/// itself, so no ` ago` pairing is stitched on here: a sub-second-fresh file or
+/// a future mtime reads `just now`, never `now ago`.
+fn age_half(s: &SessionInfo, now: SystemTime) -> String {
     let age_secs = now
         .duration_since(s.updated)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    // `humanize_duration` spells ≤0 `now`, so the ` ago` pairing must skip
-    // the non-positive ages: a sub-second-fresh file or a future mtime would
-    // render `now ago`.
-    if age_secs <= 0 {
-        "now".to_string()
-    } else {
-        format!("{} ago", crate::usage::humanize_duration(age_secs))
+    if crate::format::age_takes_a_date(age_secs.max(0) as u64) {
+        return String::new();
     }
+    let epoch = s
+        .updated
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    crate::format::spoken_age(age_secs.max(0) as u64, epoch).unwrap_or_else(|| "-".to_string())
 }
 
 fn tokens_cell(s: &SessionInfo) -> String {

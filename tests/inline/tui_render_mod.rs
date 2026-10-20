@@ -276,7 +276,7 @@ fn incident_selector_moves_by_two_rows_without_recentering() {
     term.draw(|f| super::draw(f, &app)).unwrap();
     let bottom = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
-        bottom.iter().any(|line| line.contains("incident-11")),
+        bottom.iter().any(|line| line.contains("❯ incident-11")),
         "last item is visible"
     );
     let bottom_bar: String = (5..14)
@@ -298,14 +298,14 @@ fn incident_selector_moves_by_two_rows_without_recentering() {
     let first = crate::testutil::buffer_rows(term.backend().buffer());
     let before = first
         .iter()
-        .position(|line| line.contains("incident-10"))
+        .position(|line| line.contains("❯ incident-10"))
         .expect("selected incident visible");
     app.status.cursor = 9;
     term.draw(|f| super::draw(f, &app)).unwrap();
     let second = crate::testutil::buffer_rows(term.backend().buffer());
     let after = second
         .iter()
-        .position(|line| line.contains("incident-09"))
+        .position(|line| line.contains("❯ incident-09"))
         .expect("previous incident visible");
     assert_eq!(
         after + 2,
@@ -328,7 +328,7 @@ fn incident_selector_moves_by_two_rows_without_recentering() {
         "the first visible row is incident 06's title"
     );
     assert!(
-        resized.iter().any(|line| line.contains("incident-11")),
+        resized.iter().any(|line| line.contains("❯ incident-11")),
         "final incident remains reachable"
     );
     term.backend_mut().resize(80, 10);
@@ -336,7 +336,7 @@ fn incident_selector_moves_by_two_rows_without_recentering() {
     term.draw(|f| super::draw(f, &app)).unwrap();
     let tiny = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
-        tiny.iter().any(|line| line.contains("incident-11")),
+        tiny.iter().any(|line| line.contains("❯ incident-11")),
         "one-line selector shows selected title"
     );
 }

@@ -421,6 +421,38 @@ fn local_stamp_renders_the_local_wall_clock_shape() {
     }
 }
 
+/// The shared point-in-time age formatter reads one unit at every ladder edge
+/// and the ISO date from 30 days. Boundaries hand-written, never recomputed.
+#[test]
+fn spoken_age_reads_one_unit_and_a_date_at_thirty_days() {
+    let epoch = 1_780_000_000;
+    // The date arm is derived through chrono's own formatter, not the crate's,
+    // so the pin is a second derivation of the same claim and holds in any zone.
+    let date = chrono::DateTime::from_timestamp(epoch, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    for (secs, want) in [
+        (59, "just now"),
+        (60, "1m ago"),
+        (3599, "59m ago"),
+        (3600, "1h ago"),
+        (86399, "23h ago"),
+        (86400, "1d ago"),
+        (604799, "6d ago"),
+        (604800, "1w ago"),
+        (2591999, "4w ago"),
+    ] {
+        assert_eq!(spoken_age(secs, epoch).as_deref(), Some(want), "{secs}s");
+    }
+    assert_eq!(
+        spoken_age(2592000, epoch).as_deref(),
+        Some(date.as_str()),
+        "30 days reads the ISO date"
+    );
+}
+
 #[test]
 fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status_line() {
     let canceled = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
@@ -695,6 +727,7 @@ fn render_start_walk_matches_the_approved_layout() {
             stale: false,
             fresh: true,
             demand: Vec::new(),
+            now: 1_782_000_000,
         },
         StartCandidate {
             name: crate::profile::ProfileName::from("D2"),
@@ -703,6 +736,7 @@ fn render_start_walk_matches_the_approved_layout() {
             stale: false,
             fresh: true,
             demand: Vec::new(),
+            now: 1_782_000_000,
         },
         StartCandidate {
             name: crate::profile::ProfileName::from("D3"),
@@ -711,11 +745,38 @@ fn render_start_walk_matches_the_approved_layout() {
             stale: true,
             fresh: false,
             demand: Vec::new(),
+            now: 1_782_000_000,
         },
     ];
     assert_eq!(
         render_start_walk(&rows, Some(1)),
         "  D1  7d opus 100%, other models ok   usage 4m ago\n* D2  ok                              usage 4m ago\n  D3  ok                              usage 3h ago (stale)"
+    );
+}
+
+/// A DATED age of 40 days takes the shared formatter's ISO-date arm (`usage
+/// <date>`, never `usage 5w ago`); the date derives from `now - age` so the
+/// cell stays pure and the expectation is a second (chrono) derivation of the
+/// same instant, correct in any zone.
+#[test]
+fn start_walk_age_uses_the_iso_date_at_thirty_days() {
+    let rows = vec![StartCandidate {
+        name: crate::profile::ProfileName::from("D1"),
+        block: None,
+        age: OauthAge::Dated(3_456_000_000), // 40 days
+        stale: false,
+        fresh: false,
+        demand: Vec::new(),
+        now: 1_782_000_000,
+    }];
+    let date = chrono::DateTime::from_timestamp(1_782_000_000 - 3_456_000, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(
+        render_start_walk(&rows, Some(0)),
+        format!("* D1  ok   usage {date}")
     );
 }
 
@@ -732,6 +793,7 @@ fn start_lines_match_the_approved_copy() {
             stale: false,
             fresh: true,
             demand: Vec::new(),
+            now: 1_782_000_000,
         },
         StartCandidate {
             name: crate::profile::ProfileName::from("D2"),
@@ -740,6 +802,7 @@ fn start_lines_match_the_approved_copy() {
             stale: false,
             fresh: true,
             demand: Vec::new(),
+            now: 1_782_000_000,
         },
     ];
     let two = ["opus".to_owned(), "sonnet".to_owned()];

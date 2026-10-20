@@ -7725,6 +7725,7 @@ fn shared_demand_shares_the_same_families_in_any_order() {
             stale: false,
             fresh: false,
             demand: vec!["opus".to_owned(), "sonnet".to_owned()],
+            now: 0,
         },
         StartCandidate {
             name: ProfileName::from("b"),
@@ -7733,6 +7734,7 @@ fn shared_demand_shares_the_same_families_in_any_order() {
             stale: false,
             fresh: false,
             demand: vec!["sonnet".to_owned(), "opus".to_owned()],
+            now: 0,
         },
     ];
     assert_eq!(

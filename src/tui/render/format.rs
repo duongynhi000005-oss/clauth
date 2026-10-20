@@ -577,19 +577,14 @@ fn month_label(month: u32) -> &'static str {
 }
 
 /// Relative age of an epoch-ms timestamp: single largest unit under 30 days
-/// (`4m ago`, `2h ago`, `3d ago`, `2w ago`); the local prose stamp
-/// (`2026-04-12 14:03:07`) at 30 days and beyond. `< 1 minute` reads `just now`.
+/// (`4m ago`, `2h ago`, `3d ago`, `2w ago`); the local ISO date (`2026-04-12`,
+/// no time) at 30 days and beyond. `< 1 minute` reads `just now`. Routes through
+/// the shared [`crate::format::spoken_age`] so the CLI reads the same shape.
 pub(super) fn relative_age(epoch_ms: u64) -> String {
     let now = crate::usage::now_ms();
-    let age_secs = (now.saturating_sub(epoch_ms) / 1000) as i64;
-    if age_secs < 30 * 24 * 3600 {
-        crate::format::humanize_age(age_secs.max(0) as u64)
-    } else {
-        // Local wall clock per the 2026-08-22 ruling: the bare UTC date read
-        // as local off UTC. Same formatter as the status tab's incident
-        // stamps; an instant chrono cannot represent renders no-data, never UTC.
-        crate::format::local_stamp((epoch_ms / 1000) as i64).unwrap_or_else(|| NO_DATA.to_string())
-    }
+    let age_secs = now.saturating_sub(epoch_ms) / 1000;
+    crate::format::spoken_age(age_secs, (epoch_ms / 1000) as i64)
+        .unwrap_or_else(|| NO_DATA.to_string())
 }
 
 use crate::spinner::SPINNER_FRAMES;

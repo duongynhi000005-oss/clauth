@@ -186,6 +186,7 @@ fn wallet_rows_stats(amount: f64) -> crate::providers::ThirdPartyStats {
             label: "total".to_string(),
             value: format!("{amount:.2} CNY"),
             kind: crate::providers::StatRowKind::Body,
+            raw: None,
         }],
         bars: vec![],
         plan: None,

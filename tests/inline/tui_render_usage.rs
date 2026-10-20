@@ -365,21 +365,25 @@ fn tp_rows_append_the_wallet_burn_rate_to_the_balance_row() {
                     label: "USD balance".to_string(),
                     value: String::new(),
                     kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
                 },
                 crate::providers::StatRow {
                     label: "api balance".to_string(),
                     value: "0.00 USD".to_string(),
                     kind: crate::providers::StatRowKind::Body,
+                    raw: None,
                 },
                 crate::providers::StatRow {
                     label: "CNY balance".to_string(),
                     value: String::new(),
                     kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
                 },
                 crate::providers::StatRow {
                     label: "api balance".to_string(),
                     value: "63.34 CNY".to_string(),
                     kind: crate::providers::StatRowKind::Body,
+                    raw: None,
                 },
             ],
             bars: vec![],
@@ -434,6 +438,483 @@ fn tp_rows_append_the_wallet_burn_rate_to_the_balance_row() {
         bare.iter()
             .any(|l| l.contains("63.34 CNY") && !l.contains("/day")),
         "a cold series leaves the balance row bare: {bare:?}"
+    );
+}
+
+/// The value column of a third-party text row left-pads each figure to the
+/// column's widest value so the right edges align (ragged-left, no decimal
+/// point rule, no zero padding) — the contract's numeric-column alignment.
+#[test]
+fn tp_rows_left_pad_balance_values_to_the_widest_value() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
+    profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    profile.provider =
+        crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "ds",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "CNY balance".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: "50.00 CNY".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "granted".to_string(),
+                    value: "1132.60 CNY".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "topped up".to_string(),
+                    value: "13.34 CNY".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rendered,
+        [
+            "CNY balance",
+            "  api balance    50.00 CNY",
+            "  granted      1132.60 CNY",
+            "  topped up      13.34 CNY",
+        ]
+    );
+}
+
+/// A figure is every labelled row whose value opens with a digit (or a `-` sign
+/// immediately followed by a digit), whether Body or Danger: a word (`valid`) or
+/// a no-data glyph (`-`, `—`) is not. The widest figure left-pads every figure,
+/// so the right edges align, and words start at the value column unpadded.
+#[test]
+fn tp_rows_align_figures_across_body_and_danger_and_leave_words_unpadded() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("or"));
+    profile.base_url = Some("https://openrouter.ai/api/v1".to_string());
+    profile.provider = crate::providers::Provider::from_base_url("https://openrouter.ai/api/v1");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "or",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "credits".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: "0.00 USD".to_string(),
+                    kind: crate::providers::StatRowKind::Danger,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "used".to_string(),
+                    value: "12.34 USD".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "purchased".to_string(),
+                    value: "100.00 USD".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "status".to_string(),
+                    value: "valid".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rendered,
+        [
+            "credits",
+            "  api balance    0.00 USD",
+            "  used          12.34 USD",
+            "  purchased    100.00 USD",
+            "  status       valid",
+        ]
+    );
+}
+
+/// A Danger figure joins the width measurement too: when the Danger value is
+/// the widest in its block (an overdrawn `-1234.56 USD`), every Body figure
+/// left-pads to it.
+#[test]
+fn tp_danger_rows_join_the_figure_measurement_when_widest() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("or"));
+    profile.base_url = Some("https://openrouter.ai/api/v1".to_string());
+    profile.provider = crate::providers::Provider::from_base_url("https://openrouter.ai/api/v1");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "or",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "credits".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: "-1234.56 USD".to_string(),
+                    kind: crate::providers::StatRowKind::Danger,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "used".to_string(),
+                    value: "12.34 USD".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rendered,
+        [
+            "credits",
+            "  api balance  -1234.56 USD",
+            "  used            12.34 USD",
+        ]
+    );
+}
+
+/// Figure-ness rides on the value's own text: one number (optionally signed)
+/// with an optional unit/currency word is a figure; a word, a no-data glyph, or
+/// a `·`-joined / parenthesized composite is not. Two known residuals are named
+/// rather than fixed — `$5` reads as a word (leading currency) and an ISO date
+/// as a figure; no current producer emits either shape.
+#[test]
+fn is_figure_reads_off_the_values_own_text() {
+    for (value, want) in [
+        ("12 days", true),
+        ("52.2M  (451 calls)", false),
+        ("5h 40% · 7d 80%", false),
+        ("valid", false),
+        ("—", false),
+        ("-", false),
+        ("-3.50 USD", true),
+        ("44,456,531", true),
+        ("3", true),
+        ("$5", false),
+        ("2026-10-01", true),
+    ] {
+        assert_eq!(is_figure(value), want, "{value:?}");
+    }
+}
+
+/// z.ai's per-model token totals and the `total` row print full grouped integers
+/// in the Usage detail (`44,456,531`, not `44.5M`), while every other reader of
+/// those rows keeps the compact `value` string.
+#[test]
+fn zai_usage_detail_prints_full_grouped_counts() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("zai"));
+    profile.base_url = Some("https://api.z.ai/anthropic".to_string());
+    profile.provider = crate::providers::Provider::from_base_url("https://api.z.ai/anthropic");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "zai",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "7d tokens".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "GLM-5.2".to_string(),
+                    value: "44.5M".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: Some(crate::providers::StatRowRaw::Count { value: 44_456_531 }),
+                },
+                crate::providers::StatRow {
+                    label: "GLM-4.7".to_string(),
+                    value: "7.8M".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: Some(crate::providers::StatRowRaw::Count { value: 7_788_526 }),
+                },
+                crate::providers::StatRow {
+                    label: "total".to_string(),
+                    value: "52.2M  (451 calls)".to_string(),
+                    kind: crate::providers::StatRowKind::Faint,
+                    raw: Some(crate::providers::StatRowRaw::Calls {
+                        value: 52_245_057,
+                        calls: 451,
+                    }),
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rendered,
+        [
+            "7d tokens",
+            "  GLM-5.2      44,456,531",
+            "  GLM-4.7       7,788,526",
+            "  total        52,245,057  (451 calls)",
+        ]
+    );
+}
+
+/// The `total` row's leading number joins the figure column like any figure:
+/// when it is wider than every model figure, the model figures left-pad to it
+/// and the `(N calls)` suffix trails outside the column.
+#[test]
+fn zai_total_joins_the_figure_column_when_wider_than_models() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("zai"));
+    profile.base_url = Some("https://api.z.ai/anthropic".to_string());
+    profile.provider = crate::providers::Provider::from_base_url("https://api.z.ai/anthropic");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "zai",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "7d tokens".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "GLM-5.2".to_string(),
+                    value: "9M".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: Some(crate::providers::StatRowRaw::Count { value: 9_000_000 }),
+                },
+                crate::providers::StatRow {
+                    label: "GLM-4.7".to_string(),
+                    value: "8M".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: Some(crate::providers::StatRowRaw::Count { value: 8_000_000 }),
+                },
+                crate::providers::StatRow {
+                    label: "total".to_string(),
+                    value: "11M  (451 calls)".to_string(),
+                    kind: crate::providers::StatRowKind::Faint,
+                    raw: Some(crate::providers::StatRowRaw::Calls {
+                        value: 11_000_000,
+                        calls: 451,
+                    }),
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rendered,
+        [
+            "7d tokens",
+            "  GLM-5.2       9,000,000",
+            "  GLM-4.7       8,000,000",
+            "  total        11,000,000  (451 calls)",
+        ]
+    );
+}
+
+/// A z.ai cache written before this build carries no `raw`: its rows keep the
+/// compact `value` string (`44.5M`), never hidden and never refetched — the
+/// decided transitional behaviour until a successful refetch.
+#[test]
+fn zai_old_cache_row_renders_its_compact_value() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("zai"));
+    profile.base_url = Some("https://api.z.ai/anthropic".to_string());
+    profile.provider = crate::providers::Provider::from_base_url("https://api.z.ai/anthropic");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "zai",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "7d tokens".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "GLM-5.2".to_string(),
+                    value: "44.5M".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(rendered, ["7d tokens", "  GLM-5.2      44.5M"]);
+}
+
+/// A per-tool quota row (z.ai's `quota_stats` breakdown) drives through the
+/// Usage detail and renders its raw count full grouped, not the compact `1.2k`
+/// the `value` string carries.
+#[test]
+fn zai_per_tool_row_renders_its_full_grouped_count() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("zai"));
+    profile.base_url = Some("https://api.z.ai/anthropic".to_string());
+    profile.provider = crate::providers::Provider::from_base_url("https://api.z.ai/anthropic");
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "zai",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "mcp tools".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                    raw: None,
+                },
+                crate::providers::StatRow {
+                    label: "search-prime".to_string(),
+                    value: "1.2k".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: Some(crate::providers::StatRowRaw::Count { value: 1_234 }),
+                },
+                crate::providers::StatRow {
+                    label: "web-reader".to_string(),
+                    value: "3".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: Some(crate::providers::StatRowRaw::Count { value: 3 }),
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rendered,
+        ["mcp tools", "  search-prime  1,234", "  web-reader       3",]
     );
 }
 
@@ -609,11 +1090,12 @@ fn tp_rows_auth_expired_copy_splits_by_credential() {
     assert!(!msg.contains("expired"), "nothing lapsed, got {msg}");
 }
 
-/// `TP_KEY_W` exists so every value in a stat block starts at one column.
-/// `key_cell` widens rather than truncates, so a label longer than the constant
-/// does not clip — it pushes that one row's value right of all its siblings, and
-/// the misalignment reads as a render bug rather than as a too-narrow constant.
-/// The block that catches it is the one with the longest label, DeepSeek's.
+/// `TP_KEY_W` exists so every key cell in a stat block has one width and the
+/// value column starts at one column. `key_cell` widens rather than truncates,
+/// so a label longer than the constant does not clip — it pushes that one row's
+/// value right of all its siblings, and the misalignment reads as a render bug
+/// rather than as a too-narrow constant. The block that catches it is the one
+/// with the longest label, DeepSeek's.
 #[test]
 fn tp_body_rows_share_one_value_column() {
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
@@ -627,8 +1109,9 @@ fn tp_body_rows_share_one_value_column() {
             .expect("the captured balance cache parses"),
     );
 
-    // A body row is `["  " + key_cell, value]`, so the value's start column is
-    // the width of everything before it.
+    // A body row is `["  " + key_cell, pad?, value]`: the value is left-padded
+    // to the column's widest figure, so its key cell is still the fixed-width
+    // span before it and every key still starts at one column.
     let starts: Vec<(String, usize)> = build_tp_rows(
         &profile,
         52,
@@ -639,7 +1122,7 @@ fn tp_body_rows_share_one_value_column() {
         None,
     )
     .iter()
-    .filter(|l| l.spans.len() == 2)
+    .filter(|l| l.spans.len() >= 2)
     .map(|l| {
         (
             l.spans[0].content.trim().to_string(),
@@ -652,7 +1135,7 @@ fn tp_body_rows_share_one_value_column() {
     let first = starts[0].1;
     assert!(
         starts.iter().all(|(_, w)| *w == first),
-        "every value starts at the same column: {starts:?}",
+        "every key cell has one width: {starts:?}",
     );
 }
 

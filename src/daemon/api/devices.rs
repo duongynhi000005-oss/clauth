@@ -21,7 +21,7 @@ use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::out::{Wrote, errln, out, outln, write_chunk_result};
 use crate::profile::{atomic_write_600, clauth_dir};
-use crate::usage::{epoch_secs_to_iso, humanize_duration, iso_to_epoch_secs, now_epoch_secs};
+use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs, now_epoch_secs};
 
 const STORE_FILE: &str = "devices.json";
 /// Where a clauth from before pairing kept its one global bearer token.
@@ -703,22 +703,26 @@ fn render_table(devices: &[Device], now: i64) -> String {
     out
 }
 
-/// The prose-stamp shape: local wall clock, paired with the age. `-` when the
-/// stamp does not parse, never the raw text passed off as a time.
+/// The prose-stamp shape: local wall clock, paired with the one-unit age. At
+/// 30 days and past the age would repeat the date the stamp already carries, so
+/// the cell renders the stamp alone. `-` when the stamp does not parse, never
+/// the raw text passed off as a time.
 fn paired_cell(iso: &str, now: i64) -> String {
     let Some((epoch, stamp)) =
         iso_to_epoch_secs(iso).and_then(|epoch| Some((epoch, crate::format::local_stamp(epoch)?)))
     else {
         return "-".to_string();
     };
-    // `humanize_duration` spells a non-positive span `now`, which ` ago` would
-    // turn into `now ago`.
-    let age = now - epoch;
-    if age <= 0 {
-        format!("{stamp} · now")
-    } else {
-        format!("{stamp} · {} ago", humanize_duration(age))
+    let age_secs = (now - epoch).max(0) as u64;
+    if crate::format::age_takes_a_date(age_secs) {
+        return stamp;
     }
+    // The shared formatter spells a non-positive span `just now` itself, which
+    // reads as-is, never `now ago`.
+    format!(
+        "{stamp} · {}",
+        crate::format::spoken_age(age_secs, epoch).unwrap_or_else(|| "-".to_string())
+    )
 }
 
 /// `clauth devices add <name> [--control] [--sessions]`: the token alone on

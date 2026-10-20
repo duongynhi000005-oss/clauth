@@ -611,7 +611,7 @@ fn the_table_pairs_the_local_stamp_with_its_age() {
     let epoch = iso_to_epoch_secs(&device.paired_at).expect("parse");
     let stamp = crate::format::local_stamp(epoch).expect("stamp");
     let table = render_table(&[device], epoch + 3 * 3600 + 300);
-    let cell = format!("{stamp} · 3h 5m ago");
+    let cell = format!("{stamp} · 3h ago");
     assert_eq!(
         table,
         format!(
@@ -628,6 +628,21 @@ fn the_table_pairs_the_local_stamp_with_its_age() {
 #[test]
 fn an_unparseable_stamp_renders_as_no_data() {
     assert_eq!(paired_cell("synthetic-fixture", 0), "-");
+}
+
+/// The paired cell drops the age half once the age would be a date (30 days
+/// and past): the full local stamp already carries the date, so a second copy
+/// reads as a duplicate. Younger rows keep `stamp · age` (`4w ago` at 29 days).
+#[test]
+fn the_paired_cell_drops_the_age_half_once_it_would_be_a_date() {
+    let iso = "2026-01-02T03:04:05+00:00";
+    let epoch = iso_to_epoch_secs(iso).expect("parse");
+    let stamp = crate::format::local_stamp(epoch).expect("stamp");
+    assert_eq!(
+        paired_cell(iso, epoch + 29 * 86_400),
+        format!("{stamp} · 4w ago")
+    );
+    assert_eq!(paired_cell(iso, epoch + 30 * 86_400), stamp);
 }
 
 #[test]

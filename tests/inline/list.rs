@@ -417,6 +417,7 @@ fn list_table_falls_through_to_the_wallet_over_a_non_canonical_bar_label() {
         label: "total".to_string(),
         value: "31.45 CNY".to_string(),
         kind: crate::providers::StatRowKind::Body,
+        raw: None,
     });
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from("z.ai"),

@@ -21,7 +21,7 @@ use super::format::{
 };
 use super::panes::{
     draw_scrollbar, empty_state, follow_scroll_offset, key_cell, master_detail, section_box,
-    wrap_words,
+    section_box_verbatim, wrap_words,
 };
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase, shorten_component_status};
 
@@ -275,11 +275,16 @@ fn phase_pill(incident: &Incident) -> (String, ratatui::style::Color) {
 
 fn draw_incident_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let incident = app.status.selected();
-    let title = incident.map(|i| i.title.as_str()).unwrap_or("status");
     // Read-only detail pane (focus descends but it's the second panel): blurred
     // when the list owns focus, strong when the detail is focused.
     let focused = app.status.focus == StatusFocus::Detail;
-    let block = section_box(title, focused, false, area.width);
+    // The title IS the selected incident's own identity when one is selected, so
+    // it keeps its case (the Panel proper-noun exception); the no-selection
+    // fallback is a structural label and stays uppercase.
+    let block = match incident {
+        Some(i) => section_box_verbatim(&i.title, focused, false, area.width),
+        None => section_box("status", focused, false, area.width),
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

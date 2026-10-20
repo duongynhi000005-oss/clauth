@@ -33,7 +33,7 @@ use super::panes::{
     draw_scrollbar, draw_selector_list, master_detail, meta_line, picker_row, section_box,
     section_box_loading, section_box_verbatim,
 };
-use crate::format::format_pct;
+use crate::format::{format_pct, group_thousands};
 use crate::pricing::{HourTokens, PriceTable};
 use crate::tokens::{
     DaySummary, ModelTokens, PeriodDay, PeriodModel, TokenStats, bucket_activity, bucket_start,
@@ -87,26 +87,6 @@ fn fmt_count(n: u64) -> String {
     } else {
         format!("{v:.2}{suffix}")
     }
-}
-
-/// Group the integer part of non-negative `n` with `,` thousands separators,
-/// keeping `decimals` fractional digits: `(12345.6, 2)` → `12,345.60`.
-fn group_thousands(n: f64, decimals: usize) -> String {
-    let s = format!("{n:.decimals$}");
-    let (int, frac) = s.split_once('.').map_or((s.as_str(), ""), |(i, f)| (i, f));
-    let digits = int.len();
-    let mut out = String::with_capacity(digits + digits / 3 + 1 + frac.len());
-    for (i, ch) in int.chars().enumerate() {
-        if i > 0 && (digits - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    if !frac.is_empty() {
-        out.push('.');
-        out.push_str(frac);
-    }
-    out
 }
 
 /// Full USD with 2–3 decimal precision and `,`-grouped thousands: `$12,345.67`,
@@ -2030,41 +2010,56 @@ fn draw_model_detail(
     };
 
     // This block carries the spelled-out `cache read`/`cache write` rows, so it
-    // pads to WIDE_KEY_W (not the shared KEY_W) to keep the value column aligned.
+    // pads to WIDE_KEY_W (not the shared KEY_W) to keep the value column
+    // aligned; every count left-pads to the widest so their right edges align.
+    let s = &m.split;
+    let value_w = if m.split_complete {
+        [
+            group_thousands(s.input as f64, 0),
+            group_thousands(s.output as f64, 0),
+            group_thousands(s.cache_read as f64, 0),
+            group_thousands(s.cache_create as f64, 0),
+            group_thousands(s.total() as f64, 0),
+            group_thousands(s.in_out() as f64, 0),
+        ]
+        .into_iter()
+        .map(|v| Span::raw(&v).width())
+        .max()
+        .unwrap_or(0)
+    } else {
+        Span::raw(group_thousands(m.in_out as f64, 0)).width()
+    };
     let kv = |label: &str, value: String| {
+        let pad = value_w.saturating_sub(Span::raw(&value).width());
         Line::from(vec![
             Span::styled(format!("{label:<WIDE_KEY_W$}"), theme::label()),
+            Span::raw(" ".repeat(pad)),
             Span::styled(value, theme::body()),
         ])
     };
-    let s = &m.split;
+    let accent_kv = |label: &str, value: String| {
+        let pad = value_w.saturating_sub(Span::raw(&value).width());
+        Line::from(vec![
+            Span::styled(format!("{label:<WIDE_KEY_W$}"), theme::label()),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(value, theme::accent().add_modifier(Modifier::BOLD)),
+        ])
+    };
     let mut lines = if m.split_complete {
         vec![
-            kv("input", fmt_count(s.input)),
-            kv("output", fmt_count(s.output)),
-            kv("cache read", fmt_count(s.cache_read)),
-            kv("cache write", fmt_count(s.cache_create)),
+            kv("input", group_thousands(s.input as f64, 0)),
+            kv("output", group_thousands(s.output as f64, 0)),
+            kv("cache read", group_thousands(s.cache_read as f64, 0)),
+            kv("cache write", group_thousands(s.cache_create as f64, 0)),
             Line::from(""),
-            Line::from(vec![
-                Span::styled(format!("{:<WIDE_KEY_W$}", "total"), theme::label()),
-                Span::styled(
-                    fmt_count(s.total()),
-                    theme::accent().add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            kv("in+out", fmt_count(s.in_out())),
+            accent_kv("total", group_thousands(s.total() as f64, 0)),
+            kv("in+out", group_thousands(s.in_out() as f64, 0)),
         ]
     } else {
         // Part of the window predates the transcript cutoff, where only the
         // combined in+out per model exists — no split rows, no cache lens.
         vec![
-            Line::from(vec![
-                Span::styled(format!("{:<WIDE_KEY_W$}", "tokens"), theme::label()),
-                Span::styled(
-                    fmt_count(m.in_out),
-                    theme::accent().add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            accent_kv("tokens", group_thousands(m.in_out as f64, 0)),
             Line::from(Span::styled(
                 "in+out only (older days carry no split)",
                 theme::faint(),

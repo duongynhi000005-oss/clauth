@@ -814,6 +814,56 @@ fn model_detail_total_floors_mixed_priced_days() {
     );
 }
 
+/// The Models detail is a detail pane: its token counts print full grouped
+/// integers with thousands separators, never the dashboard's compact `1.2M`.
+#[test]
+fn model_detail_counts_print_full_grouped_integers() {
+    let split = ModelTokens {
+        model: "m".into(),
+        input: 1_234_567,
+        output: 234_567,
+        cache_read: 345_678,
+        cache_create: 45_678,
+        ..Default::default()
+    };
+    let model = PeriodModel::from_full(&split);
+    let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    term.draw(|f| {
+        super::draw_model_detail(
+            f,
+            f.area(),
+            Some(&model),
+            0,
+            (None, false),
+            TokenPeriod::Lifetime,
+            None,
+        );
+    })
+    .unwrap();
+    let rows: Vec<String> = crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|r| r.trim_end().to_string())
+        .collect();
+    let row = |label: &str| {
+        rows.iter()
+            .find(|r| r.starts_with(&format!("│ {label}")))
+            .map(|r| {
+                r.trim()
+                    .trim_start_matches('│')
+                    .trim_end_matches('│')
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_else(|| panic!("{label} row renders: {rows:?}"))
+    };
+    assert_eq!(row("input"), "input       1,234,567");
+    assert_eq!(row("output"), "output        234,567");
+    assert_eq!(row("cache read"), "cache read    345,678");
+    assert_eq!(row("cache write"), "cache write    45,678");
+    assert_eq!(row("total"), "total       1,860,490");
+    assert_eq!(row("in+out"), "in+out      1,469,134");
+}
+
 #[test]
 fn priced_split_model_detail_scroll_reaches_cache_hit_at_eighty_by_fourteen() {
     use crate::tui::app::{TokenView, handle_key};

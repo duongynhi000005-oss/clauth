@@ -1106,7 +1106,8 @@ pub(super) fn section_box(title: &str, focused: bool, first: bool, width: u16) -
 }
 
 /// Like [`section_box`] but preserves the title's original case — use only when
-/// the title is a profile/account name, not a structural label.
+/// the title is the selected item's own identity (a profile/account name, an
+/// incident detail named after its incident), not a structural label.
 pub(super) fn section_box_verbatim(
     title: &str,
     focused: bool,

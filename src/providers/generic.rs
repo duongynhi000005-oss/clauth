@@ -260,6 +260,7 @@ fn harvest_scalars(value: &Value, rows: &mut Vec<StatRow>) {
                         label: humanize_label(k),
                         value: num,
                         kind: StatRowKind::Body,
+                        raw: None,
                     });
                 }
             }

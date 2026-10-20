@@ -623,7 +623,7 @@ fn live_session_lines(
         return lines;
     };
     // An AGE, so it reads through `relative_age` (single largest unit, local
-    // stamp past 30 days) rather than the two-unit `humanize_duration` the countdowns
+    // date past 30 days) rather than the two-unit `humanize_duration` the countdowns
     // use — a countdown is a duration, this is a point in the past.
     lines.push(Line::from(vec![
         Span::styled(

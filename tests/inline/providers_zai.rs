@@ -61,6 +61,10 @@ fn quota_yields_bars_plan_and_detail_rows() {
         .find(|r| r.label == "search-prime")
         .unwrap();
     assert_eq!(search.value, "3");
+    assert!(
+        matches!(search.raw, Some(StatRowRaw::Count { value }) if value == 3),
+        "the per-tool row carries its raw count for the detail pane"
+    );
 }
 
 #[test]
@@ -96,9 +100,17 @@ fn model_usage_yields_token_rows() {
     assert_eq!(rows[0].label, "7d tokens");
     assert_eq!(rows[1].label, "GLM-5.2");
     assert_eq!(rows[1].value, "44.5M");
+    assert!(
+        matches!(rows[1].raw, Some(StatRowRaw::Count { value }) if value == 44_456_531),
+        "the per-model row carries its raw count for the detail pane"
+    );
     assert_eq!(rows[3].label, "total");
     assert!(rows[3].value.contains("52.2M"));
     assert!(rows[3].value.contains("451 calls"));
+    assert!(
+        matches!(rows[3].raw, Some(StatRowRaw::Calls { value, calls }) if value == 52_245_057 && calls == 451),
+        "the total row carries both raw counts for the detail pane"
+    );
 }
 
 #[test]
@@ -138,6 +150,17 @@ fn fmt_count_scales_units() {
     assert_eq!(fmt_count(1_500.0), "1.5k");
     assert_eq!(fmt_count(0.0), "0");
     assert_eq!(fmt_count(-5.0), "0");
+}
+
+/// `raw_count` rounds like `fmt_count`'s compact form (which rounds to whole
+/// units), so the grouped and compact spellings agree on the same value at a
+/// fractional count.
+#[test]
+fn raw_count_rounds_like_the_compact_form() {
+    assert_eq!(raw_count(123.7), 124);
+    assert_eq!(raw_count(1_234.5), 1_235);
+    assert_eq!(raw_count(0.0), 0);
+    assert_eq!(raw_count(-5.0), 0);
 }
 
 #[test]

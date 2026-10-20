@@ -1889,6 +1889,16 @@ fn seed_every_state(now: u64) -> Vec<jobs::StoredJob> {
     jobs::list_banded(now)
 }
 
+/// The delegates detail keeps its two-unit sub-minute age: every liveness age
+/// is read against a 300 s idle guard, so 5 s vs 55 s is the whole signal and
+/// collapsing it to `just now` would lose it. Deliberately NOT `relative_age`.
+#[test]
+fn delegate_age_keeps_the_sub_minute_two_unit_signal() {
+    assert_eq!(super::age_phrase(5), "5s ago");
+    assert_eq!(super::age_phrase(55), "55s ago");
+    assert_eq!(super::age_phrase(65), "1m 5s ago");
+}
+
 /// The exact rows, at a `now` the test owns: elapsed, the spawning account and
 /// the deadline that lands first, then the run's directory, each from the
 /// fields the record carries; a record without an origin shows neither.

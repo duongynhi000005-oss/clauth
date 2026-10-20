@@ -81,6 +81,7 @@ fn row(label: &str, value: &str) -> StatRow {
         label: label.to_string(),
         value: value.to_string(),
         kind: StatRowKind::Body,
+        raw: None,
     }
 }
 
@@ -184,6 +185,7 @@ fn third_party_headline_all_lapsed_bars_render_the_refusal_beside_its_figure() {
                 label: String::new(),
                 value: crate::providers::LOW_BALANCE.to_string(),
                 kind: StatRowKind::Danger,
+                raw: None,
             },
         ],
         None,
@@ -223,6 +225,7 @@ fn third_party_headline_names_a_refusal_beside_its_figure() {
                 label: String::new(),
                 value: crate::providers::LOW_BALANCE.to_string(),
                 kind: StatRowKind::Danger,
+                raw: None,
             },
         ],
         None,
@@ -245,6 +248,7 @@ fn third_party_headline_renders_a_refusal_alone_when_no_figure_reported() {
             label: String::new(),
             value: crate::providers::LOW_BALANCE.to_string(),
             kind: StatRowKind::Danger,
+            raw: None,
         }],
         None,
     );
