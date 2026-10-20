@@ -459,7 +459,7 @@ fn window_literal(s: &str) -> Option<String> {
 
 /// The bar's label, shared by both extraction arms: the parent map's key when
 /// present — a map entry's key IS its window name, and overview_windows,
-/// roster_rank and `window_duration_secs` match the literal `5h`/`7d`, so
+/// roster_rank_with and `window_duration_secs` match the literal `5h`/`7d`, so
 /// anything else silently loses every window-derived feature (a key parsing
 /// as a window literal normalizes to it) — else the object's own label field
 /// (a window literal passes verbatim for the same reason; anything else

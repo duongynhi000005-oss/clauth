@@ -122,31 +122,15 @@ fn throughput_warnings(profile: &ProfileName, now: i64) -> Vec<serde_json::Value
         .collect()
 }
 
-/// Fresh-from-cache 5h/7d windows for a profile. Each call re-reads the disk
-/// cache (no caching across tool calls per the design). The roster's own rank
-/// reads this: it asks for the two figures it sorts on, and consults the
-/// third-party cache itself for an account that has no such window. A window
-/// whose reset has passed reads `None` (#74) — the same liveness the published
-/// `windows` array filters on — so a lapsed 5h at the cap ranks on the next
-/// live figure instead of sorting the account to the bottom of the roster.
-/// The shared cache selector gates the read itself: a retyped profile's
-/// leftover `usage_cache.json` is a fossil from its OAuth life, not headroom,
-/// so this reader never opens it — the same cache-split `published_windows`
-/// reads by, whose third-party branch derives from the account's own cache —
-/// and the rank falls to the provider's own bars or wallet (#74).
-fn load_windows(name: &ProfileName) -> (Option<UsageWindow>, Option<UsageWindow>) {
-    let live = |w: &Option<UsageWindow>| {
-        w.as_ref()
-            .filter(|w| crate::profile_json::window_row_is_live(w))
-            .cloned()
-    };
+/// The cached OAuth usage block for `name`, or `None` when the shared cache
+/// selector says this name's cache is third-party: a retyped profile's leftover
+/// `usage_cache.json` is a fossil from its OAuth life, not headroom, so this
+/// reader never opens it — the same cache-split `published_windows` reads by.
+fn load_usage(name: &ProfileName) -> Option<UsageInfo> {
     if crate::profile::stored_usage_cache_is_third_party(name) {
-        return (None, None);
+        return None;
     }
-    match load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE) {
-        Some(u) => (live(&u.five_hour), live(&u.seven_day)),
-        None => (None, None),
-    }
+    load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
 }
 
 /// The discriminated headroom payload every MCP surface renders through
@@ -241,12 +225,13 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
     // One read of this account's own cache, feeding the one carrier its figures
     // ride in. Reading it twice (once to date the row, once for the headline)
     // cost a second parse of the same file on every row of the roster.
+    let windows = profile_windows(p);
     let mut row = serde_json::json!({
         "name": name,
         "active": config.is_active(name),
         "provider": provider_label(p),
         "tier": tier_label(p),
-        "windows": row_windows_payload(&profile_windows(p)),
+        "windows": row_windows_payload(&windows),
     });
     // Host, not the full endpoint: the host is the identifying half, and the path
     // costs tokens on every row without adding to it. For which hosts then read
@@ -301,15 +286,40 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
     if crate::profile_json::is_canceled_cached(name) {
         row["canceled"] = serde_json::json!(true);
     }
+    // Emitted only when true, beside `canceled`: a spent usage-credit cap. The
+    // flag keys on `credit_capped()` alone — gate on or off — because it is a
+    // state the picker must see; only the roster RANK is gated by
+    // `check_credit_cap` (`roster_rank_for`). It reads the cap off the windows
+    // payload's own OAuth `UsageInfo`, so the row pays no second cache parse
+    // and the flag agrees with the figures beside it.
+    if let ProfileWindows::Oauth { usage, .. } = &windows
+        && usage.as_ref().is_some_and(|u| u.credit_capped())
+    {
+        row["credit_capped"] = serde_json::json!(true);
+    }
     row
 }
 
-/// The roster's sort key for one profile. A real window first (5h, the pool a
-/// `delegate` actually competes for, then 7d), then a third-party provider's own
-/// cached bars, then the first funded wallet off its cached rows — zero-amount
-/// wallets drop, the same selection the overview balance column makes.
-fn roster_rank(name: &ProfileName) -> RosterRank {
-    let (five_h, seven_d) = load_windows(name);
+/// The roster's sort key for one profile, over a caller-supplied usage so a
+/// caller that already holds the reading pays no second parse. A real window
+/// first (5h, the pool a `delegate` actually competes for, then 7d), then a
+/// third-party provider's own cached bars, then the first funded wallet off its
+/// cached rows — zero-amount wallets drop, the same selection the overview
+/// balance column makes. A window whose reset has passed reads `None` (#74) —
+/// the same liveness the published `windows` array filters on — so a lapsed 5h
+/// at the cap ranks on the next live figure instead of sorting the account to
+/// the bottom of the roster. A `None` usage falls to the provider's own bars or
+/// wallet.
+fn roster_rank_with(name: &ProfileName, usage: Option<&UsageInfo>) -> RosterRank {
+    let live = |w: &Option<UsageWindow>| {
+        w.as_ref()
+            .filter(|w| crate::profile_json::window_row_is_live(w))
+            .cloned()
+    };
+    let (five_h, seven_d) = match usage {
+        Some(u) => (live(&u.five_hour), live(&u.seven_day)),
+        None => (None, None),
+    };
     if let Some(w) = five_h.or(seven_d) {
         return RosterRank::Window(100.0 - w.utilization);
     }
@@ -340,6 +350,20 @@ fn roster_rank(name: &ProfileName) -> RosterRank {
             currency: w.currency,
             amount: w.amount,
         })
+}
+
+/// [`roster_rank_with`] demoted to [`RosterRank::Capped`] while the profile's credit
+/// gate is on and its cached usage reads the cap as spent — the ruling that
+/// ranks a capped account after every `Unknown`. The row's own flag shows
+/// whenever the cap reads spent, gate on or off; the RANK is what the gate
+/// governs. Loads the usage once and hands it to [`roster_rank_with`], so one
+/// rank costs one cache parse, not two.
+fn roster_rank_for(p: &Profile) -> RosterRank {
+    let usage = load_usage(&p.name);
+    if p.check_credit_cap && usage.as_ref().is_some_and(|u| u.credit_capped()) {
+        return RosterRank::Capped;
+    }
+    roster_rank_with(&p.name, usage.as_ref())
 }
 
 /// A `delegate` argument/validation refusal: one `{is_error, result}` envelope
@@ -875,10 +899,11 @@ impl ClauthServer {
     #[tool(
         description = "List of clauth accounts with their cached usage headrooms. A window's \
 percentage is how much of it is already used. Call it before picking a `delegate` target. A row \
-can carry `disabled`, `login expired`, `no api key` or `subscription canceled`; when `delegate` \
-refuses an account, its refusal names the state and the fix. `subscription canceled` never means \
-a refusal, and `login expired` does not mean one on an account that has its own `host` and api \
-key, which delegates on that key."
+can carry `disabled`, `login expired`, `no api key`, `credit cap spent` or \
+`subscription canceled`; when `delegate` refuses an account, its refusal names the state and the \
+fix. `subscription canceled` never means a refusal, and `login expired` does not mean one on an \
+account that has its own `host` and api key, which delegates on that key. `credit cap spent` \
+refuses only a delegate whose model bills usage credits."
     )]
     async fn profiles(
         &self,
@@ -1245,6 +1270,11 @@ across accounts."
         };
 
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let isolation = if isolated.unwrap_or(false) {
+            Isolation::Isolated
+        } else {
+            Isolation::Shared
+        };
 
         // Which accounts to spend, in canonical spelling, resolved BEFORE any
         // spawn or read. One name is one target (blocking unless `background`);
@@ -1301,7 +1331,21 @@ across accounts."
                 }
             }
         } else {
-            match resolve_fanout(&config, &raw) {
+            // The fan-out pre-flight's demand inputs, read once for the whole
+            // set of members: the outgoing env keys the demand resolves from,
+            // and the credit-billed families each demand is judged against. A
+            // blocking single target never reaches this arm, so it pays no
+            // read it would not use.
+            let stale_env_keys = crate::actions::outgoing_env_keys(&config);
+            let credit_billed = crate::claude_json::credit_billed_families();
+            match resolve_fanout(
+                &config,
+                &raw,
+                model.as_deref(),
+                isolation,
+                &stale_env_keys,
+                &credit_billed,
+            ) {
                 Ok(names) => Target::Many(names),
                 Err(reason) => return Ok(delegate_refusal(&reason)),
             }
@@ -1321,11 +1365,6 @@ across accounts."
             raw_prompt.to_string().into()
         };
 
-        let isolation = if isolated.unwrap_or(false) {
-            Isolation::Isolated
-        } else {
-            Isolation::Shared
-        };
         let origin = DelegateOrigin::resolve(&config, session_id.as_deref(), cwd.as_deref());
 
         if background.unwrap_or(false) {
@@ -1344,7 +1383,17 @@ across accounts."
                             None,
                         )
                     })?;
-                    if let Err(reason) = preflight_target(target, &config, &name_pn) {
+                    // The single-background arm's pre-flight demand inputs,
+                    // read only here: a blocking target re-reads them inside
+                    // `run_delegate`, so a handler-wide read would parse
+                    // `~/.claude.json` twice for that path.
+                    let stale_env_keys = crate::actions::outgoing_env_keys(&config);
+                    let credit_billed = crate::claude_json::credit_billed_families();
+                    let families =
+                        delegate_families(target, isolation, model.as_deref(), &stale_env_keys);
+                    if let Err(reason) =
+                        preflight_target(target, &config, &name_pn, &families, &credit_billed)
+                    {
                         return Ok(delegate_refusal(&reason));
                     }
                     let extra_args = args.unwrap_or_default();
@@ -3602,12 +3651,21 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         target.console.as_ref(),
         target.base_url.as_deref(),
     );
+    // Strip the outgoing profile's custom env so a delegate for `<target>` does
+    // not inherit whoever was globally active — or, with no marker to read
+    // (`switch_off` clears it without touching the file), the departed
+    // account whose entries are still in the live settings (mirrors
+    // `clauth start`). Read once here: the pre-flight's demand and the
+    // runtime acquire below both consume it.
+    let stale_env_keys = crate::actions::outgoing_env_keys(&config);
+    let families = delegate_families(target, opts.isolation, opts.model, &stale_env_keys);
+    let credit_billed = crate::claude_json::credit_billed_families();
     // Mirrors `disable_profile`'s own live-session refusal from the other
     // direction: that guard stops disabling a profile mid-session, this one
     // stops opening a brand-new session on one already disabled. Also the
     // backstop for a background job whose target changed after its pre-flight,
     // since the config is re-loaded here. Guard rationale: `preflight_target`.
-    preflight_target(target, &config, &profile_name)?;
+    preflight_target(target, &config, &profile_name, &families, &credit_billed)?;
 
     if let Some(dir) = opts.cwd
         && !std::path::Path::new(dir).is_dir()
@@ -3628,13 +3686,6 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         }
         None => None,
     };
-
-    // Strip the outgoing profile's custom env so a delegate for `<target>` does
-    // not inherit whoever was globally active — or, with no marker to read
-    // (`switch_off` clears it without touching the file), the departed
-    // account whose entries are still in the live settings (mirrors
-    // `clauth start`).
-    let stale_env_keys = crate::actions::outgoing_env_keys(&config);
 
     // Guard kept alive across spawn+wait; dropped on return for RAII teardown.
     // A delegate is a one-shot headless run against a named account, so it never
@@ -4133,6 +4184,29 @@ fn live_jobs_guard(now: u64) -> Option<String> {
     ))
 }
 
+/// The model families a delegate run on `profile` may bill: an explicit `model`
+/// argument resolves alone, else the profile's runtime `settings.json` overlay
+/// (built for the delegate's isolation the way [`crate::start::member_launch_models`]
+/// builds a start's demand). Empty means no family resolved — the demand is
+/// unknown.
+fn delegate_families(
+    profile: &Profile,
+    isolation: Isolation,
+    model: Option<&str>,
+    stale_env_keys: &[String],
+) -> Vec<String> {
+    let models: Vec<String> = match model {
+        Some(m) => vec![m.to_owned()],
+        None => {
+            let base = crate::profile::claude_dir()
+                .ok()
+                .and_then(|home| crate::runtime::settings_base(&home, isolation));
+            crate::claude::runtime_models(base.as_deref(), profile, stale_env_keys).0
+        }
+    };
+    crate::fallback::demand_from(models)
+}
+
 /// Refuse a resolved target that `delegate` must not spend on: a profile the
 /// operator disabled, a recognised third-party profile whose inference has
 /// nothing to authenticate with (which
@@ -4167,11 +4241,16 @@ fn live_jobs_guard(now: u64) -> Option<String> {
 /// Called from every path that refuses before a spawn: the single-background
 /// arm and `resolve_fanout` up front, and `run_delegate` as the blocking
 /// path's own check plus the backstop for a target that changed after its
-/// pre-flight (the config is re-loaded there).
+/// pre-flight (the config is re-loaded there). `families` is the demand's
+/// resolved model families (empty means none resolved — the demand is
+/// unknown); `credit_billed` the set Claude Code bills against usage credits,
+/// read once by the caller.
 fn preflight_target(
     profile: &Profile,
     config: &AppConfig,
     name: &ProfileName,
+    families: &[String],
+    credit_billed: &[String],
 ) -> std::result::Result<(), String> {
     if profile.is_disabled() {
         return Err(format!(
@@ -4220,6 +4299,26 @@ fn preflight_target(
             render::third_party_headline(&stats),
         ));
     }
+    // LAST: a spent usage-credit cap refuses a delegate whose model Claude Code
+    // bills against usage credits. A KNOWN demand (a family resolved) decides
+    // by its own families whatever the gate says; an unknown demand (no model
+    // resolved) is judged credit-billed only while the profile's credit gate is
+    // on. Keyed on `credit_capped()`, never a stale percent or a billing-off
+    // limit.
+    if load_usage(name).is_some_and(|u| u.credit_capped()) {
+        if let Some(family) = families.iter().find(|f| credit_billed.contains(f)) {
+            return Err(format!(
+                "credit cap spent: {name} cannot run {family}, which Claude Code bills \
+                 against usage credits; name another account or another model"
+            ));
+        }
+        if families.is_empty() && profile.check_credit_cap {
+            return Err(format!(
+                "credit cap spent: {name} names no model to run, and its default may \
+                 bill usage credits; name another account or a model"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -4231,7 +4330,16 @@ fn preflight_target(
 /// does not serve its own inference, an unfunded one (the provider's own
 /// balance verdict).
 /// Runs before any spawn: N delegates is N real usage windows with no undo.
-fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec<String>, String> {
+/// `model`, `isolation`, `stale_env_keys` and `credit_billed` are the demand
+/// inputs every member's credit gate is judged under, read once by the caller.
+fn resolve_fanout(
+    config: &AppConfig,
+    raw: &[String],
+    model: Option<&str>,
+    isolation: Isolation,
+    stale_env_keys: &[String],
+    credit_billed: &[String],
+) -> std::result::Result<Vec<String>, String> {
     // An empty list passes every check below vacuously and would return a
     // success-shaped `{"jobs": []}` that spent nothing and spawned nothing.
     if raw.is_empty() {
@@ -4277,7 +4385,14 @@ fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec
         let profile = config
             .find(&ProfileName::from(name.clone()))
             .ok_or_else(|| profile_not_found(name, ProfileNotFoundFix::CallProfiles))?;
-        preflight_target(profile, config, &ProfileName::from(name.clone()))?;
+        let families = delegate_families(profile, isolation, model, stale_env_keys);
+        preflight_target(
+            profile,
+            config,
+            &ProfileName::from(name.clone()),
+            &families,
+            credit_billed,
+        )?;
     }
     Ok(resolved)
 }
@@ -5620,7 +5735,7 @@ fn build_instructions() -> String {
             provider: provider_label(p),
             base_url: p.base_url.clone(),
             sub_type: tier_label(p),
-            rank: roster_rank(&p.name),
+            rank: roster_rank_for(p),
         })
         .collect();
 

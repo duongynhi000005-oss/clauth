@@ -334,6 +334,82 @@ fn the_three_state_markers_render_as_one_group() {
     );
 }
 
+/// `credit cap spent` follows `subscription canceled`: it refuses a delegate
+/// only by model, so it sits outside the three-marker refusal group.
+#[test]
+fn the_credit_cap_marker_follows_the_canceled_marker() {
+    let line = render::profiles_prose(&serde_json::json!({
+        "profiles": [{
+            "name": "wreck",
+            "active": false,
+            "provider": "anthropic",
+            "tier": null,
+            "windows": {"kind": "oauth"},
+            "has_live_session": false,
+            "disabled": true,
+            "canceled": true,
+            "credit_capped": true,
+        }]
+    }));
+    assert_eq!(
+        line,
+        "- wreck [anthropic]: usage unknown; tier unknown; disabled; subscription canceled; credit cap spent",
+    );
+}
+
+/// The roster names a spent usage-credit cap off the account's cached
+/// reading, and only where the cap reads spent: a billing-off account
+/// carrying a stale limit at 100% is no cap. The flag shows whenever the cap
+/// reads spent, gate on or off — the gate governs only the roster RANK.
+#[test]
+fn the_roster_names_a_spent_credit_cap() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new("capped".to_string(), None, None)).expect("save capped");
+    save_profile(&Profile::new("stale".to_string(), None, None)).expect("save stale");
+    let mut gated_off = Profile::new("gated_off".to_string(), None, None);
+    gated_off.check_credit_cap = false;
+    save_profile(&gated_off).expect("save gated off");
+    save_app_state(&AppState {
+        profiles: vec!["capped".into(), "gated_off".into(), "stale".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let spend = |enabled: bool| UsageInfo {
+        spend: Some(crate::usage::SpendInfo {
+            enabled,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..Default::default()
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("capped"),
+        USAGE_CACHE_FILE,
+        &spend(true),
+    );
+    write_profile_cache(
+        &crate::profile::ProfileName::from("gated_off"),
+        USAGE_CACHE_FILE,
+        &spend(true),
+    );
+    write_profile_cache(
+        &crate::profile::ProfileName::from("stale"),
+        USAGE_CACHE_FILE,
+        &spend(false),
+    );
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- capped [anthropic]: usage unknown; tier unknown; credit cap spent".to_string(),
+            "- gated_off [anthropic]: usage unknown; tier unknown; credit cap spent".to_string(),
+            "- stale [anthropic]: usage unknown; tier unknown".to_string(),
+        ],
+    );
+}
+
 // ── scope: "session" (the folded-in former `which` tool) ─────────────────────
 
 /// Seed one account in the canceled-after-login shape: its stored token still

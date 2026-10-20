@@ -3424,11 +3424,14 @@ fn usage_cache_is_third_party(
 /// profile keeps the ENDPOINT on both readers (the pair never reaches it),
 /// but the classification still disagrees: this read sees no pair and answers
 /// third-party where the adopting load answers OAuth-cache. Only the
-/// callers that skip the full load — [`crate::mcp::digest`]'s sample,
-/// [`crate::profile_json::published_windows`], and the MCP roster's
-/// `load_windows` — can observe it; every other caller runs
-/// `load_config` first, and `recover_pending_credentials` consumes the sidecar —
-/// and it costs at most one digest call or one roster row reporting no refresh. Pinned, in that
+/// callers that skip the full load — [`crate::mcp::digest`]'s sample and
+/// [`crate::profile_json::published_windows`] — can observe it; every
+/// other caller runs
+/// `load_config` first, and `recover_pending_credentials` consumes the sidecar.
+/// The MCP `load_usage` (the roster rank and the delegate pre-flight) is a
+/// lock-free read like this one, but both its callers run `load_config` first,
+/// so the staged pair is gone before it reads — the divergence costs at most
+/// one digest call reporting no refresh. Pinned, in that
 /// direction, by
 /// `a_staged_pair_is_the_one_state_the_lock_free_read_reads_differently` (both
 /// spellings), and pinned agreeing everywhere else by

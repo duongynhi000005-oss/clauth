@@ -4493,6 +4493,155 @@ fn cmd_start_auto_takes_a_member_whose_own_default_skips_the_spent_family() {
     cmd_start_auto(Isolation::Shared).expect("the member's session runs opus, which has headroom");
 }
 
+// ── `--auto` and the usage-credit cap ───────────────────────────────────────
+//
+// Claude Code refuses a credit-billed model (Fable, plus every family its
+// cached `tengu_calm_seal` flag lists) once the account's usage-credit cap is
+// spent, whatever its windows say; every other model still runs there.
+
+/// One chain member `a` on `[models] default`, every window clear, its
+/// usage-credit spend past its limit (`billing_on` names whether the spend
+/// block is enabled), its credit gate `check_credit_cap`.
+fn seed_credit_spend_member(
+    member_default: Option<&'static str>,
+    check_credit_cap: bool,
+    billing_on: bool,
+) {
+    let name = crate::profile::ProfileName::from("a");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.clone()],
+        fallback_chain: vec![name.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.models.default = member_default.map(str::to_owned);
+    profile.check_credit_cap = check_credit_cap;
+    crate::profile::save_profile(&profile).unwrap();
+    let mut usage = cmd_start_usage();
+    usage.spend = Some(crate::usage::SpendInfo {
+        enabled: billing_on,
+        used: Some(50.0),
+        limit: Some(50.0),
+        percent: Some(100.0),
+        currency: Some("USD".to_owned()),
+    });
+    assert_eq!(
+        usage.credit_capped(),
+        billing_on,
+        "fixture control: the cap reads capped only while billing is on"
+    );
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+}
+
+#[test]
+fn cmd_start_auto_refuses_a_credit_capped_member_whose_session_runs_fable() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, true);
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("Claude Code refuses fable on an account whose credit cap is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// The demand decides by its own families whatever the gate says: a known
+/// credit-billed demand is refused with the gate off too.
+#[test]
+fn cmd_start_auto_refuses_a_known_credit_billed_demand_with_the_gate_off() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), false, true);
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("a fable session fails on a spent cap whatever the chain gate says");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_takes_a_credit_capped_member_whose_session_runs_opus() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), true, true);
+
+    cmd_start_auto(Isolation::Shared)
+        .expect("opus bills the subscription, so a spent credit cap does not stop it");
+}
+
+/// A billing-off account carrying a stale full limit is never capped: the
+/// credit rung keys on `credit_capped()`, never a stale percent, so a fable
+/// demand still runs there.
+#[test]
+fn cmd_start_auto_takes_a_billing_off_account_with_a_stale_full_limit() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, false);
+
+    cmd_start_auto(Isolation::Shared)
+        .expect("a billing-off account is never capped, whatever its stale limit says");
+}
+
+/// A family the cached `tengu_calm_seal` flag adds is credit-billed too: the
+/// set comes from Claude Code's own flag, never a hardcoded list.
+#[test]
+fn cmd_start_auto_refuses_a_family_the_cached_flag_bills_against_credits() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("claude-mythos-1"), true, true);
+    std::fs::write(
+        sb.home().join(".claude.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"cachedGrowthBookFeatures": {"tengu_calm_seal": ["Mythos"]}}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let err =
+        cmd_start_auto(Isolation::Shared).expect_err("the flag bills mythos against usage credits");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for mythos\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// No `[models] default`: the session runs Claude Code's own default, which
+/// may bill credits, so a capped member is judged credit-billed while its gate
+/// is on (the scoped gate's blanket rule).
+#[test]
+fn cmd_start_auto_refuses_a_credit_capped_member_with_no_known_model_while_its_gate_is_on() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(None, true, true);
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("an unknown model is judged credit-billed while the gate is on");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_takes_a_credit_capped_member_with_no_known_model_while_its_gate_is_off() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(None, false, true);
+
+    cmd_start_auto(Isolation::Shared)
+        .expect("the gate off keeps a capped member in rotation for an unknown model");
+}
+
 #[test]
 fn cmd_start_auto_never_judges_a_member_by_a_global_model_its_session_drops() {
     let sb = crate::testutil::HomeSandbox::new();

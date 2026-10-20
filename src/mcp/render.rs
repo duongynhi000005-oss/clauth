@@ -29,8 +29,10 @@ pub(crate) struct ProfileSnapshot {
 /// A profile's roster sort key, for ordering only.
 ///
 /// The variants never interleave: every windowed profile outranks every wallet
-/// one, which outranks every profile clauth holds no figure for. That last step
-/// is what keeps "no figure" from reading as "full".
+/// one, which outranks every profile clauth holds no figure for, which outranks
+/// a capped one. The "no figure" tier is what keeps "no figure" from reading as
+/// "full"; the capped tier sits below it, so a spent-credit account is reached
+/// only after every account the picker can judge.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RosterRank {
     /// Percent of this profile's best-known window still FREE.
@@ -41,6 +43,9 @@ pub(crate) enum RosterRank {
     Balance { currency: String, amount: f64 },
     /// Nothing cached, or nothing a wallet could be read out of.
     Unknown,
+    /// A spent usage-credit cap while the profile's credit gate is on: sorts
+    /// after every other tier, so the picker reaches it last.
+    Capped,
 }
 
 /// Host (and port) of a base url — the HOST, never the whole authority. Every
@@ -238,9 +243,9 @@ fn currency_order(profiles: &[ProfileSnapshot]) -> Vec<&str> {
 }
 
 /// Total order over [`RosterRank`] as `(tier, currency group, negated
-/// magnitude)`. Sorting ascending on it puts the freest window first and every
-/// unknown last, and negating the magnitude is what makes "more left" sort
-/// earlier without a second comparator.
+/// magnitude)`. Sorting ascending on it puts the freest window first and a
+/// capped account last, and negating the magnitude is what makes "more left"
+/// sort earlier without a second comparator.
 fn sort_key(p: &ProfileSnapshot, currencies: &[&str]) -> (u8, usize, f64) {
     match &p.rank {
         RosterRank::Window(free) => (0, 0, -free),
@@ -253,6 +258,7 @@ fn sort_key(p: &ProfileSnapshot, currencies: &[&str]) -> (u8, usize, f64) {
             -amount,
         ),
         RosterRank::Unknown => (2, 0, 0.0),
+        RosterRank::Capped => (3, 0, 0.0),
     }
 }
 
@@ -1064,6 +1070,13 @@ fn profile_line(row: &Value) -> String {
         .unwrap_or(false)
     {
         out.push_str("; subscription canceled");
+    }
+    if row
+        .get("credit_capped")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("; credit cap spent");
     }
     if let Some(rows) = row.get("throughput").and_then(Value::as_array)
         && !rows.is_empty()

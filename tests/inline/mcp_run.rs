@@ -241,6 +241,317 @@ fn run_delegate_refuses_an_auth_broken_target_before_acquiring_a_runtime() {
     );
 }
 
+// ── usage-credit cap guard ──────────────────────────────────────────────────
+
+/// One OAuth account `capped` whose usage-credit spend is past its limit
+/// (`billing_on` names whether the spend block is enabled) with every window
+/// clear, its `[models] default` and its credit gate as given. Returns a cwd
+/// that does not exist: a delegate the gate admits runs on to the cwd check
+/// and fails there, never spawning.
+fn seed_credit_spend_target(
+    home: &HomeSandbox,
+    default: Option<&str>,
+    check_credit_cap: bool,
+    billing_on: bool,
+) -> std::path::PathBuf {
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "capped".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let name = crate::profile::ProfileName::from("capped");
+    let mut profile = crate::profile::load_profile(&name).expect("load profile");
+    profile.models.default = default.map(str::to_owned);
+    profile.check_credit_cap = check_credit_cap;
+    crate::profile::save_profile(&profile).expect("save profile");
+    let usage = crate::usage::UsageInfo {
+        spend: Some(crate::usage::SpendInfo {
+            enabled: billing_on,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        usage.credit_capped(),
+        billing_on,
+        "fixture control: the cap reads capped only while billing is on"
+    );
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+    home.home().join("does-not-exist")
+}
+
+fn delegate_to_capped(
+    model: Option<&str>,
+    cwd: &std::path::Path,
+) -> std::result::Result<serde_json::Value, String> {
+    run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "hello",
+        model,
+        cwd: cwd.to_str(),
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+}
+
+/// The run reached the cwd check, past every pre-spawn refusal.
+fn assert_admitted(result: std::result::Result<serde_json::Value, String>) {
+    let err = result.expect_err("the nonexistent cwd stops an admitted run");
+    assert!(
+        !err.starts_with("credit cap spent"),
+        "the credit gate must admit this run: {err}"
+    );
+    assert!(
+        err.contains("does-not-exist"),
+        "an admitted run fails at the cwd check: {err}"
+    );
+}
+
+#[test]
+fn a_credit_capped_target_refuses_a_credit_billed_model_before_acquiring_a_runtime() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, true, true);
+
+    let err = delegate_to_capped(Some("fable"), &cwd).expect_err("fable bills usage credits");
+    assert_eq!(
+        err,
+        "credit cap spent: capped cannot run fable, which Claude Code bills against usage credits; name another account or another model"
+    );
+    assert!(
+        !home.home().join(".clauth/profiles/capped/runtime").exists(),
+        "the refusal must happen before any runtime is acquired"
+    );
+}
+
+/// A known demand decides by its own families whatever the gate says.
+#[test]
+fn a_credit_capped_target_refuses_a_credit_billed_model_with_its_gate_off() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+
+    let err = delegate_to_capped(Some("fable"), &cwd).expect_err("fable bills usage credits");
+    assert_eq!(
+        err,
+        "credit cap spent: capped cannot run fable, which Claude Code bills against usage credits; name another account or another model"
+    );
+}
+
+/// No `model` argument: the demand is the target's own runtime overlay, so
+/// its `[models] default` names the family the run would spend.
+#[test]
+fn a_credit_capped_target_refuses_its_own_credit_billed_default() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("fable"), true, true);
+
+    let err = delegate_to_capped(None, &cwd).expect_err("the target's default is fable");
+    assert_eq!(
+        err,
+        "credit cap spent: capped cannot run fable, which Claude Code bills against usage credits; name another account or another model"
+    );
+}
+
+#[test]
+fn a_credit_capped_target_refuses_a_run_naming_no_model_while_its_gate_is_on() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, true, true);
+
+    let err = delegate_to_capped(None, &cwd).expect_err("an unknown model may bill credits");
+    assert_eq!(
+        err,
+        "credit cap spent: capped names no model to run, and its default may bill usage credits; name another account or a model"
+    );
+}
+
+#[test]
+fn a_credit_capped_target_admits_a_run_naming_no_model_while_its_gate_is_off() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    assert_admitted(delegate_to_capped(None, &cwd));
+}
+
+#[test]
+fn a_credit_capped_target_admits_a_subscription_model() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("fable"), true, true);
+    assert_admitted(delegate_to_capped(Some("opus"), &cwd));
+}
+
+/// A billing-off account carrying a stale full limit is never capped: the
+/// delegate gate keys on `credit_capped()`, never a stale percent, so a fable
+/// demand still runs there (on to the cwd check).
+#[test]
+fn a_target_admits_a_billing_off_account_with_a_stale_full_limit() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("fable"), true, false);
+    assert_admitted(delegate_to_capped(Some("fable"), &cwd));
+}
+
+/// A disabled target refuses with its own disabled sentence, even when its cap
+/// reads spent: the credit arm sits LAST in `preflight_target`, so the disabled
+/// bail (and every earlier arm) keeps its own fix.
+#[test]
+fn a_disabled_and_capped_target_refuses_with_the_disabled_sentence() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, true, true);
+    let name = crate::profile::ProfileName::from("capped");
+    let mut profile = crate::profile::load_profile(&name).expect("load profile");
+    profile.disabled = true;
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    let err = delegate_to_capped(Some("fable"), &cwd).expect_err("a disabled target is refused");
+    assert_eq!(
+        err,
+        "profile is disabled: capped (run `clauth enable capped`)"
+    );
+}
+
+/// A quarantined AND capped OAuth target still refuses with the quarantine
+/// sentence: the credit arm sits LAST, below the quarantine arm, so the
+/// browser-login fix keeps its own answer even when the cap reads spent. Plant
+/// P11b (the whole credit block moved to just before the quarantine arm) must
+/// red this — the credit refusal would then win before `login_expired`.
+#[test]
+fn a_quarantined_and_capped_oauth_target_refuses_with_the_login_expired_sentence() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "capped-q".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let name = crate::profile::ProfileName::from("capped-q");
+    assert!(
+        config.set_auth_broken(&name, true),
+        "fixture control: the profile was not already quarantined",
+    );
+    let usage = crate::usage::UsageInfo {
+        spend: Some(crate::usage::SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..Default::default()
+    };
+    assert!(
+        usage.credit_capped(),
+        "fixture control: the seeded cap must read capped"
+    );
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+    #[allow(clippy::expect_used, reason = "test")]
+    let profile = config.find(&name).expect("profile");
+    assert_eq!(
+        preflight_target(
+            profile,
+            &config,
+            &name,
+            &["fable".to_string()],
+            &["fable".to_string()],
+        ),
+        Err(crate::format::login_expired(&name).line()),
+        "the quarantine arm sits above the credit arm, so the login fix keeps its answer",
+    );
+}
+
+/// The roster lists a capped account after every other one while its gate is
+/// on, even with its windows idle; with the gate off its windows rank it.
+#[test]
+fn the_roster_ranks_a_credit_capped_account_last_while_its_gate_is_on() {
+    for (gate, expect_capped_first) in [(true, false), (false, true)] {
+        let _home = HomeSandbox::new();
+        let names = ["acct-roomy", "acct-blank", "acct-capped"];
+        for n in names {
+            let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(n));
+            p.check_credit_cap = gate || n != "acct-capped";
+            crate::profile::save_profile(&p).expect("save profile");
+        }
+        crate::profile::save_app_state(&crate::profile::AppState {
+            profiles: names.iter().map(|n| (*n).into()).collect(),
+            ..Default::default()
+        })
+        .expect("save state");
+        let window = |utilization: f64| crate::usage::UsageWindow {
+            utilization,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        };
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("acct-roomy"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                five_hour: Some(window(50.0)),
+                ..Default::default()
+            },
+        );
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("acct-capped"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                five_hour: Some(window(0.0)),
+                spend: Some(crate::usage::SpendInfo {
+                    enabled: true,
+                    used: Some(50.0),
+                    limit: Some(50.0),
+                    percent: Some(100.0),
+                    currency: Some("USD".to_owned()),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let block = build_instructions();
+        let at = |n: &str| {
+            block
+                .find(n)
+                .unwrap_or_else(|| panic!("{n} missing from the roster: {block}"))
+        };
+        if expect_capped_first {
+            assert!(
+                at("acct-capped") < at("acct-roomy") && at("acct-roomy") < at("acct-blank"),
+                "gate off: the idle window ranks first: {block}"
+            );
+        } else {
+            assert!(
+                at("acct-roomy") < at("acct-blank") && at("acct-blank") < at("acct-capped"),
+                "gate on: the capped account ranks after even an unknown one: {block}"
+            );
+        }
+    }
+}
+
 // ── third-party auth guard ──────────────────────────────────────────────────
 
 /// Mirrors the disabled-target test above: a recognised third-party profile
@@ -675,8 +986,8 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
         .iter()
         .map(|n| (*n).to_string())
         .collect();
-    let err =
-        resolve_fanout(&config, &raw).expect_err("a keyless member refuses the whole fan-out");
+    let err = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
+        .expect_err("a keyless member refuses the whole fan-out");
     assert_eq!(
         err,
         "profile has no api key: qwen (run `clauth login qwen --api-key <key>`)"
@@ -733,8 +1044,8 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
         .iter()
         .map(|n| (*n).to_string())
         .collect();
-    let err =
-        resolve_fanout(&config, &raw).expect_err("an empty-key member refuses the whole fan-out");
+    let err = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
+        .expect_err("an empty-key member refuses the whole fan-out");
     assert_eq!(
         err,
         "profile has no api key: ds-empty (run `clauth login ds-empty --api-key <key>`)"
@@ -787,8 +1098,8 @@ fn resolve_fanout_refuses_an_auth_broken_member_by_name() {
         .iter()
         .map(|n| (*n).to_string())
         .collect();
-    let err =
-        resolve_fanout(&config, &raw).expect_err("a quarantined member refuses the whole fan-out");
+    let err = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
+        .expect_err("a quarantined member refuses the whole fan-out");
     assert_eq!(
         err,
         crate::format::login_expired(&crate::profile::ProfileName::from("dead")).line()
@@ -823,7 +1134,8 @@ fn a_disabled_and_quarantined_target_refuses_as_disabled() {
     );
 
     let raw = vec!["both".to_string()];
-    let err = resolve_fanout(&config, &raw).expect_err("a disabled member refuses the fan-out");
+    let err = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
+        .expect_err("a disabled member refuses the fan-out");
     assert_eq!(err, "profile is disabled: both (run `clauth enable both`)");
 }
 
@@ -854,7 +1166,7 @@ fn a_quarantined_and_keyless_third_party_target_refuses_as_keyless() {
     );
 
     let raw = vec!["ds-both".to_string()];
-    let err = resolve_fanout(&config, &raw)
+    let err = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
         .expect_err("a keyless third-party member refuses the whole fan-out");
     assert_eq!(
         err,
@@ -897,7 +1209,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
 
     let raw = vec!["ds-keyq".to_string()];
     assert_eq!(
-        resolve_fanout(&config, &raw),
+        resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[]),
         Ok(vec!["ds-keyq".to_string()]),
         "a quarantined third-party member with a working key still delegates",
     );
@@ -909,7 +1221,9 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
         preflight_target(
             profile,
             &config,
-            &crate::profile::ProfileName::from("ds-keyq")
+            &crate::profile::ProfileName::from("ds-keyq"),
+            &[],
+            &[],
         ),
         Ok(()),
         "and the pre-flight the blocking path and the backstop share admits it too",
@@ -942,7 +1256,9 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
         preflight_target(
             generic,
             &config,
-            &crate::profile::ProfileName::from("generic-q")
+            &crate::profile::ProfileName::from("generic-q"),
+            &[],
+            &[],
         ),
         Ok(()),
         "provider recognition is not the discriminator: an unrecognised endpoint \
@@ -970,7 +1286,9 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
         preflight_target(
             oauth,
             &config,
-            &crate::profile::ProfileName::from("oauth-q")
+            &crate::profile::ProfileName::from("oauth-q"),
+            &[],
+            &[],
         ),
         Err(crate::format::login_expired(&crate::profile::ProfileName::from("oauth-q")).line()),
         "an account with nothing but the dead chain still refuses",
@@ -1015,7 +1333,8 @@ fn resolve_fanout_passes_when_every_member_is_delegable() {
         .iter()
         .map(|n| (*n).to_string())
         .collect();
-    let names = resolve_fanout(&config, &raw).expect("every member has a credential");
+    let names = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
+        .expect("every member has a credential");
     assert_eq!(names, vec!["ds-key", "oauth1", "qwen"]);
 }
 
@@ -1115,6 +1434,228 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
         .map(|rd| rd.flatten().count())
         .unwrap_or(0);
     assert_eq!(job_count, 0, "a refused fan-out writes no job file");
+}
+
+/// The credit-cap sibling of the keyless fan-out pin: a background fan-out whose
+/// member is a spent usage-credit cap refuses — naming the billed family —
+/// before any job file is reserved.
+#[test]
+fn background_fanout_refuses_a_credit_capped_member_before_writing_jobs() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "solo".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-test".to_string()),
+        Default::default(),
+    )
+    .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "capped".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let capped_name = crate::profile::ProfileName::from("capped");
+    let mut capped = crate::profile::load_profile(&capped_name).expect("load capped");
+    capped.check_credit_cap = true;
+    crate::profile::save_profile(&capped).expect("save capped");
+    crate::profile_cache::write_profile_cache(
+        &capped_name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            spend: Some(crate::usage::SpendInfo {
+                enabled: true,
+                used: Some(50.0),
+                limit: Some(50.0),
+                percent: Some(100.0),
+                currency: Some("USD".to_owned()),
+            }),
+            ..Default::default()
+        },
+    );
+
+    // Pin the depth to 0, exactly like the keyless pin this mirrors.
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the sandbox),
+    // restored unconditionally below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
+
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let result = rt
+        .block_on(async {
+            server
+                .delegate_with(
+                    DelegateArgs {
+                        profiles: Some(vec!["solo".to_string(), "capped".to_string()]),
+                        prompt: Some("hello".to_string()),
+                        model: Some("fable".to_string()),
+                        cwd: None,
+                        env: None,
+                        args: None,
+                        session_id: None,
+                        subagent_type: None,
+                        allowed_tools: None,
+                        permission_mode: None,
+                        result: None,
+                        isolated: None,
+                        background: Some(true),
+                    },
+                    ProgressSink::none(),
+                )
+                .await
+        })
+        .expect("delegate returns a tool result, never a transport error");
+
+    // SAFETY: restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a credit-capped member refuses the fan-out"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("refusal text");
+    assert_eq!(
+        text,
+        "delegate failed: credit cap spent: capped cannot run fable, which Claude Code \
+         bills against usage credits; name another account or another model",
+        "the refusal names the capped profile, the billed family, and the fix",
+    );
+    let job_count = jobs::jobs_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(job_count, 0, "a refused fan-out writes no job file");
+}
+
+/// The single-background pin: a capped target named with a credit-billed model
+/// refuses before its job file is reserved, so the caller never gets a running
+/// job whose collected result carries the refusal.
+#[test]
+fn background_refuses_a_credit_capped_target_before_writing_job() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "capped".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let capped_name = crate::profile::ProfileName::from("capped");
+    let mut capped = crate::profile::load_profile(&capped_name).expect("load capped");
+    capped.check_credit_cap = true;
+    crate::profile::save_profile(&capped).expect("save capped");
+    crate::profile_cache::write_profile_cache(
+        &capped_name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            spend: Some(crate::usage::SpendInfo {
+                enabled: true,
+                used: Some(50.0),
+                limit: Some(50.0),
+                percent: Some(100.0),
+                currency: Some("USD".to_owned()),
+            }),
+            ..Default::default()
+        },
+    );
+
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the sandbox),
+    // restored unconditionally below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
+
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let result = rt
+        .block_on(async {
+            server
+                .delegate_with(
+                    DelegateArgs {
+                        profiles: Some(vec!["capped".to_string()]),
+                        prompt: Some("hello".to_string()),
+                        model: Some("fable".to_string()),
+                        cwd: None,
+                        env: None,
+                        args: None,
+                        session_id: None,
+                        subagent_type: None,
+                        allowed_tools: None,
+                        permission_mode: None,
+                        result: None,
+                        isolated: None,
+                        background: Some(true),
+                    },
+                    ProgressSink::none(),
+                )
+                .await
+        })
+        .expect("delegate returns a tool result, never a transport error");
+
+    // SAFETY: restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a credit-capped background delegate refuses"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("refusal text");
+    assert_eq!(
+        text,
+        "delegate failed: credit cap spent: capped cannot run fable, which Claude Code \
+         bills against usage credits; name another account or another model",
+        "the refusal names the billed family and the fix",
+    );
+    let job_count = jobs::jobs_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(
+        job_count, 0,
+        "a refused background delegate writes no job file"
+    );
 }
 
 // TODO(manual/integration): the live-spawn paths cannot be unit-tested without a
@@ -5121,6 +5662,13 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         // provider `anthropic`, so a scope term naming provider recognition
         // would be one the reader cannot check against the row it filters.
         "does not mean one on an account that has its own `host` and api key",
+        // `credit cap spent` refuses by model, never the whole account: an
+        // opus delegate still runs there. The list needle pins the flag's
+        // presence in the row-can-carry list without overlapping the next
+        // needle; the non-blanket direction, for the reason the canceled
+        // clause above states.
+        "`no api key`, `credit cap spent` or",
+        "`credit cap spent` refuses only a delegate whose model bills usage credits",
         // The direction of the percentage. A caller reading it backwards picks
         // the most-spent account. Relaxed 2026-08-20 from `less headroom` to the
         // clause the owner's copy states it with: the direction is what matters,
@@ -5161,7 +5709,11 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
         },
     );
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("both")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "both".to_string(),
+            None,
+            None
+        )),
         RosterRank::Window(30.0)
     );
 
@@ -5175,7 +5727,11 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
         },
     );
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("weekly")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "weekly".to_string(),
+            None,
+            None
+        )),
         RosterRank::Window(75.0)
     );
 
@@ -5197,7 +5753,11 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
         },
     );
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("bars")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "bars".to_string(),
+            None,
+            None
+        )),
         RosterRank::Window(92.0)
     );
 
@@ -5223,14 +5783,22 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
         },
     );
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("balance")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "balance".to_string(),
+            None,
+            None
+        )),
         RosterRank::Balance {
             currency: "CNY".to_string(),
             amount: 1117.10,
         }
     );
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("never-cached")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "never-cached".to_string(),
+            None,
+            None
+        )),
         RosterRank::Unknown
     );
 }
@@ -5266,7 +5834,11 @@ fn roster_rank_skips_a_window_whose_reset_has_passed() {
     );
 
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("lapsed")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "lapsed".to_string(),
+            None,
+            None
+        )),
         RosterRank::Window(75.0),
         "a lapsed 5h at 100% ranks on the live 7d beside it, never as 0% free",
     );
@@ -5316,7 +5888,7 @@ fn roster_rank_skips_a_third_party_bar_whose_reset_has_passed() {
     );
 
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("zai")),
+        roster_rank_for(&crate::profile::Profile::new("zai".to_string(), None, None)),
         RosterRank::Window(70.0),
         "a lapsed 5h bar at 100% ranks on the live 7d beside it, not as 0% free and not on the wallet",
     );
@@ -5341,7 +5913,7 @@ fn roster_rank_skips_a_third_party_bar_whose_reset_has_passed() {
         },
     );
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("zai")),
+        roster_rank_for(&crate::profile::Profile::new("zai".to_string(), None, None)),
         RosterRank::Balance {
             currency: "CNY".to_string(),
             amount: 1117.10,
@@ -5385,7 +5957,11 @@ fn roster_rank_ranks_a_monthly_only_account_on_its_monthly_quota() {
     );
 
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("qwen")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "qwen".to_string(),
+            None,
+            None
+        )),
         RosterRank::Window(80.0),
         "a monthly-only account ranks on its live monthly quota"
     );
@@ -5433,7 +6009,7 @@ fn roster_rank_ranks_a_best_effort_account_on_its_live_5h_bar() {
     );
 
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("gen")),
+        roster_rank_for(&crate::profile::Profile::new("gen".to_string(), None, None)),
         RosterRank::Window(80.0),
         "a best-effort account ranks on its live 5h bar"
     );
@@ -5491,7 +6067,7 @@ fn roster_rank_takes_the_first_live_5h_bar_when_a_label_occurs_twice() {
     );
 
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("gen")),
+        roster_rank_for(&crate::profile::Profile::new("gen".to_string(), None, None)),
         RosterRank::Window(80.0),
         "a best-effort account ranks on the first live 5h bar, not the lapsed head nor the 7d"
     );
@@ -5534,7 +6110,11 @@ fn roster_rank_ignores_a_retyped_profiles_leftover_oauth_cache() {
     );
 
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("retyped")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "retyped".to_string(),
+            None,
+            None
+        )),
         RosterRank::Unknown,
         "a retyped profile's leftover OAuth cache is not headroom it ranks on",
     );
@@ -5560,7 +6140,11 @@ fn roster_rank_ignores_a_retyped_profiles_leftover_oauth_cache() {
         },
     );
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("retyped")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "retyped".to_string(),
+            None,
+            None
+        )),
         RosterRank::Window(80.0),
         "the retyped profile ranks on its own live provider bar",
     );
@@ -5572,7 +6156,11 @@ fn roster_rank_ignores_a_retyped_profiles_leftover_oauth_cache() {
         &leftover,
     );
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("oauth")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "oauth".to_string(),
+            None,
+            None
+        )),
         RosterRank::Window(60.0),
         "an OAuth profile's own cache still ranks",
     );
@@ -5666,7 +6254,7 @@ fn a_folded_live_usage_clause_gates_the_pct_fields_on_window_liveness() {
 /// from an earlier OAuth life ranks off its own provider bars, never the
 /// stale Anthropic window — the same stale-leftover read
 /// `profile_json::published_windows` guards against, and the reason
-/// `load_windows` answers nothing for an api-key account, dropping the rank
+/// `load_usage` answers nothing for an api-key account, dropping the rank
 /// onto the provider's own live bars.
 #[test]
 fn roster_rank_ignores_a_stale_oauth_cache_on_an_api_key_account() {
@@ -5704,7 +6292,11 @@ fn roster_rank_ignores_a_stale_oauth_cache_on_an_api_key_account() {
     );
 
     assert_eq!(
-        roster_rank(&name),
+        roster_rank_for(&crate::profile::Profile::new(
+            name.as_ref().to_string(),
+            None,
+            None
+        )),
         RosterRank::Window(60.0),
         "the provider bar answers, the stale OAuth window never reaches the rank",
     );
@@ -5728,7 +6320,11 @@ fn a_two_wallet_profile_ranks_on_its_funded_wallet() {
     write_captured_third_party_cache("one-wallet", CAPTURED_ONE_WALLET_DS_CACHE);
 
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("two-wallet")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "two-wallet".to_string(),
+            None,
+            None
+        )),
         RosterRank::Balance {
             currency: "CNY".to_string(),
             amount: 498.18,
@@ -5737,7 +6333,11 @@ fn a_two_wallet_profile_ranks_on_its_funded_wallet() {
     );
     // One-wallet control: nothing to drop, the rank is the wallet as cached.
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("one-wallet")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "one-wallet".to_string(),
+            None,
+            None
+        )),
         RosterRank::Balance {
             currency: "CNY".to_string(),
             amount: 3640.55,
@@ -5785,7 +6385,11 @@ fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
         },
     );
     assert_eq!(
-        roster_rank(&crate::profile::ProfileName::from("both-wallets")),
+        roster_rank_for(&crate::profile::Profile::new(
+            "both-wallets".to_string(),
+            None,
+            None
+        )),
         RosterRank::Balance {
             currency: "USD".to_string(),
             amount: 1.19,
@@ -9353,7 +9957,8 @@ fn resolve_fanout_refuses_a_codex_member_as_a_codex_account() {
     .expect("create profile");
 
     let raw: Vec<String> = ["cl1", "cx"].iter().map(|n| (*n).to_string()).collect();
-    let err = resolve_fanout(&config, &raw).expect_err("a codex member refuses the fan-out");
+    let err = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
+        .expect_err("a codex member refuses the fan-out");
     assert_eq!(
         err,
         "profile not found: cx; cx names a CODEX account, which these tools do not manage — \

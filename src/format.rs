@@ -790,6 +790,7 @@ pub(crate) fn start_block_label(block: &StartBlock) -> String {
         StartBlock::ScopedSpent { label, pct } => {
             format!("{label} {}, other models ok", format_pct(*pct))
         }
+        StartBlock::CreditCap => "credit cap spent, other models ok".to_string(),
     }
 }
 

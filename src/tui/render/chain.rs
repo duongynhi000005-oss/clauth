@@ -801,7 +801,7 @@ fn member_row_hint(
         ),
         FallbackRow::CheckCreditCap => Some(
             if profile.check_credit_cap {
-                "a spent usage-credit cap keeps auto-switch off this account, except as last resort or when recovering from a switch-off"
+                "a spent usage-credit cap keeps auto-switch off this account, except when marked last resort or when recovering from a switch-off"
             } else {
                 "auto-switch can move onto this account even with its usage-credit cap spent"
             }

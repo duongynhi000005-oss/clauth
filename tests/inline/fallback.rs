@@ -7877,7 +7877,16 @@ fn start_block_names_a_monthly_only_members_soft_block() {
         .find(&ProfileName::from("p"))
         .expect("fixture profile");
     let usage = monthly_usage(99.0);
-    let block = start_block(&config, &member, profile, Some(&usage), false, false, None);
+    let block = start_block(
+        &config,
+        &member,
+        profile,
+        Some(&usage),
+        false,
+        false,
+        None,
+        &[],
+    );
     assert_eq!(
         block,
         Some(StartBlock::WeeklySoft {
@@ -7917,14 +7926,30 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
         .find(&ProfileName::from("p"))
         .expect("fixture profile");
 
+    let credit_billed = crate::claude_json::credit_billed_families_from(None);
     let check = |config: &AppConfig,
                  member: &ChainMember,
                  profile: &Profile,
                  usage: Option<UsageInfo>,
-                 families: Option<&[String]>| {
+                 families: Option<&[String]>,
+                 known_blocked: Option<bool>| {
+        // The credit rung: an UNKNOWN demand's expectation is the switch walk's
+        // own predicate, not a hand mirror; a KNOWN demand's is hand-written per
+        // row from the ruling — blocked iff the demand crosses a credit-billed
+        // family, whatever the gate says — a literal the `.any`→`.all` mutant
+        // cannot also mutate.
+        let usage_map: HashMap<String, UsageInfo> = usage
+            .clone()
+            .map(|u| HashMap::from([(member.name.to_string(), u)]))
+            .unwrap_or_default();
+        let credit_blocked = match known_blocked {
+            Some(blocked) => blocked,
+            None => credit_capped_from_usage(member, &usage_map),
+        };
         let expected =
             !is_exhausted_from_info(member, usage.as_ref(), member.weekly_line, now_epoch_secs())
-                && start_walk_scoped_clear(member, usage.as_ref(), families);
+                && start_walk_scoped_clear(member, usage.as_ref(), families)
+                && !credit_blocked;
         assert_eq!(
             start_block(
                 config,
@@ -7933,19 +7958,21 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
                 usage.as_ref(),
                 false,
                 false,
-                families
+                families,
+                &credit_billed,
             )
             .is_none(),
             expected,
-            "usage={usage:?} check_scoped={} families={families:?}",
-            member.check_scoped
+            "usage={usage:?} check_scoped={} check_credit_cap={} families={families:?}",
+            member.check_scoped,
+            member.check_credit_cap
         );
     };
 
     let live = Some(live_reset());
     let lapsed = Some(expired_reset());
 
-    check(&on_config, &on_member, on_profile, None, None);
+    check(&on_config, &on_member, on_profile, None, None, None);
 
     // 5h at the threshold exactly, one below, 100 — each live and lapsed.
     for resets_at in [live.clone(), lapsed.clone()] {
@@ -7959,6 +7986,7 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
                     seven_day: Some(window(0.0, live.clone())),
                     ..Default::default()
                 }),
+                None,
                 None,
             );
         }
@@ -7977,6 +8005,7 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
                     ..Default::default()
                 }),
                 None,
+                None,
             );
         }
     }
@@ -7984,16 +8013,23 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
     // A scoped window at the scoped line exactly, over each family/check arm.
     let demanded = ["fable".to_owned()];
     let other = ["opus".to_owned()];
-    for (config, member, profile, families) in [
-        (&on_config, &on_member, on_profile, None),
-        (&off_config, &off_member, off_profile, None),
+    for (config, member, profile, families, known_blocked) in [
+        (&on_config, &on_member, on_profile, None, None),
+        (&off_config, &off_member, off_profile, None, None),
         (
             &on_config,
             &on_member,
             on_profile,
             Some(demanded.as_slice()),
+            Some(false),
         ),
-        (&on_config, &on_member, on_profile, Some(other.as_slice())),
+        (
+            &on_config,
+            &on_member,
+            on_profile,
+            Some(other.as_slice()),
+            Some(false),
+        ),
     ] {
         check(
             config,
@@ -8009,8 +8045,141 @@ fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
                 ..Default::default()
             }),
             families,
+            known_blocked,
         );
     }
+
+    // A spent usage-credit cap, × credit gate on/off × families None /
+    // ["fable"] / ["opus"] / mixed. The None expectation comes from the walk's
+    // own `credit_capped_from_usage`; the known-family arms are hand-written
+    // per row from the ruling — blocked iff the demand crosses a credit-billed
+    // family, whatever the gate says. The mixed rows are where `.any` and
+    // `.all` disagree, so a literal bool pins the ruling rather than the code's
+    // own expression.
+    let mut cap_off = start_walk_profile("p");
+    cap_off.profile.check_credit_cap = false;
+    let (cap_off_config, _readings) = config_with_chain(vec![cap_off], "p");
+    let cap_off_member = chain_member(
+        &cap_off_config,
+        &ProfileName::from("p"),
+        cap_off_config.state.weekly_switch_threshold_pct(),
+        &HashSet::new(),
+    );
+    let cap_off_profile = cap_off_config
+        .find(&ProfileName::from("p"))
+        .expect("fixture profile");
+
+    let capped = UsageInfo {
+        spend: Some(SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..Default::default()
+    };
+    let fable = ["fable".to_owned()];
+    let opus = ["opus".to_owned()];
+    let fable_opus = ["opus".to_owned(), "fable".to_owned()];
+    let opus_sonnet = ["opus".to_owned(), "sonnet".to_owned()];
+    for (config, member, profile, families, known_blocked) in [
+        (&on_config, &on_member, on_profile, None, None),
+        (
+            &cap_off_config,
+            &cap_off_member,
+            cap_off_profile,
+            None,
+            None,
+        ),
+        (
+            &on_config,
+            &on_member,
+            on_profile,
+            Some(fable.as_slice()),
+            Some(true),
+        ),
+        (
+            &cap_off_config,
+            &cap_off_member,
+            cap_off_profile,
+            Some(fable.as_slice()),
+            Some(true),
+        ),
+        (
+            &on_config,
+            &on_member,
+            on_profile,
+            Some(opus.as_slice()),
+            Some(false),
+        ),
+        (
+            &cap_off_config,
+            &cap_off_member,
+            cap_off_profile,
+            Some(opus.as_slice()),
+            Some(false),
+        ),
+        (
+            &on_config,
+            &on_member,
+            on_profile,
+            Some(fable_opus.as_slice()),
+            Some(true),
+        ),
+        (
+            &cap_off_config,
+            &cap_off_member,
+            cap_off_profile,
+            Some(fable_opus.as_slice()),
+            Some(true),
+        ),
+        (
+            &on_config,
+            &on_member,
+            on_profile,
+            Some(opus_sonnet.as_slice()),
+            Some(false),
+        ),
+        (
+            &cap_off_config,
+            &cap_off_member,
+            cap_off_profile,
+            Some(opus_sonnet.as_slice()),
+            Some(false),
+        ),
+    ] {
+        check(
+            config,
+            member,
+            profile,
+            Some(capped.clone()),
+            families,
+            known_blocked,
+        );
+    }
+
+    // A billing-off account carrying a stale full limit is NOT capped: the rung
+    // keys on `credit_capped()`, never a stale percent. A fable demand still
+    // runs there.
+    let stale_full_limit = UsageInfo {
+        spend: Some(SpendInfo {
+            enabled: false,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..Default::default()
+    };
+    check(
+        &on_config,
+        &on_member,
+        on_profile,
+        Some(stale_full_limit),
+        Some(fable.as_slice()),
+        Some(false),
+    );
 }
 
 /// Ruling 2: a third-party member whose api KEY the provider rejected reads
@@ -8045,7 +8214,7 @@ fn start_block_treats_a_key_rejected_third_party_member_as_auth_broken() {
     let fp = crate::usage::profile_credential_fingerprint(profile).unwrap();
     crate::profile_cache::write_auth_expired(&ProfileName::from("zai"), fp);
     assert_eq!(
-        start_block(&config, &member, profile, None, false, false, None),
+        start_block(&config, &member, profile, None, false, false, None, &[]),
         Some(StartBlock::AuthBroken),
         "a key-rejected third-party member must read as auth-broken"
     );
@@ -8149,7 +8318,7 @@ fn start_block_leaves_a_console_lapsed_alibaba_member_pickable() {
     };
     let profile = config.find(&ProfileName::from("ali")).unwrap();
     assert_eq!(
-        start_block(&config, &member, profile, None, false, false, None),
+        start_block(&config, &member, profile, None, false, false, None, &[]),
         None,
         "a console-lapsed Alibaba member stays pickable by the start walk"
     );
@@ -8276,7 +8445,7 @@ fn an_alibaba_member_without_a_console_is_not_key_rejected() {
     };
     let profile = config.find(&ProfileName::from("ali")).unwrap();
     assert_eq!(
-        start_block(&config, &member, profile, None, false, false, None),
+        start_block(&config, &member, profile, None, false, false, None, &[]),
         None,
         "a console-lapsed Alibaba member is not refused by the start walk"
     );

@@ -3835,7 +3835,7 @@ fn the_credit_gate_row_hints_the_current_state() {
     assert_eq!(
         hint(true).as_deref(),
         Some(
-            "a spent usage-credit cap keeps auto-switch off this account, except as last resort or when recovering from a switch-off"
+            "a spent usage-credit cap keeps auto-switch off this account, except when marked last resort or when recovering from a switch-off"
         )
     );
     assert_eq!(

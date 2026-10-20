@@ -1446,6 +1446,7 @@ pub(crate) enum StartBlock {
     WeeklySoft { pct: f64, monthly: bool },
     FiveHour { pct: f64 },
     ScopedSpent { label: String, pct: f64 },
+    CreditCap,
 }
 
 /// The worst reason `member` cannot be STARTED on, or `None` when it is clear.
@@ -1455,7 +1456,10 @@ pub(crate) enum StartBlock {
 /// disk, and `families` the models a launch is about to run: `Some` narrows the
 /// per-model weekly judgment to exactly those families regardless of
 /// `check_scoped` (a KNOWN demand supersedes the blanket gate), `None` keeps
-/// today's blanket behaviour gated by `check_scoped`. `needs_oauth` is
+/// today's blanket behaviour gated by `check_scoped`. `credit_billed` is the
+/// set of model families Claude Code bills against usage credits, read once by
+/// the walk — a known demand crossing it is refused whatever the credit gate
+/// says, an unknown one only while the gate is on. `needs_oauth` is
 /// `--with-fallback`, which refuses a member the chain could never move the
 /// session off.
 ///
@@ -1464,9 +1468,11 @@ pub(crate) enum StartBlock {
 /// NAME which of its clauses fired, so none can fire while the predicate is
 /// clear. `None` means the member is not excluded (disabled, canceled,
 /// auth-broken, kick-rejected, non-OAuth under `--with-fallback`) AND not
-/// exhausted AND scoped-clear. Every rung but `NotOauth` is one the switch
-/// walk also skips or refuses on; the active-slot skip is the walk's alone,
-/// since a start has no active to leave.
+/// exhausted AND scoped-clear AND credit-clear. Every rung but `NotOauth` is
+/// one the switch walk also skips or refuses on, except the demand-narrowed
+/// rungs (`ScopedSpent`, `CreditCap`) under a known demand; the active-slot
+/// skip is the walk's alone, since a start has no active to leave.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_block(
     config: &AppConfig,
     member: &ChainMember,
@@ -1475,6 +1481,7 @@ pub(crate) fn start_block(
     kick_rejected: bool,
     needs_oauth: bool,
     families: Option<&[String]>,
+    credit_billed: &[String],
 ) -> Option<StartBlock> {
     if profile.is_disabled() {
         return Some(StartBlock::Disabled);
@@ -1527,6 +1534,20 @@ pub(crate) fn start_block(
             label: worst.label.clone(),
             pct: worst.window.utilization,
         });
+    }
+    // A spent usage-credit cap refuses a launch Claude Code would bill against
+    // usage credits. A KNOWN demand decides by its own families whatever the
+    // credit gate says; an unknown demand (no model resolved) is judged
+    // credit-billed only while the gate is on — the scoped gate's blanket rule.
+    // Keyed on `credit_capped()`, never a stale percent or a billing-off limit.
+    if usage.is_some_and(UsageInfo::credit_capped) {
+        let billed = match families {
+            Some(fams) => fams.iter().any(|f| credit_billed.contains(f)),
+            None => member.check_credit_cap,
+        };
+        if billed {
+            return Some(StartBlock::CreditCap);
+        }
     }
     if exhausted && usage.is_some_and(|info| weekly_blocked_info(info, now, member.weekly_line)) {
         let pct = usage
@@ -1588,6 +1609,9 @@ pub(crate) fn start_walk(
     // judgment (`chain_member.preferred`) reads the durable verdict — once,
     // not once per candidate.
     let key_rejected = durable_key_rejected(config);
+    // Claude Code's credit-billed model families, read once for the whole walk —
+    // a per-row read would re-parse `.claude.json` for every member.
+    let credit_billed = crate::claude_json::credit_billed_families();
     // The outgoing profile's env keys strip the base settings before the member
     // overlay re-adds its own — the same set, builder and base choice the
     // runtime write uses, so the demand's settings-derived models are exactly
@@ -1642,6 +1666,7 @@ pub(crate) fn start_walk(
             kick_rejected,
             needs_oauth,
             families,
+            &credit_billed,
         );
         readings.push(if walk_order == WalkOrder::Chain {
             None
