@@ -125,8 +125,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let owner = keyboard_owner(app);
 
-    // A login in flight owns the footer, independent of `footer_alert` so key
-    // handling that clears alerts can't hide it.
+    // A live alert replaces the footer in place — one footer row, never
+    // stacked — and outranks the login line: a ctrl+c arm can happen while a
+    // login runs, and the quit prompt must be visible then.
+    if let Some(alert) = &app.footer_alert {
+        draw_alert(frame, area, alert);
+        return;
+    }
+
+    // A login in flight owns the footer while no alert is live.
     if let Some(session) = &app.login {
         // An open editor takes esc/q before the login's cancel does, so its own
         // grammar is the hint. Any open modal owns esc/q too (the login modal
@@ -145,12 +152,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(session) = &app.codex_login {
         let keys = login_keys(owner, app, frame_area, false);
         draw_codex_login(frame, area, session, keys, app.tick_count);
-        return;
-    }
-
-    // A live alert replaces the hint bar in place — one footer row, never stacked.
-    if let Some(alert) = &app.footer_alert {
-        draw_alert(frame, area, alert);
         return;
     }
 
@@ -794,7 +795,7 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         let mut hints = Vec::new();
         if app.services.delegates_selection_moves() {
             hints.push(("↑↓", "row"));
-            hints.push(("page up/down", "read"));
+            hints.push(("pgup/pgdn", "read"));
         }
         hints.extend([("r", "refresh"), ("a", "actions"), ("?", "help")]);
         return hints;
@@ -908,7 +909,7 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             vec![("↑↓", "scroll")]
         };
         if walks_problems && app.services.detail_max_scroll.get() > 0 {
-            hints.push(("page up/down", "read"));
+            hints.push(("pgup/pgdn", "read"));
         }
         hints.push(("r", "refresh"));
         if let Some(v) = verb {
@@ -922,7 +923,7 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     if app.services.diagnostic_focus {
         let mut hints = vec![("↑↓", "row")];
         if app.services.detail_max_scroll.get() > 0 {
-            hints.push(("page up/down", "read"));
+            hints.push(("pgup/pgdn", "read"));
         }
         hints.push(("r", "refresh"));
         hints.extend(next_fix);
@@ -980,7 +981,7 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         }
     };
     if app.services.detail_max_scroll.get() > 0 {
-        hints.insert(1, ("page up/down", "read"));
+        hints.insert(1, ("pgup/pgdn", "read"));
     }
     hints
 }

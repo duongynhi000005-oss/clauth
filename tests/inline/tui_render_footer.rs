@@ -783,7 +783,7 @@ fn fingerprint(app: &App) -> String {
         keyboard_owner(app),
         owner_selection(app),
         app.toasts.len(),
-        app.armed_quit,
+        app.armed_quit.is_some(),
         app.footer_alert.is_some(),
         app.services.shunt_save.is_some(),
     )
@@ -931,7 +931,11 @@ fn the_every_modal_hint_derives_from_the_handler() {
         let mut app = bare_app();
         app.modals.push(case.modal);
         crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Char('q')));
-        assert!(!app.armed_quit, "{}: q does not arm quit", case.name);
+        assert!(
+            app.armed_quit.is_none(),
+            "{}: q does not arm quit",
+            case.name
+        );
         assert!(
             app.footer_alert.is_none(),
             "{}: q raises no quit alert",
@@ -1983,4 +1987,271 @@ fn a_shunt_new_form_login_row_drops_enter_while_disabled() {
         ],
         "the disabled shunt `+ login` drops its ↵ hint"
     );
+}
+
+/// No modal body row opens in sentence case (a capital then a lowercase
+/// letter, `Discard …`): every case's interior rows are scanned at 80x24.
+/// Residual: only the bodies these fixtures produce are seen; a body built
+/// from other copy is covered by its own pin.
+#[test]
+fn no_modal_body_row_opens_in_sentence_case() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for case in modal_cases() {
+        let mut app = bare_app();
+        app.modals.push(case.modal.clone());
+        (case.prep)(&mut app);
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("backend");
+        term.draw(|f| crate::tui::render::draw(f, &app))
+            .expect("draw");
+        term.draw(|f| crate::tui::render::draw(f, &app))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        // The modal is the box whose top-left corner is ACCENT_2; the panels
+        // behind it draw the same glyph in their border colour.
+        let orange = crate::tui::theme::accent_2_color();
+        let corner = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == "\u{256d}" && buf[(x, y)].fg == orange);
+        let (left, top) = corner.unwrap_or_else(|| panic!("{}: no open modal", case.name));
+        let right = (left + 1..buf.area.width)
+            .find(|&x| buf[(x, top)].symbol() == "\u{256e}")
+            .expect("the modal's top-right corner");
+        let bottom = (top + 1..buf.area.height)
+            .find(|&y| buf[(left, y)].symbol() == "\u{2570}")
+            .expect("the modal's bottom-left corner");
+        for y in top + 1..bottom {
+            let interior: String = (left + 1..right).map(|x| buf[(x, y)].symbol()).collect();
+            let Some(word) = interior.split_whitespace().next() else {
+                continue;
+            };
+            let mut chars = word.chars();
+            let sentence_case = chars.next().is_some_and(|c| c.is_ascii_uppercase())
+                && chars.next().is_some_and(|c| c.is_ascii_lowercase());
+            assert!(
+                !sentence_case,
+                "{}: a modal body row opens in sentence case: {interior:?}",
+                case.name
+            );
+        }
+    }
+}
+
+fn ctrl_c() -> ratatui::crossterm::event::KeyEvent {
+    ratatui::crossterm::event::KeyEvent::new(
+        ratatui::crossterm::event::KeyCode::Char('c'),
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    )
+}
+
+fn press(code: ratatui::crossterm::event::KeyCode) -> ratatui::crossterm::event::KeyEvent {
+    crate::testutil::key(code)
+}
+
+/// The settled footer row with its 1-cell inset kept.
+fn footer_row(app: &App) -> String {
+    settled_rows(app, 80, 24)
+        .last()
+        .expect("the footer row")
+        .trim_end()
+        .to_string()
+}
+
+/// ctrl+c arms a quit that only a second ctrl+c completes: the first press
+/// only raises ` ! press ⌃c again to quit`; `q` neither completes it nor is
+/// completed by it, each running its own job instead.
+#[test]
+fn ctrl_c_arms_a_quit_only_a_second_ctrl_c_completes() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    use std::sync::atomic::Ordering;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.tab = Tab::Usage;
+    handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "the first ctrl+c only arms");
+    assert_eq!(footer_row(&app), " ! press ⌃c again to quit");
+    handle_key(&mut app, ctrl_c());
+    assert!(app.quit, "the second ctrl+c quits");
+    assert!(app.shutting_down.load(Ordering::SeqCst));
+
+    let mut app = bare_app();
+    app.tab = Tab::Usage;
+    handle_key(&mut app, ctrl_c());
+    handle_key(&mut app, press(KeyCode::Char('q')));
+    assert!(!app.quit, "q does not complete a ctrl+c arm");
+    assert_eq!(
+        footer_row(&app),
+        " ! press q again to quit",
+        "q runs its own job: at the top level it arms its own quit"
+    );
+    handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "ctrl+c does not complete a q arm");
+    assert_eq!(footer_row(&app), " ! press ⌃c again to quit");
+
+    let mut app = bare_app();
+    app.tab = Tab::Usage;
+    handle_key(&mut app, ctrl_c());
+    handle_key(&mut app, press(KeyCode::Right));
+    assert!(!app.quit);
+    assert_eq!(app.tab, Tab::Usage.next(), "another key does its own job");
+    assert!(
+        !footer_row(&app).contains("again to quit"),
+        "another key disarms the ctrl+c quit"
+    );
+    handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "a disarmed quit re-arms, it does not complete");
+}
+
+/// The first ctrl+c over an open modal or an open edit only arms: the modal
+/// stays open, the edit keeps its text, and the footer shows the alert; a
+/// typed key disarms and still types; two ctrl+c presses then quit.
+#[test]
+fn ctrl_c_arms_over_a_modal_and_an_edit_without_touching_them() {
+    use crate::tui::app::{
+        ConfirmAction, ConfirmScroll, ConfirmState, InputState, NamePromptAction, NamePromptForm,
+        handle_key,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.modals.push(Modal::Confirm(ConfirmState {
+        message: "rotate 'x'?".into(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RotateOne("x".into()),
+    }));
+    handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "the first ctrl+c over a modal only arms");
+    assert_eq!(app.modals.len(), 1, "the modal stays open");
+    assert_eq!(footer_row(&app), " ! press ⌃c again to quit");
+    handle_key(&mut app, ctrl_c());
+    assert!(app.quit, "the second ctrl+c quits over a modal");
+
+    let mut app = bare_app();
+    app.modals.push(Modal::NamePrompt(NamePromptForm {
+        input: InputState::new("a"),
+        action: NamePromptAction::DuplicateProfile("src".into()),
+    }));
+    handle_key(&mut app, ctrl_c());
+    assert!(!app.quit);
+    let value = |app: &App| match app.modals.last() {
+        Some(Modal::NamePrompt(form)) => form.input.value.clone(),
+        _ => panic!("the name prompt stays open"),
+    };
+    assert_eq!(value(&app), "a", "the edit keeps its text");
+    assert_eq!(footer_row(&app), " ! press ⌃c again to quit");
+    handle_key(&mut app, press(KeyCode::Char('b')));
+    assert_eq!(value(&app), "ab", "a typed key still types");
+    assert!(
+        !footer_row(&app).contains("again to quit"),
+        "a typed key disarms the quit"
+    );
+    handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "the quit re-arms after the disarm");
+    handle_key(&mut app, ctrl_c());
+    assert!(app.quit, "two presses quit from inside an edit");
+}
+
+/// ctrl+c's arm alert is visible under a claude and a codex login line: the
+/// login keeps running, but the one footer row shows the quit prompt, never
+/// the login lead.
+#[test]
+fn the_quit_alert_is_visible_under_a_login_line() {
+    use crate::tui::app::{CodexLoginSession, LoginMethod, LoginStage, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.tab = Tab::Usage;
+    app.login = Some(LoginSession {
+        name: "fresh".into(),
+        is_new: false,
+        generation: 0,
+        url: None,
+        stage: LoginStage::WaitingBrowser,
+        method: LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
+    });
+    handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "the first ctrl+c only arms");
+    assert_eq!(
+        footer_row(&app),
+        " ! press ⌃c again to quit",
+        "the alert outranks the claude login line"
+    );
+
+    let mut app = bare_app();
+    app.tab = Tab::Usage;
+    app.codex_login = Some(CodexLoginSession {
+        name: "fresh".into(),
+        generation: 0,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: false,
+    });
+    handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "the first ctrl+c only arms");
+    assert_eq!(
+        footer_row(&app),
+        " ! press ⌃c again to quit",
+        "the alert outranks the codex login line"
+    );
+}
+
+/// `x` disarms a quit like any other key: over a toast it pops the topmost
+/// toast AND clears the arm (ctrl+c's and q's alike); with no toast it
+/// dismisses the footer alert as before. The toast pops in both.
+#[test]
+fn x_over_a_toast_pops_and_disarms_the_quit() {
+    use crate::tui::app::{ToastKind, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.tab = Tab::Usage;
+    handle_key(&mut app, ctrl_c());
+    app.toast(ToastKind::Info, "saved");
+    assert_eq!(app.toasts.len(), 1, "a toast is up");
+    handle_key(&mut app, press(KeyCode::Char('x')));
+    assert!(app.toasts.is_empty(), "x pops the toast");
+    assert!(app.armed_quit.is_none(), "x disarms the ctrl+c arm");
+    assert!(app.footer_alert.is_none(), "x clears the alert");
+    handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "ctrl+c after x re-arms, it does not quit");
+
+    let mut app = bare_app();
+    app.tab = Tab::Usage;
+    handle_key(&mut app, press(KeyCode::Char('q')));
+    app.toast(ToastKind::Info, "saved");
+    assert_eq!(app.toasts.len(), 1, "a toast is up over a q arm");
+    handle_key(&mut app, press(KeyCode::Char('x')));
+    assert!(app.toasts.is_empty(), "x pops the toast over a q arm too");
+    assert!(app.armed_quit.is_none(), "x disarms the q arm");
+    assert!(app.footer_alert.is_none(), "x clears the q alert");
+    handle_key(&mut app, press(KeyCode::Char('q')));
+    assert!(!app.quit, "q after x re-arms, it does not quit");
+
+    let mut app = bare_app();
+    app.tab = Tab::Usage;
+    handle_key(&mut app, ctrl_c());
+    assert_eq!(footer_row(&app), " ! press ⌃c again to quit");
+    handle_key(&mut app, press(KeyCode::Char('x')));
+    assert!(
+        app.armed_quit.is_none(),
+        "x with no toast dismisses the alert"
+    );
+    assert!(
+        app.footer_alert.is_none(),
+        "x with no toast clears the alert"
+    );
+    assert!(
+        !footer_row(&app).contains("again to quit"),
+        "the alert is gone"
+    );
+    handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "the quit re-arms after x");
 }

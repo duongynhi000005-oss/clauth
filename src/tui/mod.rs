@@ -17,7 +17,8 @@ use crate::profile::AppConfig;
 /// 80ms tick: spinner advances every frame per contract; responsive without burning CPU.
 const TICK: Duration = Duration::from_millis(80);
 
-/// Launch the full-screen TUI. Returns on quit (q/⎋/Ctrl+C) or fatal error.
+/// Launch the full-screen TUI. Returns on quit (`q` twice, `⌃c` twice, or a
+/// fatal error).
 /// `herdr_mode` is decided once by `cmd_tui` from `HERDR_ENV` and applied to
 /// the constructed [`app::App`] via [`app::App::with_herdr_mode`]; nothing
 /// else here reads the environment.

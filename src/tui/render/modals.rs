@@ -478,10 +478,32 @@ fn draw_modal_scrolled(
     {
         focus_rows.1 = rows.len();
     }
-    let lines = rows;
+    let lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .map(|mut line| {
+            // A selected option row carries the BG_HOVER tint on its spans; pad
+            // it to the modal's full content width with an explicit tinted
+            // filler so the tint reaches the padding boundary (a `Line::style`
+            // tint stops at the last span).
+            let tinted = line
+                .spans
+                .iter()
+                .any(|s| s.style.bg == Some(theme::bg_hover()));
+            if tinted {
+                let fill = inner_w.saturating_sub(line.width());
+                if fill > 0 {
+                    line.push_span(Span::styled(
+                        " ".repeat(fill),
+                        Style::default().bg(theme::bg_hover()),
+                    ));
+                }
+            }
+            line
+        })
+        .collect();
     let total = lines.len();
     // A too-narrow choice (3 spans) stacks into two rows; a narrower one-span
-    // line (an `Acknowledge` confirm's ` ok `) renders as one row — reserve
+    // line (an `Acknowledge` confirm's ` close `) renders as one row — reserve
     // only what the branch below actually draws.
     let button_rows = match &tail.extra {
         Some(ModalExtra::Buttons(buttons))
@@ -553,7 +575,7 @@ fn draw_modal_scrolled(
                         },
                     );
                 }
-                // A one-span line (an `Acknowledge` confirm's ` ok `) has no
+                // A one-span line (an `Acknowledge` confirm's ` close `) has no
                 // pair to stack; render it as a plain right-aligned paragraph.
                 _ => frame.render_widget(Paragraph::new(buttons.clone()), button_area),
             }
@@ -897,9 +919,9 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             theme::dim(),
         )));
     }
-    // An acknowledge-only notice has nothing to cancel — a single focused `ok`.
+    // An acknowledge-only notice has nothing to cancel — a single focused `close`.
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
-        Line::from(modal_button(" ok ", true))
+        Line::from(modal_button(" close ", true))
     } else {
         choice_buttons(state.choice, "cancel", destructive, &confirm_label)
     };
@@ -925,12 +947,12 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
 }
 
 /// The loss warning a screen switch raises over unsaved work another screen
-/// also writes: `WARNING` title, sentence-case body naming the screen holding
+/// also writes: `WARNING` title, lowercase body naming the screen holding
 /// the work and the other writer, and a `go back` / `discard` pair reusing the
 /// confirm modal's button machinery.
 fn draw_loss_warning(frame: &mut Frame<'_>, area: Rect, state: &LossWarningState) {
     let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(
-        "Discard the unsaved edit?",
+        "discard the unsaved edit?",
         theme::body(),
     ))];
     // One line per sentence so a sentence never shares a row with the next.
@@ -1232,18 +1254,26 @@ fn divergence_action_text(action: &DivergenceAction, active: &str) -> String {
     }
 }
 
-/// Arrow-selected menu row shared by the Divergence and target-picker modals:
-/// `❯ ` accent when selected, two-space indent + dim otherwise.
+/// Arrow-selected menu row shared by the Divergence and target-picker modals,
+/// the action-menu row look: `❯ ` in ACCENT + bold and the label in TEXT +
+/// bold, both on a `BG_HOVER` tint, when selected; an unselected label is
+/// TEXT, not bold, on no tint. The scrolled-modal draw pads the tint to the
+/// modal's full content width.
 fn option_line(selected: bool, label: String) -> Line<'static> {
+    let tint = selected.then(theme::bg_hover);
+    let with_bg = |style: Style| match tint {
+        Some(color) => style.bg(color),
+        None => style,
+    };
     let arrow = if selected {
-        Span::styled("\u{276f} ", theme::accent())
+        Span::styled("\u{276f} ", with_bg(theme::accent().bold()))
     } else {
         Span::raw("  ")
     };
     let style = if selected {
-        theme::accent()
+        with_bg(theme::body().bold())
     } else {
-        theme::dim()
+        theme::body()
     };
     Line::from(vec![arrow, Span::styled(label, style)])
 }
@@ -1254,7 +1284,7 @@ fn draw_divergence_target(frame: &mut Frame<'_>, area: Rect, form: &DivergenceTa
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled("where to save the login?", theme::dim())),
         Line::from(""),
-        option_line(cursor == 0, "+ new account".to_string()),
+        new_row(cursor == 0, "+ new account"),
     ];
     for (i, name) in form.targets.iter().enumerate() {
         lines.push(option_line(cursor == i + 1, format!("overwrite '{name}'")));
@@ -1287,7 +1317,7 @@ fn draw_token_picker(frame: &mut Frame<'_>, area: Rect, form: &TokenPickerForm) 
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled("which profile sends it?", theme::dim())),
         Line::from(""),
-        new_profile_row(cursor == 0),
+        new_row(cursor == 0, "+ new profile"),
     ];
     for (i, (name, has_token)) in form.targets.iter().enumerate() {
         lines.push(token_picker_row(cursor == i + 1, name, *has_token));
@@ -1313,29 +1343,41 @@ fn draw_token_picker(frame: &mut Frame<'_>, area: Rect, form: &TokenPickerForm) 
     );
 }
 
-/// The picker's first-class `+ new` row: `ACCENT` at rest, `ACCENT + bold`
-/// while selected (the `+ new` row's color is its identity).
-fn new_profile_row(selected: bool) -> Line<'static> {
+/// The pickers' first-class `+ new` row: `ACCENT` at rest, `ACCENT + bold`
+/// while selected (the `+ new` row's color is its identity), with the
+/// action-menu tint when selected.
+fn new_row(selected: bool, label: &str) -> Line<'static> {
+    let tint = selected.then(theme::bg_hover);
+    let with_bg = |style: Style| match tint {
+        Some(color) => style.bg(color),
+        None => style,
+    };
     let arrow = if selected {
-        Span::styled("\u{276f} ", theme::accent().bold())
+        Span::styled("\u{276f} ", with_bg(theme::accent().bold()))
     } else {
         Span::raw("  ")
     };
     let style = if selected {
-        theme::accent().bold()
+        with_bg(theme::accent().bold())
     } else {
         theme::accent()
     };
-    Line::from(vec![arrow, Span::styled("+ new profile", style)])
+    Line::from(vec![arrow, Span::styled(label.to_string(), style)])
 }
 
 /// One profile row of the token picker: the shared `option_line` shape (the
 /// Divergence/target-picker row), plus a dim `  has a token` suffix for a
-/// profile already holding one.
+/// profile already holding one. The suffix keeps `TEXT_DIM` but rides the
+/// selected row's tint.
 fn token_picker_row(selected: bool, name: &str, has_token: bool) -> Line<'static> {
     let mut line = option_line(selected, name.to_string());
     if has_token {
-        line.push_span(Span::styled("  has a token", theme::dim()));
+        let style = if selected {
+            theme::dim().bg(theme::bg_hover())
+        } else {
+            theme::dim()
+        };
+        line.push_span(Span::styled("  has a token", style));
     }
     line
 }
@@ -1389,21 +1431,29 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
 
     for (i, option) in options.iter().enumerate() {
         let selected = i == cursor;
+        let tint = selected.then(theme::bg_hover);
+        let with_bg = |style: Style| match tint {
+            Some(color) => style.bg(color),
+            None => style,
+        };
         let arrow = if selected {
-            Span::styled("\u{276f} ", theme::accent())
+            Span::styled("\u{276f} ", with_bg(theme::accent().bold()))
         } else {
             Span::raw("  ")
         };
         let (label, detail) = env_collision_option_text(*option, form);
         let label_style = if selected {
-            theme::accent()
+            with_bg(theme::body().bold())
         } else {
-            theme::dim()
+            theme::body()
         };
         lines.push(Line::from(vec![arrow, Span::styled(label, label_style)]));
+        // The detail line is part of the selected option's block: it keeps
+        // TEXT_DIM but rides the same tint, so a wrapped option tints every
+        // line of its block.
         lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(detail, theme::dim()),
+            Span::styled("    ", with_bg(Style::default())),
+            Span::styled(detail, with_bg(theme::dim())),
         ]));
     }
 
@@ -1535,9 +1585,15 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
         Line::from(""),
     ];
     for (i, preset) in form.presets.iter().enumerate() {
-        let mut line = option_line(i == cursor, preset.name.clone());
+        let selected = i == cursor;
+        let mut line = option_line(selected, preset.name.clone());
         if preset.builtin {
-            line.push_span(Span::styled("  built-in", theme::dim()));
+            let style = if selected {
+                theme::dim().bg(theme::bg_hover())
+            } else {
+                theme::dim()
+            };
+            line.push_span(Span::styled("  built-in", style));
         }
         lines.push(line);
     }
@@ -1621,7 +1677,7 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
                 "tokens",
                 &[
                     ("\u{2191} \u{2193}", "move between cards"),
-                    ("page up / page down", "move a page of cards"),
+                    ("pgup/pgdn", "move a page of cards"),
                     ("c", "count cache in token figures"),
                     (
                         "t",
@@ -1635,7 +1691,7 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
             "tokens",
             &[
                 ("\u{2191} \u{2193}", "move between cards"),
-                ("page up / page down", "move a page of cards"),
+                ("pgup/pgdn", "move a page of cards"),
                 ("\u{21b5}", "open per-model breakdown"),
                 ("c", "count cache in token figures"),
                 (
@@ -1751,7 +1807,7 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
                     "pick row · scroll shunt detail · walk plugin problems · walk herdr fix + options · walk delegates",
                 ),
                 (
-                    "page up / page down",
+                    "pgup/pgdn",
                     "scroll a page · read plugin / herdr diagnostics · page delegates",
                 ),
                 ("\u{21b5}", "open detail · activate · open fix"),
@@ -1882,7 +1938,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("\u{21e7}tab", "previous screen"),
         ("\u{2325}1-9", "jump to tab"),
         ("esc", "back within a sub-view (no-op at the top level)"),
-        ("page up / page down", "scroll a page"),
+        ("pgup/pgdn", "scroll a page"),
         ("\u{2303}c", "quit from anywhere"),
     ];
     // A key the current tab redefines is documented in its own section above;

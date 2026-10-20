@@ -26439,7 +26439,7 @@ fn app_prose_styles_keys_and_commands_on_every_surface() {
     app.banner = None;
 
     super::handle_key(&mut app, crate::testutil::key(super::KeyCode::Char('q')));
-    assert!(app.armed_quit, "the first q arms the quit");
+    assert!(app.armed_quit.is_some(), "the first q arms the quit");
     assert_prose_part(
         &prose_frame(&app, 120, 30),
         "press q again to quit",
@@ -36524,10 +36524,10 @@ fn alt_digits_jump_to_tabs() {
     assert_eq!(app.tab, Tab::Overview, "⌥0 is unbound");
 
     super::handle_key(&mut app, key(KeyCode::Char('q')));
-    assert!(app.armed_quit, "precondition: the quit is armed");
+    assert!(app.armed_quit.is_some(), "precondition: the quit is armed");
     super::handle_key(&mut app, alt_digit('2'));
     assert_eq!(app.tab, Tab::Usage);
-    assert!(!app.armed_quit, "the jump disarmed the quit");
+    assert!(app.armed_quit.is_none(), "the jump disarmed the quit");
 
     app.open_modal(super::Modal::Help);
     super::handle_key(&mut app, alt_digit('3'));
@@ -43431,5 +43431,346 @@ fn a_reload_keeps_setups_new_selection_open_or_at_rest() {
         app.setup_selection(),
         super::SetupSelection::New,
         "a selector resting on `+ new` keeps it across a reload"
+    );
+}
+
+// ── Services tab activity (out of view) ──────────────────────────────────────
+
+/// A herdr probe whose config file the test owns in the sandbox, so the
+/// out-of-view re-read reads a file the test flips between healthy and warn.
+fn sandbox_herdr_probe(home: &std::path::Path) -> crate::herdr::HerdrProbe {
+    crate::herdr::HerdrProbe {
+        version: Some("0.8.0".into()),
+        entry: Some(herdr_entry(true, Some("0.8.0"), vec![])),
+        config_path: Some(home.join("herdr").join("config.toml")),
+        error: None,
+    }
+}
+
+fn write_herdr_config(home: &std::path::Path, body: &str) {
+    let path = home.join("herdr").join("config.toml");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, body).expect("write herdr config");
+}
+
+/// Stage an executable `clauth` under the sandbox and pin `PATH` ahead of it so
+/// the out-of-view plugin read resolves [`crate::plugin_probe::on_path`].
+/// Restores `PATH` on drop; borrowing the [`HomeSandbox`] keeps the
+/// env-mutation lock held (the `FakeClaude` pattern).
+#[cfg(unix)]
+struct ClauthPath<'a> {
+    _home: std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+    prev: std::ffi::OsString,
+}
+
+#[cfg(unix)]
+impl<'a> ClauthPath<'a> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    fn new(home: &'a crate::testutil::HomeSandbox) -> Self {
+        let dir = home.home().join("bin");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let shim = dir.join("clauth");
+        std::fs::write(&shim, "#!/bin/sh\nexit 0\n").expect("write shim");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&shim).expect("shim meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).expect("chmod shim");
+        let prev = std::env::var_os("PATH").expect("PATH is set");
+        let mut path = std::ffi::OsString::from(&dir);
+        path.push(":");
+        path.push(&prev);
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("PATH", path) };
+        Self {
+            _home: std::marker::PhantomData,
+            prev,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ClauthPath<'_> {
+    #[expect(unsafe_code, reason = "restore the PATH pin this test made")]
+    fn drop(&mut self) {
+        // SAFETY: restoring the value saved at construction.
+        unsafe { std::env::set_var("PATH", &self.prev) };
+    }
+}
+
+/// A herdr config that parses with the key bound and the sidebar templated, so
+/// `herdr_check` reads `Health::Ok`. An empty config reads `Health::Warn`.
+const HEALTHY_HERDR_TOML: &str = "\
+[[keys.command]]
+key = \"prefix+a\"
+type = \"plugin_action\"
+command = \"clauth.open\"
+
+[ui.sidebar.agents.rows_by_agent]
+claude = \"$clauth\"
+";
+
+/// The first out-of-view poll after startup is a baseline: it records the
+/// plugin/herdr health and colors nothing, whatever the state.
+#[test]
+fn the_services_activity_baseline_colors_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let home = _home.home().to_path_buf();
+    write_herdr_config(&home, HEALTHY_HERDR_TOML);
+    let mut app = bare_app();
+    app.tab = super::Tab::Overview;
+    app.services.herdr = Some(Some(sandbox_herdr_probe(&home)));
+    app.last_services_refresh = std::time::Instant::now() - std::time::Duration::from_secs(6);
+    super::poll_services_refresh(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "the baseline reading colors nothing"
+    );
+}
+
+/// A herdr row whose health changes while Services is out of view colors the
+/// Services tab in the new state's color, and the rendered tab label takes
+/// that color.
+#[test]
+fn the_services_tab_colors_on_a_herdr_change_out_of_view() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let home = _home.home().to_path_buf();
+    write_herdr_config(&home, HEALTHY_HERDR_TOML);
+    let mut app = bare_app();
+    app.tab = super::Tab::Overview;
+    app.services.herdr = Some(Some(sandbox_herdr_probe(&home)));
+    let poll = |app: &mut super::App| {
+        app.last_services_refresh = std::time::Instant::now() - std::time::Duration::from_secs(6);
+        super::poll_services_refresh(app);
+    };
+    poll(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "the baseline colors nothing"
+    );
+    // The empty config parses but has no key and no sidebar row, so the herdr
+    // row degrades to warn.
+    write_herdr_config(&home, "");
+    poll(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Warning),
+        "the herdr row's health change colors the Services tab"
+    );
+
+    // The rendered tab label takes the activity color.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+    let label = "services";
+    let x = (0..buf.area.width.saturating_sub(label.len() as u16))
+        .find(|&x| {
+            (0..buf.area.height).any(|y| {
+                (0..label.len() as u16)
+                    .map(|i| buf[(x + i, y)].symbol())
+                    .collect::<String>()
+                    == label
+            })
+        })
+        .expect("the services tab label renders");
+    let y = (0..buf.area.height)
+        .find(|&y| {
+            (0..label.len() as u16)
+                .map(|i| buf[(x + i, y)].symbol())
+                .collect::<String>()
+                == label
+        })
+        .expect("the services tab label row");
+    assert_eq!(
+        buf[(x, y)].fg,
+        crate::tui::theme::warning_color(),
+        "the rendered services label takes the activity color"
+    );
+}
+
+/// A poll returning the same plugin/herdr state colors nothing.
+#[test]
+fn a_same_state_services_poll_colors_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let home = _home.home().to_path_buf();
+    write_herdr_config(&home, HEALTHY_HERDR_TOML);
+    let mut app = bare_app();
+    app.tab = super::Tab::Overview;
+    app.services.herdr = Some(Some(sandbox_herdr_probe(&home)));
+    let poll = |app: &mut super::App| {
+        app.last_services_refresh = std::time::Instant::now() - std::time::Duration::from_secs(6);
+        super::poll_services_refresh(app);
+    };
+    poll(&mut app);
+    poll(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "a same-state poll colors nothing"
+    );
+}
+
+/// A plugin row whose health changes while Services is out of view colors the
+/// Services tab in the new state's color.
+#[cfg(unix)]
+#[test]
+fn a_plugin_row_health_change_out_of_view_colors_services() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _path = ClauthPath::new(&_home);
+    let mut app = bare_app();
+    app.tab = super::Tab::Overview;
+    let poll = |app: &mut super::App| {
+        app.last_services_refresh = std::time::Instant::now() - std::time::Duration::from_secs(6);
+        super::poll_services_refresh(app);
+    };
+    poll(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "the baseline colors nothing"
+    );
+    // A user-scope install record appears on disk: the out-of-view poll
+    // re-reads the install record and colors the tab Success.
+    write_plugin_install("user", Some(env!("CARGO_PKG_VERSION")));
+    poll(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Success),
+        "the plugin row's recovery colors the Services tab Success"
+    );
+}
+
+/// A herdr row recovering to Ok while Services is out of view colors the
+/// Services tab Success.
+#[test]
+fn a_success_services_change_colors_success() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let home = _home.home().to_path_buf();
+    write_herdr_config(&home, "");
+    let mut app = bare_app();
+    app.tab = super::Tab::Overview;
+    app.services.herdr = Some(Some(sandbox_herdr_probe(&home)));
+    let poll = |app: &mut super::App| {
+        app.last_services_refresh = std::time::Instant::now() - std::time::Duration::from_secs(6);
+        super::poll_services_refresh(app);
+    };
+    poll(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "the baseline colors nothing"
+    );
+    write_herdr_config(&home, HEALTHY_HERDR_TOML);
+    poll(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Success),
+        "the herdr row's recovery colors the Services tab Success"
+    );
+}
+
+/// A herdr failure colors the Services tab Danger, and the worst-severity hold
+/// keeps that Danger when a later reading recovers to Ok.
+#[test]
+fn a_danger_services_change_holds_over_a_later_success() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let home = _home.home().to_path_buf();
+    write_herdr_config(&home, HEALTHY_HERDR_TOML);
+    let mut app = bare_app();
+    app.tab = super::Tab::Overview;
+    app.services.herdr = Some(Some(sandbox_herdr_probe(&home)));
+    let poll = |app: &mut super::App| {
+        app.last_services_refresh = std::time::Instant::now() - std::time::Duration::from_secs(6);
+        super::poll_services_refresh(app);
+    };
+    poll(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "the baseline colors nothing"
+    );
+    let mut failed = sandbox_herdr_probe(&home);
+    failed.error = Some("manifest unavailable".into());
+    app.services.herdr = Some(Some(failed));
+    poll(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Danger),
+        "the herdr row's failure colors the Services tab Danger"
+    );
+    app.services.herdr = Some(Some(sandbox_herdr_probe(&home)));
+    poll(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Danger),
+        "the worst-severity hold keeps Danger over a later Success"
+    );
+}
+
+/// The out-of-view poll re-reads only the plugin and herdr checks: it starts
+/// no herdr or standalone probe worker even when both are uncached.
+#[test]
+fn the_out_of_view_poll_starts_no_worker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = super::Tab::Overview;
+    app.services.herdr = None;
+    // Stub both probers so a `.start()` would be observable as `running`.
+    app.services.herdr_probe.prober = Some(|| None);
+    app.services.standalone_probe.prober = Some(super::StandaloneShunt::default);
+    app.last_services_refresh = std::time::Instant::now() - std::time::Duration::from_secs(6);
+    super::poll_services_refresh(&mut app);
+    assert!(
+        !app.services.herdr_probe.running,
+        "the out-of-view poll starts no herdr probe"
+    );
+    assert!(
+        !app.services.standalone_probe.running,
+        "the out-of-view poll starts no standalone shunt probe"
+    );
+}
+
+/// A shunt-remove refusal names a comment in the adopted file; the out-of-view
+/// poll re-reads only the plugin and herdr health, so it keeps the refusal
+/// even when the adopted config's view has since moved past it. An in-view
+/// recompute would retire it (`shunt_config` re-read and view compare).
+#[test]
+fn the_out_of_view_poll_keeps_a_shunt_remove_refusal() {
+    use super::{ShuntEntryKey, ShuntRemoveRefusal};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&_home, &[(crate::gateway::BIND_ENV, None)]);
+    crate::testutil::write_adopted_record(&_home, false, "[server]\nbind = \"127.0.0.1:9\"\n");
+    let mut app = bare_app();
+    app.tab = super::Tab::Overview;
+    let view = crate::gateway_edit::ConfigView {
+        server: crate::gateway_edit::ServerView {
+            bind: None,
+            bind_override: crate::gateway_edit::BindOverride::None,
+            default_provider: None,
+        },
+        form: crate::gateway_edit::ProviderForm::Upstreams,
+        upstreams: Vec::new(),
+        models: Vec::new(),
+        routes: Vec::new(),
+    };
+    app.services
+        .shunt_remove_refusal
+        .replace(Some(ShuntRemoveRefusal {
+            key: ShuntEntryKey::Upstream {
+                name: "a".into(),
+                occurrence: 0,
+            },
+            sentence: "cannot remove upstream \"a\"".into(),
+            view: Box::new(view),
+        }));
+    app.last_services_refresh = std::time::Instant::now() - std::time::Duration::from_secs(6);
+    super::poll_services_refresh(&mut app);
+    assert!(
+        app.services.shunt_remove_refusal.borrow().is_some(),
+        "the out-of-view poll keeps a shunt-remove refusal the in-view recompute would retire"
     );
 }

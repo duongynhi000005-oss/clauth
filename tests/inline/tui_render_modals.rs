@@ -13,8 +13,9 @@ fn empty_app(tab: Tab) -> App {
     app
 }
 
-/// An `Acknowledge` confirm's single ` ok ` button line renders on a terminal
-/// narrower than the button (the old 3-span split panicked at `unreachable!`).
+/// An `Acknowledge` confirm's single ` close ` button line renders on a
+/// terminal narrower than the button (the old 3-span split panicked at
+/// `unreachable!`).
 #[test]
 fn acknowledge_confirm_renders_on_narrow_terminals() {
     use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
@@ -29,8 +30,8 @@ fn acknowledge_confirm_renders_on_narrow_terminals() {
         };
         let (_buf, rows, _origin) = render_confirm(&state, width, 12);
         assert!(
-            rows.join("\n").contains("ok"),
-            "the ok button renders at width {width}: {}",
+            rows.join("\n").contains("cl"),
+            "the close button renders at width {width}: {}",
             rows.join("\n")
         );
     }
@@ -348,7 +349,7 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             "TOKENS",
             &[
                 "│    ↑ ↓                 move between cards",
-                "│    page up / page down  move a page of cards",
+                "│    pgup/pgdn           move a page of cards",
                 "│    c                   count cache in token figures",
                 "│    t                   cycle period · lifetime / daily / weekly / monthly",
                 "│    r                   reload on-disk stats",
@@ -360,7 +361,7 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             "TOKENS",
             &[
                 "│    ↑ ↓                 move between cards",
-                "│    page up / page down  move a page of cards",
+                "│    pgup/pgdn           move a page of cards",
                 "│    ↵                   open per-model breakdown",
                 "│    c                   count cache in token figures",
                 "│    t                   cycle period · lifetime / daily / weekly / monthly",
@@ -701,7 +702,7 @@ fn services_help_names_diagnostic_paging_without_mislabeling_arrows() {
                 "pick row · scroll shunt detail · walk plugin problems · walk herdr fix + options · walk delegates",
             ),
             (
-                "page up / page down",
+                "pgup/pgdn",
                 "scroll a page · read plugin / herdr diagnostics · page delegates",
             ),
             ("↵", "open detail · activate · open fix"),
@@ -2961,9 +2962,9 @@ fn the_loss_warning_renders_its_title_body_and_buttons() {
             "╭─ WARNING ───────────────────────────────────╮",
             vec![
                 "",
-                "  Discard the unsaved edit?",
-                "  There are unsaved edits on the Setup tab.",
-                "  Fallback also edits this account.",
+                "  discard the unsaved edit?",
+                "  there are unsaved edits on the setup tab.",
+                "  fallback also edits this account.",
                 "",
                 "                         go back   discard",
                 "",
@@ -2974,10 +2975,10 @@ fn the_loss_warning_renders_its_title_body_and_buttons() {
             "╭─ WARNING ────────────────────────────────────╮",
             vec![
                 "",
-                "  Discard the unsaved edit?",
-                "  There are unsaved edits on the Fallback",
+                "  discard the unsaved edit?",
+                "  there are unsaved edits on the fallback",
                 "  tab.",
-                "  Setup also edits this account.",
+                "  setup also edits this account.",
                 "",
                 "                          go back   discard",
                 "",
@@ -3054,9 +3055,9 @@ fn the_new_account_draft_warning_renders_its_body() {
         inner.iter().map(String::as_str).collect::<Vec<_>>(),
         [
             "",
-            "  Discard the unsaved edit?",
-            "  There are unsaved edits on the Setup tab.",
-            "  Services also edits the new account form.",
+            "  discard the unsaved edit?",
+            "  there are unsaved edits on the setup tab.",
+            "  services also edits the new account form.",
             "",
             "                         go back   discard",
             "",
@@ -3112,7 +3113,7 @@ fn the_help_global_section_names_the_switch_keys() {
             "    ⇧tab                previous screen",
             "    ⌥1-9                jump to tab",
             "    esc                 back within a sub-view (no-op at the top level)",
-            "    page up / page down  scroll a page",
+            "    pgup/pgdn           scroll a page",
             "    ⌃c                  quit from anywhere",
             "",
         ]
@@ -3807,7 +3808,7 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│    ⌥1-9                jump to tab         ┃ │",
         "│    esc                 back within a       ┃ │",
         "│  sub-view (no-op at the top level)         ┃ │",
-        "│    page up / page down  scroll a page      ┃ │",
+        "│    pgup/pgdn           scroll a page       ┃ │",
         "│    ⌃c                  quit from anywhere  ┃ │",
         "│                                            ┃ │",
         "│  GLYPHS                                    ┃ │",
@@ -4088,4 +4089,731 @@ fn a_word_wrapped_confirm_scrolls_to_its_tail_on_a_short_terminal() {
         rows.iter().any(|r| r.contains("cancel")),
         "the buttons stay pinned while the wrapped body scrolls"
     );
+}
+
+/// Draw `app` at 80x24 and return the buffer.
+fn frame_buffer(app: &App) -> ratatui::buffer::Buffer {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    term.backend().buffer().clone()
+}
+
+/// The open modal's border box `(top, bottom, left, right)`, found by its
+/// ACCENT_2 top-left corner: the panels behind it draw the same corner glyph in
+/// their own border colour.
+fn modal_bounds(buf: &ratatui::buffer::Buffer) -> (u16, u16, u16, u16) {
+    let area = buf.area;
+    let orange = crate::tui::theme::accent_2_color();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let cell = &buf[(x, y)];
+            if cell.symbol() == "\u{256d}" && cell.fg == orange {
+                let right = (x + 1..area.width)
+                    .find(|&rx| buf[(rx, y)].symbol() == "\u{256e}")
+                    .expect("the modal's top-right corner");
+                let bottom = (y + 1..area.height)
+                    .find(|&by| buf[(x, by)].symbol() == "\u{2570}")
+                    .expect("the modal's bottom-left corner");
+                return (y, bottom, x, right);
+            }
+        }
+    }
+    panic!("no open modal in the frame")
+}
+
+/// The open modal's row holding the `❯` caret: `(y, left border x, right
+/// border x, caret x)`.
+fn modal_caret_row(buf: &ratatui::buffer::Buffer) -> (u16, u16, u16, u16) {
+    let (top, bottom, left, right) = modal_bounds(buf);
+    for y in top + 1..bottom {
+        for x in left + 1..right {
+            if buf[(x, y)].symbol() == "\u{276f}" {
+                return (y, left, right, x);
+            }
+        }
+    }
+    panic!("no caret row in the modal")
+}
+
+/// The `BG_HOVER` run on row `y` between the borders, as `(cells from the left
+/// border to its first cell, cells from its last cell to the right border)`.
+/// Panics when the run has a hole.
+fn hover_run(buf: &ratatui::buffer::Buffer, y: u16, left: u16, right: u16) -> (u16, u16) {
+    let hover = crate::tui::theme::bg_hover();
+    let tinted: Vec<u16> = (left + 1..right)
+        .filter(|&x| buf[(x, y)].bg == hover)
+        .collect();
+    let (first, last) = (
+        *tinted.first().expect("a tinted cell"),
+        *tinted.last().expect("a tinted cell"),
+    );
+    assert_eq!(
+        tinted.len(),
+        usize::from(last - first + 1),
+        "the selected row's tint has no hole on row {y}"
+    );
+    (first - left, right - last)
+}
+
+/// The label after a caret at `caret`: the run of cells up to the first
+/// two-space gap or the right border.
+fn label_cells(buf: &ratatui::buffer::Buffer, y: u16, caret: u16, right: u16) -> Vec<u16> {
+    let mut cells = Vec::new();
+    let mut x = caret + 2;
+    while x < right {
+        let blank = buf[(x, y)].symbol() == " ";
+        let next_blank = x + 1 >= right || buf[(x + 1, y)].symbol() == " ";
+        if blank && next_blank {
+            break;
+        }
+        cells.push(x);
+        x += 1;
+    }
+    cells
+}
+
+/// Whether row `y` between the modal borders holds ASCII `needle`.
+fn row_has_text(
+    buf: &ratatui::buffer::Buffer,
+    y: u16,
+    left: u16,
+    right: u16,
+    needle: &str,
+) -> bool {
+    let cells: Vec<char> = (left + 1..right)
+        .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    let needle_chars: Vec<char> = needle.chars().collect();
+    cells
+        .windows(needle_chars.len())
+        .any(|window| window == needle_chars.as_slice())
+}
+
+/// The x range of ASCII `needle` on row `y` between the modal borders; panics
+/// when the row holds it nowhere.
+fn row_text(
+    buf: &ratatui::buffer::Buffer,
+    y: u16,
+    left: u16,
+    right: u16,
+    needle: &str,
+) -> std::ops::Range<u16> {
+    let cells: Vec<char> = (left + 1..right)
+        .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let start = cells
+        .windows(needle_chars.len())
+        .position(|window| window == needle_chars.as_slice())
+        .unwrap_or_else(|| panic!("`{needle}` on row {y}"));
+    (left + 1 + start as u16)..(left + 1 + start as u16 + needle_chars.len() as u16)
+}
+
+/// Every pick-one modal (divergence, divergence target, env collision, preset
+/// picker, token picker) draws its selected option with the action menu's row
+/// look: `❯` in ACCENT + bold, the label in TEXT + bold, and the `BG_HOVER`
+/// tint over the same span of the row the action menu tints; an unselected
+/// option's label is TEXT, not bold, on no tint.
+#[test]
+fn pick_one_modals_take_the_action_menu_row_look() {
+    use crate::presets::Preset;
+    use crate::tui::app::{
+        ActionMenuAction, ActionMenuState, DivergenceForm, DivergenceTargetForm, EnvCollisionForm,
+        Modal, PresetPickerForm, PresetTarget, ScrollStamp, Tab, TokenPickerForm,
+    };
+    use crate::tui::theme;
+    use ratatui::style::Modifier;
+    use std::cell::{Cell, RefCell};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+
+    let mut menu = empty_app(Tab::Overview);
+    menu.open_modal(Modal::ActionMenu(ActionMenuState::new(
+        vec![ActionMenuAction::TogglePace],
+        vec![ActionMenuAction::ToggleEstimates],
+        None,
+    )));
+    let buf = frame_buffer(&menu);
+    let (y, left, right, _) = modal_caret_row(&buf);
+    let menu_run = hover_run(&buf, y, left, right);
+
+    let preset = |name: &str| Preset {
+        name: name.into(),
+        base_url: None,
+        models: Default::default(),
+        builtin: false,
+    };
+    let cases: Vec<(&str, Modal)> = vec![
+        (
+            "divergence",
+            Modal::Divergence(DivergenceForm {
+                active: "x".into(),
+                sibling: None,
+                cursor: 0,
+                scroll: Cell::new(0),
+                viewport: Cell::new(0),
+                starts: RefCell::new(vec![]),
+                block_ends: RefCell::new(vec![]),
+                total: Cell::new(0),
+            }),
+        ),
+        (
+            "divergence target",
+            Modal::DivergenceTarget(DivergenceTargetForm {
+                targets: vec!["b".into()],
+                cursor: 1,
+                scroll: Cell::new(0),
+                viewport: Cell::new(0),
+                starts: RefCell::new(vec![]),
+                block_ends: RefCell::new(vec![]),
+                total: Cell::new(0),
+            }),
+        ),
+        (
+            "env collision",
+            Modal::EnvCollision(EnvCollisionForm {
+                profile: "a".into(),
+                key: "K".into(),
+                reason: "set by the base url field".into(),
+                existing_idx: None,
+                cursor: 0,
+                scroll: Cell::new(0),
+                reviewing_overwrite: false,
+                confirm_overwrite: false,
+                max_scroll: Cell::new(0),
+                max_scroll_stamp: Cell::new(ScrollStamp::default()),
+                viewport: Cell::new(0),
+                overwrite_needs_review: Cell::new(false),
+            }),
+        ),
+        (
+            "preset picker",
+            Modal::PresetPicker(PresetPickerForm {
+                target: PresetTarget::NewAccount,
+                presets: vec![preset("p"), preset("q")],
+                cursor: 0,
+                scroll: Cell::new(0),
+                viewport: Cell::new(0),
+                starts: RefCell::new(vec![]),
+                block_ends: RefCell::new(vec![]),
+                total: Cell::new(0),
+            }),
+        ),
+        (
+            "token picker",
+            Modal::TokenPicker(TokenPickerForm {
+                targets: vec![("b".into(), false)],
+                cursor: 1,
+                scroll: Cell::new(0),
+                viewport: Cell::new(0),
+                starts: RefCell::new(vec![]),
+                block_ends: RefCell::new(vec![]),
+                total: Cell::new(0),
+                require: false,
+            }),
+        ),
+    ];
+    for (name, modal) in cases {
+        let mut app = empty_app(Tab::Overview);
+        app.open_modal(modal);
+        let buf = frame_buffer(&app);
+        let (y, left, right, caret) = modal_caret_row(&buf);
+        let caret_cell = &buf[(caret, y)];
+        assert_eq!(caret_cell.fg, theme::accent_color(), "{name}: caret fg");
+        assert!(
+            caret_cell.modifier.contains(Modifier::BOLD),
+            "{name}: the caret is bold"
+        );
+        let label = label_cells(&buf, y, caret, right);
+        assert!(!label.is_empty(), "{name}: a label follows the caret");
+        for x in label {
+            let cell = &buf[(x, y)];
+            assert_eq!(cell.fg, theme::text_color(), "{name}: label fg at x={x}");
+            assert!(
+                cell.modifier.contains(Modifier::BOLD),
+                "{name}: the label is bold at x={x}"
+            );
+        }
+        assert_eq!(
+            hover_run(&buf, y, left, right),
+            menu_run,
+            "{name}: the selected row's tint spans what the action menu's does"
+        );
+    }
+
+    // An unselected option: the preset picker's second row, `q`.
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::PresetPicker(PresetPickerForm {
+        target: PresetTarget::NewAccount,
+        presets: vec![preset("p"), preset("q")],
+        cursor: 0,
+        scroll: Cell::new(0),
+        viewport: Cell::new(0),
+        starts: RefCell::new(vec![]),
+        block_ends: RefCell::new(vec![]),
+        total: Cell::new(0),
+    }));
+    let buf = frame_buffer(&app);
+    let (y, _, _, caret) = modal_caret_row(&buf);
+    let below = &buf[(caret + 2, y + 1)];
+    assert_eq!(
+        below.symbol(),
+        "q",
+        "the unselected option sits one row down"
+    );
+    assert_eq!(below.fg, theme::text_color(), "an unselected label is TEXT");
+    assert!(
+        !below.modifier.contains(Modifier::BOLD),
+        "an unselected label is not bold"
+    );
+    assert_ne!(
+        below.bg,
+        theme::bg_hover(),
+        "an unselected option carries no tint"
+    );
+}
+
+/// The `+ new account` and `+ new profile` synthetic rows keep their ACCENT
+/// identity: selected they carry the caret + tint like any option row but the
+/// label stays ACCENT (bold); unselected the label is ACCENT, not bold, on no
+/// tint.
+#[test]
+fn the_new_rows_keep_accent_identity_selected_and_unselected() {
+    use crate::tui::app::{
+        ActionMenuAction, ActionMenuState, DivergenceTargetForm, Modal, TokenPickerForm,
+    };
+    use crate::tui::theme;
+    use ratatui::style::Modifier;
+    use std::cell::{Cell, RefCell};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+
+    let mut menu = empty_app(Tab::Overview);
+    menu.open_modal(Modal::ActionMenu(ActionMenuState::new(
+        vec![ActionMenuAction::TogglePace],
+        vec![ActionMenuAction::ToggleEstimates],
+        None,
+    )));
+    let buf = frame_buffer(&menu);
+    let (y, left, right, _) = modal_caret_row(&buf);
+    let menu_run = hover_run(&buf, y, left, right);
+
+    let cases: Vec<(&str, Modal)> = vec![
+        (
+            "+ new account",
+            Modal::DivergenceTarget(DivergenceTargetForm {
+                targets: vec!["b".into()],
+                cursor: 0,
+                scroll: Cell::new(0),
+                viewport: Cell::new(0),
+                starts: RefCell::new(vec![]),
+                block_ends: RefCell::new(vec![]),
+                total: Cell::new(0),
+            }),
+        ),
+        (
+            "+ new profile",
+            Modal::TokenPicker(TokenPickerForm {
+                targets: vec![("b".into(), false)],
+                cursor: 0,
+                scroll: Cell::new(0),
+                viewport: Cell::new(0),
+                starts: RefCell::new(vec![]),
+                block_ends: RefCell::new(vec![]),
+                total: Cell::new(0),
+                require: false,
+            }),
+        ),
+    ];
+    for (label, modal) in cases {
+        let mut app = empty_app(Tab::Overview);
+        app.open_modal(modal);
+        let buf = frame_buffer(&app);
+        let (y, left, right, caret) = modal_caret_row(&buf);
+        let caret_cell = &buf[(caret, y)];
+        assert_eq!(caret_cell.fg, theme::accent_color(), "{label}: caret fg");
+        assert!(
+            caret_cell.modifier.contains(Modifier::BOLD),
+            "{label}: the caret is bold"
+        );
+        let cells = label_cells(&buf, y, caret, right);
+        assert!(!cells.is_empty(), "{label}: a label follows the caret");
+        for x in cells {
+            let cell = &buf[(x, y)];
+            assert_eq!(
+                cell.fg,
+                theme::accent_color(),
+                "{label}: the label stays ACCENT at x={x}"
+            );
+            assert!(
+                cell.modifier.contains(Modifier::BOLD),
+                "{label}: the label is bold at x={x}"
+            );
+        }
+        assert_eq!(
+            hover_run(&buf, y, left, right),
+            menu_run,
+            "{label}: the selected row's tint spans what the action menu's does"
+        );
+    }
+
+    // Unselected: cursor 1 leaves the `+ new` row one row above the caret.
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        targets: vec!["b".into()],
+        cursor: 1,
+        scroll: Cell::new(0),
+        viewport: Cell::new(0),
+        starts: RefCell::new(vec![]),
+        block_ends: RefCell::new(vec![]),
+        total: Cell::new(0),
+    }));
+    let buf = frame_buffer(&app);
+    let (y, left, _, _) = modal_caret_row(&buf);
+    let above = y - 1;
+    assert_eq!(
+        buf[(left + 3, above)].symbol(),
+        " ",
+        "the unselected row's gutter is blank"
+    );
+    let plus = &buf[(left + 5, above)];
+    assert_eq!(plus.symbol(), "+", "the unselected row is `+ new account`");
+    assert_eq!(
+        plus.fg,
+        theme::accent_color(),
+        "the unselected `+ new account` label stays ACCENT"
+    );
+    assert!(
+        !plus.modifier.contains(Modifier::BOLD),
+        "the unselected `+ new account` label is not bold"
+    );
+    assert_ne!(
+        plus.bg,
+        theme::bg_hover(),
+        "the unselected `+ new account` row carries no tint"
+    );
+
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::TokenPicker(TokenPickerForm {
+        targets: vec![("b".into(), false)],
+        cursor: 1,
+        scroll: Cell::new(0),
+        viewport: Cell::new(0),
+        starts: RefCell::new(vec![]),
+        block_ends: RefCell::new(vec![]),
+        total: Cell::new(0),
+        require: false,
+    }));
+    let buf = frame_buffer(&app);
+    let (y, left, _, _) = modal_caret_row(&buf);
+    let above = y - 1;
+    let plus = &buf[(left + 5, above)];
+    assert_eq!(
+        plus.symbol(),
+        "+",
+        "the unselected token-picker row is `+ new profile`"
+    );
+    assert_eq!(
+        plus.fg,
+        theme::accent_color(),
+        "the unselected `+ new profile` label stays ACCENT"
+    );
+    assert!(
+        !plus.modifier.contains(Modifier::BOLD),
+        "the unselected `+ new profile` label is not bold"
+    );
+    assert_ne!(
+        plus.bg,
+        theme::bg_hover(),
+        "the unselected `+ new profile` row carries no tint"
+    );
+}
+
+/// A selected option's tint covers every line of its block: the `has a token`
+/// and `built-in` suffixes ride the selected row's tint, the env-collision
+/// detail line is tinted beside its label, and a wrapped long label tints
+/// every wrapped line — each tint run matching the action menu's.
+#[test]
+fn pick_one_suffix_env_and_wrapped_rows_tint_their_whole_block() {
+    use crate::presets::Preset;
+    use crate::tui::app::{
+        ActionMenuAction, ActionMenuState, DivergenceTargetForm, EnvCollisionForm, Modal,
+        PresetPickerForm, PresetTarget, ScrollStamp, TokenPickerForm,
+    };
+    use crate::tui::theme;
+    use std::cell::{Cell, RefCell};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+
+    let mut menu = empty_app(Tab::Overview);
+    menu.open_modal(Modal::ActionMenu(ActionMenuState::new(
+        vec![ActionMenuAction::TogglePace],
+        vec![ActionMenuAction::ToggleEstimates],
+        None,
+    )));
+    let buf = frame_buffer(&menu);
+    let (y, left, right, _) = modal_caret_row(&buf);
+    let menu_run = hover_run(&buf, y, left, right);
+
+    // `has a token` suffix: token picker cursor on the profile row.
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::TokenPicker(TokenPickerForm {
+        targets: vec![("b".into(), true)],
+        cursor: 1,
+        scroll: Cell::new(0),
+        viewport: Cell::new(0),
+        starts: RefCell::new(vec![]),
+        block_ends: RefCell::new(vec![]),
+        total: Cell::new(0),
+        require: false,
+    }));
+    let buf = frame_buffer(&app);
+    let (y, left, right, _) = modal_caret_row(&buf);
+    for x in row_text(&buf, y, left, right, "has a token") {
+        let cell = &buf[(x, y)];
+        assert_eq!(
+            cell.fg,
+            theme::text_dim_color(),
+            "the `has a token` suffix stays TEXT_DIM at x={x}"
+        );
+        assert_eq!(
+            cell.bg,
+            theme::bg_hover(),
+            "the `has a token` suffix rides the tint at x={x}"
+        );
+    }
+    assert_eq!(
+        hover_run(&buf, y, left, right),
+        menu_run,
+        "the suffix row's tint spans what the action menu's does"
+    );
+
+    // `built-in` suffix: preset picker cursor on the built-in row.
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::PresetPicker(PresetPickerForm {
+        target: PresetTarget::NewAccount,
+        presets: vec![Preset {
+            name: "p".into(),
+            base_url: None,
+            models: Default::default(),
+            builtin: true,
+        }],
+        cursor: 0,
+        scroll: Cell::new(0),
+        viewport: Cell::new(0),
+        starts: RefCell::new(vec![]),
+        block_ends: RefCell::new(vec![]),
+        total: Cell::new(0),
+    }));
+    let buf = frame_buffer(&app);
+    let (y, left, right, _) = modal_caret_row(&buf);
+    for x in row_text(&buf, y, left, right, "built-in") {
+        let cell = &buf[(x, y)];
+        assert_eq!(
+            cell.fg,
+            theme::text_dim_color(),
+            "the `built-in` suffix stays TEXT_DIM at x={x}"
+        );
+        assert_eq!(
+            cell.bg,
+            theme::bg_hover(),
+            "the `built-in` suffix rides the tint at x={x}"
+        );
+    }
+    assert_eq!(
+        hover_run(&buf, y, left, right),
+        menu_run,
+        "the built-in row's tint spans what the action menu's does"
+    );
+
+    // Env-collision: both the label line and its detail line are tinted.
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::EnvCollision(EnvCollisionForm {
+        profile: "a".into(),
+        key: "K".into(),
+        reason: "set by the base url field".into(),
+        existing_idx: None,
+        cursor: 0,
+        scroll: Cell::new(0),
+        reviewing_overwrite: false,
+        confirm_overwrite: false,
+        max_scroll: Cell::new(0),
+        max_scroll_stamp: Cell::new(ScrollStamp::default()),
+        viewport: Cell::new(0),
+        overwrite_needs_review: Cell::new(false),
+    }));
+    let buf = frame_buffer(&app);
+    let (y, left, right, _) = modal_caret_row(&buf);
+    assert_eq!(
+        hover_run(&buf, y, left, right),
+        menu_run,
+        "the env-collision label line tints what the action menu's does"
+    );
+    assert_eq!(
+        hover_run(&buf, y + 1, left, right),
+        menu_run,
+        "the env-collision detail line is tinted too"
+    );
+    assert_eq!(
+        buf[(left + 7, y + 1)].fg,
+        theme::text_dim_color(),
+        "the env-collision detail line stays TEXT_DIM"
+    );
+
+    // A wrapped long label tints every line of its block, bounded by the
+    // label's own text rather than a row-count floor: the block runs from the
+    // caret row through the row holding the label's closing `picker'`, and the
+    // row after it is untinted.
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        targets: vec![
+            "a-very-long-account-name-that-wraps-across-several-rows-in-the-picker".into(),
+        ],
+        cursor: 1,
+        scroll: Cell::new(0),
+        viewport: Cell::new(0),
+        starts: RefCell::new(vec![]),
+        block_ends: RefCell::new(vec![]),
+        total: Cell::new(0),
+    }));
+    let buf = frame_buffer(&app);
+    let (_, bottom, left, right) = modal_bounds(&buf);
+    let (y, _, _, _) = modal_caret_row(&buf);
+    let mut label_end = y;
+    while label_end < bottom && !row_has_text(&buf, label_end, left, right, "picker'") {
+        label_end += 1;
+    }
+    assert!(
+        label_end < bottom,
+        "the wrapped label's closing `picker'` sits below the caret row"
+    );
+    for yy in y..=label_end {
+        assert_eq!(
+            buf[(left + 3, yy)].bg,
+            theme::bg_hover(),
+            "the wrapped label row {yy} is tinted"
+        );
+        assert_eq!(
+            hover_run(&buf, yy, left, right),
+            menu_run,
+            "the wrapped label row {yy} tints what the action menu's does"
+        );
+    }
+    assert!(
+        label_end + 1 < bottom,
+        "the wrapped label has a row after its last line"
+    );
+    assert_ne!(
+        buf[(left + 3, label_end + 1)].bg,
+        theme::bg_hover(),
+        "the row after the wrapped label is untinted"
+    );
+}
+
+/// The acknowledgment modal's one button takes the action verb `close`,
+/// default-focused as the neutral inverse block; no ` ok ` button remains.
+#[test]
+fn the_acknowledgment_button_reads_close() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let state = ConfirmState {
+        message: "account in use".into(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::Acknowledge,
+    };
+    let (buf, rows, origin) = render_confirm(&state, 60, 12);
+    assert!(
+        !rows.iter().any(|r| r.contains(" ok ")),
+        "no ` ok ` button remains:\n{}",
+        rows.join("\n")
+    );
+    let (y, row) = rows
+        .iter()
+        .enumerate()
+        .find(|(_, r)| r.trim_matches(|c| c == '\u{2502}' || c == ' ') == "close")
+        .unwrap_or_else(|| panic!("a `close` button row:\n{}", rows.join("\n")));
+    let x = row
+        .chars()
+        .position(|c| c == 'c')
+        .expect("the button label");
+    let cell = modal_cell(&buf, origin, x, y);
+    assert_eq!(
+        cell.bg,
+        crate::tui::theme::text_color(),
+        "the focused `close` is the neutral inverse block"
+    );
+}
+
+/// The loss warning's body is lowercase: the question and both sentences,
+/// tab names included, pinned row by row.
+#[test]
+fn the_loss_warning_body_is_lowercase() {
+    use crate::tui::app::{LossWarningDrop, LossWarningState, Modal, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = empty_app(Tab::Setup);
+    app.open_modal(Modal::LossWarning(LossWarningState {
+        choice: false,
+        target: Tab::Usage,
+        drop: LossWarningDrop::SetupDraft,
+    }));
+    let buf = frame_buffer(&app);
+    let (top, bottom, left, right) = modal_bounds(&buf);
+    let body: Vec<String> = (top + 1..bottom)
+        .map(|y| {
+            (left + 1..right)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .filter(|r| !r.is_empty())
+        .take(3)
+        .collect();
+    assert_eq!(
+        body,
+        [
+            "discard the unsaved edit?",
+            "there are unsaved edits on the setup tab.",
+            "fallback also edits this account.",
+        ],
+        "the loss warning body rows"
+    );
+}
+
+/// No help-modal row, on any tab or descended pane, spells the page keys as
+/// `page up` / `page down`: they read `pgup/pgdn`, joined.
+#[test]
+fn the_help_modal_writes_page_keys_joined() {
+    use crate::tui::app::Modal;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut joined = false;
+    for tab in Tab::ALL {
+        for descended in [false, true] {
+            let mut app = empty_app(tab);
+            if descended {
+                app.config_focus = ConfigFocus::Actions;
+                app.fallback_focus = FallbackFocus::Detail;
+                app.status.focus = StatusFocus::Detail;
+                app.services.focus = ServicesFocus::Detail;
+                app.token_view = TokenView::Models;
+            }
+            app.open_modal(Modal::Help);
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 200)).unwrap();
+            term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+            let rows = crate::testutil::buffer_rows(term.backend().buffer());
+            for row in &rows {
+                assert!(
+                    !row.contains("page up") && !row.contains("page down"),
+                    "{tab:?} (descended {descended}) help spells a page key out: {row:?}"
+                );
+            }
+            joined |= rows.iter().any(|r| r.contains("pgup/pgdn"));
+        }
+    }
+    assert!(joined, "some help section names `pgup/pgdn`");
 }

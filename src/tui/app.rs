@@ -1093,16 +1093,16 @@ impl LossWarningDrop {
     pub(crate) fn detail_lines(self) -> [&'static str; 2] {
         match self {
             Self::SetupDraft => [
-                "There are unsaved edits on the Setup tab.",
-                "Fallback also edits this account.",
+                "there are unsaved edits on the setup tab.",
+                "fallback also edits this account.",
             ],
             Self::FallbackEdit => [
-                "There are unsaved edits on the Fallback tab.",
-                "Setup also edits this account.",
+                "there are unsaved edits on the fallback tab.",
+                "setup also edits this account.",
             ],
             Self::NewAccountDraft { .. } => [
-                "There are unsaved edits on the Setup tab.",
-                "Services also edits the new account form.",
+                "there are unsaved edits on the setup tab.",
+                "services also edits the new account form.",
             ],
         }
     }
@@ -3572,6 +3572,15 @@ pub(crate) struct ServicesState {
     /// config path. The options section reads it to decide whether the
     /// `delegate row text` row can write.
     pub(crate) herdr_config: Option<crate::herdr::ConfigStatus>,
+    /// The last-seen plugin row health, the baseline for the out-of-view
+    /// activity poll: the first reading establishes it (no color), a later
+    /// change colors the Services tab. Updated by every recompute while the
+    /// tab is in view, so leaving the tab seeds the baseline to what the user
+    /// last saw.
+    pub(crate) plugin_health: Option<Health>,
+    /// The herdr row's twin of [`Self::plugin_health`]; `None` while no herdr
+    /// row exists.
+    pub(crate) herdr_health: Option<Health>,
     /// A pending first-herdr-launch landing: the cursor lands on the `herdr` row
     /// in the recompute that adopts its probe, or never. Cleared there, or
     /// earlier when a modal opens, the tab changes, or the user moves the
@@ -3638,6 +3647,8 @@ impl Default for ServicesState {
             herdr_fix_focus: false,
             herdr_tag_draft: None,
             herdr_config: None,
+            plugin_health: None,
+            herdr_health: None,
             land_on_herdr: false,
         }
     }
@@ -3862,8 +3873,19 @@ impl HerdrOption {
 
 // ── Footer alert ─────────────────────────────────────────────────────────────
 
+/// The key that armed the 2-step quit. One arm remembers its key, so `q`'s
+/// completion and `ctrl+c`'s never cross: the other key re-arms as itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuitKey {
+    /// The top-level `q` armed it.
+    Q,
+    /// `ctrl+c` armed it.
+    CtrlC,
+}
+
 /// A transient message that replaces the hint bar in place until dismissed.
-/// `x` clears it (after all toasts are gone — see dismissal precedence).
+/// `x` clears it, as does every key that disarms the quit: all but `⌃c` and a
+/// `q` that arms or confirms it.
 /// Add variants as new conditions arise; keep one active at a time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FooterAlert {
@@ -4708,8 +4730,10 @@ pub(crate) struct App {
     /// Tick counter; advances the activity spinner frame each `on_tick`.
     pub(crate) tick_count: u64,
     pub(crate) quit: bool,
-    /// First `q` at top level arms this; second `q` confirms quit.
-    pub(crate) armed_quit: bool,
+    /// The armed 2-step quit: the key that armed it, `None` when disarmed. A
+    /// second press of the SAME key confirms; the other quit key re-arms as
+    /// itself.
+    pub(crate) armed_quit: Option<QuitKey>,
     /// Live footer alert; replaces the hint bar in place while `Some`.
     /// Cleared on disarm, tab switch, or explicit `x` dismiss.
     pub(crate) footer_alert: Option<FooterAlert>,
@@ -5386,7 +5410,7 @@ impl App {
             day_claim_notices: Vec::new(),
             tick_count: 0,
             quit: false,
-            armed_quit: false,
+            armed_quit: None,
             footer_alert: None,
             banner: None,
             last_divergence_check: Some(Instant::now()),
@@ -6550,10 +6574,9 @@ impl App {
 
     /// Disarm the 2-step quit and clear its accompanying footer alert.
     /// Only call this when the armed-quit sequence is interrupted (key switch,
-    /// tab change, etc.). For `x`-dismiss of an alert produced by a non-quit
-    /// condition, clear `footer_alert` directly instead.
+    /// tab change, etc.).
     pub(crate) fn disarm_quit(&mut self) {
-        self.armed_quit = false;
+        self.armed_quit = None;
         self.footer_alert = None;
     }
 
@@ -7450,10 +7473,37 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // `ctrl+c` arms or completes its own 2-step quit, ahead of every owner so a
+    // modal, an editor or an ⌥-jump never sees the key.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.quit = true;
-        app.shutting_down.store(true, Ordering::SeqCst);
+        if app.armed_quit == Some(QuitKey::CtrlC) {
+            app.quit = true;
+            app.shutting_down.store(true, Ordering::SeqCst);
+        } else {
+            app.armed_quit = Some(QuitKey::CtrlC);
+            app.footer_alert = Some(FooterAlert::Warn(format!(
+                "press {} again to quit",
+                prose::key("\u{2303}c")
+            )));
+        }
         return;
+    }
+
+    let owner = keyboard_owner(app);
+
+    // Every key but a top-level `q` (which reads the arm below) disarms the
+    // quit before it does its own job — `x` included, so a toast-pop or alert
+    // dismiss never reads the arm; owners included, so a key the modal or
+    // editor swallows still disarms.
+    let reads_arm = matches!(
+        key.code,
+        KeyCode::Char('q')
+            if !owner.is_some_and(|o| o.claims(app, KeyCode::Char('q')))
+                && app.login.is_none()
+                && app.codex_login.is_none()
+    );
+    if !reads_arm {
+        app.disarm_quit();
     }
 
     // `⌥1`–`⌥9` jump, live inside every editor but inert while a modal owns the
@@ -7468,7 +7518,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     // A modal, then an open editor, owns the keyboard: typed digits and
     // letters can't trip global shortcuts, and ←/→ never switch the tab. A key
     // the owner does not claim falls through to the global senses below.
-    if let Some(owner) = keyboard_owner(app).filter(|owner| owner.claims(app, key.code)) {
+    if let Some(owner) = owner.filter(|owner| owner.claims(app, key.code)) {
         match owner {
             KeyOwner::Modal => handle_modal_key(app, key),
             KeyOwner::SetupField | KeyOwner::NewAccountField => handle_config_edit_key(app, key),
@@ -7514,7 +7564,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             if pane_state(app) == PaneState::Rest {
                 request_switch(app, app.tab.prev());
             } else {
-                app.disarm_quit();
                 ascend_pane(app);
             }
             return;
@@ -7541,7 +7590,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('?') => {
-            app.disarm_quit();
             app.help_scroll = 0;
             app.open_modal(Modal::Help);
             return;
@@ -7550,7 +7598,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             // Open the divergence resolver from the banner (no-op when the
             // live link is clean).
             if let Some(notice) = app.divergence_pending.clone() {
-                app.disarm_quit();
                 open_divergence_modal(app, &notice.active);
             }
             return;
@@ -7559,7 +7606,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // has nothing to mean anywhere else. Guarded rather than swallowed so
         // `c` still reaches the per-tab dispatch (Tokens binds it too).
         KeyCode::Char('c') if app.tab == Tab::Overview => {
-            app.disarm_quit();
             // `c` changes the filter, then places the cursor on the remembered
             // item's row when the new view shows it, else row 0; it never
             // writes the remembered item (a filter only hides it).
@@ -7569,7 +7615,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('a') => {
-            app.disarm_quit();
             let state = build_action_menu(app);
             if !state.items.is_empty() {
                 app.open_modal(Modal::ActionMenu(state));
@@ -7577,7 +7622,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('r') => {
-            app.disarm_quit();
             if app.tab == Tab::Status {
                 trigger_status_refresh(app);
                 return;
@@ -7601,7 +7645,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('t') => {
-            app.disarm_quit();
             // Tokens claims `t` for its period lens (as `r` reloads there);
             // rotate-all stays reachable from every other tab.
             if app.tab == Tab::Tokens {
@@ -7618,7 +7661,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('n') => {
-            app.disarm_quit();
             // The usage tab claims `n` for the account's note editor (footer +
             // help modal advertise it there); the empty roster keeps the empty
             // state's `n to create one` promise. Everywhere else: new account.
@@ -7631,9 +7673,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         // Esc backs out of sub-focus; no-op at the top level.
         KeyCode::Esc => {
-            app.disarm_quit();
             ascend_pane(app);
-            // At top level, Esc is a no-op — ctrl+c or `q q` to quit.
+            // At top level, Esc is a no-op — `⌃c ⌃c` or `q q` to quit.
             return;
         }
         // First `q` at the top level arms the 2-step quit; second confirms.
@@ -7656,11 +7697,13 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 } else {
                     app.status.focus = StatusFocus::List;
                 }
-            } else if app.armed_quit {
+            } else if app.armed_quit == Some(QuitKey::Q) {
                 app.quit = true;
                 app.shutting_down.store(true, Ordering::SeqCst);
             } else {
-                app.armed_quit = true;
+                // Armed by ctrl+c, or not armed: q runs its own job and arms
+                // (or re-arms) its own quit.
+                app.armed_quit = Some(QuitKey::Q);
                 app.footer_alert = Some(FooterAlert::Warn(format!(
                     "press {} again to quit",
                     prose::key("q")
@@ -7669,22 +7712,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('x') => {
-            // Dismissal precedence: toasts first, then footer alert.
-            // `x` dismisses the alert directly; quit disarming is a side effect
-            // only when armed_quit was the producer — not a general alert clear.
+            // Dismissal precedence: the topmost toast pops first. The quit arm
+            // (and its alert) already disarmed at the gate above.
             if !app.toasts.is_empty() {
                 app.toasts.pop_front();
-            } else if app.footer_alert.is_some() {
-                app.footer_alert = None;
-                if app.armed_quit {
-                    app.armed_quit = false;
-                }
             }
             return;
         }
-        _ => {
-            app.disarm_quit();
-        }
+        _ => {}
     }
 
     match app.tab {
@@ -11204,38 +11239,35 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
     app.services.settle_delegates_selection();
     checks.push(delegates_check(&app.services.delegates, &rate_limited));
 
-    // plugin row — the folded readout, over the cached probes + the PATH read.
-    checks.push(plugin_check(
-        clauth_path.as_deref(),
-        app.services.cc_version.clone(),
-        app.services.mcp_boot.clone(),
-    ));
-
-    // herdr — the installed herdr's clauth plugin + keybinding/sidebar config.
-    // The probe is cached (its worker lands it, above); the config read is a
-    // cheap `fs::read_to_string` that rides the tick, using the path the probe
-    // already resolved. No row when herdr does not resolve or its probe has not
-    // landed yet.
-    if let Some(Some(probe)) = &app.services.herdr {
-        let config = probe
-            .config_path
-            .as_deref()
-            .map(crate::herdr::read_config)
-            .and_then(Result::ok)
-            .map(|text| crate::herdr::config_status(&text));
-        checks.push(herdr_check(probe, config.as_ref()));
-        // The options section reads this verdict (writable vs inert) off the
-        // cache — recompute already paid for the file read, so neither the
-        // render nor the key handler re-reads per frame.
-        app.services.herdr_config = config;
-    } else {
-        // No herdr row renders without a probe, so its verdict must not
-        // outlive the probe (a stale writable verdict would arm the
-        // delegate-row confirm against a file that no longer resolves).
-        app.services.herdr_config = None;
-    }
+    // plugin + herdr rows — the folded readout, over the cached probes + the
+    // PATH read. The herdr probe is cached (its worker lands it, above); the
+    // config read is a cheap `fs::read_to_string` that rides the tick, using
+    // the path the probe already resolved. No herdr row when herdr does not
+    // resolve or its probe has not landed yet.
+    let (plugin_check, herdr) = plugin_herdr_checks(app);
+    let plugin_health = plugin_check.health;
+    checks.push(plugin_check);
+    let herdr_health = match herdr {
+        Some((herdr_check, config)) => {
+            let health = herdr_check.health;
+            checks.push(herdr_check);
+            // The options section reads this verdict (writable vs inert) off the
+            // cache — recompute already paid for the file read, so neither the
+            // render nor the key handler re-reads per frame.
+            app.services.herdr_config = config;
+            Some(health)
+        }
+        None => {
+            // No herdr row renders without a probe, so its verdict must not
+            // outlive the probe (a stale writable verdict would arm the
+            // delegate-row confirm against a file that no longer resolves).
+            app.services.herdr_config = None;
+            None
+        }
+    };
 
     app.services.checks = checks;
+    record_plugin_herdr_health(app, plugin_health, herdr_health);
 
     // Keep the cursors in range after the row/problem sets change.
     let max = app.services.row_count().saturating_sub(1);
@@ -24727,8 +24759,22 @@ const STANDALONE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// `clauth mcp` — both stay `r`-gated.
 fn poll_services_refresh(app: &mut App) {
     const SERVICES_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+    const OUT_OF_VIEW_ACTIVITY_INTERVAL: Duration = Duration::from_secs(5);
 
-    if app.tab != Tab::Services || !app.modals.is_empty() {
+    if app.tab != Tab::Services {
+        // While the tab is out of view the plugin and herdr rows' health still
+        // needs a periodic re-read so a state change can color the tab — but
+        // only the cheap local reads: no probe worker and no `claude --version`
+        // spawn rides this cadence.
+        if app.modals.is_empty()
+            && app.last_services_refresh.elapsed() >= OUT_OF_VIEW_ACTIVITY_INTERVAL
+        {
+            app.last_services_refresh = Instant::now();
+            refresh_services_activity(app);
+        }
+        return;
+    }
+    if !app.modals.is_empty() {
         return;
     }
     if app.last_services_refresh.elapsed() < SERVICES_REFRESH_INTERVAL {
@@ -24752,6 +24798,80 @@ fn poll_services_refresh(app: &mut App) {
     {
         app.services.last_standalone_recheck = Instant::now();
         app.services.standalone_probe.start();
+    }
+}
+
+/// Read the plugin and herdr rows' health from the cached probes and the local
+/// config files — the cheap reads the in-view recompute and the out-of-view
+/// refresh share. Never spawns a process.
+fn plugin_herdr_checks(app: &App) -> (Check, Option<(Check, Option<crate::herdr::ConfigStatus>)>) {
+    let clauth_path = crate::plugin_probe::on_path("clauth");
+    let plugin = plugin_check(
+        clauth_path.as_deref(),
+        app.services.cc_version.clone(),
+        app.services.mcp_boot.clone(),
+    );
+    let herdr = app
+        .services
+        .herdr
+        .as_ref()
+        .and_then(|probe| probe.as_ref())
+        .map(|probe| {
+            let config = probe
+                .config_path
+                .as_deref()
+                .map(crate::herdr::read_config)
+                .and_then(Result::ok)
+                .map(|text| crate::herdr::config_status(&text));
+            (herdr_check(probe, config.as_ref()), config)
+        });
+    (plugin, herdr)
+}
+
+/// Re-read only the plugin and herdr rows' health while the Services tab is
+/// out of view, then record it for tab activity. Cheap local reads only — the
+/// cached probes and config file — so no subprocess and no shunt probe start
+/// out of view.
+fn refresh_services_activity(app: &mut App) {
+    let (plugin, herdr) = plugin_herdr_checks(app);
+    record_plugin_herdr_health(
+        app,
+        plugin.health,
+        herdr.as_ref().map(|(check, _)| check.health),
+    );
+}
+
+/// The tab-activity color a plugin/herdr health raises; `Idle` colors nothing
+/// (the two rows never render it, but a neutral reading is no event).
+fn health_activity(health: Health) -> Option<ToastKind> {
+    match health {
+        Health::Ok => Some(ToastKind::Success),
+        Health::Warn => Some(ToastKind::Warning),
+        Health::Danger => Some(ToastKind::Danger),
+        Health::Idle => None,
+    }
+}
+
+/// Record a fresh plugin/herdr health reading: the first reading after startup
+/// seeds the baseline (no color), a later change colors the Services tab in
+/// the new state's color through [`App::set_tab_activity`]'s worst-severity
+/// hold. A same-state reading colors nothing.
+fn record_plugin_herdr_health(app: &mut App, plugin: Health, herdr: Option<Health>) {
+    if let Some(prev) = app.services.plugin_health
+        && plugin != prev
+        && let Some(kind) = health_activity(plugin)
+    {
+        app.set_tab_activity(Tab::Services, kind);
+    }
+    app.services.plugin_health = Some(plugin);
+    if let Some(herdr) = herdr {
+        if let Some(prev) = app.services.herdr_health
+            && herdr != prev
+            && let Some(kind) = health_activity(herdr)
+        {
+            app.set_tab_activity(Tab::Services, kind);
+        }
+        app.services.herdr_health = Some(herdr);
     }
 }
 

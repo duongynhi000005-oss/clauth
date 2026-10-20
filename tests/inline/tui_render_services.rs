@@ -440,7 +440,7 @@ fn the_services_footer_hints_pin_each_focus_state() {
     );
 
     // Descended into the delegates detail (overflowing): `↑↓ row` +
-    // `page up/down read` + the shared keys.
+    // `pgup/pgdn read` + the shared keys.
     let mut app = app_with_delegates(seed_walk_jobs(22));
     app.services.focus = ServicesFocus::Detail;
     render(&app); // publish the geometry the page hint derives from
@@ -448,7 +448,7 @@ fn the_services_footer_hints_pin_each_focus_state() {
         hints(&app),
         vec![
             ("↑↓", "row"),
-            ("page up/down", "read"),
+            ("pgup/pgdn", "read"),
             ("r", "refresh"),
             ("a", "actions"),
             ("?", "help"),
@@ -2759,7 +2759,7 @@ fn the_descended_delegates_footer_derives_from_the_selection_count() {
         hints(&many),
         vec![
             ("↑↓", "row"),
-            ("page up/down", "read"),
+            ("pgup/pgdn", "read"),
             ("r", "refresh"),
             ("a", "actions"),
             ("?", "help"),
@@ -9237,5 +9237,25 @@ fn a_toast_over_the_herdr_tag_field_caret_hides_the_native_cursor() {
     assert!(
         !term.backend().cursor_visible(),
         "the herdr tag caret hides under an open modal"
+    );
+}
+
+/// The descended delegates detail writes its page keys joined, `pgup/pgdn`,
+/// never the multi-word `page up/down`.
+#[test]
+fn the_delegates_detail_writes_its_page_keys_joined() {
+    use crate::tui::app::ServicesFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_delegates(seed_walk_jobs(22));
+    app.services.focus = ServicesFocus::Detail;
+    render(&app);
+    let hints = super::super::footer::services_hints(&app);
+    assert!(
+        hints.contains(&("pgup/pgdn", "read")),
+        "the page keys read `pgup/pgdn`: {hints:?}"
+    );
+    assert!(
+        !hints.iter().any(|(key, _)| key.contains("page")),
+        "no hint spells `page up`: {hints:?}"
     );
 }

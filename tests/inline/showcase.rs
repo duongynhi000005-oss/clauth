@@ -1170,13 +1170,13 @@ fn demo_data_drives_all_actions() {
 
     // ── Quit ──
     press(&mut app, KeyCode::Char('q'));
-    assert!(app.armed_quit, "first q arms the quit");
+    assert!(app.armed_quit.is_some(), "first q arms the quit");
     assert!(!app.quit, "first q does not quit yet");
     assert!(app.footer_alert.is_some(), "first q sets a footer alert");
 
     // any non-q key disarms the alert (Esc at top level is a no-op but still disarms)
     press(&mut app, KeyCode::Esc);
-    assert!(!app.armed_quit, "unhandled key disarms quit");
+    assert!(app.armed_quit.is_none(), "unhandled key disarms quit");
     assert!(app.footer_alert.is_none(), "disarm clears footer alert");
 
     // x dismisses the alert directly when no toasts are queued
@@ -1185,7 +1185,7 @@ fn demo_data_drives_all_actions() {
     assert!(app.footer_alert.is_some(), "re-arm sets alert");
     press(&mut app, KeyCode::Char('x'));
     assert!(app.footer_alert.is_none(), "x dismisses the footer alert");
-    assert!(!app.armed_quit, "x also disarms quit");
+    assert!(app.armed_quit.is_none(), "x also disarms quit");
 
     press(&mut app, KeyCode::Char('q'));
     press(&mut app, KeyCode::Char('q'));
