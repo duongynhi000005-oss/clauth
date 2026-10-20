@@ -6,7 +6,7 @@ Three files, all TOML, all safe to hand-edit while clauth runs (it reloads on ex
 - `~/.clauth/profiles/<name>/config.toml` for one account: endpoint, key, env, model routing, its chain settings.
 - `~/.clauth/codex-profiles.toml` for the codex roster: its own active marker, chain and weekly line ([Codex](Codex)).
 
-Most keys below have a TUI equivalent on the Setup, Fallback, Config or Services tab ([Interface and keys](Interface-And-Keys#config-tab-rows)). A few are written only by a command or by clauth itself; those cells say which. The codex file has no TUI equivalent at all.
+Most keys below have a TUI equivalent on the Setup, Fallback, Config or Services tab ([Interface and keys](Interface-And-Keys#config-tab-rows)). A few are written only by a command or by clauth itself; those cells say which. The codex file's chain keys have no TUI equivalent; Setup creates and deletes its profiles.
 
 ## Account types
 
@@ -185,7 +185,7 @@ A key clauth does not know (written by a newer release, or added by hand) is kep
 
 ## `codex-profiles.toml`
 
-The codex roster, kept apart from `profiles.toml` so a codex switch never rewrites the Claude Code file and an older clauth never opens this one. `clauth login <name> --codex` creates it; the threshold and `wrap_off` keys are hand-edited only, there is no tab for it, while `active_profile` moves with `clauth <name>` and the codex auto-switch, and `profiles` and `fallback_chain` with each codex login and delete ([Codex](Codex)).
+The codex roster, kept apart from `profiles.toml` so a codex switch never rewrites the Claude Code file and an older clauth never opens this one. `clauth login <name> --codex` or Setup's `+ new` creates it; the threshold and `wrap_off` keys are hand-edited only (Setup lists the roster and creates and deletes its profiles; it has no editor for the chain keys), while `active_profile` moves with `clauth <name>` and the codex auto-switch, and `profiles` and `fallback_chain` with each codex login and delete ([Codex](Codex)).
 
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|

@@ -6,7 +6,7 @@ Requires the `codex` CLI on `PATH` and a ChatGPT login (`codex login`); an API-k
 
 ## Add an account
 
-Two ways in. Neither switches to the profile, and neither needs Claude Code.
+Three ways in: adopt the login your own codex holds, mint a fresh one in the browser, or create one from the Setup tab. None switches to the profile, and the two CLI forms need no Claude Code.
 
 ### Adopt the login your own codex holds
 
@@ -46,6 +46,10 @@ clauth: run it with `clauth start spare` — your own ~/.codex is untouched
 The sign-in page sends the browser back to `http://localhost:1455/auth/callback` (port 1457 when 1455 is taken), and the listener binds the loopback address alone, so the browser has to run on the machine clauth runs on, or have that port forwarded to it. With both ports held: `codex's login ports (1455 and 1457) are both in use — close whatever holds them (another codex or clauth login?) and retry`. Five minutes without a callback ends in `timed out waiting for the codex login callback`; declining the consent page ends in `you declined the authorization request`. Either way nothing is written and the command can be re-run.
 
 A name already held by a Claude Code profile is refused for either form: `'work' is a claude profile — profile names span both harnesses, pick another`. Profile names are one namespace across both rosters, which is what lets every other command take a bare name.
+
+### From the Setup tab
+
+Open the Setup tab, pick `+ new`, cycle the `type` row to `codex`, and fill the name. `+ login` runs codex's browser login itself (as `--browser` above) and stages the mint; `+ capture current login` (shown only while your own codex login exists and is uncaptured) stages your `~/.codex` login the way `--codex` does. `create account` lands the staged login under the name; `+ login` and `+ capture current login` refuse a name either roster already holds on the name row, `create account` with nothing staged refuses on its own `└` line, and a name held by then refuses at `create account` with a `create failed` toast. A codex account's Setup row also offers `re-login` (the same browser login) and `delete account` (press twice) beside the CLI verbs.
 
 ## Run
 
@@ -90,7 +94,7 @@ clauth delete work
 # clauth: delete profile 'work' and all its credentials? [y/N]
 ```
 
-The same gate as a Claude Code delete: `--yes` skips the prompt and is required on a non-TTY stdin (`refusing to delete 'work' without confirmation; pass --yes for a non-interactive delete`), `--force` is the only way past `'work' has a live session, pass --force to remove it anyway`, and anything but `y` or `yes` leaves it with `clauth: aborted. 'work' left in place.` A confirmed delete removes `~/.clauth/profiles/work/` whole, the profile's threads and state stores under `codex-home/` included, then drops the roster row, and prints `clauth: removed codex profile 'work'.`
+The same gate as a Claude Code delete: `--yes` skips the prompt and is required on a non-TTY stdin (`refusing to delete 'work' without confirmation; pass --yes for a non-interactive delete`), `--force` is the only way past `'work' has a live session, pass --force to remove it anyway`, and anything but `y` or `yes` leaves it with `clauth: aborted. 'work' left in place.` A confirmed delete removes `~/.clauth/profiles/work/` whole, the profile's threads and state stores under `codex-home/` included, then drops the roster row, and prints `clauth: removed codex profile 'work'.` The Setup tab's `delete account` row runs the same delete behind a two-press confirm and refuses an account with a live session (there is no `--force` here).
 
 When `~/.codex/auth.json` is the link a capture installed onto this profile, the delete removes that link too and says what that means:
 
@@ -133,7 +137,7 @@ A verdict the server calls final quarantines the chain. From then on the Overvie
 | `invalidated` | the chain was revoked on the server side |
 | `lost` | clauth's own verdict: the server accepted a rotation, but the new pair could not be written to the store, so the token the store holds is spent (``clauth: '<name>' codex rotation succeeded on the wire but the store write failed (<why>); the chain is spent, run `clauth login <name> --codex --browser` ``) |
 
-No refresh revives a dead chain; a new login is the only exit, and the browser form is the one that works for every profile (a re-capture finds `~/.codex/auth.json` already pointing at the profile and captures nothing). The verdict is bound to the token it judged, so a fresh chain clears it however it lands. A refusal the server does not spell out about the chain itself (an unrecognized 4xx) never quarantines: those keep the no-replay memo and the two forced retries and nothing more.
+No refresh revives a dead chain; a new login is the only exit, and the browser form is the one that works for every profile (a re-capture finds `~/.codex/auth.json` already pointing at the profile and captures nothing). The Setup tab's codex detail shows the same verdict as a `login  [ needs re-login ]` pill while the chain is quarantined, with `re-login` running the browser form. The verdict is bound to the token it judged, so a fresh chain clears it however it lands. A refusal the server does not spell out about the chain itself (an unrecognized 4xx) never quarantines: those keep the no-replay memo and the two forced retries and nothing more.
 
 ## Use a usage-limit reset
 
@@ -214,7 +218,7 @@ Everything under `~/.clauth` is owner-only, as on the [Security](Security#where-
 
 ## What stays Claude Code only
 
-The Tokens tab and `clauth sessions` / `resume` / `info` read Claude Code's transcript stores; a codex session writes none, so its spend is absent from every figure there rather than folded in. `clauth list` shows codex accounts in their own `CODEX` section under the Claude Code table (plan, 5h, 7d, `(login expired)` on a quarantined chain), and `clauth status --json` and the daemon's `status.json` carry codex entries with `"harness": "codex"` ([Daemon](Daemon#clauth-status---json)). The Claude Code plugin's `profiles`, `switch_profile` and `delegate` refuse a codex name as a codex account they do not manage ([Claude Code plugin](Claude-Code-Plugin)). `disable`, `enable`, `rolling-token` and `static-token` refuse one as `'<name>' is a codex profile; <verb> is claude-only`. Usage and Fallback list no codex rows. Setup lists every codex account after the Claude Code ones: <kbd>⏎</kbd> opens its detail pane — `type` and `plan`, a `login [ needs re-login ]` row while the chain is quarantined — with `re-login` (the browser login of `clauth login <name> --codex --browser`: `r` opens the browser again, `c` copies the link) and `delete account` (the delete of `clauth delete <name>` behind the two-press arm; a live session still refuses). There is no TUI form for creating one: the shell verbs above are the whole way in.
+The Tokens tab and `clauth sessions` / `resume` / `info` read Claude Code's transcript stores; a codex session writes none, so its spend is absent from every figure there rather than folded in. `clauth list` shows codex accounts in their own `CODEX` section under the Claude Code table (plan, 5h, 7d, `(login expired)` on a quarantined chain), and `clauth status --json` and the daemon's `status.json` carry codex entries with `"harness": "codex"` ([Daemon](Daemon#clauth-status---json)). The Claude Code plugin's `profiles`, `switch_profile` and `delegate` refuse a codex name as a codex account they do not manage ([Claude Code plugin](Claude-Code-Plugin)). `disable`, `enable`, `rolling-token` and `static-token` refuse one as `'<name>' is a codex profile; <verb> is claude-only`. Usage and Fallback list no codex rows. Setup lists every codex account after the Claude Code ones: <kbd>⏎</kbd> opens its detail pane — `type` and `plan`, a `login [ needs re-login ]` row while the chain is quarantined — with `re-login` (the browser login of `clauth login <name> --codex --browser`: `r` opens the browser again, `c` copies the link) and `delete account` (the delete of `clauth delete <name>` behind the two-press arm; a live session still refuses). Setup's `+ new` → `type  codex` creates one ([Add an account](Codex#add-an-account)); the shell verbs are the other way in.
 
 On the Overview, codex accounts sit in selectable rows under the Claude Code rows; <kbd>↑</kbd> and <kbd>↓</kbd> reach each one, but <kbd>⏎</kbd> cannot switch a codex account and <kbd>a</kbd> offers tab-wide actions only. <kbd>c</kbd> cycles which harness the tab shows ([Interface and keys](Interface-And-Keys#tab-dependent)).
 
