@@ -36,7 +36,7 @@ Shunt pool accounts sit after the codex rows, one `shunt (<provider>)` heading p
 | <kbd>⏎</kbd> | act on the selected row (see below) |
 | <kbd>n</kbd> | new account · on the usage tab: edit the account's note |
 | <kbd>d</kbd> | open the divergence resolver, when one is pending |
-| <kbd>x</kbd> | dismiss the oldest toast, then the footer alert |
+| <kbd>x</kbd> | dismiss the oldest toast, then the footer alert; over an open dialog it dismisses the oldest toast only; while a field is open for editing, <kbd>x</kbd> stays with it |
 | <kbd>a</kbd> | action menu for the current row |
 | <kbd>?</kbd> | keybinding help for this tab |
 | <kbd>esc</kbd> | step back out of a sub-pane; in an open text field, put back the saved value (the footer reads `esc revert`), or on the new-account form keep what you typed (`esc done`) |
