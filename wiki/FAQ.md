@@ -36,7 +36,7 @@
 
 **Auto-switch does nothing at all.** The active account has to be a chain member for the walk to start. An account outside the chain is never switched away from.
 
-**On macOS a switch does not reach my running session.** Claude Code reads the Keychain first there, and it deletes the credentials file once it migrates. clauth mirrors each fresh login into the Keychain for exactly this reason, but an account holding a live `clauth start` session is skipped by force-rotate, since its Keychain item belongs to that session's own config dir. [Security](Security#per-platform-behavior).
+**On macOS a switch does not reach my running session.** Claude Code reads the Keychain first there, and it deletes the credentials file once it migrates. clauth mirrors each fresh login into the Keychain for exactly this reason, but an account holding a live `clauth start` session, or an unfinished background job holding the rotating login, is skipped by force-rotate, since its Keychain item belongs to that session's own config dir. [Security](Security#per-platform-behavior).
 
 **Claude Code does not show clauth's tools.** Open the Services tab, move to the `plugin` row. It checks the plugin install record, the `mcpServers` entry, (after <kbd>r</kbd>) whether `clauth mcp` answers a handshake, and `clauth` on `PATH`. <kbd>f</kbd> moves to the row's next fix and <kbd>⏎</kbd> opens it: `install plugin` installs at user scope, and `wire mcp server` writes the `mcpServers` entry into `~/.claude.json`; on the `herdr` row, `heal herdr config` adds clauth's keybinding and sidebar row to herdr's config.
 

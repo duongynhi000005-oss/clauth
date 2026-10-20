@@ -70,7 +70,7 @@ clauth list           # account table with cached usage, no network
 | `clauth capture <profile>` | | save the login Claude Code is using now as a new profile; the first one becomes the active account |
 | `clauth rolling-token <profile>` | | serve the profile's sessions a rolling token re-stamped from its usage chain |
 | `clauth static-token <profile>` | `--clear`, `--yes` | bare: restore the preserved mint a rolling token superseded; `--clear` removes the long-lived token entirely |
-| `clauth delete <profile>` | `--yes`, `--force` | remove a profile and every credential it holds, a codex profile included ([Codex](Codex#remove)) |
+| `clauth delete <profile>` | `--yes`, `--force` | remove a profile and every credential it holds, a codex profile included ([Codex](Codex#remove)); without `--force` it refuses while a live session runs — a Claude Code background job naming one of the profile's runtime trees (`clauth start <p> -- --bg`) counts as one, a stopped one too, until `claude rm <id>` |
 | `clauth disable <profile>` | `--yes` | hide it from auto-switch, polling, and the status feed; files stay |
 | `clauth enable <profile>` | | put a disabled profile back |
 | `clauth limit-reset <profile>` | `--list`, `--yes` | spend one of a codex account's banked usage-limit resets; `--list` shows them and spends nothing ([Codex](Codex#use-a-usage-limit-reset)) |
