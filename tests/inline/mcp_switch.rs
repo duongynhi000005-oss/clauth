@@ -784,6 +784,7 @@ fn a_login_change_during_the_gates_refresh_defers_the_switch() {
                     base_url: None,
                     api_key: None,
                     anchor: crate::actions::AnchorAction::Unproven,
+                    plan: None,
                 },
             )
             .expect("install the re-login mid-refresh");

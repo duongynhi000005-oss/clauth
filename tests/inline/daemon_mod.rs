@@ -641,6 +641,7 @@ fn drain_pending_switch_defers_a_target_relogged_into_an_expiring_login() {
                 base_url: None,
                 api_key: None,
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             },
         )
         .expect("install the re-login mid-refresh");

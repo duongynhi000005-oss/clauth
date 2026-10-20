@@ -3788,6 +3788,7 @@ fn a_body_caret_hides_under_an_open_modal_but_a_modal_field_keeps_its_caret() {
             base_url: Some("https://new.example.com".to_string()),
             api_key: Some("new-key".to_string()),
             anchor: AnchorAction::Unproven,
+            plan: None,
         }),
         input: InputState::new("a name typed into the field"),
         from_divergence: false,

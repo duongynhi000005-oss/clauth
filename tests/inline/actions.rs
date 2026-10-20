@@ -2055,6 +2055,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
         anchor: crate::actions::AnchorAction::Unproven,
+        plan: None,
     };
 
     overwrite_captured_profile(
@@ -2198,6 +2199,7 @@ fn browser_reauth_on_a_third_party_profile_keeps_its_endpoint_and_key() {
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         };
         overwrite_captured_profile(
             &mut config,
@@ -2392,6 +2394,7 @@ fn browser_reauth_keeps_a_generic_endpoint_and_key() {
                 base_url: None,
                 api_key: None,
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             },
         )
         .expect("reauth");
@@ -2485,6 +2488,7 @@ fn an_env_token_profiles_endpoint_survives_reauth_and_the_next_load() {
                 base_url: None,
                 api_key: None,
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             },
         )
         .expect("reauth");
@@ -2598,6 +2602,7 @@ fn the_auto_activate_arm_writes_a_preserved_endpoint_into_the_live_settings() {
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("reauth");
@@ -2759,6 +2764,7 @@ fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
             }),
         },
         None,
+        None,
     )
     .expect("create account");
 
@@ -2817,6 +2823,7 @@ fn a_half_filled_snapshot_never_pairs_a_stored_key_with_a_new_endpoint() {
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("endpoint-only capture");
@@ -2841,6 +2848,7 @@ fn a_half_filled_snapshot_never_pairs_a_stored_key_with_a_new_endpoint() {
             base_url: None,
             api_key: Some("sk-foreign".to_string()),
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("key-only capture");
@@ -2903,6 +2911,7 @@ fn browser_reauth_does_not_keep_an_endpoint_with_no_key_behind_it() {
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("reauth");
@@ -2974,6 +2983,7 @@ fn browser_reauth_on_an_active_third_party_profile_keeps_the_live_endpoint() {
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("reauth the active profile");
@@ -3047,6 +3057,7 @@ fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("reauth");
@@ -3067,6 +3078,7 @@ fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
             api_key: Some("zai-key".to_string()),
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("api-mode reauth");
@@ -3135,6 +3147,7 @@ fn a_credentials_less_recapture_still_drops_the_stored_chain() {
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
             api_key: Some("zai-key".to_string()),
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("recapture");
@@ -3279,6 +3292,7 @@ fn login_snapshot(refresh: &str, account_uuid: Option<&str>) -> CaptureSnapshot 
             .map(crate::profile::AccountId::from)
             .map(AnchorAction::Proven)
             .unwrap_or(AnchorAction::Unproven),
+        plan: None,
     }
 }
 
@@ -3466,6 +3480,7 @@ fn first_create_from_login_over_a_foreign_live_login_refuses_and_rolls_back() {
         "work".to_string(),
         Default::default(),
         minted,
+        None,
         None,
     )
     .expect_err("the guarded link must refuse over a foreign live file");
@@ -3773,6 +3788,7 @@ fn an_unchanged_commit_keeps_the_anchor() {
             base_url: Some("https://api.example.com".to_string()),
             api_key: Some("sk-new".to_string()),
             anchor: AnchorAction::Unchanged,
+            plan: None,
         },
     )
     .expect("overwrite in place");
@@ -3831,6 +3847,7 @@ fn a_failed_overwrite_after_the_commit_leaves_no_stale_anchor() {
             base_url: None,
             api_key: None,
             anchor: AnchorAction::Unproven,
+            plan: None,
         },
     );
     assert!(
@@ -3866,6 +3883,7 @@ fn overwrite_captured_profile_expires_the_profile_ttl_clock() {
             base_url: Some("https://api.example.com".to_string()),
             api_key: Some("new-api-key".to_string()),
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("overwrite in place");
@@ -4002,6 +4020,7 @@ fn overwrite_captured_profile_clears_auth_broken_quarantine() {
         base_url: None,
         api_key: None,
         anchor: crate::actions::AnchorAction::Unproven,
+        plan: None,
     };
     overwrite_captured_profile(
         &mut config,
@@ -4062,6 +4081,7 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
         anchor: crate::actions::AnchorAction::Unproven,
+        plan: None,
     };
     overwrite_captured_profile(
         &mut config,
@@ -4159,6 +4179,7 @@ fn overwriting_the_active_profile_replaces_a_regular_live_file() {
         base_url: None,
         api_key: None,
         anchor: crate::actions::AnchorAction::Unproven,
+        plan: None,
     };
     overwrite_captured_profile(
         &mut config,
@@ -4230,6 +4251,7 @@ fn overwriting_the_active_profile_with_no_credentials_clears_a_regular_live_file
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
         anchor: crate::actions::AnchorAction::Unproven,
+        plan: None,
     };
     overwrite_captured_profile(
         &mut config,
@@ -5695,6 +5717,7 @@ fn reauth_overwrite_clears_broken_flag() {
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("re-auth overwrite");
@@ -6258,6 +6281,7 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
             api_key: Some("zai-key".to_string()),
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("overwrite_captured_profile");
@@ -7856,6 +7880,7 @@ fn a_login_install_retires_the_spent_record() {
             base_url: None,
             api_key: None,
             anchor: AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("install the re-login");
@@ -8609,6 +8634,7 @@ fn a_same_account_create_through_the_install_path_forgets_nothing() {
         Default::default(),
         oauth_pair("access-A-again"),
         Some(AccountId::from("uuid-A")),
+        None,
     )
     .expect("create the same account in place");
 
@@ -8818,7 +8844,8 @@ fn a_key_edit_forgets_the_old_provider_reading_and_keeps_the_oauth_leg() {
 
 /// A6: a proven same-account re-login (the anchor re-seeds the SAME uuid) and a
 /// no-op re-save forget nothing — on disk or in memory, the `/profile` stamp
-/// included.
+/// included. A probe body (the normal interactive login) must not seed a
+/// plan-only cache over the live windows either.
 #[test]
 fn a_proven_same_account_relogin_forgets_nothing() {
     use crate::profile_cache::{PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
@@ -8831,12 +8858,11 @@ fn a_proven_same_account_relogin_forgets_nothing() {
     crate::testutil::register_names(&["acct"]);
     crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
 
+    let resets_at = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 3600);
     let info = crate::usage::UsageInfo {
         five_hour: Some(crate::usage::UsageWindow {
             utilization: 42.0,
-            resets_at: Some(crate::usage::epoch_secs_to_iso(
-                crate::usage::now_epoch_secs() + 3600,
-            )),
+            resets_at: Some(resets_at.clone()),
         }),
         ..Default::default()
     };
@@ -8856,14 +8882,19 @@ fn a_proven_same_account_relogin_forgets_nothing() {
             base_url: None,
             api_key: None,
             anchor: AnchorAction::Proven(AccountId::from("uuid-A")),
+            plan: Some(plan_for("uuid-A")),
         },
     )
     .expect("same-account re-login");
     apply_pending_forgets(&stores);
 
-    assert!(
-        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_some(),
-        "the OAuth disk cache survives a proven same-account re-login"
+    let disk = load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE);
+    assert_eq!(
+        disk.as_ref()
+            .and_then(|u| u.five_hour.as_ref())
+            .map(|w| (w.utilization, w.resets_at.as_deref())),
+        Some((42.0, Some(resets_at.as_str()))),
+        "a proven same-account re-login with a probe body keeps the on-disk 5h window"
     );
     assert!(
         load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_some(),
@@ -9541,6 +9572,7 @@ fn a_no_op_resave_forgets_nothing() {
             base_url: None,
             api_key: None,
             anchor: AnchorAction::Unchanged,
+            plan: None,
         },
     )
     .expect("no-op re-save");
@@ -9593,6 +9625,7 @@ fn an_anchor_backfill_forgets_nothing() {
             base_url: None,
             api_key: None,
             anchor: AnchorAction::Proven(AccountId::from("uuid-A")),
+            plan: None,
         },
     )
     .expect("backfill the anchor");
@@ -9645,6 +9678,7 @@ fn an_unproven_capture_over_an_anchored_profile_forgets_the_oauth_reading() {
             base_url: None,
             api_key: None,
             anchor: AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("capture account B");
@@ -9704,6 +9738,7 @@ fn a_hybrid_oauth_relogin_keeps_the_provider_reading() {
             base_url: None,
             api_key: None,
             anchor: AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("re-login");
@@ -9833,6 +9868,7 @@ fn a_delete_then_recreate_forgets_the_old_reading() {
             base_url: None,
             api_key: None,
             anchor: AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("recreate the name");
@@ -10263,6 +10299,7 @@ fn a_proven_install_writes_its_anchor_inside_the_hold() {
             base_url: None,
             api_key: None,
             anchor: AnchorAction::Proven(AccountId::from("uuid-A")),
+            plan: None,
         },
     )
     .expect_err("the state write fails");
@@ -10296,4 +10333,745 @@ fn a_duplicate_carries_the_usage_gates() {
         .expect("the duplicate exists");
     assert!(!dup.check_scoped, "the scoped gate is carried");
     assert!(!dup.check_credit_cap, "the credit gate is carried");
+}
+
+// ── commit 4: the login plan seed ────────────────────────────────────────────
+//
+// A login whose `/profile` probe ran seeds that body's plan into
+// `usage_cache.json` inside the install's state-flock hold, after `forget_disk`
+// and before the identity writes, so the account's real tier shows at once and
+// a failed forced `/profile` afterwards keeps it.
+
+/// The plan a probe body carries, paired with the account it was read for.
+fn plan_for(account: &str) -> crate::usage::PlanInfo {
+    crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Max(Some(5)),
+        email: Some(crate::usage::AccountEmail {
+            address: "cloudy@example.com".to_string(),
+            account: AccountId::from(account),
+        }),
+        ..crate::usage::PlanInfo::default()
+    }
+}
+
+/// Read `name`'s on-disk plan out of `usage_cache.json`, if one is seeded.
+fn seeded_plan(name: &str) -> Option<crate::usage::PlanInfo> {
+    crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+        &ProfileName::from(name),
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .and_then(|u| u.plan)
+}
+
+/// A new-account create whose snapshot carries the login's probe plan seeds a
+/// plan-only `usage_cache.json`, so the tier shows at once before the first poll.
+#[test]
+fn capture_into_profile_seeds_the_probe_plan() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let mut snapshot = login_snapshot("minted", Some("uuid-fresh"));
+    snapshot.plan = Some(plan_for("uuid-fresh"));
+
+    capture_into_profile(
+        &mut config,
+        "fresh".to_string(),
+        Default::default(),
+        snapshot,
+    )
+    .expect("capture");
+
+    let disk = crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+        &ProfileName::from("fresh"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .expect("the seed lands in the on-disk cache");
+    assert_eq!(
+        disk.plan.as_ref().map(|p| p.tier.clone()),
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the create seeds the mint's exact tier"
+    );
+    assert!(
+        disk.five_hour.is_none() && disk.seven_day.is_none(),
+        "the seed is a plan-only body"
+    );
+    assert!(
+        crate::profile_cache::load_profile_cache::<u64>(
+            &ProfileName::from("fresh"),
+            crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+        )
+        .is_none(),
+        "the seed writes no /profile stamp, so the next /profile stays due"
+    );
+}
+
+/// C2: an install whose seed landed but whose hold then fails (the app-state
+/// save) leaves no `usage_cache.json` behind — the seeded plan is for a profile
+/// the roster never registered, so the failed install must not strand it.
+#[test]
+fn a_failed_install_after_the_seed_leaves_no_usage_cache() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
+
+    let _home = HomeSandbox::new();
+    let _fail = crate::profile::FailAppStateSave::new(&_home);
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let mut snapshot = login_snapshot("minted", Some("uuid-fresh"));
+    snapshot.plan = Some(plan_for("uuid-fresh"));
+
+    capture_into_profile(
+        &mut config,
+        "fresh".to_string(),
+        Default::default(),
+        snapshot,
+    )
+    .expect_err("the app-state save fails after the seed");
+
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(
+            &ProfileName::from("fresh"),
+            USAGE_CACHE_FILE,
+        )
+        .is_none(),
+        "a failed install after the seed leaves no seeded plan behind"
+    );
+}
+
+/// The draft-commit arm: a stashed new-account mint commits through
+/// `create_profile_from_login`, which seeds the plan it carried.
+#[test]
+fn create_profile_from_login_seeds_the_probe_plan() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+
+    create_profile_from_login(
+        &mut config,
+        "fresh".to_string(),
+        Default::default(),
+        oauth_pair("minted"),
+        Some(AccountId::from("uuid-fresh")),
+        Some(plan_for("uuid-fresh")),
+    )
+    .expect("create the drafted account");
+
+    assert_eq!(
+        seeded_plan("fresh").map(|p| p.tier),
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the draft commit seeds the mint's exact tier"
+    );
+}
+
+/// A re-login into an existing account seeds the plan through
+/// `overwrite_captured_profile`, the same hold the CLI reauth and TUI
+/// confirm-gated re-login funnel through.
+#[test]
+fn overwrite_captured_profile_seeds_the_probe_plan() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("swap");
+    let target = Profile::new("swap".to_string(), None, None);
+    save_profile(&target).expect("save target");
+    crate::testutil::register_names(&["swap"]);
+    let mut config = inactive_config(target);
+
+    let mut snapshot = login_snapshot("new", Some("uuid-new"));
+    snapshot.plan = Some(plan_for("uuid-new"));
+    overwrite_captured_profile(&mut config, &name, snapshot).expect("overwrite in place");
+
+    assert_eq!(
+        seeded_plan("swap").map(|p| p.tier),
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the re-login seeds the mint's exact tier"
+    );
+}
+
+/// An install whose snapshot carries no probe body (a failed probe, an off-disk
+/// capture) seeds nothing.
+#[test]
+fn a_probe_less_install_seeds_nothing() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let snapshot = login_snapshot("minted", Some("uuid-fresh"));
+
+    capture_into_profile(
+        &mut config,
+        "fresh".to_string(),
+        Default::default(),
+        snapshot,
+    )
+    .expect("capture");
+
+    assert!(seeded_plan("fresh").is_none(), "no probe body, no seed");
+}
+
+/// A plan whose account pairing names another account is not this login's plan
+/// and is refused: the seed must never install another login's tier or address.
+#[test]
+fn a_plan_for_another_account_is_not_seeded() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let mut snapshot = login_snapshot("minted", Some("uuid-fresh"));
+    snapshot.plan = Some(plan_for("uuid-other"));
+
+    capture_into_profile(
+        &mut config,
+        "fresh".to_string(),
+        Default::default(),
+        snapshot,
+    )
+    .expect("capture");
+
+    assert!(
+        seeded_plan("fresh").is_none(),
+        "a plan read for another account is not seeded"
+    );
+}
+
+/// The seed lands inside the install's hold, after `forget_disk` and before the
+/// anchor write: a compare hook run inside `seed_login_anchor`'s hold (after the
+/// credentials write, before the anchor write) must already see the plan on disk
+/// — a seed written before the forget would have been deleted, and one written
+/// after the hold would not be there yet.
+#[test]
+fn the_seed_lands_inside_the_hold_before_the_anchor_write() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    crate::usage::set_compare_hook(
+        "acct",
+        std::sync::Arc::new(move || {
+            assert_eq!(
+                seeded_plan("acct").map(|p| p.tier),
+                Some(crate::usage::PlanTier::Max(Some(5))),
+                "the seed is on disk before the anchor write, after the forget"
+            );
+        }),
+    );
+
+    let mut config = inactive_config(profile);
+    let mut snapshot = login_snapshot("access-B", Some("uuid-B"));
+    snapshot.plan = Some(plan_for("uuid-B"));
+    overwrite_captured_profile(&mut config, &name, snapshot).expect("overwrite in place");
+
+    assert_eq!(
+        seeded_plan("acct").map(|p| p.tier),
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the seed survives to the end of the install"
+    );
+}
+
+/// The seed-order hook's fresh-install probe: the seeded `usage_cache.json` is
+/// already on disk while neither identity file exists yet. Shared by the capture
+/// and create order tests, which install into a brand-new name.
+fn assert_seed_before_identity_writes(name: &str) {
+    assert_eq!(
+        seeded_plan(name).map(|p| p.tier),
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the seed is on disk before the identity writes"
+    );
+    for file in ["credentials.json", "config.toml"] {
+        let path =
+            crate::profile::profile_subpath(&ProfileName::from(name), file).expect("identity path");
+        assert!(
+            !path.exists(),
+            "{file} is not written yet — it follows the seed"
+        );
+    }
+}
+
+/// Registers `check` as `profile`'s seed-order hook and records each run's
+/// profile name, so an order test also fails when the install never calls the
+/// hook (a dropped or moved call would otherwise leave its asserts unrun).
+fn arm_seed_order_probe(
+    profile: &str,
+    check: impl Fn(&str) + Send + Sync + 'static,
+) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    let runs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::clone(&runs);
+    set_seed_order_hook(
+        profile,
+        std::sync::Arc::new(move |name: &str| {
+            check(name);
+            seen.lock().expect("probe runs").push(name.to_string());
+        }),
+    );
+    runs
+}
+
+fn seed_order_probe_runs(runs: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+    runs.lock().expect("probe runs").clone()
+}
+
+/// The capture site seeds the plan right after `forget_disk` and before the
+/// identity writes: from inside the seed-order hook, the seeded
+/// `usage_cache.json` is on disk while `credentials.json` and `config.toml` are
+/// not yet written. A plant moving the capture seed past `save_profile` reds it.
+#[test]
+fn the_capture_seed_lands_before_the_identity_writes() {
+    let _home = HomeSandbox::new();
+    let fired = arm_seed_order_probe("fresh", assert_seed_before_identity_writes);
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let mut snapshot = login_snapshot("minted", Some("uuid-fresh"));
+    snapshot.plan = Some(plan_for("uuid-fresh"));
+
+    capture_into_profile(
+        &mut config,
+        "fresh".to_string(),
+        Default::default(),
+        snapshot,
+    )
+    .expect("capture");
+    assert_eq!(seed_order_probe_runs(&fired), ["fresh"]);
+}
+
+/// The draft-commit site seeds the plan right after `forget_disk` and before the
+/// identity writes, the same order the capture and overwrite sites keep. A plant
+/// moving the create seed past `save_profile` reds it.
+#[test]
+fn the_create_seed_lands_before_the_identity_writes() {
+    let _home = HomeSandbox::new();
+    let fired = arm_seed_order_probe("fresh", assert_seed_before_identity_writes);
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+
+    create_profile_from_login(
+        &mut config,
+        "fresh".to_string(),
+        Default::default(),
+        oauth_pair("minted"),
+        Some(AccountId::from("uuid-fresh")),
+        Some(plan_for("uuid-fresh")),
+    )
+    .expect("create the drafted account");
+    assert_eq!(seed_order_probe_runs(&fired), ["fresh"]);
+}
+
+/// The overwrite site seeds the plan right after `forget_disk` and before the
+/// identity writes: the target is a credential-less profile, so the hook must
+/// see the seed on disk while the re-login's credentials store does not exist
+/// yet. A plant moving the overwrite seed past `save_profile` reds it.
+#[test]
+fn the_overwrite_seed_lands_before_the_identity_writes() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("swap");
+    let target = Profile::new("swap".to_string(), None, None);
+    save_profile(&target).expect("save target");
+    crate::testutil::register_names(&["swap"]);
+    let mut config = inactive_config(target);
+
+    let fired = arm_seed_order_probe("swap", |name: &str| {
+        assert_eq!(
+            seeded_plan(name).map(|p| p.tier),
+            Some(crate::usage::PlanTier::Max(Some(5))),
+            "the seed is on disk before the identity writes"
+        );
+        let creds = crate::profile::profile_subpath(&ProfileName::from(name), "credentials.json")
+            .expect("credentials path");
+        assert!(
+            !creds.exists(),
+            "the credentials write has not happened yet — it follows the seed"
+        );
+    });
+
+    let mut snapshot = login_snapshot("new", Some("uuid-new"));
+    snapshot.plan = Some(plan_for("uuid-new"));
+    overwrite_captured_profile(&mut config, &name, snapshot).expect("overwrite in place");
+    assert_eq!(seed_order_probe_runs(&fired), ["swap"]);
+}
+
+/// A peer process whose snapshot predates the login re-seeds the seeded plan on
+/// its reload, so a failed forced `/profile` afterwards keeps the tier in both
+/// processes (the A4-keep half).
+#[test]
+fn a_peer_reload_after_a_seeded_login_reseeds_the_plan() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    // A peer process whose snapshot and store predate the login.
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    seed_oauth_memory(&stores, "acct", 90_000);
+
+    // This process installs a fresh login whose probe carried a plan.
+    let mut config = inactive_config(profile);
+    let mut snapshot = login_snapshot("access-B", Some("uuid-B"));
+    snapshot.plan = Some(plan_for("uuid-B"));
+    overwrite_captured_profile(&mut config, &name, snapshot).expect("overwrite in place");
+
+    // The peer reloads: the identity moved, so it forgets and re-seeds the plan.
+    crate::usage::reload_and_forget(&stores, std::slice::from_ref(&name));
+
+    let store = stores.usage.lock().unwrap();
+    assert_eq!(
+        store
+            .get("acct")
+            .and_then(|u| u.plan.as_ref())
+            .map(|p| p.tier.clone()),
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the peer's reload re-seeds the seeded plan from disk"
+    );
+}
+
+/// C3 fixture: overwrite "acct" (anchored uuid-A) with a changed-account login
+/// (uuid-B) carrying `plan`, then drive the given memory path and return the
+/// name's OAuth cadence stamp, the stored plan tier and its reading status.
+fn changed_relogin_seed_state(
+    plan: Option<crate::usage::PlanInfo>,
+    peer: bool,
+) -> (
+    Option<u64>,
+    Option<crate::usage::PlanTier>,
+    Option<crate::usage::FetchStatus>,
+) {
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    let mut config = inactive_config(profile);
+    let mut snapshot = login_snapshot("access-B", Some("uuid-B"));
+    snapshot.plan = plan;
+    overwrite_captured_profile(&mut config, &name, snapshot).expect("overwrite in place");
+    if peer {
+        crate::usage::reload_and_forget(&stores, std::slice::from_ref(&name));
+    } else {
+        crate::usage::apply_pending_forgets(&stores);
+    }
+    let stamp = stores
+        .last_fetched
+        .lock()
+        .unwrap()
+        .get(&crate::usage::FetchLeg::OAuth.key(name.clone()))
+        .map(|s| s.as_millis());
+    let tier = stores
+        .usage
+        .lock()
+        .unwrap()
+        .get("acct")
+        .and_then(|u| u.plan.as_ref())
+        .map(|p| p.tier.clone());
+    let status = stores.usage_status.lock().unwrap().get("acct").cloned();
+    (stamp, tier, status)
+}
+
+/// C3: a changed-account re-login that seeds the probe plan leaves the name's
+/// OAuth cadence unstamped in THIS process — the plan-only seed carries no
+/// windows to resume, so the new login's first `/usage` fetch stays due on the
+/// next tick instead of waiting one interval on a `Fresh` status dated off the
+/// plan rewrite's mtime.
+#[test]
+fn a_seeded_relogin_leaves_the_new_login_due_at_once() {
+    let _home = HomeSandbox::new();
+    let (stamp, tier, status) = changed_relogin_seed_state(Some(plan_for("uuid-B")), false);
+    assert!(
+        stamp.is_none(),
+        "the seed stamped this process's OAuth cadence at {stamp:?}: the new login's first /usage fetch waits one interval"
+    );
+    assert_eq!(
+        tier,
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the store still shows the seeded plan"
+    );
+    assert!(
+        status.is_none(),
+        "the seed wrote a {status:?} status: a Fresh status on a never-polled entry reads as a confirmed-live read"
+    );
+}
+
+/// C3 (peer): the same seeded re-login leaves a peer process's OAuth cadence
+/// unstamped too, while its reload still re-seeds the plan from disk.
+#[test]
+fn a_seeded_relogin_leaves_a_peer_due_at_once() {
+    let _home = HomeSandbox::new();
+    let (stamp, tier, status) = changed_relogin_seed_state(Some(plan_for("uuid-B")), true);
+    assert!(
+        stamp.is_none(),
+        "the seed stamped the peer's OAuth cadence at {stamp:?}: the new login's first /usage fetch waits one interval"
+    );
+    assert_eq!(
+        tier,
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the peer's store still shows the seeded plan"
+    );
+    assert!(
+        status.is_none(),
+        "the seed wrote a {status:?} status in the peer: a Fresh status on a never-polled entry reads as a confirmed-live read"
+    );
+}
+
+/// C3 control: the same changed-account re-login with no probe plan seeds
+/// nothing, so no stamp is expected in either process.
+#[test]
+fn an_unseeded_relogin_leaves_the_new_login_due_at_once() {
+    let _home = HomeSandbox::new();
+    let (stamp, tier, status) = changed_relogin_seed_state(None, false);
+    assert!(stamp.is_none(), "control: no seed, no stamp ({stamp:?})");
+    assert_eq!(tier, None, "control: no seed, no plan in the store");
+    assert!(status.is_none(), "control: no seed, no status ({status:?})");
+    let (peer_stamp, peer_tier, peer_status) = {
+        drop(_home);
+        let _home2 = HomeSandbox::new();
+        changed_relogin_seed_state(None, true)
+    };
+    assert!(
+        peer_stamp.is_none(),
+        "control (peer): no seed, no stamp ({peer_stamp:?})"
+    );
+    assert_eq!(
+        peer_tier, None,
+        "control (peer): no seed, no plan in the store"
+    );
+    assert!(
+        peer_status.is_none(),
+        "control (peer): no seed, no status ({peer_status:?})"
+    );
+}
+
+/// C3: a new-account create that seeds the probe plan leaves the name's OAuth
+/// cadence unstamped (and unstamped with no `Fresh` status) in THIS process,
+/// while the store still holds the plan.
+#[test]
+fn a_seeded_new_account_is_due_at_once() {
+    let _home = HomeSandbox::new();
+    let stores = empty_memory_stores();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    create_profile_from_login(
+        &mut config,
+        "fresh".to_string(),
+        Default::default(),
+        oauth_pair("minted"),
+        Some(AccountId::from("uuid-fresh")),
+        Some(plan_for("uuid-fresh")),
+    )
+    .expect("create the drafted account");
+    crate::usage::apply_pending_forgets(&stores);
+    let name = ProfileName::from("fresh");
+    let stamp = stores
+        .last_fetched
+        .lock()
+        .unwrap()
+        .get(&crate::usage::FetchLeg::OAuth.key(name))
+        .map(|s| s.as_millis());
+    let status = stores.usage_status.lock().unwrap().get("fresh").cloned();
+    assert!(
+        stamp.is_none(),
+        "a seeded new account's OAuth cadence is stamped at {stamp:?} (status {status:?}): its first /usage fetch waits one interval"
+    );
+    assert_eq!(
+        stores
+            .usage
+            .lock()
+            .unwrap()
+            .get("fresh")
+            .and_then(|u| u.plan.as_ref())
+            .map(|p| p.tier.clone()),
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the store still shows the seeded plan"
+    );
+}
+
+/// C4: a new-account create whose hold fails after the seed (the app-state
+/// save) leaves no `usage_cache.json` behind — the draft-commit guard removes
+/// the plan-only seed for the profile the roster never registered.
+#[test]
+fn a_failed_create_after_the_seed_leaves_no_usage_cache() {
+    let _home = HomeSandbox::new();
+    let _fail = crate::profile::FailAppStateSave::new(&_home);
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    create_profile_from_login(
+        &mut config,
+        "fresh".to_string(),
+        Default::default(),
+        oauth_pair("minted"),
+        Some(AccountId::from("uuid-fresh")),
+        Some(plan_for("uuid-fresh")),
+    )
+    .expect_err("the app-state save fails after the seed");
+    assert!(
+        seeded_plan("fresh").is_none(),
+        "the create guard left the seed"
+    );
+}
+
+/// C4: a changed-account overwrite whose hold fails after the seed (the
+/// app-state save) leaves no `usage_cache.json` behind — the state save fails
+/// after B's credentials landed, and the guard still removes the plan-only seed
+/// per the ruling.
+#[test]
+fn a_failed_changed_account_overwrite_after_the_seed_leaves_no_usage_cache() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+    // Arm the failure only after the roster + anchor setup: `register_names`
+    // itself writes app state and would swallow the one-shot fault.
+    let _fail = crate::profile::FailAppStateSave::new(&_home);
+    let mut config = inactive_config(profile);
+    let mut snapshot = login_snapshot("access-B", Some("uuid-B"));
+    snapshot.plan = Some(plan_for("uuid-B"));
+    overwrite_captured_profile(&mut config, &name, snapshot)
+        .expect_err("the app-state save fails after the seed");
+    assert!(
+        seeded_plan("acct").is_none(),
+        "the overwrite guard left the seed"
+    );
+}
+
+/// C5: a same-account capture onto an orphan dir (credentials + anchor for the
+/// same uuid, the name off the roster) keeps the on-disk 5h window — the
+/// `plan.oauth` gate reads the identity unchanged, so no plan-only seed
+/// replaces the window.
+#[test]
+fn a_same_account_capture_onto_an_orphan_dir_keeps_the_window() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+    let resets_at = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 3600);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(resets_at.clone()),
+            }),
+            ..Default::default()
+        },
+    );
+    // Hand-edit the roster away: credentials, anchor and cache are orphaned.
+    let mut state = crate::profile::load_app_state().expect("load app state");
+    state.profiles.retain(|n| n.as_str() != "acct");
+    crate::profile::save_app_state(&state).expect("save app state");
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let mut snapshot = login_snapshot("minted", Some("uuid-A"));
+    snapshot.plan = Some(plan_for("uuid-A"));
+    capture_into_profile(
+        &mut config,
+        "acct".to_string(),
+        Default::default(),
+        snapshot,
+    )
+    .expect("capture");
+
+    let disk = load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+        .expect("the orphan's cache survives");
+    assert_eq!(
+        disk.five_hour
+            .as_ref()
+            .map(|w| (w.utilization, w.resets_at.as_deref())),
+        Some((42.0, Some(resets_at.as_str()))),
+        "a same-account capture onto an orphan dir keeps the on-disk 5h window"
+    );
+    assert!(
+        disk.plan.is_none(),
+        "no plan-only seed replaces the window for a same-account install"
+    );
+}
+
+/// C5: the create twin — a same-account create onto the orphan dir keeps the
+/// window by equality.
+#[test]
+fn a_same_account_create_onto_an_orphan_dir_keeps_the_window() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+    let resets_at = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 3600);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(resets_at.clone()),
+            }),
+            ..Default::default()
+        },
+    );
+    // Hand-edit the roster away: credentials, anchor and cache are orphaned.
+    let mut state = crate::profile::load_app_state().expect("load app state");
+    state.profiles.retain(|n| n.as_str() != "acct");
+    crate::profile::save_app_state(&state).expect("save app state");
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    create_profile_from_login(
+        &mut config,
+        "acct".to_string(),
+        Default::default(),
+        oauth_pair("minted"),
+        Some(AccountId::from("uuid-A")),
+        Some(plan_for("uuid-A")),
+    )
+    .expect("create");
+
+    let disk = load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+        .expect("the orphan's cache survives");
+    assert_eq!(
+        disk.five_hour
+            .as_ref()
+            .map(|w| (w.utilization, w.resets_at.as_deref())),
+        Some((42.0, Some(resets_at.as_str()))),
+        "a same-account create onto an orphan dir keeps the on-disk 5h window"
+    );
+    assert!(
+        disk.plan.is_none(),
+        "no plan-only seed replaces the window for a same-account install"
+    );
 }

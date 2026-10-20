@@ -1661,6 +1661,10 @@ pub(crate) struct LoginProfile {
     pub(crate) subscription_type: Option<String>,
     pub(crate) rate_limit_tier: Option<String>,
     pub(crate) account_uuid: Option<AccountId>,
+    /// The plan the same body carries (tier, and the email paired with its
+    /// `account.uuid`) — the seed a login writes into `usage_cache.json` so the
+    /// account's real tier shows at once, before the first poll.
+    pub(crate) plan: PlanInfo,
 }
 
 /// The org's raw `rate_limit_tier` off a parsed `/profile` body, trimmed;
@@ -1690,6 +1694,8 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
         org.and_then(|o| o.rate_limit_tier.as_deref()),
     );
     let rate_limit_tier = raw_rate_limit_tier(&p);
+    // Before `p.account` moves into `account_uuid` below.
+    let plan = plan_from_profile(&p);
     LoginProfile {
         rate_limit_tier,
         subscription_type: match tier {
@@ -1705,6 +1711,9 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
             .and_then(|a| a.uuid)
             .filter(|u| !u.trim().is_empty())
             .map(AccountId::from),
+        // The one mapping the fetch path uses, so the login seed is the same
+        // plan a `/profile` read would write.
+        plan,
     }
 }
 
@@ -1714,10 +1723,12 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
 /// — a `401` here means the login produced a dud token — (b) stamp the new
 /// profile's tier so it shows the real plan immediately instead of the
 /// unknown-tier "Pro" fallback, (c) stamp the rate-limit tier Claude Code reads
-/// at startup before any save (#78), and (d) seed the identity anchor
-/// ([`seed_login_anchor`]) without a second round trip. Goes through the shared
-/// `/profile` fetch ([`AuthClient::Profile`]). Returns the HTTP error text so the
-/// caller can surface it.
+/// at startup before any save (#78), (d) seed the identity anchor
+/// ([`seed_login_anchor`]) without a second round trip, and (e) carry the body's
+/// plan so the login's install seeds it into `usage_cache.json`
+/// ([`seed_plan_cache`]) at once. Goes through the shared `/profile` fetch
+/// ([`AuthClient::Profile`]). Returns the HTTP error text so the caller can
+/// surface it.
 pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginProfile> {
     let text = get_json(
         profile_endpoint().as_ref(),
@@ -1799,6 +1810,49 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
     ) {
         remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
         logline!("clauth: {name}: could not write the identity anchor");
+    }
+}
+
+/// Seed a freshly installed OAuth login's plan into `usage_cache.json` — the
+/// plan the login's `/profile` probe body carried — so every surface shows the
+/// account's real tier at once, before the first poll. Called INSIDE the
+/// install's state-flock hold, after `forget_disk` and before the identity
+/// writes (credentials, `config.toml`, the anchor), so a reloading process that
+/// re-seeds from disk after the writes finds the seed already there, and this
+/// process's `forget_memory` re-seed picks it up once the hold drops. Writes the
+/// profile path DIRECTLY (never `write_profile_cache`): the new-account seed runs
+/// before the roster carries the name, so the off-roster gate would drop it. No
+/// `/profile` stamp and no TTL memo — the plan's next `/profile` stays due right
+/// after the login, and a failed one still keeps the seed.
+///
+/// A plan whose account pairing names a different account than the login being
+/// installed is not this login's plan (a stale plan carried over from an earlier
+/// login) and is refused. A plan with no pairing has nothing to mismatch and
+/// seeds its tier.
+pub(crate) fn seed_plan_cache(
+    name: &ProfileName,
+    plan: PlanInfo,
+    account_uuid: Option<&AccountId>,
+) {
+    if let Some(email) = plan.email.as_ref()
+        && !account_uuid.is_some_and(|u| u.trim() == email.account.trim())
+    {
+        return;
+    }
+    let info = UsageInfo {
+        plan: Some(plan),
+        ..UsageInfo::default()
+    };
+    let Some(path) =
+        crate::profile_cache::profile_cache_path(name, crate::profile_cache::USAGE_CACHE_FILE)
+    else {
+        return;
+    };
+    let Ok(json) = serde_json::to_vec(&info) else {
+        return;
+    };
+    if let Err(e) = crate::profile::atomic_write_600(&path, json) {
+        logline!("clauth: {name}: could not save the login's plan: {e}");
     }
 }
 

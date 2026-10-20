@@ -162,6 +162,7 @@ fn a_profile_read_asks_about_the_stored_login() {
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("install b with no proven uuid");
@@ -2640,6 +2641,13 @@ fn a_profile_read_reanchors_and_seeds_only_the_body_plan() {
         "the re-anchor seed holds only the body's plan, never a stale reading"
     );
     assert!(cache.plan.is_some(), "the plan comes from that body");
+    // The scheduler's re-seed reads exactly this shape (a plan, no windows, no
+    // `fetched_at`) as a plan-only seed and leaves the new login's `/usage` due
+    // on the next tick; a dated or windowed seed would stamp its cadence.
+    assert!(
+        cache.windows().is_empty() && cache.fetched_at.is_none(),
+        "the re-anchor seed is plan-only: no window and no fetch time"
+    );
     assert!(
         crate::profile_cache::profile_cache_path(&name, PROFILE_FETCHED_CACHE_FILE)
             .is_some_and(|p| p.exists()),
@@ -2704,5 +2712,107 @@ fn a_reanchor_keeps_a_hybrids_throughput_cache() {
         crate::profile_cache::profile_cache_path(&name, crate::throughput::THROUGHPUT_CACHE_FILE)
             .is_some_and(|p| p.exists()),
         "a hybrid's endpoint-auth throughput identity survives an OAuth re-anchor"
+    );
+}
+
+/// A seeded plan survives a forced `/profile` that fails (A4-keep): the seed
+/// wrote no stamp, so the read stays due, and a failed read writes no plan —
+/// the seeded tier stays on disk for the next read.
+#[test]
+fn the_seeded_plan_survives_a_failed_forced_profile() {
+    use crate::profile::{AccountId, AppConfig, AppState, ClaudeCredentials, OAuthToken};
+    use crate::profile_cache::{PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+
+    let plan = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Max(Some(5)),
+        email: Some(crate::usage::AccountEmail {
+            address: "cloudy@example.com".to_string(),
+            account: AccountId::from("u-1"),
+        }),
+        ..crate::usage::PlanInfo::default()
+    };
+    let creds = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "minted-access".to_string(),
+            refresh_token: Some("minted-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    };
+    let snapshot = crate::actions::CaptureSnapshot {
+        credentials: Some(creds),
+        base_url: None,
+        api_key: None,
+        anchor: crate::actions::AnchorAction::Proven(AccountId::from("u-1")),
+        plan: Some(plan),
+    };
+    crate::actions::capture_into_profile(
+        &mut AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        },
+        "acct".to_string(),
+        Default::default(),
+        snapshot,
+    )
+    .expect("install the seeded login");
+
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+            .and_then(|u| u.plan)
+            .is_some(),
+        "precondition: the seed is on disk"
+    );
+    assert!(
+        load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_none(),
+        "precondition: the seed wrote no stamp, so /profile is due"
+    );
+
+    // A forced `/profile` the endpoint answers with a 500.
+    let (base, handle) =
+        crate::testutil::serve_endpoints_raw(1, |_path, _i| (500, "{}".to_string()));
+    let _sandbox = crate::testutil::EndpointSandbox::new(&_home, &base);
+    let fetched = fetch_profile_plan(
+        &name,
+        "minted-access",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    );
+    handle.join().expect("join the stub");
+
+    assert!(fetched.is_none(), "the failed read yields no plan");
+    assert_eq!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+            .and_then(|u| u.plan)
+            .map(|p| p.tier),
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the failed forced read leaves the seeded plan on disk"
+    );
+}
+
+/// The probe body's plan rides `LoginProfile` out of the raw-body mapping — the
+/// same tier + paired email a `/profile` read would cache, so the login seed is
+/// the exact plan the probe carried.
+#[test]
+fn login_profile_from_raw_carries_the_probe_plan() {
+    let p: RawProfile = serde_json::from_str(
+        r#"{"account":{"uuid":"u-1","email":"cloudy@example.com"},"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_5x"}}"#,
+    )
+    .expect("the profile parses");
+    let login = login_profile_from_raw(p);
+    assert_eq!(
+        login.plan.tier,
+        crate::usage::PlanTier::Max(Some(5)),
+        "the probe carries the body's exact tier"
+    );
+    assert_eq!(
+        login.plan.email.as_ref().map(|e| e.account.as_str()),
+        Some("u-1"),
+        "and the email paired with the account it was read for"
     );
 }

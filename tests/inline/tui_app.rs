@@ -327,6 +327,7 @@ fn a_relogin_during_a_manual_rotate_toasts_the_kept_login() {
                 base_url: None,
                 api_key: None,
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             },
         )
         .expect("install the re-login mid-refresh");
@@ -4013,6 +4014,7 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
                 base_url: Some("https://api.z.ai/api/anthropic".to_string()),
                 api_key: Some("new-key".to_string()),
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             }),
             "zai".to_string(),
             false,
@@ -4091,6 +4093,7 @@ fn a_preserve_path_overwrite_keeps_the_provider_verdict() {
                 base_url: None,
                 api_key: None,
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             }),
             "zai".to_string(),
             false,
@@ -7987,7 +7990,20 @@ fn login_outcome(refresh: &str, uuid: Option<&str>) -> crate::oauth_login::Login
     crate::oauth_login::LoginOutcome {
         credentials: login_creds(refresh),
         account_uuid: uuid.map(crate::profile::AccountId::from),
+        plan: None,
     }
+}
+
+/// A login whose `/profile` probe ran: the mint, its uuid, and the probe body's
+/// plan.
+fn login_outcome_with_plan(
+    refresh: &str,
+    uuid: Option<&str>,
+    plan: crate::usage::PlanInfo,
+) -> crate::oauth_login::LoginOutcome {
+    let mut outcome = login_outcome(refresh, uuid);
+    outcome.plan = Some(plan);
+    outcome
 }
 
 /// Like [`login_creds`] but with a caller-chosen access token, so a test can
@@ -8285,6 +8301,51 @@ fn commit_new_account_consumes_the_draft_mint() {
     );
 }
 
+/// The draft-held mint carries the probe's plan, and `create account` seeds it
+/// on the commit — the new-account arm of A4-seed, through the real TUI flow.
+#[test]
+fn commit_new_account_seeds_the_probe_plan() {
+    use super::{DraftLogin, build_draft_new, commit_new_account};
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{PlanInfo, PlanTier};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.profile_cursor = 0;
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("fresh");
+    draft.model = InputState::new("opus");
+    draft.captured_login = Some(DraftLogin::Mint(Box::new(login_outcome_with_plan(
+        "minted",
+        Some("uuid-minted"),
+        PlanInfo {
+            tier: PlanTier::Max(Some(5)),
+            email: Some(crate::usage::AccountEmail {
+                address: "cloudy@example.com".to_string(),
+                account: crate::profile::AccountId::from("uuid-minted"),
+            }),
+            ..PlanInfo::default()
+        },
+    ))));
+    app.config_draft = Some(draft);
+
+    commit_new_account(&mut app);
+
+    assert_eq!(
+        crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+            &crate::profile::ProfileName::from("fresh"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+        )
+        .and_then(|u| u.plan)
+        .map(|p| p.tier),
+        Some(PlanTier::Max(Some(5))),
+        "the draft commit seeds the probe body's exact plan"
+    );
+}
+
 // ── `+ capture current login` (the `+ new` form row) ─────────────────────────
 
 /// ⏎ on `+ capture current login` stashes the live login into the draft like
@@ -8507,6 +8568,7 @@ fn login_row_over_a_stashed_live_login_confirms_first() {
         base_url: None,
         api_key: None,
         anchor: crate::actions::AnchorAction::Unproven,
+        plan: None,
     })));
     app.config_draft = Some(draft);
     app.config_focus = ConfigFocus::Actions;
@@ -8582,6 +8644,77 @@ fn a_committed_relogin_anchors_the_profile_it_swapped_onto() {
         .as_deref(),
         Some("uuid-new-account"),
         "a committed re-login re-anchors to the account that just authenticated"
+    );
+}
+
+/// A login whose probe ran seeds its body's plan at once: the TUI store shows
+/// the real tier right after the re-login (not the coarse token fallback), and
+/// the same plan lands in `usage_cache.json` for a stood-down TUI's hydration.
+#[test]
+fn a_login_seeds_the_probe_bodies_plan_at_once() {
+    use super::apply_login;
+    use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile};
+    use crate::usage::{PlanInfo, PlanTier};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let plan = PlanInfo {
+        tier: PlanTier::Max(Some(5)),
+        email: Some(crate::usage::AccountEmail {
+            address: "cloudy@example.com".to_string(),
+            account: crate::profile::AccountId::from("uuid-new"),
+        }),
+        ..PlanInfo::default()
+    };
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("old"));
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec!["work".into()],
+            default_divergence: Some(DivergenceChoice::Overwrite),
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+    crate::testutil::register_names(&["work"]);
+    // The re-login must move the identity (anchor old -> new), so the forget
+    // fires and its re-seed loads the seed from disk into the store.
+    crate::usage::seed_login_anchor(
+        &crate::profile::ProfileName::from("work"),
+        Some(&crate::profile::AccountId::from(
+            "uuid-old-account".to_string(),
+        )),
+    );
+    // The replaced login's reading must go with it — pre-seed the store so the
+    // drop is what the assertions see, not a fixture that was empty all along.
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("work".to_string(), crate::usage::UsageInfo::default());
+
+    apply_login(
+        &mut app,
+        login_session("work", false, 1),
+        login_outcome_with_plan("new", Some("uuid-new"), plan.clone()),
+    );
+
+    let store = app.usage_store.lock().unwrap();
+    assert_eq!(
+        store
+            .get("work")
+            .and_then(|u| u.plan.as_ref())
+            .map(|p| p.tier.clone()),
+        Some(PlanTier::Max(Some(5))),
+        "the probe body's exact tier shows at once, not the coarse token fallback"
+    );
+    drop(store);
+    let disk = crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+    );
+    assert_eq!(
+        disk.and_then(|u| u.plan).map(|p| p.tier),
+        Some(PlanTier::Max(Some(5))),
+        "the same plan lands in the on-disk cache a stood-down TUI hydrates from"
     );
 }
 
@@ -13735,6 +13868,7 @@ fn capture_name_collision_opens_overwrite_confirm_instead_of_erroring() {
         base_url: Some("https://new.example.com".to_string()),
         api_key: Some("new-key".to_string()),
         anchor: crate::actions::AnchorAction::Unproven,
+        plan: None,
     };
     app.modals
         .push(super::Modal::CaptureName(super::CaptureNameForm {
@@ -13801,6 +13935,7 @@ fn x_dismisses_a_toast_under_a_modal_but_stays_data_in_name_entry() {
             base_url: Some("https://new.example.com".to_string()),
             api_key: Some("new-key".to_string()),
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         }),
         input: super::InputState::new("acme"),
         from_divergence: false,
@@ -13893,6 +14028,7 @@ fn capture_overwrite_cancel_changes_nothing() {
         base_url: Some("https://new.example.com".to_string()),
         api_key: Some("new-key".to_string()),
         anchor: crate::actions::AnchorAction::Unproven,
+        plan: None,
     };
     app.modals.push(super::Modal::Confirm(super::ConfirmState {
         message: "account 'acme' already exists.".to_string(),
@@ -14270,6 +14406,7 @@ fn tui_switch_gate_login_change_warns_with_the_sentence_alone() {
                     base_url: None,
                     api_key: None,
                     anchor: crate::actions::AnchorAction::Unproven,
+                    plan: None,
                 },
             )
             .expect("install the re-login mid-refresh");
@@ -16453,6 +16590,7 @@ fn a_captured_login_on_another_endpoint_drops_the_typed_model_rows() {
         base_url: Some("https://captured.example/anthropic".to_string()),
         api_key: Some("sk-captured".to_string()),
         anchor: crate::actions::AnchorAction::Unproven,
+        plan: None,
     })));
     app.config_draft = Some(draft);
     super::commit_new_account(&mut app);
@@ -33115,6 +33253,7 @@ fn a_failed_plain_create_keeps_a_captured_login_on_the_form() {
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )));
     app.config_draft = Some(draft);
@@ -38135,6 +38274,7 @@ fn apply_preset_on_the_new_form_keeps_a_captured_login_on_the_stamped_form() {
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )));
     app.new_account_draft = Some(draft);
@@ -38316,6 +38456,7 @@ fn no_slot_write_drops_a_typed_value_across_the_switch_sequences() {
                 base_url: None,
                 api_key: None,
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             },
         )));
         app.tab = Tab::Setup;

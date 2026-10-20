@@ -673,11 +673,93 @@ fn pending_login_run_completes_the_paste_door_against_the_manual_redirect() {
     );
     assert_eq!(outcome.account_uuid.as_deref(), Some("uuid-manual"));
     assert_eq!(
+        outcome.plan.as_ref().map(|p| p.tier.clone()),
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the probe body's plan rides the login outcome for the commit to seed"
+    );
+    assert_eq!(
         *stages.lock().expect("stages"),
         vec![
             "ExchangingCode(Manual)".to_string(),
             "Verifying".to_string()
         ]
+    );
+}
+
+/// A probe that fails (an endpoint answering 500) never fails the login — but it
+/// proves no account and carries no plan, and a commit built from the outcome
+/// seeds nothing.
+#[test]
+fn a_failed_probe_carries_no_plan_and_seeds_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_recording(2, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-failed","refresh_token":"rt-failed","expires_in":28800,"scope":"user:profile user:inference"}"#
+                    .to_string(),
+            )
+        } else {
+            (500, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let pending = super::begin_login().unwrap_or_else(|e| panic!("{}", e.user_message()));
+    let state = pending.links().state.clone();
+    let code = pending
+        .links()
+        .parse(&format!("the-code#{state}"))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+
+    let (tx, paste) = std::sync::mpsc::channel();
+    tx.send(code).expect("send");
+    drop(tx);
+
+    let outcome = pending
+        .run(paste, |_p| {})
+        .unwrap_or_else(|e| panic!("{}", e.cli_message()));
+    let seen = server.join().expect("listener");
+    let paths: Vec<&str> = seen
+        .iter()
+        .map(|(p, _)| p.split('?').next().unwrap_or(p))
+        .collect();
+    assert_eq!(
+        paths,
+        ["/v1/oauth/token", "/api/oauth/profile"],
+        "the probe was sent and answered 500"
+    );
+
+    assert!(
+        outcome.account_uuid.is_none(),
+        "a failed probe proves no account"
+    );
+    assert!(
+        outcome.plan.is_none(),
+        "a failed probe carries no plan to seed"
+    );
+
+    // The commit the login carrier builds from the outcome seeds nothing: no
+    // probe body, no seed.
+    let snapshot = crate::actions::capture_snapshot_from_outcome(outcome);
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    crate::actions::capture_into_profile(
+        &mut config,
+        "fresh".to_string(),
+        Default::default(),
+        snapshot,
+    )
+    .expect("capture");
+    assert!(
+        crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+            &crate::profile::ProfileName::from("fresh"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+        )
+        .is_none(),
+        "a failed probe's commit seeds nothing"
     );
 }
 

@@ -1245,6 +1245,7 @@ mod adopt_live_rotation {
                 base_url: None,
                 api_key: None,
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             },
         )
         .expect("overwrite");
@@ -6686,6 +6687,7 @@ fn a_relogin_during_a_rotation_survives_the_rotations_persist() {
                     base_url: None,
                     api_key: None,
                     anchor: crate::actions::AnchorAction::Unproven,
+                    plan: None,
                 },
             )
             .expect("install the re-login");
@@ -7210,6 +7212,7 @@ fn relogin_into(name: &str, expires_at: i64) {
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("install the re-login");
@@ -7877,6 +7880,7 @@ fn a_capture_of_a_recorded_pair_keeps_the_record_and_its_spend_quarantines_unsen
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("install the lagging pair");

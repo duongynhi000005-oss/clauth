@@ -3939,6 +3939,7 @@ fn a_toast_over_the_modal_caret_hides_the_native_cursor() {
             base_url: Some("https://new.example.com".to_string()),
             api_key: Some("new-key".to_string()),
             anchor: AnchorAction::Unproven,
+            plan: None,
         }),
         input: InputState::new("a name typed into the field"),
         from_divergence: false,

@@ -972,6 +972,7 @@ fn api_reauth_snapshot(
         base_url,
         api_key,
         anchor: actions::AnchorAction::Unchanged,
+        plan: None,
     }
 }
 
@@ -1228,16 +1229,9 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
     // whichever action commits it, which is what anchors the profile — so
     // `oauth::try_adopt_live_rotation` can prove a diverged live login is the
     // SAME account even after the stored token dies. Seeding it here instead
-    // would anchor an account whose commit may still fail.
-    Ok(actions::CaptureSnapshot {
-        credentials: Some(outcome.credentials),
-        base_url: None,
-        api_key: None,
-        anchor: outcome
-            .account_uuid
-            .map(actions::AnchorAction::Proven)
-            .unwrap_or(actions::AnchorAction::Unproven),
-    })
+    // would anchor an account whose commit may still fail. The probe body's
+    // plan rides the same snapshot for the commit's `usage_cache.json` seed.
+    Ok(actions::capture_snapshot_from_outcome(outcome))
 }
 
 /// `clauth login <name> [--base-url <url>] [--api-key <key>] [--model <id>]` —

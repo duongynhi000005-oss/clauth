@@ -558,6 +558,7 @@ fn modal_cases() -> Vec<ModalCase> {
                     base_url: None,
                     api_key: None,
                     anchor: AnchorAction::Unproven,
+                    plan: None,
                 }),
                 input: InputState::new(""),
                 from_divergence: false,

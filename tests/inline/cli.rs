@@ -2313,6 +2313,7 @@ mod oauth_token_helper_tests {
                 base_url: None,
                 api_key: None,
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             },
         )
         .expect("install the re-login");
@@ -5742,5 +5743,61 @@ fn the_yes_rebind_that_moved_nothing_prints_the_quiet_line() {
     assert_eq!(
         out, "every account already uses the built-in preset models.\n",
         "nothing moved, so the quiet line exits 0",
+    );
+}
+
+/// The CLI login carrier forwards the probe's plan into the snapshot, so a login
+/// whose `/profile` verification ran seeds that body's plan at commit time — the
+/// same seed the TUI's `apply_login` carries, on the one constructor both doors
+/// share. A `plan: None` plant in the carrier reds this.
+#[test]
+fn the_cli_login_carrier_forwards_the_probe_plan() {
+    use crate::actions::{AnchorAction, capture_snapshot_from_outcome};
+    use crate::oauth_login::LoginOutcome;
+    use crate::profile::{AccountId, ClaudeCredentials, OAuthToken};
+    use crate::usage::{PlanInfo, PlanTier};
+
+    let plan = PlanInfo {
+        tier: PlanTier::Max(Some(5)),
+        email: Some(crate::usage::AccountEmail {
+            address: "cloudy@example.com".to_string(),
+            account: AccountId::from("uuid-new"),
+        }),
+        ..PlanInfo::default()
+    };
+    let outcome = LoginOutcome {
+        credentials: ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-new".to_string(),
+                refresh_token: Some("rt-new".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        },
+        account_uuid: Some(AccountId::from("uuid-new")),
+        plan: Some(plan),
+    };
+
+    let snapshot = capture_snapshot_from_outcome(outcome);
+
+    let carried = snapshot
+        .plan
+        .expect("the probe's plan rides the CLI snapshot");
+    assert_eq!(
+        carried.tier,
+        PlanTier::Max(Some(5)),
+        "the probe body's exact tier rides to the commit that seeds it"
+    );
+    assert_eq!(
+        carried.email.as_ref().map(|e| e.account.as_str()),
+        Some("uuid-new"),
+        "and the account it was read for"
+    );
+    assert_eq!(
+        snapshot.anchor,
+        AnchorAction::Proven(AccountId::from("uuid-new")),
+        "and the probed uuid rides it as a proven anchor"
     );
 }

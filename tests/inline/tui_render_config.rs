@@ -849,6 +849,70 @@ fn snap_email_names_no_one_after_a_copy_back() {
     assert_eq!(snap_email(Some(oauth_login()), Some("u-1"), true), None);
 }
 
+/// The seeded arm of A17: a login whose install seeded the plan (address paired
+/// with the matching anchor) wrote no `/profile` stamp, so the email line stays
+/// hidden until the next successful `/profile` stamps the plan.
+#[test]
+fn snap_email_stays_hidden_after_a_seeded_login_until_the_stamp() {
+    use crate::profile::{AccountId, AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(oauth_login());
+    crate::profile::save_profile(&profile).expect("save the profile");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    })
+    .expect("save the roster");
+    // The seed's disk state: the plan (address paired with the login's uuid) and
+    // the matching anchor, but NO `/profile` stamp.
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        &AccountId::from("u-1"),
+    );
+    let seeded_usage = crate::usage::UsageInfo {
+        plan: Some(crate::usage::PlanInfo {
+            email: Some(crate::usage::AccountEmail {
+                address: "cloudy@example.com".to_string(),
+                account: AccountId::from("u-1"),
+            }),
+            ..crate::usage::PlanInfo::default()
+        }),
+        ..crate::usage::UsageInfo::default()
+    };
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), seeded_usage);
+
+    assert_eq!(
+        build_snap(&app, &app.readings_snapshot(), true).email,
+        None,
+        "the seeded plan has no stamp, so the email line stays hidden"
+    );
+
+    // The next successful `/profile` writes the stamp; the seeded address shows.
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+        &1_u64,
+    );
+    assert_eq!(
+        build_snap(&app, &app.readings_snapshot(), true).email,
+        Some("cloudy@example.com".to_string()),
+        "once the stamp lands, the seeded address names the login"
+    );
+}
+
 /// A credentials file without an OAuth pair holds no login to name.
 #[test]
 fn snap_email_names_no_one_without_an_oauth_pair() {

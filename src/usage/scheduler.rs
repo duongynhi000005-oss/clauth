@@ -3192,6 +3192,14 @@ pub(crate) fn try_seed_cache(
     else {
         return false;
     };
+    // A plan-only body (a login plan seed, or a cold fill) carries a plan, no
+    // windows and no `fetched_at`: there is no `/usage` reading to resume, so
+    // the seed fills the store alone and leaves the OAuth cadence unstamped —
+    // the name's first `/usage` fetch stays due on the next tick instead of
+    // waiting one full interval on a `Fresh` status dated off the plan
+    // rewrite's mtime. An empty default body still stamps (it is a cache the
+    // scheduler seeded, not a plan rewrite).
+    let plan_only = info.plan.is_some() && info.windows().is_empty() && info.fetched_at.is_none();
     #[cfg(test)]
     run_seed_hook((SeedPhase::PreWrite, crate::usage::Half::OAuth), name);
     let Some(_guard) = crate::usage::epoch_guard_if_current(name, crate::usage::Half::OAuth, epoch)
@@ -3202,6 +3210,9 @@ pub(crate) fn try_seed_cache(
     run_seed_hook((SeedPhase::PostCompare, crate::usage::Half::OAuth), name);
     if let Ok(mut s) = store.lock() {
         s.insert(name.to_string(), info);
+    }
+    if plan_only {
+        return true;
     }
     // Ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350) — matches `apply_outcome`.
     if let Ok(mut lf) = last_fetched.lock() {

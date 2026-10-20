@@ -51,8 +51,8 @@ pub(crate) use fetch::{
     forget_profile_memo, http_agent, humanize_duration, ideal_pace_pct, iso_to_epoch_secs,
     long_window_live, mark_profile_read_stale, note_profile_memo, now_epoch_secs, now_ms,
     parse_retry_after, parse_retry_after_at, probe_login_profile, seed_login_anchor,
-    spent_resume_in_secs, stamp_profile_fetch, window_avg_pace_per_day, window_duration_secs,
-    windows_maxed,
+    seed_plan_cache, spent_resume_in_secs, stamp_profile_fetch, window_avg_pace_per_day,
+    window_duration_secs, windows_maxed,
 };
 pub(crate) use scheduler::{
     ActivityStore, FetchLeg, FetchStatus, KickBlock, KickBlocks, LastFetchedAt, LegKey,

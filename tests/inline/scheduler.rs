@@ -16792,10 +16792,20 @@ fn a_reanchored_landing_forgets_memory_and_keeps_the_profile_stamp() {
     state
         .memory_stores()
         .seed_snapshot(std::slice::from_ref(&rz));
-    // The re-anchor's hold wrote the new anchor + the durable /profile stamp.
+    // The re-anchor's hold wrote the new anchor, the plan-only seed and the
+    // durable /profile stamp (its `forget_disk` removed the caches first, then
+    // it re-wrote the plan-only body).
     crate::usage::seed_login_anchor(
         &rz,
         Some(&crate::profile::AccountId::from("u-b".to_string())),
+    );
+    super::write_profile_cache(
+        &rz,
+        super::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo::default()),
+            ..Default::default()
+        },
     );
     let now = crate::usage::now_ms();
     crate::usage::stamp_profile_fetch(&rz, now);
@@ -16823,6 +16833,32 @@ fn a_reanchored_landing_forgets_memory_and_keeps_the_profile_stamp() {
     assert!(
         !crate::usage::decide_profile_fetch(&rz, false, now + 1),
         "the durable stamp keeps the next fetch from re-pulling /profile"
+    );
+    // C8: the drain's re-anchor forget re-seeds B from the plan-only body the
+    // re-anchor's hold wrote, which carries no windows to resume — the new
+    // login's OAuth cadence must stay unstamped (its first /usage is due next
+    // tick, not one interval off a `Fresh` status dated at the plan rewrite).
+    let last_fetched = state.memory_stores().last_fetched;
+    assert!(
+        !last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&FetchLeg::OAuth.key(rz.clone())),
+        "the re-anchor's plan-only re-seed stamped the new login's OAuth cadence: its first /usage fetch waits one interval"
+    );
+    // C10: that missing stamp is what `partition_due` reads as due at once.
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let (due, _) = partition_due(
+        &[token("rz")],
+        crate::usage::now_ms(),
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &HashMap::new(),
+    );
+    assert!(
+        due.iter().any(|e| e.name.as_str() == "rz"),
+        "partition_due must mark the re-anchored, unstamped name due at once"
     );
 }
 

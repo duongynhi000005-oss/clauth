@@ -1770,6 +1770,7 @@ fn new_form_renders_the_capture_row_and_its_done_state() {
         base_url: None,
         api_key: None,
         anchor: crate::actions::AnchorAction::Unproven,
+        plan: None,
     })));
     app.config_draft = Some(draft);
     let out = dump(&app, 120, 30);
@@ -1884,6 +1885,7 @@ fn capture_name_caret_follows_edit_position() {
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         }),
         input,
         from_divergence: false,
@@ -1924,6 +1926,7 @@ fn capture_name_app(value: &str) -> App {
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         }),
         input: InputState::new(value),
         from_divergence: false,

@@ -20598,13 +20598,15 @@ fn commit_new_account(app: &mut App) {
                 capture_into_profile(&mut cfg, name.clone(), models, *snapshot)
             }
             // The draft parked the login's uuid until this moment fixed the
-            // name; `create_profile_from_login` anchors it on the commit.
+            // name; `create_profile_from_login` anchors it and seeds the probe's
+            // plan on the commit.
             Some(DraftLogin::Mint(login)) => create_profile_from_login(
                 &mut cfg,
                 name.clone(),
                 models,
                 login.credentials,
                 login.account_uuid,
+                login.plan,
             ),
             None => create_blank_profile(&mut cfg, name.clone(), base_url, api_key, models),
         }
@@ -22854,16 +22856,9 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         return;
     }
     // The uuid rides the snapshot: this may land in a confirm modal instead of
-    // committing now, and only the commit may seed the anchor.
-    let snapshot = CaptureSnapshot {
-        credentials: Some(outcome.credentials),
-        base_url: None,
-        api_key: None,
-        anchor: outcome
-            .account_uuid
-            .map(crate::actions::AnchorAction::Proven)
-            .unwrap_or(crate::actions::AnchorAction::Unproven),
-    };
+    // committing now, and only the commit may seed the anchor. The probe body's
+    // plan rides it too, for the commit's `usage_cache.json` seed.
+    let snapshot = crate::actions::capture_snapshot_from_outcome(outcome);
     // No stored creds → nothing diverges; adopt silently (mirrors the
     // first-login adopt in `poll_credentials_divergence`).
     let apply_now = !has_creds

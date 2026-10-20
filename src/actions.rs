@@ -28,9 +28,10 @@ use crate::providers::Provider;
 use crate::runtime::RotationGuard;
 use crate::spinner::Spinner;
 use crate::usage::{
-    ForgetPlan, Half, OAuthIdentity, endpoint_identity_plan, forget_disk, forget_disk_plan,
-    note_forget, note_forget_plan, note_rename, oauth_changed, read_before_identities,
-    read_codex_identity, third_party_identity, throughput_for_endpoint, throughput_identity,
+    ForgetPlan, Half, OAuthIdentity, PlanInfo, endpoint_identity_plan, forget_disk,
+    forget_disk_plan, note_forget, note_forget_plan, note_rename, oauth_changed,
+    read_before_identities, read_codex_identity, third_party_identity, throughput_for_endpoint,
+    throughput_identity,
 };
 
 /// ASCII alphanumeric + `-_.@+`, not leading-dot, not empty. `@`/`+` let an
@@ -2246,6 +2247,11 @@ pub(crate) struct CaptureSnapshot {
     /// whichever function COMMITS it acts — including the paths that park the
     /// snapshot in a confirm modal first.
     pub(crate) anchor: AnchorAction,
+    /// The login probe body's plan, when the snapshot came from an interactive
+    /// OAuth login whose probe ran. Rides the snapshot so a confirm-gated
+    /// re-login still seeds it at commit time. `None` for every non-login
+    /// capture (a live read, an api re-key) and a failed probe.
+    pub(crate) plan: Option<PlanInfo>,
 }
 
 pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
@@ -2257,7 +2263,27 @@ pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
         api_key,
         // Read off disk, not from a login — this snapshot proves no identity.
         anchor: AnchorAction::Unproven,
+        plan: None,
     })
+}
+
+/// The snapshot the one OAuth login carrier builds: the minted credentials plus
+/// the probe's account uuid (as the anchor) and its plan (as the seed). Shared
+/// by the CLI's `run_oauth` and the TUI's `apply_login` so neither can drop the
+/// plan.
+pub(crate) fn capture_snapshot_from_outcome(
+    outcome: crate::oauth_login::LoginOutcome,
+) -> CaptureSnapshot {
+    CaptureSnapshot {
+        credentials: Some(outcome.credentials),
+        base_url: None,
+        api_key: None,
+        anchor: outcome
+            .account_uuid
+            .map(AnchorAction::Proven)
+            .unwrap_or(AnchorAction::Unproven),
+        plan: outcome.plan,
+    }
 }
 
 /// An all-empty snapshot (no OAuth login, no endpoint, no key) holds nothing a
@@ -2298,6 +2324,75 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
     Ok(becomes_active)
 }
 
+/// Undo a seed when the install's hold does not return `Ok`: the seed lands
+/// before the hold's fallible steps and bypasses `write_profile_cache`'s
+/// off-roster gate (a new account's directory may not be registered yet), so an
+/// error after it would strand a plan for a profile the roster never registered.
+/// `arm` runs on every seed attempt under the OAuth gate — a refused pairing or
+/// a failed write included — and `release` disarms it once every step inside
+/// the hold succeeded, so an unreleased drop (any error return) removes the
+/// seeded file, best-effort.
+struct SeedCleanupGuard {
+    name: Option<ProfileName>,
+}
+
+impl SeedCleanupGuard {
+    fn new() -> Self {
+        Self { name: None }
+    }
+
+    fn arm(&mut self, name: &ProfileName) {
+        self.name = Some(name.clone());
+    }
+
+    fn release(&mut self) {
+        self.name = None;
+    }
+}
+
+impl Drop for SeedCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(name) = &self.name {
+            crate::profile_cache::remove_profile_cache(
+                name,
+                crate::profile_cache::USAGE_CACHE_FILE,
+            );
+        }
+    }
+}
+
+/// A test's stand-in for observing the seed's on-disk order inside an install's
+/// hold: called right after the seed block and before the first identity write
+/// at each install site, so a test can assert the seeded `usage_cache.json` is
+/// already on disk while the new credentials and `config.toml` are not yet
+/// written. Registered per profile name, run once, like the anchor compare hook.
+#[cfg(test)]
+pub(crate) type SeedOrderHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
+static SEED_ORDER_HOOK: std::sync::Mutex<Option<std::collections::HashMap<String, SeedOrderHook>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_seed_order_hook(profile: &str, f: SeedOrderHook) {
+    if let Ok(mut hooks) = SEED_ORDER_HOOK.lock() {
+        hooks
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(profile.to_string(), f);
+    }
+}
+
+#[cfg(test)]
+fn run_seed_order_hook(profile: &str) {
+    let hook = SEED_ORDER_HOOK
+        .lock()
+        .ok()
+        .and_then(|mut hooks| hooks.as_mut().and_then(|hooks| hooks.remove(profile)));
+    if let Some(f) = hook {
+        f(profile);
+    }
+}
+
 /// `models` rides along the same way [`create_profile_from_login`]'s does: the
 /// Setup `+ new` form's model block. Every capture-from-a-name-prompt caller
 /// passes an empty one.
@@ -2312,6 +2407,7 @@ pub(crate) fn capture_into_profile(
         base_url,
         api_key,
         anchor,
+        plan: seed_plan,
     } = snapshot;
     let name = ProfileName::from(name);
     let seed_name = name.clone();
@@ -2338,6 +2434,28 @@ pub(crate) fn capture_into_profile(
             ..ForgetPlan::default()
         };
         forget_disk_plan(&name, plan);
+        // The seed lands after the forget and before the identity writes: a
+        // reloading process re-seeds from disk and finds it, and this process's
+        // `forget_memory` re-seed picks it up once the hold drops. Only when the
+        // forget plan dropped the OAuth half — a proven same-account re-login
+        // forgets nothing, so it must keep the account's live windows instead of
+        // replacing them with a plan-only body.
+        let mut seed_guard = SeedCleanupGuard::new();
+        if plan.oauth
+            && let Some(seed) = seed_plan
+        {
+            crate::usage::seed_plan_cache(
+                &name,
+                seed,
+                match &anchor {
+                    AnchorAction::Proven(uuid) => Some(uuid),
+                    _ => None,
+                },
+            );
+            seed_guard.arm(&name);
+        }
+        #[cfg(test)]
+        run_seed_order_hook(name.as_str());
 
         let mut profile = Profile::new(name.to_string(), base_url, api_key);
         profile.models = trimmed_models(models);
@@ -2393,6 +2511,9 @@ pub(crate) fn capture_into_profile(
         if let AnchorAction::Proven(uuid) = &anchor {
             crate::usage::seed_login_anchor(&seed_name, Some(uuid));
         }
+        if saved.is_ok() {
+            seed_guard.release();
+        }
         saved
     })?;
     Ok(())
@@ -2409,6 +2530,7 @@ pub(crate) fn create_profile_from_login(
     models: ModelSettings,
     credentials: ClaudeCredentials,
     account_uuid: Option<AccountId>,
+    seed_plan: Option<PlanInfo>,
 ) -> Result<()> {
     let name = ProfileName::from(name);
     let seed_name = name.clone();
@@ -2423,6 +2545,18 @@ pub(crate) fn create_profile_from_login(
             ..ForgetPlan::default()
         };
         forget_disk_plan(&name, plan);
+        // After the forget and before the identity writes, like every install;
+        // only when the forget plan dropped the OAuth half (a same-account
+        // re-login forgets nothing and keeps its live windows).
+        let mut seed_guard = SeedCleanupGuard::new();
+        if plan.oauth
+            && let Some(seed) = seed_plan
+        {
+            crate::usage::seed_plan_cache(&name, seed, account_uuid.as_ref());
+            seed_guard.arm(&name);
+        }
+        #[cfg(test)]
+        run_seed_order_hook(name.as_str());
 
         let mut profile = Profile::new(name.to_string(), None, None);
         profile.models = trimmed_models(models);
@@ -2464,6 +2598,9 @@ pub(crate) fn create_profile_from_login(
         // The draft parked the login's uuid until `create account` fixed the
         // name.
         crate::usage::seed_login_anchor(&seed_name, account_uuid.as_ref());
+        if saved.is_ok() {
+            seed_guard.release();
+        }
         saved
     })?;
     Ok(())
@@ -2544,6 +2681,7 @@ pub(crate) fn overwrite_captured_profile(
         base_url,
         api_key,
         anchor,
+        plan: seed_plan,
     } = snapshot;
     // An api re-key carries the stored OAuth chain unchanged, so it is not a
     // login install: the anchor stays exactly as found. Every other overwrite
@@ -2619,6 +2757,25 @@ pub(crate) fn overwrite_captured_profile(
         );
         oauth_moved = plan.oauth;
         forget_disk_plan(name, plan);
+        // After the forget and before the identity writes, like every install;
+        // only when the forget plan dropped the OAuth half (a same-account
+        // re-login forgets nothing and keeps its live windows).
+        let mut seed_guard = SeedCleanupGuard::new();
+        if plan.oauth
+            && let Some(seed) = seed_plan
+        {
+            crate::usage::seed_plan_cache(
+                name,
+                seed,
+                match &anchor {
+                    AnchorAction::Proven(uuid) => Some(uuid),
+                    _ => None,
+                },
+            );
+            seed_guard.arm(name);
+        }
+        #[cfg(test)]
+        run_seed_order_hook(name.as_str());
         // A proven re-login onto the SAME uuid keeps the old anchor in place
         // through the store write: seed_login_anchor's atomic replace at the
         // end of the hold means a compare reads anchored -> anchored, never a
@@ -2709,6 +2866,9 @@ pub(crate) fn overwrite_captured_profile(
         let saved = save_app_state(&config.state);
         if let AnchorAction::Proven(uuid) = &anchor {
             crate::usage::seed_login_anchor(name, Some(uuid));
+        }
+        if saved.is_ok() {
+            seed_guard.release();
         }
         saved
     })?;

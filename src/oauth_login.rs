@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 
 use crate::logline::logline;
 use crate::profile::{AccountId, ClaudeCredentials, OAuthToken};
-use crate::usage::now_ms;
+use crate::usage::{PlanInfo, now_ms};
 
 /// Claude Code's authorize endpoint for a Pro/Max **subscription** login
 /// (`CLAUDE_AI_AUTHORIZE_URL` in v2.1.199). The `platform.claude.com/oauth/authorize`
@@ -560,11 +560,14 @@ fn credentials_from_token(token: crate::oauth::TokenResponse) -> ClaudeCredentia
 /// A completed interactive login: the minted credentials plus the account uuid
 /// the verification probe saw them authenticate as. `account_uuid` is `None` when
 /// the probe failed or the body carried no usable uuid — the login still stands,
-/// and the anchor is simply left to the hourly ride-along backfill.
+/// and the anchor is simply left to the hourly ride-along backfill. `plan` is the
+/// probe body's own plan (`None` when the probe failed), the seed a commit writes
+/// into `usage_cache.json` so the tier shows at once.
 #[derive(Debug, Clone)]
 pub(crate) struct LoginOutcome {
     pub(crate) credentials: ClaudeCredentials,
     pub(crate) account_uuid: Option<AccountId>,
+    pub(crate) plan: Option<PlanInfo>,
 }
 
 /// Why a `clauth login` produced no credential.
@@ -671,6 +674,7 @@ fn finish_login(
     // — clauth's usage poll re-derives the tier within a cycle and the anchor
     // backfills on the hourly ride-along.
     let mut account_uuid = None;
+    let mut plan = None;
     if let Some(oauth) = creds.claude_ai_oauth.as_mut()
         && let Ok(probe) = crate::usage::probe_login_profile(&oauth.access_token)
     {
@@ -679,10 +683,12 @@ fn finish_login(
             oauth.set_rate_limit_tier(tier);
         }
         account_uuid = probe.account_uuid;
+        plan = Some(probe.plan);
     }
     Ok(LoginOutcome {
         credentials: creds,
         account_uuid,
+        plan,
     })
 }
 
