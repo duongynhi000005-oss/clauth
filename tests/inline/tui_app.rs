@@ -20390,6 +20390,9 @@ fn login_event_maps_each_worker_milestone_to_its_stage() {
         match login_event(progress) {
             LoginEvent::Stage(got) => assert_eq!(got, stage, "{progress:?}"),
             LoginEvent::Url(url) => panic!("{progress:?}: a milestone is never a url ({url})"),
+            LoginEvent::ShuntCommitted(_, _) => {
+                panic!("{progress:?}: a milestone is never the shunt commit point")
+            }
         }
     }
 }
@@ -20549,6 +20552,7 @@ fn config_rows_on_the_new_form_carry_one_login_row() {
     assert_eq!(
         rows,
         [
+            ConfigRow::Type,
             ConfigRow::Name,
             ConfigRow::BaseUrl,
             ConfigRow::Model,
@@ -20564,6 +20568,7 @@ fn config_rows_on_the_new_form_carry_one_login_row() {
     assert_eq!(
         rows,
         [
+            ConfigRow::Type,
             ConfigRow::Name,
             ConfigRow::BaseUrl,
             ConfigRow::Model,
@@ -32578,7 +32583,8 @@ fn the_mint_seeded_key_row_ignores_editing() {
     adopt_token_record(&home, TOKEN_CONFIG, "");
     let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
     open_minted_form(&mut app);
-    // Navigate: Name (0) → BaseUrl (1) → ApiKey (2).
+    // Navigate: Type (0) → Name (1) → BaseUrl (2) → ApiKey (3).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     let rows = super::config_rows(&app);
@@ -33421,7 +33427,8 @@ fn the_armed_key_row_footer_omits_the_edit_hint() {
     adopt_token_record(&home, TOKEN_CONFIG, "");
     let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
     open_minted_form(&mut app);
-    // Focus the api key row: Name (0) → BaseUrl (1) → ApiKey (2).
+    // Focus the api key row: Type (0) → Name (1) → BaseUrl (2) → ApiKey (3).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     let footer = footer_row(&app, 120, 40);
@@ -33443,7 +33450,8 @@ fn the_armed_key_row_tooltip_reads_minted_by_equality() {
     adopt_token_record(&home, TOKEN_CONFIG, "");
     let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
     open_minted_form(&mut app);
-    // Focus the api key row: Name (0) → BaseUrl (1) → ApiKey (2).
+    // Focus the api key row: Type (0) → Name (1) → BaseUrl (2) → ApiKey (3).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
@@ -36540,6 +36548,7 @@ fn a_jump_keeps_the_new_account_form() {
     )]);
     super::handle_key(&mut app, key(KeyCode::Char('n')));
     assert_eq!(app.tab, Tab::Setup, "precondition: n opens the form");
+    super::handle_key(&mut app, key(KeyCode::Down)); // off the `type` row
     super::handle_key(&mut app, key(KeyCode::Enter));
     assert!(
         app.config_draft
@@ -37032,6 +37041,7 @@ fn a_suspended_new_form_survives_descending_into_another_account() {
         &crate::profile::ProfileName::from("a"),
     )]);
     super::handle_key(&mut app, key(KeyCode::Char('n')));
+    super::handle_key(&mut app, key(KeyCode::Down)); // off the `type` row
     super::handle_key(&mut app, key(KeyCode::Enter));
     for c in "zed".chars() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
@@ -37075,6 +37085,7 @@ fn n_restores_the_suspended_new_form_with_an_open_field() {
     )]);
     super::handle_key(&mut app, key(KeyCode::Char('n')));
     assert_eq!(app.tab, Tab::Setup, "precondition: n opened the form");
+    super::handle_key(&mut app, key(KeyCode::Down)); // off the `type` row
     super::handle_key(&mut app, key(KeyCode::Enter));
     for c in "zed".chars() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
@@ -37412,6 +37423,7 @@ fn the_shunt_jump_keeps_the_new_form() {
         &crate::profile::ProfileName::from("a"),
     )]);
     super::handle_key(&mut app, key(KeyCode::Char('n')));
+    super::handle_key(&mut app, key(KeyCode::Down)); // off the `type` row
     super::handle_key(&mut app, key(KeyCode::Enter));
     for c in "zed".chars() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
@@ -38194,6 +38206,7 @@ fn a_preset_stamped_new_form_then_n_then_a_jump_keeps_the_typed_form() {
         &crate::profile::ProfileName::from("a"),
     )]);
     super::handle_key(&mut app, key(KeyCode::Char('n')));
+    super::handle_key(&mut app, key(KeyCode::Down)); // off the `type` row
     super::handle_key(&mut app, key(KeyCode::Enter));
     for c in "zed".chars() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
@@ -38399,6 +38412,7 @@ fn a_preset_on_the_new_row_lands_descended_on_the_stamped_form() {
         &crate::profile::ProfileName::from("a"),
     )]);
     super::handle_key(&mut app, key(KeyCode::Char('n')));
+    super::handle_key(&mut app, key(KeyCode::Down)); // off the `type` row
     super::handle_key(&mut app, key(KeyCode::Enter));
     for c in "zed".chars() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
@@ -38540,6 +38554,7 @@ fn no_slot_write_drops_a_typed_value_across_the_switch_sequences() {
 
     seed(app);
     super::handle_key(app, key(KeyCode::Enter));
+    super::handle_key(app, key(KeyCode::Down)); // off the `type` row
     super::handle_key(app, key(KeyCode::Enter));
     super::handle_key(app, alt_digit('8'));
     super::open_new_profile_form(app, false);
@@ -38590,11 +38605,9 @@ fn no_slot_write_drops_a_typed_value_across_the_switch_sequences() {
         app.config_action_cursor, 0,
         "the stamp did not land on the first row"
     );
-    // `↑` from row 0 wraps to `create account` and commits, so step down one
-    // row first and back up onto the name field: a text row that opens an
-    // editor, never commits.
+    // The `type` row is 0; the name field is row 1. Step down onto it and open
+    // the editor (a text row, never commits).
     super::handle_key(app, key(KeyCode::Down));
-    super::handle_key(app, key(KeyCode::Up));
     super::handle_key(app, key(KeyCode::Enter));
     assert!(
         holds_unstamped(&app.config_draft),
@@ -38621,6 +38634,9 @@ fn a_preset_apply_early_return_clears_the_picker_flag() {
 
     // Suspend a typed `+ new` form (name + base url), then open the picker.
     super::handle_key(&mut app, key(KeyCode::Char('n')));
+    // ⏎ on the first row (the `type` cycle) now cycles it; step down onto the
+    // name row first so the name typed below lands in the name field.
+    super::handle_key(&mut app, key(KeyCode::Down));
     super::handle_key(&mut app, key(KeyCode::Enter));
     for c in "zed".chars() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
@@ -39270,6 +39286,10 @@ fn codex_relogin_starts_the_browser_login_with_a_pasteless_modal() {
         Some("cdx-one"),
         "the login is for the selected account"
     );
+    // `r`/`c` render only once the worker announced the URL (fold S1): before
+    // that the modal reads `opening your browser…`.
+    app.codex_login.as_mut().expect("the session").url =
+        Some("https://auth.openai.com/oauth/authorize".to_string());
     let rows = render_rows(&app);
     assert!(
         b3_row_holds(&rows, &["r", "open", "the", "browser", "again"]),
@@ -39893,6 +39913,7 @@ fn codex_login_copies_the_announced_authorize_link() {
         generation: 1,
         url: None,
         cancel: crate::codex_login::LoginCancel::new(),
+        is_new: false,
     });
     super::open_codex_login_modal(&mut app);
     app.codex_login_url_tx.send((1, url.clone())).unwrap();
@@ -40677,4 +40698,2690 @@ fn fallback_credit_gate_toggle_persists() {
     let reloaded = crate::profile::load_profile(&crate::profile::ProfileName::from("a"))
         .expect("reload profile");
     assert!(!reloaded.check_credit_cap, "the off state is on disk");
+}
+
+// ── B3 commit 2: the typed `+ new` form ──────────────────────────────────────
+//
+// Design record "Overview shunt section, pool-account actions", first two
+// bullets: the form's first row is a `type` cycle (`claude` / `codex` /
+// `shunt`), `n` presets it from the Overview cursor's section, each type
+// shows its own rows.
+
+/// The Overview with its cursor moved `downs` rows from the top, then `n`.
+fn b3_new_from_overview(app: &mut App, downs: usize) {
+    super::switch_tab(app, Tab::Overview);
+    b3_press(app, KeyCode::Down, downs);
+    super::handle_key(app, crate::testutil::key(KeyCode::Char('n')));
+}
+
+#[test]
+fn n_presets_the_type_from_the_overview_cursors_section() {
+    let home = crate::testutil::HomeSandbox::new();
+    for (downs, picked, why) in [
+        (0, "[claude]", "a claude row"),
+        (2, "[codex]", "the codex row"),
+        (3, "[shunt]", "a pool row"),
+    ] {
+        let mut app = b3_setup_app(&home, b3_claude_pool());
+        b3_new_from_overview(&mut app, downs);
+        assert_eq!(app.tab, Tab::Setup, "{why}: `n` opens Setup's form");
+        let rows = render_rows(&app);
+        assert!(
+            b3_row_holds(&rows, &["type"]) && rows.iter().any(|r| r.contains(picked)),
+            "{why}: the form opens on the type row with {picked} picked: {rows:#?}"
+        );
+    }
+}
+
+#[test]
+fn n_off_the_overview_opens_a_claude_form() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    // the Overview last rested on the codex row: an `n` that read the
+    // Overview's section off the Overview would open a codex form
+    super::switch_tab(&mut app, Tab::Overview);
+    b3_press(&mut app, KeyCode::Down, 2);
+    assert_eq!(
+        app.current_main_item(),
+        Some(super::MainItemKind::Codex(0)),
+        "fixture control: the Overview cursor rests on the codex row"
+    );
+    super::switch_tab(&mut app, Tab::Tokens);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert_eq!(app.tab, Tab::Setup);
+    let rows = render_rows(&app);
+    assert!(rows.iter().any(|r| r.contains("[claude]")), "{rows:#?}");
+}
+
+#[test]
+fn the_codex_form_shows_name_login_and_create_only() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 2);
+    let rows = render_rows(&app);
+    for needle in ["name", "+ login", "create account"] {
+        assert!(
+            rows.iter().any(|r| r.contains(needle)),
+            "{needle}: {rows:#?}"
+        );
+    }
+    for absent in ["base url", "model", "+ capture current login"] {
+        assert!(
+            !rows.iter().any(|r| r.contains(absent)),
+            "{absent} is no codex form row (no codex CLI login here): {rows:#?}"
+        );
+    }
+}
+
+#[test]
+fn the_codex_form_offers_capture_while_the_codex_cli_login_is_uncaptured() {
+    let home = crate::testutil::HomeSandbox::new();
+    let codex_home = home.home().join("operator-codex");
+    crate::profile::mkdir_700(&codex_home).expect("mkdir codex home");
+    std::fs::write(
+        codex_home.join("auth.json"),
+        crate::testutil::codex_auth_body("acc.op", "refresh.op"),
+    )
+    .expect("write the operator's codex login");
+    let _codex = crate::testutil::CodexHomeSandbox::new(&home, &codex_home);
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 2);
+    let rows = render_rows(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("+ capture current login")),
+        "{rows:#?}"
+    );
+}
+
+#[test]
+fn the_shunt_form_shows_family_name_and_login_with_no_create_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 3);
+    let rows = render_rows(&app);
+    assert!(b3_row_holds(&rows, &["family"]), "{rows:#?}");
+    assert!(b3_row_holds(&rows, &["name"]), "{rows:#?}");
+    assert!(rows.iter().any(|r| r.contains("+ login")), "{rows:#?}");
+    assert!(
+        !rows.iter().any(|r| r.contains("create account")),
+        "the shunt `+ login` is the create: {rows:#?}"
+    );
+    assert!(!rows.iter().any(|r| r.contains("base url")), "{rows:#?}");
+}
+
+/// With no running gateway the shunt `+ login` is disabled: a `└` reason
+/// under it, and ⏎ starts nothing.
+#[test]
+fn the_shunt_login_is_disabled_with_its_reason_while_no_gateway_runs() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 3);
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    let rows = render_rows(&app);
+    let at = rows
+        .iter()
+        .position(|r| b3_row_holds(std::slice::from_ref(r), &["❯", "+", "login"]))
+        .expect("the focused + login row");
+    assert!(
+        rows.get(at + 1)
+            .is_some_and(|r| r.contains("└") && r.contains("gateway")),
+        "the reason sits on the `└` line under it: {rows:#?}"
+    );
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(app.login.is_none(), "a disabled + login starts no login");
+    assert!(app.modals.is_empty(), "and opens nothing");
+}
+
+/// Cycling `type` keeps the typed name.
+#[test]
+fn cycling_the_type_keeps_the_name() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 0);
+    b3_focus_detail_row(&mut app, &["name"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    for c in "keep-me".chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["type"]);
+    b3_press(&mut app, KeyCode::Char(' '), 1);
+    let rows = render_rows(&app);
+    assert!(rows.iter().any(|r| r.contains("[codex]")), "{rows:#?}");
+    assert!(b3_row_holds(&rows, &["name", "keep-me"]), "{rows:#?}");
+}
+
+/// Cycling `type` away from a staged login asks first and changes nothing
+/// until answered.
+#[test]
+fn cycling_the_type_over_a_staged_login_asks_first() {
+    use super::DraftLogin;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 0);
+    app.config_draft
+        .as_mut()
+        .expect("the form is open")
+        .captured_login = Some(DraftLogin::Mint(Box::new(login_outcome(
+        "minted",
+        Some("uuid-minted"),
+    ))));
+    b3_focus_detail_row(&mut app, &["type"]);
+    b3_press(&mut app, KeyCode::Char(' '), 1);
+    assert!(
+        !app.modals.is_empty(),
+        "a confirm asks before the login drops"
+    );
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.captured_login.is_some()),
+        "the staged login stays until the confirm is answered"
+    );
+    let rows = render_rows(&app);
+    assert!(rows.iter().any(|r| r.contains("[claude]")), "{rows:#?}");
+}
+
+/// A name outside `[a-z0-9-]` on the shunt form refuses on the name row's
+/// `└` line.
+#[test]
+fn a_shunt_name_outside_the_grammar_refuses_on_its_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 3);
+    b3_focus_detail_row(&mut app, &["name"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    for c in "Bad_Name".chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    b3_press(&mut app, KeyCode::Enter, 1);
+    let rows = render_rows(&app);
+    let at = rows
+        .iter()
+        .position(|r| b3_row_holds(std::slice::from_ref(r), &["name", "Bad_Name"]))
+        .expect("the name row");
+    assert!(
+        rows.get(at + 1).is_some_and(|r| r.contains("└")),
+        "the refusal sits on the name row's `└` line: {rows:#?}"
+    );
+}
+
+// ── B3 commit 2: the implementer's own pins ─────────────────────────────────
+
+/// The codex `+ login` stages the minted chain (worker seam; no real port, no
+/// browser), and `create account` lands it under the typed name.
+#[test]
+fn codex_create_stages_and_lands_the_minted_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.codex_login_worker = |_announce, _cancel| {
+        Ok(crate::codex_login::CodexLoginOutcome {
+            auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+            account_id: Some("acc".to_string()),
+        })
+    };
+    b3_new_from_overview(&mut app, 2); // the codex row → codex form
+    b3_focus_detail_row(&mut app, &["name"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    for c in "cdx-new".chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| matches!(d.captured_login, Some(super::DraftLogin::CodexMint(_)))),
+        "the minted chain is staged, not landed"
+    );
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("cdx-new"))
+        .expect("profile dir")
+        .join("auth.json");
+    assert!(!store.exists(), "nothing landed before create account");
+    b3_focus_detail_row(&mut app, &["create", "account"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        crate::testutil::read_codex_store("cdx-new").contains("refresh.new"),
+        "create account lands the chain under the new name"
+    );
+    assert!(
+        app.setup_item.as_ref().is_some_and(|item| matches!(
+            item,
+            super::SetupItem::Codex(name) if name.as_str() == "cdx-new"
+        )),
+        "Setup lands on the new codex row"
+    );
+}
+
+/// `n` from Setup and from Tokens opens the form on claude (no Overview
+/// section to preset).
+#[test]
+fn n_from_setup_and_tokens_opens_a_claude_form() {
+    let home = crate::testutil::HomeSandbox::new();
+    for tab in [Tab::Setup, Tab::Tokens] {
+        let mut app = b3_setup_app(&home, b3_claude_pool());
+        super::switch_tab(&mut app, tab);
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+        assert_eq!(app.tab, Tab::Setup, "{tab:?}: n opens Setup");
+        let rows = render_rows(&app);
+        assert!(
+            rows.iter().any(|r| r.contains("[claude]")),
+            "{tab:?}: the form opens on claude: {rows:#?}"
+        );
+    }
+}
+
+/// The shunt `+ login` disabled reason's first two rungs: no adopted gateway,
+/// then a gateway that is not running.
+#[test]
+fn the_shunt_add_disabled_reason_starts_at_adopted_then_running() {
+    let home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        super::shunt_add_disabled_reason(),
+        Some("no shunt gateway is adopted".to_string())
+    );
+    crate::testutil::write_adopted_record(&home, false, "[server]\nbind = \"127.0.0.1:9\"\n");
+    assert_eq!(
+        super::shunt_add_disabled_reason(),
+        Some("the shunt gateway is not running".to_string())
+    );
+}
+
+/// Pose a healthy gateway for the disabled-reason rungs past "not running":
+/// hold the daemon lock and write a fresh `status.json` naming a healthy slot.
+/// The returned lock file keeps `daemon_health` reading `Fresh` for the test's
+/// life.
+fn pose_healthy_gateway(home: &crate::testutil::HomeSandbox) -> std::fs::File {
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("clauthd.lock"))
+        .expect("open the daemon lock");
+    lock.lock().expect("hold the daemon lock");
+    let secs = (crate::usage::now_ms() / 1000) as i64;
+    let body = serde_json::json!({
+        "generated_at": crate::usage::epoch_secs_to_iso(secs),
+        "gateway": { "state": "healthy", "floor": "0.48.0", "restarts": 0 }
+    });
+    std::fs::write(dir.join("status.json"), body.to_string()).expect("write status.json");
+    lock
+}
+
+/// Every shunt `+ login` disabled reason, by equality, in the lead's rung
+/// order: adopted, running, config read, admin key, admin token.
+#[test]
+fn every_shunt_add_disabled_reason_by_equality() {
+    let home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        super::shunt_add_disabled_reason(),
+        Some("no shunt gateway is adopted".to_string())
+    );
+
+    crate::testutil::write_adopted_record(&home, false, "[server]\nbind = \"127.0.0.1:9\"\n");
+    assert_eq!(
+        super::shunt_add_disabled_reason(),
+        Some("the shunt gateway is not running".to_string())
+    );
+
+    // Healthy gateway, but the config is unreadable: the read error's own rung.
+    let _lock = pose_healthy_gateway(&home);
+    crate::testutil::write_adopted_record(&home, false, "[server\n");
+    let reason = super::shunt_add_disabled_reason().expect("a config read error disables");
+    assert!(
+        reason.starts_with("the shunt config could not be read:"),
+        "the read error is its own reason: {reason:?}"
+    );
+
+    // Healthy gateway, readable config, but no clauth admin entry.
+    crate::testutil::write_adopted_record(&home, false, "[server]\nbind = \"127.0.0.1:9\"\n");
+    assert_eq!(
+        super::shunt_add_disabled_reason(),
+        Some("the shunt config has no clauth admin key".to_string())
+    );
+
+    // Healthy gateway, clauth admin entry present, but the token file is absent.
+    let key_ref = format!(
+        "${{file:{}}}",
+        crate::gateway::admin_token_path()
+            .expect("token path")
+            .display()
+    );
+    crate::testutil::write_adopted_record(
+        &home,
+        false,
+        &format!(
+            "[server]\nbind = \"127.0.0.1:9\"\n\n[server.admin]\n[[server.admin.write_keys]]\nid = \"clauth\"\nkey = \"{key_ref}\"\n"
+        ),
+    );
+    assert_eq!(
+        super::shunt_add_disabled_reason(),
+        Some("no gateway admin token".to_string())
+    );
+}
+
+/// The whole codex and shunt forms' row lists, pinned exactly — the frame-wide
+/// `.contains` of the protected tests cannot tell a stray row from a real one.
+#[test]
+fn the_codex_and_shunt_forms_list_exactly_their_rows() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 2); // codex
+    assert_eq!(
+        super::config_rows(&app),
+        vec![
+            super::ConfigRow::Type,
+            super::ConfigRow::Name,
+            super::ConfigRow::Login,
+            super::ConfigRow::Create,
+        ],
+        "the codex form's rows, exactly"
+    );
+
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 3); // shunt
+    assert_eq!(
+        super::config_rows(&app),
+        vec![
+            super::ConfigRow::Type,
+            super::ConfigRow::Family,
+            super::ConfigRow::Name,
+            super::ConfigRow::Login,
+        ],
+        "the shunt form's rows, exactly"
+    );
+}
+
+/// The codex login modal shows `opening your browser…` before the worker
+/// announces the URL — the fold S1 shape the plant p4 would have broken.
+#[test]
+fn the_codex_login_modal_shows_opening_before_the_url() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.codex_login = Some(super::CodexLoginSession {
+        name: "cdx-new".to_string(),
+        generation: 1,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: true,
+    });
+    super::open_codex_login_modal(&mut app);
+    let rows = render_rows(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("opening your browser")),
+        "the before-URL line shows: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("copy link")),
+        "no `c` hint before the URL: {rows:#?}"
+    );
+}
+
+/// A cancel before the codex login's landing stores nothing: the worker's own
+/// cancel check drops the minted chain unwritten.
+#[test]
+fn a_cancelled_codex_login_lands_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.codex_login_worker = |_announce, _cancel| {
+        Ok(crate::codex_login::CodexLoginOutcome {
+            auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+            account_id: Some("acc".to_string()),
+        })
+    };
+    b3_new_from_overview(&mut app, 2); // codex form
+    b3_focus_detail_row(&mut app, &["name"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    for c in "cdx-new".chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    // Collapse the modal, then cancel the login before it lands.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('q')));
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("cdx-new"))
+        .expect("profile dir")
+        .join("auth.json");
+    assert!(!store.exists(), "a cancelled login stores nothing");
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.captured_login.is_none()),
+        "and stages nothing"
+    );
+}
+
+/// The shunt add end to end against a loopback stub: the paste relays verbatim
+/// to the complete, the row lands on its own family, and no paste/token byte
+/// reaches the sandbox `~/.clauth` outside the token file or a `logline` line
+/// raised on the UI thread OR the add's worker thread.
+#[test]
+fn the_shunt_add_sends_the_paste_verbatim_and_lands_the_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    // Edge whitespace and an inner `#`: a relay that trims or parses the paste
+    // reds this pin.
+    const PASTE: &str = " code with # space ";
+    const TOKEN: &str = "test-admin-token-0123456789abcdef0123456789abcdef";
+    let logs = crate::logline::LogLines::new();
+    let capture = logs.capture_here();
+
+    // Budget one above the happy path (add + complete): a third request the
+    // pin says never happens must be observable, or the pin asserts nothing.
+    let (base, seen) = crate::testutil::serve_endpoints_raw(3, |path, _| {
+        if path.ends_with("/complete") {
+            (200, r#"{"live":true}"#.to_string())
+        } else {
+            (
+                200,
+                r#"{"name":"newpool","authorize_url":"http://example/authorize"}"#.to_string(),
+            )
+        }
+    });
+    let addr: std::net::SocketAddr = base.trim_start_matches("http://").parse().expect("addr");
+
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.shunt_add_disabled = None;
+    app.open_url_worker = |_url| Ok(());
+    // The add's worker installs this capture inside itself, so the leak check
+    // below also sees what the worker thread raised (a capture installed on
+    // the test thread alone sees nothing the worker writes).
+    app.log_capture = Some(logs.clone());
+    // Adopt the loopback-bound record and write the admin token AFTER
+    // `b3_setup_app` (which adopts its own 127.0.0.1:9 record), so the add's
+    // defensive record load finds the stub.
+    crate::testutil::write_adopted_record(&home, false, &format!("[server]\nbind = \"{addr}\"\n"));
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("gateway-admin-token"), TOKEN).expect("write the admin token");
+
+    b3_new_from_overview(&mut app, 3); // shunt form
+    b3_focus_detail_row(&mut app, &["name"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    for c in "newpool".chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+
+    // The worker announces its URL (the paste door is open); wait on it.
+    for _ in 0..400 {
+        super::on_tick(&mut app);
+        if app.login.as_ref().is_some_and(|s| s.url.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        app.login.as_ref().is_some_and(|s| s.url.is_some()),
+        "the add announced its URL"
+    );
+
+    // Paste through the TUI's own field: `p`, type the code, ⏎.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('p')));
+    for c in PASTE.chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    drop(capture);
+
+    let raw = seen.join().expect("listener");
+    assert_eq!(raw.len(), 2, "one add and one complete, got {raw:?}");
+    assert_eq!(
+        crate::testutil::request_path(&raw[0]),
+        "/admin/api/accounts/claude",
+        "the claude add goes to the claude route"
+    );
+    assert_eq!(
+        crate::testutil::request_body(&raw[0]),
+        r#"{"name":"newpool","mode":"oauth"}"#,
+        "the claude add sends mode oauth"
+    );
+    assert_eq!(
+        crate::testutil::request_path(&raw[1]),
+        "/admin/api/accounts/claude/newpool/complete"
+    );
+    assert_eq!(
+        crate::testutil::request_body(&raw[1]),
+        format!(r#"{{"code":"{PASTE}"}}"#),
+        "the pasted code relays byte for byte"
+    );
+
+    // The pending landing carries (family, name), and lands on the claude
+    // family's row — never a same-named codex row.
+    assert_eq!(
+        app.pending_pool_landing,
+        Some((
+            crate::gateway_admin::PoolFamily::Claude,
+            "newpool".to_string()
+        ))
+    );
+    app.shunt_pool = super::ShuntPool::Read(vec![
+        crate::gateway_admin::PoolProvider {
+            name: "codex-main".to_string(),
+            auth: crate::gateway_admin::PoolAuth::Codex,
+            accounts: vec![b3_pool_account("newpool")],
+        },
+        crate::gateway_admin::PoolProvider {
+            name: "claude-main".to_string(),
+            auth: crate::gateway_admin::PoolAuth::Claude,
+            accounts: vec![b3_pool_account("newpool")],
+        },
+    ]);
+    super::land_pending_pool_add(&mut app);
+    assert_eq!(
+        app.setup_item,
+        Some(super::SetupItem::Pool {
+            provider: "claude-main".to_string(),
+            account: "newpool".to_string(),
+        }),
+        "the landing picks the claude family's row, never the codex one"
+    );
+
+    // No paste or token byte in the sandbox `.clauth` (the token file excepted)
+    // nor in any logline the UI thread raised.
+    for line in logs.snapshot() {
+        assert!(
+            !line.contains(PASTE) && !line.contains(TOKEN),
+            "no logline carries the paste or the token: {line:?}"
+        );
+    }
+    let mut files = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    walk(&clauth, &mut files);
+    for file in files {
+        let Ok(bytes) = std::fs::read(&file) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains(PASTE), "the paste never reaches {file:?}");
+        if file.file_name().is_some_and(|n| n != "gateway-admin-token") {
+            assert!(
+                !text.contains(TOKEN),
+                "the token never leaves its file into {file:?}"
+            );
+        }
+    }
+}
+
+/// The codex capture create moves the operator's own login through the
+/// create-only capture codepath, and writes nothing to the terminal's stdout.
+#[cfg(unix)]
+#[test]
+fn the_codex_capture_create_moves_the_operator_login_and_writes_no_stdout() {
+    let home = crate::testutil::HomeSandbox::new();
+    let codex_home = home.home().join("operator-codex");
+    crate::profile::mkdir_700(&codex_home).expect("mkdir codex home");
+    std::fs::write(
+        codex_home.join("auth.json"),
+        crate::testutil::codex_auth_body("acc.op", "refresh.op"),
+    )
+    .expect("write the operator's codex login");
+    let _codex = crate::testutil::CodexHomeSandbox::new(&home, &codex_home);
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.refresh_form_predicates();
+    assert!(
+        app.codex_operator_capturable,
+        "the operator login is capturable"
+    );
+
+    b3_new_from_overview(&mut app, 2); // codex form
+    b3_focus_detail_row(&mut app, &["name"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    for c in "cdx-new".chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["+", "capture"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| matches!(d.captured_login, Some(super::DraftLogin::CodexCapture))),
+        "the capture marker is staged"
+    );
+
+    b3_focus_detail_row(&mut app, &["create", "account"]);
+    let stdout = crate::out::OutCapture::new();
+    let capture = stdout.capture_here();
+    b3_press(&mut app, KeyCode::Enter, 1);
+    drop(capture);
+    assert!(
+        crate::testutil::read_codex_store("cdx-new").contains("refresh.op"),
+        "create account moves the operator login into the new store"
+    );
+    assert!(
+        stdout.snapshot().is_empty(),
+        "the TUI capture create writes nothing to stdout: {:?}",
+        String::from_utf8_lossy(&stdout.snapshot())
+    );
+}
+
+/// Cycling the Services `+ new profile` form off claude disarms its client-token
+/// mint through the one `mint_armed` predicate.
+#[test]
+fn cycling_the_services_new_profile_form_disarms_the_mint() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![]);
+    open_minted_form(&mut app);
+    assert!(
+        app.config_draft.as_ref().is_some_and(|d| d.mint_armed()),
+        "the mint is armed while the form is claude"
+    );
+    b3_focus_detail_row(&mut app, &["type"]);
+    b3_press(&mut app, KeyCode::Char(' '), 1); // claude → codex
+    assert!(
+        app.config_draft.as_ref().is_some_and(|d| !d.mint_armed()),
+        "cycling off claude disarms the mint"
+    );
+}
+
+// ── B3 commit 2 round-3 pins ─────────────────────────────────────────────────
+
+/// Records whether a test's `open_url_worker` seam was reached. Reset at each
+/// test's start; the `HomeSandbox` (HOME_TEST_LOCK) serializes sandboxed tests,
+/// so the process-global is never handed across two of them.
+static OPEN_URL_CALLED: AtomicBool = AtomicBool::new(false);
+
+/// The toasts' bodies, newlines folded to ` / ` — the shape the pins compare.
+fn pin_toasts(app: &App) -> Vec<String> {
+    app.toasts
+        .iter()
+        .map(|t| t.body.replace('\n', " / "))
+        .collect()
+}
+
+/// A codex `+ login` worker that mints a fixed chain, never opening a browser.
+fn pin_codex_mint_worker(app: &mut App) {
+    app.codex_login_worker = |_announce, _cancel| {
+        Ok(crate::codex_login::CodexLoginOutcome {
+            auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+            account_id: Some("acc".to_string()),
+        })
+    };
+}
+
+/// Open the codex form and type `name`.
+fn pin_codex_form(app: &mut App, name: &str) {
+    b3_new_from_overview(app, 2);
+    b3_focus_detail_row(app, &["name"]);
+    b3_press(app, KeyCode::Enter, 1);
+    for c in name.chars() {
+        super::handle_key(app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    b3_press(app, KeyCode::Enter, 1);
+}
+
+/// Open the shunt form and type `name`.
+fn pin_shunt_form(app: &mut App, name: &str) {
+    b3_new_from_overview(app, 3);
+    b3_focus_detail_row(app, &["name"]);
+    b3_press(app, KeyCode::Enter, 1);
+    for c in name.chars() {
+        super::handle_key(app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    b3_press(app, KeyCode::Enter, 1);
+}
+
+/// Pose a shunt add in flight at `generation`: the login session, its raw paste
+/// door (uncommitted) and the guard marker, all for `newpool` on claude.
+fn pin_shunt_add_in_flight(app: &mut App, generation: u64) {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let name = crate::gateway_admin::ShuntAccountName::new("newpool").unwrap();
+    app.login = Some(super::LoginSession {
+        name: "newpool".into(),
+        is_new: true,
+        generation,
+        url: Some("http://example/authorize".into()),
+        stage: super::LoginStage::WaitingBrowser,
+        method: super::LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
+    });
+    app.login_generation = generation;
+    app.shunt_paste = Some(super::ShuntPasteDoor {
+        tx,
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        sent: false,
+        family: crate::gateway_admin::PoolFamily::Claude,
+        name: name.clone(),
+    });
+    app.pool_mutation_row = Some((crate::gateway_admin::PoolFamily::Claude, name));
+}
+
+/// Send the commit-point event for `generation` and drain it. The commit point
+/// is the paste going down the door, so the door's `sent` flips too.
+fn pin_mark_committed(app: &mut App, generation: u64) {
+    if let Some(door) = app.shunt_paste.as_mut() {
+        door.sent = true;
+    }
+    app.login_event_tx
+        .send((
+            generation,
+            super::LoginEvent::ShuntCommitted(
+                crate::gateway_admin::PoolFamily::Claude,
+                crate::gateway_admin::ShuntAccountName::new("newpool").unwrap(),
+            ),
+        ))
+        .unwrap();
+    super::on_tick(app);
+}
+
+/// Confirm the open type-cycle confirm through the real dispatch (the same
+/// `run_confirm_action` the modal's ⏎ reaches).
+fn pin_confirm_type_cycle(app: &mut App) {
+    let action = app
+        .modals
+        .iter()
+        .find_map(|m| match m {
+            super::Modal::Confirm(c) => Some(c.on_confirm.clone()),
+            _ => None,
+        })
+        .expect("the type-cycle confirm is open");
+    app.modals.clear();
+    match action {
+        super::ConfirmAction::CycleAccountType(next) => {
+            super::run_confirm_action(app, super::ConfirmAction::CycleAccountType(next));
+        }
+        other => panic!("expected the type-cycle confirm, got {other:?}"),
+    }
+}
+
+/// Cancel an in-flight login the way the real keyboard does: the first esc
+/// collapses the open login modal (the modal owner swallows it), the second
+/// reaches the top-level cancel.
+fn pin_cancel_login(app: &mut App) {
+    super::handle_key(app, crate::testutil::key(KeyCode::Esc));
+    super::handle_key(app, crate::testutil::key(KeyCode::Esc));
+}
+
+/// N1: a post-commit cancel closes the modal and the login line but keeps the
+/// guard held, and the late result clears only its own marker.
+#[test]
+fn a_postcommit_cancel_holds_the_guard_and_the_late_result_clears_only_its_own_marker() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_add_in_flight(&mut app, 7);
+    pin_mark_committed(&mut app, 7);
+    assert!(
+        app.shunt_add_committed.is_some(),
+        "the commit point is tracked"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(app.login.is_none(), "the login line closed");
+    assert!(
+        app.pool_mutation_row.is_some(),
+        "the guard stays held past the commit point — a refresh/remove is refused while the complete runs"
+    );
+    // A foreign marker stands in for a pool action that set its own meanwhile;
+    // the late result must not wipe it.
+    let foreign = (
+        crate::gateway_admin::PoolFamily::Codex,
+        crate::gateway_admin::ShuntAccountName::new("other").unwrap(),
+    );
+    app.pool_mutation_row = Some(foreign.clone());
+    app.login_result_tx
+        .send((
+            7,
+            Ok(super::LoginResult::Shunt(Box::new(
+                super::ShuntLoginOutcome {
+                    name: "newpool".into(),
+                    family: crate::gateway_admin::PoolFamily::Claude,
+                },
+            ))),
+        ))
+        .unwrap();
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.pool_mutation_row,
+        Some(foreign),
+        "the late result cleared only its own marker, never the foreign one"
+    );
+    assert!(
+        app.shunt_add_committed.is_none(),
+        "the committed slot cleared"
+    );
+}
+
+/// N2: a committed failure after a post-commit cancel still toasts and
+/// re-reads — the one-add-at-a-time slot must not drop it.
+#[test]
+fn a_committed_failure_after_a_cancel_toasts() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_add_in_flight(&mut app, 7);
+    pin_mark_committed(&mut app, 7);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    app.toasts.clear();
+    app.login_result_tx
+        .send((7, Err("the gateway refused the code".to_string())))
+        .unwrap();
+    super::on_tick(&mut app);
+    assert!(
+        pin_toasts(&app)
+            .iter()
+            .any(|t| t.contains("the gateway refused the code")),
+        "the committed failure toasts after a cancel: {:?}",
+        pin_toasts(&app)
+    );
+    assert!(
+        app.pool_mutation_row.is_none(),
+        "the result released the guard"
+    );
+    assert!(
+        app.shunt_add_committed.is_none(),
+        "the committed slot cleared"
+    );
+}
+
+/// N3: ⏎ on `+ login` while this form's add is in flight reopens its modal
+/// (round 1's behaviour), ahead of the guard.
+#[test]
+fn enter_on_plus_login_reopens_the_modal_during_the_own_add() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    pin_shunt_add_in_flight(&mut app, 3);
+    app.shunt_add_disabled = None;
+    app.modals.clear(); // the esc that collapsed the paste door
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        app.modals.iter().any(|m| matches!(m, super::Modal::Login)),
+        "⏎ reopens the paste door during the own add: {:?}",
+        pin_toasts(&app)
+    );
+}
+
+/// R6-1: ⏎ on `+ login` while this form's add is in flight reopens its modal
+/// whatever the disabled reason reads now — a reason that flipped mid-add (the
+/// tick re-reads the status feed) gates only a NEW add.
+#[test]
+fn a_flipped_disabled_reason_still_reopens_the_own_add() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    app.shunt_add_disabled = None;
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    pin_shunt_add_in_flight(&mut app, 3);
+    app.modals.clear(); // the esc that collapsed the paste door
+    // the cached reason flips mid-add (the tick re-reads the status feed)
+    app.shunt_add_disabled = Some("the shunt gateway is not running".into());
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        app.modals.iter().any(|m| matches!(m, super::Modal::Login)),
+        "⏎ reopens the own add's modal whatever the disabled reason reads: {:?}",
+        pin_toasts(&app)
+    );
+}
+
+/// R6-1 guard: the disabled reason still refuses a NEW add — with no login in
+/// flight, ⏎ on `+ login` starts nothing and opens no modal.
+#[test]
+fn a_disabled_reason_still_refuses_a_new_add() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    app.shunt_add_disabled = None;
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    app.shunt_add_disabled = Some("the shunt gateway is not running".into());
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        app.login.is_none(),
+        "⏎ on a disabled `+ login` starts nothing"
+    );
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, super::Modal::Login)),
+        "⏎ on a disabled `+ login` opens no modal: {:?}",
+        pin_toasts(&app)
+    );
+}
+
+/// N4 edge 1: a confirmed type change before the commit point cancels the
+/// in-flight add. The guard stays held until the worker reports (R3-3); the
+/// fixture has no real worker, so the test sends the report and drains it.
+#[test]
+fn a_confirmed_type_change_cancels_the_precommit_shunt_add() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    pin_shunt_add_in_flight(&mut app, 3);
+    b3_focus_detail_row(&mut app, &["type"]);
+    b3_press(&mut app, KeyCode::Char(' '), 1);
+    assert!(
+        app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::Confirm(_))),
+        "the cycle asks first"
+    );
+    pin_confirm_type_cycle(&mut app);
+    assert!(app.login.is_none(), "the pre-commit add was cancelled");
+    assert!(
+        app.pool_mutation_row.is_some(),
+        "the guard stays held until the worker reports"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().map(|d| d.account_type),
+        Some(super::NewAccountType::Claude),
+        "the type landed"
+    );
+    app.login_result_tx
+        .send((3, Err("login canceled".to_string())))
+        .unwrap();
+    super::on_tick(&mut app);
+    assert!(
+        app.pool_mutation_row.is_none(),
+        "the worker's report released the guard"
+    );
+}
+
+/// N4 edge 2: cycling the type past the commit point does not ask, and the
+/// add's result lands the pool row without closing whatever draft is open.
+#[test]
+fn a_postcommit_add_lands_without_closing_a_movedon_draft() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    pin_shunt_add_in_flight(&mut app, 7);
+    app.shunt_paste.as_mut().unwrap().sent = true; // the paste went down the door
+    pin_mark_committed(&mut app, 7);
+    b3_focus_detail_row(&mut app, &["type"]);
+    b3_press(&mut app, KeyCode::Char(' '), 1);
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::Confirm(_))),
+        "no confirm past the commit point — nothing left to drop"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().map(|d| d.account_type),
+        Some(super::NewAccountType::Claude),
+        "the type cycled without asking"
+    );
+    app.login_result_tx
+        .send((
+            7,
+            Ok(super::LoginResult::Shunt(Box::new(
+                super::ShuntLoginOutcome {
+                    name: "newpool".into(),
+                    family: crate::gateway_admin::PoolFamily::Claude,
+                },
+            ))),
+        ))
+        .unwrap();
+    super::on_tick(&mut app);
+    assert!(
+        app.config_draft.is_some(),
+        "the result did not close the moved-on draft"
+    );
+    assert!(
+        app.pending_pool_landing.is_some(),
+        "the landing is pending the re-read"
+    );
+    app.shunt_pool = super::ShuntPool::Read(vec![crate::gateway_admin::PoolProvider {
+        name: "claude-main".to_string(),
+        auth: crate::gateway_admin::PoolAuth::Claude,
+        accounts: vec![b3_pool_account("newpool")],
+    }]);
+    super::land_pending_pool_add(&mut app);
+    assert!(
+        app.config_draft.is_some(),
+        "the landing did not close the moved-on draft"
+    );
+    assert!(
+        app.setup_item.is_none(),
+        "the landing did not move Setup off the moved-on draft"
+    );
+    assert_eq!(
+        app.overview_remembered,
+        Some(super::MainItemKind::Shunt(0, 0)),
+        "the Overview landing moved onto the new pool row"
+    );
+    super::join_test_workers();
+}
+
+/// R3-1: a confirmed type change over a COMMITTED add (opened by a `+ new`
+/// codex login in flight) leaves the add running — its guard and marker stay
+/// (the door drops: the paste already went down it), and the complete lands.
+#[test]
+fn a_confirmed_type_change_over_a_committed_add_with_codex_in_flight_keeps_the_add_running() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    pin_shunt_add_in_flight(&mut app, 7);
+    pin_mark_committed(&mut app, 7);
+    app.codex_login = Some(super::CodexLoginSession {
+        name: "cdx-new".into(),
+        generation: 9,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: true,
+    });
+    b3_focus_detail_row(&mut app, &["type"]);
+    b3_press(&mut app, KeyCode::Char(' '), 1);
+    assert!(
+        app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::Confirm(_))),
+        "the codex login in flight opens the confirm"
+    );
+    pin_confirm_type_cycle(&mut app);
+    assert!(app.login.is_none(), "the login line closed");
+    assert!(
+        app.shunt_paste.is_none(),
+        "the committed add drops its door"
+    );
+    assert!(
+        app.pool_mutation_row.is_some(),
+        "the committed add keeps its guard"
+    );
+    assert!(
+        app.shunt_add_committed.is_some(),
+        "the committed add keeps its marker"
+    );
+    app.login_result_tx
+        .send((
+            7,
+            Ok(super::LoginResult::Shunt(Box::new(
+                super::ShuntLoginOutcome {
+                    name: "newpool".into(),
+                    family: crate::gateway_admin::PoolFamily::Claude,
+                },
+            ))),
+        ))
+        .unwrap();
+    super::on_tick(&mut app);
+    assert!(
+        pin_toasts(&app).iter().any(|t| t.contains("added newpool")),
+        "the committed add landed and toasted: {:?}",
+        pin_toasts(&app)
+    );
+    assert!(
+        app.pending_pool_landing.is_some(),
+        "the landing is pending the re-read"
+    );
+    super::join_test_workers();
+}
+
+/// R3-2: a landing over a moved-on draft (a claude form the user renamed)
+/// keeps the draft, its typed name and the focused row, moving only the
+/// Overview's remembered row.
+#[test]
+fn a_landing_over_a_movedon_draft_keeps_its_name_and_focus() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    pin_shunt_add_in_flight(&mut app, 7);
+    app.shunt_paste.as_mut().unwrap().sent = true;
+    pin_mark_committed(&mut app, 7);
+    b3_focus_detail_row(&mut app, &["type"]);
+    b3_press(&mut app, KeyCode::Char(' '), 1); // shunt -> claude, no confirm
+    b3_focus_detail_row(&mut app, &["name"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    for _ in 0..7 {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Backspace));
+    }
+    for c in "typed-claude".chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    b3_press(&mut app, KeyCode::Enter, 1);
+    let focus_before = (app.config_focus, app.config_action_cursor);
+    app.login_result_tx
+        .send((
+            7,
+            Ok(super::LoginResult::Shunt(Box::new(
+                super::ShuntLoginOutcome {
+                    name: "newpool".into(),
+                    family: crate::gateway_admin::PoolFamily::Claude,
+                },
+            ))),
+        ))
+        .unwrap();
+    super::on_tick(&mut app);
+    app.shunt_pool = super::ShuntPool::Read(vec![crate::gateway_admin::PoolProvider {
+        name: "claude-main".to_string(),
+        auth: crate::gateway_admin::PoolAuth::Claude,
+        accounts: vec![b3_pool_account("pool-one"), b3_pool_account("newpool")],
+    }]);
+    super::land_pending_pool_add(&mut app);
+    assert_eq!(
+        app.config_draft.as_ref().map(|d| d.name.value.as_str()),
+        Some("typed-claude"),
+        "the moved-on draft keeps its typed name"
+    );
+    assert_eq!(
+        (app.config_focus, app.config_action_cursor),
+        focus_before,
+        "the focused row is unchanged"
+    );
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::New,
+        "Setup still shows the + new form, not the pool row"
+    );
+    assert_eq!(
+        app.overview_remembered,
+        Some(super::MainItemKind::Shunt(0, 1)),
+        "the Overview landing moved onto the new pool row"
+    );
+    super::join_test_workers();
+}
+
+/// R3-3: a pre-commit cancel holds the guard while the add's request is still
+/// parked in the stub's hold — a second add refuses — and the worker's report
+/// then frees the guard.
+#[test]
+fn a_precommit_cancel_holds_the_guard_until_the_worker_reports() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (_base, seen) = crate::testutil::serve_endpoints_raw(2, move |path, _| {
+        if path.ends_with("/complete") {
+            (200, r#"{"live":true}"#.to_string())
+        } else {
+            let _ = arrived_tx.send(());
+            let _ = release_rx.recv(); // hold the add reply until the test releases it
+            (
+                200,
+                r#"{"name":"newpool","authorize_url":"http://example/authorize"}"#.to_string(),
+            )
+        }
+    });
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.shunt_add_disabled = None;
+    app.open_url_worker = |_url| Ok(());
+    crate::testutil::write_adopted_record(
+        &home,
+        false,
+        &format!(
+            "[server]\nbind = \"{}\"\n",
+            _base.trim_start_matches("http://")
+        ),
+    );
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth).expect("mkdir .clauth");
+    std::fs::write(
+        clauth.join("gateway-admin-token"),
+        "test-admin-token-0123456789abcdef0123456789abcdef",
+    )
+    .expect("write the admin token");
+    pin_shunt_form(&mut app, "newpool");
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    arrived_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the add request reached the stub");
+    pin_cancel_login(&mut app);
+    // The cancel must NOT release the guard while the add's request is parked:
+    // this marker is what refuses a refresh, remove or second add. Captured
+    // before the release so a failing pin still releases the stub's hold (a
+    // parked worker would otherwise hang the sandbox teardown join).
+    let held = app.pool_mutation_row.clone();
+    release_tx.send(()).unwrap();
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    assert_eq!(
+        held,
+        Some((
+            crate::gateway_admin::PoolFamily::Claude,
+            crate::gateway_admin::ShuntAccountName::new("newpool").unwrap()
+        )),
+        "the guard stays held while the add's request is in flight — a refresh, remove or second add refuses"
+    );
+    assert!(
+        app.pool_mutation_row.is_none(),
+        "the worker's report released the guard"
+    );
+    let raw = seen.join().expect("listener");
+    assert_eq!(raw.len(), 1, "only the add was sent, never the complete");
+}
+
+/// N5: an unrelated re-login of an existing account never triggers the
+/// type-cycle confirm.
+#[test]
+fn an_unrelated_relogin_never_makes_the_type_cycle_ask() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.login = Some(super::LoginSession {
+        name: "acct-two".into(),
+        is_new: false,
+        generation: 1,
+        url: None,
+        stage: super::LoginStage::WaitingBrowser,
+        method: super::LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
+    });
+    b3_new_from_overview(&mut app, 0);
+    b3_focus_detail_row(&mut app, &["type"]);
+    b3_press(&mut app, KeyCode::Char(' '), 1);
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::Confirm(_))),
+        "a re-login of an existing account never asks: {:?}",
+        pin_toasts(&app)
+    );
+    assert_eq!(
+        app.config_draft.as_ref().map(|d| d.account_type),
+        Some(super::NewAccountType::Codex),
+        "the type cycled straight through"
+    );
+}
+
+/// F3: a late codex mint after a confirmed type change is dropped unused (the
+/// chain never written) with the info toast.
+#[test]
+fn a_late_codex_mint_after_a_confirmed_cycle_is_dropped_unwritten() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_codex_mint_worker(&mut app);
+    pin_codex_form(&mut app, "cdx-new");
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_press(&mut app, KeyCode::Esc, 1); // collapse the codex modal
+    b3_focus_detail_row(&mut app, &["type"]);
+    b3_press(&mut app, KeyCode::Char(' '), 1);
+    assert!(
+        app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::Confirm(_))),
+        "the cycle asks first"
+    );
+    pin_confirm_type_cycle(&mut app);
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    let d = app.config_draft.as_ref().unwrap();
+    assert_eq!(
+        d.account_type,
+        super::NewAccountType::Shunt,
+        "the type changed"
+    );
+    assert!(d.captured_login.is_none(), "nothing was staged");
+    assert!(
+        pin_toasts(&app)
+            .iter()
+            .any(|t| t.contains("login finished but the form type changed")),
+        "the late mint toasts the type change: {:?}",
+        pin_toasts(&app)
+    );
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("cdx-new"))
+        .unwrap()
+        .join("auth.json");
+    assert!(!store.exists(), "the codex chain was never written");
+}
+
+/// F4: `n` restores a suspended `+ new` form exactly as suspended (type, name,
+/// stage) — the section preset applies only to a fresh form.
+#[test]
+fn n_restores_a_suspended_new_form_exactly_as_suspended() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 0); // claude form
+    app.config_draft.as_mut().unwrap().captured_login = Some(super::DraftLogin::Mint(Box::new(
+        login_outcome("m", Some("u")),
+    )));
+    super::do_switch(&mut app, Tab::Overview);
+    b3_press(&mut app, KeyCode::Down, 3);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    let d = app.config_draft.as_ref().unwrap();
+    assert_eq!(
+        d.account_type,
+        super::NewAccountType::Claude,
+        "the suspended type is kept"
+    );
+    assert!(
+        matches!(d.captured_login, Some(super::DraftLogin::Mint(_))),
+        "the staged mint is kept"
+    );
+}
+
+/// F6: a refusal set by ⏎ on another row moves the cursor onto the refused row,
+/// so its `└` shows.
+#[test]
+fn a_refusal_moves_the_cursor_onto_the_refused_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_codex_form(&mut app, "cdx-one"); // the roster already holds cdx-one
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    let rows = render_rows(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("already exists")),
+        "the refusal is drawn: {rows:#?}"
+    );
+}
+
+/// F7: a stashed login clears the create row's refusal.
+#[test]
+fn a_stashed_login_clears_the_create_refusal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_codex_form(&mut app, "cdx-new");
+    if let Some(d) = app.config_draft.as_mut() {
+        d.create_refusal = Some("log in or capture first".to_string());
+    }
+    super::stash_new_form_login(&mut app, super::DraftLogin::CodexCapture);
+    assert!(
+        app.config_draft.as_ref().unwrap().create_refusal.is_none(),
+        "the staged capture cleared the create refusal"
+    );
+}
+
+/// F8: ⏎ mirrors space on the `type` cycle row.
+#[test]
+fn enter_mirrors_space_on_the_type_cycle() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 0);
+    b3_focus_detail_row(&mut app, &["type"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert_eq!(
+        app.config_draft.as_ref().map(|d| d.account_type),
+        Some(super::NewAccountType::Codex),
+        "⏎ cycles claude → codex"
+    );
+}
+
+/// F9: the shunt modal shows `r`/`c` only once the authorize URL is in, and
+/// `p` only once the URL is in AND no paste has been sent — before the URL the
+/// modal reads `opening your browser…` alone.
+#[test]
+fn the_shunt_modal_gates_r_c_and_p_on_the_url_and_the_paste() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_add_in_flight(&mut app, 1);
+    app.login.as_mut().unwrap().url = None;
+    app.open_modal(super::Modal::Login);
+    let rows = render_rows(&app);
+    assert!(
+        !rows.iter().any(|r| r.contains("copy link")),
+        "no `c` before the URL"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("paste code")),
+        "no `p` before the URL"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("opening your browser")),
+        "`opening your browser…` alone before the URL"
+    );
+    app.login.as_mut().unwrap().url = Some("http://x".into());
+    let rows = render_rows(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("copy link")),
+        "`c` once the URL is in"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("paste code")),
+        "`p` once the URL is in and no paste was sent"
+    );
+    app.shunt_paste.as_mut().unwrap().sent = true;
+    let rows = render_rows(&app);
+    assert!(
+        !rows.iter().any(|r| r.contains("paste code")),
+        "no `p` once a paste was sent"
+    );
+}
+
+/// A paste attempt before the URL is announced changes nothing: the `p` key
+/// does not open the code field (the modal reads `opening your browser…`
+/// alone), so nothing goes down the door.
+#[test]
+fn a_paste_attempt_before_the_url_is_announced_changes_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_add_in_flight(&mut app, 1);
+    app.login.as_mut().unwrap().url = None;
+    app.open_modal(super::Modal::Login);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('p')));
+    for c in "early-code".chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.login.as_ref().is_some_and(|s| s.paste_field.is_none()),
+        "no code field opened before the URL"
+    );
+    assert!(
+        app.shunt_paste.as_ref().is_some_and(|d| !d.sent),
+        "no paste went down the door before the URL"
+    );
+}
+
+/// S2-1 (adapted): a paste sent after the URL is announced but before the
+/// worker's blocking `recv` is never swallowed — the complete is sent and the
+/// guard releases. The worker parks on the paste seam between the announce and
+/// the `recv`; the paste goes down the door in that window, then the seam
+/// releases and `recv` must be the consumer that takes it.
+#[test]
+fn a_paste_after_the_url_is_announced_but_before_the_worker_waits_reaches_the_complete() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (_base, seen) = crate::testutil::serve_endpoints_raw(2, move |path, _| {
+        if path.ends_with("/complete") {
+            (200, r#"{"live":true}"#.to_string())
+        } else {
+            (
+                200,
+                r#"{"name":"newpool","authorize_url":"http://example/authorize"}"#.to_string(),
+            )
+        }
+    });
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.shunt_add_disabled = None;
+    app.open_url_worker = |_url| Ok(());
+    let (seam_tx, seam_rx) = std::sync::mpsc::channel::<()>();
+    app.shunt_add_paste_seam = Some(seam_rx);
+    crate::testutil::write_adopted_record(
+        &home,
+        false,
+        &format!(
+            "[server]\nbind = \"{}\"\n",
+            _base.trim_start_matches("http://")
+        ),
+    );
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth).expect("mkdir .clauth");
+    std::fs::write(
+        clauth.join("gateway-admin-token"),
+        "test-admin-token-0123456789abcdef0123456789abcdef",
+    )
+    .expect("write the admin token");
+    pin_shunt_form(&mut app, "newpool");
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    // Wait for the worker to announce the URL and park on the paste seam.
+    for _ in 0..400 {
+        super::on_tick(&mut app);
+        if app.login.as_ref().is_some_and(|s| s.url.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        app.login.as_ref().is_some_and(|s| s.url.is_some()),
+        "the worker announced its URL and is parked before the recv"
+    );
+    // Paste after the announce, before the worker's `recv`.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('p')));
+    for c in "early-code".chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.shunt_paste.as_ref().is_some_and(|d| d.sent),
+        "the paste went down the door after the URL"
+    );
+    seam_tx.send(()).unwrap(); // release the seam; the worker's recv takes it
+    // A post-commit cancel (the paste already went down the door) must not
+    // stop the complete: the code is already in the channel, so the worker's
+    // `recv` takes it and the complete runs to its result.
+    pin_cancel_login(&mut app);
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    let raw = seen.join().expect("listener");
+    assert_eq!(
+        raw.len(),
+        2,
+        "the pasted code must reach the complete (add + complete), got {raw:?}"
+    );
+    assert!(
+        app.pool_mutation_row.is_none(),
+        "a pasted code must not leave the one-pool-action guard stuck"
+    );
+}
+
+/// F10: with nothing under the Overview cursor, `n` presets from the visible
+/// filter.
+#[test]
+fn n_presets_from_the_filter_when_nothing_is_under_the_cursor() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(
+        &home,
+        super::ShuntPool::NotRead("the gateway is not running".into()),
+    );
+    app.harness_filter = super::HarnessFilter::Shunt;
+    super::switch_tab(&mut app, Tab::Overview);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert_eq!(
+        app.config_draft.as_ref().map(|d| d.account_type),
+        Some(super::NewAccountType::Shunt),
+        "the shunt filter presets the shunt form"
+    );
+}
+
+/// F13: the pending pool landing is dropped by a selection change.
+#[test]
+fn a_selection_change_drops_the_pending_pool_landing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.pending_pool_landing = Some((
+        crate::gateway_admin::PoolFamily::Claude,
+        "newpool".to_string(),
+    ));
+    app.place_setup_selection(0);
+    assert!(
+        app.pending_pool_landing.is_none(),
+        "the selection change dropped the landing"
+    );
+}
+
+/// F16: the shunt-disabled and codex-capturable predicates are cached on the
+/// tick, never read on the render path — a render with the cache cleared shows
+/// the row as available even though the disk would say the gateway is down.
+#[test]
+fn the_form_predicates_render_from_the_cache_not_a_disk_read() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    assert_eq!(
+        app.shunt_add_disabled.as_deref(),
+        Some("the shunt gateway is not running"),
+        "construction cached the disabled reason"
+    );
+    app.shunt_add_disabled = None; // the cache now says the add is available
+    b3_new_from_overview(&mut app, 3);
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    let rows = render_rows(&app);
+    let at = rows
+        .iter()
+        .position(|r| b3_row_holds(std::slice::from_ref(r), &["❯", "+", "login"]))
+        .expect("the focused + login row");
+    assert!(
+        !rows.get(at + 1).is_some_and(|r| r.contains("gateway")),
+        "the render reads the cache (available), never the disk (which would say not running): {rows:#?}"
+    );
+}
+
+/// N7: a running pool action refuses a new shunt add (the one-pool-action
+/// guard), and starts nothing.
+#[test]
+fn a_shunt_add_is_refused_while_a_pool_action_runs() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    app.shunt_add_disabled = None;
+    app.pool_mutation_row = Some((
+        crate::gateway_admin::PoolFamily::Claude,
+        crate::gateway_admin::ShuntAccountName::new("pool-one").unwrap(),
+    ));
+    app.toasts.clear();
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        pin_toasts(&app)
+            .iter()
+            .any(|t| t.contains("a pool action is still running")),
+        "a running pool action refuses a new add: {:?}",
+        pin_toasts(&app)
+    );
+    assert!(app.login.is_none(), "and starts nothing");
+}
+
+/// N7 cancel path 1: a cancel before the browser opens nothing — the worker's
+/// pre-open cancel check fires, so the complete is never sent and the guard is
+/// released.
+#[test]
+fn a_cancel_before_the_browser_opens_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (_base, seen) = crate::testutil::serve_endpoints_raw(2, move |path, _| {
+        if path.ends_with("/complete") {
+            (200, r#"{"live":true}"#.to_string())
+        } else {
+            let _ = release_rx.recv(); // hold the add reply until the cancel lands
+            (
+                200,
+                r#"{"name":"newpool","authorize_url":"http://example/authorize"}"#.to_string(),
+            )
+        }
+    });
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.shunt_add_disabled = None;
+    OPEN_URL_CALLED.store(false, Ordering::SeqCst);
+    app.open_url_worker = |_url| {
+        OPEN_URL_CALLED.store(true, Ordering::SeqCst);
+        Ok(())
+    };
+    crate::testutil::write_adopted_record(
+        &home,
+        false,
+        &format!(
+            "[server]\nbind = \"{}\"\n",
+            _base.trim_start_matches("http://")
+        ),
+    );
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth).expect("mkdir .clauth");
+    std::fs::write(
+        clauth.join("gateway-admin-token"),
+        "test-admin-token-0123456789abcdef0123456789abcdef",
+    )
+    .expect("write the admin token");
+    pin_shunt_form(&mut app, "newpool");
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    pin_cancel_login(&mut app); // cancel before the browser
+    release_tx.send(()).unwrap(); // let the worker's add finish
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    assert!(
+        !OPEN_URL_CALLED.load(Ordering::SeqCst),
+        "a cancel before the browser opens nothing"
+    );
+    let raw = seen.join().expect("listener");
+    assert_eq!(
+        raw.len(),
+        1,
+        "only the add was sent, never the complete: {raw:?}"
+    );
+    assert!(
+        app.pool_mutation_row.is_none(),
+        "the worker's report released the guard"
+    );
+}
+
+/// N7 cancel path 2: a cancel after the URL but before the paste sends nothing
+/// to the complete.
+#[test]
+fn a_cancel_before_the_paste_sends_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (_base, seen) = crate::testutil::serve_endpoints_raw(2, |path, _| {
+        if path.ends_with("/complete") {
+            (200, r#"{"live":true}"#.to_string())
+        } else {
+            (
+                200,
+                r#"{"name":"newpool","authorize_url":"http://example/authorize"}"#.to_string(),
+            )
+        }
+    });
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.shunt_add_disabled = None;
+    app.open_url_worker = |_url| Ok(());
+    crate::testutil::write_adopted_record(
+        &home,
+        false,
+        &format!(
+            "[server]\nbind = \"{}\"\n",
+            _base.trim_start_matches("http://")
+        ),
+    );
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth).expect("mkdir .clauth");
+    std::fs::write(
+        clauth.join("gateway-admin-token"),
+        "test-admin-token-0123456789abcdef0123456789abcdef",
+    )
+    .expect("write the admin token");
+    pin_shunt_form(&mut app, "newpool");
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    for _ in 0..400 {
+        super::on_tick(&mut app);
+        if app.login.as_ref().is_some_and(|s| s.url.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        app.login.as_ref().is_some_and(|s| s.url.is_some()),
+        "the add announced its URL"
+    );
+    pin_cancel_login(&mut app); // cancel before the paste
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    let raw = seen.join().expect("listener");
+    assert_eq!(raw.len(), 1, "the complete was never sent: {raw:?}");
+    assert!(
+        app.pool_mutation_row.is_none(),
+        "the worker's report released the guard"
+    );
+}
+
+/// N7 cancel path 3: a cancel after the commit point keeps the guard held and
+/// the complete still runs to its result (toast + re-read).
+#[test]
+fn a_cancel_after_the_commit_runs_the_complete_to_its_result() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (_base, seen) = crate::testutil::serve_endpoints_raw(3, |path, _| {
+        if path.ends_with("/complete") {
+            (200, r#"{"live":true}"#.to_string())
+        } else {
+            (
+                200,
+                r#"{"name":"newpool","authorize_url":"http://example/authorize"}"#.to_string(),
+            )
+        }
+    });
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.shunt_add_disabled = None;
+    app.open_url_worker = |_url| Ok(());
+    crate::testutil::write_adopted_record(
+        &home,
+        false,
+        &format!(
+            "[server]\nbind = \"{}\"\n",
+            _base.trim_start_matches("http://")
+        ),
+    );
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth).expect("mkdir .clauth");
+    std::fs::write(
+        clauth.join("gateway-admin-token"),
+        "test-admin-token-0123456789abcdef0123456789abcdef",
+    )
+    .expect("write the admin token");
+    pin_shunt_form(&mut app, "newpool");
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    for _ in 0..400 {
+        super::on_tick(&mut app);
+        if app.login.as_ref().is_some_and(|s| s.url.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        app.login.as_ref().is_some_and(|s| s.url.is_some()),
+        "the add announced its URL"
+    );
+    // Paste the code, then cancel: the paste is the commit point, so the guard
+    // stays held and the complete runs to its result.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('p')));
+    for c in "the-code".chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    pin_cancel_login(&mut app);
+    assert!(app.login.is_none(), "the login line closed");
+    assert!(
+        app.pool_mutation_row.is_some(),
+        "the guard stays held past the commit point"
+    );
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    let raw = seen.join().expect("listener");
+    assert_eq!(
+        raw.len(),
+        2,
+        "the add and the complete both went out: {raw:?}"
+    );
+    assert!(
+        pin_toasts(&app).iter().any(|t| t.contains("added newpool")),
+        "the committed result toasts: {:?}",
+        pin_toasts(&app)
+    );
+    assert!(
+        app.pool_mutation_row.is_none(),
+        "the result released the guard"
+    );
+}
+
+/// R4-1: a post-commit cancel drops the stale shunt door, so a claude login
+/// started in that window gets its own door and modal — its `p  paste code` row
+/// shows, its paste goes down the CLAUDE door, and its result lands without a
+/// panic — while the committed add's own result still lands afterwards.
+#[test]
+fn a_postcommit_cancel_drops_the_shunt_door_and_a_later_claude_login_keeps_its_own() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    let (shunt_tx, shunt_rx) = std::sync::mpsc::channel::<String>();
+    let name = crate::gateway_admin::ShuntAccountName::new("newpool").unwrap();
+    app.login = Some(super::LoginSession {
+        name: "newpool".into(),
+        is_new: true,
+        generation: 7,
+        url: Some("http://example/authorize".into()),
+        stage: super::LoginStage::WaitingBrowser,
+        method: super::LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
+    });
+    app.login_generation = 7;
+    app.shunt_paste = Some(super::ShuntPasteDoor {
+        tx: shunt_tx,
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        sent: true,
+        family: crate::gateway_admin::PoolFamily::Claude,
+        name: name.clone(),
+    });
+    app.pool_mutation_row = Some((crate::gateway_admin::PoolFamily::Claude, name.clone()));
+    pin_mark_committed(&mut app, 7);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(app.login.is_none(), "the login line closed");
+    assert!(
+        app.shunt_paste.is_none(),
+        "the post-commit cancel drops the shunt door"
+    );
+    assert!(
+        app.shunt_add_committed.is_some(),
+        "the committed add's identity stays"
+    );
+    assert!(
+        app.pool_mutation_row.is_some(),
+        "the guard stays held until the committed result"
+    );
+    // A claude re-login starts in the window: it gets its own door and modal.
+    let (claude_session, claude_rx) = paste_session("acct-two", false, 8);
+    app.login_generation = 8;
+    app.login = Some(claude_session);
+    app.open_modal(super::Modal::Login);
+    let rows = render_rows(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("paste code")),
+        "the claude modal shows `p  paste code`: {rows:?}"
+    );
+    // The paste goes down the claude door, never the dropped shunt one.
+    let pasted = format!("claude-code#{PASTE_STATE}");
+    app.login.as_mut().unwrap().paste_field = Some(super::InputState::new(&pasted));
+    super::submit_paste_code(&mut app);
+    assert!(
+        shunt_rx.try_recv().is_err(),
+        "the dropped shunt door took no paste"
+    );
+    assert_eq!(
+        claude_rx.try_recv().map(|c| c.as_str().to_string()),
+        Ok("claude-code".to_string()),
+        "the claude paste went down the claude door"
+    );
+    // The claude result lands with no panic.
+    app.login_result_tx
+        .send((
+            8,
+            Ok(super::LoginResult::Oauth(Box::new(login_outcome(
+                "m",
+                Some("u"),
+            )))),
+        ))
+        .unwrap();
+    let drained =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::on_tick(&mut app)));
+    assert!(
+        drained.is_ok(),
+        "the claude result drained without a panic: {drained:?}"
+    );
+    // The committed add's own result still lands after the door was dropped.
+    app.login_result_tx
+        .send((
+            7,
+            Ok(super::LoginResult::Shunt(Box::new(
+                super::ShuntLoginOutcome {
+                    name: "newpool".into(),
+                    family: crate::gateway_admin::PoolFamily::Claude,
+                },
+            ))),
+        ))
+        .unwrap();
+    super::on_tick(&mut app);
+    assert!(
+        pin_toasts(&app).iter().any(|t| t.contains("added newpool")),
+        "the committed add still lands: {:?}",
+        pin_toasts(&app)
+    );
+    assert!(
+        app.pool_mutation_row.is_none(),
+        "the committed result released the guard"
+    );
+    super::join_test_workers();
+}
+
+/// R4-3: a panicking add worker still lands a failure, so the busy guard
+/// marker never sticks. The worker wraps its job in `catch_unwind` exactly as
+/// the refresh/remove worker does, sending a failure result on a panic.
+#[test]
+fn a_panicking_add_worker_lands_a_failure_and_never_sticks_the_guard() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    app.shunt_add_disabled = None;
+    app.shunt_add_panic = true;
+    pin_shunt_form(&mut app, "newpool");
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        app.pool_mutation_row.is_some(),
+        "the add holds the guard while its worker runs"
+    );
+    super::join_test_workers();
+    super::on_tick(&mut app);
+    assert!(
+        app.pool_mutation_row.is_none(),
+        "the panicked worker's failure cleared the guard"
+    );
+    assert!(
+        pin_toasts(&app).iter().any(|t| t.contains("add failed")),
+        "the panic landed a failure toast: {:?}",
+        pin_toasts(&app)
+    );
+    super::join_test_workers();
+}
+
+/// X1: `apply preset` is offered on `+ new` only while the form's `type` is
+/// `claude`. The codex and shunt forms have no endpoint or model rows, so a
+/// preset stamped there would edit fields the form never shows.
+#[test]
+fn apply_preset_is_offered_only_on_a_claude_new_form() {
+    let home = crate::testutil::HomeSandbox::new();
+    for (downs, why, offered) in [
+        (2, "codex", false),
+        (3, "shunt", false),
+        (0, "claude", true),
+    ] {
+        let mut app = b3_setup_app(&home, b3_claude_pool());
+        b3_new_from_overview(&mut app, downs);
+        let labels: Vec<&'static str> = super::build_action_menu(&app)
+            .items
+            .iter()
+            .map(|i| i.label)
+            .collect();
+        assert_eq!(
+            labels.contains(&"apply preset"),
+            offered,
+            "a {why} `+ new` form lists apply preset (expected {offered}): {labels:?}",
+        );
+    }
+}
+
+/// R7-2: the picker's apply re-check refuses on a codex and a shunt `+ new`
+/// draft — the Danger toast by equality, and the draft's endpoint and model
+/// buffers stay untouched (nothing stamped that the form's rows never show).
+#[test]
+fn apply_preset_refuses_on_a_codex_and_shunt_new_form() {
+    let home = crate::testutil::HomeSandbox::new();
+    for (downs, why) in [(2, "codex"), (3, "shunt")] {
+        let mut app = b3_setup_app(&home, b3_claude_pool());
+        b3_new_from_overview(&mut app, downs);
+        super::open_preset_picker(&mut app);
+        b3_press(&mut app, KeyCode::Enter, 1);
+        assert_eq!(
+            pin_toasts(&app),
+            vec!["apply preset is for the claude form"],
+            "the {why} `+ new` form refuses the apply: {:?}",
+            pin_toasts(&app)
+        );
+        let draft = app.config_draft.as_ref().expect("the draft stays");
+        assert_eq!(draft.base_url.trimmed(), "", "{why}: base url untouched");
+        for (label, buf) in [
+            ("model", draft.model.trimmed()),
+            ("fable", draft.fable_model.trimmed()),
+            ("opus", draft.opus_model.trimmed()),
+            ("sonnet", draft.sonnet_model.trimmed()),
+            ("haiku", draft.haiku_model.trimmed()),
+            ("subagent", draft.subagent_model.trimmed()),
+        ] {
+            assert_eq!(buf, "", "{why}: {label} buffer untouched");
+        }
+    }
+}
+
+/// R8-3: the apply's re-check reads the draft the picker restored from a
+/// suspension — a suspended codex/shunt `+ new` form still refuses the apply,
+/// its endpoint and model buffers untouched (nothing stamped that the form's
+/// rows never show).
+#[test]
+fn apply_preset_refuses_on_a_suspended_codex_or_shunt_form() {
+    let home = crate::testutil::HomeSandbox::new();
+    for (downs, why) in [(2, "codex"), (3, "shunt")] {
+        let mut app = b3_setup_app(&home, b3_claude_pool());
+        b3_new_from_overview(&mut app, downs);
+        super::do_switch(&mut app, Tab::Overview);
+        super::do_switch(&mut app, Tab::Setup);
+        assert!(
+            matches!(app.setup_selection(), super::SetupSelection::New),
+            "{why}: the `+ new` selection holds after the switch"
+        );
+        super::open_preset_picker(&mut app);
+        b3_press(&mut app, KeyCode::Enter, 1);
+        assert_eq!(
+            pin_toasts(&app),
+            vec!["apply preset is for the claude form"],
+            "the suspended {why} `+ new` form refuses the apply: {:?}",
+            pin_toasts(&app)
+        );
+        let draft = app.config_draft.as_ref().expect("the restored draft stays");
+        assert_eq!(draft.base_url.trimmed(), "", "{why}: base url untouched");
+        for (label, buf) in [
+            ("model", draft.model.trimmed()),
+            ("fable", draft.fable_model.trimmed()),
+            ("opus", draft.opus_model.trimmed()),
+            ("sonnet", draft.sonnet_model.trimmed()),
+            ("haiku", draft.haiku_model.trimmed()),
+            ("subagent", draft.subagent_model.trimmed()),
+        ] {
+            assert_eq!(buf, "", "{why}: {label} buffer untouched");
+        }
+    }
+}
+
+/// R7-4/R8 ruling (3) no-reason: ⏎ on the shunt `+ login` while a FOREIGN
+/// claude login is in flight (a claude `+ new` login a confirmed type cycle
+/// kept running, no disabled reason) opens nothing from this row — only the
+/// "already in progress" toast names the running login.
+#[test]
+fn a_foreign_login_in_flight_opens_no_modal_from_the_shunt_login() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    app.shunt_add_disabled = None;
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    // a claude `+ new` login a confirmed type cycle kept running (F3: not cancelled)
+    app.login = Some(super::LoginSession {
+        name: "newpool".into(),
+        is_new: true,
+        generation: 5,
+        url: Some("https://claude.ai/oauth/authorize?x".into()),
+        stage: super::LoginStage::WaitingBrowser,
+        method: super::LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
+    });
+    app.login_generation = 5;
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert_eq!(
+        pin_toasts(&app),
+        vec!["a login for 'newpool' is already in progress"],
+        "the toast names the running login"
+    );
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, super::Modal::Login)),
+        "⏎ on the shunt `+ login` opens no foreign modal: {:?}",
+        pin_toasts(&app)
+    );
+    assert!(
+        app.shunt_paste.is_none(),
+        "no shunt add started beside the foreign login"
+    );
+}
+
+/// R8 ruling (2)/(3) reason: with a cached disabled reason, a foreign claude
+/// login makes the shunt `+ login` inert — no toast, no add, no modal — the
+/// disabled check runs ahead of the foreign-login toast.
+#[test]
+fn a_foreign_login_with_a_disabled_reason_is_inert() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    app.shunt_add_disabled = Some("the shunt gateway is not running".into());
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    app.login = Some(super::LoginSession {
+        name: "newpool".into(),
+        is_new: true,
+        generation: 5,
+        url: Some("https://claude.ai/oauth/authorize?x".into()),
+        stage: super::LoginStage::WaitingBrowser,
+        method: super::LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
+    });
+    app.login_generation = 5;
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        pin_toasts(&app).is_empty(),
+        "the disabled row sends nothing: {:?}",
+        pin_toasts(&app)
+    );
+    assert!(
+        app.shunt_paste.is_none(),
+        "no shunt add started beside the foreign login"
+    );
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, super::Modal::Login)),
+        "the disabled row opens no modal"
+    );
+}
+
+/// R8-1: ⏎ on the shunt `+ login` while a codex `+ new` login is in flight
+/// (kept running across a type change, no disabled reason) starts nothing —
+/// no second add, no guard marker — and only the "already in progress" toast
+/// names the running codex login.
+#[test]
+fn a_codex_foreign_login_in_flight_opens_no_modal_from_the_shunt_login() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    app.shunt_add_disabled = None;
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    app.codex_login = Some(super::CodexLoginSession {
+        name: "newpool".into(),
+        generation: 5,
+        url: Some("https://auth.openai.com/oauth/authorize?x".into()),
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: true,
+    });
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert_eq!(
+        pin_toasts(&app),
+        vec!["a login for 'newpool' is already in progress"],
+        "the toast names the running codex login"
+    );
+    assert!(
+        app.shunt_paste.is_none(),
+        "no shunt add started beside the codex login"
+    );
+    assert!(
+        app.pool_mutation_row.is_none(),
+        "no pool-action guard marker for the never-started add"
+    );
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, super::Modal::Login)),
+        "⏎ on the shunt `+ login` opens no foreign modal"
+    );
+}
+
+/// R8-1 + ruling (2): the same codex foreign login with a cached disabled
+/// reason is inert — no toast, no add, no modal — and the pane's `+ login`
+/// row renders disabled (faint) with its `└` reason, scoped to the pane's
+/// rows.
+#[test]
+fn a_codex_foreign_login_with_a_disabled_reason_is_inert_and_renders_disabled() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    app.shunt_add_disabled = Some("the shunt gateway is not running".into());
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    app.codex_login = Some(super::CodexLoginSession {
+        name: "newpool".into(),
+        generation: 5,
+        url: Some("https://auth.openai.com/oauth/authorize?x".into()),
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: true,
+    });
+    let rows = b3_detail_inner(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("+ login")),
+        "the `+ login` row renders: {rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("the shunt gateway is not running")),
+        "the disabled `└` reason renders: {rows:#?}"
+    );
+    assert_eq!(
+        b3_needle_fg(&app, "+ login"),
+        Some(crate::tui::theme::text_faint_color()),
+        "the `+ login` label renders faint, not accent"
+    );
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        pin_toasts(&app).is_empty(),
+        "the disabled row sends nothing: {:?}",
+        pin_toasts(&app)
+    );
+    assert!(
+        app.shunt_paste.is_none() && app.pool_mutation_row.is_none(),
+        "no shunt add and no guard marker"
+    );
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, super::Modal::Login)),
+        "the disabled row opens no modal"
+    );
+}
+
+/// R7-5: the name check stays below the reopen — an add in flight for
+/// `newpool` whose name buffer was edited to an invalid `New Pool` still
+/// reopens its modal on ⏎ (the refusal gates only a NEW add).
+#[test]
+fn an_edited_name_still_reopens_the_own_adds_modal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    pin_shunt_add_in_flight(&mut app, 3);
+    app.shunt_add_disabled = None;
+    app.modals.clear(); // the esc that collapsed the paste door
+    app.config_draft.as_mut().unwrap().name = InputState::new("New Pool");
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        app.modals.iter().any(|m| matches!(m, super::Modal::Login)),
+        "⏎ reopens the own add's modal even after the name was edited: {:?}",
+        pin_toasts(&app)
+    );
+}
+
+/// R7-1: a tab switch suspends an at-rest `+ new` form into
+/// `new_account_draft` and leaves `config_draft` empty; the `a` menu must
+/// read the suspended draft too, so a suspended codex/shunt form still lists
+/// no `apply preset` (the item list by equality).
+#[test]
+fn apply_preset_is_not_offered_on_a_suspended_codex_or_shunt_form() {
+    let home = crate::testutil::HomeSandbox::new();
+    for (downs, why) in [(2, "codex"), (3, "shunt")] {
+        let mut app = b3_setup_app(&home, b3_claude_pool());
+        b3_new_from_overview(&mut app, downs);
+        super::do_switch(&mut app, Tab::Overview);
+        super::do_switch(&mut app, Tab::Setup);
+        assert!(
+            matches!(app.setup_selection(), super::SetupSelection::New),
+            "{why}: the `+ new` selection holds after the switch"
+        );
+        let labels: Vec<&'static str> = super::build_action_menu(&app)
+            .items
+            .iter()
+            .map(|i| i.label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["start daemon", "start shunt"],
+            "a suspended {why} `+ new` form lists no apply preset: {labels:?}",
+        );
+    }
+    // A suspended claude form keeps the offer: the suspended draft is claude.
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 0);
+    super::do_switch(&mut app, Tab::Overview);
+    super::do_switch(&mut app, Tab::Setup);
+    let labels: Vec<&'static str> = super::build_action_menu(&app)
+        .items
+        .iter()
+        .map(|i| i.label)
+        .collect();
+    assert!(
+        labels.contains(&"apply preset"),
+        "a suspended claude `+ new` form keeps the offer: {labels:?}",
+    );
+}
+
+/// R7-3: while this form's own add is in flight the `+ login` row renders
+/// live — no faint Disabled row, no `└` reason — whatever the cached reason
+/// reads, so the row's look agrees with what ⏎ does (reopen).
+#[test]
+fn the_plus_login_row_renders_live_during_the_own_add() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    pin_shunt_form(&mut app, "newpool");
+    app.shunt_add_disabled = None;
+    b3_focus_detail_row(&mut app, &["+", "login"]);
+    pin_shunt_add_in_flight(&mut app, 3);
+    app.modals.clear(); // the esc that collapsed the paste door
+    // the cached reason flips mid-add (the tick re-reads the status feed)
+    app.shunt_add_disabled = Some("the shunt gateway is not running".into());
+    let rows = b3_detail_inner(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("+ login")),
+        "the `+ login` row renders: {rows:#?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.contains("the shunt gateway is not running")),
+        "no `└` disabled reason renders while the own add is in flight: {rows:#?}"
+    );
+    assert_eq!(
+        b3_needle_fg(&app, "+ login"),
+        Some(crate::tui::theme::accent_color()),
+        "the `+ login` label renders accent, not faint"
+    );
+}
+
+/// R4-2 (claude): the claude `+ new` form's `+ login` never inherits the shunt
+/// disabled state — even with the strongest shunt reason cached it renders
+/// accent (not faint) with no `└` reason, scoped to the pane's rows.
+#[test]
+fn a_claude_new_form_login_ignores_the_shunt_disabled_reason() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 0);
+    app.shunt_add_disabled = Some("no shunt gateway is adopted".into());
+    // Focus the `+ login` row so its `└` tooltip line renders: the absence
+    // assertion below must red on a snap that leaks the shunt reason.
+    app.config_action_cursor = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Login)
+        .expect("the claude form's `+ login` row");
+    let rows = b3_detail_inner(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("+ login")),
+        "the `+ login` row renders: {rows:#?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.contains("no shunt gateway is adopted")),
+        "no `└` shunt reason under the claude `+ login`: {rows:#?}"
+    );
+    assert_eq!(
+        b3_needle_fg(&app, "+ login"),
+        Some(crate::tui::theme::accent_color()),
+        "the claude `+ login` label renders accent, not faint"
+    );
+}
+
+/// R4-2 (codex): the codex `+ new` form's `+ login` is the same.
+#[test]
+fn a_codex_new_form_login_ignores_the_shunt_disabled_reason() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 2);
+    app.shunt_add_disabled = Some("no shunt gateway is adopted".into());
+    // Focus the `+ login` row: its `└` tooltip must be the codex mint hint
+    // (the codex arm precedes the reason arm), beside the frame-wide absence
+    // of the shunt reason.
+    app.config_action_cursor = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Login)
+        .expect("the codex form's `+ login` row");
+    let rows = b3_detail_inner(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("+ login")),
+        "the `+ login` row renders: {rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("mint a codex login in the browser")),
+        "the focused codex `+ login` tooltip says `mint a codex login in the browser`: {rows:#?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.contains("no shunt gateway is adopted")),
+        "no `└` shunt reason under the codex `+ login`: {rows:#?}"
+    );
+    assert_eq!(
+        b3_needle_fg(&app, "+ login"),
+        Some(crate::tui::theme::accent_color()),
+        "the codex `+ login` label renders accent, not faint"
+    );
+}
+
+/// R11-1: a shunt `+ new` form suspended by a tab switch previews at rest as
+/// the shunt form it is (its own rows, its `+ login` disabled with the cached
+/// reason), never as a claude form whose `+ login` greys out.
+#[test]
+fn a_suspended_shunt_form_previews_as_the_shunt_form_at_rest() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 3);
+    assert_eq!(
+        app.config_draft.as_ref().map(|d| d.account_type),
+        Some(super::NewAccountType::Shunt),
+        "precondition: `n` on a pool row opens the shunt form"
+    );
+    super::handle_key(&mut app, alt_digit('8'));
+    super::handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.tab, Tab::Setup, "precondition: back on Setup");
+    assert!(
+        app.config_draft.is_none() && app.new_account_draft.is_some(),
+        "precondition: the form is suspended at rest"
+    );
+    app.shunt_add_disabled = Some("no shunt gateway is adopted".into());
+    let rows = b3_detail_inner(&app);
+    assert!(
+        b3_row_holds(&rows, &["family"]),
+        "the at-rest preview shows the shunt form's `family` row: {rows:#?}"
+    );
+    assert!(
+        !b3_row_holds(&rows, &["base", "url"]),
+        "the at-rest preview shows no claude `base url` row: {rows:#?}"
+    );
+    assert_ne!(
+        b3_needle_fg(&app, "+ login"),
+        Some(crate::tui::theme::accent_color()),
+        "the suspended shunt form's `+ login` keeps its disabled look"
+    );
+}
+
+/// R11-1 twin: a suspended claude `+ new` form previews as claude, its
+/// `+ login` live whatever shunt reason is cached.
+#[test]
+fn a_suspended_claude_form_previews_its_login_live_at_rest() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 0);
+    super::handle_key(&mut app, alt_digit('8'));
+    super::handle_key(&mut app, alt_digit('4'));
+    app.shunt_add_disabled = Some("no shunt gateway is adopted".into());
+    let rows = b3_detail_inner(&app);
+    assert!(
+        b3_row_holds(&rows, &["base", "url"]),
+        "the at-rest preview shows the claude form's `base url` row: {rows:#?}"
+    );
+    assert_eq!(
+        b3_needle_fg(&app, "+ login"),
+        Some(crate::tui::theme::accent_color()),
+        "the suspended claude form's `+ login` renders accent, not faint"
+    );
+}
+
+/// R12-1: a claude `+ new` form suspended at rest with typed values previews
+/// those values (base url, api key, model), never `—` beside API-mode rows.
+#[test]
+fn a_suspended_claude_form_previews_its_typed_values_at_rest() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 0);
+    if let Some(d) = app.config_draft.as_mut() {
+        d.base_url = super::InputState::new("https://typed.example");
+        d.api_key = super::InputState::new("typed-key-0123");
+        d.model = super::InputState::new("typed-model");
+    }
+    super::handle_key(&mut app, alt_digit('8'));
+    super::handle_key(&mut app, alt_digit('4'));
+    assert!(
+        app.config_draft.is_none() && app.new_account_draft.is_some(),
+        "precondition: the form is suspended at rest"
+    );
+    let rows = b3_detail_inner(&app);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("base url") && r.contains("https://typed.example")),
+        "the at-rest preview shows the typed base url: {rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("model") && r.contains("typed-model")),
+        "the at-rest preview shows the typed model: {rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("api key") && !r.contains('—')),
+        "the at-rest preview's api key row is not blank: {rows:#?}"
+    );
+}
+
+/// R13-1: a typed api key on the `+ new` form renders as the mask, never any
+/// part of the key, both at rest (suspended) and descended (restored).
+#[test]
+fn a_new_forms_api_key_renders_masked_at_rest_and_descended() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 0);
+    if let Some(d) = app.config_draft.as_mut() {
+        d.base_url = super::InputState::new("https://typed.example");
+        d.api_key = super::InputState::new("sk-typed-key-0123");
+    }
+    super::handle_key(&mut app, alt_digit('8'));
+    super::handle_key(&mut app, alt_digit('4'));
+    assert!(
+        app.config_draft.is_none() && app.new_account_draft.is_some(),
+        "precondition: the form is suspended at rest"
+    );
+    let api_key_row = |rows: &[String]| -> String {
+        rows.iter()
+            .find(|r| r.contains("api key"))
+            .cloned()
+            .unwrap_or_else(|| panic!("an api key row renders: {rows:#?}"))
+    };
+    let at_rest = b3_detail_inner(&app);
+    assert_eq!(
+        api_key_row(&at_rest),
+        "api key         ••••••••",
+        "the at-rest api key row shows the mask alone: {at_rest:#?}"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.config_draft.is_some(),
+        "precondition: ⏎ descends and restores the form"
+    );
+    let descended = b3_detail_inner(&app);
+    let row = api_key_row(&descended);
+    assert!(
+        row.contains("••••••••") && !row.contains("typed") && !row.contains("0123"),
+        "the descended api key row shows the mask and no part of the key: {row:?}"
+    );
+}
+
+/// R13-2: the `a` menu on Setup's `+ new` names the form it acts on at rest as
+/// it does descended: the suspended draft's name, the one the pane shows.
+#[test]
+fn the_new_forms_action_menu_names_the_suspended_form_at_rest() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 0);
+    if let Some(d) = app.config_draft.as_mut() {
+        d.name = super::InputState::new("fresh-one");
+    }
+    assert_eq!(
+        super::build_action_menu(&app).context.as_deref(),
+        Some("fresh-one"),
+        "precondition: the descended form's menu names it"
+    );
+    super::handle_key(&mut app, alt_digit('8'));
+    super::handle_key(&mut app, alt_digit('4'));
+    assert!(
+        app.config_draft.is_none() && app.new_account_draft.is_some(),
+        "precondition: the form is suspended at rest"
+    );
+    assert_eq!(
+        super::build_action_menu(&app).context.as_deref(),
+        Some("fresh-one"),
+        "the at-rest menu names the suspended form"
+    );
+}
+
+/// R12-1: a Services `+ new profile` mint form suspended at rest previews its
+/// gateway base url (never `—`) and keeps the read-only `minted on save` api
+/// key row the descended form shows.
+#[test]
+fn a_suspended_services_mint_form_previews_its_gateway_base_url_at_rest() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 0);
+    let record = app
+        .services
+        .shunt_record
+        .clone()
+        .expect("precondition: an adopted gateway record");
+    let bind = crate::gateway::displayed_gateway_bind(&record).expect("the gateway bind");
+    let url = crate::gateway::gateway_base_url(&record).expect("the gateway base url");
+    if let Some(d) = app.config_draft.as_mut() {
+        d.base_url = super::InputState::new(&url);
+        d.mint_for = Some(super::TokenMint {
+            record,
+            bind,
+            require: false,
+        });
+    }
+    assert!(
+        app.config_draft.as_ref().is_some_and(|d| d.mint_armed()),
+        "precondition: the mint form's api key row is read-only"
+    );
+    super::handle_key(&mut app, alt_digit('8'));
+    super::handle_key(&mut app, alt_digit('4'));
+    assert!(
+        app.config_draft.is_none() && app.new_account_draft.is_some(),
+        "precondition: the mint form is suspended at rest"
+    );
+    let rows = b3_detail_inner(&app);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("base url") && r.contains(url.as_str())),
+        "the at-rest preview shows the gateway base url, never `—`: {rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("minted on save")),
+        "the at-rest preview keeps the mint form's read-only api key row: {rows:#?}"
+    );
+}
+
+/// Move `profiles.toml`'s mtime so the next tick reloads the roster.
+fn b3_move_reload_fingerprint() {
+    let path = crate::profile::clauth_dir()
+        .expect("state dir")
+        .join("profiles.toml");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+    );
+}
+
+/// R11-2 + R11-3: a tick reload while the shunt `+ new` form is open keeps the
+/// selection on `+ new`, and ⏎ on its disabled `+ login` stays inert.
+#[test]
+fn a_reload_under_an_open_shunt_form_keeps_it_and_its_inert_login() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 3);
+    if let Some(d) = app.config_draft.as_mut() {
+        d.name = super::InputState::new("pool-two");
+    }
+    b3_move_reload_fingerprint();
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::New,
+        "the reload keeps Setup's selection on `+ new`"
+    );
+    app.shunt_add_disabled = Some("the shunt gateway is not running".into());
+    app.config_action_cursor = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Login)
+        .expect("the shunt form's `+ login` row");
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.shunt_paste.is_none() && app.pool_mutation_row.is_none(),
+        "⏎ on the disabled `+ login` starts no add after the reload"
+    );
+}
+
+/// R11-3: a tick reload keeps Setup's `+ new` selection whether the form is
+/// open (a claude draft here) or the selector merely rests on `+ new`.
+#[test]
+fn a_reload_keeps_setups_new_selection_open_or_at_rest() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 0);
+    b3_move_reload_fingerprint();
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::New,
+        "an open claude `+ new` form keeps its selection across a reload"
+    );
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Profiles,
+        "precondition: the selector rests on `+ new`"
+    );
+    b3_move_reload_fingerprint();
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::New,
+        "a selector resting on `+ new` keeps it across a reload"
+    );
 }

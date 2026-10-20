@@ -449,6 +449,12 @@ pub(crate) enum FallbackRow {
 /// trailing `+ add env` row. Both appear only for existing accounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigRow {
+    /// The `+ new` form's account-type cycle (`claude` / `codex` / `shunt`).
+    /// Only on a fresh form; an existing account keeps its read-only
+    /// `type  oauth|api` line instead.
+    Type,
+    /// The shunt form's `family` cycle (`claude` / `codex` / `antigravity`).
+    Family,
     Name,
     /// OAuth-only auto-start toggle. `config_rows` renders it in the second
     /// slot (right below `Name`); declared here so the enum tracks that order.
@@ -536,6 +542,49 @@ impl ConfigRow {
 /// The `model` row alias cycle (space advances it). `None` renders as `default`
 /// (no `model` key); a custom id set via ⏎ is outside this list.
 pub(crate) const MODEL_PRESETS: [&str; 5] = ["fable", "opus", "sonnet", "haiku", "opusplan"];
+
+/// The `+ new` form's account type: which harness the form creates for, picked
+/// on the `type` cycle row (`claude` / `codex` / `shunt`). `n` presets it from
+/// the Overview cursor's section; any other tab opens on claude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum NewAccountType {
+    #[default]
+    Claude,
+    Codex,
+    Shunt,
+}
+
+impl NewAccountType {
+    /// The cycle-row label.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            NewAccountType::Claude => "claude",
+            NewAccountType::Codex => "codex",
+            NewAccountType::Shunt => "shunt",
+        }
+    }
+
+    /// The next value `space` cycles to, wrapping.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            NewAccountType::Claude => NewAccountType::Codex,
+            NewAccountType::Codex => NewAccountType::Shunt,
+            NewAccountType::Shunt => NewAccountType::Claude,
+        }
+    }
+
+    /// The Overview cursor's section, as `n` presets it: a claude row → claude,
+    /// a codex row → codex, a pool row → shunt. No item (an empty harness) and
+    /// any other context fall back to claude.
+    pub(crate) fn from_main_item(item: Option<MainItemKind>) -> Self {
+        match item {
+            Some(MainItemKind::Profile(_)) => NewAccountType::Claude,
+            Some(MainItemKind::Codex(_)) => NewAccountType::Codex,
+            Some(MainItemKind::Shunt(..)) => NewAccountType::Shunt,
+            None => NewAccountType::Claude,
+        }
+    }
+}
 
 /// The codex detail pane's focusable action rows, in render order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -836,6 +885,16 @@ pub(crate) struct ConfigDraft {
     /// client token on `create account` (only while the base url still names
     /// the gateway). Dropped with the draft, so a cancelled form mints nothing.
     pub(crate) mint_for: Option<TokenMint>,
+    /// The `+ new` form's account type (the `type` cycle row).
+    pub(crate) account_type: NewAccountType,
+    /// The shunt form's `family` cycle row's pick.
+    pub(crate) family: crate::gateway_admin::PoolFamily,
+    /// A refusal shown on the name row's `└` line (a codex name held by either
+    /// roster). Set at press time; cleared when the name or the type changes.
+    pub(crate) name_refusal: Option<String>,
+    /// A refusal shown on the create row's `└` line (a codex create with
+    /// nothing staged).
+    pub(crate) create_refusal: Option<String>,
 }
 
 impl ConfigDraft {
@@ -878,6 +937,8 @@ impl ConfigDraft {
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
             ConfigRow::AutoStart
+            | ConfigRow::Type
+            | ConfigRow::Family
             | ConfigRow::ModelOverrideAdd
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
@@ -906,6 +967,8 @@ impl ConfigDraft {
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
             ConfigRow::AutoStart
+            | ConfigRow::Type
+            | ConfigRow::Family
             | ConfigRow::ModelOverrideAdd
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
@@ -919,6 +982,14 @@ impl ConfigDraft {
         })
     }
 
+    /// Whether `apply preset` may act on this `+ new` draft: the form's
+    /// `type` is `claude`. The codex and shunt forms carry no endpoint or
+    /// model rows, so a preset stamped there edits fields the form never
+    /// shows. The one predicate the action-menu offer and the apply share.
+    pub(crate) fn apply_preset_armed(&self) -> bool {
+        self.account_type == NewAccountType::Claude
+    }
+
     /// Whether this draft will mint a client token on `create account`: the
     /// `+ new profile` picker seeded a gateway marker, the base-url buffer
     /// still names that gateway's bind ([`crate::gateway::url_names_bind`]),
@@ -927,7 +998,8 @@ impl ConfigDraft {
     /// instead. The one predicate the render's read-only key row, the footer
     /// and the save share, so they can never disagree.
     pub(crate) fn mint_armed(&self) -> bool {
-        !matches!(self.captured_login, Some(DraftLogin::LiveLogin(_)))
+        self.account_type == NewAccountType::Claude
+            && !matches!(self.captured_login, Some(DraftLogin::LiveLogin(_)))
             && self.mint_for.as_ref().is_some_and(|mint| {
                 crate::gateway::url_names_bind(self.base_url.value.trim(), &mint.bind)
             })
@@ -961,12 +1033,18 @@ impl ConfigDraft {
 
 /// What a `+ new` draft's stash holds: the browser mint `+ login` finished
 /// with, or the live login `+ capture current login` snapshotted off
-/// `~/.claude/.credentials.json`. One slot — the second stash source replaces
-/// the first, gated on a confirm.
+/// `~/.claude/.credentials.json`, or the codex form's mint / capture. One slot
+/// — a second stash source replaces the first, gated on a confirm.
 #[derive(Debug, Clone)]
 pub(crate) enum DraftLogin {
     Mint(Box<crate::oauth_login::LoginOutcome>),
     LiveLogin(Box<CaptureSnapshot>),
+    /// The codex `+ login` browser flow's minted chain, staged until
+    /// `create account` lands it through [`crate::actions::land_codex_login`].
+    CodexMint(Box<crate::codex_login::CodexLoginOutcome>),
+    /// The codex `+ capture current login` marker: `create account` moves the
+    /// operator's own login through [`crate::actions::codex_login_capture`].
+    CodexCapture,
 }
 
 #[derive(Debug, Clone)]
@@ -1148,6 +1226,9 @@ pub(crate) enum ConfirmAction {
     /// Setup `+ new` draft: `+ capture current login` pressed while a browser
     /// mint is already stashed. Confirm, then stash the snapshot in its place.
     CaptureOverMintStash(Box<CaptureSnapshot>),
+    /// Setup `+ new` draft: `space` on the `type` cycle while a staged login is
+    /// held. Confirm, then change the type (dropping the staged login).
+    CycleAccountType(NewAccountType),
     /// Delete row on a profile with a live `clauth start` session: the unforced
     /// guard in `delete_profile` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
@@ -4021,6 +4102,10 @@ pub(crate) struct CodexLoginSession {
     pub(crate) generation: u64,
     pub(crate) url: Option<String>,
     pub(crate) cancel: crate::codex_login::LoginCancel,
+    /// `true` for a `+ new` form login (staged by `create account`), `false`
+    /// for a re-login of an existing account (lands itself). Only the former
+    /// counts as staged for the type-cycle confirm.
+    pub(crate) is_new: bool,
 }
 
 /// The codex browser login the `re-login` worker runs: the announce callback
@@ -4032,11 +4117,40 @@ pub(crate) type CodexLoginWorker =
         &crate::codex_login::LoginCancel,
     ) -> std::result::Result<crate::codex_login::CodexLoginOutcome, String>;
 
-/// The paste half of an OAuth login: the links `c` copies and a paste is
+/// The paste half of an OAuth login: the link `c` copies and a paste is
 /// checked against, and the sender a parsed code goes down to the worker.
+/// The shunt add reuses the login modal's shell with its own raw door
+/// ([`App::shunt_paste`]), so this struct keeps its OAuth-only shape.
 pub(crate) struct PasteDoor {
     pub(crate) links: crate::oauth_login::LoginLinks,
     pub(crate) tx: std::sync::mpsc::Sender<crate::oauth_login::ManualCode>,
+}
+
+/// The shunt add's raw paste door: the pasted string relays VERBATIM to
+/// `complete_pool_account` (shunt holds the PKCE state; clauth never parses
+/// it). `sent` flips once a paste went down the door, so the modal's `p` hint
+/// hides after the one paste this add accepts. Stored beside [`App::login`] —
+/// which carries the claude login modal's shell — so [`LoginSession`]/[`PasteDoor`]
+/// keep their OAuth-only shapes.
+pub(crate) struct ShuntPasteDoor {
+    pub(crate) tx: std::sync::mpsc::Sender<String>,
+    /// The worker's cancel signal: dropping the door (a cancel) sets this
+    /// flag, which the worker reads. Kept off the paste channel so the
+    /// worker's `recv` stays that channel's only consumer — a cancel probe on
+    /// the paste channel would swallow a code pasted before the blocking wait.
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) sent: bool,
+    /// The add's `(family, name)`: the identity the result clears the guard
+    /// marker by, carried on the door so the drain reads it even on the error
+    /// path where the outcome holds nothing.
+    pub(crate) family: crate::gateway_admin::PoolFamily,
+    pub(crate) name: crate::gateway_admin::ShuntAccountName,
+}
+
+impl Drop for ShuntPasteDoor {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
 }
 
 impl LoginSession {
@@ -4067,11 +4181,21 @@ pub(crate) enum LoginStage {
     Verifying,
 }
 
-/// Worker→UI login channel payload: the console login's announced URL, or a
-/// stage bump (the first of which names the door that delivered the code).
+/// Worker→UI login channel payload: the console login's announced URL, a stage
+/// bump (the first of which names the door that delivered the code), or the
+/// shunt add's commit point (see [`LoginEvent::ShuntCommitted`]).
 pub(crate) enum LoginEvent {
     Url(String),
     Stage(LoginStage),
+    /// The shunt add reached its commit point: `complete_pool_account` is
+    /// being sent. Carries the add's `(family, name)` — the identity its guard
+    /// marker holds — so a late result clears only its own marker, never a
+    /// later pool action's. Tracked so a cancelled session still drains the
+    /// committed complete's outcome (the codex N1 rule).
+    ShuntCommitted(
+        crate::gateway_admin::PoolFamily,
+        crate::gateway_admin::ShuntAccountName,
+    ),
 }
 
 /// What a finished login worker produced. Both flows (the two-door OAuth
@@ -4086,6 +4210,26 @@ pub(crate) enum LoginEvent {
 pub(crate) enum LoginResult {
     Oauth(Box<crate::oauth_login::LoginOutcome>),
     Console(Box<crate::alibaba_login::ConsoleLoginOutcome>),
+    Shunt(Box<ShuntLoginOutcome>),
+}
+
+/// A shunt add's identity: its login generation and the `(family, name)` its
+/// guard marker holds. A finished add clears the guard only when the marker
+/// still equals this identity — never a later pool action's — and only this
+/// generation's committed slot.
+#[derive(Clone)]
+pub(crate) struct ShuntAddIdentity {
+    pub(crate) generation: u64,
+    pub(crate) family: crate::gateway_admin::PoolFamily,
+    pub(crate) name: crate::gateway_admin::ShuntAccountName,
+}
+
+/// A finished shunt pool-account add: the account's `(family, name)`, for the
+/// success toast and the pending landing. shunt's `live` bool is its own;
+/// clauth only toasts the add.
+pub(crate) struct ShuntLoginOutcome {
+    pub(crate) name: String,
+    pub(crate) family: crate::gateway_admin::PoolFamily,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -4290,6 +4434,12 @@ pub(crate) struct App {
     /// What the preset picker's open did to the Setup pane, so a cancel of the
     /// pick sequence can reverse it losslessly.
     pub(crate) preset_picker_open: PresetPickerOpen,
+    /// Set by [`App::reload_if_state_changed`] before the swap: Setup's
+    /// selection was `+ new` before the reload, so the tick's clamp keeps it
+    /// on the trailing row (a reload that moves the roster must never demote
+    /// `+ new` onto the last account). Read once by the tick, never by the
+    /// tab-switch or delete clamps.
+    pub(crate) reload_was_on_new: bool,
     /// Cursor into `chain_items()` on the Fallback left pane.
     pub(crate) chain_cursor: usize,
     /// Which Fallback pane has focus.
@@ -4336,6 +4486,22 @@ pub(crate) struct App {
 
     /// In-flight login worker of any method (Setup tab); `None` when idle.
     pub(crate) login: Option<LoginSession>,
+    /// The shunt add's raw paste door, `Some` while a shunt `+ login` is in
+    /// flight. Lives beside [`App::login`] (the claude modal's shell) so the
+    /// OAuth `LoginSession`/`PasteDoor` shapes stay unchanged.
+    pub(crate) shunt_paste: Option<ShuntPasteDoor>,
+    /// The shunt add whose commit point the worker reached
+    /// (`complete_pool_account` sent). Set off the
+    /// [`LoginEvent::ShuntCommitted`] event, cleared in [`finish_shunt_add`], so
+    /// a cancelled session still drains the committed complete's outcome, and
+    /// carrying the add's identity so that late result clears only its own
+    /// guard marker.
+    pub(crate) shunt_add_committed: Option<ShuntAddIdentity>,
+    /// A pre-commit-cancelled add whose worker has not reported yet. Set by the
+    /// cancel (which holds the guard until then, R3-3), cleared when the
+    /// worker's report drains. Carries the identity so a stale result from an
+    /// older login never releases a newer add's guard.
+    pub(crate) shunt_add_cancelled: Option<ShuntAddIdentity>,
     /// What the login modal's `c` hands the hosted link to: OSC 52 on the
     /// terminal's stdout. Replaceable so a test keeps the escape off the
     /// terminal running the suite, which would take the fixture's link onto
@@ -4365,12 +4531,46 @@ pub(crate) struct App {
         std::sync::mpsc::Receiver<(u64, String, std::result::Result<String, String>)>,
     pub(crate) codex_login_result_tx:
         std::sync::mpsc::Sender<(u64, String, std::result::Result<String, String>)>,
+    /// The `+ new` form's codex `+ login` result: the minted chain (staged,
+    /// never landed) or its error sentence, keyed by generation so a cancelled
+    /// login's late result is dropped.
+    pub(crate) codex_new_login_result_rx: std::sync::mpsc::Receiver<(
+        u64,
+        std::result::Result<crate::codex_login::CodexLoginOutcome, String>,
+    )>,
+    pub(crate) codex_new_login_result_tx: std::sync::mpsc::Sender<(
+        u64,
+        std::result::Result<crate::codex_login::CodexLoginOutcome, String>,
+    )>,
     /// The codex browser login the `re-login` worker runs. A plain fn field so
     /// a test swaps in a hermetic stand-in that never binds codex's loopback
     /// ports or opens a browser (the `SchedulerState.fetcher` field precedent).
     /// The non-test worker always runs [`codex_login::login_with`].
     #[cfg(test)]
     pub(crate) codex_login_worker: CodexLoginWorker,
+    /// The browser-open the shunt add's worker runs. A plain fn field so a test
+    /// swaps in a stand-in that never opens a browser (the `codex_login_worker`
+    /// precedent). The non-test worker always runs [`crate::platform::open_url`].
+    #[cfg(test)]
+    pub(crate) open_url_worker: fn(&str) -> anyhow::Result<()>,
+    /// A logline capture the shunt add's worker installs inside itself before
+    /// running, so a test can pin that the WORKER thread's lines never carry the
+    /// paste (a capture installed on the test thread alone sees nothing the
+    /// worker raises — the `drive_fallback_ticks` install-inside-the-thread
+    /// shape). `None` outside the tests that own one.
+    #[cfg(test)]
+    pub(crate) log_capture: Option<crate::logline::LogLines>,
+    /// A panic the shunt add's worker raises before running its job, so a test
+    /// can pin that a panicking add still lands a failure and never sticks the
+    /// guard (the `PoolJob::Panic` seam's twin). `false` outside that test.
+    #[cfg(test)]
+    pub(crate) shunt_add_panic: bool,
+    /// A seam the shunt add's worker parks on after it announces the URL and
+    /// before its `recv` waits for the paste. A test arms it with a receiver
+    /// whose sender it drops to release, so a paste can land in that window
+    /// deterministically. `None` outside the tests that own one.
+    #[cfg(test)]
+    pub(crate) shunt_add_paste_seam: Option<std::sync::mpsc::Receiver<()>>,
 
     /// Claude status feed state; UI-thread-only (no shared lock).
     pub(crate) status: StatusState,
@@ -4633,9 +4833,29 @@ pub(crate) struct App {
     pub(crate) shunt_pool: ShuntPool,
     /// The worker running [`shunt_pool_probe`]; `prober` is `None` under test.
     pub(crate) shunt_pool_probe: ProbeWorker<ShuntPool>,
+    /// The shunt form's `+ login` disabled reason, computed on the tick (the
+    /// [`Self::unsaved_live_login`] precedent), never on the render path. `None`
+    /// while the add is available; the read-error rungs carry the error through
+    /// `escape_control`, so the value is a `String`, not a `&'static str`.
+    pub(crate) shunt_add_disabled: Option<String>,
+    /// Whether the operator's own codex login is capturable right now, computed
+    /// on the tick like [`Self::shunt_add_disabled`]. The codex form's
+    /// `+ capture current login` row's visibility reads this cache, never the
+    /// capture's disk reads, on the render path.
+    pub(crate) codex_operator_capturable: bool,
+    /// The pool account a finished add should land Setup and the Overview on,
+    /// resolved by [`land_pending_pool_add`] once a re-read publishes it. Held
+    /// as `(family, name)` so the landing matches the provider whose auth maps
+    /// to that family, never a same-named account in another family. Dropped by
+    /// any selection change and by the first read that does not hold it.
+    pub(crate) pending_pool_landing: Option<(crate::gateway_admin::PoolFamily, String)>,
     /// Throttle for the per-tick pool re-read while the Overview or Setup tab
     /// shows.
     last_shunt_pool_refresh: Option<Instant>,
+    /// Throttle for the per-tick form-predicate re-read
+    /// ([`Self::refresh_form_predicates`]); `None` means un-sampled, which the
+    /// poll reads as due.
+    last_form_predicates_refresh: Option<Instant>,
     /// The account `(family, name)` a remove/refresh worker is acting on;
     /// `None` while none runs. Every row whose provider maps to that family and
     /// whose name matches renders a braille spinner in its marker slot while
@@ -4952,6 +5172,7 @@ impl App {
         let (pool_mutation_tx, pool_mutation_rx) = std::sync::mpsc::channel();
         let (codex_login_url_tx, codex_login_url_rx) = std::sync::mpsc::channel();
         let (codex_login_result_tx, codex_login_result_rx) = std::sync::mpsc::channel();
+        let (codex_new_login_result_tx, codex_new_login_result_rx) = std::sync::mpsc::channel();
 
         // Seed the token cache and the live tally before `config` moves into the
         // handle below.
@@ -5067,6 +5288,7 @@ impl App {
             config_draft: None,
             new_account_draft: None,
             preset_picker_open: PresetPickerOpen::None,
+            reload_was_on_new: false,
             chain_cursor: 0,
             toasts: VecDeque::new(),
             compact: false,
@@ -5074,6 +5296,9 @@ impl App {
             update_results,
             update_handle,
             login: None,
+            shunt_paste: None,
+            shunt_add_committed: None,
+            shunt_add_cancelled: None,
             clipboard: crate::platform::copy_to_clipboard_osc52,
             login_generation: 0,
             login_event_rx,
@@ -5086,10 +5311,20 @@ impl App {
             codex_login_url_tx,
             codex_login_result_rx,
             codex_login_result_tx,
+            codex_new_login_result_rx,
+            codex_new_login_result_tx,
             #[cfg(test)]
             codex_login_worker: |_announce, _cancel| {
                 Err("test seam: no real codex browser login".to_string())
             },
+            #[cfg(test)]
+            open_url_worker: crate::platform::open_url,
+            #[cfg(test)]
+            log_capture: None,
+            #[cfg(test)]
+            shunt_add_panic: false,
+            #[cfg(test)]
+            shunt_add_paste_seam: None,
             status: StatusState::default(),
             status_events,
             status_refresh,
@@ -5179,7 +5414,11 @@ impl App {
             last_codex_rows_refresh: Some(Instant::now()),
             shunt_pool: ShuntPool::default(),
             shunt_pool_probe: ProbeWorker::new(shunt_pool_probe),
+            shunt_add_disabled: None,
+            codex_operator_capturable: false,
+            pending_pool_landing: None,
             last_shunt_pool_refresh: None,
+            last_form_predicates_refresh: None,
             pool_mutation_row: None,
             pool_mutation_kind: None,
             pool_mutation_rx,
@@ -5190,6 +5429,7 @@ impl App {
         // the construction seed and every later poll agree on the width hold.
         app.set_tps(tps);
         app.refresh_unsaved_live_login();
+        app.refresh_form_predicates();
         let rebind_form = {
             let config = app.config();
             Self::startup_rebind_form(&config)
@@ -6030,6 +6270,34 @@ impl App {
         });
     }
 
+    /// Refresh the two form predicates the render path reads from the cache —
+    /// the shunt `+ login`'s disabled reason and the operator-codex
+    /// capturable flag. Computed on the tick (never per frame), the
+    /// [`Self::unsaved_live_login`] precedent: each is a handful of disk reads
+    /// the render path must not make.
+    pub(crate) fn refresh_form_predicates(&mut self) {
+        self.shunt_add_disabled = shunt_add_disabled_reason();
+        self.codex_operator_capturable = crate::actions::codex_operator_login_capturable();
+    }
+
+    /// The one predicate for whether the shunt form's `+ login` is disabled:
+    /// live while this form's own add is in flight (its raw paste door is
+    /// open, the same identity ⏎ reopens by), and `None` off the shunt form
+    /// (the selection is not Setup's `+ new`, or the draft's type is not
+    /// shunt) — so a claude or codex `+ new` login and an existing account's
+    /// re-login never inherit the shunt reason. Else the tick's cached reason.
+    /// The render (the row's faint style and its `└` reason), the footer hints
+    /// and ⏎ in `start_shunt_add` all read this, so they can never disagree.
+    pub(crate) fn shunt_login_disabled(&self) -> Option<String> {
+        if self.shunt_paste.is_some() {
+            return None;
+        }
+        if !new_account_type_is_shunt(self) {
+            return None;
+        }
+        self.shunt_add_disabled.clone()
+    }
+
     /// Reload config if state mtime changed. Returns true on reload.
     pub(crate) fn reload_if_state_changed(&mut self) -> bool {
         let current = reload_fingerprint();
@@ -6037,6 +6305,12 @@ impl App {
             return false;
         }
         if let Ok(fresh) = load_config() {
+            // Capture Setup's selection BEFORE the swap, so the tick's clamp
+            // can keep `+ new` on the trailing row even when the roster moved
+            // (a post-swap cursor read cannot tell `+ new` from a deleted last
+            // account). The delete and tab-switch clamps never read this flag.
+            self.reload_was_on_new =
+                self.tab == Tab::Setup && self.setup_selection() == SetupSelection::New;
             let profile_names: Vec<ProfileName> =
                 fresh.profiles.iter().map(|p| p.name.clone()).collect();
             *self.config() = fresh;
@@ -6562,6 +6836,9 @@ impl App {
     /// identity (`setup_remembered`).
     fn place_setup_selection(&mut self, pos: usize) {
         self.setup_remembered = None;
+        // A selection change drops a pending pool landing: the user moved on,
+        // so the re-read must not yank Setup onto the added row.
+        self.pending_pool_landing = None;
         match self.setup_items().get(pos) {
             Some(item @ (MainItemKind::Codex(_) | MainItemKind::Shunt(..))) => {
                 if let Some(identity) = self.setup_item_for(*item) {
@@ -6795,6 +7072,9 @@ impl App {
             // A selection change on another tab replaces a held-but-hidden
             // Setup identity: the read must not restore it over this pick.
             self.setup_remembered = None;
+            // And drops a pending pool landing: the user moved on, so the
+            // re-read must not yank the Overview onto the added row.
+            self.pending_pool_landing = None;
         }
     }
 }
@@ -7204,7 +7484,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     // footer whose login line never yields to the armed alert. Sits BELOW the
     // editor captures so typing a literal `q` into a field can't cancel.
     if app.login.is_some() && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-        app.login = None;
+        // A shunt add holds the pool-action guard until its result: a cancel
+        // BEFORE the commit point (no paste sent) cancels the add (the guard
+        // releases once the worker reports, R3-3); a cancel AFTER the paste is
+        // sent only closes the modal and the login line — the door, the guard
+        // and the committed slot stay, and the complete runs to its result.
+        cancel_open_login(app, true);
         app.toast(ToastKind::Info, "login canceled");
         return;
     }
@@ -13677,9 +13962,12 @@ fn pool_probe() -> PoolOutcome {
 /// The Overview shunt section's prober: reload the record and read the typed
 /// pool listing. `Absent` with no adopted gateway, with a config whose admin
 /// entry clauth cannot read (no `[server.admin]`/clauth entry, or a missing
-/// admin token file: the Services card offers the fix, never an error heading),
-/// `NotRead("the gateway is not running")` when the status feed does not show it
-/// healthy (no request is made), else the listing or the error's `Display`.
+/// admin token file: the Services card offers `f  add admin table` / `f  add
+/// admin key` for the first two and, while the gateway runs, reads
+/// `pool  no gateway admin token` for a missing token file — never an error
+/// heading), `NotRead("the gateway is not running")` when the status feed does
+/// not show it healthy (no request is made), else the listing or the error's
+/// `Display`.
 fn shunt_pool_probe() -> ShuntPool {
     let Some(record) = crate::gateway::GatewayRecord::load().ok().flatten() else {
         return ShuntPool::Absent;
@@ -13950,9 +14238,95 @@ fn open_pool_remove_confirm(app: &mut App) {
 fn drain_shunt_pool_probe(app: &mut App) {
     if let Some(pool) = app.shunt_pool_probe.drain() {
         app.shunt_pool = pool;
+        land_pending_pool_add(app);
         app.place_overview_cursor();
         adopt_shunt_record(app, crate::gateway::GatewayRecord::load().ok().flatten());
     }
+}
+
+/// Land a finished pool add on the new pool row once the re-read publishes it:
+/// Setup's stored identity becomes the new account's `(provider, account)`, and
+/// the Overview's remembered row moves onto it. Kept pending until a read
+/// listing actually holds the account (shunt's store rescan can lag the add).
+/// Land Setup and the Overview on one item after a create: Setup adopts the
+/// item (its selector index cleared; the claude case passes `None` so the
+/// selector lists profiles at `profile_cursor`), the Overview's remembered row
+/// moves onto it, and the create form closes. One tail for all three creates,
+/// so they cannot drift.
+fn land_created_item(app: &mut App, setup_item: Option<SetupItem>, overview: MainItemKind) {
+    land_created_selection(app, setup_item, overview);
+    app.config_focus = ConfigFocus::Profiles;
+    app.config_draft = None;
+}
+
+/// The shared "land Setup + Overview on one item" tail, split from
+/// [`land_created_item`] so the pool add can close its form conditionally: only
+/// the form that started the add closes, and only while it is still the open,
+/// unchanged shunt form.
+fn land_created_selection(app: &mut App, setup_item: Option<SetupItem>, overview: MainItemKind) {
+    app.setup_item = setup_item;
+    app.setup_item_index = None;
+    app.setup_remembered = None;
+    app.overview_remembered = Some(overview);
+}
+
+/// Land a finished pool add on the new pool row once the re-read publishes it:
+/// Setup's stored identity becomes the new account's `(provider, account)`, and
+/// the Overview's remembered row moves onto it. Dropped by the first read that
+/// does not hold the `(family, name)` — the re-read a landed add triggers
+/// should have it, and a miss means the add did not land.
+fn land_pending_pool_add(app: &mut App) {
+    let Some((family, name)) = app.pending_pool_landing.clone() else {
+        return;
+    };
+    let ShuntPool::Read(providers) = &app.shunt_pool else {
+        return;
+    };
+    let Some((pi, ai, provider)) = providers.iter().enumerate().find_map(|(pi, p)| {
+        // The provider whose auth maps to the added family, never a same-named
+        // account in another family (the `pool_mutation_row` mapping).
+        if p.auth.clone().family() != Some(family) {
+            return None;
+        }
+        p.accounts
+            .iter()
+            .position(|a| a.name == name)
+            .map(|ai| (pi, ai, p.name.clone()))
+    }) else {
+        app.pending_pool_landing = None;
+        return;
+    };
+    app.pending_pool_landing = None;
+    let setup_item = Some(SetupItem::Pool {
+        provider,
+        account: name.clone(),
+    });
+    let overview = MainItemKind::Shunt(pi, ai);
+    // Only the form that started the add closes on success, and only while it
+    // is still the open, unchanged shunt form: the type not cycled away, the
+    // name unedited. Setup's selection moves onto the new pool row only while
+    // Setup's detail pane holds no open draft or edit — else the landing moves
+    // only the Overview's remembered row, leaving Setup, the draft and its
+    // focus untouched (a destructive pool row would otherwise hijack the keys).
+    if shunt_form_open_unchanged(app, &name) {
+        land_created_selection(app, setup_item, overview);
+        app.config_focus = ConfigFocus::Profiles;
+        app.config_draft = None;
+    } else if app.config_draft.is_none() && app.config_focus == ConfigFocus::Profiles {
+        land_created_selection(app, setup_item.clone(), overview);
+    } else {
+        app.overview_remembered = Some(overview);
+    }
+}
+
+/// Whether the open draft is still the shunt form that started the add: type
+/// `Shunt` and the same typed name. The add captured both at start, so a type
+/// cycle or a name edit makes the form a different one the success must not
+/// close.
+fn shunt_form_open_unchanged(app: &App, name: &str) -> bool {
+    app.config_draft
+        .as_ref()
+        .is_some_and(|d| d.account_type == NewAccountType::Shunt && d.name.trimmed() == name)
 }
 
 /// Drain pool remove/refresh results: the toast, then a fresh pool read.
@@ -14002,6 +14376,331 @@ fn handle_pool_mutation_result(app: &mut App, result: PoolMutationResult) {
     app.shunt_pool_probe.restart();
 }
 
+/// The shunt form's `+ login` disabled reason, in the lead's order: no adopted
+/// gateway, the gateway not running, the config (or the admin token file it
+/// names) unreadable, no clauth admin key in the config, no admin token file.
+/// Derived from the same reads as [`shunt_pool_probe`] and the card's
+/// `admin_need` / token read — never a second parser. Cached on
+/// [`App::shunt_add_disabled`] by the tick, never read on the render path.
+pub(crate) fn shunt_add_disabled_reason() -> Option<String> {
+    let Some(record) = crate::gateway::GatewayRecord::load().ok().flatten() else {
+        return Some("no shunt gateway is adopted".to_string());
+    };
+    let (slot, _) = crate::daemon::gateway_slot(crate::daemon::daemon_health());
+    if slot.state != GatewayState::Healthy {
+        return Some("the shunt gateway is not running".to_string());
+    }
+    match crate::gateway::admin_need(record.config()) {
+        Ok(crate::gateway::AdminNeed::Neither) => {}
+        Ok(_) => return Some("the shunt config has no clauth admin key".to_string()),
+        Err(e) => {
+            return Some(format!(
+                "the shunt config could not be read: {}",
+                escape_control(&format!("{e}"))
+            ));
+        }
+    }
+    match crate::gateway::read_admin_token() {
+        Ok(_) => None,
+        Err(e) => match e.downcast_ref::<crate::gateway::ChatgptOauthProvidersError>() {
+            Some(crate::gateway::ChatgptOauthProvidersError::NoAdminToken) => {
+                Some("no gateway admin token".to_string())
+            }
+            _ => Some(format!(
+                "the shunt config could not be read: {}",
+                escape_control(&format!("{e}"))
+            )),
+        },
+    }
+}
+
+/// Move the detail cursor onto the `name` row, so a refusal stored there (by a
+/// press on another row) renders its `└` line immediately.
+fn focus_name_row(app: &mut App) {
+    if let Some(idx) = config_rows(app).iter().position(|r| *r == ConfigRow::Name) {
+        app.config_action_cursor = idx;
+    }
+}
+
+/// Raise the one "already in progress" Warning toast for a running login.
+/// Every site with a login in flight calls this for its copy, so the text
+/// cannot drift between surfaces; each caller keeps its own control flow
+/// (some still open their modal).
+fn toast_login_in_progress(app: &mut App, name: String) {
+    app.toast(
+        ToastKind::Warning,
+        format!("a login for '{name}' is already in progress"),
+    );
+}
+
+/// The name of any login in flight other than this form's own add — a claude
+/// one in [`App::login`] or a codex one in [`App::codex_login`]. The shunt
+/// `+ login` calls it only after its own add is ruled out, so either field
+/// here names a foreign login (a `+ new` login a type change kept running,
+/// or a re-login).
+fn other_login_in_flight(app: &App) -> Option<String> {
+    app.login
+        .as_ref()
+        .map(|s| s.name.clone())
+        .or_else(|| app.codex_login.as_ref().map(|s| s.name.clone()))
+}
+
+/// The one answer to "the `+ new` draft": the descended form in
+/// `config_draft` (a `+ new` form has no `editing_name`, the marker
+/// `suspend_source` and `start_new_account` already use), else the at-rest
+/// `new_account_draft` while the selection rests on `+ new`, else none. Every
+/// reader of the form's type and rows goes through this, so the preview, the
+/// predicates and ⏎ can never read different drafts. Call it before any
+/// config guard: its fallback branch re-runs `setup_selection`.
+pub(crate) fn new_form_draft(app: &App) -> Option<&ConfigDraft> {
+    if let Some(d) = app.config_draft.as_ref()
+        && d.editing_name.is_none()
+    {
+        return Some(d);
+    }
+    if app.setup_selection() == SetupSelection::New {
+        return app.new_account_draft.as_ref();
+    }
+    None
+}
+
+/// Whether the `+ new` form's type is claude — the form a preset's endpoint
+/// and model fields stamp. The draft is [`new_form_draft`]'s; only a form
+/// with no draft is the fresh form, which opens on claude. The one predicate
+/// the action-menu offer and the apply's re-check share.
+fn new_account_type_is_claude(app: &App) -> bool {
+    new_form_draft(app).is_none_or(|d| d.apply_preset_armed())
+}
+
+/// Whether the `+ new` form is the shunt form — the form whose `+ login` is
+/// the pool create. The draft is [`new_form_draft`]'s and its `account_type`
+/// must be `Shunt`; a form with no draft is the fresh form, which opens on
+/// claude. The one check [`App::shunt_login_disabled`] adds, so the disabled
+/// state reaches only the shunt form.
+fn new_account_type_is_shunt(app: &App) -> bool {
+    new_form_draft(app).is_some_and(|d| d.account_type == NewAccountType::Shunt)
+}
+
+/// `+ login` on the shunt form — the create. `add_pool_account` runs on a
+/// worker; its authorize URL opens in the browser and the claude login modal
+/// opens with its paste door (`r` open again, `c` copy link, `p` paste code).
+/// The pasted string relays VERBATIM to `complete_pool_account` on the worker.
+/// The add holds the one-pool-action guard for its whole life: refused while a
+/// refresh/remove runs, and a running add refuses a refresh, remove or second
+/// add. Its busy marker is the new account's `(family, name)`, cleared on its
+/// result and on cancel.
+fn start_shunt_add(app: &mut App) {
+    let typed = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.name.trimmed().to_string())
+        .unwrap_or_default();
+    // (1) This form's own add in flight: ⏎ reopens its modal, ahead of every
+    // refusal — the disabled reason, the name check and the guard each refuse
+    // only a NEW add. The add's own state is its raw paste door, set by this
+    // add and cleared with it, so an edited name still reopens.
+    if app.shunt_paste.is_some() {
+        open_login_modal(app);
+        return;
+    }
+    // (2) The disabled row is inert: whatever reason holds, ⏎ sends nothing,
+    // no toast, no modal.
+    if app.shunt_login_disabled().is_some() {
+        return;
+    }
+    // (3) Any other login in flight — a claude one in `app.login` or a codex
+    // one in `app.codex_login` (a `+ new` login a type change kept running,
+    // or a re-login) — gets the "already in progress" toast naming it and
+    // opens nothing from this row.
+    if let Some(name) = other_login_in_flight(app) {
+        toast_login_in_progress(app, name);
+        return;
+    }
+    let Some(name) = crate::gateway_admin::ShuntAccountName::new(&typed) else {
+        if let Some(d) = app.config_draft.as_mut() {
+            d.name_refusal = Some("name: lowercase a-z, 0-9 and - only".to_string());
+        }
+        focus_name_row(app);
+        return;
+    };
+    if app.pool_mutation_row.is_some() {
+        app.toast(
+            ToastKind::Info,
+            "a pool action is still running\nwait for it, then try again",
+        );
+        return;
+    }
+    let family = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.family)
+        .unwrap_or(crate::gateway_admin::PoolFamily::Claude);
+    // The disabled row's gate already holds; re-check defensively so an enabled
+    // row with a raced-away record sends nothing rather than panicking.
+    let Some(record) = crate::gateway::GatewayRecord::load().ok().flatten() else {
+        return;
+    };
+    let (paste_tx, paste_rx) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.login_generation += 1;
+    let generation = app.login_generation;
+    app.login = Some(LoginSession {
+        name: typed.clone(),
+        is_new: true,
+        generation,
+        url: None,
+        stage: LoginStage::WaitingBrowser,
+        method: LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
+    });
+    app.shunt_paste = Some(ShuntPasteDoor {
+        tx: paste_tx,
+        cancel: cancel.clone(),
+        sent: false,
+        family,
+        name: name.clone(),
+    });
+    app.pool_mutation_row = Some((family, name.clone()));
+    let event_tx = app.login_event_tx.clone();
+    let result_tx = app.login_result_tx.clone();
+    #[cfg(test)]
+    let open_url = app.open_url_worker;
+    #[cfg(not(test))]
+    let open_url = crate::platform::open_url;
+    #[cfg(test)]
+    let log_capture = app.log_capture.clone();
+    #[cfg(test)]
+    let panic_plant = app.shunt_add_panic;
+    #[cfg(test)]
+    let paste_seam = app.shunt_add_paste_seam.take();
+    spawn_worker(move || {
+        #[cfg(test)]
+        let _log_guard = log_capture.as_ref().map(|capture| capture.capture_here());
+        // A panic inside the job still lands a failure, so the guard marker
+        // never sticks (the `start_pool_mutation` precedent).
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if panic_plant {
+                panic!("test seam: the shunt add panicked");
+            }
+            crate::gateway_admin::add_pool_account(&record, family, &name).and_then(|add| {
+                // A cancel drops the door, setting the cancel flag. Check it
+                // before the browser opens so a cancel before the paste opens
+                // nothing. The paste channel is never read here: the `recv`
+                // below is its only consumer, so a code pasted before the wait
+                // is not swallowed by a cancel probe.
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!("login canceled"));
+                }
+                let _ = open_url(&add.authorize_url);
+                let _ = event_tx.send((generation, LoginEvent::Url(add.authorize_url)));
+                #[cfg(test)]
+                if let Some(seam) = paste_seam {
+                    // Park between the announce and the wait so a test can land
+                    // a paste in that window; the sender's drop releases this.
+                    let _ = seam.recv();
+                }
+                // A dropped door (cancel) disconnects the receiver.
+                let code = paste_rx
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("login canceled"))?;
+                // The pasted code is in flight: `ExchangingCode(Manual)` shows
+                // the "logging in with the code" stage while `complete` runs.
+                let _ = event_tx.send((
+                    generation,
+                    LoginEvent::Stage(LoginStage::ExchangingCode(LoginMethod::Manual)),
+                ));
+                // The commit point: `complete_pool_account` is sent next, so
+                // its outcome lands whatever the session does after (the codex
+                // N1 rule). The event carries the add's identity so a late
+                // result clears only its own guard marker.
+                let _ =
+                    event_tx.send((generation, LoginEvent::ShuntCommitted(family, name.clone())));
+                crate::gateway_admin::complete_pool_account(&record, family, &name, &code)
+                    .map(|_| ())
+            })
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("add failed")));
+        let _ = result_tx.send((
+            generation,
+            result
+                .map(|()| {
+                    LoginResult::Shunt(Box::new(ShuntLoginOutcome {
+                        name: typed.clone(),
+                        family,
+                    }))
+                })
+                .map_err(|e| format!("{e}")),
+        ));
+    });
+    open_login_modal(app);
+}
+
+/// The shunt add's outcome off the login result channel: a shunt add's worker
+/// only ever reports [`LoginResult::Shunt`] or an `Err`. Any other result kind
+/// is dropped with a named log line, never a panic (R4-1).
+fn shunt_add_outcome(
+    result: std::result::Result<LoginResult, String>,
+) -> Option<std::result::Result<ShuntLoginOutcome, String>> {
+    match result {
+        Ok(LoginResult::Shunt(outcome)) => Some(Ok(*outcome)),
+        Err(e) => Some(Err(e)),
+        Ok(other) => {
+            let kind = match other {
+                LoginResult::Oauth(_) => "oauth",
+                LoginResult::Console(_) => "console",
+                LoginResult::Shunt(_) => "shunt",
+            };
+            crate::logline::logline!("the shunt add drain dropped a {kind} login result");
+            None
+        }
+    }
+}
+
+/// Fold a finished shunt add into the app, success or committed-failure: clear
+/// the add's busy marker (only when it is still this add's own), then toast.
+/// Success also lands Setup + Overview on the new row once the re-read
+/// publishes it; a failure re-reads too, since the complete reached shunt and
+/// the listing may have moved either way.
+fn finish_shunt_add(
+    app: &mut App,
+    identity: &ShuntAddIdentity,
+    result: std::result::Result<ShuntLoginOutcome, String>,
+) {
+    // Clear the guard marker only when it is still this add's own: a late
+    // result must never wipe a later pool action's marker, and a committed
+    // failure after a cancel still releases the guard its add held.
+    if matches!(
+        &app.pool_mutation_row,
+        Some((family, name)) if *family == identity.family && name == &identity.name
+    ) {
+        app.pool_mutation_row = None;
+    }
+    if app
+        .shunt_add_committed
+        .as_ref()
+        .is_some_and(|committed| committed.generation == identity.generation)
+    {
+        app.shunt_add_committed = None;
+    }
+    match result {
+        Ok(outcome) => {
+            app.toast(ToastKind::Success, format!("added {}", outcome.name));
+            app.pending_pool_landing = Some((outcome.family, outcome.name.clone()));
+            // The re-read's result postdates the add; `land_pending_pool_add`
+            // then resolves the new row's (provider, account) and lands both.
+            // The draft itself closes there, only while it is still the form
+            // that started the add.
+            app.shunt_pool_probe.restart();
+        }
+        Err(e) => {
+            app.toast(ToastKind::Danger, escape_control(&e));
+            app.shunt_pool_probe.restart();
+        }
+    }
+}
+
 /// Re-read the pool listing for the Overview's shunt section, at most once
 /// every 10 s while the Overview tab shows. The read runs on a worker (it can
 /// block up to ~20 s), so the result lands through [`drain_shunt_pool_probe`].
@@ -14021,6 +14720,20 @@ fn poll_shunt_pool(app: &mut App) {
     }
     app.last_shunt_pool_refresh = Some(Instant::now());
     app.shunt_pool_probe.start();
+}
+
+/// Re-read the two form predicates the render path caches, at most once a
+/// second. They read config + small files on the tick, never per frame.
+fn poll_form_predicates(app: &mut App) {
+    const FORM_PREDICATES_INTERVAL: Duration = Duration::from_secs(1);
+    if app
+        .last_form_predicates_refresh
+        .is_some_and(|t| t.elapsed() < FORM_PREDICATES_INTERVAL)
+    {
+        return;
+    }
+    app.last_form_predicates_refresh = Some(Instant::now());
+    app.refresh_form_predicates();
 }
 
 /// The production action prober: run one confirmed shunt-card action to
@@ -15098,30 +15811,55 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
     }));
 }
 
+/// The outcome of landing a finished login into the live `+ new` draft.
+enum StashOutcome {
+    /// The stash landed; the cursor parked on `create account`.
+    Staged,
+    /// The `+ new` form is closed; nothing landed.
+    FormClosed,
+    /// The form's type no longer matches the stash's harness; dropped unused.
+    WrongType,
+}
+
+/// Which harness a stash belongs to, so a late login result stages only into a
+/// form whose type still matches it (a claude mint never lands in a codex or
+/// shunt form, and the reverse).
+fn draft_login_harness(stash: &DraftLogin) -> NewAccountType {
+    match stash {
+        DraftLogin::Mint(_) | DraftLogin::LiveLogin(_) => NewAccountType::Claude,
+        DraftLogin::CodexMint(_) | DraftLogin::CodexCapture => NewAccountType::Codex,
+    }
+}
+
 /// Land a login stash in the live `+ new` draft (`+ login`'s finished mint, or
 /// `+ capture current login`'s snapshot) and park the cursor on `create
-/// account`, the one step left. Returns `false` when the form was closed in
-/// between, so the caller can warn about the dropped round-trip.
-fn stash_new_form_login(app: &mut App, stash: DraftLogin) -> bool {
-    let stashed = match app
+/// account`, the one step left. [`StashOutcome::FormClosed`] when the form was
+/// closed in between; [`StashOutcome::WrongType`] when the form's type no
+/// longer matches the stash's harness — a late result the type cycle already
+/// moved past, dropped unused (the chain never written).
+fn stash_new_form_login(app: &mut App, stash: DraftLogin) -> StashOutcome {
+    let harness = draft_login_harness(&stash);
+    let Some(draft) = app
         .config_draft
         .as_mut()
         .filter(|d| d.editing_name.is_none())
-    {
-        Some(draft) => {
-            draft.captured_login = Some(stash);
-            true
-        }
-        None => false,
+    else {
+        return StashOutcome::FormClosed;
     };
-    if stashed
-        && let Some(idx) = config_rows(app)
-            .iter()
-            .position(|r| *r == ConfigRow::Create)
+    if draft.account_type != harness {
+        return StashOutcome::WrongType;
+    }
+    draft.captured_login = Some(stash);
+    // The stage it asked for lands: a stale "log in or capture first" refusal
+    // no longer describes the form.
+    draft.create_refusal = None;
+    if let Some(idx) = config_rows(app)
+        .iter()
+        .position(|r| *r == ConfigRow::Create)
     {
         app.config_action_cursor = idx;
     }
-    stashed
+    StashOutcome::Staged
 }
 
 // ── Chain screen ──────────────────────────────────────────────────────────────
@@ -17122,11 +17860,14 @@ fn handle_login_modal_key(app: &mut App, key: KeyEvent) {
         }
         // OSC 52 lands the link on the LOCAL terminal's clipboard, even over ssh.
         KeyCode::Char('c' | 'C') => {
-            let link = app
-                .login
-                .as_ref()
-                .and_then(LoginSession::open_door)
-                .map(|door| door.links.hosted_url.clone());
+            let link = if app.shunt_paste.is_some() {
+                app.login.as_ref().and_then(|s| s.url.clone())
+            } else {
+                app.login
+                    .as_ref()
+                    .and_then(LoginSession::open_door)
+                    .map(|door| door.links.hosted_url.clone())
+            };
             if let Some(link) = link {
                 match (app.clipboard)(&link) {
                     Ok(()) => app.toast(ToastKind::Info, "link copied to clipboard"),
@@ -17138,8 +17879,15 @@ fn handle_login_modal_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('p' | 'P') => {
+            let door_open = app.login.as_ref().is_some_and(|s| s.open_door().is_some())
+                || app.shunt_paste.as_ref().is_some_and(|s| {
+                    // The paste door opens only once the URL is announced (no
+                    // code can exist before the link) and no paste went down it
+                    // yet.
+                    !s.sent && app.login.as_ref().is_some_and(|l| l.url.is_some())
+                });
             if let Some(session) = app.login.as_mut()
-                && session.open_door().is_some()
+                && door_open
             {
                 session.paste_field = Some(InputState::new(""));
             }
@@ -17215,13 +17963,27 @@ fn submit_paste_code(app: &mut App) {
     let Some(session) = app.login.as_mut() else {
         return;
     };
-    let Some(raw) = session
-        .paste_field
-        .as_ref()
-        .map(|field| field.trimmed().to_string())
-    else {
+    let Some(field) = session.paste_field.as_ref() else {
         return;
     };
+    // The shunt add relays the pasted string VERBATIM (never parsed, never
+    // trimmed): a bad paste is shunt's to refuse on the exchange.
+    if let Some(shunt) = app.shunt_paste.as_mut() {
+        if field.value.is_empty() {
+            return;
+        }
+        // The door accepts a submit only once the URL is announced: no code can
+        // exist before the link. The `p` key gates the same way; this re-checks
+        // so a field opened before the announce can never send.
+        if session.url.is_none() {
+            return;
+        }
+        let _ = shunt.tx.send(field.value.clone());
+        shunt.sent = true;
+        session.paste_field = None;
+        return;
+    }
+    let raw = field.trimmed().to_string();
     if raw.is_empty() {
         return;
     }
@@ -17321,13 +18083,13 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                     }
                 }
             }
-            // `+ new` only: its draft is what a preset stamps.
+            // `+ new` only: its draft is what a preset stamps, and the offer
+            // gates on the one predicate the apply's re-check shares.
             SetupSelection::New => {
-                context = app
-                    .config_draft
-                    .as_ref()
-                    .and_then(|d| d.name.trimmed_some());
-                scoped.push(ApplyPreset);
+                context = new_form_draft(app).and_then(|d| d.name.trimmed_some());
+                if new_account_type_is_claude(app) {
+                    scoped.push(ApplyPreset);
+                }
             }
             // A codex or pool row gains nothing: its detail rows carry the
             // actions (re-login / delete account; refresh / remove).
@@ -18132,7 +18894,16 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                         app.setup_detail_total.get(),
                     );
                 }
-                KeyCode::Enter => run_config_row(app, rows[app.config_action_cursor]),
+                KeyCode::Enter => {
+                    let row = rows[app.config_action_cursor];
+                    // ⏎ mirrors space on the cycle rows: the `type` and `family`
+                    // rows advance; the `model` row keeps ⏎ for its custom field.
+                    match row {
+                        ConfigRow::Type => cycle_account_type(app),
+                        ConfigRow::Family => cycle_family(app),
+                        _ => run_config_row(app, row),
+                    }
+                }
                 KeyCode::Char('+' | '=')
                     if rows[app.config_action_cursor] == ConfigRow::BellThreshold =>
                 {
@@ -18145,12 +18916,14 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Char(' ') => {
                     let row = rows[app.config_action_cursor];
-                    // Space cycles the `model` alias in place; ⏎ opens its custom
-                    // field instead. Every other row treats space like ⏎.
-                    if row == ConfigRow::Model {
-                        cycle_model(app);
-                    } else {
-                        run_config_row(app, row);
+                    // Space cycles the `model` alias, the `+ new` form's `type`,
+                    // and the shunt form's `family` in place; ⏎ opens the model's
+                    // custom field instead. Every other row treats space like ⏎.
+                    match row {
+                        ConfigRow::Model => cycle_model(app),
+                        ConfigRow::Type => cycle_account_type(app),
+                        ConfigRow::Family => cycle_family(app),
+                        _ => run_config_row(app, row),
                     }
                 }
                 _ => {}
@@ -18411,10 +19184,7 @@ fn start_codex_login(app: &mut App, name: &str) {
         // A second ⏎ on `re-login` while one runs reopens its modal (the claude
         // precedent); only a different account names the running one.
         if session.name != name {
-            app.toast(
-                ToastKind::Warning,
-                format!("a login for '{}' is already in progress", session.name),
-            );
+            toast_login_in_progress(app, session.name.clone());
         }
         open_codex_login_modal(app);
         return;
@@ -18434,6 +19204,7 @@ fn start_codex_login(app: &mut App, name: &str) {
         generation,
         url: None,
         cancel: cancel.clone(),
+        is_new: false,
     });
     #[cfg(test)]
     let worker_fn = app.codex_login_worker;
@@ -18566,42 +19337,67 @@ fn push_override_rows(
     }
 }
 
-/// The `+ new` create-form rows: name, base url, the api key once a base url
-/// makes this an API account, the model rows, then `+ login` (OAuth mode) and
-/// the live-login capture, closing on `create account`.
+/// The `+ new` create-form rows, per the draft's account type. Claude keeps
+/// today's rows; codex offers `name`, `+ login`, `+ capture current login`
+/// (while the operator's codex login is capturable) and `create account`;
+/// shunt offers `family`, `name` and `+ login` (the create) — no `create
+/// account` row.
 fn new_account_rows(app: &App, draft: Option<&ConfigDraft>) -> Vec<ConfigRow> {
-    // The api key only means something once a base url makes this an API
-    // account, so it stays hidden until one is typed.
-    let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl];
-    if draft.is_some_and(|d| !d.base_url.value.trim().is_empty()) {
-        rows.push(ConfigRow::ApiKey);
+    let account_type = draft.map(|d| d.account_type).unwrap_or_default();
+    let mut rows = vec![ConfigRow::Type];
+    match account_type {
+        NewAccountType::Claude => {
+            rows.push(ConfigRow::Name);
+            rows.push(ConfigRow::BaseUrl);
+            // The api key only means something once a base url makes this an API
+            // account, so it stays hidden until one is typed.
+            if draft.is_some_and(|d| !d.base_url.value.trim().is_empty()) {
+                rows.push(ConfigRow::ApiKey);
+            }
+            // Env rows stay existing-account-only.
+            rows.push(ConfigRow::Model);
+            push_override_rows(&mut rows, draft, None);
+            if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
+                rows.push(ConfigRow::Login);
+            }
+            // The live-login capture row sits right below `+ login` and survives
+            // into api mode (`+ login` doesn't): a live setup can be an endpoint
+            // too. Hidden while the live login is saved or absent — nothing to
+            // capture.
+            if app.unsaved_live_login {
+                rows.push(ConfigRow::CaptureLogin);
+            }
+            rows.push(ConfigRow::Create);
+        }
+        NewAccountType::Codex => {
+            rows.push(ConfigRow::Name);
+            rows.push(ConfigRow::Login);
+            // Read off the tick's cache, never the capture's disk reads on the
+            // render path (the `unsaved_live_login` precedent).
+            if app.codex_operator_capturable {
+                rows.push(ConfigRow::CaptureLogin);
+            }
+            rows.push(ConfigRow::Create);
+        }
+        NewAccountType::Shunt => {
+            rows.push(ConfigRow::Family);
+            rows.push(ConfigRow::Name);
+            rows.push(ConfigRow::Login);
+        }
     }
-    // Env rows stay existing-account-only.
-    rows.push(ConfigRow::Model);
-    push_override_rows(&mut rows, draft, None);
-    if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
-        rows.push(ConfigRow::Login);
-    }
-    // The live-login capture row sits right below `+ login` and survives
-    // into api mode (`+ login` doesn't): a live setup can be an endpoint
-    // too. Hidden while the live login is saved or absent — nothing to
-    // capture.
-    if app.unsaved_live_login {
-        rows.push(ConfigRow::CaptureLogin);
-    }
-    rows.push(ConfigRow::Create);
     rows
 }
 
 /// Detail rows for the current selection. `+ new` → create form; account →
 /// settings (auto-start only for OAuth).
 pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
-    let draft = app.config_draft.as_ref();
-    // Resolve the selection BEFORE the config guard (see `build_snap`).
+    // Resolve the selection and the `+ new` draft BEFORE the config guard (see
+    // `build_snap`): both re-run `setup_selection` under their own short guard.
     let selection = app.setup_selection();
+    let new_draft = new_form_draft(app);
     let cfg = app.config();
     let profile_idx = match selection {
-        SetupSelection::New => return new_account_rows(app, draft),
+        SetupSelection::New => return new_account_rows(app, new_draft),
         SetupSelection::Item(MainItemKind::Profile(i)) => i,
         // The codex and pool detail panes render their own row lists; this is
         // never called for them.
@@ -18609,6 +19405,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
             return Vec::new();
         }
     };
+    let draft = app.config_draft.as_ref();
     let profile = cfg.profiles.get(profile_idx);
     // `is_api` tracks the base-url buffer live (draft wins): api key shows only
     // in API mode, auto-start (OAuth-only) only when it's empty, so both flip the
@@ -18712,6 +19509,22 @@ fn enter_config_detail(app: &mut App) {
 /// suspended form instead of building over it.
 fn start_new_account(app: &mut App) {
     disarm_switch(app);
+    // `n` presets the type from the Overview cursor's section; with nothing
+    // under the cursor it falls back on the visible filter (shunt → shunt,
+    // codex → codex, else claude); any other tab (Setup included) opens on
+    // claude. Read before the switch.
+    let preset = if app.tab == Tab::Overview {
+        match app.current_main_item() {
+            Some(item) => NewAccountType::from_main_item(Some(item)),
+            None => match app.harness_filter {
+                HarnessFilter::Shunt => NewAccountType::Shunt,
+                HarnessFilter::Codex => NewAccountType::Codex,
+                HarnessFilter::All | HarnessFilter::Claude => NewAccountType::Claude,
+            },
+        }
+    } else {
+        NewAccountType::Claude
+    };
     do_switch(app, Tab::Setup);
     app.setup_item = None;
     app.setup_item_index = None;
@@ -18726,11 +19539,15 @@ fn start_new_account(app: &mut App) {
         .is_some_and(|d| d.editing_name.is_none())
     {
         // Keep the suspended form, field open or not.
+    } else if let Some(draft) = app.new_account_draft.take() {
+        // A suspended form restores exactly as suspended: type, name and stage
+        // all kept (a switch suspends what it leaves). The section preset below
+        // applies only to a fresh form.
+        app.config_draft = Some(draft);
     } else {
-        app.config_draft = app
-            .new_account_draft
-            .take()
-            .or_else(|| Some(build_draft_new()));
+        let mut draft = build_draft_new();
+        draft.account_type = preset;
+        app.config_draft = Some(draft);
     }
     app.config_focus = ConfigFocus::Actions;
 }
@@ -18758,6 +19575,10 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         overrides_shown: Vec::new(),
         captured_login: None,
         mint_for: None,
+        account_type: NewAccountType::Claude,
+        family: crate::gateway_admin::PoolFamily::Claude,
+        name_refusal: None,
+        create_refusal: None,
     }
 }
 
@@ -18791,6 +19612,10 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         overrides_shown: Vec::new(),
         captured_login: None,
         mint_for: None,
+        account_type: NewAccountType::Claude,
+        family: crate::gateway_admin::PoolFamily::Claude,
+        name_refusal: None,
+        create_refusal: None,
     };
     draft.overrides_shown = draft.filled_overrides();
     draft
@@ -18930,8 +19755,35 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 _ => arm_action(app, ConfigRow::Delete),
             }
         }
-        ConfigRow::Create => commit_new_account(app),
+        ConfigRow::Create => {
+            let account_type = app
+                .config_draft
+                .as_ref()
+                .map(|d| d.account_type)
+                .unwrap_or_default();
+            match account_type {
+                NewAccountType::Claude => commit_new_account(app),
+                NewAccountType::Codex => commit_codex_account(app),
+                NewAccountType::Shunt => {}
+            }
+        }
         ConfigRow::Login => {
+            // The `+ new` form's type through the one lookup, so this dispatcher
+            // and the inert gate in `start_shunt_add` read the same draft.
+            let account_type = new_form_draft(app)
+                .map(|d| d.account_type)
+                .unwrap_or_default();
+            match account_type {
+                NewAccountType::Codex => {
+                    start_codex_new_login(app);
+                    return;
+                }
+                NewAccountType::Shunt => {
+                    start_shunt_add(app);
+                    return;
+                }
+                NewAccountType::Claude => {}
+            }
             // New-form draft has no editing_name → validate the typed name now and
             // create-on-mint; an existing draft re-logs in place.
             let editing = app
@@ -18955,6 +19807,15 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
             }
         }
         ConfigRow::CaptureLogin => {
+            let account_type = app
+                .config_draft
+                .as_ref()
+                .map(|d| d.account_type)
+                .unwrap_or_default();
+            if account_type == NewAccountType::Codex {
+                stage_codex_capture(app);
+                return;
+            }
             // The row only renders on the `+ new` form, where a draft is always
             // open; the empty and owned states are what HIDE it, so hitting one
             // here means the live file moved since the flag was computed.
@@ -18999,7 +19860,10 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 }));
                 return;
             }
-            if stash_new_form_login(app, DraftLogin::LiveLogin(Box::new(snapshot))) {
+            if matches!(
+                stash_new_form_login(app, DraftLogin::LiveLogin(Box::new(snapshot))),
+                StashOutcome::Staged
+            ) {
                 app.toast(
                     ToastKind::Success,
                     "current login captured\ncreate account saves it",
@@ -19456,10 +20320,7 @@ fn login_in_flight(app: &mut App, name: &str, is_new: bool) -> bool {
         return false;
     };
     if session.name != name || session.is_new != is_new {
-        app.toast(
-            ToastKind::Warning,
-            format!("a login for '{}' is already in progress", session.name),
-        );
+        toast_login_in_progress(app, session.name.clone());
     }
     open_login_modal(app);
     true
@@ -19489,10 +20350,7 @@ fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &
         // so re-showing its modal without a word would read as this row's own
         // login having started.
         if session.name != name || session.is_new {
-            app.toast(
-                ToastKind::Warning,
-                format!("a login for '{}' is already in progress", session.name),
-            );
+            toast_login_in_progress(app, session.name.clone());
         }
         open_login_modal(app);
         return;
@@ -19712,6 +20570,8 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
             .and_then(|p| p.env.values().nth(i).cloned())
             .unwrap_or_default(),
         ConfigRow::AutoStart
+        | ConfigRow::Type
+        | ConfigRow::Family
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::EnvAdd
         | ConfigRow::Login
@@ -19734,6 +20594,11 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
     if is_new {
         if let Some(d) = app.config_draft.as_mut() {
             d.active = None;
+            // A name edit retires the refusals the old name carried.
+            if field == ConfigRow::Name {
+                d.name_refusal = None;
+                d.create_refusal = None;
+            }
         }
         return;
     }
@@ -19922,6 +20787,8 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         // `ConfigRow` variant fails the build instead of a silent no-op.
         ConfigRow::Name
         | ConfigRow::AutoStart
+        | ConfigRow::Type
+        | ConfigRow::Family
         | ConfigRow::BellThreshold
         | ConfigRow::BaseUrl
         | ConfigRow::ApiKey
@@ -19994,6 +20861,320 @@ fn next_model_preset(current: Option<&str>) -> Option<String> {
             _ => None,
         },
     }
+}
+
+/// Whether the `+ new` draft holds a staged login (a claude mint or capture, a
+/// codex mint or capture) — or an in-flight login this `+ new` form started —
+/// that cycling the type would drop or strand. Only a login the form started
+/// counts: the unrelated re-login of an existing account never does. A shunt
+/// add past its commit point has nothing left to drop (its result lands the
+/// pool row whatever the form does), so it never asks.
+fn staged_login_held(app: &App) -> bool {
+    app.config_draft
+        .as_ref()
+        .and_then(|d| d.captured_login.as_ref())
+        .is_some()
+        || app
+            .login
+            .as_ref()
+            .is_some_and(|s| s.is_new && !app.shunt_paste.as_ref().is_some_and(|door| door.sent))
+        || app.codex_login.as_ref().is_some_and(|s| s.is_new)
+}
+
+/// `space` on the `type` cycle: advance claude → codex → shunt → claude. A
+/// staged login is gated on a confirm first — the change drops it — and a
+/// cancel leaves both the type and the stage as they were.
+fn cycle_account_type(app: &mut App) {
+    let Some(d) = app.config_draft.as_ref() else {
+        return;
+    };
+    let next = d.account_type.next();
+    if staged_login_held(app) {
+        app.open_modal(Modal::Confirm(ConfirmState {
+            message: "change the account type?".to_string(),
+            detail: Some("the login you already captured will be dropped".to_string()),
+            choice: false,
+            scroll: ConfirmScroll::default(),
+            on_confirm: ConfirmAction::CycleAccountType(next),
+        }));
+        return;
+    }
+    set_account_type(app, next);
+}
+
+/// Land a type change: swap the type, drop the staged login and any refusal the
+/// old type's rows held, and keep the cursor on the type row.
+fn set_account_type(app: &mut App, next: NewAccountType) {
+    if let Some(d) = app.config_draft.as_mut() {
+        d.account_type = next;
+        d.captured_login = None;
+        d.name_refusal = None;
+        d.create_refusal = None;
+    }
+    app.config_action_cursor = 0;
+}
+
+/// Cancel the open claude/shunt login, applying the shunt add's commit-point
+/// rule. BEFORE the commit point (no paste sent) a cancel cancels the add:
+/// the door drops (its sender disconnects the worker's paste wait) and the
+/// add's identity is remembered so the worker's report releases the guard
+/// (R3-3) — the guard stays held until then. AFTER the paste is sent (the
+/// commit point) only the login line closes: the door drops too (the paste
+/// already went down it), the guard marker and the committed slot stay, and
+/// the complete runs to its result (the codex N1 rule). A claude login has no
+/// shunt door; `cancel_claude` says whether this cancel drops it (esc/q) or
+/// leaves it running for the harness check (a confirmed type change, F3).
+fn cancel_open_login(app: &mut App, cancel_claude: bool) {
+    let committed = app.shunt_paste.as_ref().is_some_and(|door| door.sent);
+    if committed {
+        // The paste is already in flight, so the door has no further use:
+        // drop it now, and keep only the committed add's identity
+        // (`shunt_add_committed`) and its guard marker. The complete's result
+        // routes by that identity, never through the door; a login started
+        // afterwards gets its own door and modal (R4-1).
+        app.shunt_paste = None;
+        app.login = None;
+        close_login_modal(app);
+        return;
+    }
+    if let Some(door) = app.shunt_paste.take() {
+        let generation = app.login.as_ref().map(|s| s.generation).unwrap_or_default();
+        app.shunt_add_cancelled = Some(ShuntAddIdentity {
+            generation,
+            family: door.family,
+            name: door.name.clone(),
+        });
+        app.login = None;
+    } else if cancel_claude {
+        app.login = None;
+    }
+    close_login_modal(app);
+}
+
+/// Cancel the in-flight login a confirmed type change must drop, without the
+/// "login canceled" toast — the confirm already said the stage would be
+/// dropped. Only a PRE-commit shunt add is cancelled here: its success would
+/// otherwise close whatever draft is open later. A claude or codex mint is
+/// NOT cancelled — its late result is dropped by the harness check (F3), which
+/// toasts the type change. A committed add runs to its result.
+fn cancel_staged_new_login(app: &mut App) {
+    cancel_open_login(app, false);
+}
+
+/// `space` on the shunt form's `family` cycle: claude → codex → antigravity →
+/// claude.
+fn cycle_family(app: &mut App) {
+    if let Some(d) = app.config_draft.as_mut() {
+        d.family = d.family.next();
+    }
+}
+
+/// The codex `+ login` head: validate the typed name against BOTH rosters
+/// before any browser opens (a held name refuses on the name row's `└`), then
+/// run the codex browser flow on a worker and STAGE the minted chain in the
+/// draft — `create account` lands it, a closed form drops it unused. The modal
+/// is commit 1's codex login modal (open-again `r`, copy-link `c`, no paste
+/// door).
+fn start_codex_new_login(app: &mut App) {
+    if let Some(session) = app.codex_login.as_ref() {
+        // Same shape as the re-login guard: a second ⏎ reopens the modal, one
+        // for another name names the running login.
+        let typed = app
+            .config_draft
+            .as_ref()
+            .map(|d| d.name.trimmed().to_string())
+            .unwrap_or_default();
+        if session.name != typed {
+            toast_login_in_progress(app, session.name.clone());
+        }
+        open_codex_login_modal(app);
+        return;
+    }
+    let typed = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.name.trimmed().to_string())
+        .unwrap_or_default();
+    if let Err(e) = validate_profile_name(&typed, Harness::Codex, None) {
+        if let Some(d) = app.config_draft.as_mut() {
+            d.name_refusal = Some(format!("{e}"));
+        }
+        focus_name_row(app);
+        return;
+    }
+    app.codex_login_generation += 1;
+    let generation = app.codex_login_generation;
+    let cancel = crate::codex_login::LoginCancel::new();
+    app.codex_login = Some(CodexLoginSession {
+        name: typed.clone(),
+        generation,
+        url: None,
+        cancel: cancel.clone(),
+        is_new: true,
+    });
+    #[cfg(test)]
+    let worker_fn = app.codex_login_worker;
+    let url_tx = app.codex_login_url_tx.clone();
+    let result_tx = app.codex_new_login_result_tx.clone();
+    spawn_worker(move || {
+        let announce = move |url: &str| {
+            let _ = url_tx.send((generation, url.to_string()));
+        };
+        #[cfg(test)]
+        let outcome = worker_fn(&announce, &cancel);
+        #[cfg(not(test))]
+        let outcome =
+            crate::codex_login::login_with_cancel(&announce, &cancel).map_err(|e| format!("{e:#}"));
+        // A cancel seen here drops the minted chain unwritten.
+        let res = if cancel.is_canceled() {
+            Err("login canceled".to_string())
+        } else {
+            outcome
+        };
+        let _ = result_tx.send((generation, res));
+    });
+    open_codex_login_modal(app);
+}
+
+/// Drain a finished `+ new` codex `+ login`: stage the minted chain in the
+/// draft, or toast the failure.
+fn drain_codex_new_login(app: &mut App) {
+    while let Ok((generation, result)) = app.codex_new_login_result_rx.try_recv() {
+        if app.codex_login.as_ref().map(|s| s.generation) != Some(generation) {
+            continue; // superseded or cancelled
+        }
+        app.codex_login = None;
+        close_codex_login_modal(app);
+        match result {
+            Ok(outcome) => {
+                match stash_new_form_login(app, DraftLogin::CodexMint(Box::new(outcome))) {
+                    StashOutcome::Staged => {
+                        app.toast(ToastKind::Success, "logged in\ncreate account saves it")
+                    }
+                    StashOutcome::FormClosed => app.toast(
+                        ToastKind::Warning,
+                        "login finished but the new-account form is no longer open\nlog in again",
+                    ),
+                    StashOutcome::WrongType => app.toast(
+                        ToastKind::Info,
+                        "login finished but the form type changed\nnothing was saved",
+                    ),
+                }
+            }
+            Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
+        }
+    }
+}
+
+/// `+ capture current login` on the codex form: stage a marker that moves the
+/// operator's own codex login at `create account`, exactly as
+/// `clauth login <name> --codex` does.
+fn stage_codex_capture(app: &mut App) {
+    let typed = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.name.trimmed().to_string())
+        .unwrap_or_default();
+    if let Err(e) = validate_profile_name(&typed, Harness::Codex, None) {
+        if let Some(d) = app.config_draft.as_mut() {
+            d.name_refusal = Some(format!("{e}"));
+        }
+        focus_name_row(app);
+        return;
+    }
+    // The row only renders while the operator's login is capturable; the file
+    // may have moved since the flag was computed, so re-check and drop the row.
+    if !crate::actions::codex_operator_login_capturable() {
+        app.toast(
+            ToastKind::Warning,
+            "no codex login to capture\nrun `codex login` first",
+        );
+        return;
+    }
+    if matches!(
+        stash_new_form_login(app, DraftLogin::CodexCapture),
+        StashOutcome::Staged
+    ) {
+        app.toast(
+            ToastKind::Success,
+            "current codex login captured\ncreate account saves it",
+        );
+    }
+}
+
+/// The warning a codex capture that could not adopt the operator's slot owes
+/// the user: the chain is now a separate copy of a single-use rotating chain.
+fn codex_separate_copy_warning(outcome: &crate::actions::CodexCaptureOutcome) -> Option<String> {
+    match outcome {
+        crate::actions::CodexCaptureOutcome::Captured {
+            canonical,
+            adopted: false,
+            ..
+        } => Some(format!(
+            "captured a separate copy of a single-use rotating chain\nrun codex through {} from here on, or run codex login again",
+            prose::cmd(&format!("clauth start {canonical}"))
+        )),
+        _ => None,
+    }
+}
+
+/// `create account` on the codex form: land the staged mint through
+/// [`crate::actions::land_codex_login`] or the staged capture through
+/// [`crate::actions::codex_login_capture_at`], both create-only — a name either
+/// roster holds refuses at create (re-checked under the state lock), never a
+/// re-auth. Nothing staged refuses on the create row's `└`.
+fn commit_codex_account(app: &mut App) {
+    let Some(d) = app.config_draft.as_ref() else {
+        return;
+    };
+    let name = d.name.trimmed().to_string();
+    let stash = d.captured_login.clone();
+    let result = match stash {
+        Some(DraftLogin::CodexMint(outcome)) => crate::actions::land_codex_login(
+            &name,
+            &outcome,
+            crate::actions::CodexLandMode::CreateOnly,
+        )
+        .map(|_| None),
+        Some(DraftLogin::CodexCapture) => crate::actions::codex_login_capture_at(
+            &name,
+            &chrono::Utc::now().to_rfc3339(),
+            crate::actions::CodexLandMode::CreateOnly,
+        )
+        .map(|outcome| codex_separate_copy_warning(&outcome)),
+        _ => {
+            if let Some(d) = app.config_draft.as_mut() {
+                d.create_refusal = Some("log in or capture a login first".to_string());
+            }
+            return;
+        }
+    };
+    match result {
+        Ok(warning) => {
+            finish_created_codex(app, &name);
+            app.toast(ToastKind::Success, format!("created '{name}'"));
+            if let Some(warning) = warning {
+                app.toast(ToastKind::Warning, warning);
+            }
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("create failed\n{e:#}")),
+    }
+}
+
+/// Land a created codex account: re-read the codex snapshot, and put Setup and
+/// the Overview on the new row.
+fn finish_created_codex(app: &mut App, name: &str) {
+    app.codex_rows = codex_rows();
+    let new_idx = app
+        .codex_rows
+        .iter()
+        .position(|row| row.name == name)
+        .unwrap_or(0);
+    land_created_item(
+        app,
+        Some(SetupItem::Codex(ProfileName::from(name))),
+        MainItemKind::Codex(new_idx),
+    );
 }
 
 /// ⏎ on an `EnvEntry`: seed the shared value buffer from the entry's saved value
@@ -20500,15 +21681,7 @@ fn finish_created_profile(app: &mut App, name: &str) {
         .position(|p| p.name == name)
         .unwrap_or(0);
     app.profile_cursor = new_idx;
-    // Setup lands on the new account's row and the Overview's remembered row
-    // moves onto it, so a switch to the Overview lands there too. A create or
-    // duplicate is a selection change: a held-but-hidden Setup identity is
-    // replaced, never restored over the new row.
-    app.setup_item = None;
-    app.setup_remembered = None;
-    app.overview_remembered = Some(MainItemKind::Profile(new_idx));
-    app.config_focus = ConfigFocus::Profiles;
-    app.config_draft = None;
+    land_created_item(app, None, MainItemKind::Profile(new_idx));
 }
 
 fn commit_new_account(app: &mut App) {
@@ -20608,6 +21781,11 @@ fn commit_new_account(app: &mut App) {
                 login.account_uuid,
                 login.plan,
             ),
+            // Unreachable: the `captured` filter above maps a codex stash to
+            // `None` — this claude-only path never consumes one.
+            Some(DraftLogin::CodexMint(_) | DraftLogin::CodexCapture) => {
+                unreachable!("the captured filter drops a codex stash first")
+            }
             None => create_blank_profile(&mut cfg, name.clone(), base_url, api_key, models),
         }
     };
@@ -21181,6 +22359,14 @@ fn apply_preset_to(
     }
     let name = match target {
         PresetTarget::NewAccount => {
+            // The menu offer gates on the same predicate; re-check here so a
+            // pick that raced the type off `claude` stamps nothing rather than
+            // editing fields the form no longer shows.
+            if !new_account_type_is_claude(app) {
+                app.preset_picker_open = PresetPickerOpen::None;
+                app.toast(ToastKind::Danger, "apply preset is for the claude form");
+                return;
+            }
             let selected = config_rows(app).get(app.config_action_cursor).copied();
             stamp_draft_from_preset(app, &preset, leftover);
             if let Some(pos) = selected.and_then(|row| config_row_index(app, row)) {
@@ -22014,12 +23200,19 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
         ConfirmAction::CaptureOverMintStash(snapshot) => {
-            if stash_new_form_login(app, DraftLogin::LiveLogin(snapshot)) {
+            if matches!(
+                stash_new_form_login(app, DraftLogin::LiveLogin(snapshot)),
+                StashOutcome::Staged
+            ) {
                 app.toast(
                     ToastKind::Success,
                     "current login captured\ncreate account saves it",
                 );
             }
+        }
+        ConfirmAction::CycleAccountType(next) => {
+            cancel_staged_new_login(app);
+            set_account_type(app, next);
         }
         ConfirmAction::DeleteLiveSession(name) => {
             finish_delete(app, &ProfileName::from(name), true)
@@ -22780,6 +23973,17 @@ fn drain_pricing_events(app: &mut App) {
 /// after the browser callback won has no door to reach.
 fn drain_login_events(app: &mut App) {
     while let Ok((generation, event)) = app.login_event_rx.try_recv() {
+        // The shunt add's commit point arrives as its own event, tracked even
+        // after a cancel so the committed complete's outcome still drains. It
+        // carries the add's `(family, name)` so the late result clears only its
+        // own guard marker, never a later pool action's.
+        if let LoginEvent::ShuntCommitted(family, name) = &event {
+            app.shunt_add_committed = Some(ShuntAddIdentity {
+                generation,
+                family: *family,
+                name: name.clone(),
+            });
+        }
         if let Some(session) = app.login.as_mut()
             && session.generation == generation
         {
@@ -22794,25 +23998,73 @@ fn drain_login_events(app: &mut App) {
                         session.paste_field = None;
                     }
                 }
+                LoginEvent::ShuntCommitted(_, _) => {}
             }
         }
     }
     while let Ok((generation, result)) = app.login_result_rx.try_recv() {
-        if app.login.as_ref().map(|s| s.generation) != Some(generation) {
-            continue; // superseded login; drop it
-        }
-        let Some(session) = app.login.take() else {
+        if app.login.as_ref().map(|s| s.generation) == Some(generation) {
+            let Some(session) = app.login.take() else {
+                continue;
+            };
+            // A shunt add holds its raw door beside the session; the take above
+            // drops `login`, so the door must go with it now.
+            let door = app.shunt_paste.take();
+            close_login_modal(app);
+            if let Some(door) = door {
+                let identity = ShuntAddIdentity {
+                    generation,
+                    family: door.family,
+                    name: door.name.clone(),
+                };
+                if let Some(outcome) = shunt_add_outcome(result) {
+                    finish_shunt_add(app, &identity, outcome);
+                }
+                continue;
+            }
+            match result {
+                Ok(LoginResult::Oauth(creds)) => apply_login(app, session, *creds),
+                Ok(LoginResult::Console(outcome)) => apply_console_login(app, session, *outcome),
+                Ok(LoginResult::Shunt(_)) => {
+                    // No shunt door rides this session, so the result cannot be
+                    // a shunt add's own: drop it rather than panic (R4-1).
+                    crate::logline::logline!("a login with no shunt door reported a shunt result");
+                }
+                Err(e) => app.toast(
+                    ToastKind::Danger,
+                    format!("login for '{}' failed\n{e}", session.name),
+                ),
+            }
+        } else if let Some(identity) = app
+            .shunt_add_cancelled
+            .clone()
+            .filter(|cancelled| cancelled.generation == generation)
+        {
+            // A pre-commit-cancelled add's worker reported it stopped: release
+            // the guard marker now (the cancel held it until this report, R3-3).
+            // No toast, no landing — the add was cancelled before it sent
+            // anything. The marker is still this add's own: nothing else can
+            // start while it is held.
+            if matches!(
+                &app.pool_mutation_row,
+                Some((family, name)) if *family == identity.family && name == &identity.name
+            ) {
+                app.pool_mutation_row = None;
+            }
+            app.shunt_add_cancelled = None;
             continue;
-        };
-        close_login_modal(app);
-        match result {
-            Ok(LoginResult::Oauth(creds)) => apply_login(app, session, *creds),
-            Ok(LoginResult::Console(outcome)) => apply_console_login(app, session, *outcome),
-            Err(e) => app.toast(
-                ToastKind::Danger,
-                format!("login for '{}' failed\n{e}", session.name),
-            ),
+        } else if let Some(identity) = app
+            .shunt_add_committed
+            .clone()
+            .filter(|committed| committed.generation == generation)
+        {
+            // A post-commit cancel (or supersede): `complete_pool_account` was
+            // sent, so its outcome still lands a toast and a pool re-read.
+            if let Some(outcome) = shunt_add_outcome(result) {
+                finish_shunt_add(app, &identity, outcome);
+            }
         }
+        // else: a superseded claude/console login; drop it.
     }
 }
 
@@ -22828,14 +24080,18 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         // the mint lives only in the draft, so without one it is dropped. The
         // anchor waits for `create account`: the draft's name is still editable,
         // so the profile this login belongs to has no final name yet.
-        let stashed = stash_new_form_login(app, DraftLogin::Mint(Box::new(outcome)));
-        if stashed {
-            app.toast(ToastKind::Success, "logged in\ncreate account saves it");
-        } else {
-            app.toast(
+        match stash_new_form_login(app, DraftLogin::Mint(Box::new(outcome))) {
+            StashOutcome::Staged => {
+                app.toast(ToastKind::Success, "logged in\ncreate account saves it")
+            }
+            StashOutcome::FormClosed => app.toast(
                 ToastKind::Warning,
                 "login finished but the new-account form is no longer open\nlog in again",
-            );
+            ),
+            StashOutcome::WrongType => app.toast(
+                ToastKind::Info,
+                "login finished but the form type changed\nnothing was saved",
+            ),
         }
         return;
     }
@@ -23019,9 +24275,19 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_pricing_events(app);
     drain_login_events(app);
     drain_codex_login(app);
+    drain_codex_new_login(app);
 
     if app.reload_if_state_changed() {
         app.clamp_profile_cursor();
+        // Setup's `+ new` selection is the trailing row, never an index: a
+        // reload that moves the roster keeps it there instead of demoting it
+        // onto the last account. Captured pre-swap (`reload_was_on_new`) so a
+        // deleted last account (whose cursor reads `New` post-swap) is not
+        // mistaken for `+ new`. The Overview's own cursor rules are
+        // `place_overview_cursor`'s, already run by the clamp.
+        if app.reload_was_on_new {
+            app.profile_cursor = app.profile_count();
+        }
         if app.profile_count() == 0 {
             app.usage_detail_focus = StatusFocus::List;
             app.usage_detail_scroll = 0;
@@ -23084,6 +24350,7 @@ pub(crate) fn on_tick(app: &mut App) {
     sync_broken_verdicts(app);
     poll_codex_rows(app);
     poll_shunt_pool(app);
+    poll_form_predicates(app);
     drain_service_probes(app);
     drain_shunt_pool_probe(app);
     drain_pool_mutations(app);

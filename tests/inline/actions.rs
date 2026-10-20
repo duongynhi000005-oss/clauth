@@ -6455,7 +6455,12 @@ fn codex_capture_adopts_the_operator_slot() {
     write_operator_codex(&home, Some(OPERATOR_AUTH), None);
     let operator_auth = home.home().join(".codex").join("auth.json");
 
-    codex_login_capture_at("cx", "2026-09-16T12:00:00+00:00").expect("capture");
+    codex_login_capture_at(
+        "cx",
+        "2026-09-16T12:00:00+00:00",
+        crate::actions::CodexLandMode::CreateOrReauth,
+    )
+    .expect("capture");
 
     let state = crate::codex_profiles::CodexState::load().expect("load");
     assert!(state.holds("cx"));
@@ -6544,7 +6549,12 @@ fn codex_recapture_replaces_the_chain_unless_a_session_holds_it() {
     drop(pid);
     std::fs::remove_dir_all(&sessions).expect("clear sessions");
 
-    codex_login_capture_at("cx", "2026-09-16T13:00:00+00:00").expect("re-capture");
+    codex_login_capture_at(
+        "cx",
+        "2026-09-16T13:00:00+00:00",
+        crate::actions::CodexLandMode::CreateOrReauth,
+    )
+    .expect("re-capture");
     assert_eq!(
         parsed(
             &profile_dir(&crate::profile::ProfileName::from("cx"))
@@ -6726,7 +6736,12 @@ fn delete_codex_detaches_only_the_slot_adopted_onto_it() {
 
     // A slot linked to ANOTHER profile's store survives byte-identical.
     std::fs::write(&slot, OPERATOR_AUTH).expect("fresh operator login");
-    codex_login_capture_at("cx2", "2026-09-16T12:00:00+00:00").expect("capture into cx2");
+    codex_login_capture_at(
+        "cx2",
+        "2026-09-16T12:00:00+00:00",
+        crate::actions::CodexLandMode::CreateOrReauth,
+    )
+    .expect("capture into cx2");
     let other_store = profile_dir(&crate::profile::ProfileName::from("cx2"))
         .expect("dir")
         .join("auth.json");
@@ -11073,5 +11088,47 @@ fn a_same_account_create_onto_an_orphan_dir_keeps_the_window() {
     assert!(
         disk.plan.is_none(),
         "no plan-only seed replaces the window for a same-account install"
+    );
+}
+
+/// The CLI's capture report lines, by equality — the F2 pin that moving the
+/// capture to a typed outcome changed no byte of what the operator sees.
+#[test]
+fn the_cli_capture_lines_are_unchanged() {
+    use crate::actions::{CodexCaptureOutcome, codex_capture_lines};
+    let path = std::path::PathBuf::from("/home/u/.codex/auth.json");
+    assert_eq!(
+        codex_capture_lines(&CodexCaptureOutcome::Captured {
+            canonical: "cdx".to_string(),
+            reauth: false,
+            adopted: true,
+            auth_path: path.clone(),
+        }),
+        vec![
+            "clauth: captured the operator codex login into codex profile 'cdx'".to_string(),
+            "clauth: /home/u/.codex/auth.json now follows the profile store — your own codex and clauth sessions share one chain".to_string(),
+            "clauth: while it does, `codex login` and `codex logout` reach 'cdx's chain through that link and revoke it server-side — remove the link first if you mean to mint a chain for a different account".to_string(),
+        ]
+    );
+    assert_eq!(
+        codex_capture_lines(&CodexCaptureOutcome::Captured {
+            canonical: "cdx".to_string(),
+            reauth: true,
+            adopted: false,
+            auth_path: path.clone(),
+        }),
+        vec![
+            "clauth: re-captured the operator codex login into 'cdx'".to_string(),
+            "clauth: could not repoint /home/u/.codex/auth.json (no symlink support?) — it is now a SEPARATE copy of a single-use rotating chain, and the first refresh on either side strands the other. Run codex only through `clauth start cdx` from here on, or `codex login` again for your own use".to_string(),
+        ]
+    );
+    assert_eq!(
+        codex_capture_lines(&CodexCaptureOutcome::AlreadyFollows {
+            canonical: "cdx".to_string(),
+            auth_path: path.clone(),
+        }),
+        vec![
+            "clauth: /home/u/.codex/auth.json already follows codex profile 'cdx' — nothing to capture".to_string(),
+        ]
     );
 }

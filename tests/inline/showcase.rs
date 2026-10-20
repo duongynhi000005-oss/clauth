@@ -1051,12 +1051,13 @@ fn demo_data_drives_all_actions() {
     let before = app.profile_count();
     // Navigate to the + new row (last slot in Setup list)
     press(&mut app, KeyCode::Down); // 4 → end ("+ new")
-    press(&mut app, KeyCode::Enter); // focus detail (auto-positions on Name)
+    press(&mut app, KeyCode::Enter); // focus detail (auto-positions on the `type` row)
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
     assert!(app.config_draft.is_some());
 
     // Fill the create form: Name, BaseUrl, ApiKey
-    // Cursor starts on first row (Name)
+    // The first row is `type`; step down onto Name.
+    press(&mut app, KeyCode::Down); // type → Name
     press(&mut app, KeyCode::Enter); // start capturing Name
     type_str(&mut app, "sandbox-test");
     press(&mut app, KeyCode::Enter); // commit Name

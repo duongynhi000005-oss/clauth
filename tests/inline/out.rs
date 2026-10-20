@@ -164,3 +164,87 @@ fn calls(code: &str, macro_name: &str) -> bool {
                 .is_some_and(|c| c.is_alphanumeric() || c == '_')
     })
 }
+
+/// What proves the guard's drop restored the real sink is that a SECOND install
+/// succeeds at all: `capture_here` asserts the slot is free, so a drop that
+/// left the first capture standing panics right there. Emitting into no capture
+/// to check the same thing would write the line for real (the terminal running
+/// the suite).
+#[test]
+fn a_capture_takes_the_writes_until_its_guard_drops() {
+    let first = OutCapture::new();
+    let guard = first.capture_here();
+    outln!("line {}", 2);
+    out!("prompt: ");
+    assert_eq!(
+        first.snapshot(),
+        b"line 2\nprompt: ".to_vec(),
+        "the capture must carry the bytes exactly as written, newline included"
+    );
+    drop(guard);
+
+    let second = OutCapture::new();
+    let _guard = second.capture_here();
+    outln!("after the first guard");
+    assert_eq!(
+        second.snapshot(),
+        b"after the first guard\n".to_vec(),
+        "the write went somewhere other than the capture standing when it was raised"
+    );
+}
+
+/// The per-thread scope IS what keeps one test's capture off another's bytes
+/// under the `cargo test` fallback, where every inline test is a thread of one
+/// binary. A process-global sink passes every other test in this file, so the
+/// discriminating question is what a thread that installed NOTHING sees.
+///
+/// Asked of [`captured`] directly rather than by raising a write there: a thread
+/// with no capture routes to the real sink (the terminal running the suite).
+/// The predicate is the same one [`emit`] branches on, and it appends nothing
+/// when it answers false.
+#[test]
+fn a_capture_takes_only_the_writes_raised_on_its_own_thread() {
+    let mine = OutCapture::new();
+    let _guard = mine.capture_here();
+    outln!("raised before the sibling");
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(
+                !captured(&format_args!("probed from the sibling thread"), true),
+                "a thread that installed nothing was handed another thread's capture"
+            );
+            let theirs = OutCapture::new();
+            let _guard = theirs.capture_here();
+            outln!("raised on the sibling thread");
+            assert_eq!(
+                theirs.snapshot(),
+                b"raised on the sibling thread\n".to_vec(),
+                "the sibling's own capture must take its write"
+            );
+        });
+    });
+
+    outln!("raised after the sibling");
+    assert_eq!(
+        mine.snapshot(),
+        b"raised before the sibling\nraised after the sibling\n".to_vec(),
+        "the sibling's install and its drop both reached across threads"
+    );
+}
+
+/// A guard is a claim on the thread that installed it. Carried to another one
+/// its drop clears THAT thread's empty slot and leaves the installer capturing
+/// for the rest of the process, which surfaces as some unrelated test quietly
+/// losing its bytes. The `PhantomData<*const ()>` field is the whole of what
+/// prevents the move, and dropping that field breaks nothing else.
+#[test]
+fn a_capture_guard_cannot_be_carried_to_another_thread() {
+    use crate::testutil::{NotSend as _, Probe};
+
+    assert!(Probe::<OutCapture>::is_send(), "positive control");
+    assert!(
+        !Probe::<OutCaptureGuard>::is_send(),
+        "a guard that can cross threads restores the wrong thread's sink"
+    );
+}

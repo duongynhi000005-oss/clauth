@@ -133,14 +133,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // collapses, others handle their own keys), so the hint is that modal's
         // own row behind the login lead; the login modal's open code field is
         // the exception, where `q` is data and ↵ submits.
-        let keys = match owner.and_then(|o| owner_hints(o, app, frame_area)) {
-            Some(hints) => LoginKeys::Owner(hints),
-            None => match app.modals.last() {
-                Some(Modal::Login) if session.paste_field.is_some() => LoginKeys::Paste,
-                Some(_) => LoginKeys::Back,
-                None => LoginKeys::Cancel,
-            },
-        };
+        let keys = login_keys(owner, app, frame_area, session.paste_field.is_some());
         draw_login(frame, area, session, keys, app.tick_count);
         return;
     }
@@ -150,13 +143,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // As on the claude login line, any open non-login modal owns esc/q first,
     // so its own row rides behind the codex lead; collapsed, esc cancels.
     if let Some(session) = &app.codex_login {
-        let keys = match owner.and_then(|o| owner_hints(o, app, frame_area)) {
-            Some(hints) => LoginKeys::Owner(hints),
-            None => match app.modals.last() {
-                Some(_) => LoginKeys::Back,
-                None => LoginKeys::Cancel,
-            },
-        };
+        let keys = login_keys(owner, app, frame_area, false);
         draw_codex_login(frame, area, session, keys, app.tick_count);
         return;
     }
@@ -547,6 +534,19 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                         Some(ConfigRow::ApiKey)
                             if app.config_draft.as_ref().is_some_and(|d| d.mint_armed()) =>
                         {
+                            &[("↑↓", "row"), ("a", "actions"), ("?", "help")]
+                        }
+                        // The `type` / `family` cycle rows advance on space or ↵.
+                        Some(ConfigRow::Type) | Some(ConfigRow::Family) => &[
+                            ("↑↓", "row"),
+                            ("space/↵", "cycle"),
+                            ("a", "actions"),
+                            ("?", "help"),
+                        ],
+                        // The disabled shunt `+ login` is inert: no ↵ hint. The
+                        // one predicate the row renders by, never a disk read
+                        // here.
+                        Some(ConfigRow::Login) if app.shunt_login_disabled().is_some() => {
                             &[("↑↓", "row"), ("a", "actions"), ("?", "help")]
                         }
                         _ => &[
@@ -1025,6 +1025,37 @@ enum LoginKeys {
     Owner(&'static [(&'static str, &'static str)]),
 }
 
+/// The [`LoginKeys`] a login-in-flight footer shows, shared by the claude and
+/// codex lines: an open editor/modal owns esc/q first (its own row); the login
+/// modal's open code field is `Paste`; collapsed it is `Back`; with no modal,
+/// `Cancel`. `paste_open` names the claude modal's open code field — the codex
+/// modal has no paste door, so its line passes `false`.
+fn login_keys(owner: Option<KeyOwner>, app: &App, frame_area: Rect, paste_open: bool) -> LoginKeys {
+    match owner.and_then(|o| owner_hints(o, app, frame_area)) {
+        Some(hints) => LoginKeys::Owner(hints),
+        None => match app.modals.last() {
+            Some(Modal::Login) if paste_open => LoginKeys::Paste,
+            Some(_) => LoginKeys::Back,
+            None => LoginKeys::Cancel,
+        },
+    }
+}
+
+/// The hint set a login-in-flight footer shows for its [`LoginKeys`]. `paste`
+/// is the login's own paste-field hints (the claude modal's `↵ submit · esc
+/// back`; the codex modal has no paste door, so none).
+fn login_key_hints(
+    keys: LoginKeys,
+    paste: &'static [(&'static str, &'static str)],
+) -> &'static [(&'static str, &'static str)] {
+    match keys {
+        LoginKeys::Back => &[("q", "back")],
+        LoginKeys::Cancel => &[("esc", "cancel")],
+        LoginKeys::Paste => paste,
+        LoginKeys::Owner(hints) => hints,
+    }
+}
+
 /// Login-in-progress line. Independent of `footer_alert` so key handling that
 /// clears alerts never hides it. The live stage renders in the login modal;
 /// this row is the collapsed view and carries the name alone. The trailing
@@ -1039,12 +1070,7 @@ fn draw_login(
     keys: LoginKeys,
     tick: u64,
 ) {
-    let hints: &[(&str, &str)] = match keys {
-        LoginKeys::Back => &[("q", "back")],
-        LoginKeys::Cancel => &[("esc", "cancel")],
-        LoginKeys::Paste => &[("↵", "submit"), ("esc", "back")],
-        LoginKeys::Owner(hints) => hints,
-    };
+    let hints = login_key_hints(keys, &[("↵", "submit"), ("esc", "back")]);
     // The name's budget is the row width minus the spinner, the `logging in ''`
     // envelope and the essential hints' cells, so a long profile name never
     // crowds out the one key that leaves the modal.
@@ -1082,12 +1108,7 @@ fn draw_codex_login(
     keys: LoginKeys,
     tick: u64,
 ) {
-    let hints: &[(&str, &str)] = match keys {
-        LoginKeys::Back => &[("q", "back")],
-        LoginKeys::Cancel => &[("esc", "cancel")],
-        LoginKeys::Paste => &[],
-        LoginKeys::Owner(hints) => hints,
-    };
+    let hints = login_key_hints(keys, &[]);
     let mut spans = vec![
         Span::styled(format!("{} ", spinner_frame(tick)), theme::accent()),
         Span::styled(format!("logging in '{}'", session.name), theme::dim()),

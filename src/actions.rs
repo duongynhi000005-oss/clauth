@@ -1552,36 +1552,113 @@ fn detach_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
 /// - a live session on the target profile: re-capture replaces the chain the
 ///   running session holds.
 pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
-    codex_login_capture_at(name, &chrono::Utc::now().to_rfc3339())
+    let outcome = codex_login_capture_at(
+        name,
+        &chrono::Utc::now().to_rfc3339(),
+        CodexLandMode::CreateOrReauth,
+    )?;
+    for line in codex_capture_lines(&outcome) {
+        outln!("{line}");
+    }
+    Ok(())
 }
 
-/// [`codex_login_capture`] with the capture time injected, so the re-stamp is
-/// pinnable.
-pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()> {
-    let trimmed = validate_name_chars(name)?.to_string();
-    let operator = codex_operator_home()?;
-    match codex_operator_store_mode(&operator).as_deref() {
-        None | Some("file") => {}
-        Some(mode) => bail!(
-            "the operator codex does not keep its login in auth.json \
-             (cli_auth_credentials_store = \"{mode}\" in {}/config.toml), so there is \
-             nothing current to capture there — set it to \"file\", run `codex login`, \
-             then re-run this capture",
-            operator.display()
-        ),
+/// The operator-codex capture's outcome, before any surface renders it: what
+/// moved and where. The CLI prints [`codex_capture_lines`]; the TUI reads the
+/// flags and toasts, so the capture itself never writes stdout.
+pub(crate) enum CodexCaptureOutcome {
+    /// The chain was written into the profile store — freshly, or re-captured
+    /// over the operator's own chain. `adopted` is false when the operator's
+    /// slot could not be repointed (no symlink support), so it is now a
+    /// separate copy of a single-use rotating chain.
+    Captured {
+        canonical: String,
+        reauth: bool,
+        adopted: bool,
+        auth_path: std::path::PathBuf,
+    },
+    /// The operator's slot already followed THIS profile: nothing moved.
+    AlreadyFollows {
+        canonical: String,
+        auth_path: std::path::PathBuf,
+    },
+}
+
+/// The CLI's capture report, one entry per line, exactly as the operator sees
+/// it. A pure function so a test pins the lines by equality and the TUI never
+/// prints them.
+pub(crate) fn codex_capture_lines(outcome: &CodexCaptureOutcome) -> Vec<String> {
+    let mut lines = Vec::new();
+    match outcome {
+        CodexCaptureOutcome::AlreadyFollows {
+            canonical,
+            auth_path,
+        } => lines.push(format!(
+            "clauth: {} already follows codex profile '{canonical}' — nothing to capture",
+            auth_path.display()
+        )),
+        CodexCaptureOutcome::Captured {
+            canonical,
+            reauth,
+            adopted,
+            auth_path,
+        } => {
+            if *reauth {
+                lines.push(format!(
+                    "clauth: re-captured the operator codex login into '{canonical}'"
+                ));
+            } else {
+                lines.push(format!(
+                    "clauth: captured the operator codex login into codex profile '{canonical}'"
+                ));
+            }
+            if *adopted {
+                lines.push(format!(
+                    "clauth: {} now follows the profile store — your own codex and clauth sessions share one chain",
+                    auth_path.display()
+                ));
+                lines.push(format!(
+                    "clauth: while it does, `codex login` and `codex logout` reach '{canonical}'s chain through that link and revoke it server-side — remove the link first if you mean to mint a chain for a different account"
+                ));
+            } else {
+                lines.push(format!(
+                    "clauth: could not repoint {} (no symlink support?) — it is now a SEPARATE copy of a single-use rotating chain, and the first refresh on either side strands the other. Run codex only through `clauth start {canonical}` from here on, or `codex login` again for your own use",
+                    auth_path.display()
+                ));
+            }
+        }
     }
+    lines
+}
+
+/// [`codex_login_capture`] with the capture time and landing mode injected, so
+/// the re-stamp is pinnable and the create-only refusal is testable. `mode`
+/// decides what a name the codex roster already holds means: the CLI re-auths
+/// it ([`CodexLandMode::CreateOrReauth`]); the TUI's `+ new` create refuses it
+/// ([`CodexLandMode::CreateOnly`]).
+pub(crate) fn codex_login_capture_at(
+    name: &str,
+    now_rfc3339: &str,
+    mode: CodexLandMode,
+) -> Result<CodexCaptureOutcome> {
+    let trimmed = validate_name_chars(name)?.to_string();
+    let operator = codex_operator_capture_home()?;
     let auth_path = operator.join("auth.json");
 
     // A slot clauth already adopted: the chain belongs to exactly one profile.
-    if let Ok(target) = std::fs::read_link(&auth_path)
-        && let Some(holder) = clauth_auth_store_owner(&target)
-    {
+    if let Some(holder) = operator_auth_slot_holder(&auth_path) {
         if holder.eq_ignore_ascii_case(&trimmed) {
-            outln!(
-                "clauth: {} already follows codex profile '{holder}' — nothing to capture",
-                auth_path.display()
-            );
-            return Ok(());
+            match mode {
+                CodexLandMode::CreateOnly => {
+                    bail!("codex profile '{holder}' already exists — create under a new name")
+                }
+                _ => {
+                    return Ok(CodexCaptureOutcome::AlreadyFollows {
+                        canonical: holder.clone(),
+                        auth_path,
+                    });
+                }
+            }
         }
         // NOT "run `codex login`": that slot is a LINK to '{holder}'s store, and
         // codex's login opens with `clear_existing_auth_before_login` ->
@@ -1600,30 +1677,7 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
         );
     }
 
-    let raw = match std::fs::read(&auth_path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!(
-                "no codex login to capture — {} does not exist; run `codex login` first",
-                auth_path.display()
-            )
-        }
-        Err(e) => return Err(e).with_context(|| format!("failed to read {}", auth_path.display())),
-    };
-    let parsed = crate::codex_auth::CodexAuth::parse(&raw).with_context(|| {
-        format!(
-            "failed to parse {} — codex writes this file in place, so a login caught \
-             mid-write reads half-written; re-run the capture",
-            auth_path.display()
-        )
-    })?;
-    if parsed.refresh_token().is_none() {
-        bail!(
-            "{} holds no ChatGPT token chain (an API-key-only setup?) — only a \
-             `codex login` chain can be captured",
-            auth_path.display()
-        );
-    }
+    let parsed = read_codex_operator_auth(&auth_path)?;
     // A capture is a chain event, so it carries the stamp every chain event
     // carries (codex's `persist_tokens` writes it; the browser login stamps it
     // too). Left at the operator's login time, the captured chain would read
@@ -1645,9 +1699,15 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
     let _rotation_guard =
         crate::runtime::RotationGuard::acquire(&ProfileName::from(guess.as_str()))?;
     let (canonical, reauth, adopted) = crate::codex_profiles::CodexState::update(|state| {
-        let (canonical, reauth) = match state.canonical_name(&trimmed) {
-            Some(canonical) => (canonical, true),
-            None => {
+        let (canonical, reauth) = match (state.canonical_name(&trimmed), mode) {
+            (Some(canonical), CodexLandMode::CreateOnly) => {
+                bail!("codex profile '{canonical}' already exists — create under a new name");
+            }
+            (Some(canonical), _) => (canonical, true),
+            (None, CodexLandMode::RequireExisting) => {
+                bail!("codex profile '{trimmed}' no longer exists");
+            }
+            (None, _) => {
                 // Validated UNDER the same lock the roster write lands under —
                 // the pre-IO window rule. (The claude half reads profiles.toml,
                 // which this lock also serializes.)
@@ -1675,32 +1735,89 @@ pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()
         Ok((canonical, reauth, adopted))
     })?;
 
-    if reauth {
-        outln!("clauth: re-captured the operator codex login into '{canonical}'");
-    } else {
-        outln!("clauth: captured the operator codex login into codex profile '{canonical}'");
+    Ok(CodexCaptureOutcome::Captured {
+        canonical,
+        reauth,
+        adopted,
+        auth_path,
+    })
+}
+
+/// The capture's first read: the operator home, refused unless its store mode
+/// is the file default (`auth.json`). The read-only half of
+/// [`codex_login_capture_at`]'s refusals, shared with the capturable predicate
+/// so the row's visibility and the capture run on one check.
+fn codex_operator_capture_home() -> Result<std::path::PathBuf> {
+    let operator = codex_operator_home()?;
+    match codex_operator_store_mode(&operator).as_deref() {
+        None | Some("file") => {}
+        Some(mode) => bail!(
+            "the operator codex does not keep its login in auth.json \
+             (cli_auth_credentials_store = \"{mode}\" in {}/config.toml), so there is \
+             nothing current to capture there — set it to \"file\", run `codex login`, \
+             then re-run this capture",
+            operator.display()
+        ),
     }
-    if adopted {
-        outln!(
-            "clauth: {} now follows the profile store — your own codex and clauth \
-             sessions share one chain",
+    Ok(operator)
+}
+
+/// The clauth profile whose store the operator's `auth.json` slot already
+/// links into, or `None` for any other shape (a plain file, a foreign link).
+fn operator_auth_slot_holder(auth_path: &std::path::Path) -> Option<String> {
+    std::fs::read_link(auth_path)
+        .ok()
+        .and_then(|target| clauth_auth_store_owner(&target))
+}
+
+/// Read and parse the operator's `auth.json` into a chain-bearing auth, or the
+/// capture's refusal for an absent, unreadable, unparseable or chainless file.
+fn read_codex_operator_auth(auth_path: &std::path::Path) -> Result<crate::codex_auth::CodexAuth> {
+    let raw = match std::fs::read(auth_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "no codex login to capture — {} does not exist; run `codex login` first",
+                auth_path.display()
+            )
+        }
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", auth_path.display())),
+    };
+    let parsed = crate::codex_auth::CodexAuth::parse(&raw).with_context(|| {
+        format!(
+            "failed to parse {} — codex writes this file in place, so a login caught \
+             mid-write reads half-written; re-run the capture",
+            auth_path.display()
+        )
+    })?;
+    if parsed.refresh_token().is_none() {
+        bail!(
+            "{} holds no ChatGPT token chain (an API-key-only setup?) — only a \
+             `codex login` chain can be captured",
             auth_path.display()
         );
-        outln!(
-            "clauth: while it does, `codex login` and `codex logout` reach '{canonical}'s \
-             chain through that link and revoke it server-side — remove the link first \
-             if you mean to mint a chain for a different account"
-        );
-    } else {
-        outln!(
-            "clauth: could not repoint {} (no symlink support?) — it is now a SEPARATE \
-             copy of a single-use rotating chain, and the first refresh on either side \
-             strands the other. Run codex only through `clauth start {canonical}` from \
-             here on, or `codex login` again for your own use",
-            auth_path.display()
-        );
     }
-    Ok(())
+    Ok(parsed)
+}
+
+/// Whether the operator's own codex login is capturable right now: the
+/// operator home resolves, its store mode is the file default, `auth.json`
+/// exists and parses with a refresh token, and the slot is not already a link
+/// into a clauth profile store. The read-only half of
+/// [`codex_login_capture_at`]'s refusals, sharing its reads — the row's
+/// visibility and the capture run on one predicate, so the row can never show
+/// where the capture would refuse.
+pub(crate) fn codex_operator_login_capturable() -> bool {
+    let Ok(operator) = codex_operator_capture_home() else {
+        return false;
+    };
+    let auth_path = operator.join("auth.json");
+    // A slot already adopted (a link into a clauth profile store) is captured,
+    // never capturable.
+    if operator_auth_slot_holder(&auth_path).is_some() {
+        return false;
+    }
+    read_codex_operator_auth(&auth_path).is_ok()
 }
 
 /// Refuse a re-auth that would silently swap the ChatGPT account under a
@@ -1795,20 +1912,25 @@ pub(crate) fn codex_browser_preflight(name: &str) -> Result<String> {
 /// not hold. The CLI's `clauth login --codex` creates-or-re-auths; a TUI
 /// re-login only ever re-auths an account that already exists, so a name gone
 /// from the store (deleted while the browser ran) refuses instead of being
-/// silently re-created.
+/// silently re-created; the TUI's `+ new` create only ever creates, so a name
+/// either roster holds refuses instead of re-authing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexLandMode {
     /// The CLI: create when the name is free, re-auth when it exists.
     CreateOrReauth,
     /// The TUI re-login: the account must already exist.
     RequireExisting,
+    /// The TUI `+ new` create: the name must not exist in either roster.
+    CreateOnly,
 }
 
 /// The shared landing both the CLI and the TUI re-login call after the browser
 /// flow minted a chain: re-resolve the name, guard the rotation, refuse a live
 /// session or account swap, write the store. `mode` decides whether a name the
-/// store does not hold is created ([`CodexLandMode::CreateOrReauth`]) or
-/// refused ([`CodexLandMode::RequireExisting`]).
+/// store does not hold is created ([`CodexLandMode::CreateOrReauth`] /
+/// [`CodexLandMode::CreateOnly`]) or refused ([`CodexLandMode::RequireExisting`]),
+/// and whether a name it does hold is re-authed (CLI, re-login) or refused
+/// ([`CodexLandMode::CreateOnly`]).
 pub(crate) fn land_codex_login(
     trimmed: &str,
     outcome: &crate::codex_login::CodexLoginOutcome,
@@ -1823,19 +1945,18 @@ pub(crate) fn land_codex_login(
         .ok()
         .and_then(|a| a.account_id().map(str::to_string));
     let canonical = crate::codex_profiles::CodexState::update(|state| {
-        let (canonical, reauth) = match state.canonical_name(trimmed) {
-            Some(canonical) => (canonical, true),
-            None => match mode {
-                CodexLandMode::CreateOrReauth => {
-                    validate_profile_name(trimmed, Harness::Codex, None)?;
-                    (trimmed.to_string(), false)
-                }
-                // A TUI re-login never recreates an account the browser
-                // round-trip outlived: refuse instead of minting the old name.
-                CodexLandMode::RequireExisting => {
-                    bail!("codex profile '{trimmed}' no longer exists");
-                }
-            },
+        let (canonical, reauth) = match (state.canonical_name(trimmed), mode) {
+            (Some(canonical), CodexLandMode::CreateOnly) => {
+                bail!("codex profile '{canonical}' already exists — create under a new name");
+            }
+            (Some(canonical), _) => (canonical, true),
+            (None, CodexLandMode::RequireExisting) => {
+                bail!("codex profile '{trimmed}' no longer exists");
+            }
+            (None, _) => {
+                validate_profile_name(trimmed, Harness::Codex, None)?;
+                (trimmed.to_string(), false)
+            }
         };
         if canonical != guess {
             bail!("'{trimmed}' was renamed while the login ran — re-run it");

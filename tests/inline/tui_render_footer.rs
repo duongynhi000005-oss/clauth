@@ -1465,6 +1465,7 @@ fn the_codex_login_footer_names_only_its_modal_keys() {
         generation: 0,
         url: None,
         cancel: crate::codex_login::LoginCancel::new(),
+        is_new: false,
     };
 
     let mut open = bare_app();
@@ -1502,6 +1503,7 @@ fn the_codex_login_footer_shows_the_open_modals_row() {
         generation: 0,
         url: None,
         cancel: crate::codex_login::LoginCancel::new(),
+        is_new: false,
     };
     let confirm = Modal::Confirm(ConfirmState {
         message: "rotate 'x'?".into(),
@@ -1847,5 +1849,138 @@ fn the_footer_alert_replaces_the_hints_in_place() {
     assert_eq!(
         footer, at_rest,
         "the hints return when the alert clears, got {footer:?}"
+    );
+}
+
+/// A Setup `+ new` form of `account_type` with its cursor on `+ login` and the
+/// cached shunt reason seeded — the state the footer's `+ login` hint reads.
+/// The caller holds the `HomeSandbox` across `App::new`.
+fn plus_new_login_app(account_type: crate::tui::app::NewAccountType, reason: Option<&str>) -> App {
+    let mut app = bare_app();
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    app.profile_cursor = app.profile_count();
+    let mut draft = crate::tui::app::build_draft_new();
+    draft.account_type = account_type;
+    app.config_draft = Some(draft);
+    app.shunt_add_disabled = reason.map(str::to_string);
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::Login)
+        .expect("the form lists a `+ login` row");
+    app
+}
+
+/// An existing claude OAuth account (a `re-login` row) with its cursor on the
+/// login row and the cached shunt reason seeded — the state the footer's login
+/// hint reads for a saved account.
+fn relogin_app(reason: Option<&str>) -> App {
+    let mut profile = crate::profile::Profile::new("acct-one".to_string(), None, None);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "acc".to_string(),
+            refresh_token: Some("ref".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    app.profile_cursor = 0;
+    app.shunt_add_disabled = reason.map(str::to_string);
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::Login)
+        .expect("the account lists a login row");
+    app
+}
+
+/// R4-2 (claude footer): a cached shunt reason never strips the claude `+ new`
+/// form's `↵` hint from its `+ login` row.
+#[test]
+fn a_claude_new_form_login_row_keeps_enter_despite_a_cached_shunt_reason() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = plus_new_login_app(
+        crate::tui::app::NewAccountType::Claude,
+        Some("no shunt gateway is adopted"),
+    );
+    assert_eq!(
+        tab_hints(&app),
+        [
+            ("↑↓", "row"),
+            ("↵", "edit / toggle"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "back"),
+        ],
+        "the claude `+ login` keeps its ↵ hint"
+    );
+}
+
+/// R4-2 (codex footer): the codex `+ new` form's `+ login` keeps its `↵` too.
+#[test]
+fn a_codex_new_form_login_row_keeps_enter_despite_a_cached_shunt_reason() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = plus_new_login_app(
+        crate::tui::app::NewAccountType::Codex,
+        Some("no shunt gateway is adopted"),
+    );
+    assert_eq!(
+        tab_hints(&app),
+        [
+            ("↑↓", "row"),
+            ("↵", "edit / toggle"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "back"),
+        ],
+        "the codex `+ login` keeps its ↵ hint"
+    );
+}
+
+/// R4-2 (re-login footer): an existing claude account's `re-login` row keeps
+/// its `↵` hint even with a cached shunt reason — the reason is the shunt
+/// form's alone.
+#[test]
+fn an_existing_accounts_login_row_keeps_enter_despite_a_cached_shunt_reason() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = relogin_app(Some("no shunt gateway is adopted"));
+    assert_eq!(
+        tab_hints(&app),
+        [
+            ("↑↓", "row"),
+            ("↵", "edit / toggle"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "back"),
+        ],
+        "the existing account's login row keeps its ↵ hint"
+    );
+}
+
+/// R4-2 (shunt footer): the shunt `+ new` form's disabled `+ login` still
+/// drops its `↵` hint — the disabled state is the shunt form's alone.
+#[test]
+fn a_shunt_new_form_login_row_drops_enter_while_disabled() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = plus_new_login_app(
+        crate::tui::app::NewAccountType::Shunt,
+        Some("no shunt gateway is adopted"),
+    );
+    assert_eq!(
+        tab_hints(&app),
+        [
+            ("↑↓", "row"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "back"),
+        ],
+        "the disabled shunt `+ login` drops its ↵ hint"
     );
 }

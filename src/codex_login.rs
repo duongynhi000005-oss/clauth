@@ -49,6 +49,7 @@ const SCOPE: &str = "openid profile email offline_access api.connectors.read api
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The minted login, ready to land in a profile store.
+#[derive(Clone)]
 pub(crate) struct CodexLoginOutcome {
     /// The full `auth.json` bytes clauth will write — `auth_mode`, the token
     /// chain, `last_refresh`, and `OPENAI_API_KEY` when the secondary exchange
@@ -56,6 +57,19 @@ pub(crate) struct CodexLoginOutcome {
     pub(crate) auth_json: Vec<u8>,
     /// The ChatGPT account id, for the success line.
     pub(crate) account_id: Option<String>,
+}
+
+/// The token chain is a bearer-grade secret, so the derived form would print
+/// it; redact the bytes while keeping the account id (the `LoginSession`
+/// precedent keeps the whole struct off `Debug`, but a staged draft variant
+/// needs one).
+impl std::fmt::Debug for CodexLoginOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexLoginOutcome")
+            .field("auth_json", &"<redacted>")
+            .field("account_id", &self.account_id)
+            .finish()
+    }
 }
 
 /// A cancel handle for a running browser login: `cancel` stops the callback

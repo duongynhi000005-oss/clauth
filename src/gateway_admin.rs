@@ -37,8 +37,9 @@ pub(crate) enum PoolFamily {
 }
 
 impl PoolFamily {
-    /// The family's path segment in `/admin/api/accounts/{segment}`.
-    fn segment(self) -> &'static str {
+    /// The family's path segment in `/admin/api/accounts/{segment}`; also the
+    /// family's label on the shunt form's `family` cycle row.
+    pub(crate) fn segment(self) -> &'static str {
         match self {
             PoolFamily::Claude => "claude",
             PoolFamily::Codex => "codex",
@@ -46,16 +47,18 @@ impl PoolFamily {
         }
     }
 
+    /// The next family the `family` cycle's `space` advances to, wrapping.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            PoolFamily::Claude => PoolFamily::Codex,
+            PoolFamily::Codex => PoolFamily::Antigravity,
+            PoolFamily::Antigravity => PoolFamily::Claude,
+        }
+    }
+
     /// The add body: claude sends `mode: "oauth"` always (refreshable,
     /// usage-readable), never shunt's `setup_token` default; codex and
     /// antigravity take a name alone.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the add path is a later task (B3): no caller until the Setup + new form"
-        )
-    )]
     fn add_body(self, name: &ShuntAccountName) -> String {
         match self {
             PoolFamily::Claude => {
@@ -194,13 +197,6 @@ impl ShuntAccountName {
 // ── outcomes ────────────────────────────────────────────────────────────────
 
 /// A started add: the authorize URL the TUI opens in the browser.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the add path is a later task (B3): no caller until the Setup + new form"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AddOutcome {
     pub(crate) authorize_url: String,
@@ -208,13 +204,6 @@ pub(crate) struct AddOutcome {
 
 /// A completed login. shunt's `message` sentence is dropped: a response body
 /// never reaches a user surface.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the add path is a later task (B3): no caller until the Setup + new form"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompleteOutcome {
     pub(crate) live: bool,
@@ -389,7 +378,7 @@ impl std::error::Error for ShuntAdminError {
     not(test),
     expect(
         dead_code,
-        reason = "the add path is a later task (B3): the complete route's bound stays for its doc"
+        reason = "doc-only: the complete route's bound sits above this, so a login still exchanging reads as success"
     )
 )]
 const COMPLETION_EXCHANGE_TIMEOUT_SECS: u64 = 30;
@@ -493,13 +482,6 @@ fn recorded_agent_bounds() -> Vec<(AdminRoute, Duration)> {
 // ── the operations ──────────────────────────────────────────────────────────
 
 /// Start a claude, codex or antigravity add and return the authorize URL.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the add path is a later task (B3): no caller until the Setup + new form"
-    )
-)]
 pub(crate) fn add_pool_account(
     record: &GatewayRecord,
     family: PoolFamily,
@@ -524,13 +506,6 @@ pub(crate) fn add_pool_account(
 
 /// Finish an add with the pasted code, relayed verbatim (clauth never parses
 /// or stores it).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the add path is a later task (B3): no caller until the Setup + new form"
-    )
-)]
 pub(crate) fn complete_pool_account(
     record: &GatewayRecord,
     family: PoolFamily,
@@ -856,25 +831,11 @@ impl Drop for PollRequestOverride {
 
 // ── wire shapes ─────────────────────────────────────────────────────────────
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the add path is a later task (B3): no caller until the Setup + new form"
-    )
-)]
 #[derive(Deserialize)]
 struct AddOutcomeWire {
     authorize_url: String,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the add path is a later task (B3): no caller until the Setup + new form"
-    )
-)]
 #[derive(Deserialize)]
 struct CompleteOutcomeWire {
     live: bool,

@@ -134,7 +134,36 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects
         ])
     };
     let mut field = None;
-    if session.open_door().is_some() {
+    if let Some(shunt) = app.shunt_paste.as_ref() {
+        // The shunt add: `r`/`c` only once the authorize URL is in (the codex
+        // fold's shape), `p` only once the URL is in AND no paste has been sent
+        // down the door — no code can exist before the link, so before the
+        // announce the modal reads `opening your browser…` alone.
+        match &session.url {
+            Some(_) => {
+                lines.push(key_row("r", "  open the browser again"));
+                lines.push(key_row("c", "  copy link"));
+            }
+            None => lines.push(Line::from(Span::styled(
+                "opening your browser…",
+                theme::dim(),
+            ))),
+        }
+        match session.paste_field.as_ref() {
+            Some(input) => {
+                field = Some(ModalExtra::Field {
+                    at: lines.len(),
+                    label: CODE_LABEL,
+                    input,
+                });
+                lines.push(code_field_row(input));
+            }
+            None if !shunt.sent && session.url.is_some() => {
+                lines.push(key_row("p", "  paste code"))
+            }
+            None => {}
+        }
+    } else if session.open_door().is_some() {
         lines.push(key_row("r", "  open the browser again"));
         lines.push(key_row("c", "  copy link"));
         match session.paste_field.as_ref() {
@@ -195,12 +224,14 @@ fn code_field_row(field: &InputState) -> Line<'static> {
 
 /// The codex re-login modal: the claude login shell minus the paste door. It
 /// waits on the browser callback alone (`r` opens the browser again, `c` copies
-/// the authorize link), so there is no code field and no stage ladder.
+/// the authorize link), so there is no code field and no stage ladder. `r`/`c`
+/// render only once the worker announced the URL — `opening your browser…`
+/// before (the claude modal's console-login shape).
 fn draw_codex_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(session) = app.codex_login.as_ref() else {
         return; // the login ended this frame; the modal pops on the next drain
     };
-    let lines: Vec<Line<'_>> = vec![
+    let mut lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled(
             format!("logging in '{}'", session.name),
             theme::body(),
@@ -214,15 +245,23 @@ fn draw_codex_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("continue in your browser", theme::dim()),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("r", theme::accent().bold()),
-            Span::styled("  open the browser again", theme::dim()),
-        ]),
-        Line::from(vec![
-            Span::styled("c", theme::accent().bold()),
-            Span::styled("  copy link", theme::dim()),
-        ]),
     ];
+    match session.url {
+        Some(_) => {
+            lines.push(Line::from(vec![
+                Span::styled("r", theme::accent().bold()),
+                Span::styled("  open the browser again", theme::dim()),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("c", theme::accent().bold()),
+                Span::styled("  copy link", theme::dim()),
+            ]));
+        }
+        None => lines.push(Line::from(Span::styled(
+            "opening your browser…",
+            theme::dim(),
+        ))),
+    }
     draw_modal_scrolled(
         frame,
         area,

@@ -14,7 +14,7 @@ use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, lo
 use super::super::app::{
     App, BandEntry, CodexDetailRow, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin, HarnessFilter,
     InputState, MODEL_PRESETS, MainItemKind, PoolDetailRow, PoolMutationKind, ReadingsSnapshot,
-    SetupSelection, config_rows, escape_control, pool_auth_label,
+    SetupSelection, config_rows, escape_control, new_form_draft, pool_auth_label,
 };
 use super::super::theme;
 use super::format::{NO_DATA, middle_truncate, spinner_frame, truncate};
@@ -271,6 +271,24 @@ struct Snap {
     /// (the picker's `+ new profile` seeded it and the base url still names
     /// the gateway). Turns the api key row read-only `minted on save`.
     mint_armed: bool,
+    /// `+ new` form only: the `type` cycle row's current pick.
+    account_type: crate::tui::app::NewAccountType,
+    /// `+ new` form only: the `family` cycle row's current pick.
+    family: crate::gateway_admin::PoolFamily,
+    /// `+ new` form only: the codex `+ login` mint is staged.
+    captured_codex_mint: bool,
+    /// `+ new` form only: the codex `+ capture current login` marker is staged.
+    captured_codex_capture: bool,
+    /// `+ new` form only: a refusal on the name row's `└` line (a codex name
+    /// held by either roster), stored on the draft.
+    name_refusal: Option<String>,
+    /// `+ new` form only: a refusal on the create row's `└` line (a codex
+    /// create with nothing staged), stored on the draft.
+    create_refusal: Option<String>,
+    /// `+ new` form only: the shunt `+ login`'s disabled reason, `Some` while
+    /// the add is unavailable. A read-error rung carries the error text, so it
+    /// is a `String`, not a `&'static str`.
+    login_disabled_reason: Option<String>,
 }
 
 impl Snap {
@@ -323,6 +341,13 @@ impl Snap {
             has_static_backup: false,
             email: None,
             mint_armed: false,
+            account_type: crate::tui::app::NewAccountType::Claude,
+            family: crate::gateway_admin::PoolFamily::Claude,
+            captured_codex_mint: false,
+            captured_codex_capture: false,
+            name_refusal: None,
+            create_refusal: None,
+            login_disabled_reason: None,
         }
     }
 }
@@ -337,31 +362,47 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
     };
     // Resolve the selection BEFORE taking the config guard: `setup_selection`
     // reads the profile count under its own short guard, and `RankedMutex`
-    // refuses a nested acquisition of the same rank.
+    // refuses a nested acquisition of the same rank. The disabled reason and
+    // the `+ new` draft too: `shunt_login_disabled` re-runs `setup_selection`
+    // for its type check, and `new_form_draft`'s fallback branch re-runs it.
     let selection = app.setup_selection();
+    let login_disabled_reason = app.shunt_login_disabled();
+    let new_draft = new_form_draft(app);
     let cfg = app.config();
     let profile_idx = match selection {
         SetupSelection::Item(MainItemKind::Profile(i)) => i,
         _ => {
             let mut snap = Snap::blank("+ new account");
-            let stash = app
-                .config_draft
-                .as_ref()
-                .and_then(|d| d.captured_login.as_ref());
+            let stash = new_draft.and_then(|d| d.captured_login.as_ref());
             // Mirror commit_new_account's consume rule: a typed base url flips the
             // form to API mode and the mint will be discarded, so no stale ✓. The
             // live-login stash survives into api mode, so its ✓ tracks the stash
             // alone.
-            let oauth_mode = app
-                .config_draft
-                .as_ref()
-                .is_some_and(|d| d.base_url.value.trim().is_empty());
+            let oauth_mode = new_draft.is_some_and(|d| d.base_url.value.trim().is_empty());
             snap.captured = oauth_mode && stash.is_some_and(|s| matches!(s, DraftLogin::Mint(_)));
             snap.captured_live = stash.is_some_and(|s| matches!(s, DraftLogin::LiveLogin(_)));
-            snap.mint_armed = app
-                .config_draft
-                .as_ref()
-                .is_some_and(ConfigDraft::mint_armed);
+            snap.captured_codex_mint = stash.is_some_and(|s| matches!(s, DraftLogin::CodexMint(_)));
+            snap.captured_codex_capture =
+                stash.is_some_and(|s| matches!(s, DraftLogin::CodexCapture));
+            snap.mint_armed = new_draft.is_some_and(ConfigDraft::mint_armed);
+            if let Some(d) = new_draft {
+                // The at-rest preview draws the suspended draft as it is (a
+                // switch suspends what it leaves); descended, the live buffer
+                // renders and the snap carries no text.
+                snap.name = if with_text {
+                    d.name.value.clone()
+                } else {
+                    String::new()
+                };
+                snap.account_type = d.account_type;
+                snap.family = d.family;
+                snap.name_refusal = d.name_refusal.clone();
+                snap.create_refusal = d.create_refusal.clone();
+            }
+            // The disabled reason reads off the tick's cache (and this form's
+            // own add, which keeps the row live), never a disk read on the
+            // render path; resolved before the guard above.
+            snap.login_disabled_reason = login_disabled_reason;
             return snap;
         }
     };
@@ -435,6 +476,13 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 has_static_backup: crate::claude::has_static_backup(&p.name),
                 email: login_email(p, readings.usage_of(&p.name).and_then(|u| u.plan.as_ref())),
                 mint_armed: false,
+                account_type: crate::tui::app::NewAccountType::Claude,
+                family: crate::gateway_admin::PoolFamily::Claude,
+                captured_codex_mint: false,
+                captured_codex_capture: false,
+                name_refusal: None,
+                create_refusal: None,
+                login_disabled_reason: None,
             }
         }
         None => Snap::blank("settings"),
@@ -880,7 +928,16 @@ fn draw_settings_rows(
         actions_focused,
         toast_rects,
     } = tail;
-    let draft = app.config_draft.as_ref();
+    // Every field VALUE reads the one `+ new` draft lookup too: at rest that is
+    // the suspended `new_account_draft`, so a typed base url / api key / model
+    // (and the mint form's gateway url) render instead of `—`; an existing
+    // account's detail keeps its live `config_draft` buffer. No config guard is
+    // held here — this is a render leaf on `&App`, and the lookup's fallback
+    // branch takes its own short guard internally.
+    let draft = match app.setup_selection() {
+        SetupSelection::New => new_form_draft(app),
+        _ => app.config_draft.as_ref(),
+    };
     let editing = draft.and_then(|d| d.active);
     let armed_action = draft.and_then(|d| d.armed_action);
 
@@ -908,13 +965,21 @@ fn draw_settings_rows(
         lines.push(Line::from(spans));
     }
 
-    lines.push(Line::from(vec![
-        Span::styled(
-            key_cell("type", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
-            theme::label(),
-        ),
-        Span::styled(type_value, type_style),
-    ]));
+    // The `+ new` form replaces the read-only `type  oauth|api` line with its
+    // own `type` cycle row (the first row); an existing account keeps the line.
+    // Keyed on the row list, not the selection: the render's test fixtures draw
+    // the header directly with an empty roster, which reads as `New` but still
+    // wants the line.
+    let is_new_form = rows.first() == Some(&ConfigRow::Type);
+    if !is_new_form {
+        lines.push(Line::from(vec![
+            Span::styled(
+                key_cell("type", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+                theme::label(),
+            ),
+            Span::styled(type_value, type_style),
+        ]));
+    }
 
     // The address belongs to the OAuth login, so it goes with the `oauth` type
     // the moment a draft base url turns the account api-typed.
@@ -980,9 +1045,29 @@ fn draw_settings_rows(
         );
         // The tooltip this row carries when focused: its behaviour hint, kept
         // while a text field edits; the bell threshold, a numeric row, swaps
-        // in its range tooltip while typing.
+        // in its range tooltip while typing; a name/create refusal renders the
+        // DANGER invalid-input line instead.
+        let refusal: Option<String> = match *row {
+            ConfigRow::Name => {
+                let stored = snap.name_refusal.clone();
+                if stored.is_some() {
+                    stored
+                } else if snap.account_type == crate::tui::app::NewAccountType::Shunt {
+                    let name = draft.map(|d| d.name.value.trim()).unwrap_or("");
+                    (!name.is_empty()
+                        && crate::gateway_admin::ShuntAccountName::new(name).is_none())
+                    .then(|| "name: lowercase a-z, 0-9 and - only".to_string())
+                } else {
+                    None
+                }
+            }
+            ConfigRow::Create => snap.create_refusal.clone(),
+            _ => None,
+        };
         let tip_lines: Vec<Line<'static>> = if is_editing && *row == ConfigRow::BellThreshold {
             alert_range_tooltip(&input, inner.width as usize)
+        } else if let Some(reason) = refusal {
+            invalid_tooltip_lines(&reason, inner.width as usize)
         } else {
             row_hint(*row, snap)
                 .map(|text| help_tooltip_lines(&text, inner.width as usize))
@@ -1074,6 +1159,8 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::BellThreshold => &snap.bell_threshold,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
         ConfigRow::AutoStart
+        | ConfigRow::Type
+        | ConfigRow::Family
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::EnvAdd
         | ConfigRow::Login
@@ -1134,8 +1221,17 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::Login if snap.console_login => {
             "log into alibaba console to see this account's usage"
         }
+        ConfigRow::Login if snap.account_type == crate::tui::app::NewAccountType::Codex => {
+            "mint a codex login in the browser"
+        }
+        ConfigRow::Login if snap.login_disabled_reason.is_some() => {
+            return Some(snap.login_disabled_reason.clone().unwrap_or_default());
+        }
         ConfigRow::Login if api_login => "re-enter the base URL + API key for this account",
         ConfigRow::Login => "browser OAuth login",
+        ConfigRow::CaptureLogin if snap.account_type == crate::tui::app::NewAccountType::Codex => {
+            "capture the current codex login into this account"
+        }
         ConfigRow::CaptureLogin => "save the current global credentials into a new account",
         ConfigRow::DeleteCreds if api_login => "clears the stored API key",
         ConfigRow::DeleteCreds => "clears the stored OAuth login",
@@ -1198,6 +1294,8 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         | ConfigRow::EnvEntry(_)
         | ConfigRow::EnvAdd
         | ConfigRow::Name
+        | ConfigRow::Type
+        | ConfigRow::Family
         | ConfigRow::Create => return None,
     };
     Some(hint.to_string())
@@ -1233,6 +1331,44 @@ fn detail_row(
     let line = match row {
         ConfigRow::Name => {
             return kv_field(arrow, "name", input, editing, selected, false, false, width);
+        }
+        // The `+ new` form's account-type cycle, first row of the form.
+        ConfigRow::Type => {
+            let lead = vec![
+                arrow,
+                Span::styled(
+                    key_cell("type", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+                    label_style(selected),
+                ),
+            ];
+            let options: Vec<(&str, bool)> = [
+                crate::tui::app::NewAccountType::Claude,
+                crate::tui::app::NewAccountType::Codex,
+                crate::tui::app::NewAccountType::Shunt,
+            ]
+            .iter()
+            .map(|t| (t.as_str(), *t == snap.account_type))
+            .collect();
+            return cycle_row_lines(lead, &options, None, None, selected, width);
+        }
+        // The shunt form's family cycle.
+        ConfigRow::Family => {
+            let lead = vec![
+                arrow,
+                Span::styled(
+                    key_cell("family", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+                    label_style(selected),
+                ),
+            ];
+            let options: Vec<(&str, bool)> = [
+                crate::gateway_admin::PoolFamily::Claude,
+                crate::gateway_admin::PoolFamily::Codex,
+                crate::gateway_admin::PoolFamily::Antigravity,
+            ]
+            .iter()
+            .map(|f| (f.segment(), *f == snap.family))
+            .collect();
+            return cycle_row_lines(lead, &options, None, None, selected, width);
         }
         ConfigRow::BaseUrl => {
             return kv_field(
@@ -1402,7 +1538,7 @@ fn detail_row(
         // Same done-state pattern as `Login`: a stashed snapshot renders the ✓,
         // ⏎ re-captures but confirms first before replacing a stashed mint.
         ConfigRow::CaptureLogin => {
-            if snap.captured_live {
+            if snap.captured_live || snap.captured_codex_capture {
                 Line::from(vec![
                     arrow,
                     Span::styled(
@@ -1421,9 +1557,23 @@ fn detail_row(
             }
         }
         ConfigRow::Login => {
-            // A draft-held mint renders the done state; ⏎ re-runs the login but
-            // confirms first before replacing the stash.
-            if snap.captured {
+            // The shunt `+ login` is a Disabled row while the add is
+            // unavailable: whole line faint, focusable but inert, the reason on
+            // its `└` line (via `row_hint`).
+            if snap.login_disabled_reason.is_some() {
+                let row_arrow = if selected {
+                    Span::styled("❯ ", theme::faint())
+                } else {
+                    Span::raw("  ")
+                };
+                return vec![Line::from(vec![
+                    row_arrow,
+                    Span::styled("+ login", theme::faint()),
+                ])];
+            }
+            // A draft-held mint (claude or codex) renders the done state; ⏎
+            // re-runs the login but confirms first before replacing the stash.
+            if snap.captured || snap.captured_codex_mint {
                 Line::from(vec![
                     arrow,
                     Span::styled("✓ logged in", bold_when(theme::success(), selected)),

@@ -3015,6 +3015,7 @@ fn the_setup_model_row_wraps_between_options_at_80_columns() {
         KeyCode::Enter,
         KeyCode::Down,
         KeyCode::Down,
+        KeyCode::Down,
         KeyCode::Char(' '),
     ] {
         crate::tui::app::handle_key(&mut app, key(k));
@@ -4566,6 +4567,7 @@ fn the_new_account_form_labels_esc_done_and_keeps_the_typed_value() {
     handle_key(&mut app, key(KeyCode::Esc));
 
     handle_key(&mut app, key(KeyCode::Char('n')));
+    handle_key(&mut app, key(KeyCode::Down)); // off the `type` row
     handle_key(&mut app, key(KeyCode::Enter));
     assert_eq!(
         footer_of(&dump(&app, 120, 30)),
