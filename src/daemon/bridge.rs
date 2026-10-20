@@ -1,5 +1,7 @@
 //! The mod bridge: `~/.clauth/bridge.sock`, the session a socket peer resolves
-//! to, and the control routes that queue commands for a mod.
+//! to, the control routes that queue commands for a mod (`POST /event`,
+//! `GET /poll`), and the per-ask wait (`GET /wait`) that parks a held check on
+//! its own ask without touching the session's poll.
 //!
 //! The daemon binds the socket only under `--listen`, below the singleton claim.
 //! Every event, poll and command resolves the peer pid back to an
@@ -88,6 +90,13 @@ const MAX_PARKED_POLLS: usize = 256;
 /// 8192 doubles the write-timeout pin's 4096-command batch, so the cap never
 /// bites a live mod while still bounding one stopped-reading instance.
 pub(crate) const MAX_QUEUED_COMMANDS: usize = 8192;
+
+/// Cap on one instance's parked per-ask waits. Each held check parks its own
+/// `GET /wait`; the cap bounds the parked connections one instance can pin
+/// (SB-10's per-instance wait cap), so a mod that asks while already holding
+/// many checks falls back to the stock dialog instead of parking without
+/// bound.
+pub(crate) const MAX_WAITS_PER_INSTANCE: usize = 8;
 
 /// How long the accept loop pauses after an error it cannot attribute to one
 /// connection, so a persistent failure cannot spin a core (mirrors the REST
@@ -249,8 +258,12 @@ struct Live {
     /// Open asks in open order, with what the snapshot and frames carry.
     open_asks: Vec<(String, OpenAsk)>,
     /// Ask ids already closed, so a device answer's later `ask_closed` event
-    /// and a second answer both read as closed.
-    closed_asks: HashSet<String>,
+    /// and a second answer both read as closed. The value is the answer a
+    /// device queued (`null` for a desk close or the session's end), kept so a
+    /// wait arriving after the answer returns it at once; the wait that
+    /// delivers the answer drops the payload, keeping only the id, so a live
+    /// instance never accumulates an answer per closed ask (W4).
+    closed_asks: HashMap<String, Value>,
     /// Whether the current wait's `blocked` push is reserved: set in the same
     /// lock hold that decides to push, rolled back by [`Hub::note_ask_opened`]
     /// when no push queue is wired, and cleared when the last open ask closes.
@@ -278,6 +291,13 @@ struct Live {
     /// Bumped whenever a poll parks on this instance, so a replaced poll can
     /// tell it was replaced and stop waiting.
     poll_epoch: u64,
+    /// Parked per-ask waits (`GET /wait`) held right now, keyed by ask id and
+    /// bounded by [`MAX_WAITS_PER_INSTANCE`] across the map. A wait answers at
+    /// once when its ask is already closed, so it never spends a slot; only a
+    /// wait parked on an open ask counts. The per-ask key lets a poll that
+    /// delivered an answer command leave the payload for a wait still parked on
+    /// that ask.
+    parked_waits: HashMap<String, usize>,
     /// Monotonic per hub: a parked poll captures this and compares on wake, so
     /// a `/clear` or recycled pid that replaced the instance never feeds its
     /// commands to the abandoned poll (SB-4).
@@ -307,7 +327,7 @@ impl Live {
             session_id: resolved.session_id.clone(),
             seq_high: 0,
             open_asks: Vec::new(),
-            closed_asks: HashSet::new(),
+            closed_asks: HashMap::new(),
             announced: false,
             cwd: Value::Null,
             interactive: Value::Null,
@@ -317,6 +337,7 @@ impl Live {
             commands: VecDeque::new(),
             inflight: 0,
             poll_epoch: 0,
+            parked_waits: HashMap::new(),
             generation,
             tailing: true,
             rewake: HashSet::new(),
@@ -496,7 +517,9 @@ impl Hub {
     }
 
     /// The end frames for a closing instance: every open ask closes `by:
-    /// session_end`, then the `end` status (SB-13).
+    /// session_end`, then the `end` status (SB-13). Every removal path calls
+    /// this, so the one notify here wakes any wait (and poll) parked on the
+    /// instance, whatever path removed it.
     fn emit_instance_end(&self, live: &Live) {
         for (ask, _) in &live.open_asks {
             self.broadcast(
@@ -508,6 +531,7 @@ impl Hub {
             "session.status",
             json!({"session": live.session_id, "state": "end"}),
         );
+        self.changed.notify_all();
     }
 
     /// The snapshot a (re)connecting stream opens with: every live session and
@@ -618,9 +642,9 @@ impl Hub {
 
         // `end` goes through the same reconcile path so a moved record closes
         // the old instance before the sequence is judged (A#14), then removes
-        // and wakes the instance's parked poll. An `end` for a pid whose
-        // instance this call just minted emits nothing: no `start` was ever
-        // broadcast for it.
+        // and (through [`Hub::emit_instance_end`]) wakes the instance's parked
+        // poll and waits. An `end` for a pid whose instance this call just
+        // minted emits nothing: no `start` was ever broadcast for it.
         if kind == "end" {
             let had_instance = inner.instances.get(&peer_pid).is_some_and(|live| {
                 live.proc_start == resolved.proc_start && live.session_id == resolved.session_id
@@ -638,11 +662,10 @@ impl Hub {
                 }
                 return (409, error_value("stale_sequence"));
             }
-            if let Some(live) = inner.instances.remove(&peer_pid) {
-                self.changed.notify_all();
-                if had_instance {
-                    self.emit_instance_end(&live);
-                }
+            if let Some(live) = inner.instances.remove(&peer_pid)
+                && had_instance
+            {
+                self.emit_instance_end(&live);
             }
             return (200, json!({ "ok": true }));
         }
@@ -734,18 +757,27 @@ impl Hub {
             }
             "ask_closed" => {
                 let ask = value.get("ask").and_then(Value::as_str).unwrap_or_default();
-                if !live.closed_asks.contains(ask) {
+                if !live.closed_asks.contains_key(ask) {
                     live.open_asks.retain(|(id, _)| id != ask);
-                    live.closed_asks.insert(ask.to_string());
+                    live.closed_asks.insert(ask.to_string(), Value::Null);
                     // The last open ask closed: the wait ends, so the next ask
                     // opens a new wait and announces again (WP-8).
                     if live.open_asks.is_empty() {
                         live.announced = false;
                     }
+                    // Wake a wait parked on this ask (and the poll, which finds
+                    // nothing to drain): a desk close queues no command, so this
+                    // notify is the close's only wake.
+                    self.changed.notify_all();
                     self.broadcast(
                         "session.ask",
                         json!({"session": named, "ask": ask, "state": "closed", "by": "desk"}),
                     );
+                } else {
+                    // The mod's hold was already lost (a `503 busy`, `remote:false`
+                    // or a rejected fetch), so its late `ask_closed` is the ask's
+                    // last consumer: drop the kept payload, keep the id.
+                    live.closed_asks.insert(ask.to_string(), Value::Null);
                 }
                 (200, json!({ "ok": true }))
             }
@@ -1085,22 +1117,38 @@ impl Hub {
         (status, body)
     }
 
+    /// Resolve `peer_pid` to its instance and check `session` against it: the
+    /// one guard every poll and wait answer shares, so an unknown peer and a
+    /// session mismatch refuse alike. `what` names the route in the audit line.
+    fn resolve_peer(
+        &self,
+        peer_pid: u32,
+        session: &str,
+        what: &str,
+    ) -> Result<Instance, (u16, Value)> {
+        let Some(resolved) = (self.resolver)(peer_pid) else {
+            self.log_unknown_peer(peer_pid);
+            return Err((403, error_value("unknown_peer")));
+        };
+        if resolved.session_id != session {
+            logline!(
+                "clauth bridge: peer {peer_pid} refused {what} for '{}' (resolved '{}')",
+                sanitize_for_log(session),
+                sanitize_for_log(&resolved.session_id)
+            );
+            return Err((403, error_value("session_mismatch")));
+        }
+        Ok(resolved)
+    }
+
     /// [`poll`] with the drained commands carried back, so `serve` can requeue
     /// them when the answer write fails rather than letting a 200'd command
     /// vanish (A#1).
     fn poll_answer(&self, peer_pid: u32, session: &str, wait: Duration) -> PollAnswer {
-        let Some(resolved) = (self.resolver)(peer_pid) else {
-            self.log_unknown_peer(peer_pid);
-            return PollAnswer::empty(403, error_value("unknown_peer"));
+        let resolved = match self.resolve_peer(peer_pid, session, "poll") {
+            Ok(resolved) => resolved,
+            Err((status, body)) => return PollAnswer::empty(status, body),
         };
-        if resolved.session_id != session {
-            logline!(
-                "clauth bridge: peer {peer_pid} refused poll for '{}' (resolved '{}')",
-                sanitize_for_log(session),
-                sanitize_for_log(&resolved.session_id)
-            );
-            return PollAnswer::empty(403, error_value("session_mismatch"));
-        }
         // The device store is read once per poll answer (A#15), before the hub
         // lock, so the read never stalls the hub (SB-10).
         let remote = self.remote_flag();
@@ -1174,6 +1222,79 @@ impl Hub {
         }
     }
 
+    /// Park one `GET /wait` on its own open ask until that ask closes, its
+    /// bound elapses, or the instance dies — never touching the session's
+    /// parked poll. Unlike a poll, a wait drains nothing, never bumps
+    /// `poll_epoch`, and never mints an instance: it always follows an
+    /// `ask_opened`, so an absent instance reads as an ask never opened.
+    pub(crate) fn wait_ask(
+        &self,
+        peer_pid: u32,
+        session: &str,
+        ask: &str,
+        wait: Duration,
+    ) -> (u16, Value) {
+        if let Err((status, body)) = self.resolve_peer(peer_pid, session, "wait") {
+            return (status, body);
+        }
+        // The device store is read once per wait answer (A#15), before the hub
+        // lock, so the read never stalls the hub (SB-10).
+        let remote = self.remote_flag();
+
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(live) = inner.instances.get_mut(&peer_pid) else {
+            return (404, error_value("ask_not_found"));
+        };
+        let generation = live.generation;
+        if let Some(answer) = live.closed_asks.get(ask) {
+            let answer = answer.clone();
+            live.closed_asks.insert(ask.to_string(), Value::Null);
+            return (200, wait_body(remote, Some(answer), true));
+        }
+        if !live.open_asks.iter().any(|(id, _)| id == ask) {
+            return (404, error_value("ask_not_found"));
+        }
+        if live.parked_waits.values().sum::<usize>() >= MAX_WAITS_PER_INSTANCE {
+            return (503, error_value("busy"));
+        }
+        *live.parked_waits.entry(ask.to_string()).or_default() += 1;
+        let deadline = Instant::now() + wait;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                leave_wait(&mut inner, peer_pid, generation, ask);
+                return (200, wait_body(remote, None, false));
+            }
+            let (guard, _timed_out) = self
+                .changed
+                .wait_timeout(inner, deadline - now)
+                .unwrap_or_else(|p| p.into_inner());
+            inner = guard;
+            let Some(live) = inner.instances.get(&peer_pid) else {
+                leave_wait(&mut inner, peer_pid, generation, ask);
+                return (200, wait_body(remote, None, true));
+            };
+            if live.generation != generation {
+                leave_wait(&mut inner, peer_pid, generation, ask);
+                return (200, wait_body(remote, None, true));
+            }
+            let Some(answer) = live.closed_asks.get(ask).cloned() else {
+                // Still open — a spurious wake or another ask's event woke the
+                // shared condvar: park again.
+                continue;
+            };
+            leave_wait(&mut inner, peer_pid, generation, ask);
+            // The answer rode this wait out: drop the payload, keep the id so
+            // the ask still reads as closed to a later answer or `ask_closed`.
+            if let Some(live) = inner.instances.get_mut(&peer_pid)
+                && live.generation == generation
+            {
+                live.closed_asks.insert(ask.to_string(), Value::Null);
+            }
+            return (200, wait_body(remote, Some(answer), true));
+        }
+    }
+
     /// Mark a poll's drained commands delivered: the write succeeded, so the
     /// commands are consumed (dropped) and the instance's in-flight count
     /// falls. A replaced or closed instance needs nothing — its count died
@@ -1183,8 +1304,22 @@ impl Hub {
         let Some(live) = inner.instances.get_mut(&drained.peer_pid) else {
             return;
         };
-        if live.generation == drained.generation {
-            live.inflight = live.inflight.saturating_sub(drained.commands.len());
+        if live.generation != drained.generation {
+            return;
+        }
+        live.inflight = live.inflight.saturating_sub(drained.commands.len());
+        // A delivered `answer` command is that ask's last consumer via the poll
+        // only when no wait is parked on it: a parked wait still delivers the
+        // payload, and dropping it here would race the wait to a null answer.
+        // Drop the kept payload then, keep the id so the ask still reads as
+        // closed to a later answer or `ask_closed`.
+        for command in &drained.commands {
+            if command.get("kind").and_then(Value::as_str) == Some("answer")
+                && let Some(ask) = command.get("ask").and_then(Value::as_str)
+                && !live.parked_waits.contains_key(ask)
+            {
+                live.closed_asks.insert(ask.to_string(), Value::Null);
+            }
         }
     }
 
@@ -1294,7 +1429,11 @@ impl Hub {
                             return AskOutcome::Busy;
                         }
                         live.open_asks.retain(|(id, _)| id != ask);
-                        live.closed_asks.insert(ask.to_string());
+                        // The answer rides the closed-asks record, so a wait
+                        // arriving after it returns it at once (stripped of the
+                        // `kind`/`ask` wire wrapper the poll command keeps).
+                        live.closed_asks
+                            .insert(ask.to_string(), answer_value(&command));
                         // The last open ask closed: the wait ends, so the next
                         // ask opens a new wait and announces again (WP-8).
                         if live.open_asks.is_empty() {
@@ -1308,7 +1447,7 @@ impl Hub {
                         );
                         AskOutcome::Queued
                     }
-                    None if live.closed_asks.contains(ask) => AskOutcome::AskClosed,
+                    None if live.closed_asks.contains_key(ask) => AskOutcome::AskClosed,
                     None => AskOutcome::AskNotFound,
                 }
             }
@@ -1503,6 +1642,39 @@ fn error_value(code: &str) -> Value {
 
 fn poll_body(remote: bool, commands: &[Value]) -> Value {
     json!({ "remote": remote, "commands": commands })
+}
+
+/// One `GET /wait` answer: the device flag, the ask's answer (`null` when the
+/// ask closed without one or the bound elapsed with it still open), and
+/// whether the ask is closed.
+fn wait_body(remote: bool, answer: Option<Value>, closed: bool) -> Value {
+    json!({ "remote": remote, "answer": answer, "closed": closed })
+}
+
+/// The answer a device queued, stripped of the `kind`/`ask` wire wrapper the
+/// poll command carries: the wait answers with the payload alone, the same
+/// shapes the mod form-matches in a poll answer.
+fn answer_value(command: &Value) -> Value {
+    let mut stripped = command.as_object().cloned().unwrap_or_default();
+    stripped.remove("kind");
+    stripped.remove("ask");
+    Value::Object(stripped)
+}
+
+/// Release a parked wait's slot, only when the instance it parked on is still
+/// the live one at `peer_pid` — a replaced or closed instance's counter died
+/// with it, so the successor's must not be charged for its wait.
+fn leave_wait(inner: &mut Inner, peer_pid: u32, generation: u64, ask: &str) {
+    if let Some(live) = inner.instances.get_mut(&peer_pid)
+        && live.generation == generation
+        && let Some(parked) = live.parked_waits.get_mut(ask)
+    {
+        if *parked <= 1 {
+            live.parked_waits.remove(ask);
+        } else {
+            *parked -= 1;
+        }
+    }
 }
 
 /// One complete transcript line a wake relayed.
@@ -1806,7 +1978,8 @@ fn bind_0600(path: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Serve HTTP/1.1 (`POST /event`, `GET /poll?session=<id>`) over the socket,
+/// Serve HTTP/1.1 (`POST /event`, `GET /poll?session=<id>`,
+/// `GET /wait?session=<id>&ask=<ask>`) over the socket,
 /// reading the peer pid off each accepted connection. One thread per
 /// connection, so a parked 20 s poll never blocks another connection's event.
 pub(crate) fn spawn_server(listener: UnixListener, hub: Arc<Hub>) -> std::io::Result<Server> {
@@ -2108,6 +2281,24 @@ fn serve(
                 None => {}
             }
         }
+        ("GET", path) if path.starts_with("/wait") => {
+            let Some((session, ask)) = parse_wait_query(path) else {
+                write_response(&mut stream, 400, &error_value("bad_request"));
+                return;
+            };
+            // Leave the event budget before parking, exactly as a poll does: a
+            // parked wait holds the poll budget, never an event slot (SB-10).
+            drop(event);
+            if parked.fetch_add(1, Ordering::Relaxed) >= MAX_PARKED_POLLS {
+                parked.fetch_sub(1, Ordering::Relaxed);
+                logline!("clauth bridge: refused a wait: {MAX_PARKED_POLLS} parked polls");
+                write_response(&mut stream, 503, &error_value("busy"));
+                return;
+            }
+            let _wait_slot = Slot(parked);
+            let (status, body) = hub.wait_ask(pid, session, ask, POLL_WAIT);
+            let _ = write_response(&mut stream, status, &body);
+        }
         _ => {
             write_response(&mut stream, 404, &error_value("not_found"));
         }
@@ -2289,6 +2480,24 @@ fn parse_poll_session(path: &str) -> Option<&str> {
         let (key, value) = pair.split_once('=')?;
         (key == "session").then_some(value)
     })
+}
+
+/// The `session` and `ask` of a `GET /wait` query, both required — a missing
+/// one reads as `400 bad_request`, never a default that could wait on the wrong
+/// ask.
+fn parse_wait_query(path: &str) -> Option<(&str, &str)> {
+    let query = path.split_once('?')?.1;
+    let mut session = None;
+    let mut ask = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        match key {
+            "session" => session = Some(value),
+            "ask" => ask = Some(value),
+            _ => {}
+        }
+    }
+    Some((session?, ask?))
 }
 
 fn write_response(stream: &mut UnixStream, status: u16, body: &Value) -> bool {
@@ -2535,3 +2744,7 @@ mod fix2_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/daemon_bridge_frames.rs"]
 mod frames_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/daemon_bridge_wait.rs"]
+mod wait_tests;
