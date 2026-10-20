@@ -10,6 +10,7 @@
   "homepage": "https://github.com/uwuclxdy/clauth",
   "repository": "https://github.com/uwuclxdy/clauth",
   "keywords": ["claude-code", "oauth", "profiles", "mcp", "account-switch"],
+  "types": "./types/index.d.ts",
   "mcpServers": {
     "clauth": {
       "command": "clauth",
