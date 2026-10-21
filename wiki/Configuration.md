@@ -312,7 +312,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
       runtime-isolated-<sid>/
       sessions-<sid>/      # that session's PID file, flock-held while it runs
       sessions-isolated-<sid>/
-      spawn-settings-<sid>.json # that session's --settings (auto-memory dir, Read hook, any --settings you passed), removed at exit
+      spawn-settings-<sid>.json # that session's --settings (auto-memory dir, Read hook, any --settings you passed), removed at exit; kept while a background session's (clauth start <p> -- --bg) job names it, until claude rm <id>, or while Claude Code's job store (~/.claude/jobs/) cannot be read, or holds a job whose recorded launch flags clauth cannot read and that runs in this session's runtime tree (at clauth's cleanup of a shared session's file, also one in the profile's unsuffixed runtime/); clauth's next stale-session cleanup (when clauth start or resume launches, the TUI opens, or the daemon or the plugin's MCP server starts) removes it after that
       spawn-settings-isolated-<sid>.json # likewise, only when the isolated tree sits under a symlinked path
     cx/                    # a codex profile (see Codex)
       config.toml          # harness = "codex", plus hooks_json
