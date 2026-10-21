@@ -16209,14 +16209,20 @@ fn unmeasured_profile(name: &str) -> crate::profile::Profile {
     p
 }
 
-/// Drive the `+ add` Enter on the first candidate of a chain holding `chain`.
-fn add_first_candidate(profiles: Vec<crate::profile::Profile>, chain: Vec<&str>) -> App {
+/// Drive the `+ add` Enter on the first candidate of a chain holding `chain`,
+/// with `active` in the active slot.
+fn add_first_candidate(
+    profiles: Vec<crate::profile::Profile>,
+    chain: Vec<&str>,
+    active: Option<&str>,
+) -> App {
     use crate::profile::{AppConfig, AppState};
     let names: Vec<crate::profile::ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let mut app = App::new(AppConfig {
         state: AppState {
             profiles: names,
             fallback_chain: chain.into_iter().map(Into::into).collect(),
+            active_profile: active.map(Into::into),
             ..AppState::default()
         },
         profiles,
@@ -16253,6 +16259,7 @@ fn fallback_add_enter_raises_confirm_modal_when_the_candidate_has_no_usage_sourc
             unmeasured_profile("st"),
         ],
         vec!["alice"],
+        None,
     );
     let confirm = raised_confirm(&app);
     assert!(
@@ -16288,6 +16295,39 @@ fn fallback_add_enter_raises_confirm_modal_when_the_candidate_has_no_usage_sourc
         !app.config().state.fallback_chain.iter().any(|n| n == "st"),
         "the candidate must not enter the chain until the confirm runs"
     );
+    assert_eq!(
+        confirm.detail.as_deref(),
+        Some(super::no_usage_confirm_detail("st", false).as_str()),
+        "the modal tests render this builder, so it must be what the add path raises"
+    );
+}
+
+// A candidate can already be the active account (it is the chain it is missing
+// from), and then the hazard is the machine's state, not a forecast.
+#[test]
+fn fallback_add_enter_names_the_hazard_in_the_present_when_the_candidate_is_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = add_first_candidate(
+        vec![
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("alice")),
+            unmeasured_profile("st"),
+        ],
+        vec!["alice"],
+        Some("st"),
+    );
+    let confirm = raised_confirm(&app);
+    assert_eq!(confirm.message, "clauth can't read this account's usage.");
+    assert_eq!(
+        confirm.detail.as_deref(),
+        Some(
+            "it's active, and clauth won't switch away from it on its own.\nlog in the same \
+             account with \u{e001}clauth login st\u{e002} so clauth can read its usage."
+        ),
+    );
+    assert_eq!(
+        confirm.detail.as_deref(),
+        Some(super::no_usage_confirm_detail("st", true).as_str()),
+    );
 }
 
 // An add that would mix kinds AND lands a member clauth cannot measure keeps
@@ -16298,7 +16338,7 @@ fn fallback_add_enter_keeps_the_mix_modal_when_both_warnings_apply() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut keyed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("keyed"));
     keyed.api_key = Some("sk-test".to_string());
-    let app = add_first_candidate(vec![keyed, unmeasured_profile("st")], vec!["keyed"]);
+    let app = add_first_candidate(vec![keyed, unmeasured_profile("st")], vec!["keyed"], None);
     assert_eq!(
         raised_confirm(&app).message,
         "mixing api-key and oauth accounts can leave sessions stuck on the api account.",

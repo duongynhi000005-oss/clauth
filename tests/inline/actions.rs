@@ -6031,13 +6031,13 @@ fn reauth_overwrite_clears_broken_flag() {
     );
 }
 
-/// \#116 review: what a re-auth does to a profile holding a long-lived session
-/// token, which is what the TTY confirm now says before the operator answers.
-/// The stored pair IS replaced. The sidecar is NOT: no step of the login path
-/// reads or removes it, and the relink resolves `install_source_path`, which
-/// keeps picking `session-token.json` while it is long-lived. So the fresh
-/// login reaches usage polling and the sessions keep running on the token,
-/// which is the whole reason this marker asks for the login at all.
+/// What a re-auth does to a profile holding a long-lived session token, which
+/// is what the TTY confirm says before the operator answers. The stored pair IS
+/// replaced. The sidecar is NOT: no step of the login path reads or removes it,
+/// and the relink resolves `install_source_path`, which keeps picking
+/// `session-token.json` while it is long-lived. So the fresh login reaches
+/// usage polling and the sessions keep running on the token, which is the whole
+/// reason this marker asks for the login at all.
 #[test]
 fn a_reauth_replaces_the_pair_and_leaves_the_session_token_installed() {
     let _home = HomeSandbox::new();

@@ -721,10 +721,10 @@ pub(crate) const DIAG_MONTHLY_SOFT: &str =
     "monthly quota past the weekly switch line, still serving";
 pub(crate) const DIAG_STALE: &str = "stale data";
 /// The Fallback pill for a member clauth cannot measure: it says what clauth
-/// CANNOT DO, not what has not happened yet. "no usage yet" read as "the first
-/// poll is still coming" in a real terminal, which is the opposite of this
-/// state, and it is also what the `--explain` age cell prints for an account
-/// whose first poll really is coming. The verb is the one the add confirm and
+/// CANNOT DO, not what has not happened yet. "no usage yet" reads as "the first
+/// poll is still coming", the opposite of this state, and it is what the
+/// `--explain` age cell prints for an account whose first poll really is
+/// coming. The verb is the one the add confirm and
 /// the daemon line already use ("can't read ... usage"), so the three surfaces
 /// say one thing.
 pub(crate) const DIAG_NO_USAGE: &str = "can't read usage";

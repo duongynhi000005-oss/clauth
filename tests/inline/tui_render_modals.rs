@@ -422,9 +422,8 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
                 let left = row.find('│').expect("modal border");
                 // The scrollbar column goes with the border: these rows are
                 // the subject, and whether the modal happens to scroll at this
-                // size is not. One legend row more used to be enough to put a
-                // `┃` into every comparison here. Stripped in stages, so a
-                // blank row keeps the leading border it is made of.
+                // size is not. Stripped in stages, so a blank row keeps the
+                // leading border it is made of.
                 row[left..]
                     .trim_end()
                     .trim_end_matches('│')
@@ -1344,16 +1343,11 @@ fn add_chain_candidate_modal_pins_body_and_named_confirm_button() {
     );
 }
 
-/// \#116 round 4: the no-usage add confirm carries TWO detail lines, the hazard
-/// and then the fix, and the modal has to draw them as two rows. Found by a
-/// mutation arm: collapsing the two lines into one passed every other test
-/// here.
-///
-/// Round 5 (rebase onto `mommy`): rendered wide enough that BOTH sentences fit
-/// a row whole. The modal caps at 60% of the terminal, so at 100 columns its
-/// inner width is shorter than the hazard sentence and the `hazard + 1`
-/// arithmetic was measuring `chunk_line`'s word wrap instead of the newline
-/// split it is named for. The wrap has its own test below.
+/// The no-usage add confirm carries TWO detail lines, the hazard and then the
+/// fix, and the modal has to draw them as two rows. Rendered wide enough that
+/// both sentences fit a row whole: the modal caps at 60% of the terminal, and
+/// at a narrower width `hazard + 1` would measure `chunk_line`'s word wrap
+/// instead of the newline split. The wrap has its own test below.
 #[test]
 fn add_chain_candidate_modal_draws_the_no_usage_detail_as_two_rows() {
     use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
@@ -1361,16 +1355,9 @@ fn add_chain_candidate_modal_draws_the_no_usage_detail_as_two_rows() {
     use ratatui::backend::TestBackend;
 
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    // Built the way `handle_fallback_add_key` builds it, so the copy is the
-    // production copy and not a transcription.
     let state = ConfirmState {
         message: "clauth can't read this account's usage.".into(),
-        detail: Some(format!(
-            "{}{}.\n{}",
-            crate::fallback::no_usage_hazard_lead(false),
-            crate::fallback::no_usage_hazard(),
-            crate::tui::render::prose::mark_commands(&crate::fallback::no_usage_fix(&["blind"]))
-        )),
+        detail: Some(crate::tui::app::no_usage_confirm_detail("blind", false)),
         choice: false,
         scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::AddChainCandidate("blind".into()),
@@ -1394,12 +1381,10 @@ fn add_chain_candidate_modal_draws_the_no_usage_detail_as_two_rows() {
     );
 }
 
-/// \#116 round 5: at 80 columns the fix line wraps, and its continuation has to
-/// start in the SAME column as its first row. A cell-boundary cut keeps the
-/// space at the cut and turns it into a one-column indent, which is what a real
-/// terminal showed. `mommy`'s `chunk_line` breaks between words and drops the
-/// break's whitespace run, so the column holds without this file pre-wrapping
-/// anything — which is what this pins, now that the pre-wrap is gone.
+/// At 80 columns the fix line wraps, and its continuation has to start in the
+/// SAME column as its first row. A cell-boundary cut keeps the space at the cut
+/// and turns it into a one-column indent; `chunk_line` breaks between words and
+/// drops the break's whitespace run, which is what this pins.
 #[test]
 fn add_chain_candidate_modal_wraps_the_detail_without_indenting_the_rest() {
     use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
@@ -1409,12 +1394,7 @@ fn add_chain_candidate_modal_wraps_the_detail_without_indenting_the_rest() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let state = ConfirmState {
         message: "clauth can't read this account's usage.".into(),
-        detail: Some(format!(
-            "{}{}.\n{}.",
-            crate::fallback::no_usage_hazard_lead(false),
-            crate::fallback::no_usage_hazard(),
-            crate::tui::render::prose::mark_commands(&crate::fallback::no_usage_fix(&["blind"]))
-        )),
+        detail: Some(crate::tui::app::no_usage_confirm_detail("blind", false)),
         choice: false,
         scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::AddChainCandidate("blind".into()),
@@ -4121,9 +4101,9 @@ fn the_check_output_modal_drops_trailing_whitespace_that_overflows() {
 /// One exact pin here, beside the widened (content-fit) help pins above.
 ///
 /// The thumb's extent is part of that shape, so it moves when the legend does:
-/// the `◆ can't read usage` row added for #116 is one row more of content, and
-/// the thumb is one row shorter for it. The wrapped rows above are what this
-/// test is for and none of them changed.
+/// the `◆ can't read usage` row is one row more of content, and the thumb is
+/// one row shorter for it. The wrapped rows above are what this test is for and
+/// none of them changed.
 #[test]
 fn the_help_modal_wraps_long_rows_at_the_common_width() {
     use ratatui::{Terminal, backend::TestBackend};

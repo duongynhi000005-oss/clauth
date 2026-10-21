@@ -451,19 +451,18 @@ fn draw_chain_detail(
 /// where this ladder picks the disabled one, so distinct shapes made the same
 /// account wear two glyphs on one screen.
 ///
-/// `NoUsage` takes `◆` at the warning hue. It first wore `Stale`'s faint `⋯`
-/// (wrong: the two part on what the walk does with them, since a deep-stuck
-/// stale active gets walked off and an unmeasured one never does, see
-/// [`crate::fallback::no_usage_hazard`]), then the dotted `◌` at the warning
-/// hue, which a run in a real terminal settled: on the pastel amber this
-/// palette uses, a dotted ring reads as a light GREY ring, because a hairline
-/// glyph carries almost no hue and the amber differs from body text mostly in
-/// hue (12.9:1 against the background, 1.14:1 against the text). The red `×`
-/// one row above drowned it.
+/// `NoUsage` takes `◆` at the warning hue, not `Stale`'s faint `⋯`: the two part
+/// on what the walk does with them, since a deep-stuck stale active gets walked
+/// off and an unmeasured one never does, see
+/// [`crate::fallback::no_usage_hazard`]. A dotted `◌` at the warning hue does
+/// not work either: on the pastel amber this palette uses, a dotted ring reads
+/// as a light GREY ring, because a hairline glyph carries almost no hue and the
+/// amber differs from body text mostly in hue (12.9:1 against the background,
+/// 1.14:1 against the text), and the red `×` one row above drowns it.
 ///
-/// It was also already spoken for: `◌` is the Usage tab's queued-refresh dot
-/// (`◌ refresh in Ns`), so the legend's one-shape-one-sense rule was broken
-/// across tabs, which no test here could see.
+/// `◌` is also the Usage tab's queued-refresh dot (`◌ refresh in Ns`), so it
+/// would break the legend's one-shape-one-sense rule across tabs, which no test
+/// here can see.
 ///
 /// So the shape is solid, which is what lets a 1-cell mark carry a pastel at
 /// all. `◆` and not `▲`, which would read as a rising figure beside the usage

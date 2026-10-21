@@ -886,19 +886,18 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     ))];
     // A detail may be several lines, and each is PROSE: split on the newlines
     // the caller wrote and leave the wrapping to the modal, which breaks
-    // between words and drops the break's whitespace run (`chunk_line`). A
-    // pre-wrap here wrapped a SECOND time, and because it ran before the modal
-    // measured its content it also capped the modal below its own 60% — the
-    // width this file's `the_modal_caps_at_sixty_percent_from_eighty_columns`
-    // pins. The newline split has to stay: `chunk_line` sees one line at a
-    // time, so without it the hazard and the fix would be one run of prose.
+    // between words and drops the break's whitespace run (`chunk_line`). No
+    // pre-wrap here: it would run before the modal measures its content and
+    // shrink the measurement under its 60% cap. The newline split has to stay:
+    // `chunk_line` sees one line at a time, so without it the hazard and the
+    // fix would be one run of prose.
     if let Some(detail) = &state.detail {
         for line in detail.lines() {
             lines.push(Line::from(prose::spans(line, theme::dim())));
         }
     }
-    // The daemon-start confirm's detail is two lines, which the one-line
-    // `detail` cannot hold.
+    // The daemon-start confirm carries its two lines here rather than in
+    // `detail`, which its caller leaves `None`.
     if matches!(state.on_confirm, ConfirmAction::StartDaemon) {
         lines.push(Line::from(prose::spans(
             concat!(

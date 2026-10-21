@@ -3488,19 +3488,18 @@ pub(crate) fn reading_is_polled(p: &crate::profile::Profile) -> bool {
 /// left out: the membership half of [`any_fetch_leg_polls`], and the question
 /// [`crate::fallback::no_usage_source`] reads for its marker.
 ///
-/// The OAuth half is [`usage_poll_pair`] itself, not a second spelling of it:
-/// the marker used to repeat that `claude_ai_oauth` chain by hand, which let
-/// the poller's membership rule and the two marks reading it drift. Folded, so
-/// a leg added later — the #110 inference probe above all — joins this one rule
-/// and every surface keyed on it follows without a change of its own.
+/// The OAuth half is [`usage_poll_pair`] itself, not a second spelling of it, so
+/// the poller's membership rule and the two marks reading it cannot drift; a leg
+/// added later — the #110 inference probe above all — joins this one rule and
+/// every surface keyed on it follows without a change of its own.
 ///
 /// Split from the poll question because the two answer different things and one
-/// caller needs each (#116 review). Whether anything polls this member is a
-/// question of its shape; whether the operator switched it off is the
-/// `Disabled` rung's to describe, including on the Fallback card, which stacks
-/// the health ladder under `[ disabled ]`. Read whole, this gate had the marker
-/// call every disabled member holding a login and a long-lived token
-/// unmeasurable there, and ask it for the login it already held.
+/// caller needs each. Whether anything polls this member is a question of its
+/// shape; whether the operator switched it off is the `Disabled` rung's to
+/// describe, including on the Fallback card, which stacks the health ladder
+/// under `[ disabled ]`. Read whole, this gate would call every disabled member
+/// holding a login and a long-lived token unmeasurable there, and ask it for the
+/// login it already holds.
 pub(crate) fn any_fetch_leg_admits(p: &crate::profile::Profile) -> bool {
     usage_poll_pair(p).is_some() || third_party_pollable(p)
 }

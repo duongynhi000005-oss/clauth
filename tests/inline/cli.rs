@@ -3005,100 +3005,15 @@ mod static_token_verdicts {
         assert!(!p.rolling_token, "nothing durable from a failed arm");
     }
 
-    /// The reauth confirm's survivor clause is the prompt's only affirmative
-    /// promise, and it is destructive to get wrong in either direction: a
-    /// profile told its endpoint survives when the arm will not fire, or one
-    /// told nothing survives while it silently keeps a key. It tracks the
-    /// preserve arm's own predicate, so an OAuth profile — which has neither
-    /// field — is never promised one.
-    #[test]
-    fn the_reauth_confirm_promises_a_survivor_only_where_one_survives() {
-        assert_eq!(
-            reauth_confirm_object(false, true),
-            "stored subscription login, keeping its endpoint and api key"
-        );
-        assert_eq!(reauth_confirm_object(false, false), "stored credentials");
-        // An api-mode login carries both fields and replaces them, so the
-        // preserve never applies whatever the profile holds.
-        assert_eq!(reauth_confirm_object(true, true), "endpoint + API key");
-        assert_eq!(reauth_confirm_object(true, false), "endpoint + API key");
+    fn reauth_profile(name: &str) -> crate::profile::Profile {
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from(name))
     }
 
-    /// \#116 round 3: the setup-token-only shape (#110) — the one the Fallback
-    /// card sends people here with — stores no OAuth pair, so the clause has to
-    /// say the login ADDS one instead of naming credentials that do not exist.
-    /// Pinned off real `Profile` fixtures through `usage_poll_pair`, so the
-    /// wording AND the fact it keys on are both held: a fixture with no
-    /// `claudeAiOauth` must read as storing no login, and one carrying a pair
-    /// must keep the replace wording and its survivor clause.
-    ///
-    /// Storing no login is necessary and not sufficient (#116 review): the
-    /// endpoint-shell fixture below stores none either, and the login still
-    /// strikes its `base_url`, so it keeps the replace wording. Both facts are
-    /// read off the fixture through the predicates the call site uses, so the
-    /// copy cannot drift from what the overwrite actually does.
-    #[test]
-    fn the_reauth_confirm_adds_a_login_when_the_profile_stores_none() {
-        let pairless =
-            crate::testutil::blank_profile(&crate::profile::ProfileName::from("st-only"));
-        let stores_none = crate::usage::usage_poll_pair(&pairless).is_some();
-        assert!(
-            !stores_none,
-            "fixture precondition: the setup-token-only shape stores no OAuth pair"
-        );
-        assert_eq!(
-            reauth_confirm_action(false, false, stores_none, true, false),
-            "adds an OAuth login beside its long-lived token"
-        );
-        assert_eq!(
-            reauth_confirm_action(false, false, stores_none, false, false),
-            "adds an OAuth login",
-            "with no sidecar there is no long-lived token to name beside it"
-        );
-
-        // An endpoint SHELL: a `base_url` with neither key nor pair, which is
-        // what logging an api account out leaves behind. It stores no login
-        // either, but the overwrite's preserve arm refuses an endpoint with
-        // nothing to authenticate it, so the login writes `base_url = None` —
-        // and a confirm saying "adds" would announce an add while doing a
-        // delete. Reachable with a plain `clauth login <name>`, whose api-mode
-        // flag is false (`login_bare_name_is_oauth_mode`), so the mode is read
-        // from that parse here rather than asserted as a literal.
-        let mut shell = crate::testutil::blank_profile(&crate::profile::ProfileName::from("shell"));
-        shell.base_url = Some("https://proxy.example/v1".to_string());
-        let shell_keeps_endpoint = crate::claude::has_own_inference_endpoint(&shell);
-        let shell_drops =
-            !shell_keeps_endpoint && (shell.base_url.is_some() || shell.api_key.is_some());
-        assert!(
-            crate::usage::usage_poll_pair(&shell).is_none(),
-            "fixture precondition: the shell stores no OAuth pair either"
-        );
-        assert!(
-            !shell_keeps_endpoint,
-            "fixture precondition: an endpoint with no credential behind it is not preserved"
-        );
-        assert!(
-            shell_drops,
-            "fixture precondition: so the overwrite strikes the stored base_url"
-        );
-        assert_eq!(
-            reauth_confirm_action(
-                login(&["login", "shell"]).is_api_mode(),
-                shell_keeps_endpoint,
-                crate::usage::usage_poll_pair(&shell).is_some(),
-                false,
-                shell_drops,
-            ),
-            "replaces its stored credentials",
-            "the login deletes this profile's endpoint, so it replaces rather than adds"
-        );
-
-        let mut paired =
-            crate::testutil::blank_profile(&crate::profile::ProfileName::from("paired"));
-        paired.credentials = Some(crate::profile::ClaudeCredentials {
+    fn with_pair(mut p: crate::profile::Profile) -> crate::profile::Profile {
+        p.credentials = Some(crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
-                access_token: "at-paired".to_string(),
-                refresh_token: Some("rt-paired".to_string()),
+                access_token: format!("at-{}", p.name),
+                refresh_token: Some(format!("rt-{}", p.name)),
                 expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
                 scopes: Some(vec![
                     "user:inference".to_string(),
@@ -3108,105 +3023,181 @@ mod static_token_verdicts {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         });
-        let stores_one = crate::usage::usage_poll_pair(&paired).is_some();
-        assert!(stores_one, "fixture precondition: this one stores a pair");
-        // The other direction, so the add wording cannot creep onto a profile
-        // whose login really is being replaced.
+        p
+    }
+
+    /// A long-lived sidecar on disk, the fact the prompt reads for itself.
+    fn with_mint(p: crate::profile::Profile) -> crate::profile::Profile {
+        std::fs::create_dir_all(crate::profile::profile_dir(&p.name).expect("profile dir"))
+            .expect("mkdir profile");
+        crate::claude::write_session_token(
+            &p.name,
+            "sk-ant-oat01-reauth-copy-mint-000",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint");
+        p
+    }
+
+    fn rolling(mut p: crate::profile::Profile) -> crate::profile::Profile {
+        p.rolling_token = true;
+        p
+    }
+
+    fn with_endpoint(mut p: crate::profile::Profile, key: bool) -> crate::profile::Profile {
+        p.base_url = Some("https://proxy.example/v1".to_string());
+        if key {
+            p.api_key = Some("sk-proxy-reauth-copy".to_string());
+        }
+        p
+    }
+
+    fn prompt(p: &crate::profile::Profile, is_api: bool) -> String {
+        reauth_prompt(&p.name, Some(p), is_api)
+    }
+
+    /// The whole `[y/N]` line `clauth login <existing>` prints, read off real
+    /// profiles and the sidecar on disk, so every fact the wording keys on is
+    /// read where `cmd_login` reads it. Each shape is pinned by equality: the
+    /// verb, the object, the survivor clause and the session-token sentence are
+    /// separate claims, and a dropped or swapped fact changes exactly one.
+    #[test]
+    fn the_reauth_prompt_says_what_the_login_does_to_each_profile_shape() {
+        let _home = HomeSandbox::new();
+
+        // The setup-token-only shape the Fallback card sends people here with:
+        // no pair to replace, so the login adds one.
         assert_eq!(
-            reauth_confirm_action(false, false, stores_one, true, false),
-            "replaces its stored credentials"
+            prompt(&with_mint(reauth_profile("st-plain")), false),
+            "clauth: profile 'st-plain' already exists. Re-authenticating adds an OAuth login \
+             beside its long-lived token. Sessions keep running on its long-lived token. This \
+             login only feeds usage polling. Continue? [y/N] "
+        );
+        // With `rolling_token` on, the sessions move onto this login at the
+        // next rotation, the opposite of the plain promise.
+        assert_eq!(
+            prompt(&with_mint(rolling(reauth_profile("st-roll"))), false),
+            "clauth: profile 'st-roll' already exists. Re-authenticating adds an OAuth login \
+             beside its long-lived token. Its rolling token re-stamps from the stored login, so \
+             its sessions move onto this login at the next rotation, even if it is another \
+             account. Continue? [y/N] "
         );
         assert_eq!(
-            reauth_confirm_action(false, true, stores_one, false, false),
-            "replaces its stored subscription login, keeping its endpoint and api key"
+            prompt(&with_mint(with_pair(reauth_profile("pair-plain"))), false),
+            "clauth: profile 'pair-plain' already exists. Re-authenticating replaces its stored \
+             credentials. Sessions keep running on its long-lived token. This login only feeds \
+             usage polling. Continue? [y/N] "
         );
-        // An api-mode login writes endpoint and key outright, so it replaces
-        // whatever the profile stores — pairless included.
         assert_eq!(
-            reauth_confirm_action(true, false, stores_none, true, false),
-            "replaces its endpoint + API key"
+            prompt(
+                &with_mint(rolling(with_pair(reauth_profile("pair-roll")))),
+                false
+            ),
+            "clauth: profile 'pair-roll' already exists. Re-authenticating replaces its stored \
+             credentials. Its rolling token re-stamps from the stored login, so its sessions \
+             move onto this login at the next rotation, even if it is another account. \
+             Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&with_pair(reauth_profile("pair-only")), false),
+            "clauth: profile 'pair-only' already exists. Re-authenticating replaces its stored \
+             credentials. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&reauth_profile("bare"), false),
+            "clauth: profile 'bare' already exists. Re-authenticating adds an OAuth login. \
+             Continue? [y/N] "
+        );
+        // The flag alone promises nothing: with no sidecar there is nothing to
+        // re-stamp.
+        assert_eq!(
+            prompt(&rolling(reauth_profile("bare-roll")), false),
+            "clauth: profile 'bare-roll' already exists. Re-authenticating adds an OAuth login. \
+             Continue? [y/N] "
         );
     }
 
-    /// \#116 review: the confirm used to promise only the replace, which is
-    /// true and incomplete. On a profile holding a long-lived sidecar the
-    /// replace reaches `/usage` polling and NOTHING the sessions use, because
-    /// the sidecar outranks `credentials.json` at every switch (CLA-SPLIT, and
-    /// pinned on the behaviour in `actions`'
-    /// `a_reauth_replaces_the_pair_and_leaves_the_session_token_installed`).
-    /// The operator has to read that BEFORE answering, not in the NOTE
-    /// `cmd_login` prints afterwards. One space ahead of the sentence, so it
-    /// joins the object clause without a double space or a missing one.
+    /// The survivor clause is the prompt's only promise that something is KEPT,
+    /// and it is destructive to get wrong in either direction. It follows the
+    /// overwrite's preserve arm: an endpoint with a key behind it survives an
+    /// OAuth reauth, pair or no pair; an endpoint SHELL (a `base_url` with
+    /// neither key nor pair, what logging an api account out leaves behind)
+    /// loses its `base_url`, so it is told the login replaces rather than adds;
+    /// an api-mode login writes the endpoint and key outright.
     #[test]
-    fn the_reauth_confirm_says_what_a_session_token_does_to_the_login() {
+    fn the_reauth_prompt_promises_a_survivor_only_where_one_survives() {
+        let _home = HomeSandbox::new();
+
         assert_eq!(
-            reauth_confirm_session_token_note(true, false),
-            " Sessions keep running on its long-lived token; this login only feeds usage polling."
+            prompt(&with_endpoint(reauth_profile("ep-keyed"), true), false),
+            "clauth: profile 'ep-keyed' already exists. Re-authenticating adds an OAuth login, \
+             keeping its endpoint and api key. Continue? [y/N] "
         );
         assert_eq!(
-            reauth_confirm_session_token_note(false, false),
-            "",
-            "a profile with no sidecar is promised nothing about one"
+            prompt(
+                &with_mint(with_endpoint(reauth_profile("ep-mint"), true)),
+                false
+            ),
+            "clauth: profile 'ep-mint' already exists. Re-authenticating adds an OAuth login \
+             beside its long-lived token, keeping its endpoint and api key. Sessions keep \
+             running on its long-lived token. This login only feeds usage polling. Continue? \
+             [y/N] "
         );
         assert_eq!(
-            reauth_confirm_session_token_note(false, true),
-            "",
-            "the flag alone promises nothing: with no sidecar there is nothing to re-stamp"
+            prompt(
+                &with_pair(with_endpoint(reauth_profile("ep-paired"), true)),
+                false
+            ),
+            "clauth: profile 'ep-paired' already exists. Re-authenticating replaces its stored \
+             subscription login, keeping its endpoint and api key. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&with_endpoint(reauth_profile("ep-shell"), false), false),
+            "clauth: profile 'ep-shell' already exists. Re-authenticating replaces its stored \
+             credentials. Continue? [y/N] "
+        );
+        // api mode: the endpoint set is replaced whatever the profile holds,
+        // and a sidecar beside it is no part of what this login touches.
+        assert_eq!(
+            prompt(&with_endpoint(reauth_profile("api-keyed"), true), true),
+            "clauth: profile 'api-keyed' already exists. Re-authenticating replaces its \
+             endpoint + API key. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&with_mint(reauth_profile("api-mint")), true),
+            "clauth: profile 'api-mint' already exists. Re-authenticating replaces its \
+             endpoint + API key. Continue? [y/N] "
         );
     }
 
-    /// \#116 round 3: the sentence above is true for a PLAIN `claude
-    /// setup-token` mint and false for a rolling one. With `rolling_token`
-    /// armed, every rotation re-stamps the sidecar from the stored pair
-    /// (`oauth`'s `stamp_sidecar`), so the login being confirmed is what the
-    /// sessions move onto at the next rotation — another account's whenever
-    /// that is what was logged in as, which nothing on the profile lets clauth
-    /// check. Pinned by equality in BOTH directions, because the two sentences
-    /// are opposites and getting either one onto the wrong profile is the
-    /// failure this split exists to prevent.
+    /// The NOTE after the login splits on the same facts as the prompt before
+    /// it, read the same way, so the operator is never told one thing while
+    /// answering and the other once it landed.
     #[test]
-    fn the_reauth_confirm_says_what_a_rolling_token_does_to_the_login() {
-        assert_eq!(
-            reauth_confirm_session_token_note(true, true),
-            " Its rolling token re-stamps from the stored login, so its sessions move onto this \
-             login at the next rotation, even if it is another account."
-        );
-        assert_ne!(
-            reauth_confirm_session_token_note(true, true),
-            reauth_confirm_session_token_note(true, false),
-            "the rolling case must not inherit the plain token's promise"
-        );
-    }
+    fn the_login_note_says_what_the_sidecar_does_to_the_sessions() {
+        let _home = HomeSandbox::new();
+        let note = |p: &crate::profile::Profile, is_api: bool| login_note(&p.name, Some(p), is_api);
 
-    /// The NOTE after the login splits on the same axis as the confirm before
-    /// it, so the operator cannot be told one thing while answering and the
-    /// other once it landed. The plain arm is pinned too: it is the sentence
-    /// that was already shipping, and a change there is a change to what an
-    /// untouched mint promises.
-    #[test]
-    fn the_login_note_says_what_a_rolling_token_does_to_the_sessions() {
         assert_eq!(
-            login_session_token_note("acct", true),
-            "clauth: NOTE 'acct' holds a rolling token, and that is what switches install. It \
-             re-stamps from the stored login, so its sessions move onto this login at the next \
-             rotation, even if it is another account. Drop it with:  clauth static-token acct \
-             --clear"
+            note(&with_mint(reauth_profile("note-plain")), false).as_deref(),
+            Some(
+                "clauth: NOTE 'note-plain' still holds a long-lived token, and that is what \
+                 switches install. This login only feeds usage polling. Drop it with:  clauth \
+                 static-token note-plain --clear"
+            )
         );
-    }
-
-    #[test]
-    fn the_login_note_keeps_the_plain_setup_token_sentence() {
         assert_eq!(
-            login_session_token_note("acct", false),
-            "clauth: NOTE 'acct' still holds a long-lived token, and that is what switches \
-             install. This login only feeds usage polling. Drop it with:  clauth static-token \
-             acct --clear"
+            note(&with_mint(rolling(reauth_profile("note-roll"))), false).as_deref(),
+            Some(
+                "clauth: NOTE 'note-roll' holds a rolling token, and that is what switches \
+                 install. It re-stamps from the stored login, so its sessions move onto this \
+                 login at the next rotation, even if it is another account. Drop it with:  \
+                 clauth static-token note-roll --clear"
+            )
         );
-        assert_ne!(
-            login_session_token_note("acct", false),
-            login_session_token_note("acct", true),
-            "the two kinds of sidecar must not print the same note"
-        );
+        assert_eq!(note(&with_pair(reauth_profile("note-none")), false), None);
+        assert_eq!(note(&rolling(reauth_profile("note-flag")), false), None);
+        assert_eq!(note(&with_mint(reauth_profile("note-api")), true), None);
     }
 
     /// "Name the split state" (owner ruling, 2026-08-30): a quarantined

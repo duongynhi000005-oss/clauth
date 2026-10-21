@@ -9155,9 +9155,9 @@ fn no_usage_source_is_a_session_token_without_an_oauth_pair() {
         !no_usage_source(&keyless, true),
         "an endpoint without a key (a console-only Alibaba member) is no subscription"
     );
-    // The `[env] ANTHROPIC_BASE_URL` half `is_oauth` cannot see (#116 review):
-    // such a member routes its requests to another pool, so the login this
-    // marker asks for would feed the walk windows that pool never spends.
+    // The `[env] ANTHROPIC_BASE_URL` half `is_oauth` cannot see: such a member
+    // routes its requests to another pool, so the login this marker asks for
+    // would feed the walk windows that pool never spends.
     let mut env_routed = bare("env");
     env_routed.env.insert(
         "ANTHROPIC_BASE_URL".to_string(),
@@ -9175,12 +9175,11 @@ fn no_usage_source_is_a_session_token_without_an_oauth_pair() {
         no_usage_source(&blank_env, true),
         "an entry blank once trimmed is no override, as `routing_endpoint` reads it"
     );
-    // The key half reads `claude::has_inference_auth` and not `api_key`
-    // (#116 round 3), which was wrong both ways round. A key can ride the
-    // profile's own `[env]`, where the managed field is None: such a member
-    // authenticates its own inference, so it is no more measurable here than
-    // one with the managed field set, and marking it would ask it for a login
-    // it does not need.
+    // The key half reads `claude::has_inference_auth` and not `api_key`, in
+    // both directions. A key can ride the profile's own `[env]`, where the
+    // managed field is None: such a member authenticates its own inference, so
+    // it is no more measurable here than one with the managed field set, and
+    // marking it would ask it for a login it does not need.
     let mut env_key = bare("ek");
     env_key
         .env
@@ -9197,9 +9196,9 @@ fn no_usage_source_is_a_session_token_without_an_oauth_pair() {
         !no_usage_source(&env_auth, true),
         "the auth-token entry is the other half of the same test"
     );
-    // And the other direction, the one the old field test got backwards: a key
-    // blank once trimmed authenticates nothing, so it must not HIDE the marker
-    // on a member whose sessions really do run on the sidecar alone.
+    // And the other direction: a key blank once trimmed authenticates nothing,
+    // so it must not HIDE the marker on a member whose sessions really do run on
+    // the sidecar alone.
     let mut blank_key = bare("bk");
     blank_key.api_key = Some("   ".into());
     assert!(
@@ -9216,9 +9215,9 @@ fn no_usage_source_is_a_session_token_without_an_oauth_pair() {
     );
 }
 
-/// \#116 round 3 design: the gate is the shared membership rule, not the OAuth
-/// pair test alone, so a member ANOTHER leg polls does not wear the marker
-/// beside the reading that leg writes it.
+/// The gate is the shared membership rule, not the OAuth pair test alone, so a
+/// member ANOTHER leg polls does not wear the marker beside the reading that leg
+/// writes it.
 ///
 /// The fixture is hand-built, and deliberately so: the shape it needs is a
 /// third-party member with no endpoint, and PRODUCTION HAS NONE TODAY, because
@@ -9226,11 +9225,11 @@ fn no_usage_source_is_a_session_token_without_an_oauth_pair() {
 /// (`Profile::new`, the load boundary, `edit_profile_endpoint` and the capture
 /// overwrite) and `Profile` has no `Deserialize` to carry one in from disk. So
 /// a member the third-party leg polls always has an endpoint, and this
-/// predicate's endpoint conjunct already excluded it one line earlier (#116
-/// review). What this pins is therefore the gate's STRUCTURE rather than a bug
-/// reachable now: the rule reads both legs, so the day a leg's membership stops
-/// implying an endpoint — the #110 inference probe is the case in hand — the
-/// marker follows without a change here.
+/// predicate's endpoint conjunct excludes it one line earlier. What this pins is
+/// therefore the gate's STRUCTURE rather than a bug reachable now: the rule
+/// reads both legs, so the day a leg's membership stops implying an endpoint —
+/// the #110 inference probe is the case in hand — the marker follows without a
+/// change here.
 ///
 /// The Alibaba arm is what makes the fixture constructible at all: that quota
 /// surface cannot read an api key, so the third-party leg schedules the member
@@ -9275,7 +9274,7 @@ fn no_usage_source_leaves_a_member_another_leg_polls_alone() {
 }
 
 /// Disabled-ness is not this predicate's axis, and the split that keeps it out
-/// is pinned in BOTH directions (#116 review). The marker reads the gate's
+/// is pinned in BOTH directions. The marker reads the gate's
 /// membership half, which answers for the profile's shape, so a disabled member
 /// holding a login is measurable the moment it is enabled and the `Disabled`
 /// rung is what describes it meanwhile. The poll gate keeps disabled-ness,

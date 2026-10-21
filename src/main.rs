@@ -81,7 +81,7 @@ use clap::Parser as _;
 
 use crate::cli::{Cli, Command, LoginArgs, ThemeArg};
 use crate::out::{errln, out, outln};
-use crate::profile::{AppConfig, ProfileName, ThemeName, load_config};
+use crate::profile::{AppConfig, Profile, ProfileName, ThemeName, load_config};
 use crate::runtime::Isolation;
 
 /// The not-found refusal for the commands that try the codex roster before
@@ -839,118 +839,125 @@ fn reauth_confirmed(input: &str) -> bool {
 
 /// Prompt `[y/N]` before a reauth overwrites a profile's stored credentials.
 /// Non-TTY stdin proceeds (a piped script can't be prompted), matching the
-/// OAuth reauth contract. `is_api` tailors the copy (endpoint + key vs tokens).
-/// What the reauth confirm says it REPLACES. Split out so the survivor clause
-/// is unit-pinned: it is the only affirmative promise the prompt makes, and it
-/// is true only where the preserve arm actually fires
-/// (`actions::overwrite_captured_profile`) — an api-mode login replaces the
-/// endpoint set outright, and a profile with nothing to preserve must not be
-/// told something survives.
-fn reauth_confirm_object(is_api: bool, keeps_endpoint: bool) -> &'static str {
-    match (is_api, keeps_endpoint) {
-        (true, _) => "endpoint + API key",
-        (false, true) => "stored subscription login, keeping its endpoint and api key",
-        (false, false) => "stored credentials",
+/// OAuth reauth contract.
+fn confirm_reauth(prompt: &str) -> Result<bool> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(true);
     }
+    out!("{prompt}");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(reauth_confirmed(&answer))
 }
 
-/// The whole clause after "Re-authenticating": the VERB as well as the object,
-/// because on one shape the login replaces nothing.
+/// The whole `[y/N]` line [`confirm_reauth`] prints. What the overwrite keeps or
+/// strikes is read through the predicate the overwrite itself calls
+/// ([`claude::has_own_inference_endpoint`]), and "has a login" through
+/// `usage_poll_pair`, so the clause and the poller agree on it. The sidecar
+/// fact is a disk read, so this fn makes it itself; every
+/// managed fact comes off `profile`. `is_api` tailors the copy (endpoint + key
+/// vs tokens).
 ///
 /// The setup-token-only shape (#110) is the one the Fallback card sends people
 /// here with, and it stores no OAuth pair at all, so "replaces its stored
-/// credentials" names nothing that exists and contradicts the wiki, which calls
-/// this login an add beside the long-lived token. "Long-lived" and not "setup"
-/// in the copy: [`claude::has_session_token`] is true for a rolling sidecar too,
-/// which is no `claude setup-token` mint, and the NOTE after the login already
-/// uses that umbrella.
-///
-/// An api-mode login keeps the replace wording whatever the profile stores: it
-/// writes the endpoint and the key outright. [`reauth_confirm_object`] keeps
-/// naming only what a replace replaces, so the survivor clause stays pinned
-/// where it was.
+/// credentials" would name nothing that exists and contradict the wiki, which
+/// calls this login an add beside the long-lived token. "Long-lived" and not
+/// "setup" in the copy: [`claude::has_session_token`] is true for a rolling
+/// sidecar too, which is no `claude setup-token` mint, and the NOTE after the
+/// login already uses that umbrella.
 ///
 /// Storing no login is not enough for "adds", because the login can still
-/// STRIKE something (#116 review). `actions::overwrite_captured_profile` keeps
-/// a profile's endpoint and key only as a pair and only behind
+/// STRIKE something. `actions::overwrite_captured_profile` keeps a profile's
+/// endpoint and key only as a pair and only behind
 /// [`claude::has_own_inference_endpoint`], which refuses an endpoint with
 /// nothing to authenticate it — so on an endpoint SHELL (a `base_url` with
 /// neither key nor pair, what logging an api account out leaves behind) an
 /// OAuth reauth writes `base_url = None`. Such a profile stores no login, so
-/// the clause called this login an add while it was about to delete the
-/// account's routing. `drops_endpoint_fields` is that fact, and it is read from
-/// the MANAGED fields alone: the overwrite writes those two and never touches
-/// the profile's `[env]`, so an endpoint carried by `ANTHROPIC_BASE_URL`
-/// survives and is correctly not named here.
-fn reauth_confirm_action(
-    is_api: bool,
-    keeps_endpoint: bool,
-    stores_a_login: bool,
-    keeps_session_token: bool,
-    drops_endpoint_fields: bool,
-) -> String {
-    if !is_api && !stores_a_login && !drops_endpoint_fields {
-        return if keeps_session_token {
-            "adds an OAuth login beside its long-lived token".to_string()
+/// "adds" would announce an add while the login deletes the account's routing.
+/// `drops_endpoint_fields` is that fact, and it is read from the MANAGED fields
+/// alone: the overwrite writes those two and never touches the profile's
+/// `[env]`, so an endpoint carried by `ANTHROPIC_BASE_URL` survives and is
+/// correctly not named here.
+///
+/// The survivor clause names only what the preserve arm keeps: it is the
+/// prompt's one affirmative promise, so a profile with nothing to preserve is
+/// not told something survives. An api-mode login writes the endpoint and the
+/// key outright, so it always replaces them.
+///
+/// The session-token sentence splits on `rolling_token`, and the two answers
+/// are opposites. A plain `claude setup-token` mint is untouched: the relink
+/// keeps resolving [`claude::install_source_path`] to `session-token.json`
+/// while [`claude::has_session_token`] holds, so the fresh pair reaches usage
+/// polling and nothing else. CLA-ROLL: with `rolling_token` armed, every
+/// rotation re-stamps that sidecar FROM the stored pair (`oauth`'s
+/// `stamp_sidecar`, which reads the flag off disk and skips only a mis-fill),
+/// so the halves swap roles — the login being confirmed here is what the
+/// sessions end up on at the next rotation, and it is another account's
+/// whenever that is what was logged in as. Nothing on the profile ties the mint
+/// to an account, so clauth cannot check that for the operator; the sentence
+/// says it instead. [`login_note`] splits on the same facts, so the prompt
+/// before the login and the NOTE after it cannot say different things.
+fn reauth_prompt(target: &ProfileName, profile: Option<&Profile>, is_api: bool) -> String {
+    let keeps_session_token = !is_api && claude::has_session_token(target);
+    let rolling = profile.is_some_and(|p| p.rolling_token);
+    let action = if is_api {
+        "replaces its endpoint + API key".to_string()
+    } else {
+        let keeps_endpoint = profile.is_some_and(claude::has_own_inference_endpoint);
+        let stores_a_login = profile.is_some_and(|p| crate::usage::usage_poll_pair(p).is_some());
+        let drops_endpoint_fields =
+            !keeps_endpoint && profile.is_some_and(|p| p.base_url.is_some() || p.api_key.is_some());
+        if !stores_a_login && !drops_endpoint_fields {
+            match (keeps_session_token, keeps_endpoint) {
+                (true, true) => {
+                    "adds an OAuth login beside its long-lived token, keeping its endpoint and \
+                     api key"
+                }
+                (true, false) => "adds an OAuth login beside its long-lived token",
+                (false, true) => "adds an OAuth login, keeping its endpoint and api key",
+                (false, false) => "adds an OAuth login",
+            }
+            .to_string()
+        } else if keeps_endpoint {
+            "replaces its stored subscription login, keeping its endpoint and api key".to_string()
         } else {
-            "adds an OAuth login".to_string()
-        };
-    }
-    format!(
-        "replaces its {}",
-        reauth_confirm_object(is_api, keeps_endpoint)
-    )
-}
-
-/// What the reauth confirm adds when a long-lived sidecar sits beside the
-/// login (CLA-SPLIT). The replace itself is real: `overwrite_captured_profile`
-/// rewrites `credentials.json`. What it does to the SESSIONS depends on which
-/// kind of sidecar it is, and the two answers are opposites.
-///
-/// A plain `claude setup-token` mint is untouched: the relink keeps resolving
-/// [`claude::install_source_path`] to `session-token.json` while
-/// [`claude::has_session_token`] holds, so the fresh pair reaches usage polling
-/// and nothing else.
-///
-/// CLA-ROLL: with `rolling_token` armed, every rotation re-stamps that sidecar
-/// FROM the stored pair (`oauth`'s `stamp_sidecar`, which reads the flag off
-/// disk and skips only a mis-fill), so the halves swap roles — the login being
-/// confirmed here is what the sessions end up on at the next rotation, and it
-/// is another account's whenever that is what was logged in as. Nothing on the
-/// profile ties the mint to an account, so clauth cannot check that for the
-/// operator; the sentence says it instead.
-///
-/// Split out like [`reauth_confirm_object`] so the claim is unit-pinned, and
-/// worded as its own sentence so the object clause keeps naming only what the
-/// overwrite replaces. [`login_session_token_note`] splits on the same axis, so
-/// the prompt before the login and the NOTE after it cannot say different
-/// things.
-fn reauth_confirm_session_token_note(keeps_session_token: bool, rolling: bool) -> &'static str {
-    match (keeps_session_token, rolling) {
+            "replaces its stored credentials".to_string()
+        }
+    };
+    let note = match (keeps_session_token, rolling) {
         (false, _) => "",
         (true, false) => {
-            " Sessions keep running on its long-lived token; this login only feeds usage polling."
+            " Sessions keep running on its long-lived token. This login only feeds usage polling."
         }
         (true, true) => {
             " Its rolling token re-stamps from the stored login, so its sessions move onto this \
              login at the next rotation, even if it is another account."
         }
-    }
+    };
+    format!(
+        "clauth: profile '{target}' already exists. Re-authenticating {action}.{note} Continue? [y/N] "
+    )
 }
 
 /// The NOTE `cmd_login` prints after a login onto a profile that keeps a
-/// long-lived sidecar: the same split said once more, where the operator can act
-/// on it. Silence here reads as "the re-login took", which is what sent an
-/// operator round the loop of re-authenticating an account that kept running on
-/// its year-old mint.
+/// long-lived sidecar: the same split [`reauth_prompt`] makes, said once more
+/// where the operator can act on it. Silence here reads as "the re-login took",
+/// which is what sends an operator round the loop of re-authenticating an
+/// account that keeps running on its year-old mint.
 ///
-/// Hoisted out of `cmd_login` for the same reason the confirm's half is, and
-/// split on the same `rolling` axis: on a rolling profile the re-login is not
-/// inert, it is what the sessions move onto, so telling the operator it "only
-/// feeds usage polling" would be the wrong half of the truth at the moment the
-/// rotation is about to prove it.
-fn login_session_token_note(target: &str, rolling: bool) -> String {
-    if rolling {
+/// `None` when the login is an api one (it touches no sidecar) or the profile
+/// holds no sidecar. On a rolling profile the re-login is not inert: it is what
+/// the sessions move onto at the next rotation, so "only feeds usage polling"
+/// would be the wrong half of the truth at the moment the rotation proves it.
+/// Pass the profile as it stands after the overwrite: `rolling_token` is left
+/// untouched there, so the NOTE describes the same login the prompt did.
+fn login_note(target: &ProfileName, profile: Option<&Profile>, is_api: bool) -> Option<String> {
+    if is_api || !claude::has_session_token(target) {
+        return None;
+    }
+    let rolling = profile.is_some_and(|p| p.rolling_token);
+    Some(if rolling {
         format!(
             "clauth: NOTE '{target}' holds a rolling token, and that is what switches install. \
              It re-stamps from the stored login, so its sessions move onto this login at the \
@@ -963,36 +970,7 @@ fn login_session_token_note(target: &str, rolling: bool) -> String {
              install. This login only feeds usage polling. Drop it with:  clauth static-token \
              {target} --clear"
         )
-    }
-}
-
-fn confirm_reauth(
-    target: &str,
-    is_api: bool,
-    keeps_endpoint: bool,
-    keeps_session_token: bool,
-    rolling: bool,
-    stores_a_login: bool,
-    drops_endpoint_fields: bool,
-) -> Result<bool> {
-    use std::io::IsTerminal as _;
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Ok(true);
-    }
-    let action = reauth_confirm_action(
-        is_api,
-        keeps_endpoint,
-        stores_a_login,
-        keeps_session_token,
-        drops_endpoint_fields,
-    );
-    let note = reauth_confirm_session_token_note(keeps_session_token, rolling);
-    out!(
-        "clauth: profile '{target}' already exists. Re-authenticating {action}.{note} Continue? [y/N] "
-    );
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    Ok(reauth_confirmed(&answer))
+    })
 }
 
 /// Collect the base_url + api_key pair for API-key mode. Each value comes from
@@ -1441,48 +1419,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
 
     // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
     // declined overwrite must not open a browser or read a secret.
-    // The preserve arm's own predicate, called rather than re-spelled: only a
-    // profile that has an endpoint AND something to authenticate with keeps
-    // them through a browser reauth, so only that one is told so.
-    let keeps_endpoint = config
-        .find(&target)
-        .is_some_and(claude::has_own_inference_endpoint);
-    // The same gate the NOTE after the login uses, asked before the decision:
-    // the sidecar is what switches install, so on a profile holding one this
-    // login changes what clauth polls, and on a rolling one what the sessions
-    // run on too.
-    let keeps_session_token = !is_api && claude::has_session_token(&target);
-    // CLA-ROLL: read ONCE, off the same config the endpoint half reads, and
-    // reused for the NOTE below — so the prompt before the login and the line
-    // after it can never describe two different profiles. The rotation itself
-    // re-reads the flag from disk, as it must; this is copy, not a gate.
-    let rolling_token = config.find(&target).is_some_and(|p| p.rolling_token);
-    // Whether there is a login to REPLACE. `usage_poll_pair` is the stored-pair
-    // test, read rather than re-spelled, so the clause and the poller agree on
-    // what "has a login" means; a name the config does not hold stores none.
-    let stores_a_login = config
-        .find(&target)
-        .is_some_and(|p| crate::usage::usage_poll_pair(p).is_some());
-    // What the overwrite would STRIKE, which decides the verb as much as
-    // `stores_a_login` does: the preserve arm keeps the endpoint and the key
-    // only as a pair and only where `keeps_endpoint` holds, so an endpoint
-    // shell loses its `base_url` to a browser reauth. Managed fields only —
-    // the overwrite writes those two and leaves `[env]` alone.
-    let drops_endpoint_fields = !keeps_endpoint
-        && config
-            .find(&target)
-            .is_some_and(|p| p.base_url.is_some() || p.api_key.is_some());
-    if reauth
-        && !confirm_reauth(
-            &target,
-            is_api,
-            keeps_endpoint,
-            keeps_session_token,
-            rolling_token,
-            stores_a_login,
-            drops_endpoint_fields,
-        )?
-    {
+    if reauth && !confirm_reauth(&reauth_prompt(&target, config.find(&target), is_api))? {
         outln!("clauth: aborted. '{target}' left unchanged.");
         return Ok(());
     }
@@ -1554,10 +1491,10 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     }
     // CLA-SPLIT: the sidecar outranks `credentials.json` at every switch. What
     // that costs depends on the kind, so the copy lives in one place with the
-    // confirm's half ([`login_session_token_note`]) and is read with the same
-    // `rolling_token` the confirm was given.
-    if !is_api && claude::has_session_token(&target) {
-        let note = login_session_token_note(&target, rolling_token);
+    // prompt's half ([`login_note`]). Read the post-login profile: the
+    // overwrite leaves `rolling_token` untouched, so this is the same fact the
+    // prompt was built from.
+    if let Some(note) = login_note(&target, config.find(&target), is_api) {
         outln!("{note}");
     }
     Ok(())

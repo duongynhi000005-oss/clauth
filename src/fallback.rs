@@ -516,23 +516,23 @@ pub(crate) fn is_canceled_from_info(usage: Option<&UsageInfo>) -> bool {
 /// held to them by `any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes`.
 /// So what this marker shares with the poller is the rule, not the call.
 ///
-/// `usage_poll_pair` answers for an OAuth pair alone, so a member some OTHER
-/// leg polls kept this marker up beside its reading; and when the #110
+/// The gate and not `usage_poll_pair` alone, which answers for an OAuth pair
+/// only and would mark a member another leg polls beside its reading; when the #110
 /// inference probe joins that rule, this marker retires itself with no change
 /// here.
 ///
 /// The membership half, and not the whole gate, because disabled-ness is a
-/// different question with a different answer (#116 review): whether anything
-/// polls this member is a question of its SHAPE, and a member the operator
-/// switched off is the `Disabled` rung's to describe — including on the
-/// Fallback card, which stacks this ladder under `[ disabled ]` rather than
-/// stopping at it (`member_detail_stacks_the_health_pill_under_disabled`). Read
-/// whole, the gate had this rung call every disabled member holding a login and
-/// a long-lived token unmeasurable there, and [`no_usage_fix`] ask it for the
-/// login it already holds — a shape normal operation reaches, since a setup
-/// token beside a login is what that fix line leads to. One membership rule
-/// still answers for this rung and the poller alike; only the axis that was
-/// never this rung's went back to the rung that owns it.
+/// different question with a different answer: whether anything polls this
+/// member is a question of its SHAPE, and a member the operator switched off is
+/// the `Disabled` rung's to describe — including on the Fallback card, which
+/// stacks this ladder under `[ disabled ]` rather than stopping at it
+/// (`member_detail_stacks_the_health_pill_under_disabled`). Read whole, the gate
+/// would call every disabled member holding a login and a long-lived token
+/// unmeasurable there, and [`no_usage_fix`] would ask it for the login it
+/// already holds — a shape normal operation reaches, since a setup token beside
+/// a login is what that fix line leads to. One membership rule answers for this
+/// rung and the poller alike; only the disabled axis belongs to the rung that
+/// owns it.
 ///
 /// `has_session_token` is the sidecar fact a `&Profile` cannot answer, since it
 /// lives on disk: the caller supplies it so no render path stats a file per
@@ -549,12 +549,11 @@ pub(crate) fn is_canceled_from_info(usage: Option<&UsageInfo>) -> bool {
 ///   nobody publishes has no line to cross. The test is
 ///   [`crate::claude::has_inference_auth`], the one
 ///   `build_claude_settings_json` wires the spawned `claude` from, and not
-///   `api_key.is_some()`, which was wrong in BOTH directions: it cannot see a
-///   key carried in the profile's own `[env]` (`ANTHROPIC_API_KEY` /
-///   `ANTHROPIC_AUTH_TOKEN`), where the managed field is `None`, so such a
-///   member got marked and told to add a login; and it counted a blank
-///   `api_key` as a credential, which HID the marker on a member that
-///   authenticates nothing with it,
+///   `api_key.is_some()`: that field cannot see a key carried in the profile's
+///   own `[env]` (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`), where the
+///   managed field is `None`, so such a member would be marked and told to add
+///   a login it does not need; and a blank `api_key` counts as `Some`, which
+///   would HIDE the marker on a member that authenticates nothing with it,
 /// * a member routed elsewhere by `[env] ANTHROPIC_BASE_URL`, whose requests
 ///   never reach the pool an Anthropic login would measure.
 ///   [`Profile::routing_endpoint`] reads both halves, where
@@ -574,15 +573,16 @@ pub(crate) fn no_usage_source(profile: &Profile, has_session_token: bool) -> boo
 /// chain, and the one place that copy lives: shared by the add confirm, the
 /// member card and the daemon boot warning so the three cannot drift apart.
 ///
-/// Two ways in, and they differ. The exhaustion walk reaches such a member only
-/// once no freshly read member is clear, because its fresh-first pass runs
-/// before the any-clear one. The scoped hop has no fresh-first pass at all: a
+/// Three ways in, and they differ. The exhaustion walk and the `--auto` start
+/// walk ([`start_walk`]) reach such a member only once no freshly read member is
+/// clear, because their fresh-first pass runs before the any-clear one. The
+/// scoped hop has no fresh-first pass at all: a
 /// per-model weekly line crossed on an otherwise-healthy active walks the clear
 /// list in chain order, and an unmeasured member reads clear (no reading, so no
 /// aggregate gate and no scoped window bites), so that hop lands on it ahead of
 /// a fresh member with room.
 ///
-/// Either way it stays, and there is only one way out. Once it is active the
+/// Whichever way in, it stays, and there is only one way out. Once it is active the
 /// scan finds no reading to act on (`reading_is_actionable` wants a `Fresh`
 /// status, and nothing polls this member). The dead-login exit cannot fire for
 /// it either: every site that flags a login broken sits in the stored pair's
@@ -601,11 +601,10 @@ pub(crate) fn no_usage_hazard() -> &'static str {
 }
 
 /// The lead that puts [`no_usage_hazard`] in the right tense for the member a
-/// surface is showing. A run in a real terminal found the card saying "once
-/// it's active" about the member that WAS active: the chain had walked onto it
-/// after the account ahead of it went auth-broken. That is the state the whole
-/// warning exists for, and it was the one state where the sentence read as a
-/// hypothetical.
+/// surface is showing. The member is often ALREADY active — the chain can walk
+/// onto it after the account ahead went auth-broken — and that is the state the
+/// whole warning exists for, so the hypothetical wording would read as a
+/// forecast about the state clauth is already in.
 ///
 /// Kept beside the invariant rather than in the render layer so a third surface
 /// cannot invent a third tense.

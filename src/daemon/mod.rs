@@ -625,10 +625,8 @@ fn warn_if_chain_has_no_usage_source(config: &crate::profile::AppConfig) {
         //
         // With ONE member the lead is the one the card and the confirm share
         // ([`crate::fallback::no_usage_hazard_lead`]), so a single state cannot
-        // wear three tenses across three surfaces — this line used to say
-        // `once one is active` where those two say `once it's active`. The name
-        // is not lost with it: the sentence before it already named the member.
-        // A LIST keeps this line's own lead, which is why that one stays here:
+        // wear three tenses across three surfaces; the sentence before it
+        // already named the member. A LIST keeps this line's own lead because
         // `it` cannot name which of several, and the present-tense arm has to
         // say which one is active.
         let active = config.state.active_profile.as_ref();

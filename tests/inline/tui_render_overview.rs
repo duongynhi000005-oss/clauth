@@ -621,11 +621,11 @@ fn healthy_chain_hides_resumes_hint() {
     assert!(resumes_line(&lines).is_none());
 }
 
-/// \#116 review: the Overview's chain rows carry the blocked-reason markers the
-/// Fallback rows do, so a member clauth cannot measure reads `◆` here too. The
-/// arm had no render pin, which means it could have been deleted and every test
-/// would have stayed green. The Overview's ACCOUNT rows carry no
-/// blocked-reason mark at all, which is why the wiki names the chain rows.
+/// The Overview's chain rows carry the blocked-reason markers the Fallback rows
+/// do, so a member clauth cannot measure reads `◆` here too. Without a render
+/// pin the arm could be deleted and every test would stay green. The Overview's
+/// ACCOUNT rows carry no blocked-reason mark at all, which is why the wiki names
+/// the chain rows.
 #[test]
 fn an_unmeasured_chain_member_is_marked_on_the_overview_chain_row() {
     let _home = crate::testutil::HomeSandbox::new();

@@ -17258,6 +17258,22 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// The `+ add` confirm's detail for a candidate clauth cannot measure: the
+/// hazard, then the way out. Two lines, because this dialog asks a question and
+/// the answer needs both the cost and the fix in one place.
+pub(crate) fn no_usage_confirm_detail(name: &str, active: bool) -> String {
+    // The period is added HERE, not in the shared fix line: this dialog speaks
+    // in sentences and its other two lines end in one, while the card's hint
+    // and the daemon's log line carry the same copy without a full stop, like
+    // every other hint and log line beside them.
+    format!(
+        "{}{}.\n{}.",
+        crate::fallback::no_usage_hazard_lead(active),
+        crate::fallback::no_usage_hazard(),
+        prose::mark_commands(&crate::fallback::no_usage_fix(&[name]))
+    )
+}
+
 /// `+ add` detail: a candidate picker. ↑↓ walks, ⏎ adds and re-homes focus.
 fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
     let candidates = chain_candidates(app);
@@ -17344,21 +17360,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                 // saying it.
                 app.open_modal(Modal::Confirm(ConfirmState {
                     message: "clauth can't read this account's usage.".into(),
-                    // Two lines: what it costs, then the way out. The dialog
-                    // named the hazard and left the operator to find the fix on
-                    // the card, which is the wrong order for the one surface
-                    // that asks a question.
-                    // The period is added HERE, not in the shared fix line:
-                    // this dialog speaks in sentences and its other two lines
-                    // end in one, while the card's hint and the daemon's log
-                    // line carry the same copy without a full stop, like every
-                    // other hint and log line beside them.
-                    detail: Some(format!(
-                        "{}{}.\n{}.",
-                        crate::fallback::no_usage_hazard_lead(active),
-                        crate::fallback::no_usage_hazard(),
-                        prose::mark_commands(&crate::fallback::no_usage_fix(&[name.as_str()]))
-                    )),
+                    detail: Some(no_usage_confirm_detail(name.as_str(), active)),
                     choice: false,
                     scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),
@@ -24729,9 +24731,9 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         );
     if !apply_now {
         // Names the endpoint only where the preserve arm will actually keep it
-        // — the same rule `reauth_confirm_object` enforces on the CLI prompt,
-        // asked of the same predicate. This snapshot is credential-only, so
-        // the arm turns on the stored profile alone.
+        // — the same rule the CLI reauth prompt enforces, asked of the same
+        // predicate. This snapshot is credential-only, so the arm turns on the
+        // stored profile alone.
         let keeps_endpoint = app
             .config()
             .find(&ProfileName::from(session.name.clone()))

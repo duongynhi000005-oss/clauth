@@ -992,16 +992,16 @@ fn disabled_and_canceled_share_the_marker_shape_and_split_on_hue() {
     assert_eq!(can.style.fg, theme::danger().fg, "canceled reads dead");
 }
 
-/// Stale and no-usage are two hazards, so they take two shapes (#116 review):
-/// a stale reading is a measurement that went old and the walk will leave such
-/// an active once it is deep-stuck; an unmeasured member is never read at all
-/// and the walk never leaves it.
+/// Stale and no-usage are two hazards, so they take two shapes: a stale reading
+/// is a measurement that went old and the walk will leave such an active once
+/// it is deep-stuck; an unmeasured member is never read at all and the walk
+/// never leaves it.
 ///
-/// The shape is SOLID (`◆`): a run in a real terminal showed the dotted `◌`
-/// reading as a light grey ring, because a hairline glyph carries almost none
-/// of this palette's pastel amber, and `◌` is the Usage tab's queued-refresh
-/// dot besides. The pill carries the warning hue too, so the card is charged
-/// even where the 1-cell mark is off screen.
+/// The shape is SOLID (`◆`), not the dotted `◌`: a hairline glyph carries
+/// almost none of this palette's pastel amber, so `◌` reads as a light grey
+/// ring, and it is the Usage tab's queued-refresh dot besides. The pill carries
+/// the warning hue too, so the card is charged even where the 1-cell mark is off
+/// screen.
 #[test]
 fn stale_and_no_usage_split_on_shape_and_on_hue() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
@@ -1060,14 +1060,12 @@ fn stale_and_no_usage_split_on_shape_and_on_hue() {
 /// \#110: a member clauth cannot measure opens its card on the `can't read
 /// usage` pill, and the line under it names the hazard and then the fix. Both
 /// pinned by EQUALITY, as `key_rejected_copy_is_pinned_by_equality` does: a
-/// `contains` let either end drift and stay green (#116 review). The card is
-/// rendered wide enough that the hint is one line, so the pin reads as the
-/// operator sees it.
+/// `contains` lets either end drift and stay green. The card is rendered wide
+/// enough that the hint is one line, so the pin reads as the operator sees it.
 ///
-/// The hazard is pinned in BOTH tenses. A run in a real terminal met the card
-/// of a member the chain had already walked onto, and it still said "once it's
-/// active": the one state the warning exists for was the one state it spoke
-/// about in the conditional.
+/// The hazard is pinned in BOTH tenses. A member the chain walks onto is ALREADY
+/// active, which is the state the warning exists for; the hypothetical wording
+/// would read as a forecast about the state clauth is in.
 #[test]
 fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
     // The fixture reading is DROPPED rather than blanked: a member nothing
@@ -1132,19 +1130,26 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
 
     // The same fixture without the sidecar: nothing serves from it, so this is
     // the logged-out shape and the card opens on its gauge instead of the pill.
-    assert_ne!(
-        line_text(&card(false, "ok")[0]),
-        line_text(&lines[0]),
-        "without a session token the card carries no no-usage pill"
+    let plain: Vec<String> = card(false, "ok").iter().map(line_text).collect();
+    assert_eq!(
+        plain.first(),
+        Some(&gauge),
+        "without a session token the card opens on the gauge row"
+    );
+    assert!(
+        !plain
+            .iter()
+            .any(|row| row.contains("can't read usage") || row.contains("won't switch away")),
+        "without a session token no row carries the no-usage pill or its hazard: {plain:?}"
     );
 }
 
-/// \#116 review: a member the operator disabled is not a member clauth cannot
-/// measure. The card stacks the health ladder under `[ disabled ]`
-/// (`member_detail_stacks_the_health_pill_under_disabled`), so while the
-/// marker's gate answered disabled-ness too, every disabled member holding a
-/// login and a long-lived token read `can't read usage` there and was told to
-/// log in the account it is already logged into. Normal operation reaches that
+/// A member the operator disabled is not a member clauth cannot measure. The
+/// card stacks the health ladder under `[ disabled ]`
+/// (`member_detail_stacks_the_health_pill_under_disabled`), so a marker whose
+/// gate answered disabled-ness too would read `can't read usage` on every
+/// disabled member holding a login and a long-lived token, and tell it to log
+/// in the account it is already logged into. Normal operation reaches that
 /// shape: a setup token beside a login is what the fix line itself leads to,
 /// and a rolling-token account disabled on the Setup tab is the same shape.
 ///

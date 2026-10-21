@@ -2541,8 +2541,7 @@ fn no_usage_source_members_names_only_enabled_members_clauth_cannot_measure() {
 
 /// The warning reaches the log as one line naming every such member, with the
 /// fix spelled out for each of them rather than left as a `<name>` placeholder
-/// beside a list that just named them (#116 review). Says nothing when the
-/// chain has none.
+/// beside a list that just named them. Says nothing when the chain has none.
 #[test]
 fn warn_if_chain_has_no_usage_source_logs_one_line_naming_them() {
     let _home = HomeSandbox::new();
@@ -2579,10 +2578,9 @@ fn warn_if_chain_has_no_usage_source_logs_one_line_naming_them() {
         ],
     );
     // One member reads as one account, which is the wording the member card
-    // carries too: the same fn, told a one-name list. Round 3: the LEAD comes
-    // from the card's own `no_usage_hazard_lead` for a one-member line as
-    // well, so the whole sentence matches the card and the confirm instead of
-    // only its second half.
+    // carries too: the same fn, told a one-name list. The lead comes from the
+    // card's own `no_usage_hazard_lead` for a one-member line as well, so the
+    // whole sentence matches the card and the confirm.
     assert_eq!(
         logged(vec!["polled", "st-a"]),
         [
@@ -2600,8 +2598,6 @@ fn warn_if_chain_has_no_usage_source_logs_one_line_naming_them() {
 /// A daemon can boot with such a member ALREADY active: the chain walked onto
 /// it before this process started, or the operator put it there. Then the line
 /// says so, because the hazard is the state of the machine and not a forecast.
-/// Seen in a real run, where the TUI had walked the chain onto the unmeasurable
-/// member after the account ahead of it went auth-broken.
 #[test]
 fn warn_if_chain_has_no_usage_source_names_an_active_member_in_the_present() {
     let _home = HomeSandbox::new();
@@ -2638,10 +2634,14 @@ fn warn_if_chain_has_no_usage_source_names_an_active_member_in_the_present() {
     // The measurable member being active leaves the forecast wording, and so
     // does an empty active slot.
     for active in [Some("polled"), None] {
-        assert!(
-            logged(active)[0].contains("once it's active,"),
-            "not yet active: {:?}",
-            logged(active)
+        assert_eq!(
+            logged(active),
+            [
+                "clauth daemon: can't read the usage of st-a. once it's active, clauth won't \
+                 switch away from it on its own. log in the same account with `clauth login \
+                 st-a` so clauth can read its usage"
+            ],
+            "not yet active: {active:?}"
         );
     }
 }
@@ -2677,17 +2677,24 @@ fn warn_if_chain_has_no_usage_source_keeps_its_own_lead_for_a_list() {
         lines.snapshot()
     };
 
-    assert!(
-        logged(Some("st-b"))[0]
-            .contains("can't read the usage of st-a, st-b. 'st-b' is active now, and clauth"),
-        "a list names WHICH member is active: {:?}",
-        logged(Some("st-b"))
+    assert_eq!(
+        logged(Some("st-b")),
+        [
+            "clauth daemon: can't read the usage of st-a, st-b. 'st-b' is active now, and clauth \
+             won't switch away from it on its own. log in the same accounts with `clauth login \
+             st-a`, `clauth login st-b` so clauth can read their usage"
+        ],
+        "a list names WHICH member is active"
     );
     for active in [Some("polled"), None] {
-        assert!(
-            logged(active)[0].contains("st-a, st-b. once one is active, clauth"),
-            "a list that is not active keeps the list forecast: {:?}",
-            logged(active)
+        assert_eq!(
+            logged(active),
+            [
+                "clauth daemon: can't read the usage of st-a, st-b. once one is active, clauth \
+                 won't switch away from it on its own. log in the same accounts with `clauth \
+                 login st-a`, `clauth login st-b` so clauth can read their usage"
+            ],
+            "a list that is not active keeps the list forecast: {active:?}"
         );
     }
 }
