@@ -20,6 +20,7 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        is_delegate: false,
     }
 }
 
@@ -66,6 +67,47 @@ fn a_codex_row_round_trips_its_harness_tag() {
     assert!(
         raw.contains("\"harness\":\"codex\""),
         "the on-disk spelling is lowercase: {raw}"
+    );
+}
+
+/// A row written by a clauth that predates the delegate mark must not read as
+/// a delegate on upgrade — the header's split would then file every
+/// already-running session under the delegates side.
+#[test]
+fn a_row_predating_the_delegate_key_deserializes_as_own() {
+    let pre_upgrade = br#"{"session_id":"4242-0","start_profile":"work","pid":4242,
+        "started_at":1700000000000,"cwd":"/w/proj","isolated":false}"#;
+
+    let row: LiveSession = serde_json::from_slice(pre_upgrade).expect("parse a pre-upgrade row");
+
+    assert!(
+        !row.is_delegate,
+        "a row with no `is_delegate` key must default to own"
+    );
+}
+
+/// The mark survives the registry round-trip and spells itself a bare bool, the
+/// stable on-disk form a mixed-version window reads back.
+#[test]
+fn a_delegate_row_round_trips_its_mark() {
+    let _home = HomeSandbox::new();
+    let mut written = row("4242-0", "work");
+    written.is_delegate = true;
+
+    register(&written).expect("register");
+
+    let listed = list().pop().expect("one row");
+    assert_eq!(listed, written, "the mark must survive the round-trip");
+    let raw = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("live_sessions")
+            .join("4242-0.json"),
+    )
+    .expect("read row file");
+    assert!(
+        raw.contains("\"is_delegate\":true"),
+        "the on-disk spelling carries the mark: {raw}"
     );
 }
 
@@ -563,6 +605,28 @@ fn an_unattributed_bare_session_still_counts_toward_the_fleet_total() {
         "no account hosts it"
     );
     assert_eq!(tally.total(), Some(1));
+    assert_eq!(
+        tally.own(),
+        Some(1),
+        "an unattributed bare session counts as own"
+    );
+    assert_eq!(tally.delegates(), Some(0));
+}
+
+/// A bare `claude` is the end user's own session, never a delegate: the split
+/// folds it into the own side, and `total` stays the sum of both parts.
+#[test]
+fn a_bare_session_counts_as_own() {
+    let _home = HomeSandbox::new();
+    let config = config_with(vec![oauth_profile("work", "rt-work")], "work");
+    write_linked_credentials("rt-work");
+
+    let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
+
+    let tally = LiveTally::collect(&config);
+    assert_eq!(tally.total(), Some(1));
+    assert_eq!(tally.own(), Some(1), "a bare session is an own session");
+    assert_eq!(tally.delegates(), Some(0));
 }
 
 /// `total` counts sessions, never `following`, and a session whose account was
@@ -582,6 +646,38 @@ fn the_fleet_total_counts_every_session_whatever_its_account_or_chain_flag() {
     ]);
 
     assert_eq!(tally.total(), Some(3));
+}
+
+/// The header splits the fleet count into own (non-delegate) and delegate
+/// sessions. A codex row is own, and `total` keeps counting both, so every
+/// existing caller of `total` keeps its meaning.
+#[test]
+fn the_tally_splits_own_from_delegates_and_total_is_unchanged() {
+    let mut codex = row("4242-2", "work");
+    codex.harness = crate::harness::Harness::Codex;
+    let mut delegate = crate::testutil::live_row("9999-0", "work");
+    delegate.is_delegate = true;
+    let mut other_delegate = crate::testutil::live_row("9999-1", "work");
+    other_delegate.is_delegate = true;
+
+    let tally = LiveTally::of([
+        crate::testutil::live_row("4242-0", "work"),
+        crate::testutil::live_row("4242-1", "work"),
+        codex,
+        delegate,
+        other_delegate,
+    ]);
+
+    assert_eq!(tally.total(), Some(5), "total keeps counting every row");
+    assert_eq!(tally.own(), Some(3), "own is the non-delegate rows");
+    assert_eq!(tally.delegates(), Some(2), "delegates is the marked rows");
+}
+
+/// An unread tally gives neither part a reading — the split chip's `—` form.
+#[test]
+fn an_unread_tally_reads_neither_part() {
+    assert_eq!(LiveTally::unread().own(), None);
+    assert_eq!(LiveTally::unread().delegates(), None);
 }
 
 /// The fd closing IS the release, which is what makes this survive SIGKILL: a

@@ -7968,7 +7968,7 @@ fn the_chip_shed_depends_only_on_width_and_name() {
 }
 
 /// The shed checks charge each chip at its figure ceiling — `[ 9999 tok/s ]`
-/// and `[ 999 live ]` — so a rate (none → 67.2 → 12345) or count (9 → 10)
+/// and `[ 999+999 live ]` — so a rate (none → 67.2 → 12345) or count (9 → 10)
 /// update leaves presence unchanged; only a resize flips it.
 #[test]
 fn the_chip_shed_charges_the_figure_ceilings() {
@@ -7988,9 +7988,9 @@ fn the_chip_shed_charges_the_figure_ceilings() {
         .unwrap()
         .insert("uwuclxdy".to_string(), oauth_usage(42.0, 42.0));
 
-    // 96..=99: the ceiling charges shed the tok/s chip and keep the live chip,
-    // whatever the rate and count.
-    for w in 96u16..=99 {
+    // 100..=104: the ceiling charges shed the tok/s chip and keep the live
+    // chip, whatever the rate and count.
+    for w in 100u16..=104 {
         for rate in [None, Some(67.2), Some(12_345.0)] {
             for live in [9usize, 10] {
                 app.set_tps(rate.map(|r| tps_snap("uwuclxdy", r, None)));
@@ -8017,7 +8017,7 @@ fn the_chip_shed_charges_the_figure_ceilings() {
 
     // A resize across the boundary flips the tok/s chip on.
     app.set_tps(Some(tps_snap("uwuclxdy", 67.2, None)));
-    let row = dump(&app, 101, 40)
+    let row = dump(&app, 105, 40)
         .lines()
         .nth(1)
         .map(str::trim_end)
@@ -8025,7 +8025,7 @@ fn the_chip_shed_charges_the_figure_ceilings() {
         .to_string();
     assert!(
         row.contains(" tok/s ]"),
-        "the tok/s chip appears past the boundary at 101: {row:?}"
+        "the tok/s chip appears past the boundary at 105: {row:?}"
     );
 }
 

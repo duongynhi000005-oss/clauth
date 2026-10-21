@@ -16,9 +16,10 @@
 //!   and written after would silently revert whatever the other writer put there
 //!   in between.
 //! - **Field ownership is a type, not a comment.** The daemon reaches its two
-//!   fields through [`DaemonFields`] and the session its three through
-//!   [`SessionFields`]; neither view can name the other's. Each still stores the
-//!   whole freshly-loaded row, so writing one side preserves the other's.
+//!   fields through [`DaemonFields`] and the session its execution fields
+//!   through [`SessionFields`]; neither view can name the other's. Each
+//!   still stores the whole freshly-loaded row, so writing one side preserves
+//!   the other's.
 //!
 //! Liveness is the session's flock, exactly as for its runtime tree: a row is
 //! dead once the marker named by its own `start_profile` + `isolated` +
@@ -33,6 +34,17 @@ use serde::{Deserialize, Serialize};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, atomic_write_600, clauth_dir, mkdir_700};
 use crate::runtime::{SessionId, is_session_id};
+
+/// Who launched a session. The end user's own sessions — `clauth start` and
+/// codex — are [`Launcher::Own`]; a one-shot headless run the clauth MCP
+/// server spawned for a `delegate` request is [`Launcher::Delegate`]. Carried
+/// into registration the way `follows_chain` is, so the mark is on the row
+/// before any tally can read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Launcher {
+    Own,
+    Delegate,
+}
 
 /// One live session's row. Every field is written by exactly one of the two
 /// writers; which one is enforced by the mutator views, not by this listing.
@@ -100,6 +112,13 @@ pub(crate) struct LiveSession {
     /// rotation refusal keeps applying to it exactly as it does today.
     #[serde(default)]
     pub(crate) launch_store: Option<PathBuf>,
+    /// Whether this row is a delegate: a one-shot headless run the clauth MCP
+    /// server spawned. Set once at registration and never mutated, so the first
+    /// read of the row already carries it — no tally reads a delegate row as an
+    /// own session first. `serde(default)` is the upgrade gate: a row written
+    /// by an older clauth reads as own until that server restarts.
+    #[serde(default)]
+    pub(crate) is_delegate: bool,
 }
 
 impl LiveSession {
@@ -111,6 +130,7 @@ impl LiveSession {
         harness: crate::harness::Harness,
         isolated: bool,
         follows_chain: bool,
+        launcher: Launcher,
         launch_store: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -127,6 +147,7 @@ impl LiveSession {
             current_member: None,
             last_swap_at: None,
             launch_store,
+            is_delegate: matches!(launcher, Launcher::Delegate),
         }
     }
 }
@@ -186,6 +207,10 @@ impl SessionFields<'_> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LiveTally {
     members: std::collections::BTreeMap<String, MemberSessions>,
+    /// Delegate sessions across the fleet: one-shot headless runs the clauth
+    /// MCP spawned. Split out for the header chip's own/delegates count; every
+    /// per-account surface keeps counting them inside `MemberSessions::sessions`.
+    delegates: usize,
     /// Bare sessions whose credential link resolves to no enabled profile:
     /// live, but on no account clauth attributes them to, so they reach
     /// [`LiveTally::total`] only.
@@ -275,7 +300,9 @@ impl LiveTally {
     fn from_live_rows(rows: impl IntoIterator<Item = LiveSession>) -> Self {
         let mut per_member: std::collections::BTreeMap<String, MemberSessions> =
             std::collections::BTreeMap::new();
+        let mut delegates = 0;
         for row in rows {
+            delegates += usize::from(row.is_delegate);
             let member = row.current_member.unwrap_or(row.start_profile);
             let slot = per_member.entry(member).or_default();
             slot.sessions += 1;
@@ -284,6 +311,7 @@ impl LiveTally {
         }
         Self {
             members: per_member,
+            delegates,
             unattributed: 0,
             unread: false,
         }
@@ -329,6 +357,28 @@ impl LiveTally {
             return None;
         }
         Some(self.members.values().map(|m| m.sessions).sum::<usize>() + self.unattributed)
+    }
+
+    /// Own (non-delegate) live sessions across the fleet: `clauth start` and
+    /// codex rows plus bare sessions. `None` when a dir it counts from could
+    /// not be listed.
+    pub(crate) fn own(&self) -> Option<usize> {
+        if self.unread {
+            return None;
+        }
+        Some(
+            self.members.values().map(|m| m.sessions).sum::<usize>() + self.unattributed
+                - self.delegates,
+        )
+    }
+
+    /// Delegate live sessions across the fleet. `None` when a dir it counts
+    /// from could not be listed.
+    pub(crate) fn delegates(&self) -> Option<usize> {
+        if self.unread {
+            return None;
+        }
+        Some(self.delegates)
     }
 }
 

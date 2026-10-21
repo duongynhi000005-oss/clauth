@@ -1042,6 +1042,74 @@ fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_en
     );
 }
 
+// ── the start producer's launcher choice ─────────────────────────────────
+
+/// A `clauth start` row reads own: the producer passes `Launcher::Own`, so a
+/// reader on the registry mid-run must see the start row and must never read
+/// it as a delegate. Drives the real `run` under `SlowClaude` — the row is
+/// unregistered at teardown, so it is read inside the shim's window — through
+/// the same shared reader the mcp producer pin uses.
+#[cfg(unix)]
+#[test]
+fn a_clauth_start_row_is_seen_and_reads_own() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(&claude_home).expect("~/.claude");
+
+    let target = Profile::new(
+        "target".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-target".to_string()),
+    );
+    crate::profile::save_profile(&target).expect("save target");
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["target".into()],
+            active_profile: Some("target".into()),
+            ..AppState::default()
+        },
+        profiles: vec![target],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    let dir = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("live_sessions");
+    let shim = crate::testutil::SlowClaude::new(&sb);
+    let observer = std::thread::spawn(move || {
+        crate::testutil::live_session_rows_until(
+            &dir,
+            |row| row.start_profile == "target",
+            std::time::Duration::from_secs(20),
+        )
+    });
+    run(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("start");
+    let seen = observer.join().expect("observer thread");
+    drop(shim);
+
+    let start_rows: Vec<_> = seen
+        .iter()
+        .filter(|row| row.start_profile == "target")
+        .collect();
+    assert!(
+        !start_rows.is_empty(),
+        "the start row must be observed mid-run"
+    );
+    assert!(
+        start_rows.iter().all(|row| !row.is_delegate),
+        "a clauth start row reads own: {start_rows:?}"
+    );
+}
+
 // ── start-time model demand + the extracted admit ───────────────────────────
 
 #[test]

@@ -304,6 +304,7 @@ fn register_self_row(session_id: &str) {
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        is_delegate: false,
     })
     .expect("register");
 }

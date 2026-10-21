@@ -3701,8 +3701,14 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // Guard kept alive across spawn+wait; dropped on return for RAII teardown.
     // A delegate is a one-shot headless run against a named account, so it never
     // follows the chain — moving it mid-prompt would change who answered.
-    let runtime = ProfileRuntime::acquire(target, opts.isolation, &stale_env_keys, false)
-        .map_err(|e| format!("failed to acquire runtime: {e}"))?;
+    let runtime = ProfileRuntime::acquire(
+        target,
+        opts.isolation,
+        &stale_env_keys,
+        false,
+        crate::live_sessions::Launcher::Delegate,
+    )
+    .map_err(|e| format!("failed to acquire runtime: {e}"))?;
 
     // The acquire above is the longest thing that can happen before a child
     // exists, and the supervision loop that reads this flag does not exist until

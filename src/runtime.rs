@@ -4213,12 +4213,14 @@ impl ProfileRuntime {
         isolation: Isolation,
         stale_env_keys: &[String],
         follows_chain: bool,
+        launcher: crate::live_sessions::Launcher,
     ) -> Result<Self> {
         Self::acquire_synced(
             &profile.name,
             isolation,
             stale_env_keys,
             follows_chain,
+            launcher,
             || {},
             |_, _| {},
             || {},
@@ -4271,11 +4273,13 @@ impl ProfileRuntime {
     /// that the lock is free by then. It needs no fixed position now that the
     /// artifacts are pinned inside the closure — restoring the long hold makes it
     /// see the lock HELD wherever it sits.
+    #[allow(clippy::too_many_arguments)]
     fn acquire_synced(
         name: &ProfileName,
         isolation: Isolation,
         stale_env_keys: &[String],
         follows_chain: bool,
+        launcher: crate::live_sessions::Launcher,
         pre_lock_done: impl FnOnce(),
         stamp_window_closing: impl FnOnce(&SessionPaths, &SessionId),
         hold_released: impl FnOnce(),
@@ -4440,6 +4444,7 @@ impl ProfileRuntime {
                 crate::harness::Harness::Claude,
                 isolation == Isolation::Isolated,
                 opt_in,
+                launcher,
                 // The SAME value the runtime tree is built from below, so the
                 // row cannot disagree with what this session actually reads —
                 // on macOS, which is the only place it is consulted. Every
@@ -7393,6 +7398,7 @@ impl CodexRuntime {
                 crate::harness::Harness::Codex,
                 isolation == Isolation::Isolated,
                 false,
+                crate::live_sessions::Launcher::Own,
                 Some(home.join("auth.json")),
             );
             if let Err(e) = crate::live_sessions::register(&row) {

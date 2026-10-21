@@ -531,28 +531,28 @@ fn row1_shows_zero_live_so_the_gauge_holds_its_place() {
     }
 }
 
-/// The shed seam: the max gauge + suffix charge (39) + the live chip's
-/// three-digit ceiling 12 + separator 3 + indicator 18 + reserve 3 = 75 text
-/// cells, so 85 is the narrowest width holding the live chip, and at 84 the
-/// chip drops whole with its ` · ` while the gauge keeps its full bar.
+/// The shed seam: the max gauge + suffix charge (39) + the live chip's split
+/// ceiling 16 + separator 3 + indicator 18 + reserve 3 = 79 text cells, so 89
+/// is the narrowest width holding the live chip, and at 88 the chip drops whole
+/// with its ` · ` while the gauge keeps its full bar.
 #[test]
 fn row1_sheds_the_live_count_before_the_gauge_or_the_indicator() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = app_with_three_live(Tab::Tokens);
 
     assert_eq!(
-        row_content(&app, 85, 1),
+        row_content(&app, 89, 1),
         format!(
             "[ 3 live ] · uwuclxdy 42% [████░░░░░░]{}● status.claude.ai",
-            " ".repeat(19)
+            " ".repeat(23)
         ),
         "at its own fit width the chip renders"
     );
     assert_eq!(
-        row_content(&app, 84, 1),
+        row_content(&app, 88, 1),
         format!(
             "uwuclxdy 42% [████░░░░░░]{}● status.claude.ai",
-            " ".repeat(31)
+            " ".repeat(35)
         ),
         "one column narrower the count drops whole, the gauge untouched"
     );
@@ -561,6 +561,17 @@ fn row1_sheds_the_live_count_before_the_gauge_or_the_indicator() {
 fn tally_of(n: usize) -> crate::live_sessions::LiveTally {
     crate::live_sessions::LiveTally::of(
         (0..n).map(|i| crate::testutil::live_row(&format!("4242-{i}"), "uwuclxdy")),
+    )
+}
+
+fn split_tally(own: usize, delegates: usize) -> crate::live_sessions::LiveTally {
+    crate::live_sessions::LiveTally::of(
+        (0..own)
+            .map(|i| crate::testutil::live_row(&format!("4242-{i}"), "uwuclxdy"))
+            .chain((0..delegates).map(|i| crate::live_sessions::LiveSession {
+                is_delegate: true,
+                ..crate::testutil::live_row(&format!("91{i}-0"), "uwuclxdy")
+            })),
     )
 }
 
@@ -783,8 +794,8 @@ fn the_gauge_rung_cells_carry_the_chrome_and_util_roles() {
     }
 }
 
-/// The shed gate charges the live chip's three-digit ceiling, not its held
-/// width: after `10`, a `9` chip still sheds at the `999` ceiling's width.
+/// The shed gate charges the live chip's split ceiling, not its held width:
+/// after `10`, a `9` chip still sheds at the `999+999` ceiling's width.
 #[test]
 fn the_live_chip_sheds_at_its_three_digit_ceiling() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -793,14 +804,157 @@ fn the_live_chip_sheds_at_its_three_digit_ceiling() {
     app.set_live_sessions(tally_of(10));
     app.set_live_sessions(tally_of(9));
 
-    // ceiling 12 + separator 3 + gauge 39 + indicator 18 + reserve 3 = 75.
+    // ceiling 16 + separator 3 + gauge 39 + indicator 18 + reserve 3 = 79.
     assert!(
-        row_content(&app, 85, 1).starts_with("[ 9 live ]  · uwuclxdy"),
-        "85 holds the live chip"
+        row_content(&app, 89, 1).starts_with("[ 9 live ]  · uwuclxdy"),
+        "89 holds the live chip"
     );
     assert!(
-        row_content(&app, 84, 1).starts_with("uwuclxdy 42%"),
-        "84 sheds it whole at the ceiling's width"
+        row_content(&app, 88, 1).starts_with("uwuclxdy 42%"),
+        "88 sheds it whole at the ceiling's width"
+    );
+}
+
+/// The split form's cells by role: the own number `TEXT` + bold, the `+` dim,
+/// the delegates number `ACCENT` + bold, brackets and unit dim without bold.
+/// Pinned per cell off the theme's own colors, and the whole row by equality.
+#[test]
+fn the_split_live_chip_renders_own_then_delegates_with_their_styles() {
+    use ratatui::style::Modifier;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let dim = super::theme::text_dim_color();
+    let text = super::theme::text_color();
+    let accent = super::theme::accent_color();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_live_sessions(split_tally(6, 7));
+    let height = header_height(&app);
+    let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+    term.draw(|f| {
+        let area = f.area();
+        super::draw(f, area, &app, &app.readings_snapshot());
+    })
+    .unwrap();
+    let buf = term.backend().buffer().clone();
+    let cell = |col: usize| &buf.content[120 + 10 + col];
+    let text_of: String = (0..15).map(|c| cell(c).symbol().to_string()).collect();
+    assert_eq!(text_of, "[ 6+7 live ]  [", "the split chip's text");
+    let row1: String = crate::testutil::buffer_rows(&buf)[1]
+        .chars()
+        .skip(10)
+        .collect();
+    assert_eq!(
+        row1,
+        format!(
+            "[ 6+7 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]{}● status.claude.ai",
+            " ".repeat(39)
+        ),
+        "the split chip leads row 1"
+    );
+    assert_eq!(cell(2).fg, text, "the own number renders TEXT");
+    assert!(
+        cell(2).modifier.contains(Modifier::BOLD),
+        "the own number is bold"
+    );
+    assert_eq!(cell(3).fg, dim, "the + renders TEXT_DIM");
+    assert!(
+        !cell(3).modifier.contains(Modifier::BOLD),
+        "the + is unbolded"
+    );
+    assert_eq!(cell(4).fg, accent, "the delegates number renders ACCENT");
+    assert!(
+        cell(4).modifier.contains(Modifier::BOLD),
+        "the delegates number is bold"
+    );
+    for col in [0, 1, 5, 6, 7, 8, 9, 10, 11] {
+        assert_eq!(cell(col).fg, dim, "chrome renders TEXT_DIM at {col}");
+        assert!(
+            !cell(col).modifier.contains(Modifier::BOLD),
+            "chrome carries no bold at {col}"
+        );
+    }
+}
+
+/// A lone delegate part renders `[ 7 live ]` with the 7 in `ACCENT` + bold:
+/// the colour alone marks which part it is, no `0+` prefix. The whole row is
+/// pinned by equality — the chip is 2 cells narrower than the split form, so
+/// the gauge gap grows by 2 — and every chrome cell reads dim without bold.
+#[test]
+fn a_lone_delegate_part_renders_in_accent_alone() {
+    use ratatui::style::Modifier;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let dim = super::theme::text_dim_color();
+    let accent = super::theme::accent_color();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_live_sessions(split_tally(0, 7));
+    let height = header_height(&app);
+    let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+    term.draw(|f| {
+        let area = f.area();
+        super::draw(f, area, &app, &app.readings_snapshot());
+    })
+    .unwrap();
+    let buf = term.backend().buffer().clone();
+    let cell = |col: usize| &buf.content[120 + 10 + col];
+    let row1: String = crate::testutil::buffer_rows(&buf)[1]
+        .chars()
+        .skip(10)
+        .collect();
+    assert_eq!(
+        row1,
+        format!(
+            "[ 7 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]{}● status.claude.ai",
+            " ".repeat(41)
+        ),
+        "the lone delegate part leads row 1 whole"
+    );
+    assert_eq!(cell(2).fg, accent, "the lone delegate number is ACCENT");
+    assert!(
+        cell(2).modifier.contains(Modifier::BOLD),
+        "the lone delegate number is bold"
+    );
+    for col in [0, 1, 3, 4, 5, 6, 7, 8, 9] {
+        assert_eq!(cell(col).fg, dim, "chrome renders TEXT_DIM at {col}");
+        assert!(
+            !cell(col).modifier.contains(Modifier::BOLD),
+            "chrome carries no bold at {col}"
+        );
+    }
+}
+
+/// The width hold spans the split form: after `6+7`, a drop to `6` keeps the
+/// three-cell number field, the freed cells standing blank after the closing
+/// bracket, so the gauge's first cell stays in its column.
+#[test]
+fn the_split_chip_holds_its_split_width_so_the_gauge_stays_put() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_live_sessions(split_tally(6, 7));
+    let at_split = row_content(&app, 120, 1);
+    assert!(
+        at_split.starts_with("[ 6+7 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
+        "{at_split:?}"
+    );
+    app.set_live_sessions(split_tally(6, 0));
+    let at_six = row_content(&app, 120, 1);
+    assert!(
+        at_six.starts_with("[ 6 live ]    [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
+        "six after the split keeps the split width: {at_six:?}"
+    );
+    assert_eq!(
+        at_split.chars().position(|c| c == 'u'),
+        Some(28),
+        "the gauge's first cell sits after the split chip and its separator"
+    );
+    assert_eq!(
+        at_six.chars().position(|c| c == 'u'),
+        Some(28),
+        "the gauge's first cell holds its column across 6+7 -> 6"
     );
 }
 

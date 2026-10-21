@@ -1169,6 +1169,7 @@ fn registry_row(sid: &str, profile: &str, harness: crate::harness::Harness) {
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        is_delegate: false,
     };
     crate::live_sessions::register(&row).expect("register row");
 }

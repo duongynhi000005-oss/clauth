@@ -303,7 +303,13 @@ pub(crate) fn run(
 
     let runtime = {
         let _spinner = Spinner::start("clauth: preparing runtime");
-        ProfileRuntime::acquire(profile, isolation, &stale_env_keys, follows_chain)?
+        ProfileRuntime::acquire(
+            profile,
+            isolation,
+            &stale_env_keys,
+            follows_chain,
+            crate::live_sessions::Launcher::Own,
+        )?
     };
 
     #[cfg(unix)]

@@ -18,7 +18,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, Health, ReadingsSnapshot, Tab, gateway_health, live_count_text};
+use super::super::app::{
+    App, Health, ReadingsSnapshot, Tab, gateway_health, live_count_text, live_number_spans,
+};
 use super::super::theme;
 use super::format::{bar_string_with_cells, fixed_split};
 use super::services::health_color;
@@ -57,9 +59,10 @@ const GAUGE_MAX_SUFFIX_W: usize = 11;
 /// figure ceiling the chip's whole-`k` form reaches. Charged in the shed checks
 /// so a rate update never moves a chip.
 const TPS_CHIP_CEILING_W: usize = 14; // "[ " + "9999" + " tok/s ]"
-/// The widest the live chip can ever render: `[ 999 live ]`, three digits.
-/// Charged in the shed checks so a count update never moves a chip.
-const LIVE_CHIP_CEILING_W: usize = 12; // "[ " + "999" + " live ]"
+/// The widest the live chip can ever render: `[ 999+999 live ]`, the split
+/// form at three digits a part. Charged in the shed checks so a count update
+/// never moves a chip.
+const LIVE_CHIP_CEILING_W: usize = 16; // "[ " + "999+999" + " live ]"
 /// Flush bar brackets: `[` + `]`.
 const GAUGE_BAR_CHROME_W: usize = 2;
 /// Every gauge gap — name → percent, percent → bar, bare rung — 1 cell.
@@ -347,11 +350,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
     let gauge_w: usize = gauge_spans_vec.iter().map(|s| s.width()).sum();
     // The chip shed checks charge the widest the gauge, its speed suffix and
     // each chip can ever render — the full bar rung with the widest percent
-    // label, the ` (9999 t/s)` suffix, and the `[ 9999 tok/s ]` / `[ 999 live ]`
-    // ceilings — so a chip's presence depends on the terminal width and the
-    // active account's name only, never on a reading, speed, rate or count
-    // update. The gauge, suffix and chips still render at their real widths in
-    // whatever room the shed checks leave.
+    // label, the ` (9999 t/s)` suffix, and the `[ 9999 tok/s ]` /
+    // `[ 999+999 live ]` ceilings — so a chip's presence depends on the
+    // terminal width and the active account's name only, never on a reading,
+    // speed, rate or count update. The gauge, suffix and chips still render at
+    // their real widths in whatever room the shed checks leave.
     let (charged_gauge_w, charged_suffix_w) = gauge.as_ref().map_or((0, 0), |g| {
         let oauth = g.pct.is_some();
         let name_w = Span::raw(g.name.as_str()).width().min(GAUGE_NAME_MAX);
@@ -430,23 +433,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
     super::tabs::draw(frame, rows[2], app);
 }
 
-/// `[ N live ]`: brackets and unit dim, the number `TEXT` + bold, dim at zero
-/// and as the `—` of a tally that could not read. Blank cells after the closing
-/// bracket pad it to the widest count the app has read, so a count losing a
-/// digit moves nothing right of the chip.
+/// `[ N live ]` or its split form `[ N+M live ]`: brackets and unit dim, the
+/// own number `TEXT` + bold, the delegates number `ACCENT` + bold, the `+` dim,
+/// all dim at zero and as the `—` of a tally that could not read. Blank cells
+/// after the closing bracket pad it to the widest count the app has read, so a
+/// count losing a digit moves nothing right of the chip.
 fn live_chip_spans(app: &App) -> Vec<Span<'static>> {
-    let total = app.live_sessions.total();
-    let number = live_count_text(total);
-    let number_style = match total {
-        Some(n) if n > 0 => Style::default().fg(theme::text_color()).bold(),
-        Some(_) | None => theme::dim(),
-    };
+    let own = app.live_sessions.own();
+    let delegates = app.live_sessions.delegates();
+    let number = live_count_text(own, delegates);
     let pad = app.live_count_width.saturating_sub(number.chars().count());
-    let mut spans = vec![
-        Span::styled("[ ", theme::dim()),
-        Span::styled(number, number_style),
-        Span::styled(" live ]", theme::dim()),
-    ];
+    let mut spans = vec![Span::styled("[ ", theme::dim())];
+    spans.extend(live_number_spans(own, delegates));
+    spans.push(Span::styled(" live ]", theme::dim()));
     if pad > 0 {
         spans.push(Span::raw(" ".repeat(pad)));
     }

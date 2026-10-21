@@ -1601,6 +1601,7 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        is_delegate: false,
     }
 }
 
@@ -1922,6 +1923,44 @@ pub(crate) fn runtime_settings_until(profile_dir: &std::path::Path) -> Option<St
             return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Poll the live-session registry until a row matches `stop` (or the deadline
+/// passes), returning every observation in time order, duplicates across
+/// passes kept — so a caller can assert a row was NEVER seen in a given state,
+/// not just what the last pass held. The shared reader the mcp and `clauth
+/// start` producer pins both call, so each producer's launcher choice is
+/// observed through the registry it actually writes.
+#[cfg(unix)]
+pub(crate) fn live_session_rows_until(
+    dir: &std::path::Path,
+    stop: impl Fn(&crate::live_sessions::LiveSession) -> bool,
+    timeout: std::time::Duration,
+) -> Vec<crate::live_sessions::LiveSession> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen = Vec::new();
+    loop {
+        let mut found = false;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let Ok(bytes) = std::fs::read(entry.path()) else {
+                    continue;
+                };
+                let Ok(row) = serde_json::from_slice::<crate::live_sessions::LiveSession>(&bytes)
+                else {
+                    continue;
+                };
+                found |= stop(&row);
+                seen.push(row);
+            }
+        }
+        if found || std::time::Instant::now() > deadline {
+            return seen;
+        }
+        // No pause between passes: a pause can skip a row state that lasts only
+        // a moment, and the callers assert a state was never seen.
+        std::thread::yield_now();
     }
 }
 

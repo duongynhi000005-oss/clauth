@@ -4091,6 +4091,7 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        is_delegate: false,
     }
 }
 

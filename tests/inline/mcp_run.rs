@@ -10138,3 +10138,71 @@ fn the_session_host_pid_reads_the_server_env_and_config_dir() {
     );
     assert_eq!(session_host_pid(), Some(4242));
 }
+
+/// The delegate spawn path writes the mark at registration, before the row can
+/// first be tallied: a reader thread on the registry dir must see a marked row
+/// and must never read the delegate row unmarked. Drives the real
+/// `run_delegate` under `SlowClaude` — the narrowest seam that still runs the
+/// spawn path.
+#[cfg(unix)]
+#[test]
+fn the_delegate_row_is_marked_from_its_first_sight() {
+    let sb = HomeSandbox::new();
+    std::fs::create_dir_all(sb.home().join(".claude")).expect("~/.claude");
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-key".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-test".to_string()),
+        Default::default(),
+    )
+    .expect("create profile");
+    let dir = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("live_sessions");
+    let me = std::process::id();
+    let shim = crate::testutil::SlowClaude::new(&sb);
+    let observer = std::thread::spawn(move || {
+        crate::testutil::live_session_rows_until(
+            &dir,
+            |row| row.is_delegate,
+            std::time::Duration::from_secs(20),
+        )
+    });
+    let _ = run_delegate(DelegateOpts {
+        profile: "ds-key",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    let seen = observer.join().expect("observer");
+    drop(shim);
+    let first = seen.first().map(|row| (row.pid == me, row.is_delegate));
+    assert!(
+        seen.iter().any(|row| row.is_delegate),
+        "a marked delegate row must be observed (first sight: {first:?})"
+    );
+    let unmarked = seen.iter().filter(|row| !row.is_delegate).count();
+    let unmarked_mcp_pid = seen
+        .iter()
+        .filter(|row| !row.is_delegate && row.pid == me)
+        .count();
+    assert_eq!(
+        unmarked, 0,
+        "no observation may read the delegate row unmarked \
+         ({unmarked_mcp_pid} with the mcp's pid before the mark landed)"
+    );
+}

@@ -4821,8 +4821,9 @@ pub(crate) struct App {
     /// reload (jobs come and go without touching config), and seeded in
     /// [`App::new`] so the first frame already reads a real snapshot.
     pub(crate) job_trees: crate::claude_jobs::JobTrees,
-    /// The widest the header's `[ N live ]` chip has read `N`, in cells: the
-    /// chip renders at least this wide for the TUI's lifetime.
+    /// The widest the header's `[ N live ]` chip has read its number field, in
+    /// cells: the split `N+M` form counted whole, so the chip renders at least
+    /// this wide for the TUI's lifetime.
     pub(crate) live_count_width: usize,
     /// The last tps snapshot read off the producer's cache, `None` when the
     /// cache is absent. Seeded in [`App::new`] beside `live_sessions`, so the
@@ -5429,7 +5430,9 @@ impl App {
             wallet_cache,
             wallet_fp,
             session_tokens,
-            live_count_width: live_count_text(live_sessions.total()).chars().count(),
+            live_count_width: live_count_text(live_sessions.own(), live_sessions.delegates())
+                .chars()
+                .count(),
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
             job_trees: crate::claude_jobs::job_trees(),
@@ -5585,9 +5588,11 @@ impl App {
     /// the header chip's held count width, so a count shrinking by a digit
     /// moves nothing right of the chip.
     pub(crate) fn set_live_sessions(&mut self, tally: crate::live_sessions::LiveTally) {
-        self.live_count_width = self
-            .live_count_width
-            .max(live_count_text(tally.total()).chars().count());
+        self.live_count_width = self.live_count_width.max(
+            live_count_text(tally.own(), tally.delegates())
+                .chars()
+                .count(),
+        );
         self.live_sessions = tally;
     }
 
@@ -24659,10 +24664,44 @@ fn poll_live_sessions(app: &mut App) {
     app.job_trees = crate::claude_jobs::job_trees();
 }
 
-/// The header chip's number: the fleet total, or `—` for a tally that could
-/// not read the registry or the bare-session markers.
-pub(crate) fn live_count_text(total: Option<usize>) -> String {
-    total.map_or_else(|| "—".to_owned(), |n| n.to_string())
+/// The header chip's number field, as spans: own sessions then delegates joined
+/// by a dim `+`. A zero or unread part drops with its `+`; both zero renders
+/// one dim `0`, and no part reads renders a dim `—`. Own renders `TEXT` + bold,
+/// delegates `ACCENT` + bold, the `+` and a zero dim. One decision table: the
+/// width hold's text below and the render both read these spans, so they can
+/// never disagree on a later edit.
+pub(crate) fn live_number_spans(
+    own: Option<usize>,
+    delegates: Option<usize>,
+) -> Vec<Span<'static>> {
+    let text = Style::default().fg(theme::text_color()).bold();
+    let accent = Style::default().fg(theme::accent_color()).bold();
+    let dim = theme::dim();
+    let part = |n: usize, nonzero: Style| -> Span<'static> {
+        if n == 0 {
+            Span::styled("0", dim)
+        } else {
+            Span::styled(n.to_string(), nonzero)
+        }
+    };
+    match (own, delegates) {
+        (None, None) => vec![Span::styled("—", dim)],
+        (Some(o), None) => vec![part(o, text)],
+        (None, Some(d)) => vec![part(d, accent)],
+        (Some(0), Some(0)) => vec![Span::styled("0", dim)],
+        (Some(o), Some(0)) => vec![part(o, text)],
+        (Some(0), Some(d)) => vec![part(d, accent)],
+        (Some(o), Some(d)) => vec![part(o, text), Span::styled("+", dim), part(d, accent)],
+    }
+}
+
+/// The header chip's number text, collected from [`live_number_spans`], so the
+/// width hold reads the same table the render does.
+pub(crate) fn live_count_text(own: Option<usize>, delegates: Option<usize>) -> String {
+    live_number_spans(own, delegates)
+        .into_iter()
+        .map(|s| s.content.into_owned())
+        .collect()
 }
 
 /// Re-sync the durable key-rejection verdicts into the live `ThirdPartyBroken`

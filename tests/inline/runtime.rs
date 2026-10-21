@@ -4,6 +4,7 @@ use super::*;
 use std::fs;
 use std::time::{Duration, SystemTime};
 
+use crate::live_sessions::Launcher;
 use crate::testutil::{
     HomeSandbox, hold_rotation_lock, set_mtime, write_claude_job, write_claude_job_in,
 };
@@ -11,6 +12,38 @@ use crate::testutil::{
 // V1 expires_at < V2 so tie-break tests can assert which side wins unambiguously.
 const CREDS_V1: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok1","expiresAt":1000}}"#;
 const CREDS_V2: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok2","expiresAt":2000}}"#;
+
+/// `starting` sets the delegate mark from the launcher at registration, so a
+/// `clauth start` row reads own and a delegate-spawn row reads a delegate —
+/// the carry that keeps a delegate from being tallied as own before its mark
+/// lands. The launcher is a typed value, never a bare bool that could swap
+/// places with `follows_chain` and mark every start row a delegate.
+#[test]
+fn starting_marks_only_a_delegate_row() {
+    let own = crate::live_sessions::LiveSession::starting(
+        &SessionId::for_test("4242-0"),
+        "work",
+        crate::harness::Harness::Claude,
+        false,
+        false,
+        Launcher::Own,
+        None,
+    );
+    assert!(!own.is_delegate, "a clauth start row is own");
+    let delegate = crate::live_sessions::LiveSession::starting(
+        &SessionId::for_test("4242-1"),
+        "work",
+        crate::harness::Harness::Claude,
+        false,
+        false,
+        Launcher::Delegate,
+        None,
+    );
+    assert!(
+        delegate.is_delegate,
+        "a delegate row is marked at registration"
+    );
+}
 
 #[test]
 fn sync_no_op_when_link_missing() {
@@ -2804,7 +2837,8 @@ fn acquire_creates_runtime_and_pid_file() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("lifecycle");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
 
         assert!(
             rt.config_dir().is_dir(),
@@ -2883,7 +2917,8 @@ fn acquire_wipes_a_stale_tree_at_its_own_path_when_no_marker_holds_it() {
                 .expect("seed the stale entry");
 
             let rt =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
 
             assert_eq!(
                 rt.config_dir(),
@@ -2953,7 +2988,7 @@ fn acquire_refuses_a_profile_deleted_after_the_config_load() {
 
         // Mapped away because `ProfileRuntime` is not `Debug`; an Ok here also
         // tears the session down before the panic reports it.
-        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .map(|_| ())
             .expect_err("a start for a deleted account must fail loudly");
         let msg = format!("{err:#}");
@@ -3017,6 +3052,7 @@ fn acquire_refuses_a_record_removed_without_a_rotation_lock() {
             Isolation::Shared,
             &[],
             false,
+            Launcher::Own,
             || {
                 // A record removal taking no rotation lock — the shape a clauth
                 // predating the witness ships. Its own body still runs under
@@ -3086,6 +3122,7 @@ fn acquire_builds_session_settings_from_the_profile_re_read_under_the_flock() {
             Isolation::Shared,
             &[],
             false,
+            Launcher::Own,
             || {
                 // The edit lands on disk only, after the caller's borrow and
                 // after the rotation guard: the borrowed copy stays stale.
@@ -3144,7 +3181,7 @@ fn acquire_refuses_a_deleted_account_whose_directory_came_back() {
             "fixture must have put the directory back, or it poses nothing"
         );
 
-        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .map(|_| ())
             .expect_err("a start must follow the record, not the leftover directory");
         // The gate's own sentence, not just the name: every failure path in
@@ -3186,7 +3223,8 @@ fn acquire_isolates_credentials_from_real_home() {
             .expect("mkdir profile dir");
         fs::write(&canonical, CREDS_V2).expect("write canonical");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let runtime_creds = rt.config_dir().join(".credentials.json");
 
         // The runtime's credentials resolve to the profile's OWN chain (V2),
@@ -3265,7 +3303,8 @@ fn acquire_builds_the_runtime_partition_the_mcp_note_describes() {
             .expect("mkdir profile dir");
         fs::write(&canonical, CREDS_V2).expect("write canonical");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let runtime = rt.config_dir();
 
         // 1. The partition holds exhaustively: every top-level entry is one of
@@ -3347,10 +3386,10 @@ fn acquire_twice_same_process_counts_two_sessions() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("concurrent");
 
-        let rt1 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let rt1 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("first acquire");
         // Pre-fix this second acquire blocks forever on the shared PID flock.
-        let rt2 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let rt2 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("second acquire");
 
         assert_eq!(
@@ -3392,9 +3431,9 @@ fn two_shared_sessions_get_independent_trees() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("twin");
 
-        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("first acquire");
-        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("second acquire");
 
         assert_ne!(
@@ -3472,7 +3511,8 @@ fn a_per_session_acquire_stamps_no_marker_at_the_bare_stem_path() {
         for (name, mode, isolation, bare_stem) in layouts {
             with_link_mode(mode, || {
                 let profile = configured_profile(name);
-                let rt = ProfileRuntime::acquire(&profile, isolation, &[], false).expect("acquire");
+                let rt = ProfileRuntime::acquire(&profile, isolation, &[], false, Launcher::Own)
+                    .expect("acquire");
                 let sid = live_sid(&rt);
                 let profile_dir = tmp.path().join(".clauth").join("profiles").join(name);
                 assert_eq!(
@@ -3550,13 +3590,14 @@ fn a_foreign_holder_of_our_own_marker_never_blocks_acquire() {
             std::thread::spawn(move || {
                 let profile = configured_profile("collide");
                 let claimed =
-                    ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).map(|rt| {
-                        // Read the dir while the session still holds its marker:
-                        // teardown unlinks it on drop.
-                        let names = dir_entry_names(rt.sessions_dir());
-                        drop(rt);
-                        names
-                    });
+                    ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                        .map(|rt| {
+                            // Read the dir while the session still holds its marker:
+                            // teardown unlinks it on drop.
+                            let names = dir_entry_names(rt.sessions_dir());
+                            drop(rt);
+                            names
+                        });
                 let _ = tx.send(claimed);
             });
 
@@ -3598,7 +3639,8 @@ fn teardown_racing_a_wedged_peer_removes_its_own_files_within_one_retry() {
         let profile = configured_profile("wedged");
         crate::lock::set_state_lock_timeout_override(Some(Duration::from_millis(150)));
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let runtime = rt.config_dir().to_path_buf();
         let sessions = rt.sessions_dir().to_path_buf();
 
@@ -3667,7 +3709,8 @@ fn teardown_retries_a_persistent_wedge_then_gives_up() {
         let profile = configured_profile("stuck");
         crate::lock::set_state_lock_timeout_override(Some(Duration::from_millis(50)));
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let runtime = rt.config_dir().to_path_buf();
 
         let lock_path = crate::profile::clauth_dir()
@@ -3733,7 +3776,8 @@ fn a_start_behind_a_wedged_rotation_fails_with_the_bounded_wait() {
             crate::runtime::set_rotation_lock_timeout_override(Some(Duration::from_millis(150)));
             let started = std::time::Instant::now();
             let outcome =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).map(drop);
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .map(drop);
             let _ = tx.send((outcome, started.elapsed()));
         });
         // 20x the deadline: wide enough that a loaded box never reads as a park,
@@ -3785,7 +3829,7 @@ fn a_start_behind_a_rotation_that_releases_in_time_proceeds() {
             std::thread::sleep(Duration::from_millis(150));
             drop(holder);
         });
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("a rotation that releases inside the deadline must be waited out");
         releaser.join().expect("join releaser");
 
@@ -3851,6 +3895,7 @@ fn the_rotation_hold_ends_at_the_register_and_stamp_window() {
             Isolation::Shared,
             &[],
             false,
+            Launcher::Own,
             || {
                 head_fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 // Same process, second fd: `flock(2)` binds to the open file
@@ -4030,9 +4075,9 @@ fn dropping_one_shared_session_leaves_the_sibling_intact() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("survivor");
 
-        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("first acquire");
-        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .expect("second acquire");
 
         let a_runtime = a.config_dir().to_path_buf();
@@ -4144,9 +4189,9 @@ fn fake_mode_shares_one_tree_across_two_sessions() {
             fake_claude_home(tmp.path());
             let profile = configured_profile("faketwin");
 
-            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
                 .expect("first acquire");
-            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
                 .expect("second acquire");
 
             let profile_dir = tmp.path().join(".clauth").join("profiles").join("faketwin");
@@ -4184,10 +4229,12 @@ fn fake_mode_isolated_sessions_get_independent_trees() {
             fake_claude_home(tmp.path());
             let profile = configured_profile("iso-twin");
 
-            let a = ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false)
-                .expect("first acquire");
-            let b = ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false)
-                .expect("second acquire");
+            let a =
+                ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false, Launcher::Own)
+                    .expect("first acquire");
+            let b =
+                ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false, Launcher::Own)
+                    .expect("second acquire");
 
             assert_ne!(
                 a.config_dir(),
@@ -4217,10 +4264,12 @@ fn fake_mode_isolated_teardown_rescues_only_its_own_tree() {
             let claude_home = fake_claude_home(tmp.path());
             let profile = configured_profile("iso-twin");
 
-            let a = ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false)
-                .expect("first acquire");
-            let b = ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false)
-                .expect("second acquire");
+            let a =
+                ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false, Launcher::Own)
+                    .expect("first acquire");
+            let b =
+                ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false, Launcher::Own)
+                    .expect("second acquire");
 
             let a_projects = a.config_dir().join("projects");
             let b_projects = b.config_dir().join("projects");
@@ -4282,7 +4331,7 @@ fn fake_mode_second_session_does_not_rebuild_the_tree() {
             let claude_home = fake_claude_home(tmp.path());
             let profile = configured_profile("fakecopy");
 
-            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
                 .expect("first acquire");
 
             let sentinel = ".session-one-was-here.tmp.pin";
@@ -4306,7 +4355,7 @@ fn fake_mode_second_session_does_not_rebuild_the_tree() {
                  this test would prove nothing"
             );
 
-            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
                 .expect("second acquire");
 
             assert_eq!(
@@ -4338,9 +4387,9 @@ fn fake_mode_liveness_counts_both_shared_sessions() {
             fake_claude_home(tmp.path());
             let profile = configured_profile("fakegate");
 
-            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
                 .expect("first acquire");
-            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
                 .expect("second acquire");
             let tree = a.config_dir().to_path_buf();
             let markers = a.sessions_dir().to_path_buf();
@@ -4397,7 +4446,8 @@ fn fake_mode_registry_row_survives_gc() {
             let profile = configured_profile("fakerow");
 
             let rt =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
             let sid = rt.swap.session.as_str().to_string();
 
             gc_stale_runtimes();
@@ -4431,8 +4481,8 @@ fn a_shared_fake_session_keys_its_marker_on_the_bare_sessions_stem() {
             fake_claude_home(tmp.path());
 
             let shared = configured_profile("fakebare-shared");
-            let rt =
-                ProfileRuntime::acquire(&shared, Isolation::Shared, &[], false).expect("acquire");
+            let rt = ProfileRuntime::acquire(&shared, Isolation::Shared, &[], false, Launcher::Own)
+                .expect("acquire");
             let bare = tmp
                 .path()
                 .join(".clauth")
@@ -5361,7 +5411,8 @@ fn teardown_leaves_a_tree_a_claude_job_names() {
                 .expect("mkdir profile dir");
             fs::write(&canonical, CREDS_V2).expect("write canonical");
             let rt =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
             let tree = rt.config_dir().to_path_buf();
             trees.push((tree, rt));
         }
@@ -5473,14 +5524,16 @@ fn acquire_keeps_a_tree_a_job_names_under_fake_link_mode() {
             fs::create_dir_all(canonical.parent().expect("parent")).expect("mkdir");
             fs::write(&canonical, CREDS_V2).expect("write canonical");
             let rt =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
             let tree = rt.config_dir().to_path_buf();
             write_claude_job(tmp.path(), "37560ded", &tree);
             drop(rt);
             assert!(tree.is_dir(), "teardown spared the tree");
             fs::write(tree.join("bg-session-sentinel"), b"x").expect("sentinel");
-            let rt2 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
-                .expect("acquire 2");
+            let rt2 =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire 2");
             assert_eq!(rt2.config_dir(), tree.as_path(), "same bare-stem tree");
             assert!(
                 tree.join("bg-session-sentinel").is_file(),
@@ -6131,6 +6184,7 @@ fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
             current_member: None,
             last_swap_at: None,
             launch_store: None,
+            is_delegate: false,
         };
         crate::live_sessions::register(&dead).expect("register dead");
         dead.session_id = "6001-1".into();
@@ -6162,7 +6216,8 @@ fn acquire_registers_a_row_and_teardown_removes_it() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("registered");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         // `live_sid`, not `sid_of`: the subject here is the ROW, which a host
         // sharing one runtime tree files exactly the same way. Reading the sid off
         // the tree's name instead would skip this wiring on every such host.
@@ -6223,7 +6278,8 @@ fn session_teardown_holds_the_state_flock_once() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("teardown-count");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
 
         crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
         drop(rt);
@@ -6375,6 +6431,7 @@ fn lone_session(
         crate::harness::Harness::Claude,
         isolation == Isolation::Isolated,
         false,
+        Launcher::Own,
         Some(store.to_path_buf()),
     );
     crate::live_sessions::register(&row).expect("register row");
@@ -6417,6 +6474,7 @@ fn fake_session(
         crate::harness::Harness::Claude,
         isolation == Isolation::Isolated,
         false,
+        Launcher::Own,
         Some(store.to_path_buf()),
     );
     crate::live_sessions::register(&row).expect("register row");
@@ -6470,13 +6528,13 @@ fn the_with_fallback_flag_reaches_the_row_only_where_a_swap_can_land() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("optin-flag");
 
-        let opted =
-            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true).expect("acquire");
+        let opted = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true, Launcher::Own)
+            .expect("acquire");
         let opted_row = crate::live_sessions::get(&live_sid(&opted)).expect("the opted-in row");
         drop(opted);
 
-        let plain =
-            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let plain = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let plain_row = crate::live_sessions::get(&live_sid(&plain)).expect("the opted-out row");
         drop(plain);
 
@@ -6519,7 +6577,7 @@ fn a_fake_mode_host_never_registers_a_session_as_following_the_chain() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("optin-fake");
         with_link_mode(LinkMode::Fake, || {
-            let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true)
+            let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true, Launcher::Own)
                 .expect("acquire under the shared fake-mode tree");
             let rows = crate::live_sessions::list();
             drop(rt);
@@ -7129,7 +7187,8 @@ fn a_swap_keeps_both_members_marked_live_and_both_rotation_candidates() {
         member_store(&launch);
         member_store(&intended);
 
-        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let sid = live_sid(&rt);
         assert_eq!(
             rt.swap().swap_to("rot-b").expect("swap"),
@@ -7750,7 +7809,8 @@ fn teardown_removes_every_marker_a_swap_stamped() {
         member_store(&launch);
         member_store(&intended);
 
-        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
         let sid = live_sid(&rt);
         assert_eq!(
             rt.swap().swap_to("down-b").expect("swap"),
@@ -9030,10 +9090,10 @@ fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
         // `resolve_credential_winner` keeps canonical on an mtime tie.
         set_mtime(&canonical, SystemTime::now() - Duration::from_secs(60));
 
-        let a =
-            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire a");
-        let b =
-            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire b");
+        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire a");
+        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire b");
 
         // A hang guard, not a timing pin: the event path converges in
         // milliseconds, and the tick counters below are what separate it from
@@ -9463,6 +9523,7 @@ fn register_row(profile: &str, sid: &str, launch_store: Option<std::path::PathBu
         current_member: None,
         last_swap_at: None,
         launch_store,
+        is_delegate: false,
     })
     .expect("register row");
 }
@@ -10375,6 +10436,7 @@ fn codex_acquire_registers_and_teardown_keeps_the_durable_store() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].harness, crate::harness::Harness::Codex);
     assert_eq!(rows[0].start_profile, "cx");
+    assert!(!rows[0].is_delegate, "a codex row is own");
     assert_eq!(
         rows[0].launch_store.as_deref(),
         Some(session_home.join("auth.json").as_path()),
@@ -12583,7 +12645,8 @@ fn a_session_start_lands_a_live_stage_before_its_tree_reads_the_store() {
         fake_claude_home(tmp.path());
         let profile = staged_profile("chain-start");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
 
         assert_eq!(stored_refresh_of("chain-start").as_deref(), Some("rt-mid"));
         let seen: crate::profile::ClaudeCredentials =
@@ -12611,7 +12674,7 @@ fn a_session_start_refuses_while_a_live_stage_cannot_land() {
         fs::remove_file(profile_dir.join("auth.spent.json")).expect("drop the record");
         fs::create_dir(profile_dir.join("auth.spent.json")).expect("block the record");
 
-        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
             .map(|_| ())
             .expect_err("a failed land refuses the start");
 
