@@ -279,7 +279,7 @@ pub(crate) fn apply_spawn_settings(
 
     let mut settings = match merge_value {
         Some(value) => {
-            let inline = value.trim().starts_with('{') && value.trim().ends_with('}');
+            let inline = is_inline_settings(&value);
             match parse_settings_value(&value, cwd, inline) {
                 Ok(map) => {
                     if let Some(field) = hooks_shape_error(&map) {
@@ -437,10 +437,18 @@ fn fold_settings_args(passthrough: &[String]) -> Result<(Option<String>, Vec<Str
     Ok((value, clean))
 }
 
-/// The user's `--settings` value as a JSON object. Inline JSON is a trimmed
-/// value that starts with `{` AND ends with `}` (Claude Code's own rule);
-/// anything else is a settings file path resolved against `cwd`. The `Err` is
-/// the full, already-rendered warning.
+/// Whether a `--settings` value is inline JSON (Claude Code's own rule): a
+/// trimmed value that starts with `{` AND ends with `}`. Anything else is a
+/// settings file path. Shared by [`apply_spawn_settings`] and the job-store
+/// reader, so both parse one value the same way.
+pub(crate) fn is_inline_settings(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with('{') && trimmed.ends_with('}')
+}
+
+/// The user's `--settings` value as a JSON object, inline JSON or a settings
+/// file path resolved against `cwd` ([`is_inline_settings`] picks). The `Err`
+/// is the full, already-rendered warning.
 fn parse_settings_value(
     value: &str,
     cwd: &Path,

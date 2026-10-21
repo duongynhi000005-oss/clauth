@@ -505,7 +505,6 @@ fn session_marker_paths(
 /// [`LinkMode::Fake`] fallback — derived from [`paired_dir_names`] so no other
 /// module rebuilds the layout. The bridge reads the peer's session record
 /// under whichever tree holds its `sessions` dir.
-#[cfg(unix)]
 pub(crate) fn session_runtime_trees(
     profile: &ProfileName,
     isolated: bool,
@@ -1810,8 +1809,19 @@ pub(crate) mod namespaced_keychain_ledger {
 /// without teardown. The name carries the flavor, so liveness is the registry's
 /// own [`session_row_is_live`] over every marker layout (per-session and fake
 /// mode's bare `sessions/`): a held marker spares the file, an undecidable one
-/// reads as live, and a file with no marker at all is a crash leftover.
+/// reads as live, and a file with no marker at all is a crash leftover. A job
+/// whose `respawnFlags` name the file spares it; a job whose flags cannot be
+/// read spares the files beside its tree; nothing else is spared (the file can
+/// hold a folded user `env` token).
 fn gc_spawn_settings_files() {
+    gc_spawn_settings_files_synced(|| {});
+}
+
+/// [`gc_spawn_settings_files`] with the in-hold interleave point exposed for
+/// the pin: `in_hold` runs as the first statement inside the state-flock
+/// closure, before any liveness check or job-store read, so a job written
+/// there still spares the file it names. A no-op in production.
+fn gc_spawn_settings_files_synced(in_hold: impl FnOnce()) {
     let Ok(root) = profiles_root_dir() else {
         return;
     };
@@ -1848,10 +1858,22 @@ fn gc_spawn_settings_files() {
         return;
     }
     let _ = with_state_lock(|_held| {
+        in_hold();
+        // Read the store only once a file is actually dead, so a sweep of all
+        // live sessions holds the flock for no job-store walk.
+        let mut jobs_read: Option<crate::claude_jobs::JobTrees> = None;
         for (file, profile, isolated, sid) in candidates {
-            if !session_row_is_live(&profile, isolated, &sid) {
-                let _ = std::fs::remove_file(&file);
+            if session_row_is_live(&profile, isolated, &sid) {
+                continue;
             }
+            let jobs = jobs_read.get_or_insert_with(crate::claude_jobs::job_trees);
+            let Ok(own_trees) = session_runtime_trees(&profile, isolated, &sid) else {
+                continue;
+            };
+            if jobs.spares_settings(&file, &own_trees) {
+                continue;
+            }
+            let _ = std::fs::remove_file(&file);
         }
         Ok::<_, anyhow::Error>(())
     });
@@ -4763,11 +4785,17 @@ impl Drop for ProfileRuntime {
         // the retry re-enters the same flock for the same body.
         // The settings file is per-session (its own sid in the profile dir), so
         // it shares no state with the teardown lock below: remove it even when
-        // the flock cannot be taken, so a wedged peer cannot strand it.
-        let _ = std::fs::remove_file(spawn_settings_file(
-            &self.swap.runtime,
-            self.swap.session.as_str(),
-        ));
+        // the flock cannot be taken, so a wedged peer cannot strand it. Skip
+        // while a job's `respawnFlags` name it, its tree's flags are
+        // unreadable, or the store is unreadable; read the store only when the
+        // file exists.
+        let settings = spawn_settings_file(&self.swap.runtime, self.swap.session.as_str());
+        if settings.symlink_metadata().is_ok()
+            && !crate::claude_jobs::job_trees()
+                .spares_settings(&settings, std::slice::from_ref(&self.swap.runtime))
+        {
+            let _ = std::fs::remove_file(&settings);
+        }
         match acquire_state_lock_for_teardown() {
             Ok(_guard) => {
                 if let Err(e) = crate::live_sessions::unregister(self.swap.session.as_str()) {
@@ -4884,8 +4912,8 @@ pub(crate) fn guard_home_project_settings(command: &mut std::process::Command, c
 /// ([`crate::cc_exempt::apply_spawn_settings`]). Lives BESIDE the runtime tree
 /// (the profile dir), not inside it, so the fake-mode mirror never publishes
 /// it into `~/.claude` and `settings_sync` (which reconciles only
-/// `settings.json`) never reads it. Unique per session id; removed when this
-/// runtime drops.
+/// `settings.json`) never reads it. Unique per session id; kept while a job's
+/// `respawnFlags` name it or the job store cannot be read.
 pub(crate) fn spawn_settings_file(config_dir: &Path, session_id: &str) -> PathBuf {
     // The name carries the session's flavor so GC can find its marker: an
     // isolated session's marker lives in `sessions-isolated-<sid>`, a shared

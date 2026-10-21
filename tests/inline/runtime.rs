@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::live_sessions::Launcher;
 use crate::testutil::{
-    HomeSandbox, hold_rotation_lock, set_mtime, write_claude_job, write_claude_job_in,
+    HomeSandbox, hold_rotation_lock, respawn_flags_naming, set_mtime, write_claude_job,
+    write_claude_job_flags, write_claude_job_in,
 };
 
 // V1 expires_at < V2 so tie-break tests can assert which side wins unambiguously.
@@ -5432,6 +5433,641 @@ fn teardown_leaves_a_tree_a_claude_job_names() {
             "teardown still removes {}: no job names it",
             gone.display()
         );
+    });
+}
+
+/// Writes the canonical credentials `acquire` links for `name`.
+fn seed_profile_store(home: &Path, name: &str) {
+    let canonical = home
+        .join(".clauth")
+        .join("profiles")
+        .join(name)
+        .join("credentials.json");
+    fs::create_dir_all(canonical.parent().expect("canonical parent")).expect("mkdir profile dir");
+    fs::write(&canonical, CREDS_V2).expect("write canonical");
+}
+
+/// Writes a `{}` per-spawn `--settings` file for a live session and returns it.
+fn write_spawn_settings(rt: &ProfileRuntime) -> PathBuf {
+    let settings = spawn_settings_file(rt.config_dir(), rt.session_id());
+    fs::write(&settings, b"{}").expect("write spawn settings");
+    settings
+}
+
+/// A job's `respawnFlags` carry `--settings <spawn-settings-<sid>.json>`
+/// (measured 2026-10-20, 2.1.304): that list, not the tree the job runs in, is
+/// what says which settings file a respawn reads. Teardown keeps the file a job
+/// names and removes a sibling session's file even while a job names that
+/// sibling's tree, both sessions in one profile.
+#[test]
+fn teardown_keeps_only_the_spawn_settings_file_a_jobs_respawn_flags_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fs::create_dir_all(tmp.path().join(".claude")).expect("mkdir ~/.claude");
+        seed_profile_store(tmp.path(), "bgss");
+        let profile = configured_profile("bgss");
+        let named = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let sibling =
+            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                .expect("acquire");
+        let named_settings = write_spawn_settings(&named);
+        let sibling_settings = write_spawn_settings(&sibling);
+        let sibling_tree = sibling.config_dir().to_path_buf();
+        write_claude_job_flags(
+            tmp.path(),
+            "4b1d2c3e",
+            named.config_dir(),
+            respawn_flags_naming(&named_settings),
+        );
+        write_claude_job_flags(tmp.path(), "4b1d2c3f", &sibling_tree, serde_json::json!([]));
+
+        drop((named, sibling));
+
+        assert!(
+            named_settings.is_file(),
+            "teardown must keep {}: a job's respawnFlags name it",
+            named_settings.display()
+        );
+        assert!(
+            !sibling_settings.exists(),
+            "teardown still removes {}: no job's respawnFlags name it",
+            sibling_settings.display()
+        );
+        assert!(
+            sibling_tree.is_dir(),
+            "the sibling's tree itself stays: a job names it"
+        );
+    });
+}
+
+/// The sweep's half: a dead session's file survives exactly while a job's
+/// `respawnFlags` name it, shared or isolated, and is collected once the job dir
+/// is gone; a dead file no job names goes at once, even while some job names a
+/// tree it could have shared (the profile's bare fake-mode `runtime`). The file
+/// can hold a folded user `env` token, so nothing keeps it longer.
+#[test]
+fn gc_keeps_exactly_the_spawn_settings_files_a_jobs_respawn_flags_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (shared, _) = dead_pair(&profiles, "ssbg", "runtime-4545-0", "4545-0");
+        let shared_file = spawn_settings_file(&shared, "4545-0");
+        fs::write(&shared_file, b"{}").expect("shared settings file");
+        let (isolated, _) = dead_pair(&profiles, "ssbg", "runtime-isolated-4545-1", "4545-1");
+        let isolated_file = spawn_settings_file(&isolated, "4545-1");
+        fs::write(&isolated_file, b"{}").expect("isolated settings file");
+        let (unnamed, _) = dead_pair(&profiles, "ssbg", "runtime-4545-2", "4545-2");
+        let unnamed_file = spawn_settings_file(&unnamed, "4545-2");
+        fs::write(&unnamed_file, b"{}").expect("unnamed settings file");
+        let (beside_bare, _) = dead_pair(&profiles, "ssbg", "runtime-4545-3", "4545-3");
+        let beside_bare_file = spawn_settings_file(&beside_bare, "4545-3");
+        fs::write(&beside_bare_file, b"{}").expect("settings file beside a bare-runtime job");
+        let bare = profiles.join("ssbg").join("runtime");
+        fs::create_dir_all(&bare).expect("mkdir bare runtime");
+        let shared_job = write_claude_job_flags(
+            tmp.path(),
+            "5c2e3d4f",
+            &shared,
+            respawn_flags_naming(&shared_file),
+        );
+        let isolated_job = write_claude_job_flags(
+            tmp.path(),
+            "6d3f4e5a",
+            &isolated,
+            respawn_flags_naming(&isolated_file),
+        );
+        write_claude_job(tmp.path(), "7e4a5f6b", &bare);
+
+        gc_stale_runtimes();
+
+        for (file, flavor) in [(&shared_file, "shared"), (&isolated_file, "isolated")] {
+            assert!(
+                file.is_file(),
+                "a dead {flavor} session's {} must survive while a job's respawnFlags name it",
+                file.display()
+            );
+        }
+        for (file, why) in [
+            (&unnamed_file, "no job names it"),
+            (
+                &beside_bare_file,
+                "a job naming the bare `runtime` tree names no settings file",
+            ),
+        ] {
+            assert!(
+                !file.exists(),
+                "{} must be collected: {why}",
+                file.display()
+            );
+        }
+
+        fs::remove_dir_all(&shared_job).expect("claude rm");
+        fs::remove_dir_all(&isolated_job).expect("claude rm");
+        gc_stale_runtimes();
+
+        for (file, flavor) in [(&shared_file, "shared"), (&isolated_file, "isolated")] {
+            assert!(
+                !file.exists(),
+                "once the job dir is gone the dead {flavor} session's {} is collected",
+                file.display()
+            );
+        }
+    });
+}
+
+/// Fake-mode shared sessions of one profile all run in the bare `runtime`
+/// tree, so a job naming that tree says nothing about which session's file it
+/// respawns with: only the file its `respawnFlags` name survives.
+#[test]
+fn gc_keeps_only_the_named_fake_mode_sessions_spawn_settings_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profile_dir = tmp.path().join(".clauth").join("profiles").join("ssfk");
+        let runtime = profile_dir.join("runtime");
+        let sessions = profile_dir.join("sessions");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(sessions.join("4646-0"), b"").expect("dead marker 0");
+        fs::write(sessions.join("4646-1"), b"").expect("dead marker 1");
+        let named = spawn_settings_file(&runtime, "4646-0");
+        let other = spawn_settings_file(&runtime, "4646-1");
+        fs::write(&named, b"{}").expect("named settings file");
+        fs::write(&other, b"{}").expect("other settings file");
+        write_claude_job_flags(
+            tmp.path(),
+            "8f5b6a7c",
+            &runtime,
+            respawn_flags_naming(&named),
+        );
+
+        gc_stale_runtimes();
+
+        assert!(
+            named.is_file(),
+            "{} must survive: the job's respawnFlags name it",
+            named.display()
+        );
+        assert!(
+            !other.exists(),
+            "{} must be collected: the job shares its tree but names another file",
+            other.display()
+        );
+    });
+}
+
+/// A job record caught mid-rewrite names nothing either side can trust, so both
+/// removers take the store's fail-closed answer: keep every settings file.
+#[test]
+fn teardown_and_gc_keep_spawn_settings_files_while_the_job_store_cannot_be_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let torn = tmp.path().join(".claude").join("jobs").join("0add99ed");
+        fs::create_dir_all(&torn).expect("mkdir job dir");
+        fs::write(
+            torn.join("state.json"),
+            br#"{"state":"working","respawnFlags":["--settings","#,
+        )
+        .expect("torn job record");
+        seed_profile_store(tmp.path(), "bgtorn");
+        let rt = ProfileRuntime::acquire(
+            &configured_profile("bgtorn"),
+            Isolation::Shared,
+            &[],
+            false,
+            Launcher::Own,
+        )
+        .expect("acquire");
+        let live_settings = write_spawn_settings(&rt);
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (dead, _) = dead_pair(&profiles, "bgtorn", "runtime-4747-0", "4747-0");
+        let dead_settings = spawn_settings_file(&dead, "4747-0");
+        fs::write(&dead_settings, b"{}").expect("dead settings file");
+
+        drop(rt);
+        gc_stale_runtimes();
+
+        for (file, remover) in [(&live_settings, "teardown"), (&dead_settings, "GC")] {
+            assert!(
+                file.is_file(),
+                "{remover} must keep {} while the job store cannot be read",
+                file.display()
+            );
+        }
+    });
+}
+
+/// A record whose `respawnFlags` is present but not a list of strings (a
+/// retyped field after a Claude Code update: a string, `null`, a non-string
+/// element anywhere, a `--settings` with a non-string value) cannot say which
+/// file it names, so the files beside its tree fall back to T33a's tree rule; a
+/// file beside a tree no job names still goes.
+#[test]
+fn gc_keeps_the_settings_files_beside_a_tree_whose_jobs_respawn_flags_cannot_be_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let shapes = [
+            ("a string", serde_json::json!("--settings somewhere")),
+            ("null", serde_json::Value::Null),
+            ("a number", serde_json::json!(7)),
+            ("a negative number", serde_json::json!(-7)),
+            ("a float", serde_json::json!(7.5)),
+            ("a bool", serde_json::json!(true)),
+            (
+                "a non-string --settings value",
+                serde_json::json!(["--settings", 7]),
+            ),
+            (
+                "a non-string element before a --settings",
+                serde_json::json!([1, "--settings", "/nowhere/spawn-settings-1-0.json"]),
+            ),
+            (
+                "a map",
+                serde_json::json!({"--settings": "/nowhere/spawn-settings-1-1.json"}),
+            ),
+            (
+                "a map element before a --settings",
+                serde_json::json!([{"k": [1, {"j": null}]}, "--settings", "/nowhere/spawn-settings-1-2.json"]),
+            ),
+        ];
+        let mut kept = Vec::new();
+        for (n, (shape, flags)) in shapes.into_iter().enumerate() {
+            let sid = format!("4848-{n}");
+            let (tree, _) = dead_pair(&profiles, "ssrt", &format!("runtime-{sid}"), &sid);
+            let beside = spawn_settings_file(&tree, &sid);
+            fs::write(&beside, b"{}").expect("settings file beside the job's tree");
+            write_claude_job_flags(tmp.path(), &format!("9a6c7b8{n}"), &tree, flags);
+            kept.push((beside, shape));
+        }
+        let (other, _) = dead_pair(&profiles, "ssrt", "runtime-4849-0", "4849-0");
+        let elsewhere = spawn_settings_file(&other, "4849-0");
+        fs::write(&elsewhere, b"{}").expect("settings file beside an unnamed tree");
+
+        gc_stale_runtimes();
+
+        for (beside, shape) in &kept {
+            assert!(
+                beside.is_file(),
+                "{} must survive: its tree's job has respawnFlags clauth cannot read ({shape})",
+                beside.display()
+            );
+        }
+        assert!(
+            !elsewhere.exists(),
+            "{} must be collected: no job names its tree",
+            elsewhere.display()
+        );
+    });
+}
+
+/// Teardown takes the same fallback: a job naming this session's own tree with
+/// unreadable `respawnFlags` keeps the session's file.
+#[test]
+fn teardown_keeps_the_spawn_settings_file_beside_a_tree_whose_jobs_respawn_flags_cannot_be_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fs::create_dir_all(tmp.path().join(".claude")).expect("mkdir ~/.claude");
+        seed_profile_store(tmp.path(), "bgunk");
+        let rt = ProfileRuntime::acquire(
+            &configured_profile("bgunk"),
+            Isolation::Shared,
+            &[],
+            false,
+            Launcher::Own,
+        )
+        .expect("acquire");
+        let settings = write_spawn_settings(&rt);
+        write_claude_job_flags(
+            tmp.path(),
+            "9a6c7b90",
+            rt.config_dir(),
+            serde_json::json!("--settings somewhere"),
+        );
+
+        drop(rt);
+
+        assert!(
+            settings.is_file(),
+            "teardown must keep {}: its tree's job has respawnFlags clauth cannot read",
+            settings.display()
+        );
+    });
+}
+
+/// `--settings` also takes inline JSON, and clauth hands a user's own value
+/// through unfolded, so a job's flags can carry a value that is no path. Inline
+/// JSON names no file; a value that cannot resolve as a path (a NUL) falls back
+/// to its own job's tree. Neither makes the whole job store unreadable: a dead
+/// tree in an unrelated profile is still collected.
+#[test]
+fn gc_scopes_a_settings_value_that_is_no_path_to_its_own_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (inline_tree, _) = dead_pair(&profiles, "ssval", "runtime-4949-0", "4949-0");
+        let beside_inline = spawn_settings_file(&inline_tree, "4949-0");
+        fs::write(&beside_inline, b"{}").expect("settings file beside the inline job's tree");
+        let long_inline = format!(
+            r#"{{"permissions":{{"allow":["Bash({})"]}}}}"#,
+            "a".repeat(512)
+        );
+        write_claude_job_flags(
+            tmp.path(),
+            "aa1b2c3d",
+            &inline_tree,
+            serde_json::json!(["--settings", long_inline]),
+        );
+        let (nul_tree, _) = dead_pair(&profiles, "ssval", "runtime-4949-1", "4949-1");
+        let beside_nul = spawn_settings_file(&nul_tree, "4949-1");
+        fs::write(&beside_nul, b"{}").expect("settings file beside the NUL job's tree");
+        write_claude_job_flags(
+            tmp.path(),
+            "aa1b2c3e",
+            &nul_tree,
+            serde_json::json!(["--settings", "bad\u{0}path"]),
+        );
+        let (unrelated, unrelated_sessions) =
+            dead_pair(&profiles, "ssother", "runtime-5050-0", "5050-0");
+
+        gc_stale_runtimes();
+
+        assert!(
+            !unrelated.exists() && !unrelated_sessions.exists(),
+            "a dead tree in an unrelated profile must still be collected: no job value makes the store unreadable"
+        );
+        assert!(
+            !beside_inline.exists(),
+            "{} must be collected: an inline JSON value names no file",
+            beside_inline.display()
+        );
+        assert!(
+            inline_tree.join(".claude.json").is_file(),
+            "the inline job's own tree stays: the job names it"
+        );
+        assert!(
+            beside_nul.is_file(),
+            "{} must survive: its job's value cannot resolve, so its tree falls back",
+            beside_nul.display()
+        );
+    });
+}
+
+/// Claude Code's `--settings` also parses the `--settings=<value>` spelling, so a
+/// record carrying it names that file too.
+#[test]
+fn gc_keeps_a_spawn_settings_file_named_in_the_equals_spelling() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (tree, _) = dead_pair(&profiles, "sseq", "runtime-5151-0", "5151-0");
+        let file = spawn_settings_file(&tree, "5151-0");
+        fs::write(&file, b"{}").expect("settings file");
+        write_claude_job_flags(
+            tmp.path(),
+            "bb2c3d4e",
+            &tree,
+            serde_json::json!([format!("--settings={}", file.to_string_lossy())]),
+        );
+
+        gc_stale_runtimes();
+
+        assert!(
+            file.is_file(),
+            "{} must survive: the job's respawnFlags name it as --settings=<path>",
+            file.display()
+        );
+    });
+}
+
+/// A `respawnFlags` nested past serde_json's 128-level recursion limit is still
+/// one job's unreadable flags, never an unreadable store: the file beside its
+/// tree falls back to the tree rule, and a dead tree in an unrelated profile is
+/// still collected.
+#[test]
+fn gc_scopes_a_deeply_nested_respawn_flags_value_to_its_own_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (tree, _) = dead_pair(&profiles, "ssdeep", "runtime-5353-0", "5353-0");
+        let beside = spawn_settings_file(&tree, "5353-0");
+        fs::write(&beside, b"{}").expect("settings file beside the deep job's tree");
+        let mut deep = serde_json::json!([]);
+        for _ in 0..199 {
+            deep = serde_json::json!([deep]);
+        }
+        write_claude_job_flags(tmp.path(), "cc3d4e5a", &tree, deep);
+        let (unrelated, unrelated_sessions) =
+            dead_pair(&profiles, "ssdeepother", "runtime-5454-0", "5454-0");
+
+        gc_stale_runtimes();
+
+        assert!(
+            !unrelated.exists() && !unrelated_sessions.exists(),
+            "a dead tree in an unrelated profile must still be collected: a 200-deep respawnFlags must not make the store unreadable"
+        );
+        assert!(
+            beside.is_file(),
+            "{} must survive: its tree's job has respawnFlags clauth cannot read",
+            beside.display()
+        );
+    });
+}
+
+/// The settings sweep reads the job store inside its state-flock hold, never
+/// before it: a job written after the candidate scan, before the dead decision,
+/// still spares the file it names.
+#[test]
+fn gc_spares_a_settings_file_whose_job_is_written_inside_the_hold() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (tree, _) = dead_pair(&profiles, "sslate", "runtime-5555-0", "5555-0");
+        let file = spawn_settings_file(&tree, "5555-0");
+        fs::write(&file, b"{}").expect("settings file");
+        let home = tmp.path().to_path_buf();
+        let (job_tree, named) = (tree.clone(), file.clone());
+
+        gc_spawn_settings_files_synced(move || {
+            write_claude_job_flags(&home, "cc3d4e5b", &job_tree, respawn_flags_naming(&named));
+        });
+
+        assert!(
+            file.is_file(),
+            "{} must survive: its job was written inside the hold, before the dead decision",
+            file.display()
+        );
+    });
+}
+
+/// Replace the one occurrence of `from` in a job dir's `state.json` with `to`,
+/// for record bytes a `serde_json::Value` cannot hold (an out-of-range number,
+/// a lone surrogate escape, a repeated key).
+fn rewrite_job_record(job_dir: &Path, from: &str, to: &str) {
+    let path = job_dir.join("state.json");
+    let record = fs::read_to_string(&path).expect("read job");
+    assert_eq!(
+        record.matches(from).count(),
+        1,
+        "{from} must occur once in {record}"
+    );
+    fs::write(&path, record.replace(from, to)).expect("rewrite job");
+}
+
+/// A `respawnFlags` token serde_json refuses to convert (an out-of-range
+/// number, a lone surrogate escape) or a repeated `respawnFlags` key is one
+/// job's unreadable flags, never an unreadable store: the file beside that
+/// job's tree falls back to the tree rule, and a dead tree in an unrelated
+/// profile is still collected.
+#[test]
+fn gc_scopes_a_respawn_flags_token_serde_json_refuses_to_its_own_job() {
+    let shapes = [
+        (
+            "an out-of-range number element",
+            r#""respawnFlags":[1e400]"#,
+        ),
+        (
+            "an out-of-range --settings value",
+            r#""respawnFlags":["--settings",1e400]"#,
+        ),
+        ("an out-of-range number", r#""respawnFlags":1e400"#),
+        ("a lone surrogate element", r#""respawnFlags":["\ud800"]"#),
+        (
+            "a lone surrogate map-element key",
+            r#""respawnFlags":[{"\ud800":1}]"#,
+        ),
+        ("a repeated key", r#""respawnFlags":[],"respawnFlags":[]"#),
+    ];
+    for (shape, raw) in shapes {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".clauth").join("profiles");
+            let (tree, _) = dead_pair(&profiles, "sstoken", "runtime-5656-0", "5656-0");
+            let beside = spawn_settings_file(&tree, "5656-0");
+            fs::write(&beside, b"{}").expect("settings file beside the job's tree");
+            let job = write_claude_job_flags(
+                tmp.path(),
+                "dd4e5f6a",
+                &tree,
+                serde_json::json!("__flags__"),
+            );
+            rewrite_job_record(&job, r#""respawnFlags":"__flags__""#, raw);
+            let (unrelated, unrelated_sessions) =
+                dead_pair(&profiles, "sstokenother", "runtime-5757-0", "5757-0");
+
+            gc_stale_runtimes();
+
+            assert!(
+                !unrelated.exists() && !unrelated_sessions.exists(),
+                "a dead tree in an unrelated profile must still be collected ({shape}): the job store stays readable"
+            );
+            assert!(
+                beside.is_file(),
+                "{} must survive ({shape}): its tree's job has respawnFlags clauth cannot read",
+                beside.display()
+            );
+        });
+    }
+}
+
+/// A record whose `providerEnv` serde_json refuses still makes the store
+/// unreadable: clauth cannot tell which tree that job reads, so every tree is
+/// spared, a dead tree in an unrelated profile included.
+#[test]
+fn gc_keeps_every_tree_while_a_jobs_provider_env_cannot_be_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (tree, _) = dead_pair(&profiles, "ssenv", "runtime-5858-0", "5858-0");
+        let job = write_claude_job(tmp.path(), "dd4e5f6b", &tree);
+        rewrite_job_record(
+            &job,
+            r#"{"CLAUDE_CONFIG_DIR":"#,
+            r#"{"CLAUDE_CONFIG_DIR":1e400,"unread":"#,
+        );
+        let (unrelated, unrelated_sessions) =
+            dead_pair(&profiles, "ssenvother", "runtime-5959-0", "5959-0");
+
+        gc_stale_runtimes();
+
+        assert!(
+            unrelated.is_dir() && unrelated_sessions.is_dir(),
+            "a dead tree in an unrelated profile must be spared: a job whose providerEnv cannot be read may read any tree"
+        );
+    });
+}
+
+/// A `state` nested past serde_json's 128-level recursion limit reads as an
+/// unknown state (unfinished), never as an unreadable store: the job's own
+/// tree is spared, and a dead tree in an unrelated profile is still collected.
+#[test]
+fn gc_reads_a_deeply_nested_job_state_as_unknown_not_unreadable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (tree, _) = dead_pair(&profiles, "ssstate", "runtime-6060-0", "6060-0");
+        let job =
+            crate::testutil::write_claude_job_in(tmp.path(), "dd4e5f6c", &tree, "__state__", None);
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        rewrite_job_record(
+            &job,
+            r#""state":"__state__""#,
+            &format!(r#""state":{deep}"#),
+        );
+        let (unrelated, unrelated_sessions) =
+            dead_pair(&profiles, "ssstateother", "runtime-6161-0", "6161-0");
+
+        gc_stale_runtimes();
+
+        assert!(
+            !unrelated.exists() && !unrelated_sessions.exists(),
+            "a dead tree in an unrelated profile must still be collected: a 200-deep state must not make the store unreadable"
+        );
+        assert!(
+            tree.join(".claude.json").is_file(),
+            "the job's own tree stays: the job names it"
+        );
+    });
+}
+
+/// Teardown removes a session's settings file before it takes the state flock,
+/// so a wedged peer holding the flock past every retry still cannot strand it.
+#[test]
+fn teardown_removes_an_unnamed_spawn_settings_file_while_the_state_flock_is_wedged() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = configured_profile("sswedge");
+        crate::lock::set_state_lock_timeout_override(Some(Duration::from_millis(50)));
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let settings = write_spawn_settings(&rt);
+        let lock_path = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join(crate::lock::LOCK_FILENAME);
+        let holder = crate::profile::open_state_file(&lock_path).expect("open holder");
+        holder.lock().expect("hold the flock");
+        let timeouts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&timeouts);
+        set_teardown_timeout_hook(Some(Box::new(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })));
+
+        drop(rt);
+
+        assert!(
+            timeouts.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the flock must have been wedged through teardown"
+        );
+        assert!(
+            !settings.exists(),
+            "teardown must remove {} even though the flock never came free",
+            settings.display()
+        );
+
+        drop(holder);
+        set_teardown_timeout_hook(None);
+        crate::lock::set_state_lock_timeout_override(None);
     });
 }
 

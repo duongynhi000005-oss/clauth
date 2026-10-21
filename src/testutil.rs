@@ -2854,6 +2854,36 @@ pub(crate) fn write_claude_job_in(
     dir
 }
 
+/// [`write_claude_job`] with the record's `respawnFlags` set to `flags`. A
+/// clauth-launched job carries `["--system-prompt-file", <path>, "--settings",
+/// <spawn-settings file>]` there (captured 2026-10-20, 2.1.304); a test passes
+/// any JSON value to pose a retyped field.
+pub(crate) fn write_claude_job_flags(
+    home: &Path,
+    id: &str,
+    config_dir: &Path,
+    flags: serde_json::Value,
+) -> PathBuf {
+    let dir = write_claude_job(home, id, config_dir);
+    let path = dir.join("state.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read job")).expect("parse job");
+    record["respawnFlags"] = flags;
+    std::fs::write(&path, serde_json::to_vec(&record).expect("encode job")).expect("write job");
+    dir
+}
+
+/// The `respawnFlags` a `clauth start <p> -- --bg` job carries for `settings`,
+/// in the captured order.
+pub(crate) fn respawn_flags_naming(settings: &Path) -> serde_json::Value {
+    serde_json::json!([
+        "--system-prompt-file",
+        "/home/dev/.claude/system-prompt/cc-sys.md",
+        "--settings",
+        settings.to_string_lossy(),
+    ])
+}
+
 /// The `--seq` value of one recorded report line (the token after the flag).
 #[cfg(unix)]
 pub(crate) fn seq_of(line: &str) -> u64 {
