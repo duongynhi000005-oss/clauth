@@ -4063,6 +4063,13 @@ impl SelectionSlotKind {
             Self::Usage => Tab::Usage,
         }
     }
+
+    fn other(self) -> Self {
+        match self {
+            Self::Setup => Self::Usage,
+            Self::Usage => Self::Setup,
+        }
+    }
 }
 
 /// The Overview's visible harness filter; selection maps onto the rows it shows.
@@ -4147,9 +4154,10 @@ pub(crate) struct CodexRow {
     /// Banked usage-limit resets off the same cache, floored at one
     /// available: `None` (or zero) renders no chip on the row.
     pub(crate) resets: Option<i64>,
-    /// Epoch-ms stamp of the codex poll that wrote this row's windows, carried
-    /// unchanged from the codex usage cache's `fetched_at` (epoch ms). `None` =
-    /// the pane reads `not read yet`.
+    /// Epoch-ms stamp dating this row's windows: the codex usage cache's own
+    /// `fetched_at` (epoch ms) when it is not in the future, else the cache
+    /// file's mtime (a pre-`fetched_at` cache, or a stamp past the clock).
+    /// `None` = no readable cache, so the pane reads `not read yet`.
     pub(crate) fetched_at: Option<u64>,
 }
 
@@ -4188,7 +4196,7 @@ pub(crate) fn codex_rows() -> Vec<CodexRow> {
                     .as_ref()
                     .and_then(|u| u.codex_reset_credits)
                     .filter(|count| *count > 0),
-                fetched_at: cached.as_ref().and_then(|u| u.fetched_at),
+                fetched_at: crate::usage::usage_cache_clock_of(name, cached.as_ref()),
             }
         })
         .collect()
@@ -6996,9 +7004,10 @@ impl App {
     /// choice of a new row, so it replaces the slot's held-but-hidden identity
     /// (`remembered`) and drops a pending pool landing. A shared-claude-cursor
     /// move bumps the move count, which the restore gate in
-    /// [`App::rehome_selection`] reads — no explicit clear of the other slot is
-    /// needed. Setup's past-end (`+ new`) and Usage's past-end differ only in
-    /// where the shared cursor rests.
+    /// [`App::rehome_selection`] reads; the other slot's clear rides the user
+    /// step alone ([`App::step_selection`]), never this placement path, so a
+    /// rehome clears nothing. Setup's past-end (`+ new`) and Usage's past-end
+    /// differ only in where the shared cursor rests.
     fn place_selection(&mut self, kind: SelectionSlotKind, pos: usize) {
         self.selection_slot_mut(kind).clear();
         self.pending_pool_landing = None;
@@ -7035,8 +7044,25 @@ impl App {
         self.place_selection(SelectionSlotKind::Setup, pos);
     }
 
-    fn place_usage_selection(&mut self, pos: usize) {
-        self.place_selection(SelectionSlotKind::Usage, pos);
+    /// A user step (a ↑/↓ or page key, never a rehome) lands `kind`'s
+    /// selection on flat position `pos`. A step whose row actually changed ends
+    /// the other tab's held-but-hidden identity — the Overview's rule
+    /// ([`App::move_overview_cursor`]): any index change clears the hold, and
+    /// the shared claude cursor's move count cannot see all of them (a step off
+    /// a codex/pool row onto the claude row the cursor already holds moves no
+    /// count). The clear reaches Setup <-> Usage only; the Overview's own
+    /// `overview_remembered` is untouched. It rides only this user-move path,
+    /// so a rehome's own `place_selection` (a listing blip, no user move) never
+    /// ends the other tab's hold.
+    fn step_selection(&mut self, kind: SelectionSlotKind, pos: usize) {
+        let current = match kind {
+            SelectionSlotKind::Setup => self.setup_position(),
+            SelectionSlotKind::Usage => self.usage_position(),
+        };
+        self.place_selection(kind, pos);
+        if current != pos {
+            self.selection_slot_mut(kind.other()).clear();
+        }
     }
 
     /// The flat [`App::setup_items`] index `item` sits at (a claude row's is
@@ -8613,7 +8639,7 @@ fn step_usage_cursor(app: &mut App, delta: i32) {
         return;
     }
     let next = (app.usage_position() as i32 + delta).rem_euclid(items.len() as i32) as usize;
-    app.place_usage_selection(next);
+    app.step_selection(SelectionSlotKind::Usage, next);
 }
 
 /// Move Setup's selector by `delta`, wrapping over the item rows plus `+ new`.
@@ -8622,7 +8648,7 @@ fn step_setup_cursor(app: &mut App, delta: i32, len: usize) {
         return;
     }
     let next = (app.setup_position() as i32 + delta).rem_euclid(len as i32) as usize;
-    app.place_setup_selection(next);
+    app.step_selection(SelectionSlotKind::Setup, next);
 }
 
 /// One page = the current viewport minus one overlap line (minimum 1), so a
@@ -8856,12 +8882,12 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::PageUp => {
             let next = selector_page_up(app.usage_position(), &app.usage_selector);
-            app.place_usage_selection(next);
+            app.step_selection(SelectionSlotKind::Usage, next);
             app.usage_detail_scroll = 0;
         }
         KeyCode::PageDown => {
             let next = selector_page_down(app.usage_position(), &app.usage_selector);
-            app.place_usage_selection(next);
+            app.step_selection(SelectionSlotKind::Usage, next);
             app.usage_detail_scroll = 0;
         }
         KeyCode::Enter if count > 0 => {
@@ -18658,17 +18684,9 @@ fn provider_console_by_name(app: &App, name: &ProfileName) -> Option<&'static st
         .console_url()
 }
 
-/// Open the focused account's provider console in the default browser
-/// (detached), mirroring [`open_incident_link`].
-fn open_provider_console(app: &mut App) {
-    let Some(name) = app.profile_name_at(app.profile_cursor.read()) else {
-        app.toast(ToastKind::Info, "no console page for this endpoint");
-        return;
-    };
-    open_console_account(app, &name);
-}
-
-/// [`open_provider_console`] for a named account.
+/// Open the named account's provider console in the default browser
+/// (detached), mirroring [`open_incident_link`]. The menu's per-row pick
+/// resolves its stored claude identity through this.
 fn open_console_account(app: &mut App, name: &ProfileName) {
     let Some(url) = provider_console_by_name(app, name) else {
         app.toast(ToastKind::Info, "no console page for this endpoint");
@@ -18833,8 +18851,8 @@ fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
 }
 
 /// Queue a usage refetch for the named account, or toast why not. One shape
-/// for every entry point (Usage `r`, the action menu's refresh entry, and the
-/// menu's identity-resolved pick): the OAuth arm and the third-party-cache arm
+/// for every entry point (Usage `r` and the menu's identity-resolved pick):
+/// the OAuth arm and the third-party-cache arm
 /// both queue [`App::manual_refresh_one`] — the same refetch the cadence legs
 /// would run — and only an endpoint-only account with no credential either leg
 /// can use falls through to the nothing-to-refresh toast.
@@ -18903,7 +18921,7 @@ fn refresh_usage_identity(app: &mut App, identity: Option<RowIdentity>) {
 }
 
 /// The `rotate access token` action on the named account — the shared body
-/// behind both the cursor-resolving dispatcher and the menu's identity pick.
+/// the menu's identity pick resolves into.
 fn rotate_account(app: &mut App, name: &ProfileName) {
     match account_by_name(app, name) {
         // macOS refuses this rotation (`runtime::rotation_blocked_for`), so
@@ -18942,8 +18960,7 @@ fn rotate_tokens_identity(app: &mut App, identity: Option<RowIdentity>) {
 }
 
 /// The menu's disable/enable pick: flip the stored claude row (the current
-/// state decides the direction, the same flip the cursor-resolving dispatcher
-/// runs), or toast that the account left the roster.
+/// state decides the direction), or toast that the account left the roster.
 fn toggle_disabled_identity(app: &mut App, identity: Option<RowIdentity>) {
     let Some(name) = claude_name_at_pick(app, identity) else {
         return;
@@ -18980,22 +18997,22 @@ fn save_preset_identity(app: &mut App, identity: Option<RowIdentity>) {
 /// the draft through the cursor path, and a gone account toasts.
 fn apply_preset_identity(app: &mut App, identity: Option<RowIdentity>) {
     match identity {
-        Some(RowIdentity::Profile(name)) if account_by_name(app, &name).is_some() => {
-            apply_preset_account(app, &name);
+        None => open_preset_picker(app),
+        Some(_) => {
+            if let Some(name) = claude_name_at_pick(app, identity) {
+                apply_preset_account(app, &name);
+            }
         }
-        Some(RowIdentity::Profile(_)) => {
-            app.toast(ToastKind::Info, CLAUDE_ROW_GONE);
-        }
-        Some(RowIdentity::Pool(_)) | None => open_preset_picker(app),
     }
 }
 
-/// Dispatch a menu pick: every per-row action resolves the row identity the
+/// Dispatch a menu pick. Every per-row action resolves the row identity the
 /// menu was built for (never the cursor re-read at pick time, which a roster or
 /// listing change between open and pick could have moved onto a neighbour);
-/// only the tab-global actions run through [`dispatch_action_menu_action`].
+/// the tab-global actions ignore the row identity and run their handlers.
 fn dispatch_menu_pick(app: &mut App, action: ActionMenuAction, row_identity: Option<RowIdentity>) {
     match action {
+        // Per-row actions: the identity the menu stored.
         ActionMenuAction::RefreshPoolAccount => start_pool_refresh_identity(app, row_identity),
         ActionMenuAction::RemovePoolAccount => open_pool_remove_confirm_identity(app, row_identity),
         ActionMenuAction::RefreshUsage => refresh_usage_identity(app, row_identity),
@@ -19007,41 +19024,17 @@ fn dispatch_menu_pick(app: &mut App, action: ActionMenuAction, row_identity: Opt
         ActionMenuAction::Duplicate => duplicate_identity(app, row_identity),
         ActionMenuAction::SaveAsPreset => save_preset_identity(app, row_identity),
         ActionMenuAction::ApplyPreset => apply_preset_identity(app, row_identity),
-        other => dispatch_action_menu_action(app, other),
-    }
-}
-
-/// Dispatch a selected action menu item to its handler.
-fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
-    match action {
+        // Tab-global actions: no row identity.
         ActionMenuAction::NewAccount => start_new_account(app),
-        ActionMenuAction::RefreshUsage => queue_focused_usage_refresh(app),
-        ActionMenuAction::RotateTokens => {
-            let Some((name, _, _)) = focused_account(app) else {
-                return;
-            };
-            rotate_account(app, &name);
-        }
         ActionMenuAction::RefreshAll => {
             app.manual_refresh();
             app.toast(ToastKind::Info, "refreshing every account");
         }
-        ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
-            toggle_focused_account_disabled(app);
-        }
-        ActionMenuAction::OpenProviderConsole => open_provider_console(app),
         ActionMenuAction::StartDaemon => open_daemon_start_confirm(app),
         ActionMenuAction::StopDaemon => stop_daemon(app),
         ActionMenuAction::StartShunt | ActionMenuAction::StopShunt => {
             dispatch_shunt_verb(app, action);
         }
-        // The pool actions never dispatch here: they need the row identity the
-        // menu stored, which only [`dispatch_menu_pick`] carries. This arm
-        // exists to keep the match exhaustive.
-        ActionMenuAction::RefreshPoolAccount | ActionMenuAction::RemovePoolAccount => {}
-        ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
-        ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
-        ActionMenuAction::ApplyPreset => open_preset_picker(app),
         ActionMenuAction::RefreshStatus => trigger_status_refresh(app),
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
@@ -19370,11 +19363,11 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
             KeyCode::Down => step_setup_cursor(app, 1, sel_len),
             KeyCode::PageUp => {
                 let next = selector_page_up(app.setup_position(), &app.setup_selector);
-                app.place_setup_selection(next);
+                app.step_selection(SelectionSlotKind::Setup, next);
             }
             KeyCode::PageDown => {
                 let next = selector_page_down(app.setup_position(), &app.setup_selector);
-                app.place_setup_selection(next);
+                app.step_selection(SelectionSlotKind::Setup, next);
             }
             KeyCode::Enter => enter_config_detail(app),
             _ => {}
@@ -22472,22 +22465,12 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
     }
 }
 
-/// The action menu's `disable account` / `enable account` off the Setup pane,
-/// where there is no row to arm. Disabling routes through the confirm modal
-/// instead (the row's own arm-then-confirm, in the shape a modal can carry);
-/// enabling is harmless, so it fires straight away, exactly as the row does.
-///
-/// The two gates the row renders inert speak up here: a menu carries no dimmed
-/// item, so a silent no-op would read as a broken pick.
-fn toggle_focused_account_disabled(app: &mut App) {
-    let Some((name, _, _)) = focused_account(app) else {
-        return;
-    };
-    toggle_account_disabled(app, &name);
-}
-
-/// [`toggle_focused_account_disabled`] for a named account — the menu's
-/// disable/enable pick resolves its stored claude identity through this.
+/// Disable/enable the named account — the menu's per-row pick resolves its
+/// stored claude identity through this. Disabling routes through the confirm
+/// modal instead of flipping on one press (the row's own arm-then-confirm, in
+/// the shape a modal can carry); enabling is harmless, so it fires straight
+/// away. The two gates the row renders inert speak up here: a menu carries no
+/// dimmed item, so a silent no-op would read as a broken pick.
 fn toggle_account_disabled(app: &mut App, name: &ProfileName) {
     if app.config().is_active(name) {
         app.toast(
@@ -22518,16 +22501,8 @@ fn toggle_account_disabled(app: &mut App, name: &ProfileName) {
 
 // ── Setup menu: duplicate + presets ───────────────────────────────────────────
 
-/// `duplicate account`: ask for the new name. The copy itself runs on ⏎, so
-/// esc costs nothing.
-fn prompt_duplicate_profile(app: &mut App) {
-    let Some((name, _, _)) = focused_account(app) else {
-        return;
-    };
-    duplicate_account(app, &name);
-}
-
-/// [`prompt_duplicate_profile`] for a named account.
+/// Ask for the duplicate's new name. The copy itself runs on ⏎, so esc costs
+/// nothing.
 fn duplicate_account(app: &mut App, name: &ProfileName) {
     app.open_modal(Modal::NamePrompt(NamePromptForm {
         input: InputState::new(""),
@@ -22543,15 +22518,7 @@ fn toast_builtin_preset(app: &mut App, name: &str) {
     );
 }
 
-/// `save as preset`: ask for the preset name.
-fn prompt_save_preset(app: &mut App) {
-    let Some((name, _, _)) = focused_account(app) else {
-        return;
-    };
-    save_preset_account(app, &name);
-}
-
-/// [`prompt_save_preset`] for a named account.
+/// Ask for the preset name.
 fn save_preset_account(app: &mut App, name: &ProfileName) {
     app.open_modal(Modal::NamePrompt(NamePromptForm {
         input: InputState::new(""),

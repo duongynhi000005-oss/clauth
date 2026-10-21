@@ -3097,16 +3097,26 @@ pub(crate) fn clear_codex_compare_hooks_for_test() {
         .clear();
 }
 
-/// The OAuth seed's clock: the body's own `fetched_at` stamp, which only a live
-/// fetch writes (`apply_outcome`), falling back to the cache mtime when the body
-/// is undatable (a plan-only cold fill, a pre-`fetched_at` cache). The future
-/// arm maps to the mtime too: a stamp in the future proves the clock moved, not
-/// that the read is fresh, and the mtime is the honest remaining clock.
-fn oauth_seed_clock(name: &ProfileName) -> Option<u64> {
-    load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
-        .and_then(|u| u.fetched_at)
+/// The clock dating a usage cache body: the body's own `fetched_at` stamp,
+/// which only a live fetch writes (`apply_outcome`), falling back to the cache
+/// mtime when the body is undatable (a plan-only cold fill, a pre-`fetched_at`
+/// cache). The future arm maps to the mtime too: a stamp in the future proves
+/// the clock moved, not that the read is fresh, and the mtime is the honest
+/// remaining clock. A missing body (no cache, or one that does not parse)
+/// dates nothing. Shared by the startup seeds and the codex row list, so the
+/// rule lives once.
+pub(crate) fn usage_cache_clock_of(name: &ProfileName, body: Option<&UsageInfo>) -> Option<u64> {
+    let body = body?;
+    body.fetched_at
         .filter(|at| *at <= crate::usage::now_ms())
         .or_else(|| profile_cache_mtime_ms(name, USAGE_CACHE_FILE))
+}
+
+/// [`usage_cache_clock_of`] over the cache file: the loader wrapper the startup
+/// seeds pass to [`load_cache_seed`].
+pub(crate) fn usage_cache_clock(name: &ProfileName) -> Option<u64> {
+    let body = load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE);
+    usage_cache_clock_of(name, body.as_ref())
 }
 
 /// Seed `name` from its on-disk cache whenever one exists, returning `true`. The
@@ -3186,7 +3196,7 @@ pub(crate) fn try_seed_cache(
 ) -> bool {
     let epoch = crate::usage::epoch_value(name, crate::usage::Half::OAuth);
     let Some((info, clock, fetch_status)) =
-        load_cache_seed(name, interval_ms, now, oauth_seed_clock, |n| {
+        load_cache_seed(name, interval_ms, now, usage_cache_clock, |n| {
             load_profile_cache::<UsageInfo>(n, USAGE_CACHE_FILE)
         })
     else {
@@ -3322,7 +3332,7 @@ pub(crate) fn seed_codex_name(
 ) {
     let epoch = crate::usage::epoch_value(name, crate::usage::Half::Codex);
     let Some((info, _clock, fetch_status)) =
-        load_cache_seed(name, interval_ms, now, oauth_seed_clock, |n| {
+        load_cache_seed(name, interval_ms, now, usage_cache_clock, |n| {
             load_profile_cache::<UsageInfo>(n, USAGE_CACHE_FILE)
         })
     else {

@@ -2664,6 +2664,25 @@ fn app_with(profiles: Vec<crate::profile::Profile>) -> App {
     })
 }
 
+/// The hotkey `label`'s entry carries on the menu the fixture's state builds.
+fn menu_hotkey(app: &App, label: &str) -> char {
+    super::build_action_menu(app)
+        .items
+        .iter()
+        .find(|i| i.label == label)
+        .and_then(|i| i.hotkey)
+        .unwrap_or_else(|| panic!("the menu offers {label:?} with a hotkey"))
+}
+
+/// Drive a per-row `a`-menu pick through the production keys: read `label`'s
+/// hotkey off the menu the fixture's state builds, press `a` to open the menu,
+/// then the hotkey to fire it. The same seam the frozen `t6_pick_on_b` pins.
+fn pick_menu_entry(app: &mut App, label: &str) {
+    let hotkey = menu_hotkey(app, label);
+    super::handle_key(app, key(KeyCode::Char('a')));
+    super::handle_key(app, key(KeyCode::Char(hotkey)));
+}
+
 /// The Setup frame reads the job-store SNAPSHOT, never the store itself: a full
 /// draw must not walk `~/.claude/jobs` (that walk is per-tick, in
 /// `poll_live_sessions`).
@@ -6438,12 +6457,12 @@ fn daemon_control_outcomes_toast_and_rearm_the_verb() {
 /// spawn: `start` reads the held singleton, says so, and re-probes the chip.
 #[test]
 fn the_daemon_start_confirm_spawns_nothing_once_a_daemon_runs() {
-    use super::{ActionMenuAction, ConfirmAction, ToastKind, dispatch_action_menu_action};
+    use super::{ActionMenuAction, ConfirmAction, ToastKind, dispatch_menu_pick};
     use crate::daemon::DaemonHealth;
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::StartDaemon);
+    dispatch_menu_pick(&mut app, ActionMenuAction::StartDaemon, None);
     assert!(matches!(
         app.modals.last(),
         Some(super::Modal::Confirm(state)) if matches!(state.on_confirm, ConfirmAction::StartDaemon)
@@ -6504,12 +6523,12 @@ fn the_daemon_start_confirm_refuses_an_unreadable_lock() {
 /// the sandbox.
 #[test]
 fn the_daemon_verbs_reach_their_workers() {
-    use super::{ActionMenuAction, ConfirmAction, dispatch_action_menu_action, join_test_workers};
+    use super::{ActionMenuAction, ConfirmAction, dispatch_menu_pick, join_test_workers};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
 
     // `start daemon` opens the shared confirm now; its `start` runs the start.
-    dispatch_action_menu_action(&mut app, ActionMenuAction::StartDaemon);
+    dispatch_menu_pick(&mut app, ActionMenuAction::StartDaemon, None);
     let Some(super::Modal::Confirm(state)) = app.modals.last() else {
         panic!("start daemon must open the confirm, got {:?}", app.modals);
     };
@@ -6529,7 +6548,7 @@ fn the_daemon_verbs_reach_their_workers() {
         "a refused start leaves the verb armed"
     );
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::StopDaemon);
+    dispatch_menu_pick(&mut app, ActionMenuAction::StopDaemon, None);
     assert!(
         app.daemon_control_busy,
         "the stop holds the verb back while it runs"
@@ -6760,8 +6779,7 @@ fn caret_row(app: &App) -> String {
 #[test]
 fn start_shunt_on_an_absent_gateway_jumps_to_the_adopt_line() {
     use super::{
-        ActionMenuAction, ServicesFocus, ShuntFocusLine, StandaloneShunt, Tab,
-        dispatch_action_menu_action,
+        ActionMenuAction, ServicesFocus, ShuntFocusLine, StandaloneShunt, Tab, dispatch_menu_pick,
     };
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
@@ -6772,7 +6790,7 @@ fn start_shunt_on_an_absent_gateway_jumps_to_the_adopt_line() {
         unread_env: false,
         answer: None,
     });
-    dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
+    dispatch_menu_pick(&mut app, ActionMenuAction::StartShunt, None);
 
     assert_eq!(app.tab, Tab::Services, "lands on the Services tab");
     let shunt_idx = app
@@ -6803,7 +6821,7 @@ fn start_shunt_on_an_absent_gateway_jumps_to_the_adopt_line() {
         unread_env: false,
         answer: None,
     });
-    dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
+    dispatch_menu_pick(&mut app, ActionMenuAction::StartShunt, None);
     assert_eq!(app.tab, Tab::Services);
     assert_eq!(app.services.focus, ServicesFocus::Detail, "still descended");
     assert_eq!(
@@ -6817,12 +6835,12 @@ fn start_shunt_on_an_absent_gateway_jumps_to_the_adopt_line() {
 /// and never flips the record.
 #[test]
 fn start_shunt_on_a_disabled_gateway_jumps_to_the_enabled_row_without_flipping_it() {
-    use super::{ActionMenuAction, ServicesFocus, ShuntFocusLine, dispatch_action_menu_action};
+    use super::{ActionMenuAction, ServicesFocus, ShuntFocusLine, dispatch_menu_pick};
     let home = crate::testutil::HomeSandbox::new();
     crate::testutil::write_adopted_record(&home, true, "[server]\n");
     let mut app = bare_app();
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
+    dispatch_menu_pick(&mut app, ActionMenuAction::StartShunt, None);
     assert_eq!(app.tab, super::Tab::Services);
     let shunt_idx = app
         .services
@@ -6856,15 +6874,13 @@ fn start_shunt_on_a_disabled_gateway_jumps_to_the_enabled_row_without_flipping_i
 /// and `start` reaches it (which a test build refuses, by name).
 #[test]
 fn a_no_daemon_start_shunt_opens_the_daemon_start_confirm() {
-    use super::{
-        ActionMenuAction, ConfirmAction, KeyCode, dispatch_action_menu_action, handle_confirm_key,
-    };
+    use super::{ActionMenuAction, ConfirmAction, KeyCode, dispatch_menu_pick, handle_confirm_key};
     const REFUSED: &str = "daemon start failed\na test build starts no daemon";
     let home = crate::testutil::HomeSandbox::new();
     crate::testutil::write_adopted_record(&home, false, "[server]\n");
     let mut app = bare_app();
     let open = |app: &mut App| {
-        dispatch_action_menu_action(app, ActionMenuAction::StartShunt);
+        dispatch_menu_pick(app, ActionMenuAction::StartShunt, None);
         let state = top_confirm(app);
         assert_eq!(
             (
@@ -6911,7 +6927,7 @@ fn a_no_daemon_start_shunt_opens_the_daemon_start_confirm() {
 /// reports `held`, `start shunt` removes it with no confirm.
 #[test]
 fn the_shunt_hold_verbs_write_and_remove_the_hold_through_the_menu() {
-    use super::{ActionMenuAction, ConfirmAction, KeyCode, ToastKind, dispatch_action_menu_action};
+    use super::{ActionMenuAction, ConfirmAction, KeyCode, ToastKind, dispatch_menu_pick};
     use crate::daemon::DaemonHealth;
     use crate::daemon::gateway::GatewayState as S;
     let home = crate::testutil::HomeSandbox::new();
@@ -6927,7 +6943,7 @@ fn the_shunt_hold_verbs_write_and_remove_the_hold_through_the_menu() {
     app.services.shunt_action.prober = Some(super::run_shunt_action);
     set_daemon(&mut app, DaemonHealth::Fresh);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::StopShunt);
+    dispatch_menu_pick(&mut app, ActionMenuAction::StopShunt, None);
     let state = top_confirm(&app);
     assert_eq!(state.message, "stop shunt?");
     assert!(matches!(state.on_confirm, ConfirmAction::StopShunt));
@@ -6961,7 +6977,7 @@ fn the_shunt_hold_verbs_write_and_remove_the_hold_through_the_menu() {
     );
 
     crate::testutil::write_daemon_gateway_slot(&home, S::Held);
-    dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
+    dispatch_menu_pick(&mut app, ActionMenuAction::StartShunt, None);
     assert!(app.modals.is_empty(), "a release opens no confirm");
     assert!(
         app.services.shunt_action.running,
@@ -6982,8 +6998,7 @@ fn the_shunt_hold_verbs_write_and_remove_the_hold_through_the_menu() {
 #[test]
 fn a_shunt_pick_acts_on_the_state_at_pick_time() {
     use super::{
-        ActionMenuAction, KeyCode, ServicesFocus, ShuntFocusLine, ToastKind,
-        dispatch_action_menu_action,
+        ActionMenuAction, KeyCode, ServicesFocus, ShuntFocusLine, ToastKind, dispatch_menu_pick,
     };
     use crate::daemon::DaemonHealth;
     use crate::daemon::gateway::GatewayState as S;
@@ -7003,7 +7018,7 @@ fn a_shunt_pick_acts_on_the_state_at_pick_time() {
 
         // `stop shunt` picked while the gateway went `stopping`: no verb now.
         crate::testutil::write_daemon_gateway_slot(&home, S::Stopping);
-        dispatch_action_menu_action(&mut app, ActionMenuAction::StopShunt);
+        dispatch_menu_pick(&mut app, ActionMenuAction::StopShunt, None);
         assert!(app.modals.is_empty(), "no confirm for a vanished verb");
         assert!(!app.services.shunt_action.running, "nothing runs");
         assert_eq!(last_toast(&app), changed_owned);
@@ -7012,14 +7027,14 @@ fn a_shunt_pick_acts_on_the_state_at_pick_time() {
         // verb is `stop shunt` now.
         crate::testutil::write_daemon_gateway_slot(&home, S::Healthy);
         app.toasts.clear();
-        dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
+        dispatch_menu_pick(&mut app, ActionMenuAction::StartShunt, None);
         assert!(app.modals.is_empty());
         assert!(!app.services.shunt_action.running, "nothing runs");
         assert_eq!(last_toast(&app), changed_owned);
 
         // The stop confirm's `stop` re-checks: the gateway went `stopping`
         // while it sat open.
-        dispatch_action_menu_action(&mut app, ActionMenuAction::StopShunt);
+        dispatch_menu_pick(&mut app, ActionMenuAction::StopShunt, None);
         assert_eq!(top_confirm(&app).message, "stop shunt?");
         crate::testutil::write_daemon_gateway_slot(&home, S::Stopping);
         app.toasts.clear();
@@ -7036,7 +7051,7 @@ fn a_shunt_pick_acts_on_the_state_at_pick_time() {
     set_daemon(&mut app, DaemonHealth::Absent);
     assert_eq!(app.gateway_state, S::Absent);
     crate::testutil::write_adopted_record(&home, true, "[server]\n");
-    dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
+    dispatch_menu_pick(&mut app, ActionMenuAction::StartShunt, None);
     assert_eq!(app.services.focus, ServicesFocus::Detail);
     assert_eq!(
         app.services.shunt_focus_kind(),
@@ -7494,7 +7509,7 @@ fn the_shunt_hold_toasts_follow_the_outcome() {
 /// toast.
 #[test]
 fn usage_refresh_queues_a_generic_api_key_account() {
-    use super::{ActionMenuAction, KeyCode, Tab, dispatch_action_menu_action, handle_key};
+    use super::{KeyCode, Tab, handle_key};
     use crate::profile::Profile;
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -7575,7 +7590,7 @@ fn usage_refresh_queues_a_generic_api_key_account() {
 
     // The menu entry rides the same gate.
     app.profile_cursor.set(2);
-    dispatch_action_menu_action(&mut app, ActionMenuAction::RefreshUsage);
+    pick_menu_entry(&mut app, "refresh usage");
     assert_eq!(last_toast(&app), "refreshing 'litellm'");
 }
 
@@ -7639,17 +7654,34 @@ fn the_provider_console_entry_follows_the_recognised_endpoints() {
 }
 
 /// The handler resolves the page itself instead of trusting that it was only
-/// offered where one exists, so a pick that somehow lands on an account with no
-/// console says so rather than opening a browser on nothing.
+/// offered where one exists, so a pick that lands on an account whose endpoint
+/// lost its page between open and pick says so rather than opening a browser on
+/// nothing.
 #[test]
 fn picking_the_console_entry_without_a_page_says_so_and_opens_nothing() {
-    use super::{ActionMenuAction, dispatch_action_menu_action};
+    use super::Tab;
     use crate::profile::Profile;
     let _home = crate::testutil::HomeSandbox::new();
 
-    let mut app = app_with(vec![Profile::new("oauth".to_string(), None, None)]);
+    let mut app = app_with(vec![Profile::new(
+        "qwen".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
+        Some("sk-sp-test".to_string()),
+    )]);
+    app.tab = Tab::Overview;
     app.profile_cursor.set(0);
-    dispatch_action_menu_action(&mut app, ActionMenuAction::OpenProviderConsole);
+    let hotkey = menu_hotkey(&app, "open provider console");
+    super::handle_key(&mut app, key(KeyCode::Char('a')));
+    {
+        // The endpoint loses its page after the menu was built for it.
+        let mut cfg = app.config();
+        cfg.profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == "qwen")
+            .expect("the qwen row")
+            .base_url = Some("https://nowhere.example/v1".to_string());
+    }
+    super::handle_key(&mut app, key(KeyCode::Char(hotkey)));
 
     let toast = app.toasts.back().expect("the pick answers");
     assert_eq!(toast.body, "no console page for this endpoint");
@@ -7660,10 +7692,7 @@ fn picking_the_console_entry_without_a_page_says_so_and_opens_nothing() {
 /// enabling stays immediate, exactly as the row behaves.
 #[test]
 fn disabling_from_an_account_tab_confirms_first_while_enabling_is_immediate() {
-    use super::{
-        ActionMenuAction, ConfirmAction, Modal, Tab, build_action_menu,
-        dispatch_action_menu_action, run_confirm_action,
-    };
+    use super::{ConfirmAction, Modal, Tab, build_action_menu, run_confirm_action};
     use crate::profile::Profile;
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -7673,7 +7702,7 @@ fn disabling_from_an_account_tab_confirms_first_while_enabling_is_immediate() {
     app.tab = Tab::Overview;
     app.profile_cursor.set(0);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::DisableProfile);
+    pick_menu_entry(&mut app, "disable account");
     assert!(
         !app.config()
             .find(&crate::profile::ProfileName::from("acct"))
@@ -7696,7 +7725,7 @@ fn disabling_from_an_account_tab_confirms_first_while_enabling_is_immediate() {
 
     // Re-enabling is harmless: the menu flips its label and fires on the pick.
     assert_eq!(build_action_menu(&app).items[2].label, "enable account");
-    dispatch_action_menu_action(&mut app, ActionMenuAction::EnableProfile);
+    pick_menu_entry(&mut app, "enable account");
     assert!(
         !app.config()
             .find(&crate::profile::ProfileName::from("acct"))
@@ -7711,7 +7740,7 @@ fn disabling_from_an_account_tab_confirms_first_while_enabling_is_immediate() {
 /// silently doing nothing.
 #[test]
 fn disabling_the_active_account_from_a_menu_says_why_instead_of_no_opping() {
-    use super::{ActionMenuAction, Tab, dispatch_action_menu_action};
+    use super::Tab;
     use crate::profile::{AppConfig, AppState, Profile};
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -7728,7 +7757,7 @@ fn disabling_the_active_account_from_a_menu_says_why_instead_of_no_opping() {
     app.tab = Tab::Overview;
     app.profile_cursor.set(0);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::DisableProfile);
+    pick_menu_entry(&mut app, "disable account");
     assert!(app.modals.is_empty(), "a gated pick arms no confirm");
     assert!(
         !app.config()
@@ -7796,7 +7825,7 @@ fn overview_switch_request_never_opens_a_confirm_for_a_disabled_account() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn rotate_tokens_with_live_session_arms_the_rotate_confirm() {
-    use super::{ActionMenuAction, ConfirmAction, Modal, dispatch_action_menu_action};
+    use super::{ConfirmAction, Modal};
     use crate::profile::Profile;
     let home = crate::testutil::HomeSandbox::new();
 
@@ -7804,7 +7833,7 @@ fn rotate_tokens_with_live_session_arms_the_rotate_confirm() {
     app.profile_cursor.set(0);
     let _pid_guard = crate::testutil::arm_live_session(home.home(), "busy");
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
+    pick_menu_entry(&mut app, "rotate access token");
     let confirm = app
         .modals
         .last()
@@ -7826,9 +7855,7 @@ fn rotate_tokens_with_live_session_arms_the_rotate_confirm() {
 #[cfg(target_os = "macos")]
 #[test]
 fn rotate_tokens_with_live_session_arms_an_acknowledge_notice_on_macos() {
-    use super::{
-        ActionMenuAction, ConfirmAction, Modal, dispatch_action_menu_action, run_confirm_action,
-    };
+    use super::{ConfirmAction, Modal, run_confirm_action};
     use crate::profile::Profile;
     let home = crate::testutil::HomeSandbox::new();
 
@@ -7836,7 +7863,7 @@ fn rotate_tokens_with_live_session_arms_an_acknowledge_notice_on_macos() {
     app.profile_cursor.set(0);
     let _pid_guard = crate::testutil::arm_live_session(home.home(), "busy");
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
+    pick_menu_entry(&mut app, "rotate access token");
     let confirm = app
         .modals
         .last()
@@ -7994,14 +8021,14 @@ fn the_live_session_rotate_refusal_names_the_keychain_mechanism() {
 /// per-profile `RotateOne`.
 #[test]
 fn rotate_tokens_without_live_session_arms_rotate_confirm() {
-    use super::{ActionMenuAction, ConfirmAction, Modal, dispatch_action_menu_action};
+    use super::{ConfirmAction, Modal};
     use crate::profile::Profile;
     let _home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("idle".to_string(), None, None)]);
     app.profile_cursor.set(0);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
+    pick_menu_entry(&mut app, "rotate access token");
     let confirm = app
         .modals
         .last()
@@ -13591,7 +13618,7 @@ fn models_detail_resets_scroll_when_period_or_filter_changes() {
 fn empty_model_list_returns_detail_focus_on_filter_period_and_load() {
     use super::{
         ActionMenuAction, StatusFocus, Tab, TokenFilter, TokenPeriod, TokenView,
-        dispatch_action_menu_action, drain_tokens_events, handle_key,
+        dispatch_menu_pick, drain_tokens_events, handle_key,
     };
     use crate::tokens::{ModelTokens, TokenStats, TokensEvent};
     use ratatui::crossterm::event::KeyCode;
@@ -13629,10 +13656,10 @@ fn empty_model_list_returns_detail_focus_on_filter_period_and_load() {
         );
         app.model_detail_scroll = 7;
         match producer {
-            "filter" => dispatch_action_menu_action(&mut app, ActionMenuAction::TokensShowOthers),
+            "filter" => dispatch_menu_pick(&mut app, ActionMenuAction::TokensShowOthers, None),
             "period key" => handle_key(&mut app, crate::testutil::key(KeyCode::Char('t'))),
             "period menu" => {
-                dispatch_action_menu_action(&mut app, ActionMenuAction::TokensPeriodWeekly)
+                dispatch_menu_pick(&mut app, ActionMenuAction::TokensPeriodWeekly, None)
             }
             "loaded" => {
                 tx.send(TokensEvent::Loaded(Box::<TokenStats>::default()))
@@ -13736,7 +13763,7 @@ fn calendar_rollover_reconciles_empty_model_detail_on_tick() {
 
 #[test]
 fn tokens_action_menu_sets_and_swaps_the_model_filter() {
-    use super::{ActionMenuAction, TokenFilter, build_action_menu, dispatch_action_menu_action};
+    use super::{ActionMenuAction, TokenFilter, build_action_menu, dispatch_menu_pick};
     use crate::tokens::{ModelTokens, TokenStats};
 
     let _home = crate::testutil::HomeSandbox::new();
@@ -13783,7 +13810,7 @@ fn tokens_action_menu_sets_and_swaps_the_model_filter() {
 
     // Narrow to claude models; the cursor re-clamps into the shorter list.
     app.token_model_cursor = 1;
-    dispatch_action_menu_action(&mut app, ActionMenuAction::TokensShowClaude);
+    dispatch_menu_pick(&mut app, ActionMenuAction::TokensShowClaude, None);
     assert_eq!(app.token_filter, TokenFilter::Claude);
     assert_eq!(super::token_model_count(&app), 1);
     assert_eq!(
@@ -16262,7 +16289,7 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
 /// model), not a saved profile — nothing hits disk until the create form fires.
 #[test]
 fn apply_preset_on_new_row_stamps_the_draft_buffers() {
-    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use super::{Tab, handle_key};
     use crate::profile::Profile;
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -16274,7 +16301,7 @@ fn apply_preset_on_new_row_stamps_the_draft_buffers() {
 
     // Open the picker (cursor 0 = DeepSeek built-in), press Enter to pick it.
     // No confirm fires: the draft has no saved fields to clobber.
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
 
     let draft = app.config_draft.as_ref().expect("draft still mounted");
@@ -16310,9 +16337,7 @@ fn apply_preset_on_new_row_stamps_the_draft_buffers() {
 /// the delete confirm naming the file's stem.
 #[test]
 fn a_saved_file_in_a_builtins_slot_applies_the_file_and_opens_its_delete_confirm() {
-    use super::{
-        ActionMenuAction, ConfirmAction, Modal, Tab, dispatch_action_menu_action, handle_key,
-    };
+    use super::{ConfirmAction, Modal, Tab, handle_key};
     use crate::profile::Profile;
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -16336,7 +16361,7 @@ fn a_saved_file_in_a_builtins_slot_applies_the_file_and_opens_its_delete_confirm
     app.tab = Tab::Setup;
     app.profile_cursor.set(0);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     for _ in 0..pick {
         handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     }
@@ -16360,7 +16385,7 @@ fn a_saved_file_in_a_builtins_slot_applies_the_file_and_opens_its_delete_confirm
     );
 
     // `d` on the same row opens the delete confirm naming the file's stem.
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     for _ in 0..pick {
         handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     }
@@ -16380,7 +16405,7 @@ fn a_saved_file_in_a_builtins_slot_applies_the_file_and_opens_its_delete_confirm
 /// would resolve `load_preset("qwen")` to the built-in and report it unremovable.
 #[test]
 fn delete_confirm_on_a_vanished_saved_preset_reports_it_gone() {
-    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use super::{Modal, Tab, handle_key};
     use crate::profile::Profile;
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -16405,7 +16430,7 @@ fn delete_confirm_on_a_vanished_saved_preset_reports_it_gone() {
     app.tab = Tab::Setup;
     app.profile_cursor.set(0);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     for _ in 0..pick {
         handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     }
@@ -16449,7 +16474,7 @@ fn draft_buffers(app: &super::App) -> [String; 7] {
 /// A `+ new` draft with every buffer but opus typed, opened on `apply
 /// preset` → a custom preset that sets opus alone.
 fn typed_draft_on_custom_preset() -> super::App {
-    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use super::{Tab, handle_key};
     use crate::profile::{ModelSettings, Profile};
     use ratatui::crossterm::event::KeyCode;
 
@@ -16479,7 +16504,7 @@ fn typed_draft_on_custom_preset() -> super::App {
     draft.subagent_model = super::InputState::new("typed-subagent");
     app.config_draft = Some(draft);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     for _ in 0..pick {
         handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     }
@@ -16557,7 +16582,7 @@ fn apply_preset_on_new_row_clears_the_buffers_the_preset_leaves_unset() {
 /// A typed buffer the preset would overwrite asks first on `+ new` too.
 #[test]
 fn apply_preset_on_new_names_the_typed_buffers_it_replaces() {
-    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use super::{Modal, Tab, handle_key};
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -16568,7 +16593,7 @@ fn apply_preset_on_new_names_the_typed_buffers_it_replaces() {
     draft.opus_model = super::InputState::new("my-opus");
     app.config_draft = Some(draft);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // DeepSeek
     let Some(Modal::Confirm(state)) = app.modals.last() else {
         panic!("a replaced typed buffer raises the overwrite warning");
@@ -16666,7 +16691,7 @@ fn a_captured_login_on_another_endpoint_drops_the_typed_model_rows() {
 /// the new account, the same block applying it to a saved account writes.
 #[test]
 fn a_preset_stamped_on_new_reaches_the_created_account_whole() {
-    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use super::{Tab, handle_key};
     use crate::profile::{ModelSettings, ProfileName};
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -16683,7 +16708,7 @@ fn a_preset_stamped_on_new_reaches_the_created_account_whole() {
         .position(|&r| r == super::ConfigRow::Create)
         .expect("the form ends on create");
     // Cursor 0 = the DeepSeek built-in.
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(
         super::config_rows(&app).get(app.config_action_cursor),
@@ -16718,7 +16743,7 @@ fn a_preset_stamped_on_new_reaches_the_created_account_whole() {
 /// takes the stamp, and the saved account keeps its own.
 #[test]
 fn apply_preset_on_new_never_confirms_against_a_saved_namesake() {
-    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use super::{Modal, Tab, handle_key};
     use crate::profile::{Profile, ProfileName};
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -16737,7 +16762,7 @@ fn apply_preset_on_new_never_confirms_against_a_saved_namesake() {
     draft.name = super::InputState::new("acct");
     app.config_draft = Some(draft);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
 
     assert!(
@@ -16761,7 +16786,7 @@ fn apply_preset_on_new_never_confirms_against_a_saved_namesake() {
 /// would put two profiles in a slot only one may hold.
 #[test]
 fn duplicate_copies_the_settings_and_leaves_the_login_and_the_radios_behind() {
-    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use super::{Modal, Tab, handle_key};
     use crate::profile::{ClaudeCredentials, OAuthToken, Profile};
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -16796,7 +16821,7 @@ fn duplicate_copies_the_settings_and_leaves_the_login_and_the_radios_behind() {
     app.tab = Tab::Setup;
     app.profile_cursor.set(0);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::Duplicate);
+    pick_menu_entry(&mut app, "duplicate account");
     assert!(
         matches!(app.modals.last(), Some(Modal::NamePrompt(_))),
         "the copy waits on a name",
@@ -16840,7 +16865,7 @@ fn duplicate_copies_the_settings_and_leaves_the_login_and_the_radios_behind() {
 /// the create form uses, with the prompt left open so the name can be fixed.
 #[test]
 fn duplicate_refuses_a_name_already_on_the_roster() {
-    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use super::{Modal, Tab, handle_key};
     use crate::profile::Profile;
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -16859,7 +16884,7 @@ fn duplicate_refuses_a_name_already_on_the_roster() {
     app.tab = Tab::Setup;
     app.profile_cursor.set(0);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::Duplicate);
+    pick_menu_entry(&mut app, "duplicate account");
     for ch in "taken".chars() {
         handle_key(&mut app, crate::testutil::key(KeyCode::Char(ch)));
     }
@@ -16881,7 +16906,7 @@ fn duplicate_refuses_a_name_already_on_the_roster() {
 /// apply, so what lands is what the store holds.
 #[test]
 fn a_saved_preset_applies_onto_another_account() {
-    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use super::{Modal, Tab, handle_key};
     use crate::profile::Profile;
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -16904,7 +16929,7 @@ fn a_saved_preset_applies_onto_another_account() {
     app.tab = Tab::Setup;
     app.profile_cursor.set(0);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::SaveAsPreset);
+    pick_menu_entry(&mut app, "save as preset");
     for ch in "mine".chars() {
         handle_key(&mut app, crate::testutil::key(KeyCode::Char(ch)));
     }
@@ -16919,7 +16944,7 @@ fn a_saved_preset_applies_onto_another_account() {
     // Apply it onto the blank second account: nothing is set there, so no
     // warning stands between the pick and the write.
     app.profile_cursor.set(1);
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     let Some(Modal::PresetPicker(picker)) = app.modals.last() else {
         panic!("apply opens the picker");
     };
@@ -16958,7 +16983,7 @@ fn a_saved_preset_applies_onto_another_account() {
 /// A saved account carrying an endpoint, every model row and a subagent id,
 /// opened on `apply preset` → DeepSeek, which leaves `subagent` unset.
 fn preset_apply_target() -> super::App {
-    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use super::{Tab, handle_key};
     use crate::profile::Profile;
     use ratatui::crossterm::event::KeyCode;
 
@@ -16976,7 +17001,7 @@ fn preset_apply_target() -> super::App {
     let mut app = app_with(vec![target]);
     app.tab = Tab::Setup;
     app.profile_cursor.set(0);
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // cursor 0 = DeepSeek
     app
 }
@@ -17117,7 +17142,7 @@ fn the_keep_or_clear_buttons_shorten_on_a_narrow_terminal() {
 /// apply.
 #[test]
 fn a_new_account_stamp_stays_on_the_draft_when_the_roster_grows() {
-    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use super::{Tab, handle_key};
     use crate::profile::{Profile, ProfileName};
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -17128,7 +17153,7 @@ fn a_new_account_stamp_stays_on_the_draft_when_the_roster_grows() {
     let mut draft = super::build_draft_new();
     draft.name = super::InputState::new("late");
     app.config_draft = Some(draft);
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     app.config()
         .profiles
         .push(Profile::new("late".to_string(), None, None));
@@ -17207,9 +17232,7 @@ fn clear_them_writes_the_preset_and_clears_what_it_leaves_unset() {
 /// the two-button confirm, naming just the fields whose value changes.
 #[test]
 fn applying_over_set_fields_names_them_before_replacing_anything() {
-    use super::{
-        ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key, run_confirm_action,
-    };
+    use super::{Modal, Tab, handle_key, run_confirm_action};
     use crate::profile::Profile;
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -17226,7 +17249,7 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
     app.tab = Tab::Setup;
     app.profile_cursor.set(0);
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // cursor 0 = DeepSeek
 
     let Some(Modal::Confirm(state)) = app.modals.pop() else {
@@ -17255,10 +17278,7 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
 /// the row it was on.
 #[test]
 fn a_preset_applied_from_the_open_detail_pane_keeps_the_cursor_on_its_row() {
-    use super::{
-        ActionMenuAction, ConfigRow, Modal, Tab, config_rows, dispatch_action_menu_action,
-        handle_key, run_confirm_action,
-    };
+    use super::{ConfigRow, Modal, Tab, config_rows, handle_key, run_confirm_action};
     use crate::profile::Profile;
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -17277,7 +17297,7 @@ fn a_preset_applied_from_the_open_detail_pane_keeps_the_cursor_on_its_row() {
         .position(|r| *r == ConfigRow::Login)
         .expect("login row");
 
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // cursor 0 = DeepSeek
     let Some(Modal::Confirm(state)) = app.modals.pop() else {
         panic!("the set opus override raises the overwrite warning");
@@ -17297,9 +17317,7 @@ fn a_preset_applied_from_the_open_detail_pane_keeps_the_cursor_on_its_row() {
 /// a built-in's name is refused outright with the prompt still open.
 #[test]
 fn saving_a_preset_guards_both_an_existing_name_and_a_builtin() {
-    use super::{
-        ActionMenuAction, ConfirmAction, Modal, Tab, dispatch_action_menu_action, handle_key,
-    };
+    use super::{ConfirmAction, Modal, Tab, handle_key};
     use crate::profile::Profile;
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -17315,7 +17333,7 @@ fn saving_a_preset_guards_both_an_existing_name_and_a_builtin() {
     app.profile_cursor.set(0);
 
     let type_name = |app: &mut super::App, name: &str| {
-        dispatch_action_menu_action(app, ActionMenuAction::SaveAsPreset);
+        pick_menu_entry(app, "save as preset");
         for ch in name.chars() {
             handle_key(app, crate::testutil::key(KeyCode::Char(ch)));
         }
@@ -17353,9 +17371,7 @@ fn saving_a_preset_guards_both_an_existing_name_and_a_builtin() {
 /// custom preset pops the picker and raises the delete confirm.
 #[test]
 fn d_on_a_builtin_keeps_the_picker_on_a_custom_pops_it() {
-    use super::{
-        ActionMenuAction, ConfirmAction, Modal, Tab, dispatch_action_menu_action, handle_key,
-    };
+    use super::{ConfirmAction, Modal, Tab, handle_key};
     use crate::profile::{ModelSettings, Profile};
     use crate::testutil::key;
     use ratatui::crossterm::event::KeyCode;
@@ -17374,7 +17390,7 @@ fn d_on_a_builtin_keeps_the_picker_on_a_custom_pops_it() {
     app.profile_cursor.set(0);
 
     // Cursor 0 = DeepSeek built-in. `d` toasts and keeps the picker mounted.
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     handle_key(&mut app, key(KeyCode::Char('d')));
     assert!(
         matches!(app.modals.last(), Some(Modal::PresetPicker(_))),
@@ -17385,7 +17401,7 @@ fn d_on_a_builtin_keeps_the_picker_on_a_custom_pops_it() {
     // built-in table moves the cursor instead of silently retargeting this
     // assertion at a built-in.
     handle_key(&mut app, key(KeyCode::Esc));
-    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    pick_menu_entry(&mut app, "apply preset");
     let mine = crate::presets::list_presets()
         .iter()
         .position(|p| p.name == "mine")
@@ -21703,6 +21719,276 @@ fn an_overview_claude_pick_after_a_reload_acts_on_the_menus_row() {
         vec!["refreshing 'b'".to_string()],
         "the pick acts on b, the row the menu named"
     );
+}
+
+/// `held` hides `alpha` (the shown row is claude `a`); the user goes to
+/// `excursion`, where the listing returns, and steps `a` -> `alpha` -> `a`,
+/// which leaves the shared claude cursor's index and move count where they
+/// were; back on `held` the selection is what the user last chose, never the
+/// held row (review r4 J6: any step onto a codex/pool row ends the other
+/// tabs' held rows, the Overview's rule on every tab; cloudy, 2026-10-21).
+fn t6_excursion_then_return(held: Tab, excursion: Tab) -> super::SetupSelection {
+    let mut app = pool_rows_app();
+    super::switch_tab(&mut app, held);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let on_alpha = if held == Tab::Usage {
+        app.usage_pool_pair()
+    } else {
+        app.setup_pool_pair()
+    };
+    assert_eq!(on_alpha, Some((0, 0)), "sits on alpha");
+    let read = app.shunt_pool.clone();
+    app.shunt_pool = super::ShuntPool::NotRead("down".to_string());
+    if held == Tab::Usage {
+        app.rehome_usage_selection()
+    } else {
+        app.rehome_setup_selection()
+    }
+    let moves = app.profile_cursor.count();
+    super::switch_tab(&mut app, excursion);
+    app.shunt_pool = read;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let stepped_on = if excursion == Tab::Overview {
+        app.current_main_item()
+    } else if excursion == Tab::Usage {
+        match app.usage_selection() {
+            super::SetupSelection::Item(item) => Some(item),
+            super::SetupSelection::New => None,
+        }
+    } else {
+        match app.setup_selection() {
+            super::SetupSelection::Item(item) => Some(item),
+            super::SetupSelection::New => None,
+        }
+    };
+    assert_eq!(
+        stepped_on,
+        Some(super::MainItemKind::Shunt(0, 0)),
+        "the excursion stepped onto alpha on {excursion:?}"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(
+        (app.profile_cursor.read(), app.profile_cursor.count()),
+        (0, moves),
+        "the excursion left the shared claude cursor unmoved"
+    );
+    super::switch_tab(&mut app, held);
+    if held == Tab::Usage {
+        app.usage_selection()
+    } else {
+        app.setup_selection()
+    }
+}
+
+#[test]
+fn a_setup_pool_excursion_ends_the_held_usage_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        t6_excursion_then_return(Tab::Usage, Tab::Setup),
+        super::SetupSelection::Item(super::MainItemKind::Profile(0)),
+        "a step onto a pool row on Setup ends Usage's held row"
+    );
+}
+
+#[test]
+fn a_usage_pool_excursion_ends_the_held_setup_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        t6_excursion_then_return(Tab::Setup, Tab::Usage),
+        super::SetupSelection::Item(super::MainItemKind::Profile(0)),
+        "a step onto a pool row on Usage ends Setup's held row"
+    );
+}
+
+#[test]
+fn an_overview_pool_excursion_ends_the_held_usage_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        t6_excursion_then_return(Tab::Usage, Tab::Overview),
+        super::SetupSelection::Item(super::MainItemKind::Profile(0)),
+        "a step onto a pool row on the Overview ends Usage's held row"
+    );
+}
+
+/// Claude rows `a`, `b` (a qwen api-key account, so the console entry is
+/// offered on it) and `c`; no account is active.
+fn t6_three_claude_app() -> App {
+    use crate::profile::Profile;
+    app_with(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        Profile::new(
+            "b".to_string(),
+            Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
+            Some("sk-sp-test".to_string()),
+        ),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("c")),
+    ])
+}
+
+/// What a per-row `a`-menu pick left behind: every toast as (kind, body) and
+/// the modal now on top, if any.
+#[derive(Debug, PartialEq)]
+enum T6PickOutcome {
+    Confirm(String),
+    NamePrompt(super::NamePromptAction),
+    PresetPicker(super::PresetTarget),
+    None,
+}
+
+/// Open `tab`'s menu on claude row `b`, drop `drop` from the roster while it
+/// is open (another clauth process deleted it), then pick `label` by its
+/// hotkey through the production keys.
+fn t6_pick_on_b(
+    tab: Tab,
+    label: &str,
+    drop: &str,
+) -> (Vec<(super::ToastKind, String)>, T6PickOutcome) {
+    use super::handle_key;
+    let mut app = t6_three_claude_app();
+    app.profile_cursor.set(1);
+    super::switch_tab(&mut app, tab);
+    let menu = super::build_action_menu(&app);
+    assert_eq!(menu.context.as_deref(), Some("b"), "the menu names b");
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|i| i.label == label)
+        .and_then(|i| i.hotkey)
+        .unwrap_or_else(|| panic!("{tab:?}'s menu offers {label:?} with a hotkey"));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    {
+        let mut cfg = app.config();
+        let gone = crate::profile::ProfileName::from(drop);
+        cfg.profiles.retain(|p| p.name != gone);
+        cfg.state.profiles.retain(|n| *n != gone);
+        cfg.state.fallback_chain.retain(|n| *n != gone);
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    let toasts = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.clone()))
+        .collect();
+    let outcome = match app.modals.last() {
+        Some(super::Modal::Confirm(s)) => T6PickOutcome::Confirm(s.message.clone()),
+        Some(super::Modal::NamePrompt(form)) => T6PickOutcome::NamePrompt(form.action.clone()),
+        Some(super::Modal::PresetPicker(form)) => T6PickOutcome::PresetPicker(form.target.clone()),
+        Some(other) => panic!("{label:?} opened an unexpected modal: {other:?}"),
+        None => T6PickOutcome::None,
+    };
+    (toasts, outcome)
+}
+
+/// The per-row claude actions each tab's menu offers on `b`.
+const T6_CLAUDE_PICKS: [(Tab, &str); 12] = [
+    (Tab::Overview, "refresh usage"),
+    (Tab::Overview, "rotate access token"),
+    (Tab::Overview, "disable account"),
+    (Tab::Overview, "open provider console"),
+    (Tab::Usage, "refresh usage"),
+    (Tab::Usage, "rotate access token"),
+    (Tab::Usage, "disable account"),
+    (Tab::Usage, "open provider console"),
+    (Tab::Setup, "duplicate account"),
+    (Tab::Setup, "save as preset"),
+    (Tab::Setup, "apply preset"),
+    (Tab::Setup, "open provider console"),
+];
+
+/// A pick whose own row left the roster while the menu was open acts on
+/// nothing and raises exactly one info toast, `that account is gone`, for every
+/// per-row claude action on every tab (review r4 J5: the gone arm was pinned by
+/// no test).
+#[test]
+fn a_claude_pick_on_a_deleted_row_acts_on_nothing_and_says_so() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (tab, label) in T6_CLAUDE_PICKS {
+        assert_eq!(
+            t6_pick_on_b(tab, label, "b"),
+            (
+                vec![(super::ToastKind::Info, "that account is gone".to_string())],
+                T6PickOutcome::None
+            ),
+            "{label:?} on {tab:?} after b was deleted"
+        );
+    }
+}
+
+/// A reload that drops `a` while the menu is open leaves the shared cursor's
+/// index on `c`; every per-row claude pick still acts on `b`, the row the menu
+/// named, through the production keys (review r4 J3: these picks were driven
+/// only through the dispatcher production never runs for them). The console
+/// pick is left out: it opens a browser on a page; its identity is pinned by
+/// the deleted-row test above.
+#[test]
+#[allow(clippy::type_complexity)]
+fn a_claude_pick_after_a_reload_acts_on_the_menus_row_for_every_action() {
+    use super::ToastKind::Info;
+    let _home = crate::testutil::HomeSandbox::new();
+    let none = Vec::new;
+    let cases: [(Tab, &str, Vec<(super::ToastKind, String)>, T6PickOutcome); 9] = [
+        (
+            Tab::Overview,
+            "refresh usage",
+            vec![(Info, "refreshing 'b'".to_string())],
+            T6PickOutcome::None,
+        ),
+        (
+            Tab::Overview,
+            "rotate access token",
+            vec![(Info, "'b' has no tokens to rotate".to_string())],
+            T6PickOutcome::None,
+        ),
+        (
+            Tab::Overview,
+            "disable account",
+            none(),
+            T6PickOutcome::Confirm("disable 'b'?".to_string()),
+        ),
+        (
+            Tab::Usage,
+            "refresh usage",
+            vec![(Info, "refreshing 'b'".to_string())],
+            T6PickOutcome::None,
+        ),
+        (
+            Tab::Usage,
+            "rotate access token",
+            vec![(Info, "'b' has no tokens to rotate".to_string())],
+            T6PickOutcome::None,
+        ),
+        (
+            Tab::Usage,
+            "disable account",
+            none(),
+            T6PickOutcome::Confirm("disable 'b'?".to_string()),
+        ),
+        (
+            Tab::Setup,
+            "duplicate account",
+            none(),
+            T6PickOutcome::NamePrompt(super::NamePromptAction::DuplicateProfile("b".to_string())),
+        ),
+        (
+            Tab::Setup,
+            "save as preset",
+            none(),
+            T6PickOutcome::NamePrompt(super::NamePromptAction::SavePreset("b".to_string())),
+        ),
+        (
+            Tab::Setup,
+            "apply preset",
+            none(),
+            T6PickOutcome::PresetPicker(super::PresetTarget::from("b")),
+        ),
+    ];
+    for (tab, label, toasts, outcome) in cases {
+        assert_eq!(
+            t6_pick_on_b(tab, label, "a"),
+            (toasts, outcome),
+            "{label:?} on {tab:?} after a was deleted"
+        );
+    }
 }
 
 /// With no claude profile the Usage fallback is the first band item, so the
@@ -44559,5 +44845,91 @@ fn the_out_of_view_poll_keeps_a_shunt_remove_refusal() {
     assert!(
         app.services.shunt_remove_refusal.borrow().is_some(),
         "the out-of-view poll keeps a shunt-remove refusal the in-view recompute would retire"
+    );
+}
+
+/// A Setup step off a pool row onto the claude row the shared cursor already
+/// holds moves no cursor count, yet it ends Usage's held row: Setup and Usage
+/// take the Overview's rule, which ends a hold on any index change
+/// (cloudy, 2026-10-21; T6 residue review R1).
+#[test]
+fn a_setup_step_off_a_pool_row_onto_the_cursors_claude_row_ends_the_held_usage_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    super::switch_tab(&mut app, Tab::Setup);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.setup_pool_pair(), Some((0, 0)), "Setup sits on alpha");
+    super::switch_tab(&mut app, Tab::Usage);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_pool_pair(), Some((0, 0)), "Usage sits on alpha");
+    let read = app.shunt_pool.clone();
+    app.shunt_pool = super::ShuntPool::NotRead("down".to_string());
+    app.rehome_usage_selection();
+    let moves = app.profile_cursor.count();
+    app.shunt_pool = read;
+    super::switch_tab(&mut app, Tab::Setup);
+    assert_eq!(
+        app.setup_pool_pair(),
+        Some((0, 0)),
+        "Setup still shows alpha"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(
+        app.setup_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Profile(0)),
+        "the step landed on a"
+    );
+    assert_eq!(
+        (app.profile_cursor.read(), app.profile_cursor.count()),
+        (0, moves),
+        "the step left the shared cursor unmoved"
+    );
+    super::switch_tab(&mut app, Tab::Usage);
+    assert_eq!(
+        app.usage_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Profile(0)),
+        "a step on Setup ends Usage's held row, as the same step on the Overview does"
+    );
+}
+
+/// Only a user step ends the other tab's hold: with no claude row the first
+/// row is codex, so Setup's own hide (a rehome placing on a codex row, no key
+/// pressed) must leave Usage's held pool row to return with the listing
+/// (T6 residue review R3).
+#[test]
+fn a_setup_rehome_onto_a_codex_first_row_keeps_the_held_usage_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    let mut app = app_with(Vec::new());
+    app.codex_rows = super::codex_rows();
+    app.shunt_pool = one_provider_pool(&["alpha", "beta"]);
+    let read = app.shunt_pool.clone();
+    super::switch_tab(&mut app, Tab::Setup);
+    for _ in 0..3 {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert_eq!(app.setup_pool_pair(), Some((0, 1)), "Setup sits on beta");
+    super::switch_tab(&mut app, Tab::Usage);
+    for _ in 0..2 {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert_eq!(app.usage_pool_pair(), Some((0, 1)), "Usage sits on beta");
+    app.shunt_pool = super::ShuntPool::NotRead("down".to_string());
+    app.rehome_usage_selection();
+    app.shunt_pool = read.clone();
+    super::switch_tab(&mut app, Tab::Setup);
+    assert_eq!(
+        app.setup_pool_pair(),
+        Some((0, 1)),
+        "Setup still shows beta"
+    );
+    app.shunt_pool = super::ShuntPool::NotRead("down".to_string());
+    app.rehome_setup_selection();
+    app.shunt_pool = read;
+    super::switch_tab(&mut app, Tab::Usage);
+    assert_eq!(
+        app.usage_selection(),
+        super::SetupSelection::Item(super::MainItemKind::Shunt(0, 1)),
+        "no user step happened, so Usage's held row returns"
     );
 }

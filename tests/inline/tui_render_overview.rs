@@ -3557,6 +3557,89 @@ fn codex_rows_read_the_roster_and_its_own_cache() {
     );
 }
 
+/// A codex cache written before `fetched_at` existed still dates its windows:
+/// the row's age falls back to the cache file's mtime, so the pane reads
+/// `◌ read <age> ago` over cached bars instead of `◌ not read yet` (T6 docs
+/// review F9). A stamped cache keeps its own stamp.
+#[test]
+fn codex_rows_date_an_unstamped_cache_by_its_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    let body = |used: u32| {
+        crate::usage::map_codex_usage(
+            &format!(
+                r#"{{"plan_type":"plus","rate_limit":{{"primary_window":{{"used_percent":{used},"limit_window_seconds":18000,"reset_after_seconds":600}}}}}}"#
+            ),
+            crate::usage::now_epoch_secs(),
+        )
+        .expect("maps")
+    };
+    let unstamped = body(42);
+    assert_eq!(unstamped.fetched_at, None, "the pre-T6 cache shape");
+    let cx1 = crate::profile::ProfileName::from("cx1");
+    crate::profile_cache::write_profile_cache(
+        &cx1,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &unstamped,
+    );
+    let mtime_ms: u64 = 1_760_000_000_000;
+    let path =
+        crate::profile_cache::profile_cache_path(&cx1, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("cache path");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms),
+    );
+    let stamp_ms: u64 = 1_750_000_000_000;
+    let mut stamped = body(7);
+    stamped.fetched_at = Some(stamp_ms);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cx2"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &stamped,
+    );
+
+    let rows = crate::tui::app::codex_rows();
+    assert_eq!(
+        rows.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
+        vec![Some(mtime_ms), Some(stamp_ms)],
+        "the unstamped cache reads its mtime; the stamped one its own stamp"
+    );
+}
+
+/// A codex cache stamped past the clock dates its windows by the file's mtime,
+/// the usage seeds' rule: a future stamp proves the clock moved, never that
+/// the read is fresh (T6 residue review R4).
+#[test]
+fn codex_rows_date_a_future_stamped_cache_by_its_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut info = crate::usage::map_codex_usage(
+        r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":600}}}"#,
+        crate::usage::now_epoch_secs(),
+    )
+    .expect("maps");
+    let day_ms: u64 = 86_400_000;
+    info.fetched_at = Some(crate::usage::now_ms() + day_ms);
+    let cx1 = crate::profile::ProfileName::from("cx1");
+    crate::profile_cache::write_profile_cache(&cx1, crate::profile_cache::USAGE_CACHE_FILE, &info);
+    let mtime_ms: u64 = 1_760_000_000_000;
+    let path =
+        crate::profile_cache::profile_cache_path(&cx1, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("cache path");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms),
+    );
+
+    let rows = crate::tui::app::codex_rows();
+    assert_eq!(
+        rows.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
+        vec![Some(mtime_ms)],
+        "a stamp past the clock reads the file's mtime"
+    );
+}
+
 /// The plan cell's fallback: a captured-but-never-polled account still shows
 /// its tier off the store's id_token `chatgpt_plan_type` claim, and the cached
 /// `wham/usage` plan wins the moment a poll has answered.
