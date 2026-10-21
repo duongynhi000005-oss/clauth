@@ -1805,14 +1805,15 @@ pub(crate) mod namespaced_keychain_ledger {
     }
 }
 
-/// Collect `spawn-settings[-isolated]-<sid>.json` files whose session died
-/// without teardown. The name carries the flavor, so liveness is the registry's
-/// own [`session_row_is_live`] over every marker layout (per-session and fake
-/// mode's bare `sessions/`): a held marker spares the file, an undecidable one
-/// reads as live, and a file with no marker at all is a crash leftover. A job
-/// whose `respawnFlags` name the file spares it; a job whose flags cannot be
-/// read spares the files beside its tree; nothing else is spared (the file can
-/// hold a folded user `env` token).
+/// Collect `spawn-settings[-isolated]-<sid>.json` files no live session and no
+/// job holds: a crash leftover, or a file a teardown kept for a job that is
+/// gone or while the job store could not be read. The name carries the
+/// flavor, so liveness is the registry's own [`session_row_is_live`] over
+/// every marker layout (per-session and fake mode's bare `sessions/`): a held
+/// marker spares the file, an undecidable one reads as live, and a file with
+/// no marker at all is a crash leftover. The job term is
+/// [`crate::claude_jobs::JobTrees::spares_settings`] over both layouts' trees;
+/// nothing else is spared (the file can hold a folded user `env` token).
 fn gc_spawn_settings_files() {
     gc_spawn_settings_files_synced(|| {});
 }
@@ -4912,8 +4913,8 @@ pub(crate) fn guard_home_project_settings(command: &mut std::process::Command, c
 /// ([`crate::cc_exempt::apply_spawn_settings`]). Lives BESIDE the runtime tree
 /// (the profile dir), not inside it, so the fake-mode mirror never publishes
 /// it into `~/.claude` and `settings_sync` (which reconciles only
-/// `settings.json`) never reads it. Unique per session id; kept while a job's
-/// `respawnFlags` name it or the job store cannot be read.
+/// `settings.json`) never reads it. Unique per session id; kept while
+/// [`crate::claude_jobs::JobTrees::spares_settings`] spares it.
 pub(crate) fn spawn_settings_file(config_dir: &Path, session_id: &str) -> PathBuf {
     // The name carries the session's flavor so GC can find its marker: an
     // isolated session's marker lives in `sessions-isolated-<sid>`, a shared

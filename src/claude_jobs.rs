@@ -63,9 +63,8 @@ struct JobState {
     /// decodes through [`read_respawn_flags`] to [`RespawnFlags::Named`] or
     /// [`RespawnFlags::Unknown`]; any other value, or a token serde_json
     /// refuses inside it, fails this parse and [`JobCore`] reads the flags
-    /// [`RespawnFlags::Unknown`]. Only a record that fails that parse too (a
-    /// syntax error, or a `providerEnv` or `state` token serde_json refuses)
-    /// flips the store `Unreadable`.
+    /// [`RespawnFlags::Unknown`]. Of the record's parse faults, only one that
+    /// fails that parse too flips the store `Unreadable`.
     #[serde(
         default,
         rename = "respawnFlags",
@@ -357,12 +356,10 @@ pub(crate) fn job_trees() -> JobTrees {
         };
         let state: JobState = match serde_json::from_slice(&record) {
             Ok(state) => state,
-            // A non-list `respawnFlags`, or a token serde_json rejects inside
-            // it (an out-of-range number, a lone surrogate, a repeated key),
-            // fails the derive parse; re-read the record without the field
-            // rather than spare every tree. A record that fails this too is
-            // torn or holds a `providerEnv` or `state` token serde_json
-            // refuses, and stays unreadable.
+            // A non-list `respawnFlags`, a repeated `respawnFlags` key, or a
+            // token serde_json refuses as one of its elements fails the derive
+            // parse; re-read the record without the field rather than spare
+            // every tree. A record that fails this too stays unreadable.
             Err(_) => match serde_json::from_slice::<JobCore>(&record) {
                 Ok(core) => JobState {
                     provider_env: core.provider_env,

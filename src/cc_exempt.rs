@@ -9,7 +9,8 @@
 //!
 //! Two repairs ride one per-spawn `--settings` FILE (never inline, so a user's
 //! settings — credentials included — stay off the child's argv), written into
-//! the runtime's profile dir and removed when the runtime drops:
+//! the runtime's profile dir and removed when the runtime drops unless
+//! [`crate::claude_jobs::JobTrees::spares_settings`] spares it:
 //! - `autoMemoryDirectory` pointed at the resolved memory dir, so both
 //!   spellings agree;
 //! - a `PreToolUse` `Read` hook that allows a read whose resolved path is this
