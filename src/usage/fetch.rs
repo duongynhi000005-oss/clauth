@@ -343,8 +343,9 @@ impl SpendInfo {
         }
     }
 
-    /// A spend bar is worth showing once the account has a cap enabled or a
-    /// limit set; disabled accounts (the current default) render nothing.
+    /// Whether the account carries a spend row at all: a bar while billing is
+    /// on, or the `billing off` note for a stale limit. A disabled account with
+    /// no limit renders nothing.
     pub(crate) fn is_visible(&self) -> bool {
         self.enabled || self.limit.is_some()
     }

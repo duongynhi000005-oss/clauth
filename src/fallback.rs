@@ -114,10 +114,11 @@ const SPEND_ARM_FRACTION: f64 = 0.90;
 /// pay-as-you-go.
 ///
 /// `enabled` is the honest field here, NOT [`crate::usage::SpendInfo::is_visible`]:
-/// that one answers "is a spend bar worth rendering" and is true for an account
-/// carrying a stale limit with billing switched OFF (observed live 2026-07-17).
-/// Arming on it would hop the chain into an account that refuses the request,
-/// with money attached.
+/// that one answers "does the account carry a spend row at all" (a bar while
+/// billing is on, a `billing off` note for a stale limit) and is true for an
+/// account carrying a stale limit with billing switched OFF (observed live
+/// 2026-07-17). Arming on it would hop the chain into an account that refuses
+/// the request, with money attached.
 ///
 /// The cap is whichever binds first — the account's own limit or the member's
 /// ceiling. An account with billing on but no declared limit is bounded by the

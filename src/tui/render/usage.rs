@@ -732,7 +732,10 @@ fn render_stat_block(stats: &[Stat], inner_w: u16) -> Vec<Line<'static>> {
 
 struct Stat {
     label: String,
-    pct: f64,
+    /// The `%` reading. `None` when the reply carried no `percent` /
+    /// `utilization`: the eyebrow renders `—` faint and the bar line draws no
+    /// track (figures only), so an unread figure never reads as `0%`.
+    pct: Option<f64>,
     color: Style,
     trailing: String,
     /// Absolute `used / total` shown on the eyebrow line immediately before the
@@ -747,6 +750,10 @@ struct Stat {
     /// Seconds until this window resets, for the burn-ETA color cue. `None` when
     /// the window carries no reset stamp (e.g. extra credits).
     reset_secs: Option<i64>,
+    /// A note-only row: `Some(text)` renders `label  text` faint, with no bar
+    /// and no `%`/`$` figures — the billing-off spend block, whose stale cap
+    /// must not read as live.
+    note: Option<&'static str>,
 }
 
 /// Seconds until the window hits 100% at the current burn rate.
@@ -773,7 +780,9 @@ impl Stat {
         };
         let mut w =
             " · ".chars().count() + format!("{:.1} %/{}", rate, self.rate_unit).chars().count();
-        if let Some(dur) = eta_left(rate, self.pct, self.rate_unit) {
+        if let Some(pct) = self.pct
+            && let Some(dur) = eta_left(rate, pct, self.rate_unit)
+        {
             w += " · ".chars().count() + dur.chars().count() + " left".chars().count();
         }
         w
@@ -790,10 +799,17 @@ impl Stat {
         max_rate_w: usize,
         max_amount_w: usize,
     ) -> Vec<Line<'static>> {
+        if let Some(note) = self.note {
+            return vec![Line::from(vec![
+                Span::styled(self.label.clone(), theme::faint()),
+                Span::styled(format!("  {note}"), theme::faint()),
+            ])];
+        }
+        let unread = self.pct.is_none();
         // Natural width — `header_pad` right-aligns the whole block to `pct_col`,
         // so the `%` lands in the same column every row without padding the
         // number. (A fixed `{:>3.0}` width added stray spaces after the amount.)
-        let pct_str = format_pct(self.pct);
+        let pct_str = self.pct.map_or_else(|| NO_DATA.to_string(), format_pct);
 
         // The amount sits in its own right-aligned column just left of the %,
         // with a 2-space gap when present.
@@ -808,22 +824,44 @@ impl Stat {
             .saturating_sub(amount_section_w)
             .saturating_sub(pct_str.chars().count());
 
-        let filled = (((self.pct / 100.0) * bar_width as f64).round() as usize).min(bar_width);
-        let marker = self.pace_pct.filter(|_| bar_width > 0).map(|p| {
+        let filled = self.pct.map_or(0, |p| {
+            (((p / 100.0) * bar_width as f64).round() as usize).min(bar_width)
+        });
+        let pct_style = if unread {
+            theme::faint()
+        } else {
+            self.color.add_modifier(Modifier::BOLD)
+        };
+        let marker = self.pace_pct.filter(|_| !unread && bar_width > 0).map(|p| {
             (((p.clamp(0.0, 100.0) / 100.0) * bar_width as f64).round() as usize).min(bar_width - 1)
         });
 
-        let mut bar_line = bar_spans(filled, bar_width, self.color, marker);
-        // Right-align trailing text to the same far column as %.
-        if !self.trailing.is_empty() {
-            let pad = pct_col
-                .saturating_sub(bar_width)
-                .saturating_sub(self.trailing.chars().count());
-            if pad > 0 {
-                bar_line.push(Span::raw(" ".repeat(pad)));
+        let bar_line = if unread {
+            // No track: keep the money figures right-aligned where the bar's
+            // trailing line would sit, with no `░`/`█`/pace marker.
+            let mut v = Vec::new();
+            if !self.trailing.is_empty() {
+                let pad = pct_col.saturating_sub(self.trailing.chars().count());
+                if pad > 0 {
+                    v.push(Span::raw(" ".repeat(pad)));
+                }
+                v.push(Span::styled(self.trailing.clone(), theme::faint()));
             }
-            bar_line.push(Span::styled(self.trailing.clone(), theme::faint()));
-        }
+            v
+        } else {
+            let mut v = bar_spans(filled, bar_width, self.color, marker);
+            // Right-align trailing text to the same far column as %.
+            if !self.trailing.is_empty() {
+                let pad = pct_col
+                    .saturating_sub(bar_width)
+                    .saturating_sub(self.trailing.chars().count());
+                if pad > 0 {
+                    v.push(Span::raw(" ".repeat(pad)));
+                }
+                v.push(Span::styled(self.trailing.clone(), theme::faint()));
+            }
+            v
+        };
 
         let mut label_spans = vec![Span::styled(self.label.clone(), theme::label())];
         if let Some(rate) = self.burn_rate
@@ -834,7 +872,9 @@ impl Stat {
             let rate_str = format!("{:.1} %/{}", rate, self.rate_unit);
             label_spans.push(Span::styled(rate_str.clone(), rate_color));
 
-            if let Some(eta_secs) = eta_left_secs(rate, self.pct, self.rate_unit) {
+            if let Some(pct) = self.pct
+                && let Some(eta_secs) = eta_left_secs(rate, pct, self.rate_unit)
+            {
                 let dur = crate::usage::humanize_duration(eta_secs);
                 // Warn when the window hits 100% before it resets: you run dry
                 // before the limit refreshes. Faint when the reset lands first.
@@ -874,10 +914,7 @@ impl Stat {
                     }
                     spans.push(Span::raw("  "));
                 }
-                spans.push(Span::styled(
-                    pct_str,
-                    self.color.add_modifier(Modifier::BOLD),
-                ));
+                spans.push(Span::styled(pct_str, pct_style));
                 spans
             }));
         } else {
@@ -900,10 +937,7 @@ impl Stat {
             } else {
                 dropped.push(Span::raw(" ".repeat(pct_col.saturating_sub(pct_cells))));
             }
-            dropped.push(Span::styled(
-                pct_str,
-                self.color.add_modifier(Modifier::BOLD),
-            ));
+            dropped.push(Span::styled(pct_str, pct_style));
             out.push(Line::from(dropped));
         }
         out.push(Line::from(bar_line));
@@ -984,7 +1018,7 @@ fn make_window_stat(
     };
     Stat {
         label: label.to_string(),
-        pct,
+        pct: Some(pct),
         color,
         trailing,
         amount,
@@ -992,6 +1026,7 @@ fn make_window_stat(
         rate_unit,
         pace_pct,
         reset_secs,
+        note: None,
     }
 }
 
@@ -1003,6 +1038,12 @@ fn fmt_window_dollars(d: &WindowDollars) -> String {
         (None, Some(l)) => format!("/ ${l:.2}"),
         (None, None) => String::new(),
     }
+}
+
+/// One credit figure (`$used` / `$limit`), `—` when the reply carried none —
+/// never a fabricated `$0.00` for an unread figure.
+fn fmt_credit_amt(sym: &str, v: Option<f64>) -> String {
+    v.map_or_else(|| NO_DATA.to_string(), |v| format!("{sym}{v:.2}"))
 }
 
 fn collect_stats(usage: &crate::usage::UsageInfo, reset_fmt: ResetFmt) -> Vec<Stat> {
@@ -1036,40 +1077,52 @@ fn collect_stats(usage: &crate::usage::UsageInfo, reset_fmt: ResetFmt) -> Vec<St
             },
         ));
     }
-    // `spend` is the newer, correctly-typed view of the same credit cap; when it
-    // renders, the legacy `extra_usage` bar would just duplicate it. Fall back to
-    // `extra` only for accounts that expose the legacy field but no `spend` block.
-    let spend_shown = usage.spend.as_ref().is_some_and(|s| s.is_visible());
+    // `spend` is the newer, correctly-typed view of the same credit cap; while
+    // its billing is ON, the legacy `extra_usage` bar would just duplicate it.
+    // Fall back to `extra` when spend billing is OFF — the stale-limit case,
+    // where the spend row is a billing-off note, not a bar.
+    let spend_billing_on = usage.spend.as_ref().is_some_and(|s| s.enabled);
     if let Some(extra) = &usage.extra_usage
         && extra.is_enabled
-        && !spend_shown
+        && !spend_billing_on
     {
-        let pct = extra.utilization.unwrap_or(0.0).clamp(0.0, 100.0);
+        let pct = extra.utilization.map(|v| v.clamp(0.0, 100.0));
         let sym = match extra.currency.as_deref() {
             Some("USD") | None => "$",
             Some(other) => other,
         };
         // Legacy `extra_usage` reports money as bare minor units (cents); `spend`
         // carries the same figures already scaled to dollars. Divide to match.
-        let used = extra.used_credits.unwrap_or(0.0) / 100.0;
-        let limit = extra.monthly_limit.unwrap_or(0.0) / 100.0;
+        let used = extra.used_credits.map(|v| v / 100.0);
+        let limit = extra.monthly_limit.map(|v| v / 100.0);
         stats.push(Stat {
             label: "extra".to_string(),
             pct,
-            color: Style::default().fg(theme::util_color(pct)),
+            color: pct.map_or(theme::faint(), |p| {
+                Style::default().fg(theme::util_color(p))
+            }),
             // Credits used/limit ride the bar's trailing line, where window bars
             // show their reset countdown, so the eyebrow carries just the %.
-            trailing: format!("{sym}{used:.2} / {sym}{limit:.2}"),
+            trailing: format!(
+                "{} / {}",
+                fmt_credit_amt(sym, used),
+                fmt_credit_amt(sym, limit)
+            ),
             amount: String::new(),
             burn_rate: None,
             rate_unit: "h",
             pace_pct: None,
             reset_secs: None,
+            note: None,
         });
     }
-    // Per-period extra-credit breakdowns (`daily`/`weekly`) — shape unconfirmed,
-    // absent on every current account; rendered only when a value is extractable.
-    if let Some(extra) = &usage.extra_usage {
+    // Per-period extra-credit breakdowns (`daily`/`weekly`) — shape
+    // unconfirmed, absent on every current account. Keyed on `extra.is_enabled`
+    // alone: a daily/weekly breakdown is a figure no other row shows, never a
+    // duplicate of the spend bar.
+    if let Some(extra) = &usage.extra_usage
+        && extra.is_enabled
+    {
         for (label, raw) in [
             ("extra usage (24h)", &extra.daily),
             ("extra usage (7d)", &extra.weekly),
@@ -1077,53 +1130,80 @@ fn collect_stats(usage: &crate::usage::UsageInfo, reset_fmt: ResetFmt) -> Vec<St
             let Some(period) = raw.as_ref().and_then(ExtraPeriod::from_value) else {
                 continue;
             };
-            let pct = period.utilization.unwrap_or(0.0).clamp(0.0, 100.0);
+            let pct = period.utilization.map(|v| v.clamp(0.0, 100.0));
             let sym = match period.currency.as_deref().or(extra.currency.as_deref()) {
                 Some("USD") | None => "$",
                 Some(other) => other,
             };
-            let cost = match (period.used_credits, period.monthly_limit) {
-                (Some(u), Some(l)) => format!("{sym}{u:.2} / {sym}{l:.2}"),
-                (Some(u), None) => format!("{sym}{u:.2}"),
-                _ => String::new(),
+            let cost = match period.monthly_limit {
+                Some(_) => format!(
+                    "{} / {}",
+                    fmt_credit_amt(sym, period.used_credits),
+                    fmt_credit_amt(sym, period.monthly_limit)
+                ),
+                None => fmt_credit_amt(sym, period.used_credits),
             };
             stats.push(Stat {
                 label: label.to_string(),
                 pct,
-                color: Style::default().fg(theme::util_color(pct)),
+                color: pct.map_or(theme::faint(), |p| {
+                    Style::default().fg(theme::util_color(p))
+                }),
                 trailing: cost,
                 amount: String::new(),
                 burn_rate: None,
                 rate_unit: "h",
                 pace_pct: None,
                 reset_secs: None,
+                note: None,
             });
         }
     }
-    if let Some(spend) = &usage.spend
-        && spend.is_visible()
-    {
-        let pct = spend.percent.unwrap_or(0.0).clamp(0.0, 100.0);
-        let sym = match spend.currency.as_deref() {
-            Some("USD") | None => "$",
-            Some(other) => other,
-        };
-        let used = spend.used.unwrap_or(0.0);
-        let cost = match spend.limit {
-            Some(limit) => format!("{sym}{used:.2} / {sym}{limit:.2}"),
-            None => format!("{sym}{used:.2}"),
-        };
-        stats.push(Stat {
-            label: "spend".to_string(),
-            pct,
-            color: Style::default().fg(theme::util_color(pct)),
-            trailing: cost,
-            amount: String::new(),
-            burn_rate: None,
-            rate_unit: "h",
-            pace_pct: None,
-            reset_secs: None,
-        });
+    if let Some(spend) = &usage.spend {
+        if spend.enabled {
+            let pct = spend.percent.map(|v| v.clamp(0.0, 100.0));
+            let sym = match spend.currency.as_deref() {
+                Some("USD") | None => "$",
+                Some(other) => other,
+            };
+            let cost = match spend.limit {
+                Some(_) => format!(
+                    "{} / {}",
+                    fmt_credit_amt(sym, spend.used),
+                    fmt_credit_amt(sym, spend.limit)
+                ),
+                None => fmt_credit_amt(sym, spend.used),
+            };
+            stats.push(Stat {
+                label: "spend".to_string(),
+                pct,
+                color: pct.map_or(theme::faint(), |p| {
+                    Style::default().fg(theme::util_color(p))
+                }),
+                trailing: cost,
+                amount: String::new(),
+                burn_rate: None,
+                rate_unit: "h",
+                pace_pct: None,
+                reset_secs: None,
+                note: None,
+            });
+        } else if spend.is_visible() {
+            // Billing is off but the wire left a stale cap behind; render only a
+            // faint note so the stale figures never read as a live bar.
+            stats.push(Stat {
+                label: "spend".to_string(),
+                pct: None,
+                color: theme::faint(),
+                trailing: String::new(),
+                amount: String::new(),
+                burn_rate: None,
+                rate_unit: "h",
+                pace_pct: None,
+                reset_secs: None,
+                note: Some("billing off"),
+            });
+        }
     }
     stats
 }

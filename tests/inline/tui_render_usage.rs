@@ -31,7 +31,7 @@ fn snap_with_stale(mut s: ReadingsSnapshot, name: &str) -> ReadingsSnapshot {
 fn usage_stat_prints_a_rounded_percentage_without_changing_its_measurement() {
     let stat = Stat {
         label: "5h".to_string(),
-        pct: 1.0000000000000009,
+        pct: Some(1.0000000000000009),
         amount: String::new(),
         color: theme::body(),
         burn_rate: None,
@@ -39,13 +39,14 @@ fn usage_stat_prints_a_rounded_percentage_without_changing_its_measurement() {
         pace_pct: None,
         reset_secs: None,
         trailing: String::new(),
+        note: None,
     };
     let lines = stat.render(6, 20, 0, 0);
     assert_eq!(
         lines[0].spans.last().map(|s| s.content.as_ref()),
         Some("1%")
     );
-    assert_eq!(stat.pct, 1.0000000000000009);
+    assert_eq!(stat.pct, Some(1.0000000000000009));
 }
 
 /// `bar_spans` overlays the `│` pace marker at its cell without ever changing
@@ -146,8 +147,8 @@ fn stats_from_bars_does_not_rename_duplicate_labels() {
     let stats = stats_from_bars(&bars, true, true, ResetFmt::default());
     assert_eq!(stats[0].label, "tokens limit");
     assert_eq!(stats[1].label, "tokens limit");
-    assert_eq!(stats[0].pct, 0.0);
-    assert_eq!(stats[1].pct, 12.0);
+    assert_eq!(stats[0].pct, Some(0.0));
+    assert_eq!(stats[1].pct, Some(12.0));
 }
 
 /// A bar whose label decodes to a window (`5h`/`7d`/`30d`) gets the OAuth window
@@ -2889,6 +2890,330 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
     assert!(bar.amount.is_empty());
 }
 
+fn credit_stats(
+    extra: Option<crate::usage::ExtraUsage>,
+    spend: Option<crate::usage::SpendInfo>,
+) -> Vec<Stat> {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "a",
+        crate::usage::UsageInfo {
+            plan: None,
+            five_hour: None,
+            seven_day: None,
+            monthly: None,
+            weekly_scoped: Vec::new(),
+            window_dollars: Vec::new(),
+            extra_usage: extra,
+            spend,
+            codex_limit_reached: None,
+            codex_reset_credits: None,
+            open_at: None,
+            fetched_at: None,
+        },
+    );
+    collect_stats(
+        readings.usage_of(&profile.name).expect("usage"),
+        ResetFmt::default(),
+    )
+}
+
+/// The billing-off shape observed live on 2026-07-17: a stale limit and spend
+/// left behind on an account whose billing is switched off. That cap binds
+/// nothing, so none of its figures may render as if it were live.
+fn billing_off_spend() -> crate::usage::SpendInfo {
+    crate::usage::SpendInfo {
+        enabled: false,
+        used: Some(31.07),
+        limit: Some(50.0),
+        percent: Some(62.0),
+        currency: Some("USD".to_string()),
+    }
+}
+
+#[test]
+fn a_billing_off_spend_block_shows_none_of_its_stale_figures() {
+    let stats = credit_stats(None, Some(billing_off_spend()));
+    for stat in &stats {
+        for text in [&stat.trailing, &stat.amount] {
+            assert!(
+                !text.contains("31.07") && !text.contains("50.00"),
+                "a billing-off cap's stale figures must not render: {:?} -> {text:?}",
+                stat.label
+            );
+        }
+    }
+    assert!(
+        !stats
+            .iter()
+            .any(|s| s.label == "spend" && s.pct.is_some_and(|p| p > 0.0)),
+        "a billing-off cap draws no filled bar"
+    );
+}
+
+#[test]
+fn a_billing_off_spend_block_leaves_the_live_legacy_extra_bar_up() {
+    let extra = crate::usage::ExtraUsage {
+        is_enabled: true,
+        monthly_limit: Some(5000.0),
+        used_credits: Some(487.0),
+        utilization: Some(9.74),
+        currency: Some("USD".to_string()),
+        ..Default::default()
+    };
+    let stats = credit_stats(Some(extra), Some(billing_off_spend()));
+    let bar = stats
+        .iter()
+        .find(|s| s.label == "extra")
+        .expect("the live extra bar renders while spend's billing is off");
+    assert_eq!(bar.trailing, "$4.87 / $50.00");
+}
+
+#[test]
+fn an_unread_spend_figure_renders_a_dash_never_zero() {
+    let spend = crate::usage::SpendInfo {
+        enabled: true,
+        used: None,
+        limit: Some(50.0),
+        percent: Some(10.0),
+        currency: Some("USD".to_string()),
+    };
+    let stats = credit_stats(None, Some(spend));
+    let bar = stats
+        .iter()
+        .find(|s| s.label == "spend")
+        .expect("spend renders");
+    assert_eq!(bar.trailing, "— / $50.00");
+}
+
+#[test]
+fn an_unread_legacy_extra_figure_renders_a_dash_never_zero() {
+    let extra = crate::usage::ExtraUsage {
+        is_enabled: true,
+        monthly_limit: None,
+        used_credits: Some(487.0),
+        utilization: Some(9.74),
+        currency: Some("USD".to_string()),
+        ..Default::default()
+    };
+    let stats = credit_stats(Some(extra), None);
+    let bar = stats
+        .iter()
+        .find(|s| s.label == "extra")
+        .expect("extra renders");
+    assert_eq!(bar.trailing, "$4.87 / —");
+}
+
+/// Render the usage pane (90×24) for one OAuth profile seeded with `u`, as
+/// plain per-row strings. The credit rows live in the right-hand detail pane.
+fn render_usage_rows(u: crate::usage::UsageInfo) -> Vec<String> {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("a")],
+            ..AppState::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&ProfileName::from("a"))],
+    });
+    app.profile_cursor.set(0);
+    let readings = snap_with_usage(ReadingsSnapshot::default(), "a", u);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// A spend block whose billing is off must not dress its stale cap as a live
+/// bar: exactly one `spend` note names the state, and no pane row carries a bar
+/// glyph or a dollar figure.
+#[test]
+fn a_billing_off_spend_block_renders_one_note_row_without_bar_or_figures() {
+    let rows = render_usage_rows(crate::usage::UsageInfo {
+        spend: Some(billing_off_spend()),
+        ..Default::default()
+    });
+    let note_rows: Vec<_> = rows.iter().filter(|r| r.contains("billing off")).collect();
+    assert_eq!(note_rows.len(), 1, "exactly one note row: {rows:?}");
+    // The whole note row: the label, the note, and nothing else — no bar, no
+    // stale figures, no `$`. Padded to the 90-cell pane.
+    let expected = format!(
+        "│ spend  billing off{}│",
+        " ".repeat(90 - "│ spend  billing off│".chars().count())
+    );
+    assert_eq!(note_rows[0], &expected, "the whole note row: {rows:?}");
+    assert!(
+        !rows.iter().any(|r| r.contains('█') || r.contains('░')),
+        "no bar glyph may render: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains('$')),
+        "no dollar figure: {rows:?}"
+    );
+}
+
+/// An unread `spend.percent` renders `—` faint where the `%` prints and no bar
+/// track (figures only) — never `0%`, never a `░`/`█` track.
+#[test]
+fn an_unread_spend_percent_renders_a_dash_and_no_track() {
+    let spend = crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(31.07),
+        limit: Some(50.0),
+        percent: None,
+        currency: Some("USD".to_string()),
+    };
+    let lines = render_stat_block(&credit_stats(None, Some(spend)), 36);
+    let text: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert_eq!(
+        text,
+        vec![
+            format!("spend{}—", " ".repeat(30)),
+            format!("{}{}", " ".repeat(21), "$31.07 / $50.00"),
+        ],
+        "the whole eyebrow and bar rows, figures only: {text:?}"
+    );
+}
+
+/// An unread `extra` or per-period utilization renders `—` and no track, the
+/// same as an unread spend percent — never `0%`, never a bar graphic.
+#[test]
+fn an_unread_extra_or_period_utilization_draws_a_dash_and_no_track() {
+    let extra = crate::usage::ExtraUsage {
+        is_enabled: true,
+        used_credits: Some(487.0),
+        monthly_limit: Some(5000.0),
+        utilization: None,
+        daily: Some(serde_json::json!({"used_credits": 200.0})),
+        ..Default::default()
+    };
+    let lines = render_stat_block(&credit_stats(Some(extra), None), 60);
+    let text: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    let eyebrows: Vec<&str> = text
+        .iter()
+        .filter(|l| l.contains("extra"))
+        .map(|l| l.as_str())
+        .collect();
+    assert_eq!(
+        eyebrows.len(),
+        2,
+        "the extra bar and the period row both render: {text:?}"
+    );
+    assert_eq!(
+        eyebrows,
+        vec![
+            format!("extra{}—", " ".repeat(54)),
+            format!("extra usage (24h){}—", " ".repeat(42)),
+        ],
+        "each unread utilization renders — where the % prints: {text:?}"
+    );
+    assert!(
+        !text.iter().any(|l| l.contains('░') || l.contains('█')),
+        "an unread utilization draws no track: {text:?}"
+    );
+}
+
+/// A billing-on spend whose money objects are both unread renders `—` for the
+/// figures — never an empty trailing, never `$0.00`.
+#[test]
+fn a_spend_with_both_amounts_unread_renders_a_dash() {
+    let spend = crate::usage::SpendInfo {
+        enabled: true,
+        used: None,
+        limit: None,
+        percent: Some(40.0),
+        currency: Some("USD".to_string()),
+    };
+    let stats = credit_stats(None, Some(spend));
+    let bar = stats.iter().find(|s| s.label == "spend").expect("spend");
+    assert_eq!(bar.trailing, "—");
+}
+
+/// A per-period row with a read `monthly_limit` and unread `used_credits`
+/// renders `— / $limit` — the read limit is kept, the unread used is marked.
+#[test]
+fn a_period_with_read_limit_and_unread_used_renders_a_dash() {
+    let extra = crate::usage::ExtraUsage {
+        is_enabled: true,
+        used_credits: Some(487.0),
+        monthly_limit: Some(5000.0),
+        utilization: Some(9.74),
+        daily: Some(serde_json::json!({"utilization": 5.0, "monthly_limit": 100.0})),
+        ..Default::default()
+    };
+    let stats = credit_stats(Some(extra), None);
+    let period = stats
+        .iter()
+        .find(|s| s.label == "extra usage (24h)")
+        .expect("period renders");
+    assert_eq!(period.trailing, "— / $100.00");
+}
+
+/// Per-period rows key on `extra.is_enabled` alone, never on spend billing: a
+/// disabled extra block hides them, but a billing-on or billing-off spend both
+/// keep them — only the legacy `extra` bar dedups against a billing-on spend.
+#[test]
+fn period_rows_gate_on_extra_enabled_alone() {
+    let enabled = || crate::usage::ExtraUsage {
+        is_enabled: true,
+        daily: Some(serde_json::json!({"utilization": 5.0, "used_credits": 200.0})),
+        ..Default::default()
+    };
+    let spend = || crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(1.0),
+        limit: Some(50.0),
+        percent: Some(2.0),
+        currency: Some("USD".to_string()),
+    };
+
+    // A disabled extra block renders no period rows.
+    let disabled = crate::usage::ExtraUsage {
+        is_enabled: false,
+        daily: Some(serde_json::json!({"utilization": 5.0, "used_credits": 200.0})),
+        ..Default::default()
+    };
+    let stats = credit_stats(Some(disabled), None);
+    assert!(
+        !stats.iter().any(|s| s.label.starts_with("extra usage")),
+        "a disabled extra block renders no period rows"
+    );
+
+    // A billing-on spend with an enabled extra hides only the legacy extra bar;
+    // the period rows still render.
+    let stats = credit_stats(Some(enabled()), Some(spend()));
+    let labels: Vec<_> = stats.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        vec!["extra usage (24h)", "spend"],
+        "a billing-on spend hides the extra bar, not the period rows"
+    );
+
+    // A billing-off spend with an enabled extra keeps the extra bar and the
+    // period rows.
+    let stats = credit_stats(Some(enabled()), Some(billing_off_spend()));
+    let labels: Vec<_> = stats.iter().map(|s| s.label.as_str()).collect();
+    assert!(
+        labels.contains(&"extra"),
+        "the extra bar renders: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"extra usage (24h)"),
+        "the period row renders beside a billing-off spend: {labels:?}"
+    );
+}
+
 // ── diagnostic hints ──────────────────────────────────────────────────────────
 //
 // Each degraded/misconfigured state maps to a `└` fix line naming WHAT is wrong
@@ -4110,7 +4435,7 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
 fn the_eyebrow_percent_drops_to_its_own_line_when_narrow() {
     let stat = Stat {
         label: "7d".to_string(),
-        pct: 24.5,
+        pct: Some(24.5),
         amount: "12.2".to_string(),
         color: theme::body(),
         burn_rate: Some(12.2),
@@ -4118,6 +4443,7 @@ fn the_eyebrow_percent_drops_to_its_own_line_when_narrow() {
         pace_pct: None,
         reset_secs: None,
         trailing: String::new(),
+        note: None,
     };
     let max_rate_w = stat.rate_section_width();
     let lines = stat.render(8, 20, max_rate_w, 5);
