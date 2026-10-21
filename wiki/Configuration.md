@@ -293,7 +293,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
       credentials.json.staged # a refreshed pair waiting to land in credentials.json after a busy or failed save
       auth.spent.json      # fingerprints of the last 64 refresh tokens clauth traded in, never the tokens
       mcp-logins.json      # MCP-server logins parked while this profile stores no Claude login
-      note.txt             # the account's free-form note, edited from the usage tab's n key (0600)
+      note.txt             # the account's free-form note, edited from the Usage tab's n key (0600)
       session-token.json   # long-lived setup-token login, when captured
       session-token.static.json # the mint a rolling token superseded, kept for the restore
       usage_cache.json     # last-known utilization, plan and account email

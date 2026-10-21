@@ -7,7 +7,7 @@
 | Tab | Holds | You can |
 |-----|-------|---------|
 | **Overview** | account table, live 5h / long-window bars (7d, or Alibaba's monthly quota), chain position, selectable codex and pool accounts | switch or reorder Claude Code accounts, browse codex and pool accounts, refresh or remove a pool account, pick which harness shows |
-| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend, peak-rate state | refresh one account, toggle estimates and the pace marker, edit the account's note |
+| **Usage** | per-account window breakdown for every Claude Code, codex and shunt pool account: 5h, 7d, per-model weeks, extra-usage spend, peak-rate state; a codex or pool account shows its own facts and windows | refresh one Claude Code account or re-read the pool listing, toggle estimates and the pace marker (Claude Code panes), edit a Claude Code account's note |
 | **Tokens** | global Claude Code token stats and API-equivalent cost | drill into models, move between dashboard cards, change the period lens, count cache tokens |
 | **Setup** | the Overview's account list (Claude Code, codex and pool rows), then each Claude Code account's endpoint, key, env, model routing, auto-start, 5h alert | edit any of it, log in, log out, disable or delete a Claude Code account, create a claude, codex or pool account, re-login or delete a codex account, refresh or remove a pool account |
 | **Fallback** | the auto-switch chain | reorder members, edit thresholds, flip gates, set a spend ceiling |
@@ -23,6 +23,8 @@ Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section head
 
 Shunt pool accounts sit after the codex rows, one `shunt (<provider>)` heading per provider with a row per account under it. A row shows the account name; the plan in the type column (`—` where the gateway reports none); the 5h and 7d bracketed bars with their reset countdowns, `—` where the gateway reports none; and blank live and t/s columns. Status rides cues: a red `×` before the name when the account needs a re-login (a spinner takes its place while a pool action runs on the row), a dimmed row while it is paused or disabled, a cooldown's remaining time in the timer slot in amber, and the bars' threshold colors as it nears its quota. The `codex` heading and each `shunt (<provider>)` heading are dim and bold, and brighten while the cursor rests on a row under one. A listing clauth cannot read shows one `shunt — not read: <reason>` heading and no rows; with no gateway adopted, a config without clauth's admin entry, or a missing admin token file, the section does not appear: the Services card offers `f  add admin table` or `f  add admin key` for a missing table or entry, and while the gateway runs it reads `pool  no gateway admin token` for a missing file.
 
+The Usage tab lists the same accounts as Setup, unfiltered and without `+ new`: the Claude Code accounts, then the `codex` section, then one `shunt (<provider>)` section per pool provider. A codex account's detail shows `type  codex`, its plan, `login  [ needs re-login ]` while its chain is quarantined, `resets  ↺ N banked` while it holds a banked reset, how long ago its usage was read, then whichever of its 5h and 7d bars it reports. A pool account's detail shows `type  shunt`, its family, every provider serving it, its plan, one `status` pill (needs re-login, paused, disabled, or a cooldown with its countdown; none while available), how long ago the listing was read, then whichever of its 5h, 7d and `7d fable` bars the listing reports. While the pool listing cannot be read, or the pool section goes away, a selected pool account gives way to the Usage tab's first row; it comes back once the listing returns, unless since then you moved on the Usage tab or the Overview, moved the Claude Code account selection on any other tab, or opened the row shown.
+
 ## Keys
 
 ### Everywhere
@@ -34,7 +36,7 @@ Shunt pool accounts sit after the codex rows, one `shunt (<provider>)` heading p
 | <kbd>↑</kbd> <kbd>↓</kbd> | move the selection through long lists without snapping it to an edge, or scroll a detail pane |
 | <kbd>pgup</kbd> <kbd>pgdn</kbd> | move a page in a scrollable list, detail, form or dialog |
 | <kbd>⏎</kbd> | act on the selected row (see below) |
-| <kbd>n</kbd> | new account (on the Overview, the form's `type` is preset from the row under the cursor; a suspended form comes back as you left it) · on the usage tab: edit the account's note |
+| <kbd>n</kbd> | new account (on the Overview, the form's `type` is preset from the row under the cursor; a suspended form comes back as you left it) · on a Claude Code row of the Usage tab: edit the account's note; nothing on a codex or pool row there |
 | <kbd>d</kbd> | open the divergence resolver, when one is pending |
 | <kbd>x</kbd> | dismiss the oldest toast, then the footer alert; over an open dialog it dismisses the oldest toast only; while a field is open for editing, <kbd>x</kbd> stays with it. Any <kbd>x</kbd> also cancels a pending quit and clears its alert |
 | <kbd>a</kbd> | action menu for the current row |
@@ -53,7 +55,7 @@ On the Tokens dashboard, <kbd>↑</kbd> / <kbd>↓</kbd> move focus card to card
 
 | Key | Behavior |
 |-----|----------|
-| <kbd>r</kbd> | Usage: refresh the selected account only. Tokens / Status / Services: reload that tab's data. Everywhere else: refresh every Claude Code account |
+| <kbd>r</kbd> | Usage: refresh the selected Claude Code account only; on a pool row, read the pool listing again; nothing on a codex row, which refreshes on the refresh interval alone. Tokens / Status / Services: reload that tab's data. Everywhere else: refresh every Claude Code account |
 | <kbd>t</kbd> | Tokens: cycle the period lens. Everywhere else: force-rotate every Claude Code account's token, after a confirm |
 | <kbd>⏎</kbd> | Overview: switch to the selected Claude Code account; inert on a codex or pool row. Usage: descend into the selected account's detail to scroll its full breakdown. Tokens: open the model breakdown, then descend into the selected model's detail; a view with no model has no detail to open. Setup / Fallback: open a detail row, or commit an edit; on Setup's `type` and `family` cycle rows ⏎ mirrors `space`; on a Fallback card's `preferred days` row, open the day picker. Status / Services: open the detail (the `delegates` detail only while it lists a job); in a Services detail, open the confirm of a focused `f` line (on the `shunt` card also: flip a focused `enabled` row, open a focused `check output`) |
 | <kbd>⇧↑</kbd> <kbd>⇧↓</kbd> | Overview: reorder Claude Code accounts; inert on a codex or pool row. Fallback (chain focus): reorder chain members |
@@ -79,15 +81,15 @@ Entries above the rule act on the account named in the menu's title bar; entries
 | Tab | Account | Tab-wide |
 |-----|---------|----------|
 | Overview | `refresh usage`, `rotate access token`, `disable account` / `enable account`, `open provider console` | `refresh all accounts`, `new account` |
-| Usage | `refresh usage`, `rotate access token`, `disable account` / `enable account`, `open provider console` | `refresh all accounts`, `toggle estimates`, `toggle pace marker` |
+| Usage | `refresh usage`, `rotate access token`, `disable account` / `enable account`, `open provider console` (a pool row: see below; none on a codex row) | `refresh all accounts`, `toggle estimates`, `toggle pace marker` |
 | Tokens | none | `period: lifetime` / `daily` / `weekly` / `monthly`, `show all models` / `show claude models` / `show other models`, `toggle cache counting`, `reload stats` |
 | Setup | `duplicate account`, `save as preset`, `apply preset`, `open provider console` (none on a codex or pool row) | none |
 | Status | none | `refresh status`, `open in browser` |
 | every tab | none | `start daemon` / `stop daemon`, then `start shunt` / `stop shunt`, last |
 
-On a shunt pool row the menu holds `refresh` (claude and antigravity accounts; shunt has no codex refresh) and `remove` (behind a `remove <name>?` confirm); a kimi row, or one whose sign-in kind clauth does not know, carries no action. One pool action runs at a time, and picking a second while one runs says to wait.
+On a shunt pool row, on the Overview or the Usage tab, the menu holds `refresh` (claude and antigravity accounts; shunt has no codex refresh) and `remove` (behind a `remove <name>?` confirm); a kimi row, or one whose sign-in kind clauth does not know, carries no action. One pool action runs at a time, and picking a second while one runs says to wait. An account entry always acts on the account the menu was opened for: if that account is deleted or renamed before you pick, or leaves the pool listing (or the listing cannot be read at that moment), nothing runs and a toast says the account is gone.
 
-The usage tab claims <kbd>n</kbd> for the selected account's note: a free-form text block shown in full on the tab under `notes:` (`press n to add notes` while the account has none). <kbd>⏎</kbd> saves, <kbd>esc</kbd> cancels, <kbd>⌃j</kbd> starts a new line. The note is stored as `profiles/<name>/note.txt` (see [Configuration](Configuration#storage-layout)), so it follows the account on rename and goes with it on delete; everywhere else <kbd>n</kbd> still starts a new account.
+The Usage tab claims <kbd>n</kbd> on a Claude Code row for the selected account's note: a free-form text block shown in full on the tab under `notes:` (`press n to add notes` while the account has none). <kbd>⏎</kbd> saves, <kbd>esc</kbd> cancels, <kbd>⌃j</kbd> starts a new line. The note is stored as `profiles/<name>/note.txt` (see [Configuration](Configuration#storage-layout)), so it follows the account on rename and goes with it on delete. <kbd>n</kbd> does nothing on a codex or pool row of the Usage tab; everywhere else it still starts a new account.
 
 `start daemon` shows while no daemon runs and, once you confirm, starts `clauth daemon` in the background, detached from the TUI: it keeps running after you quit the TUI or close its terminal, and writes its log to `~/.clauth/daemon.log`. If a daemon came up elsewhere while the confirm was open, it starts nothing and says `daemon already running`. It starts the plain daemon, so it serves no REST API; for the clauth app, run `clauth daemon --listen` yourself ([Daemon](Daemon)). `stop daemon` shows while one runs and stops it the way `clauth daemon --replace` does, taking the shunt gateway and every enabled proxy down with it (a daemon that takes over at once, such as a standby, runs its own). Neither shows while one of them is still working; a toast reports how it went.
 
