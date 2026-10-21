@@ -116,8 +116,8 @@ clauth list           # account table with cached usage, no network
 - **`delete`, `disable` and `limit-reset` want a TTY.** Each prompts `[y/N]`; on a non-TTY stdin they refuse unless you pass `--yes`. `--force` is the only way past `delete`'s live-session guard, and `--yes` alone does not override it.
 - **Bare names span both rosters.** `clauth <name>`, `delete` and `start` try the Claude Code profiles first, then the codex ones; an unknown name lists both (`available: … · codex: …`).
   - `disable`, `enable`, `rolling-token` and `static-token` refuse a codex name as one ([Codex](Codex)), and `limit-reset` refuses a Claude Code name the same way.
-- **`login <existing>`** re-authenticates in place. The chain slot, env block, and model settings survive; a browser re-login replaces the subscription login after a confirm.
-  - On an account that has an endpoint and a key it can still authenticate with, whether or not clauth recognises the provider, a browser re-login replaces the subscription login alone and leaves the endpoint and key where they are.
+- **`login <existing>`** re-authenticates in place. The chain slot, env block, and model settings survive; on a terminal, a browser re-login asks first, and the confirm says whether it replaces the stored login or adds one beside what the profile keeps (a piped run proceeds without asking).
+  - On an account that has an endpoint and a key it can still authenticate with, whether or not clauth recognises the provider, a browser re-login touches the subscription login alone and leaves the endpoint and key where they are.
   - That is because the stored OAuth chain is what you came to renew, and the key is what that account's inference actually runs on.
   - An endpoint with nothing left behind it is cleared as before, so a re-login never leaves a bare endpoint standing in front of a fresh subscription login.
   - An api-key re-login replaces the endpoint set, and so does any capture that brings one of the fields; a headless one (non-interactive stdin) with no `--base-url` reuses the stored endpoint instead of prompting.
