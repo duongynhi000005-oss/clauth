@@ -19,10 +19,10 @@ use super::super::app::{
 use super::super::theme;
 use super::format::{NO_DATA, middle_truncate, spinner_frame, truncate};
 use super::panes::{
-    DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, MIN_VALUE_W, bold_when, cycle_row_lines,
-    draw_following_list, draw_scrolled_lines, head_cols, help_tooltip_lines, highlight_row,
-    invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, picker_row, pill,
-    place_caret, section_box, section_box_verbatim, value_caret,
+    DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, ListView, MIN_VALUE_W, bold_when,
+    cycle_row_lines, draw_following_list, draw_scrolled_lines, head_cols, help_tooltip_lines,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color,
+    picker_row, pill, place_caret, section_box, section_box_verbatim, value_caret,
 };
 use super::prose::{cmd, cmd_lit, key_lit, spans as prose_spans};
 
@@ -43,6 +43,32 @@ pub(super) fn draw(
 }
 
 fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
+    draw_band_selector(
+        frame,
+        area,
+        app,
+        focused,
+        app.setup_position(),
+        true,
+        &app.setup_selector,
+    );
+}
+
+/// The shared band-list selector, Setup's shape: the [`App::band_entries`]
+/// walk under the all-filter, each harness row rendered via
+/// [`setup_selector_row`], then — when `with_new` — the trailing `+ new` row.
+/// Setup passes `+ new`; Usage passes none. `selected_flat` is the flat
+/// [`App::setup_items`] index of the selection, its `len()` the `+ new` row
+/// when `with_new`.
+pub(super) fn draw_band_selector(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    focused: bool,
+    selected_flat: usize,
+    with_new: bool,
+    list: &ListView,
+) {
     let block = section_box("accounts", focused, true, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -52,7 +78,7 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     // guard, and `RankedMutex` refuses a nested acquisition of the same rank.
     let entries = app.band_entries(HarnessFilter::All);
     let items = app.setup_items();
-    let pos = app.setup_position();
+    let pos = selected_flat;
     let cfg = app.config();
     let ranges = App::heading_ranges(&entries);
     let width = inner.width;
@@ -61,8 +87,9 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     // cursor-indexed starts, so a heading or spacer never shifts a selection
     // off its row. `pos` is the flat item index, `items.len()` the `+ new`
     // row — the clamped form would double-select the last item beside `+ new`.
-    let mut rows: Vec<ratatui::widgets::ListItem<'static>> = Vec::with_capacity(items.len() + 8);
-    let mut starts: Vec<usize> = Vec::with_capacity(items.len());
+    let mut rows: Vec<ratatui::widgets::ListItem<'static>> =
+        Vec::with_capacity(items.len() + usize::from(with_new) + 8);
+    let mut starts: Vec<usize> = Vec::with_capacity(items.len() + usize::from(with_new));
     let mut flat: usize = 0;
     for (i, entry) in entries.iter().enumerate() {
         match entry {
@@ -98,15 +125,17 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
         }
     }
     let new_row = rows.len();
-    rows.push(ratatui::widgets::ListItem::new(picker_row(
-        pos == items.len(),
-        focused,
-        "+ new".to_string(),
-        theme::accent(),
-        width,
-    )));
+    if with_new {
+        rows.push(ratatui::widgets::ListItem::new(picker_row(
+            pos == items.len(),
+            focused,
+            "+ new".to_string(),
+            theme::accent(),
+            width,
+        )));
+    }
 
-    let render_sel = if pos >= items.len() {
+    let render_sel = if with_new && pos >= items.len() {
         new_row
     } else {
         starts.get(pos).copied().unwrap_or(0)
@@ -114,11 +143,13 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     // The `+ new` row joins the starts list so the page step treats it as the
     // last selectable row (a PageDown at `+ new` stays, not clamps to the last
     // item).
-    starts.push(new_row);
-    draw_following_list(frame, inner, rows, render_sel, &app.setup_selector);
+    if with_new {
+        starts.push(new_row);
+    }
+    draw_following_list(frame, inner, rows, render_sel, list);
     let block_ends: Vec<usize> = starts.iter().map(|s| s + 1).collect();
-    app.setup_selector.starts.replace(starts);
-    app.setup_selector.block_ends.replace(block_ends);
+    list.starts.replace(starts);
+    list.block_ends.replace(block_ends);
 }
 
 /// One Setup selector row for a harness item: a claude row (dim disabled,
@@ -723,19 +754,10 @@ fn draw_pool_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         },
     ]));
     // The status pill is the first that holds; none while the account is
-    // available, so a clean row carries no status word.
-    let status = if account.needs_relogin {
-        Some(("needs re-login", theme::danger().bold()))
-    } else if account.paused {
-        Some(("paused", theme::dim().bold()))
-    } else if account.disabled {
-        Some(("disabled", theme::dim().bold()))
-    } else if account.cooldown_secs_remaining.is_some() {
-        Some(("cooldown", theme::warning().bold()))
-    } else {
-        None
-    };
-    if let Some((label, style)) = status {
+    // available, so a clean row carries no status word. The Usage pool pane
+    // shares this one judgment via [`pool_status_pill`], which also hands back
+    // the cooldown countdown the Setup detail deliberately omits.
+    if let Some((label, style, _)) = pool_status_pill(account) {
         lines.push(Line::from(
             [
                 vec![Span::styled(
@@ -808,6 +830,28 @@ fn draw_pool_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .replace(rows.iter().map(|_| 1).collect::<Vec<_>>());
     app.setup_detail_tips.replace(vec![0; rows.len()]);
     draw_scrolled_lines(frame, inner, lines, focus, Some(&app.setup_detail_offset));
+}
+
+/// The pool detail's `status` pill, the first that holds: needs re-login
+/// (DANGER), paused (dim), disabled (dim), cooldown (WARNING) — `None` while
+/// the account is available, so a clean row carries no status word. The third
+/// tuple element is the cooldown countdown (epoch-seconds remaining) for the
+/// one caller that renders it; the Setup detail omits it. Shared by Setup's
+/// [`draw_pool_detail`] and the Usage pool pane, so the two cannot disagree.
+pub(super) fn pool_status_pill(
+    account: &crate::gateway_admin::PoolAccount,
+) -> Option<(&'static str, Style, Option<u64>)> {
+    if account.needs_relogin {
+        Some(("needs re-login", theme::danger().bold(), None))
+    } else if account.paused {
+        Some(("paused", theme::dim().bold(), None))
+    } else if account.disabled {
+        Some(("disabled", theme::dim().bold(), None))
+    } else if let Some(secs) = account.cooldown_secs_remaining {
+        Some(("cooldown", theme::warning().bold(), Some(secs)))
+    } else {
+        None
+    }
 }
 
 /// CLA-SPLIT status row (`token`): a profile carrying a long-lived-token sidecar

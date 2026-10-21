@@ -365,6 +365,14 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         return hints;
     }
 
+    // The Usage hints derive per row (a codex row has no `n`/`r`; a pool row's
+    // `r` re-reads the listing), so they build a Vec like Services.
+    if app.tab == Tab::Usage {
+        let mut hints = usage_hints(app);
+        hints.push(("q", q_label));
+        return hints;
+    }
+
     let tail: &[(&str, &str)] = match app.tab {
         Tab::Overview => &[
             ("⇧↑↓", "reorder"),
@@ -372,25 +380,7 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("c", "harness"),
             ("?", "help"),
         ],
-        // The hint derives from the key's behavior on this frame: with no
-        // accounts, `n` still starts a new account (the empty state's promise)
-        // and the note editor does not exist yet.
-        Tab::Usage if app.usage_detail_focus == StatusFocus::Detail => &[
-            ("↑↓", "scroll"),
-            ("r", "refresh account"),
-            ("n", "note"),
-            ("a", "actions"),
-            ("?", "help"),
-        ],
-        Tab::Usage if app.profile_count() > 0 => &[
-            ("↑↓", "account"),
-            ("↵", "detail"),
-            ("r", "refresh account"),
-            ("n", "note"),
-            ("a", "actions"),
-            ("?", "help"),
-        ],
-        Tab::Usage => &[("↑↓", "account"), ("a", "actions"), ("?", "help")],
+        Tab::Usage => &[], // handled above: its hints derive per row
         Tab::Tokens => match app.token_view {
             TokenView::Dashboard if token_model_count(app) == 0 => &[
                 ("r", "reload"),
@@ -685,6 +675,77 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     {
         hints.push(("q", q_label));
     }
+    hints
+}
+
+/// Which keys act on the Usage tab's current row and focus: the one predicate
+/// set the footer's hints and the help modal's Usage rows both derive from, so
+/// neither advertises a key the shown row ignores.
+pub(crate) struct UsageKeyFacts {
+    /// In detail focus (↑↓ scrolls, esc/← ascend).
+    pub(crate) detail: bool,
+    /// `↵` descends: list focus with at least one item row.
+    pub(crate) enter: bool,
+    /// `r` acts, and what it re-reads.
+    pub(crate) r: Option<UsageRefresh>,
+    /// `n` opens the note editor (a claude row with a profile to hold it).
+    pub(crate) n: bool,
+}
+
+/// What a Usage `r` re-reads on the current row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsageRefresh {
+    /// The focused claude account's usage.
+    RefreshAccount,
+    /// The shunt pool listing.
+    ReReadPool,
+}
+
+/// The per-row key facts: `n` acts on claude rows only, `r` where a re-read
+/// exists (claude account refresh, pool listing re-read; a codex row has no
+/// per-account trigger so `r` is inert there), and `↵` descends on any item
+/// row. The empty roster keeps the empty state's promise.
+pub(crate) fn usage_key_facts(app: &App) -> UsageKeyFacts {
+    let detail = app.usage_detail_focus == StatusFocus::Detail;
+    let (r, n) = match app.usage_selection() {
+        SetupSelection::Item(MainItemKind::Profile(_)) if app.profile_count() > 0 => {
+            (Some(UsageRefresh::RefreshAccount), true)
+        }
+        SetupSelection::Item(MainItemKind::Shunt(..)) => (Some(UsageRefresh::ReReadPool), false),
+        SetupSelection::Item(MainItemKind::Profile(_))
+        | SetupSelection::Item(MainItemKind::Codex(_))
+        | SetupSelection::New => (None, false),
+    };
+    UsageKeyFacts {
+        detail,
+        enter: !detail && !app.setup_items().is_empty(),
+        r,
+        n,
+    }
+}
+
+/// The Usage tab's own hints, derived from [`usage_key_facts`] per row.
+fn usage_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut hints: Vec<(&'static str, &'static str)> = Vec::new();
+    let facts = usage_key_facts(app);
+    if facts.detail {
+        hints.push(("↑↓", "scroll"));
+    } else {
+        hints.push(("↑↓", "account"));
+        if facts.enter {
+            hints.push(("↵", "detail"));
+        }
+    }
+    match facts.r {
+        Some(UsageRefresh::RefreshAccount) => hints.push(("r", "refresh account")),
+        Some(UsageRefresh::ReReadPool) => hints.push(("r", "re-read pool")),
+        None => {}
+    }
+    if facts.n {
+        hints.push(("n", "note"));
+    }
+    hints.push(("a", "actions"));
+    hints.push(("?", "help"));
     hints
 }
 

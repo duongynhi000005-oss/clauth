@@ -10,17 +10,20 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, NoteBuffer, ReadingsSnapshot, StatusFocus};
+use super::super::app::{
+    App, MainItemKind, NoteBuffer, ReadingsSnapshot, SetupSelection, StatusFocus, escape_control,
+    pool_auth_label,
+};
 use super::super::theme;
 use super::format::{
-    ResetFmt, activity_verb, is_past_reset, reset_in_secs_at, reset_phrase, spinner_frame,
-    spinner_style, truncate,
+    NO_DATA, ResetFmt, activity_verb, duration_label, is_past_reset, relative_age,
+    reset_in_secs_at, reset_phrase, spinner_frame, spinner_style, truncate,
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
-    cells_window, draw_profile_selector, draw_scrollbar, edit_slot_block, empty_state,
-    follow_window, grapheme_cells_before, key_cell, master_detail, pill, place_caret,
-    rail_hint_lines, scroll_offset, section_box, section_box_verbatim, wrap_words,
+    cells_window, draw_scrollbar, edit_slot_block, empty_state, follow_window,
+    grapheme_cells_before, key_cell, master_detail, pill, place_caret, rail_hint_lines,
+    scroll_offset, section_box, section_box_verbatim, wrap_words,
 };
 use super::prose::{self, cmd, cmd_lit, key_lit};
 use crate::format::{account_tier, format_pct};
@@ -102,17 +105,30 @@ pub(super) fn draw(
     readings: &ReadingsSnapshot,
     toast_rects: &[Rect],
 ) {
-    let items = app.config().profiles.len();
+    let items = app.setup_items().len();
     let (selector, detail) = master_detail(area, items);
 
-    draw_profile_selector(
+    // The shared band-list selector (Setup's shape, no `+ new` row); the
+    // selection is held by identity and resolved to a flat index each frame.
+    super::config::draw_band_selector(
         frame,
         selector,
         app,
-        app.profile_cursor,
         app.usage_detail_focus == StatusFocus::List,
+        app.usage_position(),
+        false,
+        &app.usage_selector,
     );
-    draw_usage_detail(frame, detail, app, readings, toast_rects);
+
+    match app.usage_selection() {
+        SetupSelection::Item(MainItemKind::Profile(_)) | SetupSelection::New => {
+            draw_usage_detail(frame, detail, app, readings, toast_rects);
+        }
+        SetupSelection::Item(MainItemKind::Codex(_)) => draw_codex_usage_detail(frame, detail, app),
+        SetupSelection::Item(MainItemKind::Shunt(..)) => {
+            draw_pool_usage_detail(frame, detail, app);
+        }
+    }
 }
 
 /// Which reading source the shown profile's stuck judgment took — the one that
@@ -193,9 +209,11 @@ fn draw_usage_detail(
     // the durable verdict per member.
     let key_rejected = app.key_rejected_names();
     let cfg = app.config();
-    let profile = cfg
-        .profiles
-        .get(app.profile_cursor.min(cfg.profiles.len().saturating_sub(1)));
+    let profile = cfg.profiles.get(
+        app.profile_cursor
+            .read()
+            .min(cfg.profiles.len().saturating_sub(1)),
+    );
 
     let title = profile.map(|p| p.name.as_str()).unwrap_or("usage");
     let focused = app.usage_detail_focus == StatusFocus::Detail;
@@ -344,6 +362,217 @@ fn draw_usage_detail(
     if let Some(editor) = slot {
         draw_note_slot(frame, slot_area.unwrap_or(inner), &editor.buf, toast_rects);
     }
+}
+
+/// The 5h / 7d(/ 7d fable) window bars both the codex and pool panes render:
+/// one trailing reset-countdown + `make_window_stat` per window, with both
+/// gates off. The panes differ only in which windows they pass, so the loop is
+/// one helper both call.
+fn window_stats(
+    windows: &[(&str, Option<&UsageWindow>)],
+    reset_fmt: ResetFmt,
+    now: i64,
+) -> Vec<Stat> {
+    let mut stats: Vec<Stat> = Vec::new();
+    for (label, window) in windows {
+        let Some(window) = window else {
+            continue;
+        };
+        let trailing = reset_in_secs_at(window, now)
+            .map(|secs| format!("  {}", reset_phrase(secs, reset_fmt)))
+            .unwrap_or_default();
+        stats.push(make_window_stat(
+            label,
+            window.utilization,
+            window.resets_at.as_deref(),
+            now,
+            String::new(),
+            trailing,
+            WindowGates {
+                show_estimates: false,
+                show_pace: false,
+            },
+        ));
+    }
+    stats
+}
+
+/// The Usage codex pane: `type`/`plan` (and `login` while quarantined, then
+/// `resets` while one is banked)/`status` facts, then the 5h and 7d bars. No
+/// notes, no speed/rate and no burn rate — the design's codex rows.
+fn draw_codex_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(i) = app.usage_codex_index() else {
+        return;
+    };
+    let Some(row) = app.codex_rows.get(i) else {
+        return;
+    };
+    let focused = app.usage_detail_focus == StatusFocus::Detail;
+    let block = section_box_verbatim(row.name.as_ref(), focused, false, area.width);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        key_span("type"),
+        Span::styled("codex", theme::accent()),
+    ]));
+    lines.push(Line::from(vec![
+        key_span("plan"),
+        match row.plan.as_deref() {
+            Some(plan) => Span::styled(escape_control(plan), theme::accent()),
+            None => Span::styled(NO_DATA.to_string(), theme::faint()),
+        },
+    ]));
+    if crate::codex_auth::read_quarantine(row.name.as_str()).is_some() {
+        lines.push(Line::from(
+            [
+                vec![key_span("login")],
+                pill("needs re-login".to_string(), theme::danger().bold()),
+            ]
+            .concat(),
+        ));
+    }
+    if let Some(resets) = row.resets.filter(|n| *n > 0) {
+        lines.push(Line::from(vec![
+            key_span("resets"),
+            Span::styled(format!("↺ {resets} banked"), theme::accent()),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        key_span("status"),
+        match row.fetched_at {
+            Some(stamp) => Span::styled(format!("◌ read {}", relative_age(stamp)), theme::dim()),
+            None => Span::styled("◌ not read yet", theme::dim()),
+        },
+    ]));
+    lines.push(Line::from(""));
+
+    let reset_fmt = ResetFmt::from_state(&app.config().state);
+    let now = now_epoch_secs();
+    let stats = window_stats(
+        &[
+            ("5h", row.five_hour.as_ref()),
+            ("7d", row.seven_day.as_ref()),
+        ],
+        reset_fmt,
+        now,
+    );
+    if !stats.is_empty() {
+        lines.extend(render_stat_block(&stats, inner.width));
+    }
+    render_usage_lines(frame, inner, app, lines);
+}
+
+/// The Usage pool pane: `type`/`family`/`provider`/`plan`/`status`/`read`
+/// facts, then the 5h, 7d and `7d fable` bars from the pool account's own
+/// admin row. No notes, no speed/rate and no burn rate — the design's pool
+/// rows.
+fn draw_pool_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some((pi, ai)) = app.usage_pool_pair() else {
+        return;
+    };
+    let Some((account, auth)) = app.shunt_pool_row(pi, ai) else {
+        return;
+    };
+    let focused = app.usage_detail_focus == StatusFocus::Detail;
+    let block = section_box_verbatim(&escape_control(&account.name), focused, false, area.width);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        key_span("type"),
+        Span::styled("shunt", theme::accent()),
+    ]));
+    lines.push(Line::from(vec![
+        key_span("family"),
+        Span::styled(pool_auth_label(auth), theme::accent()),
+    ]));
+    let providers = app.pool_providers_for(auth, &account.name);
+    if !providers.is_empty() {
+        let value_width = inner.width.saturating_sub((KEY_W + KEY_GUTTER) as u16) as usize;
+        lines.push(Line::from(vec![
+            key_span("provider"),
+            Span::styled(
+                truncate(&providers.join(" · "), value_width),
+                theme::accent(),
+            ),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        key_span("plan"),
+        match account.plan.as_deref() {
+            Some(plan) => Span::styled(escape_control(plan), theme::accent()),
+            None => Span::styled(NO_DATA.to_string(), theme::faint()),
+        },
+    ]));
+    if let Some((label, style, countdown)) = super::config::pool_status_pill(account) {
+        let mut spans = vec![key_span("status")];
+        spans.extend(pill(label.to_string(), style));
+        if let Some(secs) = countdown {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(duration_label(secs), theme::faint()));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(vec![
+        key_span("read"),
+        match app.shunt_pool_read_at_ms {
+            Some(stamp) => Span::styled(relative_age(stamp), theme::dim()),
+            None => Span::styled("not read yet", theme::dim()),
+        },
+    ]));
+    lines.push(Line::from(""));
+
+    let reset_fmt = ResetFmt::from_state(&app.config().state);
+    let now = now_epoch_secs();
+    let five_h = super::overview::pool_window(account.utilization_5h, account.reset_5h);
+    let seven_d = super::overview::pool_window(account.utilization_7d, account.reset_7d);
+    let fable = super::overview::pool_window(account.utilization_7d_oi, account.reset_7d_oi);
+    let stats = window_stats(
+        &[
+            ("5h", five_h.as_ref()),
+            ("7d", seven_d.as_ref()),
+            ("7d fable", fable.as_ref()),
+        ],
+        reset_fmt,
+        now,
+    );
+    if !stats.is_empty() {
+        lines.extend(render_stat_block(&stats, inner.width));
+    }
+    render_usage_lines(frame, inner, app, lines);
+}
+
+/// Render an assembled Usage detail body into `inner`, publishing the scroll
+/// bounds the key handler clamps against and drawing the overflow scrollbar.
+/// The claude pane has its own slot-aware tail because the note editor docks
+/// at its bottom; the codex and pool panes share this one.
+fn render_usage_lines(frame: &mut Frame<'_>, inner: Rect, app: &App, lines: Vec<Line<'static>>) {
+    let total = lines.len();
+    let viewport = inner.height as usize;
+    let max_scroll = if viewport == 0 {
+        0
+    } else {
+        total.saturating_sub(viewport)
+    };
+    app.usage_detail_max_scroll.set(max_scroll);
+    app.usage_detail_viewport.set(viewport);
+    let scroll = app.usage_detail_scroll.min(max_scroll);
+    let paragraph = if scroll > usize::from(u16::MAX) {
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(scroll)
+                .take(viewport)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        Paragraph::new(lines).scroll((scroll as u16, 0))
+    };
+    frame.render_widget(paragraph.style(theme::base()), inner);
+    draw_scrollbar(frame, inner, total, scroll, viewport);
 }
 
 #[allow(

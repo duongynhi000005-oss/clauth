@@ -3621,6 +3621,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
         }),
         seven_day: None,
         resets: None,
+        fetched_at: None,
     };
     let (config, readings) = config_with(vec![], None, vec![]);
     let app = App::new(config);
@@ -3666,6 +3667,7 @@ fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
         five_hour: None,
         seven_day: None,
         resets,
+        fetched_at: None,
     };
     let (config, readings) = config_with(vec![], None, vec![]);
     let mut app = App::new(config);
@@ -3716,6 +3718,7 @@ fn a_codex_reset_chip_never_sits_under_the_tps_header() {
         five_hour: None,
         seven_day: None,
         resets: Some(2),
+        fetched_at: None,
     };
     let (config, readings) = config_with(vec![], None, vec![]);
     let mut app = App::new(config);
@@ -3783,6 +3786,7 @@ fn a_codex_reset_chip_charges_the_gap_then_the_name_then_sheds() {
                 five_hour: None,
                 seven_day: None,
                 resets: Some(12),
+                fetched_at: None,
             },
             CodexRow {
                 name: crate::profile::ProfileName::from("cx2"),
@@ -3792,6 +3796,7 @@ fn a_codex_reset_chip_charges_the_gap_then_the_name_then_sheds() {
                 five_hour: None,
                 seven_day: None,
                 resets: Some(2),
+                fetched_at: None,
             },
         ]
     };
@@ -4354,6 +4359,8 @@ fn pool_account(name: &str) -> crate::gateway_admin::PoolAccount {
         reset_5h: None,
         utilization_7d: None,
         reset_7d: None,
+        utilization_7d_oi: None,
+        reset_7d_oi: None,
         plan: None,
         status: None,
     }

@@ -17280,6 +17280,100 @@ fn a_codex_poll_across_an_account_change_writes_no_reading() {
     );
 }
 
+/// The codex leg stamps the usage cache it writes: a live poll's `fetched_at`
+/// lands in epoch MILLISECONDS between the tick's call and return, so the TUI's
+/// `status  read <age> ago` row reads the poll's own age in production — not
+/// only when a fixture writes the stamp.
+#[test]
+fn a_codex_poll_stamps_the_written_cache_in_epoch_ms() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cxstamp"]);
+    let name = crate::profile::ProfileName::from("cxstamp");
+    let auth_path = crate::profile::profile_subpath(&name, "auth.json").expect("path");
+    crate::profile::mkdir_700(auth_path.parent().expect("profile dir")).expect("mkdir profile dir");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"access_token":"tok-a","account_id":"account-a"}}"#,
+    )
+    .expect("write auth.json");
+
+    let (base, server) = crate::testutil::serve_endpoints(2, |_path, _i| {
+        (200, r#"{"plan_type":"pro"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+
+    let before = crate::usage::now_ms();
+    super::codex_usage_tick(&completion_order_state());
+    let after = crate::usage::now_ms();
+
+    crate::usage::clear_codex_usage_url_override();
+    let _ = server.join().expect("listener");
+
+    let cached =
+        super::load_profile_cache::<crate::usage::UsageInfo>(&name, super::USAGE_CACHE_FILE)
+            .expect("the poll wrote a cache");
+    let stamped = cached
+        .fetched_at
+        .expect("a live codex poll stamps the cache");
+    assert!(
+        before <= stamped && stamped <= after,
+        "the stamp is the poll's own epoch-ms clock ({before} <= {stamped} <= {after})"
+    );
+}
+
+/// The stamp is the poll's own moment, not the tick's start (F8/G3-PL9): two
+/// codex accounts poll at distinguishable moments — the loopback server delays
+/// the first response, and the per-host request pacing separates them — so the
+/// second account's stamp must be at least the first response's send time. A
+/// tick-start stamp would predate it.
+#[test]
+fn the_second_codex_poll_stamps_after_the_first_response() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    for n in ["cx1", "cx2"] {
+        let name = crate::profile::ProfileName::from(n);
+        let p = crate::profile::profile_subpath(&name, "auth.json").expect("path");
+        crate::profile::mkdir_700(p.parent().expect("dir")).expect("mkdir profile dir");
+        std::fs::write(
+            &p,
+            r#"{"tokens":{"access_token":"tok","account_id":"acct"}}"#,
+        )
+        .expect("auth.json");
+    }
+    let first_reply_sent = std::sync::Arc::new(AtomicU64::new(0));
+    let reply_marker = std::sync::Arc::clone(&first_reply_sent);
+    let (base, server) = crate::testutil::serve_endpoints(2, move |_path, i| {
+        if i == 0 {
+            std::thread::sleep(Duration::from_millis(80));
+            reply_marker.store(crate::usage::now_ms(), Ordering::SeqCst);
+        }
+        (200, r#"{"plan_type":"pro"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+
+    super::codex_usage_tick(&completion_order_state());
+
+    crate::usage::clear_codex_usage_url_override();
+    let _ = server.join().expect("listener");
+
+    let second = crate::profile::ProfileName::from("cx2");
+    let cached =
+        super::load_profile_cache::<crate::usage::UsageInfo>(&second, super::USAGE_CACHE_FILE)
+            .expect("the second poll wrote a cache");
+    let stamped = cached.fetched_at.expect("the second poll stamps its cache");
+    let first_reply = first_reply_sent.load(Ordering::SeqCst);
+    assert!(
+        stamped >= first_reply,
+        "the second account's stamp is the poll's own moment ({stamped} >= {first_reply})"
+    );
+}
+
 /// F8/M9 twin (codex flag): a peer holding the state flock past the wait bound
 /// stalls one codex batch once, never once per landing.
 #[test]

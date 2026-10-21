@@ -176,7 +176,7 @@ fn account_selectors_hold_separate_viewports_across_tabs_and_resize() {
             .collect(),
     });
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-    app.profile_cursor = 20;
+    app.profile_cursor.set(20);
     app.overview_cursor = 20;
     term.draw(|f| super::draw(f, &app)).unwrap();
     app.tab = Tab::Setup;
@@ -189,7 +189,7 @@ fn account_selectors_hold_separate_viewports_across_tabs_and_resize() {
         app.usage_selector.offset.get() > 0,
         "usage has its own viewport"
     );
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.overview_cursor = 0;
     app.tab = Tab::Overview;
     term.draw(|f| super::draw(f, &app)).unwrap();
@@ -468,18 +468,23 @@ fn single_line_selectors_page_the_cursor_and_stop_at_the_ends() {
             profiles: profiles.clone(),
         });
         app.tab = tab;
-        app.profile_cursor = 0;
+        app.profile_cursor.set(0);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| super::draw(f, &app)).unwrap();
         // 25 rows (Setup: 25 + `+ new`) at 80x24 leave an 18-row pane, so one
         // page = 17 rows.
         handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
-        assert_eq!(app.profile_cursor, 17, "{name} pages the cursor by 17 rows");
+        assert_eq!(
+            app.profile_cursor.read(),
+            17,
+            "{name} pages the cursor by 17 rows"
+        );
         // Land on the last row and PageDown: it stays.
-        app.profile_cursor = last_row;
+        app.profile_cursor.set(last_row);
         handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
         assert_eq!(
-            app.profile_cursor, last_row,
+            app.profile_cursor.read(),
+            last_row,
             "{name} PageDown stays at the last row"
         );
     }
@@ -690,12 +695,12 @@ fn a_shrunk_selector_restores_its_first_row_and_removes_its_bar() {
             .collect(),
     });
     app.tab = Tab::Usage;
-    app.profile_cursor = 24;
+    app.profile_cursor.set(24);
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
     assert!(app.usage_selector.offset.get() > 0);
     app.config().profiles.truncate(5);
-    app.profile_cursor = 4;
+    app.profile_cursor.set(4);
     term.draw(|f| super::draw(f, &app)).unwrap();
     let lines = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
@@ -1741,7 +1746,7 @@ fn new_form_renders_the_capture_row_and_its_done_state() {
     app.refresh_unsaved_live_login();
     app.tab = Tab::Setup;
     app.config_focus = ConfigFocus::Actions;
-    app.profile_cursor = 0; // the `+ new` form
+    app.profile_cursor.set(0); // the `+ new` form
 
     // Park the cursor on the capture row so its hint renders too.
     app.config_action_cursor = config_rows(&app)
@@ -2497,7 +2502,7 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     // The create form sits past the roster: only `apply preset` is offered
     // (no source account to duplicate or save), but that still means the menu
     // has an item, so the footer keeps advertising `a`.
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     app.config_draft = None;
     let menu = crate::tui::app::build_action_menu(&app);
     assert_eq!(menu.items.len(), 3);
@@ -3247,7 +3252,11 @@ fn the_usage_selector_scrolls_with_two_rows_of_context() {
         term.draw(|f| super::draw(f, &app)).unwrap();
         offsets.push(app.usage_selector.offset.get());
     }
-    assert_eq!(app.profile_cursor, viewport - 1, "each press moved one row");
+    assert_eq!(
+        app.profile_cursor.read(),
+        viewport - 1,
+        "each press moved one row"
+    );
     // Row c keeps rows c+1 and c+2 on screen: the first visible row is at
     // least c + 3 - viewport.
     let expected: Vec<usize> = (0..viewport)
@@ -5344,7 +5353,7 @@ fn forms_and_overview_codex_page_by_hand_pinned_cursors() {
         profiles: profiles.clone(),
     });
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
@@ -6002,6 +6011,7 @@ fn page_never_skips_content() {
                 five_hour: None,
                 seven_day: None,
                 resets: None,
+                fetched_at: None,
             })
             .collect();
         a.tab = Tab::Overview;
@@ -6197,6 +6207,7 @@ fn page_never_skips_content() {
                     .collect(),
                 scoped_len: 12,
                 context: None,
+                row_identity: None,
                 cursor: 0,
                 scroll: std::cell::Cell::new(0),
                 viewport: std::cell::Cell::new(0),
@@ -7125,7 +7136,7 @@ fn save_oauth_beside_provider(extra: &[&Profile], state: AppState) {
 /// The Usage tab's 5h/7d rows for the account at `cursor` on `app`'s frame.
 fn usage_bars_at(app: &mut App, cursor: usize) -> Vec<String> {
     app.tab = crate::tui::app::Tab::Usage;
-    app.profile_cursor = cursor;
+    app.profile_cursor.set(cursor);
     rows_with(&dump(app, 100, 24), &["5h", "7d"])
 }
 
@@ -7447,7 +7458,7 @@ fn the_queue_chip_drops_a_hybrid_canceled_only_in_the_oauth_store() {
     app.auto_start_queue.lock().unwrap().last_open_at = Some(crate::usage::now_epoch_secs());
     app.tab = Tab::Usage;
     let chip = |app: &mut App, cursor: usize| {
-        app.profile_cursor = cursor;
+        app.profile_cursor.set(cursor);
         rows_with(&dump(app, 100, 24), &["usage auto-start"])
     };
     assert_eq!(
@@ -7619,6 +7630,7 @@ fn p1_readings_app() -> App {
                 five_hour: window.clone(),
                 seven_day: window,
                 resets: None,
+                fetched_at: None,
             }
         })
         .collect();
@@ -7771,7 +7783,7 @@ fn usage_bars_keep_two_rounded_decimals_at_every_width() {
             0,
             80,
             [
-                "│                      ││ 5h                                                1% │",
+                "│   cx-bravo           ││ 5h                                                1% │",
                 "│                      ││ 7d                                                1% │",
             ],
         ),
@@ -7779,7 +7791,7 @@ fn usage_bars_keep_two_rounded_decimals_at_every_width() {
             1,
             80,
             [
-                "│                      ││ 5h                                            73.42% │",
+                "│   cx-bravo           ││ 5h                                            73.42% │",
                 "│                      ││ 7d                                            73.42% │",
             ],
         ),
@@ -7787,13 +7799,13 @@ fn usage_bars_keep_two_rounded_decimals_at_every_width() {
             2,
             80,
             [
-                "│                      ││ 5h                                              100% │",
+                "│   cx-bravo           ││ 5h                                              100% │",
                 "│                      ││ 7d                                              100% │",
             ],
         ),
     ];
     for (cursor, w, rows) in want {
-        app.profile_cursor = *cursor;
+        app.profile_cursor.set(*cursor);
         assert_eq!(
             pct_rows(&dump(&app, *w, 40)),
             *rows,

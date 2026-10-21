@@ -727,7 +727,7 @@ fn headless_showcase_renders() {
 
     // Select the profile carrying a populated spend cap. Real accounts return it
     // disabled, so the demo is the only place the guarded spend bar is observable.
-    app.profile_cursor = 1; // personal → work
+    app.profile_cursor.set(1); // personal → work
     term.draw(|f| render::draw(f, &app)).unwrap();
     let work_usage = flatten(&term);
     assert!(
@@ -915,7 +915,11 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Right); // Usage → Tokens
     press(&mut app, KeyCode::Right); // Tokens → Setup
     assert_eq!(app.tab, Tab::Setup);
-    assert_eq!(app.profile_cursor, 1, "cursor carried over from the switch");
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "cursor carried over from the switch"
+    );
     press(&mut app, KeyCode::Down); // 1 → 2 (side-project)
     press(&mut app, KeyCode::Enter); // focus the detail pane
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);

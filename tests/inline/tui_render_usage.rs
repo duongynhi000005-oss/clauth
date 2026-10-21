@@ -3527,7 +3527,7 @@ fn a_stuck_third_party_row_renders_the_pill_ordinal_and_hint() {
         },
         profiles: vec![zai],
     });
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.third_party_streaks
         .lock()
         .unwrap()
@@ -3596,7 +3596,7 @@ fn the_key_rejection_fix_copy_survives_a_narrow_usage_pane() {
         .lock()
         .unwrap()
         .insert("zai".into(), FetchStatus::AuthExpired);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
@@ -3641,7 +3641,7 @@ fn the_oauth_no_login_fix_copy_survives_a_narrow_usage_pane() {
         },
         profiles: vec![oau],
     });
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
@@ -3711,7 +3711,7 @@ fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
             best_effort: true,
         },
     );
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
@@ -3795,7 +3795,8 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
         "scroll reaches the final note"
     );
     assert_eq!(
-        app.profile_cursor, 0,
+        app.profile_cursor.read(),
+        0,
         "detail scrolling keeps the account selected"
     );
     let (selector, detail) = super::master_detail(ratatui::layout::Rect::new(0, 0, 80, 14), 1);
@@ -4364,4 +4365,338 @@ fn a_toast_over_the_note_editor_caret_hides_the_native_cursor() {
         !term.backend().cursor_visible(),
         "the note caret hides under an open modal"
     );
+}
+
+// ── codex and pool accounts on the Usage tab (design record "Settled: usage") ──
+
+/// A pool account with every flag clear and no readings.
+fn t6_pool_account(name: &str) -> crate::gateway_admin::PoolAccount {
+    crate::gateway_admin::PoolAccount {
+        name: name.to_string(),
+        available: true,
+        near_quota: false,
+        cooldown_secs_remaining: None,
+        needs_relogin: false,
+        paused: false,
+        disabled: false,
+        utilization_5h: None,
+        reset_5h: None,
+        utilization_7d: None,
+        reset_7d: None,
+        utilization_7d_oi: None,
+        reset_7d_oi: None,
+        plan: None,
+        status: None,
+    }
+}
+
+/// One claude account `cl1`, one codex account `cx1` (plus, 5h 42%, 7d 12%,
+/// two banked resets, polled 2 h ago) and one pool provider `claude-main`
+/// serving `alpha` (max, 5h 73%, 7d 41%, 7d fable 18%) and `beta` (cooling
+/// down 240 s), the pool listing read 2 min ago; the Usage tab shown.
+fn t6_app() -> App {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+
+    crate::testutil::register_names(&["cl1"]);
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let now = crate::usage::now_epoch_secs();
+    let mut info = crate::usage::map_codex_usage(
+        r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":7230},"secondary_window":{"used_percent":12,"limit_window_seconds":604800,"reset_after_seconds":360000}},"rate_limit_reset_credits":{"available_count":2}}"#,
+        now,
+    )
+    .expect("maps");
+    info.fetched_at = Some(crate::usage::now_ms() - 7_200_000);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("cx1"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &info,
+    );
+
+    let name = ProfileName::from("cl1");
+    let profile = crate::testutil::blank_profile(&name);
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    let now = now as u64;
+    app.shunt_pool = crate::tui::app::ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![
+            PoolAccount {
+                plan: Some("max".to_string()),
+                utilization_5h: Some(0.73),
+                reset_5h: Some(now + 2 * 3600 + 13 * 60),
+                utilization_7d: Some(0.41),
+                reset_7d: Some(now + 4 * 86_400 + 2 * 3600),
+                utilization_7d_oi: Some(0.18),
+                reset_7d_oi: Some(now + 4 * 86_400 + 2 * 3600),
+                ..t6_pool_account("alpha")
+            },
+            PoolAccount {
+                available: false,
+                cooldown_secs_remaining: Some(240),
+                ..t6_pool_account("beta")
+            },
+        ],
+    }]);
+    app.shunt_pool_read_at_ms = Some(crate::usage::now_ms() - 120_000);
+    app.tab = crate::tui::app::Tab::Usage;
+    app
+}
+
+/// The Usage body drawn at 100x24, split into its two panes' inner text rows
+/// (the detail pane opens at the second `╭` of the top border), each row
+/// stripped of border and scrollbar cells and trimmed, trailing blank rows
+/// dropped.
+fn t6_panes(app: &App) -> (Vec<String>, Vec<String>) {
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| draw(f, f.area(), app, &app.readings_snapshot(), &[]))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let top: Vec<char> = rows[0].chars().collect();
+    let split = top
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c == '╭')
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("a selector and a detail pane");
+    let strip = |cells: &[char]| -> String {
+        cells
+            .iter()
+            .collect::<String>()
+            .trim_matches(|c: char| c == '│' || c == '┊' || c == '┃' || c.is_whitespace())
+            .to_string()
+    };
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for row in &rows[1..rows.len() - 1] {
+        let cells: Vec<char> = row.chars().collect();
+        left.push(strip(&cells[..split]));
+        right.push(strip(&cells[split..]));
+    }
+    for pane in [&mut left, &mut right] {
+        while pane.last().is_some_and(|r| r.is_empty()) {
+            pane.pop();
+        }
+    }
+    (left, right)
+}
+
+fn t6_down(app: &mut App) {
+    crate::tui::app::handle_key(
+        app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Down),
+    );
+}
+
+/// The Usage selector is Setup's band list, unfiltered: the claude rows, then
+/// the `codex` band, then one `shunt (<provider>)` band per pool provider, and
+/// no `+ new` row.
+#[test]
+fn the_usage_selector_lists_codex_and_pool_rows_in_their_bands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = t6_app();
+    let (selector, _) = t6_panes(&app);
+    assert_eq!(
+        selector,
+        [
+            "❯ cl1",
+            "",
+            "codex",
+            "cx1",
+            "",
+            "shunt (claude-main)",
+            "alpha",
+            "beta",
+        ],
+        "one band walk, headings never selectable, no + new"
+    );
+}
+
+/// ↓ walks the item rows only (headings and spacers skipped), and wraps from
+/// the last pool row back to the first claude row, whose pane is the claude
+/// one it always was.
+#[test]
+fn the_usage_cursor_walks_every_band_and_wraps() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = t6_app();
+    let selected = |app: &App| {
+        let (selector, _) = t6_panes(app);
+        selector
+            .into_iter()
+            .find(|row| row.starts_with('❯'))
+            .unwrap_or_else(|| panic!("no caret row"))
+    };
+    assert_eq!(selected(&app), "❯ cl1");
+    t6_down(&mut app);
+    assert_eq!(selected(&app), "❯ cx1");
+    t6_down(&mut app);
+    assert_eq!(selected(&app), "❯ alpha");
+    t6_down(&mut app);
+    assert_eq!(selected(&app), "❯ beta");
+    t6_down(&mut app);
+    assert_eq!(
+        selected(&app),
+        "❯ cl1",
+        "↓ on the last row wraps to the first"
+    );
+    assert_eq!(app.profile_cursor.read(), 0);
+    let (_, detail) = t6_panes(&app);
+    assert!(
+        detail.iter().any(|row| row.starts_with("plan"))
+            && !detail.iter().any(|row| row.starts_with("type")),
+        "a claude row keeps the claude pane: {detail:?}"
+    );
+}
+
+/// A codex account's pane: its facts, the read age off the codex poll's own
+/// cache, then the 5h and 7d bars; none of the claude-only rows.
+#[test]
+fn the_usage_codex_pane_shows_its_facts_and_two_windows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = t6_app();
+    t6_down(&mut app);
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        detail[..5],
+        [
+            "type      codex",
+            "plan      plus",
+            "resets    ↺ 2 banked",
+            "status    ◌ read 2h ago",
+            "",
+        ],
+        "facts, then a blank row before the bars: {detail:?}"
+    );
+    assert!(
+        detail[5].starts_with("5h") && detail[5].ends_with("42%"),
+        "the 5h eyebrow: {detail:?}"
+    );
+    assert!(
+        detail[6].contains('█') || detail[6].contains('░'),
+        "the 5h bar: {detail:?}"
+    );
+    assert_eq!(detail[7], "", "a blank between the two windows: {detail:?}");
+    assert!(
+        detail[8].starts_with("7d") && detail[8].ends_with("12%"),
+        "the 7d eyebrow: {detail:?}"
+    );
+    assert!(
+        detail[9].contains('█') || detail[9].contains('░'),
+        "the 7d bar: {detail:?}"
+    );
+    assert_eq!(detail.len(), 10, "nothing after the 7d bar: {detail:?}");
+}
+
+/// A quarantined codex account names it on a `login` row between `plan` and
+/// `resets`; without the quarantine the row is gone (the pane pin above).
+#[test]
+fn a_quarantined_codex_account_shows_its_login_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_store(
+        "cx1",
+        &crate::testutil::codex_auth_body("acc.1", "refresh.cx1"),
+    );
+    crate::codex_auth::quarantine_for_test("cx1", "reused", "refresh.cx1");
+    let mut app = t6_app();
+    t6_down(&mut app);
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        detail[..4],
+        [
+            "type      codex",
+            "plan      plus",
+            "login     [ needs re-login ]",
+            "resets    ↺ 2 banked",
+        ],
+        "{detail:?}"
+    );
+}
+
+/// A pool account's pane: type, family, provider, plan, the listing's read
+/// age, then the 5h, 7d and `7d fable` bars from its own admin row.
+#[test]
+fn the_usage_pool_pane_shows_its_facts_and_three_windows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = t6_app();
+    t6_down(&mut app);
+    t6_down(&mut app);
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        detail[..6],
+        [
+            "type      shunt",
+            "family    claude",
+            "provider  claude-main",
+            "plan      max",
+            "read      2m ago",
+            "",
+        ],
+        "an available account has no status row: {detail:?}"
+    );
+    for (row, label, pct) in [(6, "5h", "73%"), (9, "7d", "41%"), (12, "7d fable", "18%")] {
+        assert!(
+            detail[row].starts_with(label) && detail[row].ends_with(pct),
+            "the {label} eyebrow at row {row}: {detail:?}"
+        );
+        assert!(
+            detail[row + 1].contains('█') || detail[row + 1].contains('░'),
+            "the {label} bar: {detail:?}"
+        );
+    }
+    assert_eq!(detail.len(), 14, "nothing after the fable bar: {detail:?}");
+}
+
+/// A cooling-down pool account carries one `status` pill before its read age.
+#[test]
+fn a_cooling_down_pool_account_shows_its_status_pill() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = t6_app();
+    for _ in 0..3 {
+        t6_down(&mut app);
+    }
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(detail[3], "plan      —", "{detail:?}");
+    assert_eq!(
+        detail[4], "status    [ cooldown ]  4m",
+        "the cooldown pill and its 240 s countdown: {detail:?}"
+    );
+    assert_eq!(detail[5], "read      2m ago", "{detail:?}");
+}
+
+/// The footer offers `n note` on a claude row only: codex and pool accounts
+/// keep no notes.
+#[test]
+fn the_usage_footer_offers_notes_on_claude_rows_only() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = t6_app();
+    let footer = |app: &App| {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+        term.draw(|f| crate::tui::render::draw(f, app))
+            .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer())
+            .pop()
+            .expect("a footer row")
+    };
+    assert!(
+        footer(&app).contains("n note"),
+        "claude row: {}",
+        footer(&app)
+    );
+    t6_down(&mut app);
+    assert!(
+        !footer(&app).contains("note"),
+        "codex row: {}",
+        footer(&app)
+    );
+    t6_down(&mut app);
+    assert!(!footer(&app).contains("note"), "pool row: {}", footer(&app));
 }

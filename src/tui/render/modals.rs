@@ -1624,6 +1624,71 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
     );
 }
 
+/// The Usage help-modal rows, derived from the same per-row predicate set the
+/// footer's hints use ([`super::footer::usage_key_facts`]), so the help never
+/// promises a key the shown row ignores: `n` on claude rows only, `r` where a
+/// re-read exists, `↵` on any item row.
+fn usage_help_rows(app: &App) -> &'static [(&'static str, &'static str)] {
+    use super::footer::{UsageRefresh, usage_key_facts};
+    let facts = usage_key_facts(app);
+    if facts.detail {
+        return match facts.r {
+            Some(UsageRefresh::RefreshAccount) => &[
+                ("\u{2191} \u{2193}", "scroll account detail"),
+                ("esc", "return to account selector"),
+                ("\u{2190}", "return to account selector"),
+                ("r", "refresh account"),
+                ("n", "edit the account's note"),
+                ("e", "toggle estimates"),
+                ("p", "toggle pace marker"),
+            ],
+            Some(UsageRefresh::ReReadPool) => &[
+                ("\u{2191} \u{2193}", "scroll account detail"),
+                ("esc", "return to account selector"),
+                ("\u{2190}", "return to account selector"),
+                ("r", "re-read the pool listing"),
+                ("e", "toggle estimates"),
+                ("p", "toggle pace marker"),
+            ],
+            None => &[
+                ("\u{2191} \u{2193}", "scroll account detail"),
+                ("esc", "return to account selector"),
+                ("\u{2190}", "return to account selector"),
+                ("e", "toggle estimates"),
+                ("p", "toggle pace marker"),
+            ],
+        };
+    }
+    match facts.r {
+        Some(UsageRefresh::RefreshAccount) => &[
+            ("\u{2191} \u{2193}", "pick account to inspect"),
+            ("\u{21b5}", "open account detail"),
+            ("r", "refresh account"),
+            ("n", "edit the account's note"),
+            ("e", "toggle estimates"),
+            ("p", "toggle pace marker"),
+        ],
+        Some(UsageRefresh::ReReadPool) => &[
+            ("\u{2191} \u{2193}", "pick account to inspect"),
+            ("\u{21b5}", "open account detail"),
+            ("r", "re-read the pool listing"),
+            ("e", "toggle estimates"),
+            ("p", "toggle pace marker"),
+        ],
+        None if facts.enter => &[
+            ("\u{2191} \u{2193}", "pick account to inspect"),
+            ("\u{21b5}", "open account detail"),
+            ("e", "toggle estimates"),
+            ("p", "toggle pace marker"),
+        ],
+        None => &[
+            ("\u{2191} \u{2193}", "pick account to inspect"),
+            ("e", "toggle estimates"),
+            ("p", "toggle pace marker"),
+        ],
+    }
+}
+
 /// Per-tab rows for the KEYS help modal, beneath the shared `tabs`/`global`
 /// sections. A standalone builder (not inlined into `draw_help`) so tests can
 /// enumerate every tab's real content without rendering a frame — see
@@ -1638,40 +1703,12 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
                 ("shift \u{2191} \u{2193}", "reorder account up / down"),
             ][..],
         )],
-        // `n` is the note editor only while an account exists to hold one; on
-        // an empty roster the global `n new account` row must survive the
-        // shadow filter below, matching the empty state's `n to create one`.
-        Tab::Usage if app.usage_detail_focus == StatusFocus::Detail => vec![(
-            "usage",
-            &[
-                ("\u{2191} \u{2193}", "scroll account detail"),
-                ("esc", "return to account selector"),
-                ("\u{2190}", "return to account selector"),
-                ("r", "refresh account"),
-                ("n", "edit the account's note"),
-                ("e", "toggle estimates"),
-                ("p", "toggle pace marker"),
-            ][..],
-        )],
-        Tab::Usage if app.profile_count() > 0 => vec![(
-            "usage",
-            &[
-                ("\u{2191} \u{2193}", "pick account to inspect"),
-                ("\u{21b5}", "open account detail"),
-                ("r", "refresh account"),
-                ("n", "edit the account's note"),
-                ("e", "toggle estimates"),
-                ("p", "toggle pace marker"),
-            ][..],
-        )],
-        Tab::Usage => vec![(
-            "usage",
-            &[
-                ("\u{2191} \u{2193}", "pick account to inspect"),
-                ("e", "toggle estimates"),
-                ("p", "toggle pace marker"),
-            ][..],
-        )],
+        // Derived from the same per-row predicate set as the footer's hints
+        // (`usage_key_facts`), so the help never promises a key the shown row
+        // ignores; on an empty roster the section omits `n`, keeping the
+        // global `n new account` row (matching the empty state's `n to create
+        // one`).
+        Tab::Usage => vec![("usage", usage_help_rows(app))],
         Tab::Tokens if app.token_view == TokenView::Dashboard && token_model_count(app) == 0 => {
             vec![(
                 "tokens",
@@ -1944,10 +1981,20 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // A key the current tab redefines is documented in its own section above;
     // keeping the global sense too would contradict it (`t` cycles the period
     // and `r` reloads stats on Tokens, `r` refreshes one account on Usage).
-    let shadowed: Vec<&str> = tab_specific
+    let mut shadowed: Vec<&str> = tab_specific
         .iter()
         .flat_map(|(_, rows)| rows.iter().map(|(k, _)| *k))
         .collect();
+    // On the Usage tab `r` and `n` are redefined for every row (the key
+    // handler routes them per selection), so the global `r refresh usage now`
+    // never applies there, and `n new account` applies only to the empty
+    // roster — the one case the Usage section leaves `n` to the global row.
+    if app.tab == Tab::Usage {
+        shadowed.push("r");
+        if !app.setup_items().is_empty() {
+            shadowed.push("n");
+        }
+    }
     let global: Vec<(&str, &str)> = global_all
         .iter()
         .copied()

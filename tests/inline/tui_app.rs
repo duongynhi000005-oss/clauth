@@ -2089,7 +2089,7 @@ fn config_rows_login_and_delete_creds_visibility() {
     app.config_draft = None;
 
     // OAuth account holding creds → re-login row plus delete-creds row.
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     let rows = config_rows(&app);
     assert!(rows.contains(&ConfigRow::Login), "oauth+creds shows login");
     assert!(
@@ -2098,7 +2098,7 @@ fn config_rows_login_and_delete_creds_visibility() {
     );
 
     // OAuth shell with no creds → login only.
-    app.profile_cursor = 1;
+    app.profile_cursor.set(1);
     let rows = config_rows(&app);
     assert!(rows.contains(&ConfigRow::Login), "oauth blank shows login");
     assert!(
@@ -2107,7 +2107,7 @@ fn config_rows_login_and_delete_creds_visibility() {
     );
 
     // API account with no key → login (re-enter url+key), no log-out yet.
-    app.profile_cursor = 2;
+    app.profile_cursor.set(2);
     let rows = config_rows(&app);
     assert!(rows.contains(&ConfigRow::Login), "api blank shows login");
     assert!(
@@ -2116,7 +2116,7 @@ fn config_rows_login_and_delete_creds_visibility() {
     );
 
     // API account holding a key → login (re-login) plus log-out.
-    app.profile_cursor = 3;
+    app.profile_cursor.set(3);
     let rows = config_rows(&app);
     assert!(rows.contains(&ConfigRow::Login), "api+key shows login");
     assert!(
@@ -2125,7 +2125,7 @@ fn config_rows_login_and_delete_creds_visibility() {
     );
 
     // `+ new` form with an empty base_url buffer → login before create.
-    app.profile_cursor = 4;
+    app.profile_cursor.set(4);
     let rows = config_rows(&app);
     let login_idx = rows
         .iter()
@@ -2168,7 +2168,7 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
         state: AppState::default(),
         profiles: vec![acct],
     });
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = None;
 
     let rows = config_rows(&app);
@@ -2225,7 +2225,7 @@ fn api_relogin_chain_walks_base_url_then_api_key() {
         },
         profiles: vec![api],
     });
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     enter_config_detail(&mut app);
     assert_eq!(app.config_focus, ConfigFocus::Actions);
 
@@ -2308,7 +2308,7 @@ fn api_relogin_chain_keeps_the_cursor_on_the_field_being_typed() {
         profiles: vec![api],
     });
     app.tab = super::Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     enter_config_detail(&mut app);
     app.config_action_cursor = config_rows(&app)
         .iter()
@@ -2396,7 +2396,7 @@ fn rekeying_an_endpoint_drops_the_live_broken_mark_immediately() {
     );
 
     // Re-key through the real producer (the Setup endpoint editor's ⏎).
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     enter_config_detail(&mut app);
     app.config_draft.as_mut().expect("draft").base_url =
         InputState::new("https://api.z.ai/api/anthropic");
@@ -2591,7 +2591,7 @@ fn config_rows_login_tracks_api_mode_when_draft_types_a_base_url() {
     // mode (api key shows), but the login rows type off the stored credential:
     // committing that base url would make this a hybrid, and its OAuth pair stays
     // logged out-able throughout.
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     let mut draft = build_draft_existing(&app, &crate::profile::ProfileName::from("oauth"));
     draft.base_url = InputState::new("https://api.example.com");
     app.config_draft = Some(draft);
@@ -2611,7 +2611,7 @@ fn config_rows_login_tracks_api_mode_when_draft_types_a_base_url() {
 
     // `+ new` form with a typed base url is an API create → no login row (the
     // base url + api key + create rows already stand in for it).
-    app.profile_cursor = 1;
+    app.profile_cursor.set(1);
     let mut draft = build_draft_new();
     draft.base_url = InputState::new("https://api.example.com");
     app.config_draft = Some(draft);
@@ -3853,7 +3853,7 @@ fn commit_endpoint_clears_the_edited_profiles_stale_status_chrome() {
         },
         profiles: vec![zai],
     });
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     // Stale chrome the repair must clear: the dead-key verdict, a deep 429
     // streak, and an OAuth-side status entry (the hybrid's other leg).
     app.third_party_status
@@ -4393,7 +4393,7 @@ fn a_rekey_retires_the_frames_fetch_status_before_the_next_tick() {
     );
 
     // Re-key through the real producer (the Setup endpoint editor's ⏎).
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     enter_config_detail(&mut app);
     app.config_draft.as_mut().expect("draft").base_url = InputState::new("https://new.example.com");
     commit_config_field(&mut app, ConfigRow::BaseUrl);
@@ -4476,7 +4476,7 @@ fn a_poisoned_status_clear_still_retires_the_frames_verdict() {
 
     // Re-key through the real producer (the Setup endpoint editor's ⏎) —
     // the round-6 flash test's exact sequence.
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     enter_config_detail(&mut app);
     app.config_draft.as_mut().expect("draft").base_url = InputState::new("https://new.example.com");
     commit_config_field(&mut app, ConfigRow::BaseUrl);
@@ -4990,7 +4990,7 @@ fn config_rows_hybrid_shows_the_logout_row_for_its_oauth_pair() {
     // credential is the OAuth pair.
     let mut app = app_with(vec![hybrid("hybrid", None)]);
     app.config_draft = None;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     let rows = config_rows(&app);
     assert!(
@@ -5037,7 +5037,7 @@ fn hybrid_login_row_routes_to_the_browser_mint_not_the_api_chain() {
     // the route is observable without minting anything.
     app.login_generation = 1;
     app.login = Some(login_session("other", true, 1));
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     let draft = build_draft_existing(&app, &crate::profile::ProfileName::from("hybrid"));
     app.config_draft = Some(draft);
 
@@ -5158,7 +5158,7 @@ fn committing_a_rename_takes_its_guard_outside_the_config_lock() {
     let _home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("before".to_string(), None, None)]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     let mut draft = build_draft_existing(&app, &crate::profile::ProfileName::from("before"));
     draft.name = super::InputState::new("after");
     app.config_draft = Some(draft);
@@ -5270,7 +5270,7 @@ fn disabled_row_toggle_is_inert_for_the_active_account() {
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
     app.config().state.active_profile = Some("acct".into());
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("acct"),
@@ -5300,7 +5300,7 @@ fn disabled_row_toggle_is_inert_with_a_live_session() {
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
     let _pid_guard = crate::testutil::arm_live_session(home.home(), "acct");
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("acct"),
@@ -5336,7 +5336,7 @@ fn disable_row_arms_on_first_press_confirms_on_second() {
     let _home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("acct"),
@@ -5388,7 +5388,7 @@ fn enable_row_fires_immediately_no_arm() {
     let mut acct = Profile::new("acct".to_string(), None, None);
     acct.disabled = true;
     let mut app = app_with(vec![acct]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("acct"),
@@ -5459,7 +5459,7 @@ fn config_rows_clear_session_token_row_tracks_the_sidecar() {
     acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
     crate::profile::save_profile(&acct).expect("save profile");
     let mut app = app_with(vec![acct]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = None;
 
     assert!(
@@ -5531,7 +5531,7 @@ fn clear_session_token_row_is_inert_without_another_stored_login() {
         .join("session-token.json");
 
     let mut app = app_with(vec![acct]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("acct"),
@@ -5598,7 +5598,7 @@ fn clear_session_token_arms_then_clears_and_relinks_the_active_account() {
 
     let mut app = app_with(vec![acct]);
     make_active(&mut app, "acct");
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("acct"),
@@ -5670,7 +5670,7 @@ fn clear_session_token_on_an_active_api_key_account_reports_the_sign_out() {
 
     let mut app = app_with(vec![acct]);
     make_active(&mut app, "acct");
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("acct"),
@@ -5728,7 +5728,7 @@ fn clear_session_token_on_an_idle_account_leaves_the_live_link_alone() {
 
     let mut app = app_with(vec![live_acct, idle]);
     make_active(&mut app, "live");
-    app.profile_cursor = 1;
+    app.profile_cursor.set(1);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("idle"),
@@ -5802,7 +5802,7 @@ fn clear_session_token_on_a_rolling_profile_disarms_and_takes_the_backup() {
     );
 
     let mut app = app_with(vec![acct]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("roll"),
@@ -5859,7 +5859,7 @@ fn clear_session_token_disarms_a_flag_only_account_with_no_other_login() {
     crate::profile::save_profile(&acct).expect("save profile");
 
     let mut app = app_with(vec![acct]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("solo"),
@@ -5917,7 +5917,7 @@ fn clear_session_token_refuses_when_the_disk_login_is_gone() {
         .expect("profile dir");
 
     let mut app = app_with(vec![acct]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("ghost"),
@@ -5978,7 +5978,7 @@ fn clear_session_token_relinks_before_the_backup_removal_can_fail() {
 
     let mut app = app_with(vec![acct]);
     make_active(&mut app, "mid");
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("mid"),
@@ -6053,7 +6053,7 @@ fn clear_session_token_relinks_the_account_active_on_disk_not_in_the_snapshot() 
 
     let mut app = app_with(vec![acct]);
     make_active(&mut app, "acct");
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("acct"),
@@ -6099,7 +6099,7 @@ fn clear_session_token_keeps_the_flag_when_the_persist_fails() {
         .expect("profile dir");
 
     let mut app = app_with(vec![acct]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("stuck"),
@@ -6166,7 +6166,7 @@ fn clear_session_token_refuses_while_a_rotation_holds_the_profile() {
             .expect("hold the lock");
 
     let mut app = app_with(vec![acct]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("held"),
@@ -6219,7 +6219,7 @@ fn clear_session_token_lands_a_live_stage_before_it_relinks() {
 
     let mut app = app_with(vec![acct]);
     make_active(&mut app, "staged");
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("staged"),
@@ -6257,7 +6257,7 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
     };
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     app.tab = Tab::Overview;
     assert_eq!(
@@ -6313,7 +6313,7 @@ fn every_tab_offers_the_daemon_verb_that_applies() {
     use crate::profile::Profile;
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     let daemon_verbs = |app: &super::App| -> Vec<&'static str> {
         build_action_menu(app)
             .items
@@ -6658,7 +6658,7 @@ fn the_shunt_verb_table_holds_per_state_and_health() {
             },
         }
         let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
-        app.profile_cursor = 0;
+        app.profile_cursor.set(0);
         set_daemon(&mut app, health);
         assert_eq!(app.gateway_state, state, "the fixture reads as {state:?}");
         let shunt_verbs: Vec<&str> = build_action_menu(&app)
@@ -6690,7 +6690,7 @@ fn the_shunt_verb_follows_the_daemon_verb_and_gates_on_in_flight() {
         let home = crate::testutil::HomeSandbox::new();
         crate::testutil::write_daemon_gateway_slot(&home, S::Healthy);
         let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
-        app.profile_cursor = 0;
+        app.profile_cursor.set(0);
         set_daemon(&mut app, DaemonHealth::Fresh);
         for tab in Tab::ALL {
             app.tab = tab;
@@ -7534,7 +7534,7 @@ fn usage_refresh_queues_a_generic_api_key_account() {
     };
 
     // The generic row the fix is about: queued, not toasted away.
-    app.profile_cursor = 2;
+    app.profile_cursor.set(2);
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
     assert!(
         queued(&app).contains(&"litellm".to_string()),
@@ -7544,7 +7544,7 @@ fn usage_refresh_queues_a_generic_api_key_account() {
     assert_eq!(last_toast(&app), "refreshing 'litellm'");
 
     // The two arms that must not move.
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
     assert!(
         queued(&app).contains(&"oauth".to_string()),
@@ -7553,7 +7553,7 @@ fn usage_refresh_queues_a_generic_api_key_account() {
     );
     assert_eq!(last_toast(&app), "refreshing 'oauth'");
 
-    app.profile_cursor = 1;
+    app.profile_cursor.set(1);
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
     assert!(
         queued(&app).contains(&"vendor".to_string()),
@@ -7564,7 +7564,7 @@ fn usage_refresh_queues_a_generic_api_key_account() {
 
     // A keyless endpoint has no credential either leg can fetch with: the
     // toast arm is unchanged for it.
-    app.profile_cursor = 3;
+    app.profile_cursor.set(3);
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
     assert!(
         !queued(&app).contains(&"keyless".to_string()),
@@ -7574,7 +7574,7 @@ fn usage_refresh_queues_a_generic_api_key_account() {
     assert_eq!(last_toast(&app), "'keyless' has no usage to refresh");
 
     // The menu entry rides the same gate.
-    app.profile_cursor = 2;
+    app.profile_cursor.set(2);
     dispatch_action_menu_action(&mut app, ActionMenuAction::RefreshUsage);
     assert_eq!(last_toast(&app), "refreshing 'litellm'");
 }
@@ -7611,7 +7611,7 @@ fn the_provider_console_entry_follows_the_recognised_endpoints() {
 
     // What the entry would OPEN, not just that it is offered: the label alone
     // cannot tell a correct page from a neighbouring plan's.
-    app.profile_cursor = 1;
+    app.profile_cursor.set(1);
     assert_eq!(
         super::focused_provider_console(&app),
         Some(
@@ -7623,14 +7623,14 @@ fn the_provider_console_entry_follows_the_recognised_endpoints() {
     // the api-key row it feeds lives.
     for tab in [Tab::Overview, Tab::Usage, Tab::Setup] {
         app.tab = tab;
-        app.profile_cursor = 1;
+        app.profile_cursor.set(1);
         assert!(
             has_entry(&app),
             "a recognised provider offers it on {tab:?}"
         );
-        app.profile_cursor = 0;
+        app.profile_cursor.set(0);
         assert!(!has_entry(&app), "an oauth account has no page on {tab:?}");
-        app.profile_cursor = 2;
+        app.profile_cursor.set(2);
         assert!(
             !has_entry(&app),
             "an unrecognised endpoint has no page on {tab:?}"
@@ -7648,7 +7648,7 @@ fn picking_the_console_entry_without_a_page_says_so_and_opens_nothing() {
     let _home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("oauth".to_string(), None, None)]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     dispatch_action_menu_action(&mut app, ActionMenuAction::OpenProviderConsole);
 
     let toast = app.toasts.back().expect("the pick answers");
@@ -7671,7 +7671,7 @@ fn disabling_from_an_account_tab_confirms_first_while_enabling_is_immediate() {
     crate::profile::save_profile(&acct).expect("save profile");
     let mut app = app_with(vec![acct]);
     app.tab = Tab::Overview;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::DisableProfile);
     assert!(
@@ -7726,7 +7726,7 @@ fn disabling_the_active_account_from_a_menu_says_why_instead_of_no_opping() {
         profiles: vec![acct],
     });
     app.tab = Tab::Overview;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::DisableProfile);
     assert!(app.modals.is_empty(), "a gated pick arms no confirm");
@@ -7801,7 +7801,7 @@ fn rotate_tokens_with_live_session_arms_the_rotate_confirm() {
     let home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     let _pid_guard = crate::testutil::arm_live_session(home.home(), "busy");
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
@@ -7833,7 +7833,7 @@ fn rotate_tokens_with_live_session_arms_an_acknowledge_notice_on_macos() {
     let home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     let _pid_guard = crate::testutil::arm_live_session(home.home(), "busy");
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
@@ -7875,7 +7875,7 @@ fn confirming_a_rotate_under_a_live_session_is_refused_on_macos() {
     let home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     let _pid_guard = crate::testutil::arm_live_session(home.home(), "busy");
 
     run_confirm_action(&mut app, ConfirmAction::RotateOne("busy".to_string()));
@@ -7926,7 +7926,7 @@ fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
     let home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     let _pid_guard = crate::testutil::arm_live_session(home.home(), "busy");
 
     run_confirm_action(&mut app, ConfirmAction::RotateOne("busy".to_string()));
@@ -7999,7 +7999,7 @@ fn rotate_tokens_without_live_session_arms_rotate_confirm() {
     let _home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("idle".to_string(), None, None)]);
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
     let confirm = app
@@ -8174,7 +8174,7 @@ fn login_result_on_the_new_form_stashes_into_the_draft() {
         state: AppState::default(),
         profiles: vec![],
     });
-    app.profile_cursor = 0; // == profile_count() → the `+ new` form
+    app.profile_cursor.set(0); // == profile_count() → the `+ new` form
     let mut draft = build_draft_new();
     draft.name = InputState::new("fresh");
     app.config_draft = Some(draft);
@@ -8230,7 +8230,7 @@ fn relogin_on_a_stashed_new_form_confirms_before_replacing_the_stash() {
         state: AppState::default(),
         profiles: vec![],
     });
-    app.profile_cursor = 0; // the `+ new` form
+    app.profile_cursor.set(0); // the `+ new` form
     let mut draft = build_draft_new();
     draft.name = InputState::new("fresh");
     // A mint already captured → the `✓ logged in` done-state row.
@@ -8304,7 +8304,7 @@ fn commit_new_account_consumes_the_draft_mint() {
         state: AppState::default(),
         profiles: vec![],
     });
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     let mut draft = build_draft_new();
     draft.name = InputState::new("fresh");
     draft.model = InputState::new("opus");
@@ -8361,7 +8361,7 @@ fn commit_new_account_seeds_the_probe_plan() {
         state: AppState::default(),
         profiles: vec![],
     });
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     let mut draft = build_draft_new();
     draft.name = InputState::new("fresh");
     draft.model = InputState::new("opus");
@@ -8408,7 +8408,7 @@ fn capture_row_stashes_and_create_account_commits() {
     plain_live_login("live-refresh");
     let mut app = bare_app();
     app.refresh_unsaved_live_login();
-    app.profile_cursor = 0; // the `+ new` form
+    app.profile_cursor.set(0); // the `+ new` form
     let mut draft = build_draft_new();
     draft.name = InputState::new("work");
     draft.model = InputState::new("sonnet");
@@ -8481,7 +8481,7 @@ fn capture_row_over_an_owned_live_login_refuses() {
             .push(stored_oauth_profile("owner", far_future()));
     }
     app.unsaved_live_login = true; // stale: the state the row was rendered on
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_new());
     app.config_focus = ConfigFocus::Actions;
 
@@ -8513,7 +8513,7 @@ fn capture_row_with_nothing_live_refuses() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.unsaved_live_login = true; // stale
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(build_draft_new());
     app.config_focus = ConfigFocus::Actions;
 
@@ -8546,7 +8546,7 @@ fn capture_row_over_a_stashed_mint_confirms_first() {
     plain_live_login("live-refresh");
     let mut app = bare_app();
     app.refresh_unsaved_live_login();
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     let mut draft = build_draft_new();
     draft.name = InputState::new("fresh");
     draft.captured_login = Some(DraftLogin::Mint(Box::new(login_outcome(
@@ -8607,7 +8607,7 @@ fn login_row_over_a_stashed_live_login_confirms_first() {
         state: AppState::default(),
         profiles: vec![],
     });
-    app.profile_cursor = 0; // the `+ new` form
+    app.profile_cursor.set(0); // the `+ new` form
     let mut draft = build_draft_new();
     draft.name = InputState::new("fresh");
     draft.captured_login = Some(DraftLogin::LiveLogin(Box::new(CaptureSnapshot {
@@ -11475,7 +11475,7 @@ mod env_editor {
 
     fn enter_detail(app: &mut App) {
         app.tab = Tab::Setup;
-        app.profile_cursor = 0;
+        app.profile_cursor.set(0);
         super::super::enter_config_detail(app);
         assert_eq!(app.config_focus, ConfigFocus::Actions);
     }
@@ -12397,14 +12397,14 @@ fn focused_account_types_the_hybrid_on_its_credential() {
         profiles: vec![hybrid, api_key_only],
     });
 
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     assert_eq!(
         focused_account(&app),
         Some((crate::profile::ProfileName::from("hybrid"), true, true)),
         "a stored pair is rotatable no matter where requests route"
     );
 
-    app.profile_cursor = 1;
+    app.profile_cursor.set(1);
     assert_eq!(
         focused_account(&app),
         Some((crate::profile::ProfileName::from("apikey"), false, true)),
@@ -13473,7 +13473,7 @@ fn usage_read_only_detail_keys_keep_account_and_return_to_selector() {
     });
     app.tab = Tab::Usage;
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    assert_eq!(app.profile_cursor, 1, "at rest ↓ changes account");
+    assert_eq!(app.profile_cursor.read(), 1, "at rest ↓ changes account");
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(app.usage_detail_focus, StatusFocus::Detail);
     app.usage_detail_max_scroll.set(20);
@@ -13486,14 +13486,19 @@ fn usage_read_only_detail_keys_keep_account_and_return_to_selector() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(app.usage_detail_scroll, 8, "↓ scrolls one real detail line");
     assert_eq!(
-        app.profile_cursor, 1,
+        app.profile_cursor.read(),
+        1,
         "detail scroll does not change account"
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Left));
     assert_eq!(app.usage_detail_focus, StatusFocus::List);
     assert_eq!(app.tab, Tab::Usage, "← ascends rather than switching tabs");
     handle_key(&mut app, crate::testutil::key(KeyCode::Up));
-    assert_eq!(app.profile_cursor, 0, "↑ once again selects accounts");
+    assert_eq!(
+        app.profile_cursor.read(),
+        0,
+        "↑ once again selects accounts"
+    );
 }
 
 #[test]
@@ -13851,7 +13856,7 @@ fn new_form_capture_row_tracks_an_unsaved_live_login() {
     use super::{ConfigRow, build_draft_new, config_rows};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
-    app.profile_cursor = 0; // == profile_count() → the `+ new` form
+    app.profile_cursor.set(0); // == profile_count() → the `+ new` form
 
     // Nothing live: no row (the flag starts false — no login exists).
     assert!(
@@ -14132,7 +14137,7 @@ mod new_account_model_row {
 
     fn enter_new_account_form(app: &mut App) {
         app.tab = Tab::Setup;
-        app.profile_cursor = app.profile_count(); // trailing "+ new" row
+        app.profile_cursor.set(app.profile_count()); // trailing "+ new" row
         enter_config_detail(app);
         assert_eq!(app.config_focus, ConfigFocus::Actions);
         assert_eq!(
@@ -16210,7 +16215,7 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     for focus in [ConfigFocus::Profiles, ConfigFocus::Actions] {
         app.config_focus = focus;
@@ -16235,7 +16240,7 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
 
     // `+ new` sits past the roster: only `apply preset` is offered, scoped to
     // the draft (no context name until the user types one).
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     let menu = build_action_menu(&app);
     assert_eq!(
         menu.items
@@ -16264,7 +16269,7 @@ fn apply_preset_on_new_row_stamps_the_draft_buffers() {
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     app.config_draft = Some(super::build_draft_new());
 
     // Open the picker (cursor 0 = DeepSeek built-in), press Enter to pick it.
@@ -16329,7 +16334,7 @@ fn a_saved_file_in_a_builtins_slot_applies_the_file_and_opens_its_delete_confirm
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
     for _ in 0..pick {
@@ -16398,7 +16403,7 @@ fn delete_confirm_on_a_vanished_saved_preset_reports_it_gone() {
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
     for _ in 0..pick {
@@ -16464,7 +16469,7 @@ fn typed_draft_on_custom_preset() -> super::App {
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     let mut draft = super::build_draft_new();
     draft.base_url = super::InputState::new("https://typed.example/anthropic");
     draft.model = super::InputState::new("typed-default");
@@ -16558,7 +16563,7 @@ fn apply_preset_on_new_names_the_typed_buffers_it_replaces() {
 
     let mut app = app_with(vec![]);
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     let mut draft = super::build_draft_new();
     draft.opus_model = super::InputState::new("my-opus");
     app.config_draft = Some(draft);
@@ -16593,7 +16598,7 @@ fn create_saves_every_model_buffer_into_its_own_row() {
     use crate::profile::{ModelSettings, ProfileName};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![]);
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     let mut draft = super::build_draft_new();
     draft.name = super::InputState::new("six");
     draft.model = super::InputState::new("m-default");
@@ -16628,7 +16633,7 @@ fn a_captured_login_on_another_endpoint_drops_the_typed_model_rows() {
     use crate::profile::{ModelSettings, ProfileName};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![]);
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     let mut draft = super::build_draft_new();
     draft.name = super::InputState::new("cap");
     draft.base_url = super::InputState::new("https://api.deepseek.com/anthropic");
@@ -16668,7 +16673,7 @@ fn a_preset_stamped_on_new_reaches_the_created_account_whole() {
 
     let mut app = app_with(vec![]);
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     let mut draft = super::build_draft_new();
     draft.name = super::InputState::new("fresh");
     app.config_draft = Some(draft);
@@ -16727,7 +16732,7 @@ fn apply_preset_on_new_never_confirms_against_a_saved_namesake() {
     crate::profile::save_profile(&acct).expect("save acct");
     let mut app = app_with(vec![acct]);
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     let mut draft = super::build_draft_new();
     draft.name = super::InputState::new("acct");
     app.config_draft = Some(draft);
@@ -16789,7 +16794,7 @@ fn duplicate_copies_the_settings_and_leaves_the_login_and_the_radios_behind() {
 
     let mut app = app_with(vec![src]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::Duplicate);
     assert!(
@@ -16852,7 +16857,7 @@ fn duplicate_refuses_a_name_already_on_the_roster() {
     .expect("save roster");
     let mut app = app_with(vec![src, Profile::new("taken".to_string(), None, None)]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::Duplicate);
     for ch in "taken".chars() {
@@ -16897,7 +16902,7 @@ fn a_saved_preset_applies_onto_another_account() {
 
     let mut app = app_with(vec![src, target]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::SaveAsPreset);
     for ch in "mine".chars() {
@@ -16913,7 +16918,7 @@ fn a_saved_preset_applies_onto_another_account() {
 
     // Apply it onto the blank second account: nothing is set there, so no
     // warning stands between the pick and the write.
-    app.profile_cursor = 1;
+    app.profile_cursor.set(1);
     dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
     let Some(Modal::PresetPicker(picker)) = app.modals.last() else {
         panic!("apply opens the picker");
@@ -16970,7 +16975,7 @@ fn preset_apply_target() -> super::App {
 
     let mut app = app_with(vec![target]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // cursor 0 = DeepSeek
     app
@@ -17119,7 +17124,7 @@ fn a_new_account_stamp_stays_on_the_draft_when_the_roster_grows() {
 
     let mut app = app_with(vec![]);
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     let mut draft = super::build_draft_new();
     draft.name = super::InputState::new("late");
     app.config_draft = Some(draft);
@@ -17219,7 +17224,7 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
     crate::profile::save_profile(&target).expect("save target");
     let mut app = app_with(vec![target]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // cursor 0 = DeepSeek
@@ -17264,7 +17269,7 @@ fn a_preset_applied_from_the_open_detail_pane_keeps_the_cursor_on_its_row() {
 
     let mut app = app_with(vec![target]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::enter_config_detail(&mut app);
     let before = config_rows(&app);
     app.config_action_cursor = before
@@ -17307,7 +17312,7 @@ fn saving_a_preset_guards_both_an_existing_name_and_a_builtin() {
     crate::profile::save_profile(&src).expect("save source");
     let mut app = app_with(vec![src]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     let type_name = |app: &mut super::App, name: &str| {
         dispatch_action_menu_action(app, ActionMenuAction::SaveAsPreset);
@@ -17366,7 +17371,7 @@ fn d_on_a_builtin_keeps_the_picker_on_a_custom_pops_it() {
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
 
     // Cursor 0 = DeepSeek built-in. `d` toasts and keeps the picker mounted.
     dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
@@ -20592,7 +20597,7 @@ fn config_rows_on_the_new_form_carry_one_login_row() {
     use super::{ConfigRow, build_draft_new, config_rows};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![]);
-    app.profile_cursor = 0; // == profile_count() → the `+ new` form
+    app.profile_cursor.set(0); // == profile_count() → the `+ new` form
     app.config_draft = Some(build_draft_new());
     app.unsaved_live_login = false;
 
@@ -20727,6 +20732,8 @@ fn pool_rows_app() -> App {
         reset_5h: None,
         utilization_7d: None,
         reset_7d: None,
+        utilization_7d_oi: None,
+        reset_7d_oi: None,
         plan: None,
         status: None,
     };
@@ -21085,21 +21092,33 @@ fn a_claude_row_survives_the_filter_round_trip() {
     ));
 }
 
-/// The pool read polls only while the Overview tab shows.
+/// The pool read polls every 10 s while the Overview, Setup or Usage tab shows
+/// (so a Usage pool row's countdown and bars stay fresh), and not elsewhere.
 #[test]
-fn the_pool_read_polls_only_while_the_overview_shows() {
+fn the_pool_read_polls_while_a_pool_row_is_visible() {
     let _home = crate::testutil::HomeSandbox::new();
     POOL_PROBE_CALLS.store(0, Ordering::SeqCst);
+    POOL_PROBE_NOTREAD.store(false, Ordering::SeqCst);
     let mut app = pool_rows_app();
     app.shunt_pool_probe.prober = Some(counting_pool_probe);
     app.last_shunt_pool_refresh = None;
-    app.tab = Tab::Usage;
+    app.tab = Tab::Tokens;
     super::poll_shunt_pool(&mut app);
     super::join_test_workers();
     assert_eq!(
         POOL_PROBE_CALLS.load(Ordering::SeqCst),
         0,
-        "off the Overview no read starts"
+        "off a pool tab no read starts"
+    );
+    app.tab = Tab::Usage;
+    app.last_shunt_pool_refresh = None;
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        POOL_PROBE_CALLS.load(Ordering::SeqCst),
+        1,
+        "on the Usage tab the read starts"
     );
     app.tab = Tab::Overview;
     app.last_shunt_pool_refresh = None;
@@ -21108,8 +21127,738 @@ fn the_pool_read_polls_only_while_the_overview_shows() {
     super::drain_shunt_pool_probe(&mut app);
     assert_eq!(
         POOL_PROBE_CALLS.load(Ordering::SeqCst),
+        2,
+        "on the Overview the read starts too"
+    );
+}
+
+/// `a` on a Usage pool row builds its scoped group from Usage's own row, and
+/// the pick opened through the production keys names that same row — never the
+/// Overview cursor's (F1). One case with the Overview cursor on a DIFFERENT
+/// pool row, one with it on a claude row.
+#[test]
+fn a_usage_pool_remove_targets_the_usage_row() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let confirm_message = |app: &App| match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.message.clone(),
+        _ => "<no modal>".to_string(),
+    };
+    let remove_hotkey = |app: &App| {
+        let menu = super::build_action_menu(app);
+        let remove_at = menu
+            .items
+            .iter()
+            .position(|i| i.label == "remove")
+            .expect("the menu offers remove");
+        menu.items[remove_at].hotkey.expect("remove has a hotkey")
+    };
+
+    // Overview cursor on a different pool row (cx-work); Usage sits on alpha.
+    let mut app = pool_rows_app();
+    app.overview_cursor = 2;
+    app.tab = Tab::Usage;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_pool_pair(), Some((0, 0)), "Usage sits on alpha");
+    assert_eq!(
+        super::build_action_menu(&app).context.as_deref(),
+        Some("alpha"),
+        "the scoped group names the Usage row"
+    );
+    let hotkey = remove_hotkey(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    assert_eq!(
+        confirm_message(&app),
+        "remove alpha?",
+        "the confirm names the Usage row"
+    );
+
+    // Overview cursor on a claude row: the pick still opens alpha's confirm.
+    let mut app = pool_rows_app();
+    app.overview_cursor = 0;
+    app.tab = Tab::Usage;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_pool_pair(), Some((0, 0)), "Usage sits on alpha");
+    let hotkey = remove_hotkey(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    assert_eq!(
+        confirm_message(&app),
+        "remove alpha?",
+        "the confirm names the Usage row"
+    );
+}
+
+/// A Usage `a` menu built for `alpha` whose row drops from a relist before the
+/// pick acts on nothing — no `remove` confirm for the neighbour — and toasts
+/// that the account left the listing (G2, driven through the identity the menu
+/// stored).
+#[test]
+fn a_usage_pool_menu_pick_after_the_row_drops_acts_on_nothing() {
+    use super::{ActionMenuAction, ToastKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.shunt_pool = one_provider_pool(&["alpha", "beta"]);
+    app.tab = Tab::Usage;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let menu = super::build_action_menu(&app);
+    assert_eq!(
+        menu.context.as_deref(),
+        Some("alpha"),
+        "the menu names the Usage row"
+    );
+    app.shunt_pool = one_provider_pool(&["beta"]);
+    app.rehome_usage_selection();
+    super::dispatch_menu_pick(
+        &mut app,
+        ActionMenuAction::RemovePoolAccount,
+        menu.row_identity.clone(),
+    );
+    assert!(app.modals.is_empty(), "no modal opens for a dropped row");
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Info && t.body == super::POOL_ROW_GONE),
+        "the pick toasts that the account left the listing: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// The Overview twin: a menu built for `alpha` whose row drops before the pick
+/// acts on nothing and toasts (G2).
+#[test]
+fn an_overview_pool_menu_pick_after_the_row_drops_acts_on_nothing() {
+    use super::{ActionMenuAction, ToastKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.shunt_pool = one_provider_pool(&["alpha", "beta"]);
+    app.tab = Tab::Overview;
+    app.overview_cursor = 0;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let menu = super::build_action_menu(&app);
+    assert_eq!(
+        menu.context.as_deref(),
+        Some("alpha"),
+        "the menu names the Overview row"
+    );
+    app.shunt_pool = one_provider_pool(&["beta"]);
+    app.place_overview_cursor();
+    super::dispatch_menu_pick(
+        &mut app,
+        ActionMenuAction::RemovePoolAccount,
+        menu.row_identity.clone(),
+    );
+    assert!(app.modals.is_empty(), "no modal opens for a dropped row");
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Info && t.body == super::POOL_ROW_GONE),
+        "the pick toasts that the account left the listing: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A Usage descend adopts the shown row: a pool row hidden by an unread
+/// listing puts the selection on the claude row and holds the pool identity;
+/// `↵` on that row replaces the held identity, so the read's return keeps the
+/// claude row (F2, Setup's rule).
+#[test]
+fn a_usage_descend_replaces_the_held_pool_identity() {
+    use super::{MainItemKind, SetupSelection, StatusFocus};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.tab = Tab::Usage;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_pool_pair(), Some((0, 0)));
+    let read = app.shunt_pool.clone();
+    app.shunt_pool = super::ShuntPool::NotRead("down".to_string());
+    app.rehome_usage_selection();
+    assert!(app.usage.remembered.is_some(), "hidden but held");
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(0))
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.usage_detail_focus, StatusFocus::Detail, "descended");
+    app.shunt_pool = read;
+    app.rehome_usage_selection();
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(0)),
+        "a descend adopted the shown row (Setup's rule)"
+    );
+}
+
+/// Opening the note editor on a claude row replaces a held-but-hidden Usage
+/// pool identity the same way a descend does (F2's note-editor variant).
+#[test]
+fn opening_the_note_editor_replaces_the_held_pool_identity() {
+    use super::{MainItemKind, SetupSelection};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.tab = Tab::Usage;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_pool_pair(), Some((0, 0)));
+    let read = app.shunt_pool.clone();
+    app.shunt_pool = super::ShuntPool::NotRead("down".to_string());
+    app.rehome_usage_selection();
+    assert!(app.usage.remembered.is_some(), "hidden but held");
+    // `n` opens the editor on the claude row and adopts it.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert!(app.note_editor.is_some(), "the note editor opened");
+    app.shunt_pool = read;
+    app.rehome_usage_selection();
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(0)),
+        "opening the note editor adopted the shown row"
+    );
+}
+
+/// Two claude rows (`a`, `b`) over the pool listing: the G1 fixture, where a
+/// shared-claude-cursor move can carry the cursor off the row a hidden Usage
+/// or Setup pool identity showed.
+fn t6_two_claude_pool_app() -> App {
+    let app = pool_rows_app();
+    {
+        let mut cfg = app.config();
+        let b = crate::profile::ProfileName::from("b");
+        cfg.profiles.push(crate::testutil::blank_profile(&b));
+        cfg.state.profiles.push(b.clone());
+        cfg.state.fallback_chain = vec![crate::profile::ProfileName::from("a"), b];
+    }
+    app
+}
+
+/// Shared-cursor move on the Fallback tab (via the Fallback `↓` key) while a
+/// Usage/Setup pool identity is held: the moved cursor (b) becomes the
+/// selection; the held pool row does not restore over it (G1).
+fn t6_fallback_move_then_return(kind_usage: bool) -> (super::SetupSelection, usize) {
+    let mut app = t6_two_claude_pool_app();
+    let tab = if kind_usage { Tab::Usage } else { Tab::Setup };
+    super::switch_tab(&mut app, tab);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let on_alpha = if kind_usage {
+        app.usage_pool_pair()
+    } else {
+        app.setup_pool_pair()
+    };
+    assert_eq!(on_alpha, Some((0, 0)), "sits on alpha");
+    let read = app.shunt_pool.clone();
+    app.shunt_pool = super::ShuntPool::NotRead("down".to_string());
+    if kind_usage {
+        app.rehome_usage_selection()
+    } else {
+        app.rehome_setup_selection()
+    }
+    let shown = if kind_usage {
+        app.usage_selection()
+    } else {
+        app.setup_selection()
+    };
+    assert_eq!(
+        shown,
+        super::SetupSelection::Item(super::MainItemKind::Profile(0)),
+        "hidden: first row"
+    );
+    super::switch_tab(&mut app, Tab::Fallback);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.profile_cursor.read(),
         1,
-        "on the Overview the read starts"
+        "the Fallback tab moved the shared claude cursor to b"
+    );
+    app.shunt_pool = read;
+    super::switch_tab(&mut app, tab);
+    let sel = if kind_usage {
+        app.usage_selection()
+    } else {
+        app.setup_selection()
+    };
+    (sel, app.profile_cursor.read())
+}
+
+/// A Fallback-tab cursor move while a Usage pool identity is held: the moved
+/// shared cursor (b) is the selection when the read returns, never the held
+/// pool row (G1, driven through the Fallback ↓ key).
+#[test]
+fn the_fallback_cursor_move_replaces_the_held_usage_identity() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (sel, cursor) = t6_fallback_move_then_return(true);
+    assert_eq!(
+        sel,
+        super::SetupSelection::Item(super::MainItemKind::Profile(1)),
+        "the moved shared cursor (b) is the selection, cursor={cursor}"
+    );
+}
+
+/// The Setup twin: a held Setup pool row no longer comes back after a
+/// Fallback-tab move (the lead's call, 2026-10-21).
+#[test]
+fn the_fallback_cursor_move_replaces_the_held_setup_identity() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (sel, cursor) = t6_fallback_move_then_return(false);
+    assert_eq!(
+        sel,
+        super::SetupSelection::Item(super::MainItemKind::Profile(1)),
+        "the moved shared cursor (b) is the selection, cursor={cursor}"
+    );
+}
+
+/// `n`'s new-account landing while a Usage pool identity is held moves the
+/// shared claude cursor to `+ new`; when the read returns the selection is the
+/// last claude row, never the held pool row (G1's create writer, through the
+/// `n` key).
+#[test]
+fn a_new_account_landing_replaces_the_held_usage_identity() {
+    use super::{MainItemKind, SetupSelection};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = t6_two_claude_pool_app();
+    super::switch_tab(&mut app, Tab::Usage);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_pool_pair(), Some((0, 0)), "sits on alpha");
+    let read = app.shunt_pool.clone();
+    app.shunt_pool = super::ShuntPool::NotRead("down".to_string());
+    app.rehome_usage_selection();
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(0)),
+        "hidden: first row"
+    );
+    super::switch_tab(&mut app, Tab::Overview);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert_eq!(
+        app.profile_cursor.read(),
+        2,
+        "`n` moved the shared cursor to + new"
+    );
+    app.shunt_pool = read;
+    super::switch_tab(&mut app, Tab::Usage);
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(1)),
+        "the + new landing replaced the held identity (b is the selection)"
+    );
+}
+
+/// Hide `alpha` on `tab` (the fallback shows claude `a`), run `mover`, which
+/// carries the shared claude cursor to `b` and back to `a` while `tab` is
+/// hidden, let the read return, re-enter `tab`: the selection the user moved
+/// through, never the held pool row (review r3 H1, a round trip the state
+/// compare cannot see).
+fn t6_round_trip_then_return(tab: Tab, mover: fn(&mut App)) -> super::SetupSelection {
+    let mut app = t6_two_claude_pool_app();
+    super::switch_tab(&mut app, tab);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let on_alpha = if tab == Tab::Usage {
+        app.usage_pool_pair()
+    } else {
+        app.setup_pool_pair()
+    };
+    assert_eq!(on_alpha, Some((0, 0)), "sits on alpha");
+    let read = app.shunt_pool.clone();
+    app.shunt_pool = super::ShuntPool::NotRead("down".to_string());
+    if tab == Tab::Usage {
+        app.rehome_usage_selection()
+    } else {
+        app.rehome_setup_selection()
+    }
+    mover(&mut app);
+    assert_eq!(
+        app.profile_cursor.read(),
+        0,
+        "the round trip ends back on a"
+    );
+    app.shunt_pool = read;
+    super::switch_tab(&mut app, tab);
+    if tab == Tab::Usage {
+        app.usage_selection()
+    } else {
+        app.setup_selection()
+    }
+}
+
+fn t6_setup_round_trip(app: &mut App) {
+    super::switch_tab(app, Tab::Setup);
+    super::handle_key(app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "Setup ↓ moved the shared cursor to b"
+    );
+    super::handle_key(app, crate::testutil::key(KeyCode::Up));
+}
+
+fn t6_fallback_round_trip(app: &mut App) {
+    super::switch_tab(app, Tab::Fallback);
+    super::handle_key(app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "Fallback ↓ moved the shared cursor to b"
+    );
+    super::handle_key(app, crate::testutil::key(KeyCode::Up));
+}
+
+fn t6_usage_round_trip(app: &mut App) {
+    super::switch_tab(app, Tab::Usage);
+    super::handle_key(app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "Usage ↓ moved the shared cursor to b"
+    );
+    super::handle_key(app, crate::testutil::key(KeyCode::Up));
+}
+
+/// Usage holds a hidden `alpha`; Setup `↓↑` moves the shared cursor away and
+/// back: the held row stays gone (H1 A1).
+#[test]
+fn a_setup_round_trip_keeps_the_held_usage_row_gone() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        t6_round_trip_then_return(Tab::Usage, t6_setup_round_trip),
+        super::SetupSelection::Item(super::MainItemKind::Profile(0)),
+        "the user moved off and back: the held pool row does not return"
+    );
+}
+
+/// Usage holds a hidden `alpha`; the Fallback chain `↓↑` moves the shared
+/// cursor away and back: the held row stays gone (H1 A2).
+#[test]
+fn a_fallback_round_trip_keeps_the_held_usage_row_gone() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        t6_round_trip_then_return(Tab::Usage, t6_fallback_round_trip),
+        super::SetupSelection::Item(super::MainItemKind::Profile(0)),
+        "the user moved off and back: the held pool row does not return"
+    );
+}
+
+/// Setup holds a hidden `alpha`; Usage `↓↑` moves the shared cursor away and
+/// back: the held row stays gone (H1 A3).
+#[test]
+fn a_usage_round_trip_keeps_the_held_setup_row_gone() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        t6_round_trip_then_return(Tab::Setup, t6_usage_round_trip),
+        super::SetupSelection::Item(super::MainItemKind::Profile(0)),
+        "the user moved off and back: the held pool row does not return"
+    );
+}
+
+/// A pool-only roster (no claude, no codex row) on `tab` holds `cx-work`; the
+/// listing goes unread and returns unchanged with no move in between: the held
+/// row comes back (review r3 H2: the shown selection recorded at hide time
+/// shifts as the list regrows).
+fn t6_pool_only_regrow(tab: Tab) -> super::SetupSelection {
+    let mut app = pool_rows_app();
+    {
+        let mut cfg = app.config();
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+    }
+    app.profile_cursor.set(0);
+    super::switch_tab(&mut app, tab);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    if tab == Tab::Setup {
+        // Setup opens on `+ new` here (no claude row): ↓ wraps to alpha first.
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    let on = if tab == Tab::Usage {
+        app.usage_pool_pair()
+    } else {
+        app.setup_pool_pair()
+    };
+    assert_eq!(on, Some((1, 0)), "sits on cx-work");
+    let read = app.shunt_pool.clone();
+    app.shunt_pool = super::ShuntPool::NotRead("down".to_string());
+    if tab == Tab::Usage {
+        app.rehome_usage_selection()
+    } else {
+        app.rehome_setup_selection()
+    }
+    app.shunt_pool = read;
+    if tab == Tab::Usage {
+        app.rehome_usage_selection();
+        app.usage_selection()
+    } else {
+        app.rehome_setup_selection();
+        app.setup_selection()
+    }
+}
+
+#[test]
+fn a_pool_only_usage_hold_returns_after_the_listing_regrows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        t6_pool_only_regrow(Tab::Usage),
+        super::SetupSelection::Item(super::MainItemKind::Shunt(1, 0)),
+        "no move happened: the held cx-work returns"
+    );
+}
+
+#[test]
+fn a_pool_only_setup_hold_returns_after_the_listing_regrows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        t6_pool_only_regrow(Tab::Setup),
+        super::SetupSelection::Item(super::MainItemKind::Shunt(1, 0)),
+        "no move happened: the held cx-work returns"
+    );
+}
+
+/// The Usage pool `remove` picked through the production keys (`a`, then the
+/// item's hotkey, then `a`, the cursor walk and `↵`): each opens the confirm
+/// for the Usage row (review r3 H4: the menu's own identity capture on Usage
+/// and the `↵` site's capture, which the handler-level tests skip).
+#[test]
+fn a_usage_pool_remove_through_the_keys_targets_the_usage_row() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let confirm_message = |app: &App| match app.modals.last() {
+        Some(super::Modal::Confirm(s)) => s.message.clone(),
+        _ => "<no modal>".to_string(),
+    };
+    let mut app = pool_rows_app();
+    app.tab = Tab::Usage;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_pool_pair(), Some((0, 0)), "Usage sits on alpha");
+    let menu = super::build_action_menu(&app);
+    let remove_at = menu
+        .items
+        .iter()
+        .position(|i| i.label == "remove")
+        .expect("the menu offers remove");
+    let hotkey = menu.items[remove_at].hotkey.expect("remove has a hotkey");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    assert_eq!(confirm_message(&app), "remove alpha?", "the hotkey pick");
+
+    app.pop_modal();
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    for _ in 0..remove_at {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(confirm_message(&app), "remove alpha?", "the ↵ pick");
+}
+
+/// A claude row's menu opened on `b`; before the pick, a state reload drops
+/// `a` (another clauth process deleted it), which leaves the shared cursor's
+/// index on `c`. The pick acts on `b`, the row the menu named, never on `c`
+/// (review r3 H3: the claude picks re-read the cursor at dispatch).
+fn t6_claude_pick_after_a_reload(tab: Tab) -> Vec<String> {
+    use super::handle_key;
+    let mut app = t6_two_claude_pool_app();
+    {
+        let mut cfg = app.config();
+        let c = crate::profile::ProfileName::from("c");
+        cfg.profiles.push(crate::testutil::blank_profile(&c));
+        cfg.state.profiles.push(c.clone());
+        cfg.state.fallback_chain.push(c);
+    }
+    app.profile_cursor.set(1);
+    super::switch_tab(&mut app, tab);
+    let menu = super::build_action_menu(&app);
+    assert_eq!(menu.context.as_deref(), Some("b"), "the menu names b");
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|i| i.label == "refresh usage")
+        .and_then(|i| i.hotkey)
+        .expect("refresh usage has a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    {
+        let mut cfg = app.config();
+        let a = crate::profile::ProfileName::from("a");
+        cfg.profiles.retain(|p| p.name != a);
+        cfg.state.profiles.retain(|n| *n != a);
+        cfg.state.fallback_chain.retain(|n| *n != a);
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    app.toasts.iter().map(|t| t.body.clone()).collect()
+}
+
+#[test]
+fn a_usage_claude_pick_after_a_reload_acts_on_the_menus_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        t6_claude_pick_after_a_reload(Tab::Usage),
+        vec!["refreshing 'b'".to_string()],
+        "the pick acts on b, the row the menu named"
+    );
+}
+
+#[test]
+fn an_overview_claude_pick_after_a_reload_acts_on_the_menus_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        t6_claude_pick_after_a_reload(Tab::Overview),
+        vec!["refreshing 'b'".to_string()],
+        "the pick acts on b, the row the menu named"
+    );
+}
+
+/// With no claude profile the Usage fallback is the first band item, so the
+/// caret row and the pane agree on the codex row and `↓` walks every row (F3).
+#[test]
+fn a_codex_only_usage_roster_selects_and_walks_the_codex_rows() {
+    use super::{MainItemKind, SetupSelection, StatusFocus};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    let mut app = app_with(vec![]);
+    app.tab = Tab::Usage;
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Codex(0)),
+        "no claude profile: the selection falls on the first codex row"
+    );
+    // In list focus the caret row and the pane agree on cx1 (the old fallback
+    // put the caret on cx1 while the pane drew the claude empty state).
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("draw");
+    let text = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
+    assert!(
+        text.contains("❯ cx1") && !text.contains("no accounts yet"),
+        "the caret row and the pane agree on cx1:\n{text}"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Codex(1)),
+        "↓ reaches the second codex row"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Codex(0)),
+        "↓ wraps to the first codex row"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.usage_detail_focus,
+        StatusFocus::Detail,
+        "↵ descends into the codex pane"
+    );
+}
+
+/// A read landing through `drain_shunt_pool_probe` stamps `shunt_pool_read_at_ms`
+/// at the landing moment (F7-PL2).
+#[test]
+fn a_pool_read_lands_a_fresh_read_stamp() {
+    let _home = crate::testutil::HomeSandbox::new();
+    POOL_PROBE_NOTREAD.store(false, Ordering::SeqCst);
+    let mut app = pool_rows_app();
+    app.shunt_pool_probe.prober = Some(counting_pool_probe);
+    app.shunt_pool_probe.start();
+    super::join_test_workers();
+    let before = crate::usage::now_ms();
+    super::drain_shunt_pool_probe(&mut app);
+    let after = crate::usage::now_ms();
+    let stamp = app
+        .shunt_pool_read_at_ms
+        .expect("a read landing stamps the listing");
+    assert!(
+        before <= stamp && stamp <= after,
+        "the stamp reads the landing moment: {before} <= {stamp} <= {after}"
+    );
+}
+
+/// `r` on a Usage pool row re-reads the pool listing through the probe restart
+/// path (F7-PL3).
+#[test]
+fn usage_r_on_a_pool_row_restarts_the_pool_probe() {
+    let _home = crate::testutil::HomeSandbox::new();
+    POOL_PROBE_CALLS.store(0, Ordering::SeqCst);
+    POOL_PROBE_NOTREAD.store(false, Ordering::SeqCst);
+    let mut app = pool_rows_app();
+    app.shunt_pool_probe.prober = Some(counting_pool_probe);
+    app.tab = Tab::Usage;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_pool_pair(), Some((0, 0)), "Usage sits on alpha");
+    super::usage_refresh(&mut app);
+    super::join_test_workers();
+    assert_eq!(
+        POOL_PROBE_CALLS.load(Ordering::SeqCst),
+        1,
+        "r re-reads the pool listing"
+    );
+}
+
+/// `r` on a Usage pool row reaches the pool-probe restart through the key
+/// handler itself, so the key routing is pinned, not only the direct
+/// `usage_refresh` call (G3/PL7).
+#[test]
+fn the_r_key_on_a_usage_pool_row_restarts_the_pool_probe() {
+    let _home = crate::testutil::HomeSandbox::new();
+    POOL_PROBE_CALLS.store(0, Ordering::SeqCst);
+    POOL_PROBE_NOTREAD.store(false, Ordering::SeqCst);
+    let mut app = pool_rows_app();
+    app.shunt_pool_probe.prober = Some(counting_pool_probe);
+    app.tab = Tab::Usage;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_pool_pair(), Some((0, 0)), "Usage sits on alpha");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    super::join_test_workers();
+    assert_eq!(
+        POOL_PROBE_CALLS.load(Ordering::SeqCst),
+        1,
+        "the r key re-reads the pool listing"
+    );
+}
+
+/// A pool read landing while the Usage tab shows runs through the periodic poll
+/// too, so a home-tab usage frame still publishes pool rows (F4's companion;
+/// the probe worker's test seam drives it).
+#[test]
+fn the_pool_read_lands_on_the_usage_tab() {
+    let _home = crate::testutil::HomeSandbox::new();
+    POOL_PROBE_CALLS.store(0, Ordering::SeqCst);
+    POOL_PROBE_NOTREAD.store(false, Ordering::SeqCst);
+    let mut app = pool_rows_app();
+    app.shunt_pool_probe.prober = Some(counting_pool_probe);
+    app.last_shunt_pool_refresh = None;
+    app.tab = Tab::Usage;
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        app.shunt_pool,
+        super::ShuntPool::Read(vec![]),
+        "the read lands on the Usage tab"
+    );
+    assert_eq!(POOL_PROBE_CALLS.load(Ordering::SeqCst), 1);
+}
+
+/// `on_tick` re-homes a Usage pool identity hidden by an unread listing the
+/// same way it re-homes Setup's (F7-PL6): the identity moves to the held slot
+/// and the selection shows the first row.
+#[test]
+fn on_tick_rehomes_a_hidden_usage_identity() {
+    use super::{MainItemKind, SetupSelection};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.tab = Tab::Usage;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_pool_pair(), Some((0, 0)), "Usage sits on alpha");
+    app.shunt_pool = super::ShuntPool::NotRead("down".to_string());
+    super::on_tick(&mut app);
+    assert!(
+        app.usage.remembered.is_some(),
+        "on_tick holds the hidden identity and shows the first row"
+    );
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(0)),
+        "the shown selection is the first row"
     );
 }
 
@@ -21305,6 +22054,8 @@ fn one_provider_pool(names: &[&str]) -> super::ShuntPool {
         reset_5h: None,
         utilization_7d: None,
         reset_7d: None,
+        utilization_7d_oi: None,
+        reset_7d_oi: None,
         plan: None,
         status: None,
     };
@@ -21640,7 +22391,7 @@ fn a_tab_cycle_through_fallback_keeps_the_pool_row() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 0)));
-    assert_eq!(app.profile_cursor, 1, "`b`, outside the chain");
+    assert_eq!(app.profile_cursor.read(), 1, "`b`, outside the chain");
     for _ in 0..Tab::ALL.len() {
         handle_key(&mut app, crate::testutil::key(KeyCode::Tab));
     }
@@ -21663,7 +22414,7 @@ fn an_off_tab_codex_shrink_keeps_the_menu_on_the_highlighted_row() {
     app.tab = Tab::Overview;
     handle_key(&mut app, crate::testutil::key(KeyCode::Up));
     assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
-    assert_eq!(app.profile_cursor, 0);
+    assert_eq!(app.profile_cursor.read(), 0);
     handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     assert_eq!(app.tab, Tab::Usage);
     crate::testutil::write_codex_roster(&[]);
@@ -21697,11 +22448,19 @@ fn a_codex_poll_keeps_the_new_account_form() {
     app.tab = Tab::Overview;
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
     assert_eq!(app.tab, Tab::Setup);
-    assert_eq!(app.profile_cursor, 2, "precondition: the `+ new` row");
+    assert_eq!(
+        app.profile_cursor.read(),
+        2,
+        "precondition: the `+ new` row"
+    );
     assert!(super::config_rows(&app).contains(&super::ConfigRow::Create));
     app.last_codex_rows_refresh = None;
     super::poll_codex_rows(&mut app);
-    assert_eq!(app.profile_cursor, 2, "a codex poll keeps the `+ new` form");
+    assert_eq!(
+        app.profile_cursor.read(),
+        2,
+        "a codex poll keeps the `+ new` form"
+    );
     assert!(super::config_rows(&app).contains(&super::ConfigRow::Create));
 }
 
@@ -21724,10 +22483,18 @@ fn a_codex_poll_keeps_the_usage_pick_under_the_claude_filter() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     assert_eq!(app.tab, Tab::Usage);
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    assert_eq!(app.profile_cursor, 1, "precondition: `b` picked on Usage");
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "precondition: `b` picked on Usage"
+    );
     app.last_codex_rows_refresh = None;
     super::poll_codex_rows(&mut app);
-    assert_eq!(app.profile_cursor, 1, "a codex poll keeps the Usage pick");
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "a codex poll keeps the Usage pick"
+    );
 }
 
 /// A pool read that fails once hides the pool rows without forgetting the one
@@ -21796,15 +22563,17 @@ fn leaving_overview_does_not_restore_an_old_claude_selection() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     assert_eq!(app.tab, Tab::Usage);
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    assert_eq!(app.profile_cursor, 1);
+    assert_eq!(app.profile_cursor.read(), 1);
     handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     assert_eq!(
-        app.profile_cursor, 1,
+        app.profile_cursor.read(),
+        1,
         "the Usage selection survives leaving that tab"
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Left));
     assert_eq!(
-        app.profile_cursor, 1,
+        app.profile_cursor.read(),
+        1,
         "returning to Usage keeps the selected account"
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Left));
@@ -21830,7 +22599,8 @@ fn removing_the_selected_codex_account_targets_the_visible_claude_fallback() {
         Some(MainItemKind::Codex(0))
     ));
     assert_eq!(
-        app.profile_cursor, 0,
+        app.profile_cursor.read(),
+        0,
         "a remains the previous Claude selection"
     );
     crate::testutil::write_codex_roster(&[]);
@@ -21844,7 +22614,7 @@ fn removing_the_selected_codex_account_targets_the_visible_claude_fallback() {
     assert!(
         matches!(app.modals.last(), Some(Modal::ActionMenu(m)) if m.context.as_deref() == Some("b"))
     );
-    assert_eq!(app.profile_cursor, 1);
+    assert_eq!(app.profile_cursor.read(), 1);
 }
 
 #[test]
@@ -21864,7 +22634,8 @@ fn filtering_a_codex_selection_back_to_claude_targets_the_visible_account() {
         Some(MainItemKind::Codex(0))
     ));
     assert_eq!(
-        app.profile_cursor, 1,
+        app.profile_cursor.read(),
+        1,
         "b was the last selected Claude account"
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
@@ -21877,7 +22648,8 @@ fn filtering_a_codex_selection_back_to_claude_targets_the_visible_account() {
         matches!(app.modals.last(), Some(Modal::ActionMenu(m)) if m.context.as_deref() == Some("a"))
     );
     assert_eq!(
-        app.profile_cursor, 0,
+        app.profile_cursor.read(),
+        0,
         "account actions follow the visible caret"
     );
 }
@@ -26796,7 +27568,7 @@ fn alert_app(threshold: Option<f64>) -> App {
     .expect("persist state");
     let mut app = app_with(vec![profile]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     enter_config_detail(&mut app);
     app.config_action_cursor = config_rows(&app)
         .iter()
@@ -26848,7 +27620,7 @@ fn the_alert_row_follows_auto_start_on_oauth_and_name_on_api_accounts() {
         Some("https://api.test".to_string()),
         Some("k".to_string()),
     )]);
-    api.profile_cursor = 0;
+    api.profile_cursor.set(0);
     super::enter_config_detail(&mut api);
     assert_eq!(
         config_rows(&api)[..3],
@@ -26860,7 +27632,7 @@ fn the_alert_row_follows_auto_start_on_oauth_and_name_on_api_accounts() {
     );
 
     let mut new_form = app_with(vec![]);
-    new_form.profile_cursor = 0;
+    new_form.profile_cursor.set(0);
     assert!(
         !config_rows(&new_form).contains(&ConfigRow::BellThreshold),
         "the + new form has no account to ring for yet"
@@ -33139,7 +33911,7 @@ fn a_state_write_failure_after_the_profile_save_keeps_the_token() {
         super::ConfigFocus::Profiles,
         "the pane shows the profile, not the actions list"
     );
-    assert_eq!(app.profile_cursor, 0, "the cursor lands on alice");
+    assert_eq!(app.profile_cursor.read(), 0, "the cursor lands on alice");
     assert_eq!(
         super::config_rows(&app),
         vec![
@@ -33175,7 +33947,7 @@ fn a_plain_create_state_write_failure_closes_the_form_onto_the_profile() {
     let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
     // The plain `+ new` form: no picker, no mint marker.
     app.tab = super::Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     app.config_draft = Some(super::build_draft_new());
     app.config_focus = super::ConfigFocus::Actions;
     {
@@ -33203,7 +33975,11 @@ fn a_plain_create_state_write_failure_closes_the_form_onto_the_profile() {
         app.config_draft.is_none(),
         "the form closes onto the created profile"
     );
-    assert_eq!(app.profile_cursor, 1, "the cursor lands on alice, not bob");
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "the cursor lands on alice, not bob"
+    );
     assert_eq!(
         super::config_rows(&app),
         vec![
@@ -33239,7 +34015,7 @@ fn a_failed_plain_create_keeps_the_form_open_with_its_typed_draft() {
     let _env = crate::testutil::no_shunt_env(&home);
     let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
     app.tab = super::Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     app.config_draft = Some(super::build_draft_new());
     app.config_focus = super::ConfigFocus::Actions;
     {
@@ -33278,7 +34054,7 @@ fn a_failed_plain_create_keeps_the_form_open_with_its_typed_draft() {
     assert_eq!(d.api_key.value, "k", "the draft api key survives");
     assert_eq!(d.model.value, "opus", "the draft model survives");
     assert_eq!(
-        app.profile_cursor,
+        app.profile_cursor.read(),
         app.profile_count(),
         "the cursor stays on the `+ new` row"
     );
@@ -33298,7 +34074,7 @@ fn a_failed_plain_create_keeps_a_captured_login_on_the_form() {
     let _env = crate::testutil::no_shunt_env(&home);
     let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
     app.tab = super::Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     let mut draft = super::build_draft_new();
     draft.name = super::InputState::new("alice");
     draft.captured_login = Some(super::DraftLogin::LiveLogin(Box::new(
@@ -33340,7 +34116,7 @@ fn a_failed_plain_create_keeps_a_captured_login_on_the_form() {
         "the captured login survives on the open form"
     );
     assert_eq!(
-        app.profile_cursor,
+        app.profile_cursor.read(),
         app.profile_count(),
         "the cursor stays on the `+ new` row"
     );
@@ -36441,7 +37217,7 @@ fn descended_editable_panes_trap_the_switch_keys() {
     )]);
 
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     assert_eq!(
         app.config_focus,
@@ -36625,7 +37401,7 @@ fn a_jump_keeps_the_new_account_form() {
         "the pane ascended on the way out"
     );
     assert_eq!(
-        app.profile_cursor,
+        app.profile_cursor.read(),
         app.profile_count(),
         "the selector still rests on `+ new`"
     );
@@ -36755,7 +37531,7 @@ fn a_jump_drops_the_armed_setup_draft() {
         &crate::profile::ProfileName::from("a"),
     )]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     assert_eq!(
         app.config_focus,
@@ -36789,7 +37565,7 @@ fn a_dirty_setup_field_warns_and_a_clean_one_suspends() {
         &crate::profile::ProfileName::from("a"),
     )]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Enter)); // open the name field
     super::handle_key(&mut app, key(KeyCode::Char('x'))); // dirty the buffer
@@ -36814,7 +37590,7 @@ fn a_dirty_setup_field_warns_and_a_clean_one_suspends() {
         &crate::profile::ProfileName::from("a"),
     )]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Enter)); // open, no typing
     super::handle_key(&mut app, alt_digit('1'));
@@ -36899,7 +37675,7 @@ fn a_jump_suspends_the_note_editor_and_day_picker() {
         &crate::profile::ProfileName::from("a"),
     )]);
     app.tab = Tab::Usage;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Char('n')));
     assert!(
         app.note_editor.is_some(),
@@ -37101,7 +37877,7 @@ fn a_suspended_new_form_survives_descending_into_another_account() {
     assert_eq!(app.tab, Tab::Setup);
 
     // Descend into the existing account, then back into `+ new`.
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     assert_eq!(app.config_focus, ConfigFocus::Actions);
     assert!(
@@ -37111,7 +37887,7 @@ fn a_suspended_new_form_survives_descending_into_another_account() {
         "descending did not land on the existing account"
     );
     super::handle_key(&mut app, key(KeyCode::Esc));
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     super::handle_key(&mut app, key(KeyCode::Enter));
     assert!(
         app.config_draft
@@ -37162,7 +37938,7 @@ fn setup_return_keeps_the_edited_account_selected() {
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
     ]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Enter)); // open a's name field, clean
     assert!(
@@ -37175,7 +37951,8 @@ fn setup_return_keeps_the_edited_account_selected() {
     assert_eq!(app.tab, Tab::Usage, "precondition: clean field suspended");
     super::handle_key(&mut app, key(KeyCode::Down));
     assert_eq!(
-        app.profile_cursor, 1,
+        app.profile_cursor.read(),
+        1,
         "precondition: Usage moved the selection to b"
     );
     super::handle_key(&mut app, alt_digit('4'));
@@ -37187,7 +37964,7 @@ fn setup_return_keeps_the_edited_account_selected() {
     let shown = app
         .config()
         .profiles
-        .get(app.profile_cursor)
+        .get(app.profile_cursor.read())
         .map(|p| p.name.to_string());
     assert_eq!(
         editing.as_deref(),
@@ -37225,7 +38002,8 @@ fn fallback_return_keeps_the_edited_member_selected() {
     assert_eq!(app.tab, Tab::Usage, "precondition: clean field suspended");
     super::handle_key(&mut app, key(KeyCode::Down));
     assert_eq!(
-        app.profile_cursor, 1,
+        app.profile_cursor.read(),
+        1,
         "precondition: Usage moved the selection to b"
     );
     super::handle_key(&mut app, alt_digit('5'));
@@ -37292,12 +38070,12 @@ fn the_new_form_rehome_leaves_an_open_existing_edit_alone() {
     super::handle_key(&mut app, alt_digit('1'));
     super::handle_key(&mut app, alt_digit('4'));
     assert_eq!(
-        app.profile_cursor,
+        app.profile_cursor.read(),
         app.profile_count(),
         "precondition: on + new"
     );
     super::handle_key(&mut app, key(KeyCode::Up));
-    assert_eq!(app.profile_cursor, 0, "precondition: on a");
+    assert_eq!(app.profile_cursor.read(), 0, "precondition: on a");
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Enter)); // open a's name field, clean
     assert!(
@@ -37309,7 +38087,8 @@ fn the_new_form_rehome_leaves_an_open_existing_edit_alone() {
     super::handle_key(&mut app, alt_digit('1'));
     super::handle_key(&mut app, alt_digit('4'));
     assert_eq!(
-        app.profile_cursor, 0,
+        app.profile_cursor.read(),
+        0,
         "the + new re-home moved the selector off a's open edit"
     );
 }
@@ -37325,7 +38104,7 @@ fn a_suspended_setup_edit_closes_when_its_account_is_deleted() {
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
     ]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, alt_digit('1'));
@@ -37391,7 +38170,7 @@ fn the_note_editor_keeps_the_usage_descent_and_caret() {
         &crate::profile::ProfileName::from("a"),
     )]);
     app.tab = Tab::Usage;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     assert_eq!(
         app.usage_detail_focus,
@@ -37485,7 +38264,7 @@ fn the_shunt_jump_keeps_the_new_form() {
     );
     super::handle_key(&mut app, alt_digit('4'));
     assert_eq!(app.tab, Tab::Setup);
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     super::handle_key(&mut app, key(KeyCode::Enter));
     assert_eq!(
         app.config_draft
@@ -37534,14 +38313,14 @@ fn the_new_form_open_field_returns_on_the_new_row() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
     }
     assert_eq!(
-        app.profile_cursor,
+        app.profile_cursor.read(),
         app.profile_count(),
         "precondition: on + new"
     );
     super::handle_key(&mut app, alt_digit('1'));
     super::handle_key(&mut app, alt_digit('4'));
     assert_eq!(
-        app.profile_cursor,
+        app.profile_cursor.read(),
         app.profile_count(),
         "the + new form's open field returned under an existing account's selection"
     );
@@ -37701,7 +38480,7 @@ fn a_suspended_note_editor_returns_under_its_own_account() {
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
     ]);
     app.tab = Tab::Usage;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Char('n')));
     assert!(
@@ -37715,13 +38494,14 @@ fn a_suspended_note_editor_returns_under_its_own_account() {
     assert_eq!(app.tab, Tab::Setup, "precondition: jumped");
     super::handle_key(&mut app, key(KeyCode::Down));
     assert_eq!(
-        app.profile_cursor, 1,
+        app.profile_cursor.read(),
+        1,
         "precondition: Setup moved the selection to b"
     );
     super::handle_key(&mut app, alt_digit('2'));
     let editor_for = app.note_editor.as_ref().map(|e| e.profile.to_string());
     let shown = app
-        .profile_name_at(app.profile_cursor)
+        .profile_name_at(app.profile_cursor.read())
         .map(|n| n.to_string());
     assert_eq!(
         editor_for.as_deref(),
@@ -37756,7 +38536,7 @@ fn a_suspended_note_editor_closes_when_its_account_is_deleted() {
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
     ]);
     app.tab = Tab::Usage;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Char('n')));
     assert!(
         app.note_editor.is_some(),
@@ -37789,7 +38569,7 @@ fn a_note_editor_opened_from_the_list_returns_without_a_descent() {
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
     ]);
     app.tab = Tab::Usage;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Char('n')));
     assert!(
         app.note_editor.is_some(),
@@ -37803,13 +38583,15 @@ fn a_note_editor_opened_from_the_list_returns_without_a_descent() {
     super::handle_key(&mut app, alt_digit('4'));
     super::handle_key(&mut app, key(KeyCode::Down));
     assert_eq!(
-        app.profile_cursor, 1,
+        app.profile_cursor.read(),
+        1,
         "precondition: Setup moved the selection to b"
     );
     super::handle_key(&mut app, alt_digit('2'));
     assert_eq!(app.tab, Tab::Usage);
     assert_eq!(
-        app.profile_cursor, 0,
+        app.profile_cursor.read(),
+        0,
         "the editor returned under b's selection"
     );
     assert_eq!(
@@ -37824,7 +38606,7 @@ fn a_note_editor_opened_from_the_list_returns_without_a_descent() {
 #[cfg(unix)]
 fn suspend_a_typed_new_form(app: &mut App) {
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     super::handle_key(app, key(KeyCode::Enter));
     let base_row = super::config_rows(app)
         .iter()
@@ -38001,7 +38783,7 @@ fn an_untouched_suspended_form_opens_the_mint_form_directly() {
     let mut rig = config_edit_rig(&home, RIG_TEXT);
     let app = &mut rig.app;
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     super::handle_key(app, key(KeyCode::Enter));
     super::handle_key(app, alt_digit('8'));
     assert!(
@@ -38032,14 +38814,14 @@ fn a_rename_rebinds_the_suspended_note_editor() {
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
     ]);
     app.tab = Tab::Usage;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Char('n')));
     for c in "keep me".chars() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
     }
     super::handle_key(&mut app, alt_digit('4'));
     assert_eq!(app.tab, Tab::Setup, "precondition: jumped");
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Char('2')));
@@ -38101,7 +38883,7 @@ fn a_rename_rebinds_the_suspended_fallback_edit() {
         Some("a"),
         "precondition: the edit holds member a"
     );
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Char('2')));
@@ -38147,7 +38929,7 @@ fn a_rename_rebinds_the_suspended_fallback_day_stop() {
         Some("a"),
         "precondition: the day stop survived the jump"
     );
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Char('2')));
@@ -38175,7 +38957,7 @@ fn a_name_miss_on_the_usage_landing_closes_the_note_editor() {
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
     ]);
     app.tab = Tab::Usage;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Char('n')));
     for c in "keep me".chars() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
@@ -38263,7 +39045,7 @@ fn a_preset_stamped_new_form_then_n_then_a_jump_keeps_the_typed_form() {
     super::handle_key(&mut app, alt_digit('1'));
     super::handle_key(&mut app, alt_digit('4'));
     assert_eq!(
-        app.profile_cursor,
+        app.profile_cursor.read(),
         app.profile_count(),
         "precondition: selector on + new"
     );
@@ -38326,7 +39108,7 @@ fn apply_preset_on_the_new_form_keeps_a_captured_login_on_the_stamped_form() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     let mut draft = super::build_draft_new();
     draft.name = super::InputState::new("alice");
     draft.captured_login = Some(super::DraftLogin::LiveLogin(Box::new(
@@ -38377,7 +39159,7 @@ fn an_in_app_delete_closes_the_suspended_note_editor() {
         crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
     ]);
     app.tab = Tab::Usage;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Char('n')));
     for c in "keep me".chars() {
@@ -38420,7 +39202,7 @@ fn a_refused_slot_write_puts_the_form_back_and_keeps_the_descent() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     app.config_focus = super::ConfigFocus::Actions;
     let mut slot = super::build_draft_new();
     slot.base_url = super::InputState::new("https://slot.example");
@@ -38524,7 +39306,7 @@ fn no_slot_write_drops_a_typed_value_across_the_switch_sequences() {
         app.tab = Tab::Setup;
         app.config_draft = None;
         app.new_account_draft = Some(draft);
-        app.profile_cursor = app.profile_count();
+        app.profile_cursor.set(app.profile_count());
         app.config_focus = super::ConfigFocus::Profiles;
         app.config_action_cursor = 0;
     }
@@ -38750,7 +39532,7 @@ fn the_preset_undo_is_a_noop_unless_the_pane_holds_a_new_form() {
         &crate::profile::ProfileName::from("a"),
     )]);
     app.tab = Tab::Setup;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_draft = Some(super::build_draft_existing(
         &app,
         &crate::profile::ProfileName::from("a"),
@@ -38790,7 +39572,7 @@ fn an_unrelated_confirm_cancel_leaves_the_preset_open_undo_alone() {
         &crate::profile::ProfileName::from("a"),
     )]);
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     app.config_focus = super::ConfigFocus::Actions;
     let mut form = super::build_draft_new();
     form.name = super::InputState::new("zed");
@@ -38924,6 +39706,8 @@ fn b3_pool_account(name: &str) -> crate::gateway_admin::PoolAccount {
         reset_5h: None,
         utilization_7d: None,
         reset_7d: None,
+        utilization_7d_oi: None,
+        reset_7d_oi: None,
         plan: None,
         status: None,
     }
@@ -39652,7 +40436,8 @@ fn setup_selection_wraps_and_keeps_the_overview_alone() {
         "the codex row is selected"
     );
     assert_eq!(
-        app.profile_cursor, 1,
+        app.profile_cursor.read(),
+        1,
         "a codex selection does not move the shared cursor past acct-two"
     );
     assert_eq!(
@@ -39668,7 +40453,8 @@ fn setup_selection_wraps_and_keeps_the_overview_alone() {
         "up lands on a claude row"
     );
     assert_eq!(
-        app.profile_cursor, 1,
+        app.profile_cursor.read(),
+        1,
         "a claude selection IS profile_cursor"
     );
 }
@@ -39858,7 +40644,7 @@ fn setup_remove_hits_the_armed_pool_account_across_a_relisting() {
 }
 
 /// A pool that goes unread ascends the descended selection, shows the first
-/// row, and holds the identity separately (`setup_remembered`, like the
+/// row, and holds the identity separately (`setup.remembered`, like the
 /// Overview's `overview_remembered`) for the read's return (F3/N4).
 #[test]
 fn an_unread_pool_ascends_and_keeps_its_selection() {
@@ -39880,7 +40666,7 @@ fn an_unread_pool_ascends_and_keeps_its_selection() {
         "the selection shows on the first row"
     );
     assert!(
-        app.setup_remembered.is_some(),
+        app.setup.remembered.is_some(),
         "the identity is held separately for the next read"
     );
     // The read returns (no move since): the selection is the pool row again.
@@ -40468,7 +41254,7 @@ fn a_hide_off_setup_leaves_the_shared_claude_cursor() {
     let mut app = b3_setup_app(&home, b3_claude_pool());
     b3_press(&mut app, KeyCode::Down, 1); // acct-two: profile_cursor 1
     b3_press(&mut app, KeyCode::Down, 2); // cdx-one, pool-one
-    assert_eq!(app.profile_cursor, 1);
+    assert_eq!(app.profile_cursor.read(), 1);
     app.overview_remembered = Some(MainItemKind::Profile(1));
     super::switch_tab(&mut app, Tab::Overview);
     assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(1)));
@@ -40477,7 +41263,7 @@ fn a_hide_off_setup_leaves_the_shared_claude_cursor() {
     let menu = super::build_action_menu(&app);
     assert_eq!(
         (
-            app.profile_cursor,
+            app.profile_cursor.read(),
             app.current_main_item(),
             menu.context.clone()
         ),
@@ -40502,7 +41288,7 @@ fn a_move_elsewhere_replaces_the_held_identity() {
     super::on_tick(&mut app); // Setup now shows acct-one (row 0), identity held
     super::switch_tab(&mut app, Tab::Overview);
     b3_press(&mut app, KeyCode::Down, 1); // the user picks acct-two on the Overview
-    let picked = app.profile_cursor;
+    let picked = app.profile_cursor.read();
     super::switch_tab(&mut app, Tab::Setup); // back before the read returns
     app.shunt_pool = b3_claude_pool(); // the read returns while Setup shows
     super::on_tick(&mut app);
@@ -40521,8 +41307,8 @@ fn a_duplicate_while_hidden_does_not_restore_the_held_pool() {
     let mut app = b3_setup_app(&home, b3_claude_pool());
     b3_press(&mut app, KeyCode::Down, 3); // pool-one
     app.shunt_pool = super::ShuntPool::NotRead("the gateway is not running".to_string());
-    super::on_tick(&mut app); // hidden: setup_remembered holds pool-one
-    assert!(app.setup_remembered.is_some());
+    super::on_tick(&mut app); // hidden: setup.remembered holds pool-one
+    assert!(app.setup.remembered.is_some());
     super::duplicate_profile_into(
         &mut app,
         &crate::profile::ProfileName::from("acct-one"),
@@ -40996,7 +41782,7 @@ fn codex_create_stages_and_lands_the_minted_chain() {
         "create account lands the chain under the new name"
     );
     assert!(
-        app.setup_item.as_ref().is_some_and(|item| matches!(
+        app.setup.item.as_ref().is_some_and(|item| matches!(
             item,
             super::SetupItem::Codex(name) if name.as_str() == "cdx-new"
         )),
@@ -41331,7 +42117,7 @@ fn the_shunt_add_sends_the_paste_verbatim_and_lands_the_row() {
     ]);
     super::land_pending_pool_add(&mut app);
     assert_eq!(
-        app.setup_item,
+        app.setup.item,
         Some(super::SetupItem::Pool {
             provider: "claude-main".to_string(),
             account: "newpool".to_string(),
@@ -41803,7 +42589,7 @@ fn a_postcommit_add_lands_without_closing_a_movedon_draft() {
         "the landing did not close the moved-on draft"
     );
     assert!(
-        app.setup_item.is_none(),
+        app.setup.item.is_none(),
         "the landing did not move Setup off the moved-on draft"
     );
     assert_eq!(

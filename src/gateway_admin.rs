@@ -144,9 +144,9 @@ pub(crate) struct PoolProvider {
     pub(crate) accounts: Vec<PoolAccount>,
 }
 
-/// One pool account's fields the Overview section renders. Every other field
-/// shunt reports is ignored. `paused` defaults: shunt adds the key in v0.52.0,
-/// so a row from the v0.48.0 floor lacks it and must read as `false`
+/// One pool account's fields the Overview and Usage panes render. Every other
+/// field shunt reports is ignored. `paused` defaults: shunt adds the key in
+/// v0.52.0, so a row from the v0.48.0 floor lacks it and must read as `false`
 /// (unpaused) instead of failing the whole listing; every `Option` field
 /// parses an absent key as `None` on its own.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -163,6 +163,8 @@ pub(crate) struct PoolAccount {
     pub(crate) reset_5h: Option<u64>,
     pub(crate) utilization_7d: Option<f64>,
     pub(crate) reset_7d: Option<u64>,
+    pub(crate) utilization_7d_oi: Option<f64>,
+    pub(crate) reset_7d_oi: Option<u64>,
     pub(crate) plan: Option<String>,
     pub(crate) status: Option<String>,
 }

@@ -302,6 +302,8 @@ fn the_pool_listing_parses_providers_accounts_and_absent_optionals() {
             reset_5h: Some(1000),
             utilization_7d: Some(0.25),
             reset_7d: Some(2000),
+            utilization_7d_oi: None,
+            reset_7d_oi: None,
             plan: Some("max".to_string()),
             status: Some("healthy".to_string()),
         }
@@ -320,6 +322,8 @@ fn the_pool_listing_parses_providers_accounts_and_absent_optionals() {
             reset_5h: None,
             utilization_7d: None,
             reset_7d: None,
+            utilization_7d_oi: None,
+            reset_7d_oi: None,
             plan: None,
             status: None,
         }
@@ -371,6 +375,8 @@ fn a_floor_version_pool_row_without_paused_parses_as_unpaused() {
             reset_5h: None,
             utilization_7d: None,
             reset_7d: None,
+            utilization_7d_oi: None,
+            reset_7d_oi: None,
             plan: None,
             status: None,
         }]
@@ -1208,4 +1214,34 @@ fn the_pool_listing_never_recovers_a_401() {
     let raw = seen.join().expect("listener");
     assert_eq!(raw.len(), 1, "the read alone, no recovery");
     assert_eq!(request_path(&raw[0]), "/admin/api/pool");
+}
+
+/// shunt's pool row carries the fable-scoped weekly window beside 5h and 7d
+/// (`AccountSnapshot`'s `utilization_7d_oi` / `reset_7d_oi`, present since the
+/// 0.48.0 floor): the listing keeps both, and an absent pair reads `None`.
+#[test]
+fn the_pool_listing_keeps_the_fable_weekly_window() {
+    let home = HomeSandbox::new();
+    write_token(&home, TOKEN);
+    let body = r#"{"providers":[
+  {"provider":"claude","auth":"claude_oauth","accounts":[
+    {"name":"a1","available":true,"near_quota":false,"needs_relogin":false,"paused":false,"disabled":false,"utilization_5h":0.5,"reset_5h":1000,"utilization_7d":0.25,"reset_7d":2000,"utilization_7d_oi":0.125,"reset_7d_oi":3000},
+    {"name":"a2","available":true,"near_quota":false,"needs_relogin":false,"paused":false,"disabled":false}
+  ]}
+]}"#;
+    let (base, seen) = serve_endpoints_raw(1, move |_, _| (200, body.to_string()));
+    let record = record_at(&home, listener_addr(&base));
+    let providers = list_pool(&record).expect("listing");
+    seen.join().expect("listener");
+    let accounts = &providers[0].accounts;
+    assert_eq!(
+        (accounts[0].utilization_7d_oi, accounts[0].reset_7d_oi),
+        (Some(0.125), Some(3000)),
+        "the fable weekly window rides the row"
+    );
+    assert_eq!(
+        (accounts[1].utilization_7d_oi, accounts[1].reset_7d_oi),
+        (None, None),
+        "an absent pair reads as no window"
+    );
 }

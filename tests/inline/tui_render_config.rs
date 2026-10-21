@@ -947,12 +947,12 @@ fn a_job_under_one_profile_reads_live_only_that_profiles_snapshot() {
     // Refresh the per-tick job snapshot the way poll_live_sessions does.
     app.job_trees = crate::claude_jobs::job_trees();
 
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     assert!(
         build_snap(&app, &app.readings_snapshot(), true).has_live_session,
         "a job under work/ is a live work session"
     );
-    app.profile_cursor = 1;
+    app.profile_cursor.set(1);
     assert!(
         !build_snap(&app, &app.readings_snapshot(), true).has_live_session,
         "a job under work/ is nobody's home session"
@@ -1879,7 +1879,7 @@ fn mint_armed_app(home: &crate::testutil::HomeSandbox) -> App {
         profiles: vec![],
     });
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     app.config_draft = Some(draft);
     app.config_focus = ConfigFocus::Actions;
     app
@@ -1971,7 +1971,7 @@ fn a_setup_field_keeps_its_hint_line_through_edit_entry_and_exit() {
         profiles: vec![],
     });
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     app.config_draft = Some(draft);
     app.config_focus = ConfigFocus::Actions;
     app.config_action_cursor = crate::tui::app::config_rows(&app)
@@ -2035,7 +2035,7 @@ fn editing_base_url(value: &str) -> App {
         profiles: vec![],
     });
     app.tab = crate::tui::app::Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     app.config_draft = Some(draft);
     app.config_focus = ConfigFocus::Actions;
     app.config_action_cursor = crate::tui::app::config_rows(&app)
@@ -2129,7 +2129,7 @@ fn the_alert_editor_swaps_its_hint_for_its_range_while_typing() {
             profiles: vec![crate::profile::Profile::new("a".to_string(), None, None)],
         });
         app.tab = crate::tui::app::Tab::Setup;
-        app.profile_cursor = 0;
+        app.profile_cursor.set(0);
         crate::tui::app::handle_key(&mut app, key(KeyCode::Enter));
         assert!(
             app.config_draft.is_some(),
@@ -2205,7 +2205,7 @@ fn the_alert_editor_caret_stays_inside_the_field_on_a_narrow_pane() {
             profiles: vec![crate::profile::Profile::new("a".to_string(), None, None)],
         });
         app.tab = crate::tui::app::Tab::Setup;
-        app.profile_cursor = 0;
+        app.profile_cursor.set(0);
         crate::tui::app::handle_key(&mut app, key(KeyCode::Enter));
         app.config_action_cursor = crate::tui::app::config_rows(&app)
             .iter()
@@ -2252,7 +2252,7 @@ fn a_toast_over_a_setup_field_caret_hides_the_native_cursor() {
         profiles: vec![],
     });
     app.tab = Tab::Setup;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     app.config_draft = Some(draft);
     app.config_focus = ConfigFocus::Actions;
     app.config_action_cursor = config_rows(&app)

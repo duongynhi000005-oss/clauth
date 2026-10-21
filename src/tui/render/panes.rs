@@ -10,7 +10,7 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
 
-use super::super::app::{App, InputState};
+use super::super::app::InputState;
 use super::super::theme;
 use super::format::{fixed_split, grapheme_cells, truncate};
 use super::prose;
@@ -1295,38 +1295,4 @@ pub(super) fn meta_line(meta: &str, border_style: Style) -> Line<'static> {
         Span::styled("─", border_style),
     ])
     .right_aligned()
-}
-
-pub(super) fn draw_profile_selector(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &App,
-    selected: usize,
-    focused: bool,
-) {
-    let cfg = app.config();
-    let sel = selected.min(cfg.profiles.len().saturating_sub(1));
-    draw_selector_list(
-        frame,
-        area,
-        "accounts",
-        focused,
-        sel,
-        &app.usage_selector,
-        |w| {
-            cfg.profiles
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    // A disabled account can never be active, so dim wins outright.
-                    let ns = if p.is_disabled() {
-                        theme::dim()
-                    } else {
-                        name_color(cfg.is_active(&p.name))
-                    };
-                    picker_row(i == sel, focused, p.name.to_string(), ns, w)
-                })
-                .collect()
-        },
-    );
 }

@@ -232,6 +232,7 @@ fn action_menu_pages_its_cursor_and_stops_at_the_end() {
             .collect(),
         scoped_len: 0,
         context: None,
+        row_identity: None,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -1248,7 +1249,7 @@ fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
             &crate::profile::ProfileName::from("acct"),
         )],
     );
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     // ⏎ on the account list is what seeds the draft the menu titles itself with.
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(app.config_focus, ConfigFocus::Actions);
@@ -1362,6 +1363,229 @@ fn the_usage_help_section_documents_the_note_key() {
     assert!(
         empty.iter().all(|(k, _)| *k != "n"),
         "an empty roster keeps n = new account, got {empty:?}"
+    );
+}
+
+/// The Usage help rows derive per row from the same predicate set as the
+/// footer: `r refresh account` + `n` on a claude row, `r re-read the pool
+/// listing` on a pool row, neither on a codex row, `↵` on any item row (F5).
+#[test]
+fn the_usage_help_rows_derive_per_row() {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    use crate::profile::ProfileName;
+    use crate::tui::app::ShuntPool;
+    use ratatui::crossterm::event::KeyCode;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let pool_account = |name: &str| PoolAccount {
+        name: name.to_string(),
+        available: true,
+        near_quota: false,
+        cooldown_secs_remaining: None,
+        needs_relogin: false,
+        paused: false,
+        disabled: false,
+        utilization_5h: None,
+        reset_5h: None,
+        utilization_7d: None,
+        reset_7d: None,
+        utilization_7d_oi: None,
+        reset_7d_oi: None,
+        plan: None,
+        status: None,
+    };
+    let mut app = app_on(
+        Tab::Usage,
+        vec![crate::testutil::blank_profile(&ProfileName::from("cl1"))],
+    );
+    app.shunt_pool = ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![pool_account("alpha")],
+    }]);
+
+    let rows = |app: &App| -> Vec<(&str, &str)> {
+        tab_specific_rows(app)
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().copied())
+            .collect()
+    };
+
+    assert_eq!(
+        rows(&app),
+        vec![
+            ("\u{2191} \u{2193}", "pick account to inspect"),
+            ("\u{21b5}", "open account detail"),
+            ("r", "refresh account"),
+            ("n", "edit the account's note"),
+            ("e", "toggle estimates"),
+            ("p", "toggle pace marker"),
+        ],
+        "the claude row's help rows"
+    );
+
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        rows(&app),
+        vec![
+            ("\u{2191} \u{2193}", "pick account to inspect"),
+            ("\u{21b5}", "open account detail"),
+            ("e", "toggle estimates"),
+            ("p", "toggle pace marker"),
+        ],
+        "the codex row's help rows"
+    );
+
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        rows(&app),
+        vec![
+            ("\u{2191} \u{2193}", "pick account to inspect"),
+            ("\u{21b5}", "open account detail"),
+            ("r", "re-read the pool listing"),
+            ("e", "toggle estimates"),
+            ("p", "toggle pace marker"),
+        ],
+        "the pool row's help rows"
+    );
+}
+
+/// The Usage help's GLOBAL section shadows the keys the tab redefines: `r` on
+/// every Usage frame, `n` on every non-empty roster (a codex and a pool row
+/// alike), while the empty roster keeps the global `n new account` (G3/PL8).
+/// Pinned by equality, driven through `draw_help` so the shadow filter itself
+/// is the code under test.
+#[test]
+fn the_usage_help_global_section_shadows_r_and_n_per_row() {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    use crate::profile::ProfileName;
+    use crate::tui::app::{ShuntPool, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let pool_account = |name: &str| PoolAccount {
+        name: name.to_string(),
+        available: true,
+        near_quota: false,
+        cooldown_secs_remaining: None,
+        needs_relogin: false,
+        paused: false,
+        disabled: false,
+        utilization_5h: None,
+        reset_5h: None,
+        utilization_7d: None,
+        reset_7d: None,
+        utilization_7d_oi: None,
+        reset_7d_oi: None,
+        plan: None,
+        status: None,
+    };
+
+    let global_section = |app: &App| -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(130, 60)).unwrap();
+        term.draw(|f| draw_help(f, f.area(), app)).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let inner: Vec<String> = rows
+            .iter()
+            .filter(|r| {
+                let t = r.trim();
+                t.starts_with('│')
+            })
+            .map(|r| r.split('│').nth(1).unwrap().trim_end().to_string())
+            .collect();
+        let global = inner
+            .iter()
+            .position(|r| r.trim() == "GLOBAL")
+            .expect("the global section");
+        let glyphs = inner
+            .iter()
+            .position(|r| r.trim() == "GLYPHS")
+            .expect("the glyphs section");
+        inner[global..glyphs].to_vec()
+    };
+
+    let without_r_or_n = vec![
+        "  GLOBAL",
+        "",
+        "    t                   rotate all tokens",
+        "    d                   resolve credential divergence (when flagged)",
+        "    ?                   toggle this help",
+        "    a                   actions",
+        "    x                   dismiss toast / alert",
+        "    q                   back / quit",
+        "    ← →                 switch screen",
+        "    tab                 next screen",
+        "    ⇧tab                previous screen",
+        "    ⌥1-9                jump to tab",
+        "    esc                 back within a sub-view (no-op at the top level)",
+        "    pgup/pgdn           scroll a page",
+        "    ⌃c                  quit from anywhere",
+        "",
+    ];
+    let with_n_without_r = vec![
+        "  GLOBAL",
+        "",
+        "    n                   new account",
+        "    t                   rotate all tokens",
+        "    d                   resolve credential divergence (when flagged)",
+        "    ?                   toggle this help",
+        "    a                   actions",
+        "    x                   dismiss toast / alert",
+        "    q                   back / quit",
+        "    ← →                 switch screen",
+        "    tab                 next screen",
+        "    ⇧tab                previous screen",
+        "    ⌥1-9                jump to tab",
+        "    esc                 back within a sub-view (no-op at the top level)",
+        "    pgup/pgdn           scroll a page",
+        "    ⌃c                  quit from anywhere",
+        "",
+    ];
+
+    // Asserted before the codex roster is written: an empty roster keeps the
+    // global `n new account` (nothing redefines `n`).
+    assert_eq!(
+        global_section(&empty_app(Tab::Usage)),
+        with_n_without_r,
+        "the empty roster keeps n new account but drops r"
+    );
+
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_on(
+        Tab::Usage,
+        vec![crate::testutil::blank_profile(&ProfileName::from("cl1"))],
+    );
+    app.shunt_pool = ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![pool_account("alpha")],
+    }]);
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.usage_codex_index(),
+        Some(0),
+        "the codex row is selected"
+    );
+    assert_eq!(
+        global_section(&app),
+        without_r_or_n,
+        "the codex row's GLOBAL section drops r and n"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.usage_pool_pair(),
+        Some((0, 0)),
+        "the pool row is selected"
+    );
+    assert_eq!(
+        global_section(&app),
+        without_r_or_n,
+        "the pool row's GLOBAL section drops r and n"
     );
 }
 
@@ -1851,6 +2075,7 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
             .collect(),
         scoped_len: 0,
         context: None,
+        row_identity: None,
         cursor: 23,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -1917,6 +2142,7 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
         ],
         scoped_len: 0,
         context: None,
+        row_identity: None,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -1939,6 +2165,7 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
         }],
         scoped_len: 0,
         context: None,
+        row_identity: None,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -2199,6 +2426,7 @@ fn action_menu_publishes_starts_that_count_the_group_rule() {
             .collect(),
         scoped_len: 12,
         context: None,
+        row_identity: None,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -2241,6 +2469,7 @@ fn action_menu_pages_across_the_rule_line() {
             .collect(),
         scoped_len: 12,
         context: None,
+        row_identity: None,
         cursor: 11,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -2438,6 +2667,7 @@ fn the_action_menu_sizes_its_width_by_cells() {
         }],
         scoped_len: 0,
         context: None,
+        row_identity: None,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -3306,6 +3536,7 @@ fn the_modal_caps_at_sixty_percent_from_eighty_columns() {
         }],
         scoped_len: 0,
         context: None,
+        row_identity: None,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -4234,6 +4465,7 @@ fn pick_one_modals_take_the_action_menu_row_look() {
         vec![ActionMenuAction::TogglePace],
         vec![ActionMenuAction::ToggleEstimates],
         None,
+        None,
     )));
     let buf = frame_buffer(&menu);
     let (y, left, right, _) = modal_caret_row(&buf);
@@ -4395,6 +4627,7 @@ fn the_new_rows_keep_accent_identity_selected_and_unselected() {
         vec![ActionMenuAction::TogglePace],
         vec![ActionMenuAction::ToggleEstimates],
         None,
+        None,
     )));
     let buf = frame_buffer(&menu);
     let (y, left, right, _) = modal_caret_row(&buf);
@@ -4551,6 +4784,7 @@ fn pick_one_suffix_env_and_wrapped_rows_tint_their_whole_block() {
     menu.open_modal(Modal::ActionMenu(ActionMenuState::new(
         vec![ActionMenuAction::TogglePace],
         vec![ActionMenuAction::ToggleEstimates],
+        None,
         None,
     )));
     let buf = frame_buffer(&menu);

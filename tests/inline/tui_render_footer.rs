@@ -80,6 +80,68 @@ fn the_usage_hints_advertise_the_note_key() {
     );
 }
 
+/// The Usage `r` hint derives from the row: `re-read pool` on a pool row, no
+/// `r` on a codex row (F7-PL4).
+#[test]
+fn the_usage_r_hint_derives_from_the_row() {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    use crate::profile::ProfileName;
+    use crate::tui::app::ShuntPool;
+    use ratatui::crossterm::event::KeyCode;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let pool_account = |name: &str| PoolAccount {
+        name: name.to_string(),
+        available: true,
+        near_quota: false,
+        cooldown_secs_remaining: None,
+        needs_relogin: false,
+        paused: false,
+        disabled: false,
+        utilization_5h: None,
+        reset_5h: None,
+        utilization_7d: None,
+        reset_7d: None,
+        utilization_7d_oi: None,
+        reset_7d_oi: None,
+        plan: None,
+        status: None,
+    };
+    let with_claude = || {
+        App::new(AppConfig {
+            state: AppState {
+                profiles: vec![ProfileName::from("cl1")],
+                ..AppState::default()
+            },
+            profiles: vec![crate::testutil::blank_profile(&ProfileName::from("cl1"))],
+        })
+    };
+
+    let mut pool = with_claude();
+    pool.shunt_pool = ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![pool_account("alpha")],
+    }]);
+    pool.tab = Tab::Usage;
+    crate::tui::app::handle_key(&mut pool, crate::testutil::key(KeyCode::Down));
+    assert!(
+        tab_hints(&pool).contains(&("r", "re-read pool")),
+        "a pool row advertises `r re-read pool`: {:?}",
+        tab_hints(&pool)
+    );
+
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut codex = with_claude();
+    codex.tab = Tab::Usage;
+    crate::tui::app::handle_key(&mut codex, crate::testutil::key(KeyCode::Down));
+    assert!(
+        !tab_hints(&codex).iter().any(|(k, _)| *k == "r"),
+        "a codex row advertises no `r`: {:?}",
+        tab_hints(&codex)
+    );
+}
+
 /// On the Setup tab's `alert at` row the bar names the stepper keys, the same
 /// pair the Fallback card's threshold row names.
 #[test]
@@ -92,7 +154,7 @@ fn the_setup_alert_row_advertises_its_stepper_keys() {
     });
     app.tab = Tab::Setup;
     app.config_focus = ConfigFocus::Actions;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.config_action_cursor = config_rows(&app)
         .iter()
         .position(|r| *r == ConfigRow::BellThreshold)
@@ -509,6 +571,7 @@ fn modal_cases() -> Vec<ModalCase> {
             modal: Modal::ActionMenu(ActionMenuState::new(
                 vec![ActionMenuAction::TogglePace],
                 vec![ActionMenuAction::ToggleEstimates],
+                None,
                 None,
             )),
             row: Some("↑↓ pick   ↵ choose   q back"),
@@ -1412,6 +1475,7 @@ fn the_login_footer_shows_the_open_modals_row() {
         vec![ActionMenuAction::TogglePace],
         vec![],
         None,
+        None,
     ));
     let name_prompt = Modal::NamePrompt(NamePromptForm {
         input: InputState::new(""),
@@ -1519,6 +1583,7 @@ fn the_codex_login_footer_shows_the_open_modals_row() {
     let action_menu = Modal::ActionMenu(ActionMenuState::new(
         vec![ActionMenuAction::TogglePace],
         vec![],
+        None,
         None,
     ));
     let name_prompt = Modal::NamePrompt(NamePromptForm {
@@ -1863,7 +1928,7 @@ fn plus_new_login_app(account_type: crate::tui::app::NewAccountType, reason: Opt
     let mut app = bare_app();
     app.tab = Tab::Setup;
     app.config_focus = ConfigFocus::Actions;
-    app.profile_cursor = app.profile_count();
+    app.profile_cursor.set(app.profile_count());
     let mut draft = crate::tui::app::build_draft_new();
     draft.account_type = account_type;
     app.config_draft = Some(draft);
@@ -1896,7 +1961,7 @@ fn relogin_app(reason: Option<&str>) -> App {
     });
     app.tab = Tab::Setup;
     app.config_focus = ConfigFocus::Actions;
-    app.profile_cursor = 0;
+    app.profile_cursor.set(0);
     app.shunt_add_disabled = reason.map(str::to_string);
     app.config_action_cursor = config_rows(&app)
         .iter()

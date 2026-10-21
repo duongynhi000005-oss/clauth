@@ -340,8 +340,9 @@ fn codex_label(window: &UsageWindow) -> String {
 /// A pool account's window as the bracketed bar renders it: shunt reports a
 /// 0-1 fraction for every family and an epoch-seconds reset, the claude row's
 /// bar model reads a 0-100 utilization and an ISO reset stamp. The one
-/// conversion both the width band and [`render_pool_row`] use.
-fn pool_window(utilization: Option<f64>, reset: Option<u64>) -> Option<UsageWindow> {
+/// conversion both the width band, [`render_pool_row`] and the Usage pool pane
+/// use.
+pub(super) fn pool_window(utilization: Option<f64>, reset: Option<u64>) -> Option<UsageWindow> {
     utilization.map(|fraction| UsageWindow {
         utilization: fraction * 100.0,
         resets_at: reset.map(|secs| crate::usage::epoch_secs_to_iso(secs as i64)),

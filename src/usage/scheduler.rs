@@ -4956,7 +4956,13 @@ fn codex_usage_tick_flagged(state: &SchedulerState, timed_out: Option<&AtomicBoo
             now_epoch_secs(),
         );
         match outcome {
-            Ok(info) => {
+            Ok(mut info) => {
+                // The age clock: only a live poll re-ages the body, so the
+                // stamp reads `now_ms()` at the write — the poll's own moment,
+                // not the tick's start (the per-name loop waits on request
+                // slots and HTTP between the two) — mirroring the OAuth leg's
+                // `info.fetched_at = Some(now.as_millis())`.
+                info.fetched_at = Some(crate::usage::now_ms());
                 crate::codex_auth::kick_reset(name.as_str());
                 #[cfg(test)]
                 run_codex_compare_hook(name.as_str());
