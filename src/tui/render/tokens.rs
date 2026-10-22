@@ -981,11 +981,13 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             // Today's date → the today card's title-right meta badge.
             let today_meta = stats.today.as_ref().map(|t| short_date(&t.date));
-            let mut today_body = today_lines(stats, inner_w(d.first), count_cache, prices);
-            today_body.push(today_speed_line(
-                app,
-                speed_days.get(&today_date()).copied(),
-            ));
+            let today_body = today_lines(
+                stats,
+                inner_w(d.first),
+                count_cache,
+                prices,
+                today_speed_line(app, speed_days.get(&today_date()).copied()),
+            );
             card(
                 frame,
                 d.first,
@@ -1236,12 +1238,13 @@ fn today_lines(
     w: usize,
     count_cache: bool,
     prices: Option<&PriceTable>,
+    speed: Line<'static>,
 ) -> Vec<Line<'static>> {
     let Some(t) = stats.today.as_ref() else {
-        return vec![Line::from(Span::styled(
-            "idle so far today",
-            theme::faint(),
-        ))];
+        return vec![
+            Line::from(Span::styled("idle so far today", theme::faint())),
+            speed,
+        ];
     };
     let tokens = if count_cache { t.total() } else { t.in_out() };
     vec![
@@ -1251,6 +1254,7 @@ fn today_lines(
             key("msgs"),
             Span::styled(group_thousands(t.messages as f64, 0), theme::body()),
         ]),
+        speed,
         lr(
             vec![Span::styled(
                 format!("{} in", fmt_count(t.input)),

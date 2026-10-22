@@ -486,7 +486,7 @@ fn today_card_prices_peak_and_off_peak_hours_at_their_tiers() {
         ..Default::default()
     };
     let stats = stats_with_today("deepseek-chat", hours);
-    let lines = today_lines(&stats, 60, false, Some(&table));
+    let lines = today_lines(&stats, 60, false, Some(&table), Line::default());
     let cost = line_text(&lines[1]);
     assert!(
         cost.contains("$0.003"),
@@ -498,7 +498,7 @@ fn today_card_prices_peak_and_off_peak_hours_at_their_tiers() {
     );
 
     // No table → the dash.
-    let bare = today_lines(&stats, 60, false, None);
+    let bare = today_lines(&stats, 60, false, None, Line::default());
     assert!(line_text(&bare[1]).contains('—'), "no table → dash");
 }
 
@@ -521,6 +521,7 @@ fn peak_window_boundary_hour_16_prices_peak() {
         60,
         false,
         Some(&table),
+        Line::default(),
     );
     assert!(
         line_text(&peak_lines[1]).contains("$0.002"),
@@ -538,6 +539,7 @@ fn peak_window_boundary_hour_16_prices_peak() {
         60,
         false,
         Some(&table),
+        Line::default(),
     );
     assert!(
         line_text(&off_lines[1]).contains("$0.001"),
@@ -586,7 +588,13 @@ fn today_card_floors_unpriced_models_and_dashes_without_a_table() {
         input: 1000,
         ..Default::default()
     };
-    let lines = today_lines(&stats_with_today("glm-5.2", hours), 60, false, Some(&table));
+    let lines = today_lines(
+        &stats_with_today("glm-5.2", hours),
+        60,
+        false,
+        Some(&table),
+        Line::default(),
+    );
     assert!(
         line_text(&lines[1]).contains("$0+"),
         "unpriced token-bearing model floors the day, got {:?}",
@@ -2303,5 +2311,64 @@ fn the_merged_day_sums_let_the_ledger_win_on_a_shared_date() {
             gen_ms: 10_000,
         }),
         "the ledger's finalized day wins over the cache's day"
+    );
+}
+
+/// The today card's body as drawn: the cells between the first card's side
+/// borders on every row of a Tokens frame, up to its bottom border, blank rows
+/// dropped.
+fn today_card_rows(app: &App, w: u16, h: u16) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .skip_while(|row| !row.starts_with("╭─ TODAY "))
+        .skip(1)
+        .take_while(|row| !row.contains('╰'))
+        .filter_map(|row| {
+            let inner = row.split('│').nth(1)?.trim().to_string();
+            (!inner.is_empty()).then_some(inner)
+        })
+        .collect()
+}
+
+/// The today card reads `speed` right under `msgs`, above the in/out split.
+#[test]
+fn the_today_card_puts_speed_above_the_in_out_split() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Tokens;
+    app.token_period = TokenPeriod::Daily;
+    app.token_stats = Some(TokenStats {
+        today: Some(DaySummary {
+            date: crate::tokens::today_date(),
+            input: 800_000,
+            output: 400_000,
+            messages: 310,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    app.set_tps(Some(tps_tokens_snapshot(1_000)));
+
+    assert_eq!(
+        today_card_rows(&app, 120, 40),
+        [
+            "tokens    1.20M",
+            "cost      —",
+            "msgs      310",
+            "speed     92 t/s now · 90 t/s today",
+            "800K in                               400K out",
+        ]
+    );
+
+    // An idle day draws no split: speed stays under the idle line.
+    app.token_stats = Some(TokenStats::default());
+    assert_eq!(
+        today_card_rows(&app, 120, 40),
+        ["idle so far today", "speed     92 t/s now · 90 t/s today"]
     );
 }
