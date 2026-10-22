@@ -6948,16 +6948,473 @@ fn set_daemon(app: &mut App, health: crate::daemon::DaemonHealth) {
 /// Drain the Services probes until the shunt action (or a config save, which
 /// runs on its own worker) in flight lands.
 fn drain_shunt_action(app: &mut App) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.services.shunt_action.running || app.services.shunt_save_worker.running {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the shunt action did not land"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        super::drain_service_probes(app);
+    drain_shunt_action_within(app, std::time::Duration::from_secs(120));
+}
+
+/// One shared wait for a TUI worker's `running` flag: drain, and while
+/// `running(app)` still holds, join every registered worker bounded at `bound`.
+/// A flag still set with no registered worker panics naming it (the worker was
+/// never in the registry, so the join keeps finding nothing and would spin
+/// forever); a join that misses at `bound` panics naming how many workers are
+/// still running, their handles already handed back to the registry for the
+/// next join.
+fn drain_workers(
+    app: &mut App,
+    bound: std::time::Duration,
+    what: &str,
+    running: fn(&App) -> bool,
+    drain: fn(&mut App),
+) {
+    loop {
+        drain(app);
+        if !running(app) {
+            return;
+        }
+        let registered = super::TEST_WORKERS.lock().map(|w| w.len()).unwrap_or(0);
+        if registered == 0 {
+            panic!("{what} is running with no registered worker");
+        }
+        if let Err(n) = super::join_test_workers_within(bound) {
+            let workers = if n == 1 { "worker" } else { "workers" };
+            panic!("{what} did not finish within {bound:?} ({n} {workers} still running)");
+        }
     }
-    super::drain_service_probes(app);
+}
+
+/// [`drain_shunt_action`] with the hang-detector bound explicit: a worker still
+/// running past `bound` fails the test naming how many, and the handle stays
+/// in the registry so the next join still waits for it.
+fn drain_shunt_action_within(app: &mut App, bound: std::time::Duration) {
+    drain_workers(
+        app,
+        bound,
+        "the shunt action or config save",
+        |app: &App| app.services.shunt_action.running || app.services.shunt_save_worker.running,
+        super::drain_service_probes,
+    );
+}
+
+/// A bounded join that sees a worker still running hands its handle back to
+/// the registry: the next join waits for it, so its outcome has been sent by
+/// the time that join returns. The worker runs 300 ms past its gate, so a
+/// join that lost the handle returns before the send and the drain finds
+/// nothing.
+#[test]
+fn a_bounded_worker_join_keeps_the_worker_it_did_not_see_finish() {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+    static OPEN: Mutex<bool> = Mutex::new(false);
+    static OPENED: Condvar = Condvar::new();
+    fn gated(_job: super::ShuntActionJob) -> super::ShuntActionOutcome {
+        let open = OPEN.lock().unwrap();
+        drop(
+            OPENED
+                .wait_timeout_while(open, Duration::from_secs(60), |open| !*open)
+                .unwrap(),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        super::ShuntActionOutcome::default()
+    }
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::join_test_workers();
+    app.services.shunt_action.prober = Some(gated);
+    app.services.shunt_action.start(super::ShuntActionJob::Hold);
+    assert_eq!(
+        super::join_test_workers_within(Duration::from_millis(200)),
+        Err(1)
+    );
+    *OPEN.lock().unwrap() = true;
+    OPENED.notify_all();
+    assert_eq!(
+        super::join_test_workers_within(Duration::from_secs(60)),
+        Ok(())
+    );
+    super::drain_service_probes(&mut app);
+    assert!(
+        !app.services.shunt_action.running,
+        "the join returned before the worker sent its outcome"
+    );
+}
+
+/// A shunt drain whose worker outlives the drain's bound fails naming what it
+/// waited on, and the worker stays joinable afterwards.
+#[test]
+fn a_shunt_drain_past_its_bound_fails_naming_the_worker() {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+    static OPEN: Mutex<bool> = Mutex::new(false);
+    static OPENED: Condvar = Condvar::new();
+    fn gated(_job: super::ShuntActionJob) -> super::ShuntActionOutcome {
+        let open = OPEN.lock().unwrap();
+        drop(
+            OPENED
+                .wait_timeout_while(open, Duration::from_secs(60), |open| !*open)
+                .unwrap(),
+        );
+        super::ShuntActionOutcome::default()
+    }
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::join_test_workers();
+    app.services.shunt_action.prober = Some(gated);
+    app.services.shunt_action.start(super::ShuntActionJob::Hold);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drain_shunt_action_within(&mut app, Duration::from_millis(200));
+    }));
+    *OPEN.lock().unwrap() = true;
+    OPENED.notify_all();
+    let payload = caught.expect_err("a drain past its bound returned");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .expect("a text panic");
+    assert_eq!(
+        message,
+        "the shunt action or config save did not finish within 200ms (1 worker still running)"
+    );
+    drain_shunt_action(&mut app);
+    assert!(!app.services.shunt_action.running);
+}
+
+/// The panic payload of a `catch_unwind` over a helper, as its message text.
+fn panic_message(caught: std::thread::Result<()>) -> String {
+    let payload = caught.expect_err("expected a panic");
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .expect("a text panic")
+}
+
+/// Run `f` on its own thread and return its panic message, failing the test
+/// when `f` never returns: the no-handle guard must panic, never spin, so a
+/// hang reads as a red here instead of stalling the gate.
+fn panic_message_of(f: impl FnOnce() + Send + 'static) -> String {
+    let handle =
+        std::thread::spawn(move || std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        handle.is_finished(),
+        "the wait helper never returned: it spun on a flag with no registered worker"
+    );
+    panic_message(handle.join().unwrap())
+}
+
+/// Spawn a worker gated on `open`, so a bounded join can miss on it.
+fn spawn_gated_worker(open: &'static std::sync::Mutex<bool>, opened: &'static std::sync::Condvar) {
+    super::spawn_worker(move || {
+        let g = open.lock().unwrap();
+        let _ = opened
+            .wait_timeout_while(g, std::time::Duration::from_secs(60), |open| !*open)
+            .unwrap();
+    });
+}
+
+/// A worker that itself spawns a second worker while a bounded join waits on
+/// it must not deadlock: the join never holds the registry lock across its
+/// wait, so the first worker's nested `spawn_worker` completes and the join
+/// returns `Ok` within its bound.
+#[test]
+fn a_nested_spawn_under_a_bounded_join_is_not_deadlocked() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
+    static OPEN: Mutex<bool> = Mutex::new(false);
+    static OPENED: Condvar = Condvar::new();
+    static NESTED_RAN: AtomicBool = AtomicBool::new(false);
+    let _home = crate::testutil::HomeSandbox::new();
+    super::join_test_workers();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    super::spawn_worker(move || {
+        started_tx.send(()).unwrap();
+        let g = OPEN.lock().unwrap();
+        let _ = OPENED
+            .wait_timeout_while(g, Duration::from_secs(60), |open| !*open)
+            .unwrap();
+        super::spawn_worker(|| NESTED_RAN.store(true, Ordering::SeqCst));
+    });
+    started_rx.recv().unwrap();
+
+    let join_thread =
+        std::thread::spawn(|| super::join_test_workers_within(Duration::from_secs(60)));
+
+    // Open the gate only once the join has taken the worker out and released
+    // the registry lock. A join that held the lock across the wait keeps
+    // `try_lock` failing and then finishes with `Err`, so the loop exits on
+    // the join thread either way.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut took = false;
+    while !took && !join_thread.is_finished() {
+        if let Ok(guard) = super::TEST_WORKERS.try_lock() {
+            took = guard.is_empty();
+        }
+        if !took {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the bounded join neither released the registry nor finished"
+        );
+    }
+    *OPEN.lock().unwrap() = true;
+    OPENED.notify_all();
+
+    let result = join_thread.join().unwrap();
+    assert_eq!(
+        result,
+        Ok(()),
+        "a worker spawning another worker under the bounded join deadlocked"
+    );
+    super::join_test_workers();
+    assert!(NESTED_RAN.load(Ordering::SeqCst));
+}
+
+/// A hand-set `running` flag with no registered worker panics naming it,
+/// through both wait helpers, instead of spinning forever.
+#[test]
+fn a_running_flag_with_no_registered_worker_fails_naming_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::join_test_workers();
+    app.services.shunt_action.running = true;
+    let message = panic_message_of(move || {
+        drain_shunt_action_within(&mut app, std::time::Duration::from_millis(200))
+    });
+    assert_eq!(
+        message,
+        "the shunt action or config save is running with no registered worker"
+    );
+
+    let mut app = bare_app();
+    super::join_test_workers();
+    app.services.herdr_probe.running = true;
+    let message = panic_message_of(move || await_service_probes(&mut app));
+    assert_eq!(
+        message,
+        "a Services probe is running with no registered worker"
+    );
+}
+
+/// A drain past its bound names the exact count still running: two gated
+/// workers read plural, one gated plus one already finished reads singular (a
+/// join that skips the `is_finished` check on a handle past the bound
+/// overcounts the finished one).
+#[test]
+fn a_drain_names_how_many_workers_are_still_running() {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+    static TWO_OPEN: Mutex<bool> = Mutex::new(false);
+    static TWO_OPENED: Condvar = Condvar::new();
+    static ONE_OPEN: Mutex<bool> = Mutex::new(false);
+    static ONE_OPENED: Condvar = Condvar::new();
+
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = bare_app();
+        super::join_test_workers();
+        spawn_gated_worker(&TWO_OPEN, &TWO_OPENED);
+        spawn_gated_worker(&TWO_OPEN, &TWO_OPENED);
+        app.services.shunt_action.running = true;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drain_shunt_action_within(&mut app, Duration::from_millis(200));
+        }));
+        *TWO_OPEN.lock().unwrap() = true;
+        TWO_OPENED.notify_all();
+        assert_eq!(
+            panic_message(caught),
+            "the shunt action or config save did not finish within 200ms (2 workers still running)"
+        );
+        super::join_test_workers();
+    }
+
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = bare_app();
+        super::join_test_workers();
+        spawn_gated_worker(&ONE_OPEN, &ONE_OPENED);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        super::spawn_worker(move || {
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the already-finished worker never started");
+        // "Already finished" is a fact, never a timing guess: the worker has
+        // sent, and its handle now reports finished. The registry is locked
+        // only to read `is_finished` — the worker exits without needing it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let finished = super::TEST_WORKERS
+                .lock()
+                .map(|workers| workers.iter().any(|h| h.is_finished()))
+                .unwrap_or(false);
+            if finished {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the already-finished worker never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.services.shunt_action.running = true;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drain_shunt_action_within(&mut app, Duration::from_millis(200));
+        }));
+        *ONE_OPEN.lock().unwrap() = true;
+        ONE_OPENED.notify_all();
+        assert_eq!(
+            panic_message(caught),
+            "the shunt action or config save did not finish within 200ms (1 worker still running)"
+        );
+        super::join_test_workers();
+    }
+}
+
+/// A worker stuck past the drop's join bound is detached while the test is
+/// already panicking, so the thread ends promptly instead of the drop hanging
+/// on the worker's gate.
+#[test]
+fn a_home_sandbox_drop_detaches_a_worker_stuck_past_its_bound_while_panicking() {
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
+    static OPEN: Mutex<bool> = Mutex::new(false);
+    static OPENED: Condvar = Condvar::new();
+    struct OpenTheGate;
+    impl Drop for OpenTheGate {
+        fn drop(&mut self) {
+            *OPEN.lock().unwrap() = true;
+            OPENED.notify_all();
+        }
+    }
+
+    let inner = std::thread::spawn(move || {
+        let _home = crate::testutil::HomeSandbox::new();
+        // Set inside the sandbox so `HOME_TEST_LOCK` is held: no parallel
+        // test's teardown can clear the override between the set and the drop's
+        // read.
+        crate::testutil::set_tui_worker_join_timeout_override(Some(Duration::from_millis(200)));
+        super::join_test_workers();
+        super::spawn_worker(|| {
+            let g = OPEN.lock().unwrap();
+            let _ = OPENED
+                .wait_timeout_while(g, Duration::from_secs(60), |open| !*open)
+                .unwrap();
+        });
+        panic!("the drop must detach, not hang");
+    });
+    // Releases the gate on every path, the assert's unwind included, so the
+    // detached worker finishes and nothing outlives the test.
+    let _open = OpenTheGate;
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !inner.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        inner.is_finished(),
+        "HomeSandbox::drop hung on a worker stuck past its join bound"
+    );
+    let _ = inner.join();
+
+    // Release the gate before reading the registry: if the detach was deleted,
+    // the worker's handle is still in the registry and must be finished before
+    // a fresh sandbox's teardown joins it, else that teardown hangs on the
+    // gate.
+    *OPEN.lock().unwrap() = true;
+    OPENED.notify_all();
+    // The panicking teardown detached the worker: the registry is empty when
+    // read under a fresh sandbox.
+    let _fresh = crate::testutil::HomeSandbox::new();
+    let left = super::TEST_WORKERS.lock().map(|w| w.len()).unwrap_or(0);
+    assert_eq!(
+        left, 0,
+        "the panicking teardown left a TUI worker handle behind"
+    );
+}
+
+/// A join miss while the test is NOT panicking runs the whole rest of the drop
+/// (the stuck worker is detached, so the registry is empty) and panics LAST,
+/// naming the count and the bound. The panic text is pinned by equality, the
+/// detach (the first teardown step) by an empty registry, and the env restore
+/// (the last step) by a `CLAUDE_PID` sentinel only that restore replaces.
+#[test]
+fn a_home_sandbox_drop_panics_last_after_a_non_panicking_join_miss() {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+    static OPEN: Mutex<bool> = Mutex::new(false);
+    static OPENED: Condvar = Condvar::new();
+    struct OpenTheGate;
+    impl Drop for OpenTheGate {
+        fn drop(&mut self) {
+            *OPEN.lock().unwrap() = true;
+            OPENED.notify_all();
+        }
+    }
+    // Releases the gate on every path, the assert's unwind included, so the
+    // detached worker finishes and nothing outlives the test.
+    let _open = OpenTheGate;
+
+    const SENTINEL: &str = "the drop's env restore never ran";
+    let inner = std::thread::spawn(move || {
+        let home = crate::testutil::HomeSandbox::new();
+        // Forgotten, so its own restore never runs: only the drop's LAST
+        // teardown step (the env restore) replaces this value.
+        std::mem::forget(crate::testutil::EnvPin::new(
+            &home,
+            &[("CLAUDE_PID", Some(std::ffi::OsStr::new(SENTINEL)))],
+        ));
+        crate::testutil::set_tui_worker_join_timeout_override(Some(Duration::from_millis(200)));
+        super::join_test_workers();
+        super::spawn_worker(|| {
+            let g = OPEN.lock().unwrap();
+            let _ = OPENED
+                .wait_timeout_while(g, Duration::from_secs(60), |open| !*open)
+                .unwrap();
+        });
+        // No panic: the miss happens in the drop itself.
+    });
+
+    let message = panic_message(inner.join());
+    assert_eq!(
+        message,
+        "1 TUI worker still running past the 200ms join bound"
+    );
+    // Read under `HOME_TEST_LOCK`: every sandbox removes `CLAUDE_PID` while it
+    // holds the lock and restores its own prior value before releasing it, so
+    // only a drop that skipped its env restore leaves the sentinel here.
+    let pid = {
+        let _held = crate::profile::HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::var_os("CLAUDE_PID")
+    };
+    assert_ne!(
+        pid.as_deref(),
+        Some(std::ffi::OsStr::new(SENTINEL)),
+        "the drop panicked before its last teardown step (the env restore)"
+    );
+
+    // Release the gate before reading the registry: if the panic fired before
+    // the detach (the teardown skipped), the worker's handle survives and must
+    // be finished before a fresh sandbox's teardown joins it, else that
+    // teardown hangs on the gate.
+    *OPEN.lock().unwrap() = true;
+    OPENED.notify_all();
+    // The teardown ran first: it detached the stuck worker, so the registry is
+    // empty when read under a fresh sandbox.
+    let _fresh = crate::testutil::HomeSandbox::new();
+    let left = super::TEST_WORKERS.lock().map(|w| w.len()).unwrap_or(0);
+    assert_eq!(
+        left, 0,
+        "the drop panicked before detaching the stuck worker (the teardown did not finish)"
+    );
 }
 
 /// The confirm on top, or a panic naming what is open instead.
@@ -7605,15 +8062,13 @@ fn stub_left_behind(app: &mut App, left_running: bool) {
 
 /// Drain the left-behind probe until its run lands.
 fn await_left_behind(app: &mut App) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.left_behind_probe.running {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the left-behind probe did not land within 10 s"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        super::drain_left_behind_probe(app);
-    }
+    drain_workers(
+        app,
+        std::time::Duration::from_secs(120),
+        "the left-behind probe",
+        |app: &App| app.left_behind_probe.running,
+        super::drain_left_behind_probe,
+    );
 }
 
 /// The throttled daemon poll, forced due, then the probe it may start.
@@ -7742,15 +8197,14 @@ fn the_tick_lands_the_no_daemon_warning() {
     stub_left_behind(&mut app, false);
     app.toasts.clear();
     app.last_daemon_probe = std::time::Instant::now() - std::time::Duration::from_secs(2);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while gateway_unrun_toasts(&app).is_empty() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "ticking never landed the no-daemon warning"
+    super::on_tick(&mut app);
+    if let Err(n) = super::join_test_workers_within(std::time::Duration::from_secs(120)) {
+        panic!(
+            "ticking never landed the no-daemon warning: the left-behind probe did not finish within 120 s ({n} worker{} still running)",
+            if n == 1 { "" } else { "s" }
         );
-        super::on_tick(&mut app);
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    super::on_tick(&mut app);
     assert_eq!(gateway_unrun_toasts(&app), vec![super::ToastKind::Warning]);
 }
 
@@ -8313,8 +8767,9 @@ fn confirming_a_rotate_under_a_live_session_is_refused_on_macos() {
 /// worker short-circuits before any HTTP.
 ///
 /// `join_test_workers` is load-bearing, not hygiene: `spawn_worker` detaches, and
-/// a worker still running when `HomeSandbox` drops resolves the operator's REAL
-/// `$HOME` and takes real locks under `~/.clauth`.
+/// a worker still running when `HomeSandbox` drops is detached, its next home
+/// read resolving whichever `HOME_OVERRIDE` is installed then, never the real
+/// `$HOME`.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
@@ -18736,24 +19191,24 @@ fn herdr_row_absent_when_herdr_does_not_resolve() {
     );
 }
 
-/// Drain the Services probe workers' results the way the tick does, waiting up
-/// to 10 s for every running one to land.
+/// Drain the Services probe workers' results the way the tick does: joining
+/// every registered worker (120 s hang bound) and draining until none of the
+/// six `running` flags holds.
 fn await_service_probes(app: &mut App) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.services.herdr_probe.running
-        || app.services.standalone_probe.running
-        || app.services.move_plan_probe.running
-        || app.services.pool_probe.running
-        || app.services.shunt_action.running
-        || app.services.shunt_save_worker.running
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "a Services probe did not land within 10 s"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        super::drain_service_probes(app);
-    }
+    drain_workers(
+        app,
+        std::time::Duration::from_secs(120),
+        "a Services probe",
+        |app: &App| {
+            app.services.herdr_probe.running
+                || app.services.standalone_probe.running
+                || app.services.move_plan_probe.running
+                || app.services.pool_probe.running
+                || app.services.shunt_action.running
+                || app.services.shunt_save_worker.running
+        },
+        super::drain_service_probes,
+    );
 }
 
 /// While the Services tab shows a standalone shunt's claim, the readout is
@@ -26976,16 +27431,7 @@ fn the_admin_action_reaches_the_engine_and_toasts() {
         .start(super::ShuntActionJob::AddAdminTable {
             record: record.clone(),
         });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.services.shunt_action.running {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the admin action did not land"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        super::drain_service_probes(&mut app);
-    }
-    super::drain_service_probes(&mut app);
+    drain_shunt_action(&mut app);
     assert!(
         app.toasts
             .iter()
@@ -27341,16 +27787,7 @@ fn a_landed_move_drops_the_stale_plan() {
     app.services
         .shunt_action
         .start(super::ShuntActionJob::AddAdminKey { record });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.services.shunt_action.running {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the move action did not land"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        super::drain_service_probes(&mut app);
-    }
-    super::drain_service_probes(&mut app);
+    drain_shunt_action(&mut app);
     assert!(
         app.services.move_plan.is_none(),
         "a landed move drops the stale plan: {:?}",
@@ -27462,16 +27899,7 @@ fn the_key_confirm_dispatches_the_key_job() {
     app.services.shunt_record = Some(record.clone());
     app.services.shunt_action.prober = Some(capture);
     super::run_confirm_action(&mut app, ConfirmAction::AddAdminKey);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.services.shunt_action.running {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the key action did not land"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        super::drain_service_probes(&mut app);
-    }
-    super::drain_service_probes(&mut app);
+    drain_shunt_action(&mut app);
     let job = CAPTURED
         .lock()
         .unwrap()
@@ -34189,17 +34617,10 @@ fn one_save_at_a_time_across_a_field_save_a_token_add_and_a_token_remove() {
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if app.services.shunt_save_worker.running {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the remove never started"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        assert!(
+            app.services.shunt_save_worker.running,
+            "the remove never started"
+        );
         let config_before = std::fs::read_to_string(record.config()).unwrap();
         app.services
             .shunt_expanded
@@ -34283,17 +34704,10 @@ fn one_save_at_a_time_across_a_field_save_a_token_add_and_a_token_remove() {
             super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
         }
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if app.services.shunt_save_worker.running {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the field save never started"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        assert!(
+            app.services.shunt_save_worker.running,
+            "the field save never started"
+        );
         // The committed editor is locked while its save runs; `↓` steps off the
         // row and closes it so the next key reaches the card.
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
@@ -34700,17 +35114,10 @@ fn a_mint_form_jump_over_an_in_flight_field_holds_until_it_lands() {
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
     }
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if app.services.shunt_save_worker.running {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the field save never started"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    assert!(
+        app.services.shunt_save_worker.running,
+        "the field save never started"
+    );
     // Step off the locked editor, then jump to the mint form: the jump holds
     // on the running save.
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
@@ -34756,17 +35163,10 @@ fn the_mint_save_guards_while_a_token_remove_is_in_flight() {
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if app.services.shunt_save_worker.running {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the remove never started"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    assert!(
+        app.services.shunt_save_worker.running,
+        "the remove never started"
+    );
     open_minted_form(&mut app);
     assert!(
         app.config_draft.is_some(),

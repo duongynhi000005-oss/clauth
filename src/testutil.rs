@@ -135,6 +135,7 @@ impl HomeSandbox {
         // lock deadline it did not set. The callback/feed bounds and the
         // marker-registration pose are the same class of process-global state.
         crate::lock::set_state_lock_timeout_override(None);
+        set_tui_worker_join_timeout_override(None);
         crate::oauth_login::set_callback_read_timeout_override(None);
         crate::oauth_login::set_callback_reader_cap_override(None);
         crate::codex_login::set_callback_read_timeout_override(None);
@@ -188,16 +189,18 @@ impl Drop for HomeSandbox {
     )]
     fn drop(&mut self) {
         // Join BEFORE clearing the override, not after and not per-test. A
-        // detached worker still running when `HOME_OVERRIDE` clears resolves
-        // the user's REAL `$HOME` and takes real locks under `~/.clauth`
-        // (`RotationGuard::acquire` alone does `mkdir_700` + a blocking
-        // flock). Doing it here rather than asking each test to call the join
-        // fns covers the tests that never thought about it — which is every
-        // test that will ever be added. Two registries: the TUI's own
-        // `spawn_worker` handles (joinable OS threads) and
-        // [`join_background_tasks`] for detach mechanisms that hand back no
-        // joinable handle at all (e.g. `tokio::task::spawn_blocking`).
-        crate::tui::join_test_workers();
+        // worker still running past the join bound is detached, so its next
+        // home read resolves whichever `HOME_OVERRIDE` is installed then — a
+        // later test's sandbox under one-process `cargo test` — and never the
+        // operator's real `$HOME` (a `cfg(test)` home read with no override
+        // panics inside the worker's own `catch_unwind`). Doing it here rather
+        // than asking each test to call the join fns covers the tests that
+        // never thought about it — which is every test that will ever be
+        // added. Two registries: the TUI's own `spawn_worker` handles
+        // (joinable OS threads) and [`join_background_tasks`] for detach
+        // mechanisms that hand back no joinable handle at all (e.g.
+        // `tokio::task::spawn_blocking`).
+        let stuck = join_tui_workers_bounded();
         join_background_tasks();
         // Clear the forget queue, its registered-stores flag and the seed
         // hooks: under `cargo test` the suite is one process, so a leak or an
@@ -212,6 +215,7 @@ impl Drop for HomeSandbox {
         // the next one. The callback/feed bounds and the marker-registration
         // pose leak the same way, so they clear together.
         crate::lock::set_state_lock_timeout_override(None);
+        set_tui_worker_join_timeout_override(None);
         crate::oauth_login::set_callback_read_timeout_override(None);
         crate::oauth_login::set_callback_reader_cap_override(None);
         crate::codex_login::set_callback_read_timeout_override(None);
@@ -233,6 +237,12 @@ impl Drop for HomeSandbox {
         match self.prev_claude_pid.take() {
             Some(prev) => unsafe { std::env::set_var("CLAUDE_PID", prev) },
             None => unsafe { std::env::remove_var("CLAUDE_PID") },
+        }
+        // A non-panicking miss ran the whole teardown above; panic LAST naming
+        // the count and the bound. The unwind then drops the guard (poisoning
+        // `HOME_TEST_LOCK`, which the next sandbox recovers) and the tempdir.
+        if let Some(msg) = stuck {
+            panic!("{msg}");
         }
     }
 }
@@ -350,6 +360,63 @@ pub(crate) fn join_background_tasks_with(timeout: std::time::Duration) {
                 panic!("{msg}");
             }
         }
+    }
+}
+
+/// The bound [`HomeSandbox::drop`] waits for TUI workers: [`BACKGROUND_TASK_JOIN_TIMEOUT`],
+/// or a shorter value a test poses a hung worker under. Production never sets
+/// the override. Reset by `HomeSandbox` (which serializes the whole suite
+/// through `HOME_TEST_LOCK`), so a parallel test never sees a leaked override.
+#[cfg(test)]
+static TUI_WORKER_JOIN_TIMEOUT_OVERRIDE: std::sync::Mutex<Option<std::time::Duration>> =
+    std::sync::Mutex::new(None);
+
+/// The bound [`HomeSandbox::drop`] waits for TUI workers: the test-only
+/// override when set, else [`BACKGROUND_TASK_JOIN_TIMEOUT`].
+#[cfg(test)]
+fn tui_worker_join_timeout() -> std::time::Duration {
+    if let Some(t) = *TUI_WORKER_JOIN_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return t;
+    }
+    BACKGROUND_TASK_JOIN_TIMEOUT
+}
+
+/// Set or clear the test-only TUI-worker join bound. `None` restores
+/// [`BACKGROUND_TASK_JOIN_TIMEOUT`].
+#[cfg(test)]
+pub(crate) fn set_tui_worker_join_timeout_override(timeout: Option<std::time::Duration>) {
+    *TUI_WORKER_JOIN_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
+}
+
+/// Join every TUI worker bounded, so a worker that never finishes cannot turn a
+/// test's teardown into a hung gate. On a miss the stuck workers are detached,
+/// and a detached worker's next home read resolves whichever `HOME_OVERRIDE` is
+/// installed then — never the operator's real `$HOME`. A panicking miss logs
+/// and returns `None`; a non-panicking miss returns the message for
+/// [`HomeSandbox::drop`] to panic with LAST, after the rest of the teardown.
+#[cfg(test)]
+fn join_tui_workers_bounded() -> Option<String> {
+    let bound = tui_worker_join_timeout();
+    if let Err(n) = crate::tui::join_test_workers_within(bound) {
+        let suffix = if n == 1 { "" } else { "s" };
+        let msg = format!("{n} TUI worker{suffix} still running past the {bound:?} join bound");
+        crate::tui::detach_test_workers();
+        if std::thread::panicking() {
+            crate::out::errln!(
+                "clauth: {msg}; detached, its next home read may resolve the next \
+                 sandboxed test's home, never the real one"
+            );
+            None
+        } else {
+            Some(msg)
+        }
+    } else {
+        None
     }
 }
 

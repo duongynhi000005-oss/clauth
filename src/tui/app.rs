@@ -27286,10 +27286,10 @@ impl Drop for BootstrapDoneGuard {
 }
 
 /// Handles of every [`spawn_worker`] thread, so a test can join them BEFORE its
-/// `HomeSandbox` drops. `HOME_OVERRIDE` is a process-global cleared on that drop,
-/// so a detached worker that outlives it resolves the operator's REAL `$HOME` and
-/// takes real locks under `~/.clauth` — `RotationGuard::acquire` alone does
-/// `mkdir_700` + a blocking flock. Serialized by `profile::HOME_TEST_LOCK`, which
+/// `HomeSandbox` drops. `HOME_OVERRIDE` is a process-global cleared on that drop;
+/// a worker that outlives it is detached, and its next home read resolves
+/// whichever `HOME_OVERRIDE` is installed then (a later test's sandbox), never
+/// the operator's real `$HOME`. Serialized by `profile::HOME_TEST_LOCK`, which
 /// every sandboxed test holds, so the registry is effectively exclusive.
 /// Never compiled into the binary.
 #[cfg(test)]
@@ -27307,6 +27307,56 @@ pub(crate) fn join_test_workers() {
     for handle in handles {
         let _ = handle.join();
     }
+}
+
+/// Join every worker spawned so far, waiting at most `bound` for all of them.
+/// A handle still unfinished when the bound lapses is handed BACK to the
+/// registry before this returns: the caller can then fail naming what it
+/// waited on, while [`join_test_workers`] and the next bounded join still wait
+/// for that handle — or, in `HomeSandbox::drop`, detach it so a stuck worker
+/// cannot hang the teardown again. `Err` carries how many handles were still
+/// running at the bound.
+#[cfg(test)]
+pub(crate) fn join_test_workers_within(bound: Duration) -> Result<(), usize> {
+    let handles: Vec<_> = TEST_WORKERS
+        .lock()
+        .map(|mut w| std::mem::take(&mut *w))
+        .unwrap_or_default();
+    let deadline = Instant::now() + bound;
+    let mut unfinished = Vec::new();
+    for handle in handles {
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            unfinished.push(handle);
+        }
+    }
+    if unfinished.is_empty() {
+        Ok(())
+    } else {
+        let n = unfinished.len();
+        if let Ok(mut workers) = TEST_WORKERS.lock() {
+            workers.extend(unfinished);
+        }
+        Err(n)
+    }
+}
+
+/// Detach every worker the registry still holds, dropping its handle. Used by
+/// `HomeSandbox::drop` after a bounded join misses: the worker is stuck past
+/// the bound and the teardown must not hang on it again. A detached worker's
+/// next [`crate::profile::home_dir`] resolves whichever `HOME_OVERRIDE` is
+/// installed then (a later test's sandbox), never the operator's real `$HOME`.
+#[cfg(test)]
+pub(crate) fn detach_test_workers() {
+    let handles: Vec<_> = TEST_WORKERS
+        .lock()
+        .map(|mut w| std::mem::take(&mut *w))
+        .unwrap_or_default();
+    drop(handles);
 }
 
 /// Spawn a background worker, catching panics so a single thread crash never

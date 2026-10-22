@@ -77,8 +77,9 @@ fn run_loop(terminal: &mut DefaultTerminal, config: AppConfig, herdr_mode: bool)
 #[path = "../../tests/inline/showcase.rs"]
 mod showcase;
 
-// Test-only: `HomeSandbox::drop` joins detached `spawn_worker` threads before it
-// clears `HOME_OVERRIDE`, so a worker can never resolve the operator's real
-// `$HOME` and lock under their `~/.clauth`.
+// Test-only: `HomeSandbox::drop` joins detached `spawn_worker` threads bounded
+// before it clears `HOME_OVERRIDE`; a worker still running past the bound is
+// detached, and its next home read resolves whichever `HOME_OVERRIDE` is
+// installed then, never the operator's real `$HOME`.
 #[cfg(test)]
-pub(crate) use app::join_test_workers;
+pub(crate) use app::{detach_test_workers, join_test_workers_within};
