@@ -39,7 +39,7 @@ Three per-account toggles relax this:
 
 - **`weekly gate`** off: ignore the soft weekly line for this account. The hard cap still blocks.
 - **`scoped gate`** off: keep rotating to this account for other models, ignoring its capped per-model weeks. Blunt by nature — it drops the gate for every model, so a session of the capped model can then land here too. `start --auto` narrows the same judgment to the models a session will actually run, and needs no toggle.
-- **`credit gate`** off: let auto-switch move onto this account after its usage-credit cap is spent. The cap only refuses credit-billed models (Fable, plus any family Claude Code's flag adds), so an opus or sonnet session still runs there; it never moves an account off the chain by itself.
+- **`credit gate`** off: let auto-switch move onto this account after its usage-credit cap is spent. The cap only refuses credit-billed models (Fable, plus any family Claude Code's flag adds), so an opus or sonnet session still runs there; it never moves the global account off the chain by itself. A `--with-fallback` session running a credit-billed model passes over this account whatever the gate says ([Running it](Auto-Switch#running-it)).
 
 ## Excluded members
 
@@ -116,6 +116,8 @@ An account's 5h window opens on its first real request, so a chain member you ha
 The chain runs wherever the decision loop runs: an open TUI, or `clauth daemon` with the TUI closed ([Daemon](Daemon)). Only one of them decides at a time.
 
 `clauth start <profile> --with-fallback` gives a single session its own chain, so that session hops accounts while your global one stays put. It needs a running daemon and an OAuth account inside a chain that holds a second member to move to, and it does not work alongside `--isolated` ([Quickstart](Quickstart#rules-worth-knowing)). On macOS the swap also writes the session's per-config-dir Keychain item, so the running session follows the chain there too.
+
+Such a session also leaves an account whose usage-credit cap is spent when it runs a credit-billed model: at once when it was launched on one (its `[models]`, `--model` or `ANTHROPIC_MODEL`), otherwise on its own first refusal from Claude Code (`You've hit your monthly spend limit.`). From then on it skips every account whose cap is spent, whatever that account's `credit gate` says. A session running opus or sonnet stays where it is.
 
 ## Choosing where a session starts
 
