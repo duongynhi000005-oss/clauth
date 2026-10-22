@@ -2512,6 +2512,276 @@ fn build_runtime_dir_links_claude_json_from_parent() {
     });
 }
 
+/// A shared tree always reaches Claude Code's ONE job store. CC writes a
+/// background job's record under `$CLAUDE_CONFIG_DIR/jobs/`, so a box that never
+/// ran one has no `~/.claude/jobs` for the build's walk to link — the record
+/// would land inside the tree, where the store never names it and the next
+/// teardown collects the tree under its own job.
+#[test]
+fn a_shared_tree_links_jobs_into_the_one_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a shared tree's jobs link") {
+            return;
+        }
+        let claude_home = fake_claude_home(tmp.path());
+        assert!(
+            !claude_home.join("jobs").exists(),
+            "the fixture starts on a box that never wrote a job"
+        );
+        let profile = configured_profile("jobslink");
+
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+
+        let store = claude_home.join("jobs");
+        assert!(store.is_dir(), "the store is created before the walk");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&store)
+                    .expect("store meta")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "the store lands owner-only like every other clauth write"
+            );
+        }
+        assert_eq!(
+            fs::canonicalize(rt.config_dir().join("jobs")).expect("resolve the tree's link"),
+            fs::canonicalize(&store).expect("resolve the store"),
+            "the per-session tree reaches the one store"
+        );
+        drop(rt);
+    });
+}
+
+/// A shared tree links `projects` even on a box with no `~/.claude/projects`
+/// yet — the store is created before the walk, so the tree reaches the one
+/// transcript store the session index reads.
+#[test]
+fn a_shared_tree_links_projects_on_a_box_without_the_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a shared tree's projects link") {
+            return;
+        }
+        let claude_home = fake_claude_home(tmp.path());
+        assert!(
+            !claude_home.join("projects").exists(),
+            "the fixture starts on a box that never wrote a transcript"
+        );
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("projectslink");
+        let canonical = tmp.path().join("creds.json");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("build");
+
+        let store = claude_home.join("projects");
+        assert!(store.is_dir(), "the store is created before the walk");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&store)
+                    .expect("store meta")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "the store lands owner-only like every other clauth write"
+            );
+        }
+        assert_eq!(
+            fs::canonicalize(runtime.join("projects")).expect("resolve the tree's link"),
+            fs::canonicalize(&store).expect("resolve the store"),
+            "the per-session tree reaches the one store"
+        );
+    });
+}
+
+/// An isolated Real tree links neither `jobs` nor `projects`, and creates
+/// neither store. The shared-only gate is what keeps an isolated session's CC
+/// (empty settings → default 30-day cleanupPeriodDays) from cleaning the user's
+/// transcripts through a linked `projects`, and its `--bg` records from naming
+/// a store that never sees them.
+#[test]
+fn an_isolated_tree_links_no_stores_on_a_box_without_them() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "an isolated tree's store boundary") {
+            return;
+        }
+        let claude_home = fake_claude_home(tmp.path());
+        assert!(
+            !claude_home.join("jobs").exists(),
+            "the fixture starts without a jobs store"
+        );
+        assert!(
+            !claude_home.join("projects").exists(),
+            "the fixture starts without a projects store"
+        );
+        let runtime = tmp.path().join("runtime-isolated");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("isolatedstores");
+        let canonical = tmp.path().join("creds.json");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Isolated,
+        )
+        .expect("build");
+
+        assert!(
+            !runtime.join("jobs").exists(),
+            "an isolated tree links no jobs store"
+        );
+        assert!(
+            !runtime.join("projects").exists(),
+            "an isolated tree links no projects store"
+        );
+        assert!(
+            !claude_home.join("jobs").exists(),
+            "an isolated build creates no jobs store"
+        );
+        assert!(
+            !claude_home.join("projects").exists(),
+            "an isolated build creates no projects store"
+        );
+    });
+}
+
+/// A store entry that is not a usable dir — a dangling `projects` symlink (a
+/// target moved aside or an unmounted disk), a regular `jobs` file — is left
+/// to the walk, never a refused start: one moved-aside `~/.claude` target must
+/// not take down every acquire.
+#[cfg(unix)]
+#[test]
+fn a_shared_build_skips_a_store_that_is_not_a_usable_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a shared build's unusable store skip") {
+            return;
+        }
+        let claude_home = fake_claude_home(tmp.path());
+        std::os::unix::fs::symlink("gone-projects", claude_home.join("projects"))
+            .expect("dangling projects symlink");
+        fs::write(claude_home.join("jobs"), b"not a dir").expect("regular jobs file");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("badstores");
+        let canonical = tmp.path().join("creds.json");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("a store that is not a usable dir skips, never fails the build");
+
+        assert!(
+            claude_home
+                .join("projects")
+                .symlink_metadata()
+                .expect("projects meta")
+                .file_type()
+                .is_symlink(),
+            "the dangling projects symlink stays a symlink, never a created dir"
+        );
+        assert!(
+            claude_home.join("jobs").is_file(),
+            "the regular jobs file stays a file, never a created dir"
+        );
+        assert!(
+            !runtime.join("projects").is_dir(),
+            "the tree gets no usable projects store"
+        );
+        assert!(
+            !runtime.join("jobs").is_dir(),
+            "the tree gets no usable jobs store"
+        );
+    });
+}
+
+/// A `~/.claude` that refuses new entries (read-only, `EACCES`, `ENOSPC`) must
+/// not refuse a shared start: the store is skipped, as an unusable one is, and
+/// the tree gets no link for it. The base started there — the walk only links
+/// what `~/.claude` already holds — and this fix must not be stricter than the
+/// base it corrects.
+///
+/// Unix only: [`crate::testutil::UnwritableDir`]'s Windows deny ACE still lets
+/// a new SUBDIRECTORY through, so it cannot pose a refused `mkdir` here.
+#[cfg(unix)]
+#[test]
+fn a_shared_build_skips_a_store_it_cannot_create() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a shared build's store-create failure") {
+            return;
+        }
+        let claude_home = fake_claude_home(tmp.path());
+        assert!(
+            claude_home.join("jobs").symlink_metadata().is_err(),
+            "the fixture starts without a jobs store"
+        );
+        assert!(
+            claude_home.join("projects").symlink_metadata().is_err(),
+            "the fixture starts without a projects store"
+        );
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("uncreatablestores");
+        let canonical = tmp.path().join("creds.json");
+        let unwritable = crate::testutil::UnwritableDir::new(&claude_home);
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("a store that cannot be created skips, never fails the build");
+        drop(unwritable);
+
+        assert!(
+            claude_home.join("jobs").symlink_metadata().is_err(),
+            "no jobs store was created"
+        );
+        assert!(
+            claude_home.join("projects").symlink_metadata().is_err(),
+            "no projects store was created"
+        );
+        assert!(
+            runtime.join("jobs").symlink_metadata().is_err(),
+            "the tree links no jobs store"
+        );
+        assert!(
+            runtime.join("projects").symlink_metadata().is_err(),
+            "the tree links no projects store"
+        );
+    });
+}
+
 /// `runtime/settings.json` carries clauth-owned credential routing for an
 /// api-key profile (top-level `apiKeyHelper` naming the profile, plus the
 /// base_url and model env keys), so it is a credential file and must land

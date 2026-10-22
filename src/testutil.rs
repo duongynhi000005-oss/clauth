@@ -995,6 +995,23 @@ impl Drop for EnvPin<'_> {
 #[cfg(unix)]
 const FAKE_CLAUDE_SHIM: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CLAUDE_SHIM_LOG"
+printf '%s\t%s\n' "${CLAUDE_CONFIG_DIR-}" "$*" >> "$CLAUDE_SHIM_LOG.spawns"
+# Like the real background launch: the job service takes the session, the
+# launch returns at once, and the job record names the config dir it reads.
+# The record is written through that config dir, as Claude Code writes it.
+for arg in "$@"; do
+  case "$arg" in
+    --bg|--background)
+      : "${CLAUDE_CONFIG_DIR:?}"
+      job="$CLAUDE_CONFIG_DIR/jobs/fakebg$$"
+      mkdir -p "$job"
+      printf '{"state":"working","respawnFlags":[],"providerEnv":{"CLAUDE_CONFIG_DIR":"%s"},"sessionId":"fakebg%s-0a6e-4b11-883e-fca3a218ae52"}\n' "$CLAUDE_CONFIG_DIR" "$$" > "$job/state.json"
+      mkdir -p "$CLAUDE_CONFIG_DIR/projects/-fake-cwd"
+      printf '{"type":"user"}\n' > "$CLAUDE_CONFIG_DIR/projects/-fake-cwd/fakebg$$.jsonl"
+      exit 0
+      ;;
+  esac
+done
 case "$1" in
   --version)
     echo "2.1.220 (Claude Code)"
@@ -1148,6 +1165,19 @@ impl<'a> FakeClaude<'a> {
 
     pub(crate) fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Every call the shim answered, as `(CLAUDE_CONFIG_DIR, argv)`, in call
+    /// order; an unset `CLAUDE_CONFIG_DIR` reads as the empty string.
+    pub(crate) fn spawns(&self) -> Vec<(String, String)> {
+        let mut path = self.log.clone().into_os_string();
+        path.push(".spawns");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .map(|(dir, argv)| (dir.to_string(), argv.to_string()))
+            .collect()
     }
 }
 

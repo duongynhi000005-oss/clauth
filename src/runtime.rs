@@ -5186,6 +5186,9 @@ fn build_runtime_dir_with_active_env(
     // revisit — and skip — that stale link. Live entries stay; a still-present
     // source gets re-linked by the walk.
     prune_dangling_links(runtime)?;
+    if isolation == Isolation::Shared {
+        ensure_store_links(claude_home, runtime, mode)?;
+    }
 
     let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(claude_home)
@@ -5233,6 +5236,56 @@ fn build_runtime_dir_with_active_env(
     seed_claude_json(runtime, claude_home)?;
 
     Ok(())
+}
+
+/// Stores Claude Code writes through its config dir and clauth reads from
+/// `~/.claude`.
+const SHARED_STORES: &[&str] = &["jobs", "projects"];
+
+/// Link the stores a shared tree must reach: Claude Code writes `jobs`
+/// (background job records) and `projects` (transcripts) through its config
+/// dir, and clauth reads them from `~/.claude`. The build's walk only visits
+/// what `~/.claude` already holds, so a box that never wrote either offers no
+/// store for the walk to link, and the record would land inside the tree,
+/// where the store never sees it and the next teardown collects it.
+///
+/// Shared trees on the linking transport only: fake mode copies the store into
+/// the tree and the watchdog's mirror publishes a record written through the
+/// tree back out, and an isolated tree reaches nothing in `~/.claude`. Each
+/// absent store is created 0700, the owner-only shape every clauth write
+/// takes; an existing tree entry is left as it is; a store that is unusable or
+/// cannot be created is skipped, so a start the base allowed is never refused
+/// by this fix.
+fn ensure_store_links(claude_home: &Path, runtime: &Path, mode: LinkMode) -> Result<()> {
+    if mode == LinkMode::Fake {
+        return Ok(());
+    }
+    for name in SHARED_STORES {
+        ensure_store_link(claude_home, runtime, name)?;
+    }
+    Ok(())
+}
+
+fn ensure_store_link(claude_home: &Path, runtime: &Path, name: &str) -> Result<()> {
+    let global = claude_home.join(name);
+    // A regular file, a dangling link or an `ELOOP` loop (`is_dir` swallows
+    // the error) is no store: the walk links the tree entry to it as it
+    // stands, exactly as the base does.
+    if global.symlink_metadata().is_ok() && !global.is_dir() {
+        return Ok(());
+    }
+    // A start the base allowed must never be refused by this fix: a read-only
+    // or full `~/.claude` skips this store and the build goes on.
+    if crate::profile::mkdir_700(&global).is_err() {
+        return Ok(());
+    }
+    let dst = runtime.join(name);
+    if dst.symlink_metadata().is_ok() {
+        // A tree entry already in place (a link or a real dir) is left as-is,
+        // the walk's existing skip.
+        return Ok(());
+    }
+    link_entry(&global, &dst)
 }
 
 /// Test-only convenience over [`build_runtime_dir_with_active_env`]: passes

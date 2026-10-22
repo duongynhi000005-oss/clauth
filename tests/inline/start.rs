@@ -1315,3 +1315,84 @@ fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
     )
     .expect("no flag, no refusal");
 }
+
+/// A background launch on a box that never ran `claude --bg` (no
+/// `~/.claude/jobs` yet) still leaves its job record in the one global store,
+/// naming the tree it runs on, so the launcher's teardown spares that tree.
+/// Claude Code writes the record through its own `CLAUDE_CONFIG_DIR`, so a
+/// tree without a `jobs` link would keep the record where no clauth reader
+/// looks and lose the tree under the running session. The transcript store is
+/// the same case: with no `~/.claude/projects`, a transcript written through
+/// the tree is unindexed and dies with it.
+///
+/// The Real arm is the red-first pin: on the base it places no store link. The
+/// Fake arm is a regression guard, green on the base too: fake mode copies the
+/// store into the tree and the watchdog's mirror already publishes a record
+/// written through the tree back into `~/.claude`.
+#[cfg(unix)]
+#[test]
+fn a_background_start_keeps_its_job_in_the_global_store_on_a_fresh_box() {
+    for fake in [false, true] {
+        let sb = HomeSandbox::new();
+        let claude = sb.home().join(".claude");
+        fs::create_dir_all(&claude).expect("~/.claude");
+        let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+        let _fake_mode = fake.then(crate::runtime::ForcedFakeLinkMode::new);
+        let shim = crate::testutil::FakeClaude::new(&sb);
+        let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+        fs::create_dir_all(&clauth_dir).expect("clauth dir");
+        fs::write(
+            clauth_dir.join("profiles.toml"),
+            "profiles = [\"wired\", \"spare\"]\n",
+        )
+        .expect("profiles.toml");
+
+        run(
+            &chain_ready_config("wired"),
+            &crate::profile::ProfileName::from("wired"),
+            &["--bg".to_string()],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect("background start");
+
+        let tree: Vec<String> = shim
+            .spawns()
+            .into_iter()
+            .filter(|(_, argv)| argv.split(' ').any(|word| word == "--bg"))
+            .map(|(dir, _)| dir)
+            .collect();
+        assert_eq!(tree.len(), 1, "fake: {fake}: one background launch");
+        let tree = std::path::PathBuf::from(&tree[0]);
+        let jobs: Vec<std::path::PathBuf> = fs::read_dir(claude.join("jobs"))
+            .map(|dir| dir.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "fake: {fake}: the job is in the global store"
+        );
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(jobs[0].join("state.json")).expect("job record"))
+                .expect("parse job record");
+        assert_eq!(
+            record["providerEnv"]["CLAUDE_CONFIG_DIR"].as_str(),
+            Some(tree.to_string_lossy().as_ref()),
+            "fake: {fake}: the record names the tree"
+        );
+        assert!(
+            tree.is_dir(),
+            "fake: {fake}: the tree outlives its launcher"
+        );
+        let transcripts: Vec<std::path::PathBuf> = fs::read_dir(claude.join("projects"))
+            .map(|dir| dir.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            transcripts.len(),
+            1,
+            "fake: {fake}: the transcript is in the global store the session index reads"
+        );
+    }
+}
