@@ -1016,6 +1016,7 @@ fn a_poll_that_times_out_counts_as_not_yet_and_the_recovery_proceeds() {
                     Err(e) => panic!("stub accept: {e}"),
                 }
             };
+            sock.set_nonblocking(false).ok();
             sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
             let mut req = Vec::new();
             let mut tmp = [0u8; 1024];
