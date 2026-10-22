@@ -7,12 +7,14 @@
 
 use super::*;
 
+use std::io::Read as _;
 use std::net::TcpStream;
 
 /// Feed one request through `handle_callback` over a real loopback socket
 /// pair; returns its verdict and the raw HTTP response the "browser" received.
-/// The request carries a complete header block, so the read loop ends at the
-/// terminator instead of at its timeout.
+/// The request carries a complete header block, so the whole-connection read
+/// ends at the terminator; the deadline is the production one and the login is
+/// still live, so the security paths below are what this helper pins.
 fn callback_roundtrip(target: &str, expected_state: &str) -> (Result<Option<String>>, String) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
@@ -21,7 +23,13 @@ fn callback_roundtrip(target: &str, expected_state: &str) -> (Result<Option<Stri
         .write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
         .expect("send request");
     let (server, _) = listener.accept().expect("accept");
-    let verdict = handle_callback(server, expected_state);
+    let wait_over = std::sync::atomic::AtomicBool::new(false);
+    let verdict = handle_callback(
+        server,
+        expected_state,
+        std::time::Instant::now() + callback_read_timeout(),
+        &wait_over,
+    );
     let mut response = String::new();
     client.read_to_string(&mut response).expect("read response");
     (verdict, response)
@@ -418,4 +426,293 @@ fn the_code_exchange_is_form_urlencoded_unlike_the_json_refresh() {
     // The refresh body IS json, at the same endpoint — the two must not drift.
     let refresh = crate::codex_auth::CODEX_TOKEN_URL;
     assert_eq!(refresh, "https://auth.openai.com/oauth/token");
+}
+
+/// A browser preconnect that never sends a request must not hold codex's
+/// real callback queued behind it: the code lands at once, never after the
+/// silent socket's read bound.
+#[test]
+fn a_silent_preconnect_never_delays_the_queued_codex_callback() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let _silent = TcpStream::connect(addr).expect("connect the silent socket");
+    let mut real = TcpStream::connect(addr).expect("connect the callback");
+    real.write_all(
+        b"GET /auth/callback?code=authcode-1&state=state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    )
+    .expect("send the callback");
+    let cancel = LoginCancel::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(wait_for_code(&listener, "state", &cancel));
+    });
+    let code = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the callback lands while the silent socket is still open")
+        .expect("a valid callback");
+    assert_eq!(code, "authcode-1");
+}
+
+/// A cancel lands at once even while a silent socket is open: the wait never
+/// sits inside that socket's read with the cancel unseen.
+#[test]
+fn a_cancel_lands_while_a_silent_preconnect_is_open() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let _silent = TcpStream::connect(addr).expect("connect the silent socket");
+    let cancel = LoginCancel::new();
+    let flag = cancel.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(wait_for_code(&listener, "state", &cancel));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    flag.cancel();
+    let err = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the cancel lands while the silent socket is still open")
+        .expect_err("canceled");
+    assert_eq!(err.to_string(), "login canceled");
+}
+
+/// A request line that arrives slower than the old 5 s read bound still yields
+/// the code now that the bound is 60 s. Scaled: the seam shrinks the bound to
+/// 600 ms and the request line lands at 300 ms — past the old bound's scaled
+/// form, inside the new one — so the code is not lost.
+#[test]
+fn a_request_line_past_the_old_read_bound_still_yields_the_code() {
+    let _home = crate::testutil::HomeSandbox::new();
+    super::set_callback_read_timeout_override(Some(std::time::Duration::from_millis(600)));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let cancel = LoginCancel::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(wait_for_code(&listener, "state", &cancel));
+    });
+    let mut client = TcpStream::connect(addr).expect("connect");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    client
+        .write_all(b"GET /auth/callback?code=slow-code&state=state HTTP/1.1\r\n\r\n")
+        .expect("send the slow callback");
+    let code = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the slow callback lands")
+        .expect("a valid callback");
+    assert_eq!(code, "slow-code");
+    super::set_callback_read_timeout_override(None);
+}
+
+/// A state mismatch is a security stop wherever it arrives: one queued behind
+/// a silent socket still ends the wait with the mismatch error, never an
+/// ignored request. The reader thread's `Err` is what carries it back.
+#[test]
+fn a_state_mismatch_behind_a_silent_preconnect_still_stops_the_wait() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let _silent = TcpStream::connect(addr).expect("connect the silent socket");
+    let mut evil = TcpStream::connect(addr).expect("connect the callback");
+    evil.write_all(b"GET /auth/callback?code=authcode-1&state=EVIL HTTP/1.1\r\n\r\n")
+        .expect("send the callback");
+    let cancel = LoginCancel::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(wait_for_code(&listener, "STATE", &cancel));
+    });
+    let err = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the wait ends")
+        .expect_err("a state mismatch stops the login");
+    assert_eq!(
+        err.to_string(),
+        "codex login state mismatch (possible CSRF); aborted"
+    );
+}
+
+/// The bound is cloudy's ruled number, pinned by equality: the scaled test
+/// above pins the SHAPE, this one pins the 60 s the ruling names, so retuning
+/// the constant cannot ship green.
+#[test]
+fn the_callback_connection_bound_is_the_ruled_sixty_seconds() {
+    assert_eq!(
+        super::CALLBACK_READ_TIMEOUT,
+        std::time::Duration::from_secs(60),
+        "cloudy's 2026-10-21 ruling: one accepted codex callback connection gets 60 s"
+    );
+}
+
+/// A peer trickling one byte just under any per-read bound must still end at
+/// the connection's ONE deadline, driven through `codex_login::wait_for_code`
+/// (the codex listener arms its own per-connection deadline). On a per-read
+/// timeout it would hold its reader for as long as it kept dribbling.
+#[test]
+fn a_trickling_peer_cannot_outlive_the_whole_connection_deadline() {
+    use std::io::Read as _;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    super::set_callback_read_timeout_override(Some(std::time::Duration::from_millis(400)));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let cancel = LoginCancel::new();
+    let flag = cancel.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(wait_for_code(&listener, "state", &cancel));
+    });
+
+    let mut trickler = TcpStream::connect(addr).expect("connect the trickler");
+    let mut watcher = trickler.try_clone().expect("clone the socket");
+    // Set the timeout right after connect, before any peer end is served or
+    // dropped (test-infrastructure.md RULE).
+    watcher
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("read timeout");
+    std::thread::spawn(move || {
+        // One byte every 50 ms for far longer than the watcher waits: inside any
+        // per-read bound of 400 ms, so a per-read scheme never closes the socket.
+        for _ in 0..200 {
+            if trickler.write_all(b"G").is_err() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let mut byte = [0u8; 1];
+    let verdict = watcher.read(&mut byte);
+    let elapsed = started.elapsed();
+    let ended = match &verdict {
+        Ok(0) => true,
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+        ),
+        Ok(_) => false,
+    };
+    assert!(
+        ended,
+        "the server closes a trickling connection at its whole-connection deadline; got: {verdict:?}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(300)
+            && elapsed < std::time::Duration::from_secs(1),
+        "the connection ends at the scaled 400 ms deadline, not some longer bound: {elapsed:?}"
+    );
+
+    // End the wait so its thread does not outlive the test.
+    flag.cancel();
+    rx.recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the wait ends")
+        .expect_err("canceled");
+}
+
+/// Past the live-reader cap a new connection is dropped, never spawned: a local
+/// flood costs connections, not threads — driven through `codex_login`'s own
+/// public wait entry, so the codex accept loop's cap spawn is what this pins.
+#[test]
+fn a_callback_connection_past_the_reader_cap_is_dropped() {
+    use std::io::Read as _;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    // Long enough that the first reader still holds its slot when the second
+    // connects.
+    super::set_callback_read_timeout_override(Some(std::time::Duration::from_secs(2)));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let cancel = LoginCancel::new();
+    let flag = cancel.clone();
+
+    // The accept loop (and so `spawn_callback_reader`) runs on the thread that
+    // enters `wait_for_code` — this one — because the cap override is
+    // thread-local (a process-wide tiny cap would refuse a sibling test's
+    // reader). The browser side runs on a helper thread.
+    let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
+    let browser = std::thread::spawn(move || {
+        // The first silent socket fills the one slot; give the accept loop a
+        // poll to take it before the second arrives. The override carries its
+        // own counter, so this first reader is ours and holds the slot for the
+        // whole scaled deadline.
+        let _first = TcpStream::connect(addr).expect("connect the first");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut second = TcpStream::connect(addr).expect("connect the second");
+        // A client bound well under the server's 2 s deadline: under the cap the
+        // read sees EOF at once; a cap bypass holds the reader to its 2 s
+        // deadline and this times out instead (two equal timers would race).
+        second
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .expect("read timeout");
+        let mut byte = [0u8; 1];
+        let verdict = second.read(&mut byte);
+        let _ = verdict_tx.send(verdict);
+        flag.cancel();
+    });
+
+    crate::oauth_login::set_callback_reader_cap_override(Some(1));
+    let outcome = wait_for_code(&listener, "state", &cancel);
+    crate::oauth_login::set_callback_reader_cap_override(None);
+    assert_eq!(
+        outcome.expect_err("the wait ends on cancel").to_string(),
+        "login canceled"
+    );
+
+    let verdict = verdict_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the refused connection reports its verdict");
+    assert_eq!(
+        verdict.expect("the refused connection is closed"),
+        0,
+        "past the cap the server drops the connection instead of spawning a reader"
+    );
+    browser.join().expect("browser thread");
+}
+
+/// A reader that finishes after the wait already ended writes NO page of any
+/// kind — here a state-mismatch request arriving late: the login is over, so
+/// even the security page would lie. The connection just closes.
+#[test]
+fn a_reader_finishing_after_the_wait_ended_writes_no_page() {
+    use std::io::Read as _;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    super::set_callback_read_timeout_override(Some(std::time::Duration::from_secs(5)));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let cancel = LoginCancel::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(wait_for_code(&listener, "state", &cancel));
+    });
+
+    // Accepted first, and silent: its reader is still waiting when the login ends.
+    let mut late = TcpStream::connect(addr).expect("connect the late callback");
+    // Set the timeout right after connect, before any write or peer drop
+    // (test-infrastructure.md RULE).
+    late.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("read timeout");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut evil = TcpStream::connect(addr).expect("connect the mismatch");
+    evil.write_all(b"GET /auth/callback?code=x&state=EVIL HTTP/1.1\r\n\r\n")
+        .expect("send the mismatch");
+    let err = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the mismatch ends the wait")
+        .expect_err("a state mismatch stops the login");
+    assert!(
+        err.to_string().contains("state mismatch"),
+        "the wait ended on the security stop: {err}"
+    );
+
+    // A non-success request arrives after the wait returned: no page of any
+    // kind is written, the connection just closes.
+    late.write_all(b"GET /auth/callback?code=late-code&state=EVIL HTTP/1.1\r\n\r\n")
+        .expect("send the late callback");
+    let mut response = String::new();
+    let _ = late.read_to_string(&mut response);
+    assert_eq!(
+        response, "",
+        "an already-ended login writes no page of any kind"
+    );
 }

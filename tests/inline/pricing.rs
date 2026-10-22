@@ -5,6 +5,8 @@
 
 use super::*;
 
+use std::io::Write;
+
 use crate::logline::LogLines;
 use crate::testutil::HomeSandbox;
 
@@ -3668,4 +3670,136 @@ fn peak_state_for_profile_is_provider_bound() {
         None,
         "a pin is never a provider: no indicator without one"
     );
+}
+
+// ── fetch body bounds ─────────────────────────────────────────────────────────
+
+/// One loopback stub answer: `headers` written at once, then `body` decides how
+/// the response plays out. Returns the URL to fetch.
+fn fetch_stub(
+    headers: &'static str,
+    body: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
+) -> String {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr").to_string();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept one fetch");
+        crate::testutil::read_request_head(&mut sock);
+        let _ = sock.write_all(headers.as_bytes());
+        body(&mut sock);
+    });
+    format!("http://{addr}/")
+}
+
+/// A body served promptly still reads in full under the end-to-end bound.
+#[test]
+fn a_fetch_reads_a_body_served_within_the_bound() {
+    let _home = HomeSandbox::new();
+    super::set_fetch_timeout_override(Some(std::time::Duration::from_millis(1000)));
+    let url = fetch_stub(
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n",
+        |sock| {
+            let _ = sock.write_all(b"the-body");
+        },
+    );
+    let body = super::fetch_body(&url).expect("fetch within the bound");
+    assert_eq!(body, "the-body");
+    super::set_fetch_timeout_override(None);
+}
+
+/// The ruled numbers, pinned by equality: the scaled tests pin the SHAPE, these
+/// pin what cloudy's 2026-10-21 ruling names, so retuning a constant cannot
+/// ship green. `RECV_TIMEOUT` is gone by the same ruling (one budget).
+#[test]
+fn the_feed_bounds_are_the_ruled_numbers() {
+    assert_eq!(
+        super::FETCH_TIMEOUT,
+        std::time::Duration::from_secs(60),
+        "cloudy's 2026-10-21 ruling: pricing gets 60 s end to end"
+    );
+    assert_eq!(
+        super::CONNECT_TIMEOUT,
+        std::time::Duration::from_secs(5),
+        "cloudy's 2026-10-21 ruling: connect is 5 s, then headers + body share the one budget"
+    );
+}
+
+/// The fetch carries ONE end-to-end budget and no separate header-phase
+/// deadline: a re-added `timeout_recv_response` inside the builder would fail
+/// headers that the ruling says succeed (cloudy, 2026-10-21: "headers + body
+/// share 60 s"). Scoped to the builder's span so a doc comment naming the
+/// method elsewhere in the file cannot red it.
+#[test]
+fn the_fetch_carries_one_end_to_end_budget_not_a_header_phase_bound() {
+    let src = include_str!("../../src/pricing.rs");
+    let builder = src
+        .split_once("config_builder()")
+        .and_then(|(_, rest)| rest.split_once(".build()").map(|(span, _)| span))
+        .expect(
+            "the fetch builder span is found: \
+             the_fetch_carries_one_end_to_end_budget_not_a_header_phase_bound",
+        );
+    assert!(
+        !builder.contains("timeout_recv_response"),
+        "the one-budget ruling allows no separate header-phase deadline"
+    );
+}
+
+/// Headers that take longer than the old header bound (15 s, scaled here to a
+/// quarter of the 1000 ms budget) still succeed: they share the ONE budget with
+/// the body, as the ruling names. Re-adding a per-phase header bound reds here.
+#[test]
+fn headers_past_the_old_header_bound_still_succeed_under_the_one_budget() {
+    let _home = HomeSandbox::new();
+    super::set_fetch_timeout_override(Some(std::time::Duration::from_millis(1000)));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr").to_string();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept one fetch");
+        crate::testutil::read_request_head(&mut sock);
+        // 300 ms: past 15 s scaled to this 1000 ms budget (250 ms), inside it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = sock.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nthe-body",
+        );
+    });
+    let body = super::fetch_body(&format!("http://{addr}/"))
+        .expect("headers inside the one budget succeed, whatever their delay");
+    assert_eq!(body, "the-body");
+    super::set_fetch_timeout_override(None);
+}
+
+/// A body that never arrives fails the fetch at the end-to-end bound instead of
+/// hanging. Wrapped in a thread + `recv_timeout` so the pre-fix hang (the body
+/// read was unbounded) reads as a red timeout, never a hung suite.
+#[test]
+fn a_stalled_body_fails_the_fetch_at_the_end_to_end_bound() {
+    let _home = HomeSandbox::new();
+    let bound = std::time::Duration::from_millis(200);
+    super::set_fetch_timeout_override(Some(bound));
+    let url = fetch_stub(
+        "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n",
+        |_sock| {
+            std::thread::sleep(std::time::Duration::from_secs(600));
+        },
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = std::time::Instant::now();
+    std::thread::spawn(move || {
+        let _ = tx.send(super::fetch_body(&url));
+    });
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the stalled body must fail the fetch within the scaled bound");
+    let elapsed = started.elapsed();
+    crate::testutil::assert_one_budget_timeout(&result);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(150),
+        "the fetch waits out the scaled bound, never a shorter hard-coded one: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the fetch fails at the 200 ms budget, not a longer hard-coded one: {elapsed:?}"
+    );
+    super::set_fetch_timeout_override(None);
 }

@@ -37,7 +37,7 @@ use sha2::Digest;
 
 use crate::logline::logline;
 use crate::outln;
-use crate::profile::{AppConfig, Profile, ProfileName, load_config};
+use crate::profile::{AppConfig, Profile, ProfileName, load_config, load_config_without_rewrite};
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, write_auth_expired,
 };
@@ -1217,6 +1217,14 @@ across accounts."
             let prose = render::delegate_refusal_prose(&payload);
             return Ok(CallToolResult::error(single_block(prose)));
         }
+
+        // A delegate mints a job record, and a mint must not stamp an owner
+        // while the startup marker registration is still deciding. The wait
+        // runs HERE, before any reserve or spawn, and yields to the runtime
+        // between polls: the server runs on a single-threaded runtime, so the
+        // blocking wait this replaces stalled every other request (a
+        // `profiles` call, a cancel, a monitor check) for its whole bound.
+        jobs::wait_for_server_marker_async(jobs::marker_wait_deadline()).await;
 
         let Some(raw_prompt) = prompt.as_deref() else {
             return Ok(delegate_refusal(
@@ -4746,6 +4754,10 @@ fn reserve_background_job(
 /// ceiling anymore, and `0`/`None` is also the shape a record an older server
 /// wrote parses into, so the serde fields stay load-bearing for those.
 fn mint_spec(mint: &MintSpec, kind: jobs::RecordKind) -> jobs::RunningSpec {
+    // No marker wait here: a mint must not stamp an owner while the startup
+    // registration is still deciding. The ONE wait lives at the single entry
+    // point every mint is reached from — `delegate_with`, async, before any
+    // reserve or spawn — so a mint is always reached after it.
     jobs::RunningSpec {
         job_id: jobs::new_job_id(mint.started_at),
         profile: mint.profile.clone(),
@@ -5737,8 +5749,14 @@ impl ServerHandler for ClauthServer {
 /// Build the init-time `instructions` block once from the on-demand config and
 /// usage disk cache. Best-effort: a config load failure degrades to a prose-only
 /// block rather than failing the handshake.
+///
+/// Loads through [`load_config_without_rewrite`]: this answers `initialize` and
+/// `server/discover`, and the handshake never waits on the state flock — the
+/// rewrite path would for a profile whose `config.toml` does not round-trip,
+/// and a legacy `.pending` sidecar adoption would too, so the no-rewrite read
+/// answers lock-free and writes nothing.
 fn build_instructions() -> String {
-    let Ok(config) = load_config() else {
+    let Ok(config) = load_config_without_rewrite() else {
         return "clauth manages multiple Claude Code accounts (\"profiles\"). \
             Call `profiles` for live usage figures."
             .to_string();
@@ -5834,25 +5852,64 @@ fn startup() -> Option<std::fs::File> {
 }
 
 pub(crate) fn serve() -> Result<()> {
-    let _bare_marker = startup();
-    // Held across `block_on` exactly like the bare marker: the flock drops with
-    // the process however it dies, so every record this server mints carries an
-    // owner a later server reads alive exactly as long as this one is. A failed
-    // registration is logged and stepped over — records then mint ownerless,
-    // and the silence window is their only corpse rule.
-    let _server_marker = match jobs::hold_server_marker() {
-        Ok(guard) => Some(guard),
-        Err(e) => {
-            logline!("clauth: server marker not registered: {e:#}");
-            None
-        }
-    };
+    // The startup sweep and the server-marker registration run on their own
+    // thread, started before serving and never awaited by the handshake. The
+    // marker is registered FIRST so a delegate mint waits only for the (quick)
+    // flock, never for the slow sweep behind it. Both guards live for the
+    // process: the thread parks holding them, so their flocks drop with the
+    // process however it dies. Each leg runs under its own `catch_unwind`: a
+    // panic in the marker registration settles it and still lets `startup()`
+    // run, and a panic in the sweep still leaves the guards held. A refused
+    // spawn settles the registration and serves without it, never aborts the
+    // boot.
+    jobs::mark_server_registration_in_flight();
+    if let Err(e) = std::thread::Builder::new()
+        .name("clauth-startup".to_string())
+        .spawn(move || {
+            let _server_marker = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                jobs::hold_server_marker,
+            )) {
+                Ok(Ok(guard)) => Some(guard),
+                Ok(Err(e)) => {
+                    logline!("clauth: server marker not registered: {e:#}");
+                    None
+                }
+                Err(_) => {
+                    logline!(
+                        "clauth: server marker registration panicked; the server keeps serving and its records mint ownerless"
+                    );
+                    None
+                }
+            };
+            let _bare_marker =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(startup)) {
+                    Ok(marker) => marker,
+                    Err(_) => {
+                        logline!(
+                            "clauth: startup sweep panicked; the server keeps serving and its markers stay held"
+                        );
+                        None
+                    }
+                };
+            loop {
+                std::thread::park();
+            }
+        })
+    {
+        logline!(
+            "clauth: startup thread not spawned: {e}; serving without the sweep or the server marker"
+        );
+        jobs::settle_marker_registration();
+    }
+    // `host_pid` is a plain read (a `OnceLock` init), so it stays inline: it
+    // cannot block the handshake.
     let _ = host_pid();
-    // The delegate-dot knob, read once at startup from the on-demand config.
-    // A missing or unreadable profiles.toml answers the default (dot on), so
-    // the knob can never fail the server.
-    let delegate_dot = load_config()
-        .map(|config| config.state.herdr.delegate_dot)
+    // The delegate-dot knob is a plain field of `profiles.toml`, read without
+    // the per-profile load that can take the state flock for a `config.toml`
+    // rewrite. A missing or unreadable profiles.toml answers the default (dot
+    // on), so the knob can never fail the server.
+    let delegate_dot = crate::profile::load_app_state()
+        .map(|state| state.herdr.delegate_dot)
         .unwrap_or_else(|_| crate::profile::HerdrSettings::default().delegate_dot);
     // rmcp's service loop arms a Tokio timer (needs `enable_time`), so a bare
     // current-thread runtime panics right after the first reply. `enable_all`

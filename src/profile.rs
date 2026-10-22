@@ -3600,6 +3600,20 @@ pub(crate) fn stored_endpoint_identity(name: &ProfileName) -> Option<StoredEndpo
 }
 
 pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
+    load_profile_with(name, true)
+}
+
+/// [`load_profile`] for a caller that must answer without waiting on the state
+/// flock: the same read, but never through [`maybe_rewrite_config_toml`] and
+/// never through a legacy `.pending` sidecar's write-through, both of which take
+/// the flock: a `config.toml` that does not round-trip (a hand-quoted `[env]`
+/// key the renderer writes unquoted) is left as it is, and an adoptable sidecar
+/// is answered from memory and left for the next ordinary load to land.
+pub(crate) fn load_profile_without_rewrite(name: &ProfileName) -> Result<Profile> {
+    load_profile_with(name, false)
+}
+
+fn load_profile_with(name: &ProfileName, rewrite: bool) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,
@@ -3621,7 +3635,7 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
     };
     // A live `.staged` pair loads in place of the store; a legacy `.pending` that
     // never committed is adopted.
-    let credentials = recover_pending_credentials(name, credentials);
+    let credentials = recover_pending_credentials(name, credentials, rewrite);
 
     let base_url = effective_base_url(
         config.base_url,
@@ -3671,7 +3685,9 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
         provider,
     };
 
-    maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
+    if rewrite {
+        maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
+    }
 
     Ok(profile)
 }
@@ -4059,9 +4075,15 @@ pub(crate) fn clear_staged_credentials(name: &ProfileName) {
 /// deleted, since a loader deciding outside the rotation guard raced installs
 /// and refused the rotation's own persist. A legacy `credentials.json.pending`
 /// from an older binary keeps its mtime rule.
+///
+/// `rewrite == false` is the no-rewrite read (the MCP handshake): the legacy
+/// `.pending` sidecar's live pair is answered read lock-free and the sidecar is
+/// left for the next ordinary load to land under the flock, so this path never
+/// takes the state lock and never writes `credentials.json`.
 fn recover_pending_credentials(
     name: &ProfileName,
     loaded: Option<ClaudeCredentials>,
+    rewrite: bool,
 ) -> Option<ClaudeCredentials> {
     if let Some(staged) = crate::oauth::live_stage_credentials(name, loaded.as_ref()) {
         return Some(staged);
@@ -4074,6 +4096,12 @@ fn recover_pending_credentials(
     };
     if pending_path.symlink_metadata().is_err() {
         return loaded; // no sidecar — the common case
+    }
+    // The no-rewrite read answers with the pair the rule judges live, read
+    // lock-free and never written: the sidecar stays for the next ordinary load
+    // to land under the flock.
+    if !rewrite {
+        return adoptable_pending(&pending_path, &cred_path).or(loaded);
     }
     // A sidecar the rule already discards goes lock-free, as it always did: a
     // stale one must not make every load of this profile wait on the flock.
@@ -4132,6 +4160,19 @@ fn adoptable_pending(pending_path: &Path, cred_path: &Path) -> Option<ClaudeCred
 }
 
 pub(crate) fn load_config() -> Result<AppConfig> {
+    load_config_with(true)
+}
+
+/// [`load_config`] for a caller that answers before it serves and must never
+/// wait on the state flock — the `clauth mcp` handshake's `instructions` block.
+/// Same reads, but each profile loads through
+/// [`load_profile_without_rewrite`], so neither a `config.toml` rewrite nor a
+/// legacy `.pending` sidecar's write-through blocks the handshake on the flock.
+pub(crate) fn load_config_without_rewrite() -> Result<AppConfig> {
+    load_config_with(false)
+}
+
+fn load_config_with(rewrite: bool) -> Result<AppConfig> {
     mkdir_700(&profiles_root()?)?;
     // Every entry point loads config early, so this is the tree-wide chokepoint
     // that retightens an install created before the owner-only invariant.
@@ -4142,7 +4183,13 @@ pub(crate) fn load_config() -> Result<AppConfig> {
     let profiles = state
         .profiles
         .iter()
-        .map(load_profile)
+        .map(|name| {
+            if rewrite {
+                load_profile(name)
+            } else {
+                load_profile_without_rewrite(name)
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(AppConfig { state, profiles })
 }

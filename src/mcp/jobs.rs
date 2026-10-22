@@ -35,12 +35,13 @@
 //! collectable record `monitor` then answers and removes.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::lock::with_state_lock;
+use crate::lock::{state_lock_timeout, with_state_lock};
 use crate::logline::logline;
 use crate::profile::clauth_dir;
 
@@ -875,6 +876,90 @@ static SERVER_MARKER_HELD: AtomicBool = AtomicBool::new(false);
 /// is held.
 static SERVER_STARTED_AT: AtomicU64 = AtomicU64::new(0);
 
+/// The server-marker registration lifecycle. `hold_server_marker` runs on the
+/// serve background thread, and a delegate mint must not stamp an owner while
+/// that registration is still deciding: it would either mint ownerless the
+/// instant before the marker lands, or stamp an owner no marker backs. Three
+/// states: never started (no registration began → the mint proceeds ownerless at
+/// once, the pre-marker test shape), in flight, and settled (success or failure).
+static MARKER_REGISTRATION: AtomicU8 = AtomicU8::new(REG_NEVER);
+const REG_NEVER: u8 = 0;
+const REG_IN_FLIGHT: u8 = 1;
+const REG_SETTLED: u8 = 2;
+
+/// Mark the marker registration in flight. Called by `serve` before it spawns
+/// the startup thread, and by a test posing a registration that has not settled.
+pub(crate) fn mark_server_registration_in_flight() {
+    MARKER_REGISTRATION.store(REG_IN_FLIGHT, Ordering::Release);
+}
+
+/// Settle the registration without a registration ever running: the serve
+/// thread's spawn was refused, so no later mint waits the full bound on a
+/// registration that can never settle itself.
+pub(crate) fn settle_marker_registration() {
+    MARKER_REGISTRATION.store(REG_SETTLED, Ordering::Release);
+}
+
+/// Reset the registration lifecycle and owner stamp to the never-started shape.
+/// A test posing an in-flight registration that never settles calls this at its
+/// end so no later mint in the process waits on the dead pose.
+#[cfg(test)]
+pub(crate) fn reset_marker_registration_for_test() {
+    MARKER_REGISTRATION.store(REG_NEVER, Ordering::Release);
+    SERVER_MARKER_HELD.store(false, Ordering::Relaxed);
+    SERVER_STARTED_AT.store(0, Ordering::Relaxed);
+}
+
+/// How long a delegate mint waits for an in-flight marker registration to settle
+/// before minting the ownerless legacy shape, derived from the flock acquisition
+/// the registration itself waits behind ([`state_lock_timeout`]) plus a poll
+/// margin that lets a registration which just timed the flock out land its
+/// settled signal.
+///
+/// Residual, deliberate: `with_state_lock` first queues on `lock`'s in-process
+/// `THREAD_LOCK`, an unbounded wait behind any other holder in this process, and
+/// that holder may itself spend a `SUBPROCESS_BUDGET` under the flock. A bound
+/// covering those would be `2 × state_lock_timeout + SUBPROCESS_BUDGET` (~70 s),
+/// which delays every delegate call in the boot window by more than the stall it
+/// removes. The mint's contract is bounded, never ownerless-by-surprise: past
+/// this bound it mints ownerless and logs, and the wait only decides whether a
+/// real owner stamp can be carried.
+pub(crate) fn server_marker_wait() -> Duration {
+    state_lock_timeout() + Duration::from_millis(250)
+}
+
+/// The deadline one mint's marker wait arms: [`server_marker_wait`] from now.
+pub(crate) fn marker_wait_deadline() -> Instant {
+    Instant::now() + server_marker_wait()
+}
+
+/// The ONE production marker wait, taken at `delegate_with` (the single entry
+/// point every mint is reached from): yields to the runtime between polls
+/// (`tokio::time::sleep`), so a mint waiting on the registration never stalls
+/// the current-thread runtime that answers every other MCP request.
+pub(crate) async fn wait_for_server_marker_async(deadline: Instant) {
+    if MARKER_REGISTRATION.load(Ordering::Acquire) != REG_IN_FLIGHT {
+        return;
+    }
+    while MARKER_REGISTRATION.load(Ordering::Acquire) == REG_IN_FLIGHT {
+        if Instant::now() >= deadline {
+            logline!(
+                "clauth: server marker not registered within {:.0}s; the job record mints ownerless",
+                server_marker_wait().as_secs_f64()
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Whether the registration lifecycle has settled, success or failure. The pin
+/// that a failed registration still wakes its waiters.
+#[cfg(test)]
+pub(crate) fn marker_registration_settled() -> bool {
+    MARKER_REGISTRATION.load(Ordering::Acquire) == REG_SETTLED
+}
+
 /// The owner stamp the mint writes. [`SERVER_MARKER_HELD`] is the whole gate:
 /// a server whose marker registration failed mints ownerless records, which is
 /// the graceful half of the fail-safe above.
@@ -907,6 +992,18 @@ impl Drop for ServerMarkerGuard {
     }
 }
 
+/// Settles [`MARKER_REGISTRATION`] however the registration ends, a panic
+/// included. The explicit store this replaces ran only on a normal return, so an
+/// unwinding registration left the state IN_FLIGHT and every later mint waiting
+/// out the full bound.
+struct MarkerRegistrationSettled;
+
+impl Drop for MarkerRegistrationSettled {
+    fn drop(&mut self) {
+        MARKER_REGISTRATION.store(REG_SETTLED, Ordering::Release);
+    }
+}
+
 /// Stamp and hold THIS server's marker. The state lock is what separates the
 /// create-then-lock from [`gc_server_markers`]'s prune, which unlinks whatever
 /// it reads as unlocked — a marker pruned in that window would leave a live
@@ -914,8 +1011,11 @@ impl Drop for ServerMarkerGuard {
 /// the bare-session registration documents).
 ///
 /// Called once per server at startup; a failure is the caller's to log and
-/// step over — it costs the owner-liveness fast path, never the server.
+/// step over — it costs the owner-liveness fast path, never the server. The
+/// registration settles ([`MARKER_REGISTRATION`]) on every exit, success, failure
+/// or panic, so a mint waiting on it wakes either way.
 pub(crate) fn hold_server_marker() -> Result<ServerMarkerGuard> {
+    let _settled = MarkerRegistrationSettled;
     let dir = mcp_live_dir()?;
     let guard = with_state_lock(|_held| {
         crate::profile::mkdir_700(&dir)

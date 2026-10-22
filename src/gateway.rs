@@ -72,9 +72,10 @@ pub(crate) const HEALTH_CONNECT_SECS: u64 = 4;
 /// and this is what keeps a wedged answerer from parking the caller.
 pub(crate) const HEALTH_RESPONSE_SECS: u64 = 2;
 
-/// The probe's end-to-end ceiling, the two phase bounds added: ureq re-arms
-/// its response deadline before every wait (`oauth::TOKEN_HTTP_DEADLINES`),
-/// so the sum is enforced as one global bound as well.
+/// The probe's end-to-end ceiling, the two phase bounds added:
+/// [`direct_config`] also sets `timeout_global` to this sum, which is what
+/// enforces it as one end-to-end bound (the header deadline alone stops at the
+/// headers; see `oauth::TOKEN_HTTP_DEADLINES` for the 3.4.2 measurement).
 pub(crate) const HEALTH_PROBE_TIMEOUT: Duration =
     Duration::from_secs(HEALTH_CONNECT_SECS + HEALTH_RESPONSE_SECS);
 
@@ -2547,12 +2548,14 @@ pub(crate) fn health_agent() -> ureq::Agent {
 }
 
 /// `builder` bounded for a gateway request: the health probe's connect phase,
-/// `response` for the response and the body, and their sum as one global
-/// bound (ureq re-arms its response deadline before every wait,
-/// `oauth::TOKEN_HTTP_DEADLINES`). No redirect is followed and no proxy is
-/// used, whatever `builder` carried: through an env-configured proxy a
-/// loopback target resolves on the proxy's own host, any other target's
-/// delays and errors would be the proxy's, and the admin key would reach it.
+/// `response` for the response headers and the body, and their sum as one
+/// end-to-end `timeout_global` bound (which is what makes the sum hold even
+/// though the header deadline stops applying at the headers — see
+/// `oauth::TOKEN_HTTP_DEADLINES` for the 3.4.2 measurement). No redirect is
+/// followed and no proxy is used, whatever `builder` carried: through an
+/// env-configured proxy a loopback target resolves on the proxy's own host, any
+/// other target's delays and errors would be the proxy's, and the admin key
+/// would reach it.
 fn direct_config(
     builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
     response: Duration,

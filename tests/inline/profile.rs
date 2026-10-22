@@ -2018,6 +2018,7 @@ fn pending_sidecar_newer_than_the_commit_is_adopted_and_written_through() {
     let got = recover_pending_credentials(
         &crate::profile::ProfileName::from(name),
         Some(committed.clone()),
+        true,
     );
     assert_eq!(
         refresh_token_of(&got),
@@ -2069,6 +2070,7 @@ fn pending_sidecar_older_than_the_commit_is_discarded_not_reinstalled() {
     let got = recover_pending_credentials(
         &crate::profile::ProfileName::from(name),
         Some(committed.clone()),
+        true,
     );
     assert_eq!(
         refresh_token_of(&got),
@@ -2121,7 +2123,8 @@ fn pending_sidecar_with_an_equal_mtime_is_adopted() {
     assert_eq!(
         refresh_token_of(&recover_pending_credentials(
             &crate::profile::ProfileName::from(name),
-            Some(committed)
+            Some(committed),
+            true,
         )),
         Some("tie-refresh"),
         "an equal mtime must adopt: the compare is `pending >= committed`",
@@ -2155,7 +2158,8 @@ fn pending_sidecar_is_adopted_when_no_commit_exists_at_all() {
     assert_eq!(
         refresh_token_of(&recover_pending_credentials(
             &crate::profile::ProfileName::from(name),
-            None
+            None,
+            true,
         )),
         Some("only-refresh"),
         "with no commit to compare against, the staged pair is the only live one",
@@ -2204,7 +2208,8 @@ fn a_bare_store_stamp_does_not_discard_a_sidecar_staged_before_it() {
     assert_eq!(
         refresh_token_of(&recover_pending_credentials(
             &crate::profile::ProfileName::from(name),
-            Some(committed)
+            Some(committed),
+            true,
         )),
         Some("orphan-refresh"),
         "the stamp moved no bytes, so the staged pair is still the newest write",
@@ -2251,7 +2256,8 @@ fn a_commit_landing_after_a_stamp_still_discards_the_sidecar() {
     assert_eq!(
         refresh_token_of(&recover_pending_credentials(
             &crate::profile::ProfileName::from(name),
-            Some(live)
+            Some(live),
+            true,
         )),
         Some("live-refresh"),
         "a commit newer than the sidecar still wins; the stamp's receipt is spent",
@@ -3782,7 +3788,11 @@ fn pending_recovery_preserves_the_stores_mcp_oauth() {
     crate::testutil::set_mtime(&cred_path, now - std::time::Duration::from_secs(60));
     crate::testutil::set_mtime(&pending_path, now);
 
-    recover_pending_credentials(&crate::profile::ProfileName::from(name), Some(committed));
+    recover_pending_credentials(
+        &crate::profile::ProfileName::from(name),
+        Some(committed),
+        true,
+    );
 
     let after: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&cred_path).expect("re-read")).expect("parse");
@@ -4746,7 +4756,7 @@ fn a_legacy_pending_survives_a_load_that_cannot_take_the_flock() {
     let _held = hold_state_flock();
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(200)));
 
-    let got = recover_pending_credentials(&name, Some(pair("old-access", "old-refresh")));
+    let got = recover_pending_credentials(&name, Some(pair("old-access", "old-refresh")), true);
     crate::lock::set_state_lock_timeout_override(None);
 
     assert_eq!(
@@ -4781,13 +4791,67 @@ fn a_stale_legacy_pending_goes_without_waiting_on_the_flock() {
     let _held = hold_state_flock();
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(200)));
 
-    let got = recover_pending_credentials(&name, Some(pair("old-access", "old-refresh")));
+    let got = recover_pending_credentials(&name, Some(pair("old-access", "old-refresh")), true);
     crate::lock::set_state_lock_timeout_override(None);
 
     assert_eq!(refresh_token_of(&got), Some("old-refresh"));
     assert!(
         !pending_path.exists(),
         "a stale sidecar goes without the flock"
+    );
+}
+
+/// The no-rewrite read (the MCP handshake) answers an adoptable legacy
+/// `.pending` sidecar with the pair the rule judges live — read lock-free and
+/// never written through — even while another process holds the state flock:
+/// the sidecar's pair comes back at once and both `credentials.json` and the
+/// sidecar are left for the next ordinary load to land under the flock.
+#[test]
+fn the_no_rewrite_read_adopts_a_pending_sidecar_lock_free_and_never_writes() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("pending-norewrite");
+    seed_committed(name.as_str(), &pair("old-access", "old-refresh"));
+    let dir = profile_dir(&name).expect("dir");
+    let cred_path = dir.join("credentials.json");
+    let pending_path = dir.join("credentials.json.pending");
+    std::fs::write(
+        &pending_path,
+        serde_json::to_vec(&pair("new-access", "new-refresh")).expect("serialize"),
+    )
+    .expect("write the legacy sidecar");
+    let now = std::time::SystemTime::now();
+    crate::testutil::set_mtime(&cred_path, now - std::time::Duration::from_secs(60));
+    crate::testutil::set_mtime(&pending_path, now);
+
+    let _held = hold_state_flock();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_secs(2)));
+
+    let started = std::time::Instant::now();
+    let profile = load_profile_without_rewrite(&name).expect("the no-rewrite read succeeds");
+    let waited = started.elapsed();
+    crate::lock::set_state_lock_timeout_override(None);
+
+    assert_eq!(
+        refresh_token_of(&profile.credentials),
+        Some("new-refresh"),
+        "the no-rewrite read answers with the sidecar's live pair"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(1),
+        "the no-rewrite read never waits on the state flock (2 s timeout): {waited:?}"
+    );
+    assert!(
+        pending_path.is_file(),
+        "the sidecar stays for the next ordinary load to land under the flock"
+    );
+    let on_disk: ClaudeCredentials = read_json_file(&cred_path).expect("re-read credentials.json");
+    assert_eq!(
+        on_disk
+            .claude_ai_oauth
+            .and_then(|o| o.refresh_token)
+            .as_deref(),
+        Some("old-refresh"),
+        "the no-rewrite read never writes the adopted pair through"
     );
 }
 
@@ -4840,4 +4904,69 @@ fn the_credit_gate_defaults_on_and_round_trips_through_config_toml() {
         !load_profile(&name).expect("load").check_credit_cap,
         "an explicit false survives"
     );
+}
+
+/// The MCP handshake's profile read never waits on the state flock, while the
+/// ordinary load DOES take it for a `config.toml` that would be rewritten. The
+/// fixture is the reach the review found: `[env]` key `A:B` parses only quoted,
+/// and the canonical render writes it bare, so `maybe_rewrite_config_toml`
+/// decides on a rewrite — which is a `with_state_lock` the handshake cannot
+/// afford.
+#[test]
+fn the_handshake_profile_read_never_waits_on_the_state_flock() {
+    let _home = HomeSandbox::new();
+    let clauth = clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(clauth.join("profiles").join("held")).expect("create profile dir");
+    let config_path = clauth.join("profiles").join("held").join("config.toml");
+    std::fs::write(&config_path, "[env]\n\"A:B\" = \"x\"\n").expect("write config.toml");
+
+    // This process holds the flock a peer process would hold. `try_lock` so a
+    // second holder can never hang the suite; a lock file is never truncated.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(clauth.join(".lock"))
+        .expect("open the state lock");
+    lock.try_lock().expect("take the state flock");
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_secs(2)));
+    let name = ProfileName::from("held");
+
+    let started = std::time::Instant::now();
+    let profile = load_profile_without_rewrite(&name).expect("the no-rewrite read succeeds");
+    let waited = started.elapsed();
+    assert_eq!(
+        profile.env.get("A:B").map(String::as_str),
+        Some("x"),
+        "the no-rewrite read still reads the profile"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(1),
+        "the handshake read never waits on the state flock (2 s timeout): {waited:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read back"),
+        "[env]\n\"A:B\" = \"x\"\n",
+        "the no-rewrite read leaves the file as it is"
+    );
+
+    // The control: the ordinary load takes the flock for the same fixture, so
+    // the test would fail if the fixture stopped needing a rewrite.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let control_name = name.clone();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let outcome = load_profile(&control_name);
+        let _ = tx.send((started.elapsed(), outcome.is_ok()));
+    });
+    let (control_waited, ok) = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the control load returns after the scaled flock timeout");
+    assert!(ok, "the control load still succeeds");
+    assert!(
+        control_waited >= std::time::Duration::from_millis(1500),
+        "the control: load_profile waits on the flock: {control_waited:?}"
+    );
+    drop(lock);
 }

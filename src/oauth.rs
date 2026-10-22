@@ -312,33 +312,37 @@ fn token_parse_error(e: &serde_json::Error, status: u16, body_len: usize) -> Tok
 
 /// Connect deadline for every token/kick call [`AGENT`] makes.
 const HTTP_CONNECT_SECS: u64 = 4;
-/// Response-HEADER deadline for the same. An IDLE deadline, re-armed from `now`
-/// before every wait, not a phase bound measured from the connect — see
-/// [`TOKEN_HTTP_DEADLINES`] below for what that difference costs.
+/// Response-HEADER deadline for the same — the header phase's bound, armed from
+/// the phase's start and stopping once the headers arrive — see
+/// [`TOKEN_HTTP_DEADLINES`] below for what that leaves unbounded.
 const HTTP_RECV_HEADERS_SECS: u64 = 15;
 
-/// The two deadlines a token call carries, added. Named for the deadlines rather
-/// than for a phase because neither spelling of "the time a call may spend" is
-/// true of it: one term bounds a phase and the other does not. It bounds NO PHASE of a token call end to end, and
-/// reading it as a ceiling is the mistake the doc below exists to prevent.
+/// The two deadlines a token call carries, added. The sum names the time a
+/// waiter that must OUTLAST a refresh spends, not a ceiling on the call: the
+/// connect and header-receipt phases are bounded, the response BODY and the
+/// whole call are not — reading the constant as an end-to-end ceiling is the
+/// mistake this doc exists to prevent.
 ///
 /// `timeout_connect` is a true phase bound — upstream's wording is "Max duration
 /// for establishing the connection. For a TLS connection this includes opening
 /// the socket and doing the TLS handshake."
 ///
-/// `timeout_recv_response` is NOT, despite reading like one. ureq 3.4.0 re-arms it
-/// from `now` before every wait (`CallTimings::next_timeout`, re-called inside the
-/// receive loop), so it caps the gap between two header bytes, never the phase. A
-/// server dribbling one header byte every 3 s ran 135 s to a 200 under exactly
-/// this agent config, against a 15.3 s timeout on a server that sent nothing —
-/// measured 2026-08-31, which is also what proves the deadline is armed at all.
+/// `timeout_recv_response` is the header phase's bound — upstream's wording is
+/// "Max duration for receiving the response headers, but not the body", and it
+/// stops applying once the headers are received. Measured on the locked 3.4.2
+/// (2026-10-21): a loopback stub dribbling one header byte every 100 ms against
+/// a 500 ms bound returned `Timeout(RecvResponse)` at 502 ms — the deadline is
+/// armed from the header phase's START, not re-armed per byte (the earlier
+/// 3.4.0 note here claimed a per-byte re-arm; 3.4.2 does not). The same stub
+/// sending complete headers then stalling the body stayed blocked past 3 s,
+/// which is what proves the deadline stops applying at the headers.
 ///
-/// Of ureq's five per-phase deadlines the other three are left at their `None`
-/// default here — `timeout_resolve`, `timeout_send_request` and
-/// `timeout_send_body`, the last live rather than hypothetical since a refresh
-/// POSTs a body — and so are `timeout_recv_body` and `timeout_global`. So every
-/// phase of the call is unbounded: DNS, the request send, header receipt and the
-/// response body alike.
+/// The two bounds the call still lacks are `timeout_recv_body` ("Max total
+/// duration for receiving the response body ... not restarted for each read")
+/// and `timeout_global` ("end-to-end, from DNS lookup to finishing reading the
+/// response body"), both left at their `None` default here, as are
+/// `timeout_resolve`, `timeout_send_request` and `timeout_send_body`. So the
+/// response body is unbounded — a token call whose body stalls hangs.
 ///
 /// Named rather than left as two literals inside [`AGENT`] because a caller that
 /// must OUTLAST a refresh derives its own deadline from it —

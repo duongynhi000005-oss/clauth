@@ -21,7 +21,7 @@
 //! - the RFC-8693 secondary exchange that mints `OPENAI_API_KEY` is
 //!   best-effort — its failure must not fail the login.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,10 @@ use anyhow::{Context, Result, bail};
 
 use crate::codex_auth::{CODEX_CLIENT_ID, CODEX_TOKEN_URL};
 use crate::logline::logline;
-use crate::oauth_login::{AuthorizeRejection, base64url_nopad, percent_encode, query_param};
+use crate::oauth_login::{
+    AuthorizeRejection, MAX_CALLBACK_HEAD_BYTES, WaitOver, base64url_nopad, percent_encode,
+    query_param, read_callback_head, spawn_callback_reader,
+};
 
 /// codex's registered loopback ports and callback path — a redirect_uri the
 /// server will accept, not a free port.
@@ -47,6 +50,47 @@ const ORIGINATOR: &str = "codex_cli_rs";
 const SCOPE: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The WHOLE deadline one accepted callback connection carries for delivering
+/// its request line, armed when the listener accepts it and never reset by a
+/// byte. Raised from the old serial accept's 5 s read bound to 60 s per
+/// cloudy's ruling: a slow request line still yields the code, while a silent
+/// or trickling socket ends at the deadline. A per-read timeout alone would let
+/// a peer sending one byte just under the bound hold its reader for days, so
+/// [`read_callback_head`] re-arms each read to the time REMAINING to this
+/// deadline (the `daemon::bridge::REQUEST_DEADLINE` shape).
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The whole-connection bound [`wait_for_code`] arms at accept:
+/// [`CALLBACK_READ_TIMEOUT`], or a shorter value a test poses a slow or
+/// trickling request line under. The one source, so the listener and its tests
+/// read the same number; production never sets the override.
+pub(crate) fn callback_read_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(t) = *CALLBACK_READ_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return t;
+    }
+    CALLBACK_READ_TIMEOUT
+}
+
+/// Test seam shortening the callback connection deadline so a slow or trickling
+/// request line is drivable in milliseconds, the `lock::STATE_LOCK_TIMEOUT_OVERRIDE`
+/// shape. `None` is the production deadline. `HomeSandbox` also clears it.
+#[cfg(test)]
+static CALLBACK_READ_TIMEOUT_OVERRIDE: std::sync::Mutex<Option<Duration>> =
+    std::sync::Mutex::new(None);
+
+/// Set or clear the test-only connection-deadline override. `None` restores
+/// [`CALLBACK_READ_TIMEOUT`].
+#[cfg(test)]
+pub(crate) fn set_callback_read_timeout_override(timeout: Option<Duration>) {
+    *CALLBACK_READ_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
+}
 
 /// The minted login, ready to land in a profile store.
 #[derive(Clone)]
@@ -256,8 +300,13 @@ fn authorize_url(redirect_uri: &str, challenge: &str, state: &str) -> String {
 }
 
 /// Block on the loopback socket for the OAuth redirect, validating `state`.
-/// Bails `login canceled` as soon as `cancel` is set, so an abandoned login
-/// never holds codex's registered ports for the rest of its timeout.
+/// Every accepted connection is read on its own reader thread under one
+/// whole-connection [`callback_read_timeout`] deadline armed at accept, so a
+/// silent or trickling socket never blocks the accept loop and the cancel flag
+/// is seen within one poll whatever a reader is doing; the first reader's valid
+/// code wins, and a reader's `Err` ends the wait. Bails `login canceled` as soon
+/// as `cancel` is set, so an abandoned login never holds codex's registered
+/// ports for the rest of its timeout.
 fn wait_for_code(
     listener: &TcpListener,
     expected_state: &str,
@@ -267,6 +316,8 @@ fn wait_for_code(
         .set_nonblocking(true)
         .context("failed to set the callback listener non-blocking")?;
     let deadline = Instant::now() + LOGIN_TIMEOUT;
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Option<String>>>();
+    let (wait_over, _wait_over_guard) = WaitOver::new();
     loop {
         if cancel.is_canceled() {
             bail!("login canceled");
@@ -274,11 +325,26 @@ fn wait_for_code(
         if Instant::now() >= deadline {
             bail!("timed out waiting for the codex login callback");
         }
+        // A reader thread's outcome; `tx` stays alive in this loop, so the
+        // channel never disconnects here.
+        match rx.try_recv() {
+            Ok(Ok(Some(code))) => return Ok(code),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Some(code) = handle_callback(stream, expected_state)? {
-                    return Ok(code);
-                }
+                let tx = tx.clone();
+                let state = expected_state.to_string();
+                let over = wait_over.clone();
+                // Fixed at ACCEPT: the reader's budget is this connection's,
+                // never re-armed by a later byte.
+                let connection_deadline = Instant::now() + callback_read_timeout();
+                spawn_callback_reader(move || {
+                    let _ = tx.send(handle_callback(stream, &state, connection_deadline, &over));
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(50));
@@ -291,30 +357,25 @@ fn wait_for_code(
 fn handle_callback(
     mut stream: std::net::TcpStream,
     expected_state: &str,
+    deadline: Instant,
+    wait_over: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<String>> {
     // The accepted socket inherits the listener's O_NONBLOCK on some
     // platforms (macOS), so a single `read` could return WouldBlock and drop
-    // the code on the floor. Force blocking with a read deadline: the browser
-    // has already connected, so the request is milliseconds away, and the
-    // deadline keeps a half-open connection from hanging the login. Read in a
-    // short loop so a redirect split across packets still arrives whole.
+    // the code on the floor. Force blocking, then read under the connection's
+    // whole deadline: the browser has already connected, so the request is
+    // milliseconds away, and a half-open or trickling connection ends at the
+    // deadline instead of holding its reader.
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                // The request line plus the query is all we need; stop once
-                // the header block is complete or the buffer is generous.
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= 16384 {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
+    let Some(buf) = read_callback_head(&mut stream, deadline, MAX_CALLBACK_HEAD_BYTES, |buf| {
+        buf.windows(4).any(|w| w == b"\r\n\r\n")
+    }) else {
+        return Ok(None);
+    };
+    if wait_over.load(std::sync::atomic::Ordering::Acquire) {
+        // The login already ended (a cancel, another door, an aborted reader):
+        // write NO page of any kind. The connection closes when `stream` drops.
+        return Ok(None);
     }
     let request = String::from_utf8_lossy(&buf);
     let target = request

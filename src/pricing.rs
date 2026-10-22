@@ -144,8 +144,12 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// HTTP connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// HTTP response-receive timeout.
-const RECV_TIMEOUT: Duration = Duration::from_secs(15);
+/// End-to-end budget for one feed fetch: connect + headers + body in one
+/// `timeout_global` bound, so a stalled body fails the fetch and the next poll
+/// retries. No separate header-phase bound sits beside it: cloudy's 2026-10-21
+/// ruling is one budget, so a feed whose headers take 20 s still succeeds under
+/// this 60 s. The bound is read through [`fetch_timeout`] so a test scales it.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard cap on a response body. Measured against the store 2026-09-03: the
 /// index is ~336 KiB, the history ~509 KiB (largest single-day batch: 608
 /// rows on 2026-08-29), and the three catalog files ~164 KiB (models),
@@ -1290,11 +1294,40 @@ fn fetch_table_with(
     })
 }
 
+/// The end-to-end fetch bound: [`FETCH_TIMEOUT`], or a shorter value a test
+/// poses a stalled body under. The one source, so the fetch and its tests read
+/// the same number; production never sets the override.
+pub(crate) fn fetch_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(t) = *FETCH_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return t;
+    }
+    FETCH_TIMEOUT
+}
+
+/// Test seam shortening the fetch bound so a stalled body is drivable in
+/// milliseconds, the `lock::STATE_LOCK_TIMEOUT_OVERRIDE` shape. `None` is the
+/// production deadline.
+#[cfg(test)]
+static FETCH_TIMEOUT_OVERRIDE: std::sync::Mutex<Option<Duration>> = std::sync::Mutex::new(None);
+
+/// Set or clear the test-only fetch-bound override. `None` restores
+/// [`FETCH_TIMEOUT`].
+#[cfg(test)]
+pub(crate) fn set_fetch_timeout_override(timeout: Option<Duration>) {
+    *FETCH_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
+}
+
 /// GET one feed URL as text, capped at [`MAX_BODY_BYTES`].
 fn fetch_body(url: &str) -> anyhow::Result<String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
-        .timeout_recv_response(Some(RECV_TIMEOUT))
+        .timeout_global(Some(fetch_timeout()))
         .build()
         .into();
 

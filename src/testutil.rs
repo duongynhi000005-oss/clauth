@@ -66,6 +66,45 @@ pub(crate) fn node_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Downcast a feed fetch's failure to ureq's own timeout and pin its REASON:
+/// only `Global` is the one end-to-end budget cloudy's 2026-10-21 ruling names.
+/// A `RecvBody` bound or one of ureq's other phases is a different, unruled
+/// budget even when it errors inside the window.
+///
+/// ureq 3.4.2's `BodyReader` surfaces its timeout as `io::Error::other`, so the
+/// ureq error is the io error's inner source.
+pub(crate) fn assert_one_budget_timeout<T: std::fmt::Debug>(result: &anyhow::Result<T>) {
+    let err = result.as_ref().expect_err("a stalled body is an error");
+    let io = err
+        .downcast_ref::<std::io::Error>()
+        .unwrap_or_else(|| panic!("the body stall surfaces an io error: {err:?}"));
+    let ureq_err = io
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+        .unwrap_or_else(|| panic!("the io error wraps ureq's timeout: {err:?}"));
+    assert!(
+        matches!(ureq_err, ureq::Error::Timeout(ureq::Timeout::Global)),
+        "the body stall must trip the ONE end-to-end budget: {err:?}"
+    );
+}
+
+/// Read a loopback stub's request head before it answers, as a real server
+/// does. A socket closed with the request still unread sends a RST instead of a
+/// FIN: Windows then fails the client's read with `os error 10053`, and macOS
+/// refuses the client's next `SO_RCVTIMEO` with `EINVAL` (CI run 39758751460).
+pub(crate) fn read_request_head(sock: &mut std::net::TcpStream) {
+    use std::io::Read;
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        match sock.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
 /// RAII home sandbox: acquires `HOME_TEST_LOCK` and redirects `home_dir()` into
 /// a tempdir for its lifetime, clearing the override on drop (even on panic).
 /// Required for any test that writes into the per-profile tree or creates
@@ -93,8 +132,15 @@ impl HomeSandbox {
             .unwrap_or_else(|e| e.into_inner());
         // A prior test that panicked mid-override leaks it into this one: clear
         // it here (and on drop) so a parallel test never inherits a shortened
-        // lock deadline it did not set.
+        // lock deadline it did not set. The callback/feed bounds and the
+        // marker-registration pose are the same class of process-global state.
         crate::lock::set_state_lock_timeout_override(None);
+        crate::oauth_login::set_callback_read_timeout_override(None);
+        crate::oauth_login::set_callback_reader_cap_override(None);
+        crate::codex_login::set_callback_read_timeout_override(None);
+        crate::pricing::set_fetch_timeout_override(None);
+        crate::status::set_fetch_timeout_override(None);
+        crate::mcp::jobs::reset_marker_registration_for_test();
         let tmp = tempfile::tempdir().expect("create home sandbox");
         let home = tmp.path().to_path_buf();
         crate::profile::set_home_override(home.clone());
@@ -163,8 +209,15 @@ impl Drop for HomeSandbox {
         // Clear the process-wide lock-timeout override after the joins above
         // (a worker's last wait still needs the shortened deadline it was
         // posed under), so a test that forgot to clear it cannot leak it into
-        // the next one.
+        // the next one. The callback/feed bounds and the marker-registration
+        // pose leak the same way, so they clear together.
         crate::lock::set_state_lock_timeout_override(None);
+        crate::oauth_login::set_callback_read_timeout_override(None);
+        crate::oauth_login::set_callback_reader_cap_override(None);
+        crate::codex_login::set_callback_read_timeout_override(None);
+        crate::pricing::set_fetch_timeout_override(None);
+        crate::status::set_fetch_timeout_override(None);
+        crate::mcp::jobs::reset_marker_registration_for_test();
         // Restore the user's own value, after the joins above for the same
         // reason the home override is cleared there: a still-running worker that
         // sees it back resolves outside the sandbox.
