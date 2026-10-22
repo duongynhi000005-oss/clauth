@@ -636,6 +636,22 @@ fn walk_store(projects: &Path, source: &SessionSource, by_id: &mut HashMap<Strin
     let mut paths = Vec::new();
     collect_jsonl(projects, WALK_MAX_DEPTH, &mut paths);
     for path in paths {
+        // Workflow journals are run logs, not conversation transcripts. Keep
+        // sibling agent transcripts and ordinary sessions named `journal`.
+        let is_workflow_journal = path.file_name().is_some_and(|name| name == "journal.jsonl")
+            && path.parent().is_some_and(|parent| {
+                parent
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("wf_"))
+                    && parent
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|name| name == "workflows")
+            });
+        if is_workflow_journal {
+            continue;
+        }
         let (Some(id), Some(updated)) = (session_id_from_path(&path), mtime_of(&path)) else {
             continue;
         };

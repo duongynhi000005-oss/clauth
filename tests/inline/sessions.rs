@@ -332,6 +332,39 @@ fn session_id_comes_from_file_stem_not_first_line() {
 }
 
 #[test]
+fn build_index_skips_workflow_journals_but_keeps_transcripts() {
+    let sb = HomeSandbox::new();
+    let project = sb.home().join(".claude/projects/-w-workflow");
+    let workflow = project.join("session/subagents/workflows/wf_x");
+    write_jsonl(
+        &project.join("session.jsonl"),
+        &[user_line("session", "/w/workflow", "parent")],
+    );
+    write_jsonl(
+        &workflow.join("journal.jsonl"),
+        &[json!({"agentId": "agent-a1b2c3d4", "key": "x", "type": "started"}).to_string()],
+    );
+    write_jsonl(
+        &workflow.join("agent-a1b2c3d4.jsonl"),
+        &[user_line("session", "/w/workflow", "subagent")],
+    );
+
+    let groups = build_index();
+    assert!(find(&groups, "session").is_some());
+    assert!(find(&groups, "agent-a1b2c3d4").is_some());
+    assert!(find(&groups, "journal").is_none());
+    assert!(locate("journal").is_none());
+
+    write_jsonl(
+        &project.join("journal.jsonl"),
+        &[user_line("journal", "/w/workflow", "real session")],
+    );
+    let groups = build_index();
+    let journal = find(&groups, "journal").expect("ordinary journal session indexed");
+    assert_eq!(journal.first_message.as_deref(), Some("real session"));
+}
+
+#[test]
 fn last_user_message_comes_from_the_tail_not_the_head() {
     let sb = HomeSandbox::new();
     let path = sb.home().join(".claude/projects/-w-tail/stail.jsonl");
