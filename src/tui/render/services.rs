@@ -1122,7 +1122,7 @@ fn entry_line(
 /// an absent side reading `—`. The position, the arrow and the provider stay
 /// whole; the model slug alone shrinks with a trailing `…`. A provider that
 /// leaves the model no room shrinks too, keeping one cell for the model.
-fn route_label(r: &RouteView, room: usize) -> String {
+pub(super) fn route_label(r: &RouteView, room: usize) -> String {
     let model = escape_control(
         r.model
             .as_ref()
@@ -1409,7 +1409,7 @@ fn config_key(label: &str, indent: usize) -> String {
 }
 
 /// A field row's label word: the provider key for an `upstream_model` row.
-fn field_label(key: &ShuntFieldKey) -> String {
+pub(super) fn field_label(key: &ShuntFieldKey) -> String {
     match key {
         ShuntFieldKey::Bind => "bind".to_string(),
         ShuntFieldKey::DefaultProvider => "default_provider".to_string(),

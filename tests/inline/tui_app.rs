@@ -30929,34 +30929,22 @@ fn route_editor_open_across_a_remove_keeps_its_route() {
     let home = crate::testutil::HomeSandbox::new();
     let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
     let mut rig = config_edit_rig(&home, ROUTES_FIXTURE);
-    rig.app
-        .services
-        .shunt_expanded
-        .insert(super::ShuntEntryKey::Route(3));
-    remove_entry_via_confirm(&mut rig, super::ShuntEntryKey::Route(2));
-    // The remove checks; the user opens route 3's (m3) upstream_model editor.
-    let key = super::ShuntFieldKey::Route {
-        position: 3,
-        field: super::RouteFieldKind::UpstreamModel,
-    };
-    rig.focus_field(key);
-    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
-    for c in "zzz".chars() {
-        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
-    }
+    type_m3_upstream_model_while_m2_remove_checks(&mut rig);
     rig.drain();
     super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
     rig.drain();
     let text = rig.config_text();
-    eprintln!("RA-P10 file after:\n{text}");
+    eprintln!("file after:\n{text}");
     assert!(
         !text.contains("model = \"m4\"\nprovider = \"a\"\nupstream_model = \"zzz\""),
-        "RA-P10 the value typed on m3's row landed on m4:\n{text}"
+        "the value typed on m3's row landed on m4:\n{text}"
     );
 }
 
 /// Open route 3's (m3) `upstream_model` editor and type `zzz` while route 2's
-/// (m2) remove checks.
+/// (m2) remove checks, through the shared `shunt_expanded.insert` and
+/// `focus_field` shortcuts (the latter expands the entry, recomputes, and
+/// descends onto the field row).
 #[cfg(unix)]
 fn type_m3_upstream_model_while_m2_remove_checks(rig: &mut ConfigEditRig) {
     rig.app
@@ -30995,6 +30983,15 @@ fn a_warning_save_across_a_route_remove_writes_the_editors_own_route() {
     );
     rig.drain();
     super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert_eq!(
+        rig.app.tab,
+        Tab::Services,
+        "the save switched before landing"
+    );
+    assert!(
+        rig.app.loss_pending.is_some(),
+        "the save did not hold the switch"
+    );
     rig.drain();
     let text = rig.config_text();
     eprintln!("file after:\n{text}");
@@ -31006,6 +31003,7 @@ fn a_warning_save_across_a_route_remove_writes_the_editors_own_route() {
         !text.contains("model = \"m4\"\nprovider = \"a\"\nupstream_model = \"zzz\""),
         "the value typed on m3's row landed on m4:\n{text}"
     );
+    assert_eq!(rig.app.tab, Tab::Overview, "the save did not switch");
 }
 
 /// Control: the remove lands before the switch key, so the warning captures
@@ -46170,105 +46168,15 @@ fn a_draft_field_typed_back_to_blank_warns_and_refuses() {
     );
 }
 
-/// A save holding one async shunt item plus a sync item starts the async item
-/// first and holds; on its landing the sync item commits (re-validated) and the
-/// switch then runs its own gate, so both land and the switch proceeds.
+/// A save holding an async shunt item (a typed `+ add` draft) beside an
+/// instant edit (the herdr tag) never mixes them: the instant edit commits and
+/// closes, no shunt save starts, no hold is set, the warning closes, nothing
+/// switches, and the shunt item opens on its own `save <kind>` row owning the
+/// keys, so the next `↵` starts its save.
 #[cfg(unix)]
 #[test]
-fn a_save_starts_the_async_item_first_then_commits_the_sync_items() {
-    use super::{ServicesFocus, ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
-    let home = crate::testutil::HomeSandbox::new();
-    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
-    let mut rig = config_edit_rig(&home, RIG_TEXT);
-    rig.open_add(ShuntAddKind::Upstream);
-    rig.focus_draft_field(
-        ShuntAddKind::Upstream,
-        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
-    );
-    super::handle_key(&mut rig.app, key(KeyCode::Enter));
-    rig.type_and_commit("zz");
-    rig.app.services.focus = ServicesFocus::List;
-    let before = rig.app.config().state.herdr.tag_watch_secs;
-    let typed = before + 7;
-    let mut d = SeededInput::new(&before.to_string());
-    d.input = InputState::new(&typed.to_string());
-    rig.app.services.herdr_tag_draft = Some(d);
-    super::handle_key(&mut rig.app, alt_digit('1'));
-    assert!(
-        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
-        "the two changed Services items opened no warning"
-    );
-    super::handle_key(&mut rig.app, key(KeyCode::Enter));
-    assert!(rig.app.loss_pending.is_some(), "the save did not hold");
-    assert!(
-        rig.app.config().state.herdr.tag_watch_secs == before,
-        "the sync item committed before the async item landed"
-    );
-    rig.drain();
-    assert_eq!(rig.app.tab, Tab::Overview, "the save did not switch");
-    assert!(
-        rig.config_text().contains("name = \"zz\""),
-        "the async item did not land"
-    );
-    assert_eq!(
-        rig.app.config().state.herdr.tag_watch_secs,
-        typed,
-        "the sync item did not commit after the async item landed"
-    );
-}
-
-/// A refused `shunt check` commits nothing: the held sync item stays uncommitted,
-/// nothing switches, and the shunt item stays open.
-#[cfg(unix)]
-#[test]
-fn a_refused_check_commits_nothing_and_opens_the_shunt_item() {
-    use super::{ServicesFocus, ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
-    let home = crate::testutil::HomeSandbox::new();
-    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
-    let mut rig = config_edit_rig(&home, RIG_TEXT);
-    rig.open_add(ShuntAddKind::Upstream);
-    rig.focus_draft_field(
-        ShuntAddKind::Upstream,
-        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
-    );
-    super::handle_key(&mut rig.app, key(KeyCode::Enter));
-    rig.type_and_commit("zz");
-    rig.app.services.focus = ServicesFocus::List;
-    let before = rig.app.config().state.herdr.tag_watch_secs;
-    let typed = before + 7;
-    let mut d = SeededInput::new(&before.to_string());
-    d.input = InputState::new(&typed.to_string());
-    rig.app.services.herdr_tag_draft = Some(d);
-    std::fs::write(rig.stub.join("fail"), "").unwrap();
-    super::handle_key(&mut rig.app, alt_digit('1'));
-    super::handle_key(&mut rig.app, key(KeyCode::Enter));
-    let pending = rig.app.loss_pending.is_some();
-    rig.drain();
-    assert_eq!(rig.app.tab, Tab::Services, "switched over the refusal");
-    assert!(
-        !rig.config_text().contains("name = \"zz\""),
-        "the add committed"
-    );
-    assert_eq!(
-        rig.app.config().state.herdr.tag_watch_secs,
-        before,
-        "the herdr tag committed though the async item in the same save was refused: pending={pending} typed={typed}"
-    );
-    assert!(
-        rig.app
-            .services
-            .shunt_drafts
-            .is_open(ShuntAddKind::Upstream),
-        "the shunt item was not kept open"
-    );
-}
-
-/// A sync item made invalid while the async item's save is held commits
-/// nothing more: the re-run gate warns over it and it stays open, invalid.
-#[cfg(unix)]
-#[test]
-fn a_sync_item_made_invalid_during_the_hold_commits_nothing_more_and_warns() {
-    use super::{ServicesFocus, ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+fn a_save_mixing_an_async_item_with_other_work_saves_the_rest_and_opens_the_shunt_item() {
+    use super::{ServicesFocus, ShuntAddKind, ShuntDraftField, ShuntFocusLine, UpstreamFieldKind};
     let home = crate::testutil::HomeSandbox::new();
     let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
     let mut rig = config_edit_rig(&home, RIG_TEXT);
@@ -46285,32 +46193,699 @@ fn a_sync_item_made_invalid_during_the_hold_commits_nothing_more_and_warns() {
     d.input = InputState::new(&(before + 7).to_string());
     rig.app.services.herdr_tag_draft = Some(d);
     super::handle_key(&mut rig.app, alt_digit('1'));
-    super::handle_key(&mut rig.app, key(KeyCode::Enter));
-    assert!(rig.app.loss_pending.is_some(), "precondition: held");
-    if let Some(d) = rig.app.services.herdr_tag_draft.as_mut() {
-        d.input = InputState::new("x");
-    }
-    rig.drain();
     assert!(
-        rig.config_text().contains("name = \"zz\""),
-        "the async item did not land"
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: the two changed Services items opened no warning"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.modals.is_empty(),
+        "the mixed save left a modal open"
+    );
+    assert!(rig.app.loss_pending.is_none(), "the mixed save set a hold");
+    assert!(
+        rig.app.services.shunt_save.is_none(),
+        "the mixed save started the shunt save"
+    );
+    rig.drain();
+    assert_eq!(rig.app.tab, Tab::Services, "the mixed save switched");
+    assert!(
+        !rig.config_text().contains("name = \"zz\""),
+        "the mixed save wrote the + add draft"
     );
     assert_eq!(
         rig.app.config().state.herdr.tag_watch_secs,
-        before,
-        "the invalidated sync item committed"
+        before + 7,
+        "the mixed save did not commit the herdr tag"
     );
     assert!(
-        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
-        "the invalidated sync item did not warn"
+        rig.app.services.herdr_tag_draft.is_none(),
+        "the committed herdr tag editor stayed open"
     );
     assert!(
         rig.app
             .services
-            .herdr_tag_draft
-            .as_ref()
-            .is_some_and(|d| d.input.value == "x"),
-        "the invalid sync item did not stay open"
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "the mixed save dropped the + add draft"
+    );
+    assert_eq!(
+        (rig.app.services.focus, rig.app.services.shunt_focus_kind()),
+        (
+            ServicesFocus::Detail,
+            Some(ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream))
+        ),
+        "the shunt item did not open on its own save row"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app
+            .services
+            .saving(&super::ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream)),
+        "the next ↵ did not start save upstream: owner={:?}",
+        super::keyboard_owner(&rig.app)
+    );
+    rig.drain();
+    assert!(
+        rig.config_text().contains("name = \"zz\""),
+        "the shunt item's own save did not land"
+    );
+}
+
+/// The quit twin over a changed shunt FIELD beside the herdr tag: `save`
+/// commits the herdr tag, quits nothing, starts no field save, and the field
+/// editor stays open with its typed text, owning the next `↵`.
+#[cfg(unix)]
+#[test]
+fn a_quit_save_mixing_a_shunt_field_with_other_work_saves_the_rest() {
+    use super::ShuntFieldEdit;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let mut d = SeededInput::new(&before.to_string());
+    d.input = InputState::new(&(before + 7).to_string());
+    rig.app.services.herdr_tag_draft = Some(d);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: the quit form is open"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(!rig.app.quit, "the mixed save quit");
+    assert!(
+        rig.app.modals.is_empty(),
+        "the mixed save left a modal open"
+    );
+    assert!(rig.app.loss_pending.is_none(), "the mixed save set a hold");
+    assert!(
+        rig.app.services.shunt_save.is_none(),
+        "the mixed save started the field save"
+    );
+    rig.drain();
+    assert!(!rig.app.quit, "the mixed save quit after a drain");
+    assert!(
+        !rig.config_text().contains("effort = \"high\""),
+        "the mixed save wrote the shunt field"
+    );
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before + 7,
+        "the mixed save did not commit the herdr tag"
+    );
+    assert!(
+        matches!(
+            rig.app.services.shunt_field_edit.as_ref().map(|s| &s.edit),
+            Some(ShuntFieldEdit::Typed { input, .. }) if input.value == "high"
+        ),
+        "the shunt field editor did not stay open with its text"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.drain();
+    assert!(
+        rig.config_text().contains("effort = \"high\""),
+        "the next ↵ did not save the shunt field: owner={:?}",
+        super::keyboard_owner(&rig.app)
+    );
+}
+
+/// Two `+ add` kinds: a typed upstream draft (editor closed) and a model
+/// draft whose id field editor is still open. A mixed `save` writes no file,
+/// lands the open model editor's text in its in-memory draft, and opens the
+/// FIRST kind's `save upstream` row owning the keys.
+#[cfg(unix)]
+#[test]
+fn a_mixed_save_over_two_add_kinds_opens_the_first_owning_the_keys() {
+    use super::{
+        ModelFieldKind, ServicesFocus, ShuntAddKind, ShuntDraftField, ShuntFocusLine,
+        UpstreamFieldKind,
+    };
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.open_add(ShuntAddKind::Model);
+    rig.focus_draft_field(
+        ShuntAddKind::Model,
+        ShuntDraftField::Model(ModelFieldKind::Id),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    for c in "mm".chars() {
+        super::handle_key(&mut rig.app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: the quit form is open"
+    );
+    let file_before = rig.config_text();
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(!rig.app.quit, "the mixed save quit");
+    assert!(rig.app.loss_pending.is_none(), "the mixed save set a hold");
+    assert!(
+        rig.app.services.shunt_save.is_none(),
+        "the mixed save started a shunt save"
+    );
+    assert_eq!(
+        rig.config_text(),
+        file_before,
+        "the mixed save wrote the file"
+    );
+    assert!(
+        rig.app.services.shunt_field_edit.is_none(),
+        "the model draft field editor stayed open"
+    );
+    assert!(
+        rig.app.services.shunt_drafts.is_open(ShuntAddKind::Model)
+            && rig
+                .app
+                .services
+                .shunt_drafts
+                .holds_typed_work(ShuntAddKind::Model),
+        "the model draft lost its typed id"
+    );
+    assert_eq!(
+        (rig.app.services.focus, rig.app.services.shunt_focus_kind()),
+        (
+            ServicesFocus::Detail,
+            Some(ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream))
+        ),
+        "the first + add kind did not open on its own save row"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app
+            .services
+            .saving(&super::ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream)),
+        "the next ↵ did not start save upstream: owner={:?}",
+        super::keyboard_owner(&rig.app)
+    );
+    rig.drain();
+}
+
+/// A quit warning's `save` over instant work beside a running remove commits
+/// the instant work, then holds the quit on the remove: no exit until it
+/// lands.
+#[cfg(unix)]
+#[test]
+fn a_quit_save_over_instant_work_waits_on_a_running_remove() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_remove_save(&mut rig);
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let mut d = SeededInput::new(&before.to_string());
+    d.input = InputState::new(&(before + 7).to_string());
+    rig.app.services.herdr_tag_draft = Some(d);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: the quit form is open over the herdr tag"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before + 7,
+        "the quit save did not commit the herdr tag"
+    );
+    assert!(
+        !rig.app.quit,
+        "the quit save exited under the running remove"
+    );
+    rig.drain();
+    super::on_tick(&mut rig.app);
+    assert!(
+        rig.app.quit,
+        "the waiting quit did not exit after the remove"
+    );
+    assert!(
+        !rig.config_text().contains("name = \"a\""),
+        "the remove did not land"
+    );
+}
+
+/// The refused twin: the quit save commits the instant work, the exit waits
+/// for the remove, and once it is refused the quit goes ahead.
+#[cfg(unix)]
+#[test]
+fn a_quit_save_over_instant_work_beside_a_refused_remove_exits_once_it_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    start_remove_save(&mut rig);
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let mut d = SeededInput::new(&before.to_string());
+    d.input = InputState::new(&(before + 7).to_string());
+    rig.app.services.herdr_tag_draft = Some(d);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        !rig.app.quit,
+        "the quit save exited under the running remove"
+    );
+    rig.drain();
+    super::on_tick(&mut rig.app);
+    assert!(
+        rig.app.quit,
+        "the quit did not exit after the refused remove"
+    );
+    assert!(
+        rig.config_text().contains("name = \"a\""),
+        "the refused remove changed the file"
+    );
+}
+
+/// A quit pressed while a switch waits on a checking `+ add` save turns the
+/// held switch into a held quit: no switch, and the landing quits.
+#[cfg(unix)]
+#[test]
+fn a_quit_during_a_held_switch_turns_the_hold_into_a_quit() {
+    use super::LossWarningTarget;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_add_save(&mut rig);
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        rig.app.loss_pending.is_some(),
+        "precondition: the switch is held"
+    );
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert_eq!(
+        rig.app.loss_pending,
+        Some(LossWarningTarget::Quit),
+        "the quit did not take over the held switch"
+    );
+    assert!(!rig.app.quit, "the quit exited under the running save");
+    rig.drain();
+    assert!(rig.app.quit, "the held quit did not land");
+    assert_eq!(
+        rig.app.tab,
+        Tab::Services,
+        "the dropped switch still landed"
+    );
+    assert!(
+        rig.config_text().contains("name = \"zz\""),
+        "the + add save did not land"
+    );
+}
+
+/// Name an upstream `+ add` draft and press its `save upstream`, leaving the
+/// save checking on the real worker.
+#[cfg(unix)]
+fn start_add_save(rig: &mut ConfigEditRig) {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFocusLine, UpstreamFieldKind};
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    start_real_save(rig, ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    assert!(
+        rig.app
+            .services
+            .saving(&super::ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream)),
+        "precondition: the + add save is checking"
+    );
+}
+
+/// A `+ add` draft whose own `save <kind>` is checking is not changed work: a
+/// switch over it alone opens no warning, holds on the save, and the landing
+/// switches with the entry written.
+#[cfg(unix)]
+#[test]
+fn a_switch_over_a_checking_add_draft_alone_holds_and_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_add_save(&mut rig);
+    assert!(
+        super::changed_work(&rig.app).is_empty(),
+        "a checking + add draft counts as changed work: {:?}",
+        super::changed_work(&rig.app)
+    );
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        !matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the checking + add draft warned"
+    );
+    assert!(rig.app.loss_pending.is_some(), "the switch did not hold");
+    assert_eq!(rig.app.tab, Tab::Services, "the switch landed early");
+    rig.drain();
+    assert_eq!(rig.app.tab, Tab::Overview, "the landed save did not switch");
+    assert!(
+        rig.config_text().contains("name = \"zz\""),
+        "the + add save did not land"
+    );
+}
+
+/// The refused twin: the draft stays open with its refusal and the re-run gate
+/// opens the warning over it; nothing switches.
+#[cfg(unix)]
+#[test]
+fn a_switch_over_a_checking_add_draft_whose_save_refuses_warns_over_it() {
+    use super::ShuntAddKind;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    start_add_save(&mut rig);
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        !matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the checking + add draft warned before its outcome"
+    );
+    assert!(rig.app.loss_pending.is_some(), "the switch did not hold");
+    rig.drain();
+    assert_eq!(rig.app.tab, Tab::Services, "switched over the refusal");
+    assert!(rig.app.loss_pending.is_none(), "the hold was not cleared");
+    assert!(
+        rig.app
+            .services
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "the refused draft was dropped"
+    );
+    assert!(
+        matches!(
+            rig.app.modals.last(),
+            Some(Modal::LossWarning(s)) if s.drop.dirty == vec![super::Dirty::ShuntAdd(ShuntAddKind::Upstream)]
+        ),
+        "the refused draft did not reopen under the warning: {:?}",
+        rig.app.modals.last()
+    );
+}
+
+/// A quit `discard` beside a checking `+ add` draft drops the other work and
+/// waits for the running save, quitting only on its landing.
+#[cfg(unix)]
+#[test]
+fn a_quit_discard_beside_a_checking_add_draft_waits_then_quits() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_add_save(&mut rig);
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let mut d = SeededInput::new(&before.to_string());
+    d.input = InputState::new(&(before + 7).to_string());
+    rig.app.services.herdr_tag_draft = Some(d);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(
+            rig.app.modals.last(),
+            Some(Modal::LossWarning(s)) if s.drop.dirty == vec![super::Dirty::HerdrTag]
+        ),
+        "the quit warning did not cover the herdr tag alone: {:?}",
+        rig.app.modals.last()
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Left));
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(!rig.app.quit, "the quit completed while the + add save ran");
+    assert!(rig.app.loss_pending.is_some(), "the discard did not hold");
+    rig.drain();
+    assert!(rig.app.quit, "the held quit did not land");
+    assert!(
+        rig.config_text().contains("name = \"zz\""),
+        "the running + add save did not land"
+    );
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before,
+        "discard committed the herdr tag"
+    );
+}
+
+/// Arm and confirm `remove upstream` on `a`, leaving the remove checking on the
+/// real worker.
+#[cfg(unix)]
+fn start_remove_save(rig: &mut ConfigEditRig) {
+    let entry = super::ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    rig.focus_remove(entry.clone());
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.services.saving(&super::ShuntSaveKey::Remove(entry)),
+        "precondition: the remove is checking"
+    );
+}
+
+/// A quit over a running `remove <kind>` save opens no warning and does not
+/// exit while the remove runs; once it lands, the next tick exits, with the
+/// entry gone from the file.
+#[cfg(unix)]
+#[test]
+fn a_quit_over_a_running_remove_holds_until_it_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_remove_save(&mut rig);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        !matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the running remove warned"
+    );
+    assert!(!rig.app.quit, "the quit exited under the running remove");
+    rig.drain();
+    super::on_tick(&mut rig.app);
+    assert!(rig.app.quit, "the landed remove did not exit");
+    assert!(
+        !rig.config_text().contains("name = \"a\""),
+        "the remove did not land"
+    );
+}
+
+/// The refused twin: the exit still waits for the remove, and once it is
+/// refused the quit goes ahead, the file unchanged.
+#[cfg(unix)]
+#[test]
+fn a_quit_over_a_refused_remove_exits_once_it_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    start_remove_save(&mut rig);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(!rig.app.quit, "the quit exited under the running remove");
+    rig.drain();
+    super::on_tick(&mut rig.app);
+    assert!(
+        rig.app.quit,
+        "the quit did not exit after the refused remove"
+    );
+    assert!(
+        rig.config_text().contains("name = \"a\""),
+        "the refused remove changed the file"
+    );
+}
+
+/// A second quit while the exit waits on a running remove exits at once,
+/// without waiting for the remove.
+#[cfg(unix)]
+#[test]
+fn a_second_quit_during_the_exit_wait_exits_at_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_remove_save(&mut rig);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        !rig.app.quit,
+        "precondition: the first quit waits on the running remove"
+    );
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        rig.app.quit && rig.app.services.shunt_save.is_some(),
+        "the second quit did not exit at once: quit={} saving={}",
+        rig.app.quit,
+        rig.app.services.shunt_save.is_some()
+    );
+    rig.drain();
+}
+
+/// Arm and confirm `remove` on the `alice` client-token row, leaving the token
+/// remove checking on the real worker.
+fn start_token_remove(app: &mut App) {
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Token("alice".into())));
+    super::handle_key(app, key(KeyCode::Enter));
+    super::handle_key(app, key(KeyCode::Right));
+    super::handle_key(app, key(KeyCode::Enter));
+    assert!(
+        app.services
+            .saving(&super::ShuntSaveKey::Token("alice".into())),
+        "precondition: the token remove is checking"
+    );
+}
+
+/// A quit over a running token remove opens no warning and does not exit while
+/// the remove runs; once it lands, the next tick exits, with the token gone
+/// from the store.
+#[test]
+fn a_quit_over_a_running_token_remove_holds_until_it_lands() {
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let record = adopt_token_record(&home, TOKEN_CONFIG, "");
+    crate::gateway_tokens::add_client_token(&record, "alice").unwrap();
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    start_token_remove(&mut app);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        !matches!(app.modals.last(), Some(Modal::LossWarning(_))),
+        "the running token remove warned"
+    );
+    assert!(!app.quit, "the quit exited under the running token remove");
+    drain_shunt_action(&mut app);
+    super::on_tick(&mut app);
+    assert!(app.quit, "the landed token remove did not exit");
+    assert!(
+        !token_names().iter().any(|n| n == "alice"),
+        "the token remove did not land"
+    );
+}
+
+/// The refused twin: the exit still waits for the token remove, and once it is
+/// refused the quit goes ahead, the store untouched.
+#[test]
+fn a_quit_over_a_refused_token_remove_exits_once_it_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let record = adopt_token_record(&home, "[server.auth]\n", "");
+    crate::gateway_tokens::add_client_token(&record, "alice").unwrap();
+    let mut app = token_app(Vec::new());
+    start_token_remove(&mut app);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "the quit exited under the running token remove");
+    drain_shunt_action(&mut app);
+    super::on_tick(&mut app);
+    assert!(
+        app.quit,
+        "the quit did not exit after the refused token remove"
+    );
+    assert!(
+        token_names().iter().any(|n| n == "alice"),
+        "the refused token remove changed the store"
+    );
+}
+
+/// Arm and confirm `+ add token` on the `alice` profile, leaving the mint save
+/// checking on the real worker.
+fn start_token_add(app: &mut App) {
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
+    super::handle_key(app, key(KeyCode::Enter));
+    super::handle_key(app, key(KeyCode::Down));
+    super::handle_key(app, key(KeyCode::Enter));
+    super::handle_key(app, key(KeyCode::Right));
+    super::handle_key(app, key(KeyCode::Enter));
+    assert!(
+        app.services.saving(&super::ShuntSaveKey::AddToken),
+        "precondition: the add token save is checking"
+    );
+}
+
+/// A quit over a running `+ add token` mint opens no warning and does not exit
+/// while the mint runs; once it lands, the next tick exits, with the token
+/// stored.
+#[test]
+fn a_quit_over_a_running_add_token_holds_until_it_lands() {
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new(
+        "alice".into(),
+        Some("https://api.example.com".into()),
+        Some("k".into()),
+    )]);
+    start_token_add(&mut app);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        !matches!(app.modals.last(), Some(Modal::LossWarning(_))),
+        "the running add token warned"
+    );
+    assert!(!app.quit, "the quit exited under the running add token");
+    drain_shunt_action(&mut app);
+    super::on_tick(&mut app);
+    assert!(app.quit, "the landed add token did not exit");
+    assert!(
+        token_names().iter().any(|n| n == "alice"),
+        "the add token did not land"
+    );
+}
+
+/// A quit over a running `require client tokens` save opens no warning and
+/// does not exit while the require runs; once it lands, the next tick exits,
+/// with `[server.auth]` written.
+#[cfg(unix)]
+#[test]
+fn a_quit_over_a_running_require_holds_until_it_lands() {
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    crate::gateway_tokens::add_client_token(
+        &crate::gateway::GatewayRecord::load().unwrap().unwrap(),
+        "alice",
+    )
+    .unwrap();
+    let mut app = rig.app;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    press_require(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.services.saving(&super::ShuntSaveKey::RequireTokens),
+        "precondition: the require is checking"
+    );
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        !matches!(app.modals.last(), Some(Modal::LossWarning(_))),
+        "the running require warned"
+    );
+    assert!(!app.quit, "the quit exited under the running require");
+    drain_shunt_action(&mut app);
+    super::on_tick(&mut app);
+    assert!(app.quit, "the landed require did not exit");
+    assert!(
+        std::fs::read_to_string(&rig.config)
+            .unwrap()
+            .contains("[server.auth]"),
+        "the require did not land"
     );
 }
 
@@ -47076,4 +47651,906 @@ fn a_one_save_guard_refusal_sets_no_hold() {
             .map(|t| t.body.clone())
             .collect::<Vec<_>>()
     );
+}
+
+/// A mixed save whose instant (sync) item refuses stops before anything
+/// commits: the refused item's own path runs, the async shunt field is neither
+/// opened nor saved, and no hold or quit is set.
+#[cfg(unix)]
+#[test]
+fn a_mixed_save_whose_instant_item_refuses_commits_nothing() {
+    use super::ShuntFieldEdit;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let mut d = SeededInput::new(&before.to_string());
+    d.input = InputState::new("abc");
+    rig.app.services.herdr_tag_draft = Some(d);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: the quit form is open"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(!rig.app.quit, "the refused mixed save quit");
+    assert!(
+        rig.app.loss_pending.is_none(),
+        "the refused mixed save set a hold"
+    );
+    assert!(
+        rig.app.services.shunt_save.is_none(),
+        "the refused mixed save started the shunt save"
+    );
+    assert!(
+        rig.app.services.herdr_tag_draft.is_some(),
+        "the refused herdr tag editor closed"
+    );
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before,
+        "the refused herdr tag committed"
+    );
+    assert!(
+        !rig.config_text().contains("effort = \"high\""),
+        "the refused mixed save wrote the shunt field"
+    );
+    assert!(
+        matches!(
+            rig.app.services.shunt_field_edit.as_ref().map(|s| &s.edit),
+            Some(ShuntFieldEdit::Typed { input, .. }) if input.value == "high"
+        ),
+        "the refused mixed save dropped the field's typed text"
+    );
+}
+
+/// A quit-form mixed save on a screen other than Services commits the sync item
+/// there, then switches to Services and opens the shunt draft on its own
+/// `save <kind>` row.
+#[cfg(unix)]
+#[test]
+fn a_quit_save_mixing_a_config_item_with_a_shunt_draft_commits_the_config_and_opens_the_draft() {
+    use super::{ServicesFocus, ShuntAddKind, ShuntDraftField, ShuntFocusLine, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.app.tab = Tab::Config;
+    rig.app.context_nudge_draft = Some(SeededInput {
+        input: InputState::new("400k"),
+        seed: "300k".to_string(),
+    });
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: the quit form is open"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(!rig.app.quit, "the mixed save quit");
+    assert!(rig.app.loss_pending.is_none(), "the mixed save set a hold");
+    assert!(
+        rig.app.services.shunt_save.is_none(),
+        "the mixed save started the shunt save"
+    );
+    assert!(
+        rig.app.context_nudge_draft.is_none(),
+        "the config item did not commit"
+    );
+    assert_eq!(
+        rig.app.tab,
+        Tab::Services,
+        "the mixed save did not switch to Services"
+    );
+    assert_eq!(
+        (rig.app.services.focus, rig.app.services.shunt_focus_kind()),
+        (
+            ServicesFocus::Detail,
+            Some(ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream))
+        ),
+        "the shunt draft did not open on its own save row"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app
+            .services
+            .saving(&super::ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream)),
+        "the next ↵ did not start save upstream: owner={:?}",
+        super::keyboard_owner(&rig.app)
+    );
+    rig.drain();
+}
+
+/// A quit over a `+ add token` mint that refuses still exits once the refusal
+/// lands, whatever its outcome.
+#[test]
+fn a_quit_over_a_refused_add_token_exits_once_it_lands() {
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "SHUNT_CLIENT_TOKENS=alice:tok1\n");
+    let mut app = token_app(vec![Profile::new(
+        "alice".into(),
+        Some("https://api.example.com".into()),
+        Some("k".into()),
+    )]);
+    start_token_add(&mut app);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "the quit exited under the running add token");
+    drain_shunt_action(&mut app);
+    super::on_tick(&mut app);
+    assert!(
+        app.quit,
+        "the quit did not exit after the refused add token"
+    );
+}
+
+/// A quit over a `+ add token` mint whose profile write fails after the mint
+/// still exits once the failure lands, whatever its outcome.
+#[cfg(unix)]
+#[test]
+fn a_quit_over_a_failed_add_token_profile_write_exits_once_it_lands() {
+    use crate::profile::Profile;
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let saved = Profile::new(
+        "alice".into(),
+        Some("https://api.example.com".into()),
+        Some("k".into()),
+    );
+    crate::profile::save_profile(&saved).unwrap();
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice")).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let mut app = token_app(vec![saved]);
+    start_token_add(&mut app);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "the quit exited under the running add token");
+    drain_shunt_action(&mut app);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    super::on_tick(&mut app);
+    assert!(
+        app.quit,
+        "the quit did not exit after the failed profile write"
+    );
+}
+
+/// A quit over a `require client tokens` save whose check fails still exits
+/// once the failure lands, whatever its outcome.
+#[cfg(unix)]
+#[test]
+fn a_quit_over_a_failed_require_exits_once_it_lands() {
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    crate::gateway_tokens::add_client_token(
+        &crate::gateway::GatewayRecord::load().unwrap().unwrap(),
+        "alice",
+    )
+    .unwrap();
+    std::fs::write(home.home().join("stub").join("fail"), "").unwrap();
+    let mut app = rig.app;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    press_require(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.services.saving(&super::ShuntSaveKey::RequireTokens),
+        "precondition: the require is checking"
+    );
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "the quit exited under the running require");
+    drain_shunt_action(&mut app);
+    super::on_tick(&mut app);
+    assert!(app.quit, "the quit did not exit after the failed require");
+}
+
+/// A quit over a running `shunt_action` worker (adopt/move/admin/stop/start)
+/// opens no warning and does not exit while the action runs; once it lands,
+/// the next tick exits.
+#[cfg(unix)]
+#[test]
+fn a_quit_while_a_shunt_action_runs_holds_until_it_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    fn landing(_job: super::ShuntActionJob) -> super::ShuntActionOutcome {
+        super::ShuntActionOutcome::Moved { n: 1 }
+    }
+    rig.app.services.shunt_action.prober = Some(landing);
+    rig.app
+        .services
+        .shunt_action
+        .start(super::ShuntActionJob::Hold);
+    assert!(
+        rig.app.services.shunt_action.running,
+        "precondition: the action runs"
+    );
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        !matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the running action warned"
+    );
+    assert!(!rig.app.quit, "the quit exited under the running action");
+    rig.drain();
+    super::on_tick(&mut rig.app);
+    assert!(rig.app.quit, "the landed action did not exit");
+}
+
+/// The failure twin: a failed `shunt_action` job still lets the exit proceed
+/// once the failure lands, whatever its outcome.
+#[cfg(unix)]
+#[test]
+fn a_quit_while_a_shunt_action_fails_exits_once_it_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    fn failing(_job: super::ShuntActionJob) -> super::ShuntActionOutcome {
+        super::ShuntActionOutcome::AdoptFailed {
+            error: "boom".to_string(),
+        }
+    }
+    rig.app.services.shunt_action.prober = Some(failing);
+    rig.app
+        .services
+        .shunt_action
+        .start(super::ShuntActionJob::Hold);
+    assert!(
+        rig.app.services.shunt_action.running,
+        "precondition: the action runs"
+    );
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(!rig.app.quit, "the quit exited under the running action");
+    rig.drain();
+    super::on_tick(&mut rig.app);
+    assert!(
+        rig.app.quit,
+        "the quit did not exit after the failed action"
+    );
+}
+
+/// A quit over a running pool account remove opens no warning and does not
+/// exit while the remove runs; once it lands, the next tick exits.
+#[test]
+fn a_quit_while_a_pool_remove_runs_holds_until_it_lands() {
+    use crate::gateway_admin::{PoolFamily, ShuntAccountName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.pool_mutation_row = Some((
+        PoolFamily::Claude,
+        ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    app.pool_mutation_kind = Some(super::PoolMutationKind::Remove);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        !matches!(app.modals.last(), Some(Modal::LossWarning(_))),
+        "the running pool remove warned"
+    );
+    assert!(!app.quit, "the quit exited under the running pool remove");
+    app.pool_mutation_tx
+        .send(super::PoolMutationResult::Removed {
+            name: "alpha".to_string(),
+            removed: true,
+            error: None,
+        })
+        .expect("send");
+    super::drain_pool_mutations(&mut app);
+    super::on_tick(&mut app);
+    assert!(app.quit, "the landed pool remove did not exit");
+}
+
+/// The failure twin: a failed pool remove still lets the exit proceed once the
+/// failure lands, whatever its outcome.
+#[test]
+fn a_quit_while_a_pool_remove_fails_exits_once_it_lands() {
+    use crate::gateway_admin::{PoolFamily, ShuntAccountName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.pool_mutation_row = Some((
+        PoolFamily::Claude,
+        ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    app.pool_mutation_kind = Some(super::PoolMutationKind::Remove);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(!app.quit, "the quit exited under the running pool remove");
+    app.pool_mutation_tx
+        .send(super::PoolMutationResult::Removed {
+            name: "alpha".to_string(),
+            removed: false,
+            error: Some("boom".to_string()),
+        })
+        .expect("send");
+    super::drain_pool_mutations(&mut app);
+    super::on_tick(&mut app);
+    assert!(
+        app.quit,
+        "the quit did not exit after the failed pool remove"
+    );
+}
+
+/// A quit over the `require client tokens` flow while it waits for the gateway
+/// restart exits at once: the wait is not a write, so the exit drops it and the
+/// next `f` asks again.
+#[cfg(unix)]
+#[test]
+fn a_quit_while_the_require_waits_for_the_restart_exits_at_once() {
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    press_require(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "precondition: the mint landed and the require waits"
+    );
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.quit,
+        "the quit did not exit at once while the require waits"
+    );
+    assert!(
+        app.services.pending_require.is_some(),
+        "the quit consumed the pending require"
+    );
+}
+
+/// A quit pressed during a held switch whose `+ add` save then refuses turns
+/// the hold into a quit whose refusal re-runs the gate over the red draft.
+#[cfg(unix)]
+#[test]
+fn a_quit_during_a_held_switch_whose_save_refuses_reopens_the_warning() {
+    use super::{LossWarningTarget, ShuntAddKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    start_add_save(&mut rig);
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        rig.app.loss_pending.is_some(),
+        "precondition: the switch is held"
+    );
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert_eq!(
+        rig.app.loss_pending,
+        Some(LossWarningTarget::Quit),
+        "the quit did not take over the held switch"
+    );
+    assert!(!rig.app.quit, "the quit exited under the running save");
+    rig.drain();
+    assert!(!rig.app.quit, "the quit landed over a refused save");
+    assert!(rig.app.loss_pending.is_none(), "the hold was not cleared");
+    assert_eq!(
+        rig.app.tab,
+        Tab::Services,
+        "the dropped switch still landed"
+    );
+    assert!(
+        matches!(
+            rig.app.modals.last(),
+            Some(Modal::LossWarning(s)) if s.drop.dirty == vec![super::Dirty::ShuntAdd(ShuntAddKind::Upstream)]
+        ),
+        "the refused draft did not reopen under the quit warning: {:?}",
+        rig.app.modals.last()
+    );
+}
+
+/// A quit warning's `save` held behind a checking field save, whose warned work
+/// is gone when the save lands, still waits on a running pool remove: the exit
+/// does not happen until the remove finishes.
+#[cfg(unix)]
+#[test]
+fn a_rerun_save_landing_with_nothing_left_waits_on_a_running_pool_remove() {
+    use crate::gateway_admin::{PoolFamily, ShuntAccountName};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: the field save checks"
+    );
+    rig.app.pool_mutation_row = Some((
+        PoolFamily::Claude,
+        ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    rig.app.pool_mutation_kind = Some(super::PoolMutationKind::Remove);
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let mut d = SeededInput::new(&before.to_string());
+    d.input = InputState::new(&(before + 7).to_string());
+    rig.app.services.herdr_tag_draft = Some(d);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(s)) if s.drop.dirty == vec![super::Dirty::HerdrTag]),
+        "precondition: the quit warning covers the herdr tag: {:?}",
+        rig.app.modals.last()
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert_eq!(
+        rig.app.loss_pending,
+        Some(super::LossWarningTarget::Quit),
+        "precondition: the save held the quit"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Esc));
+    assert!(
+        rig.app.services.herdr_tag_draft.is_none(),
+        "precondition: the tag edit dropped"
+    );
+    rig.drain();
+    assert!(
+        rig.config_text().contains("effort = \"high\""),
+        "precondition: the field landed"
+    );
+    assert_eq!(
+        rig.app.pool_mutation_kind,
+        Some(super::PoolMutationKind::Remove),
+        "precondition: the pool remove still runs"
+    );
+    assert!(
+        !rig.app.quit,
+        "the held quit exited under the running pool remove"
+    );
+    rig.app
+        .pool_mutation_tx
+        .send(super::PoolMutationResult::Removed {
+            name: "alpha".to_string(),
+            removed: true,
+            error: None,
+        })
+        .expect("send");
+    super::drain_pool_mutations(&mut rig.app);
+    super::on_tick(&mut rig.app);
+    assert!(rig.app.quit, "the landed pool remove did not exit");
+}
+
+/// A second quit while a quit is held on a checking field save exits at once,
+/// without waiting for the save.
+#[cfg(unix)]
+#[test]
+fn a_second_quit_during_a_quit_held_on_a_checking_field_save_exits_at_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: the field save checks"
+    );
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert_eq!(
+        rig.app.loss_pending,
+        Some(super::LossWarningTarget::Quit),
+        "precondition: the quit held"
+    );
+    assert!(!rig.app.quit, "precondition: no exit yet");
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    let quit_now = rig.app.quit;
+    let pending = format!("{:?}", rig.app.loss_pending);
+    let saving = rig.app.services.shunt_save.is_some();
+    rig.drain();
+    assert!(
+        quit_now,
+        "a second quit during the quit held on a checking field save did nothing: quit=false pending={pending} saving={saving}"
+    );
+}
+
+/// `q q` at the top level during the exit wait exits at once, without waiting
+/// for the running remove.
+#[cfg(unix)]
+#[test]
+fn a_q_q_at_the_top_level_during_the_exit_wait_exits_at_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_remove_save(&mut rig);
+    rig.app.services.focus = super::ServicesFocus::List;
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        rig.app.exit_wait && !rig.app.quit,
+        "precondition: the exit waits"
+    );
+    assert!(!super::has_sub_focus(&rig.app), "precondition: top level");
+    super::handle_key(&mut rig.app, key(KeyCode::Char('q')));
+    super::handle_key(&mut rig.app, key(KeyCode::Char('q')));
+    let quit_now = rig.app.quit;
+    let saving = rig.app.services.shunt_save.is_some();
+    rig.drain();
+    assert!(
+        quit_now && saving,
+        "q q during the exit wait did not exit at once: quit={quit_now} saving={saving}"
+    );
+}
+
+/// Every key but the quit keys is ignored during the exit wait: a jump and a
+/// help press reach no handler.
+#[cfg(unix)]
+#[test]
+fn keys_during_the_exit_wait_are_ignored() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_remove_save(&mut rig);
+    rig.app.services.focus = super::ServicesFocus::List;
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        rig.app.exit_wait && !rig.app.quit,
+        "precondition: the exit waits"
+    );
+    let tab = rig.app.tab;
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    super::handle_key(&mut rig.app, key(KeyCode::Char('?')));
+    let after_tab = rig.app.tab;
+    let modals = rig.app.modals.len();
+    rig.drain();
+    assert!(
+        after_tab == tab && modals == 0,
+        "a key reached its handler during the exit wait: tab {tab:?} -> {after_tab:?}, modals={modals}"
+    );
+}
+
+/// A first `⌃c` of a second pair during the exit wait arms the quit and stores
+/// `press ⌃c again to quit`, but the save cue still outranks that stored alert:
+/// the footer keeps naming the running write, not the armed prompt.
+#[cfg(unix)]
+#[test]
+fn a_stored_alert_does_not_replace_the_save_cue_during_the_exit_wait() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_remove_save(&mut rig);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        rig.app.exit_wait && !rig.app.quit,
+        "precondition: the exit waits"
+    );
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        rig.app.footer_alert.is_some(),
+        "precondition: the first ⌃c armed the quit and stored the prompt"
+    );
+    assert_eq!(
+        footer_row(&rig.app, 80, 24).trim_end(),
+        " i saving a… · ⌃c ⌃c quit now",
+        "the stored armed prompt replaced the save cue"
+    );
+    rig.drain();
+}
+
+/// A tick while the exit waits on a running pool remove does not exit; once the
+/// remove clears, the next tick exits.
+#[test]
+fn a_tick_during_the_exit_wait_does_not_exit_while_a_pool_remove_runs() {
+    use crate::gateway_admin::{PoolFamily, ShuntAccountName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.pool_mutation_row = Some((
+        PoolFamily::Claude,
+        ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    app.pool_mutation_kind = Some(super::PoolMutationKind::Remove);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(app.exit_wait && !app.quit, "precondition: the exit waits");
+    super::on_tick(&mut app);
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.pool_mutation_kind,
+        Some(super::PoolMutationKind::Remove),
+        "precondition: the remove still runs"
+    );
+    assert!(!app.quit, "a tick exited while the pool remove still runs");
+    app.pool_mutation_kind = None;
+    app.pool_mutation_row = None;
+    super::on_tick(&mut app);
+    assert!(
+        app.quit,
+        "the exit did not happen after the pool remove cleared"
+    );
+}
+
+/// A require save does not start during the exit wait: a healthy gateway feed
+/// with a fresh pid while a pool remove still holds the exit starts nothing.
+#[cfg(unix)]
+#[test]
+fn no_require_save_starts_during_the_exit_wait() {
+    use crate::gateway_admin::{PoolFamily, ShuntAccountName};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    press_require(&mut app);
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "precondition: the require waits"
+    );
+    app.pool_mutation_row = Some((
+        PoolFamily::Claude,
+        ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    app.pool_mutation_kind = Some(super::PoolMutationKind::Remove);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.exit_wait && !app.quit,
+        "precondition: the exit waits on the pool remove"
+    );
+    set_feed(&mut app, "healthy", Some(4002));
+    super::on_tick(&mut app);
+    let started = app
+        .services
+        .shunt_save
+        .as_ref()
+        .map(|s| format!("{:?}", s.key));
+    app.pool_mutation_kind = None;
+    app.pool_mutation_row = None;
+    let blocks_exit = super::in_flight_shunt_card_write(&app);
+    drain_shunt_action(&mut app);
+    let wrote = std::fs::read_to_string(&rig.config)
+        .unwrap_or_default()
+        .contains("[server.auth]");
+    assert!(
+        started.is_none(),
+        "a require save started during the exit wait: key={started:?} blocks_exit_after_pool_done={blocks_exit} wrote_server_auth={wrote}"
+    );
+}
+
+/// A tick while the exit waits on a running `shunt_action` worker (set by hand,
+/// no worker) does not exit; once the leg clears, the next tick exits.
+#[cfg(unix)]
+#[test]
+fn a_tick_during_the_exit_wait_does_not_exit_while_a_shunt_action_runs() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.app.services.shunt_action.running = true;
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(!rig.app.quit, "precondition: the exit waits on the action");
+    super::on_tick(&mut rig.app);
+    super::on_tick(&mut rig.app);
+    assert!(!rig.app.quit, "a tick exited while the action still runs");
+    rig.app.services.shunt_action.running = false;
+    super::on_tick(&mut rig.app);
+    assert!(
+        rig.app.quit,
+        "the exit did not happen after the action cleared"
+    );
+    rig.drain();
+}
+
+/// A tick while the exit waits on a running `shunt_save` record (set by hand,
+/// no worker) does not exit; once the save clears, the next tick exits.
+#[cfg(unix)]
+#[test]
+fn a_tick_during_the_exit_wait_does_not_exit_while_a_shunt_save_runs() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.app.services.shunt_save = Some(super::ShuntSave {
+        key: super::ShuntSaveKey::AddToken,
+        started: std::time::Instant::now(),
+        value: None,
+        entry: None,
+    });
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(!rig.app.quit, "precondition: the exit waits on the save");
+    super::on_tick(&mut rig.app);
+    super::on_tick(&mut rig.app);
+    assert!(!rig.app.quit, "a tick exited while the save still runs");
+    rig.app.services.shunt_save = None;
+    super::on_tick(&mut rig.app);
+    assert!(
+        rig.app.quit,
+        "the exit did not happen after the save cleared"
+    );
+    rig.drain();
+}
+
+/// A worker failure while a switch is held on a lone field save must not cancel
+/// the held switch: the field save lands and the switch still happens.
+#[cfg(unix)]
+#[test]
+fn a_worker_failure_does_not_cancel_a_held_switch() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    fn failing(_job: super::ShuntActionJob) -> super::ShuntActionOutcome {
+        super::ShuntActionOutcome::HoldFailed {
+            error: "boom".to_string(),
+        }
+    }
+    rig.app.services.shunt_action.prober = Some(failing);
+    rig.app
+        .services
+        .shunt_action
+        .start(super::ShuntActionJob::Hold);
+    assert!(
+        rig.app.services.shunt_action.running,
+        "precondition: the action runs"
+    );
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: the switch warned over the field"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.loss_pending.is_some() && rig.app.tab == Tab::Services,
+        "precondition: the lone save held the switch"
+    );
+    rig.drain();
+    assert!(
+        rig.config_text().contains("effort = \"high\""),
+        "precondition: the save landed"
+    );
+    assert_eq!(
+        rig.app.tab,
+        Tab::Overview,
+        "an unrelated worker failure cancelled the held switch; pending={:?}",
+        rig.app.loss_pending
+    );
+}
+
+/// A mixed save beside a clean, unchanged shunt field editor closes that editor
+/// so the next `↵` starts the first async item's save.
+#[cfg(unix)]
+#[test]
+fn a_mixed_save_beside_a_clean_field_editor_hands_enter_to_the_first_add() {
+    use super::{ModelFieldKind, ShuntAddKind, ShuntDraftField, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.open_add(ShuntAddKind::Model);
+    rig.focus_draft_field(
+        ShuntAddKind::Model,
+        ShuntDraftField::Model(ModelFieldKind::Id),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("mm");
+    rig.focus_field(ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert_eq!(
+        rig.app
+            .services
+            .shunt_field_edit
+            .as_ref()
+            .map(|s| s.key.clone()),
+        Some(ShuntFieldKey::Bind),
+        "precondition: the bind editor is open"
+    );
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(s)) if s.drop.dirty == vec![super::Dirty::ShuntAdd(ShuntAddKind::Upstream), super::Dirty::ShuntAdd(ShuntAddKind::Model)]),
+        "precondition: quit warning over both drafts only: {:?}",
+        rig.app.modals.last()
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.modals.is_empty() && rig.app.services.shunt_save.is_none(),
+        "precondition: mixed"
+    );
+    let owner = super::keyboard_owner(&rig.app);
+    let focus = rig.app.services.shunt_focus_kind();
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app
+            .services
+            .saving(&super::ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream)),
+        "the next enter did not start save upstream: owner={owner:?} focus={focus:?} editor_after={:?}",
+        rig.app
+            .services
+            .shunt_field_edit
+            .as_ref()
+            .map(|s| s.key.clone())
+    );
+    rig.drain();
+}
+
+/// A mixed save beside a clean, unchanged herdr tag editor closes that editor so
+/// the next `↵` starts the first async item's save.
+#[cfg(unix)]
+#[test]
+fn a_mixed_save_beside_a_clean_herdr_tag_editor_hands_enter_to_the_first_add() {
+    use super::{ModelFieldKind, ServicesFocus, ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.open_add(ShuntAddKind::Model);
+    rig.focus_draft_field(
+        ShuntAddKind::Model,
+        ShuntDraftField::Model(ModelFieldKind::Id),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("mm");
+    rig.app.services.focus = ServicesFocus::List;
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    rig.app.services.herdr_tag_draft = Some(SeededInput::new(&before.to_string()));
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(s)) if s.drop.dirty == vec![super::Dirty::ShuntAdd(ShuntAddKind::Upstream), super::Dirty::ShuntAdd(ShuntAddKind::Model)]),
+        "precondition: quit warning over both drafts only: {:?}",
+        rig.app.modals.last()
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.modals.is_empty() && rig.app.services.shunt_save.is_none(),
+        "precondition: mixed"
+    );
+    let owner = super::keyboard_owner(&rig.app);
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app
+            .services
+            .saving(&super::ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream)),
+        "the next enter did not start save upstream: owner={owner:?}"
+    );
+    rig.drain();
 }

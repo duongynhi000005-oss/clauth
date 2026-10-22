@@ -1,7 +1,9 @@
 //! Footer hint-bar pins.
 
 use super::*;
+use crate::gateway_admin::{PoolFamily, ShuntAccountName};
 use crate::profile::{AppConfig, AppState};
+use crate::tui::app::{ModelFieldKind, PoolMutationKind, ShuntAddKind, ShuntEntryKey, ShuntSave};
 
 fn bare_app() -> App {
     App::new(AppConfig {
@@ -1929,6 +1931,284 @@ fn the_footer_alert_replaces_the_hints_in_place() {
         footer, at_rest,
         "the hints return when the alert clears, got {footer:?}"
     );
+}
+
+/// The running-write save cue: ` i saving {row}… · ⌃c ⌃c quit now`, the row
+/// name cut (grapheme-safe, one `…`) so the leader and `· ⌃c ⌃c quit now`
+/// stay whole down to the 34-column floor. Shown during the exit wait on every
+/// tab and during a quit held on a checking `+ add` save, on both tiers; every
+/// cell's style is pinned (leader INFO, copy TEXT_DIM, key run ACCENT + bold).
+#[test]
+fn the_save_cue_names_the_row_and_survives_the_floor() {
+    use ratatui::style::Modifier;
+
+    fn save(key: ShuntSaveKey) -> ShuntSave {
+        ShuntSave {
+            key,
+            started: std::time::Instant::now(),
+            value: None,
+            entry: None,
+        }
+    }
+
+    fn footer_at(app: &App, w: u16, h: u16) -> (String, Vec<ratatui::buffer::Cell>) {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| crate::tui::render::draw(f, app))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let footer = buf.area.height as usize - 1;
+        let base = footer * buf.area.width as usize;
+        let row = crate::testutil::buffer_rows(&buf)[footer].clone();
+        (
+            row,
+            buf.content[base..base + buf.area.width as usize].to_vec(),
+        )
+    }
+
+    fn check(app: &App, name: &str, w: u16) {
+        let (row, cells) = footer_at(app, w, 24);
+        let expected = format!(" i saving {name}\u{2026} · \u{2303}c \u{2303}c quit now");
+        assert_eq!(row.trim_end(), expected, "whole row at {w}, got {row:?}");
+        let key_start = format!(" i saving {name}\u{2026} · ").chars().count();
+        for (i, cell) in cells.iter().enumerate().take(expected.chars().count()) {
+            let (fg, bold) = if i == 0 {
+                (crate::tui::theme::text_color(), false)
+            } else if i < 3 {
+                (crate::tui::theme::info_color(), false)
+            } else if (key_start..key_start + 5).contains(&i) {
+                (crate::tui::theme::accent_color(), true)
+            } else {
+                (crate::tui::theme::text_dim_color(), false)
+            };
+            assert_eq!(cell.fg, fg, "cell {i} fg at {w}, got {:?}", cell.fg);
+            assert_eq!(
+                cell.modifier.contains(Modifier::BOLD),
+                bold,
+                "cell {i} bold at {w}"
+            );
+            assert_eq!(cell.bg, crate::tui::theme::bg(), "cell {i} bg at {w}");
+        }
+    }
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    for tier in [
+        crate::tui::theme::Tier::Full,
+        crate::tui::theme::Tier::Compatible,
+    ] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        for tab in [Tab::Services, Tab::Tokens] {
+            let mut app = bare_app();
+            app.tab = tab;
+            app.services.shunt_save = Some(save(ShuntSaveKey::Field(ShuntFieldKey::Bind)));
+            app.exit_wait = true;
+            check(&app, "bind", 80);
+            check(&app, "bind", 34);
+
+            let mut app = bare_app();
+            app.tab = tab;
+            app.services.shunt_save = Some(save(ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream)));
+            app.exit_wait = true;
+            check(&app, "upstream", 80);
+            check(&app, "upstr", 34);
+
+            let mut app = bare_app();
+            app.tab = tab;
+            app.services.shunt_save = Some(save(ShuntSaveKey::Remove(ShuntEntryKey::Upstream {
+                name: "a".into(),
+                occurrence: 0,
+            })));
+            app.exit_wait = true;
+            check(&app, "a", 80);
+            check(&app, "a", 34);
+
+            let mut app = bare_app();
+            app.tab = tab;
+            app.pool_mutation_row = Some((
+                PoolFamily::Claude,
+                ShuntAccountName::new("alpha").expect("valid"),
+            ));
+            app.pool_mutation_kind = Some(PoolMutationKind::Remove);
+            app.exit_wait = true;
+            check(&app, "alpha", 80);
+            check(&app, "alpha", 34);
+
+            let mut app = bare_app();
+            app.tab = tab;
+            app.services.shunt_action.running = true;
+            app.exit_wait = true;
+            check(&app, "shunt", 80);
+            check(&app, "shunt", 34);
+        }
+    }
+
+    // A quit held on a checking `+ add` save shows the same cue, computed
+    // from `loss_pending`, not `exit_wait`.
+    for tier in [
+        crate::tui::theme::Tier::Full,
+        crate::tui::theme::Tier::Compatible,
+    ] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let mut app = bare_app();
+        app.tab = Tab::Overview;
+        app.services.shunt_save = Some(save(ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream)));
+        app.loss_pending = Some(LossWarningTarget::Quit);
+        check(&app, "upstream", 80);
+    }
+
+    // The hints return once the wait ends.
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    let at_rest = settled_footer(&app, 80, 24);
+    app.services.shunt_save = Some(save(ShuntSaveKey::Field(ShuntFieldKey::Bind)));
+    app.exit_wait = true;
+    check(&app, "bind", 80);
+    app.exit_wait = false;
+    app.services.shunt_save = None;
+    assert_eq!(
+        settled_footer(&app, 80, 24),
+        at_rest,
+        "the services hints return when the wait ends"
+    );
+}
+
+/// The save cue's rendered footer row (trailing blanks trimmed only — the
+/// leading inset stays), for pins that assert the whole-row spelling.
+fn cue_row(app: &App, w: u16) -> String {
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 24)).expect("backend");
+    term.draw(|f| crate::tui::render::draw(f, app))
+        .expect("draw");
+    let buf = term.backend().buffer().clone();
+    let footer = buf.area.height as usize - 1;
+    crate::testutil::buffer_rows(&buf)[footer]
+        .trim_end()
+        .to_string()
+}
+
+/// A save in flight for [`cue_row`] pins, keyed by `key`.
+fn cue_save(key: ShuntSaveKey) -> ShuntSave {
+    ShuntSave {
+        key,
+        started: std::time::Instant::now(),
+        value: None,
+        entry: None,
+    }
+}
+
+/// The whole save-cue row for `name` interpolated into the copy, at width `w`.
+fn check_cue(app: &App, name: &str, w: u16) {
+    let row = cue_row(app, w);
+    let expected = format!(" i saving {name}\u{2026} · \u{2303}c \u{2303}c quit now");
+    assert_eq!(row, expected, "whole row at {w}, got {row:?}");
+}
+
+/// An untrusted name (an upstream, model or token entry, a model
+/// `upstream_model` provider key) renders the escaped spelling the card shows —
+/// a control or bidi character spelled `\u{…}`, never a raw byte.
+#[test]
+fn the_save_cue_escapes_untrusted_names_like_the_card() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.shunt_save = Some(cue_save(ShuntSaveKey::Remove(ShuntEntryKey::Upstream {
+        name: "x\u{202e}y".into(),
+        occurrence: 0,
+    })));
+    app.exit_wait = true;
+    check_cue(&app, "x\\u{202e}y", 80);
+
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.shunt_save = Some(cue_save(ShuntSaveKey::Token("p\u{1b}q".into())));
+    app.exit_wait = true;
+    check_cue(&app, "p\\u{1b}q", 80);
+
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.shunt_save = Some(cue_save(ShuntSaveKey::Remove(ShuntEntryKey::Model {
+        id: "m\u{1b}n".into(),
+        occurrence: 0,
+    })));
+    app.exit_wait = true;
+    check_cue(&app, "m\\u{1b}n", 80);
+
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.shunt_save = Some(cue_save(ShuntSaveKey::Field(ShuntFieldKey::Model {
+        id: "m".into(),
+        occurrence: 0,
+        field: ModelFieldKind::UpstreamModel("p\u{202e}q\u{1b}z".into()),
+    })));
+    app.exit_wait = true;
+    check_cue(&app, "p\\u{202e}q\\u{1b}z", 80);
+}
+
+/// A cut name ends in exactly the always-on `…` — a kept trailing `…` is
+/// trimmed before it — while an uncut name keeps its own characters.
+#[test]
+fn the_save_cue_cuts_a_name_to_one_ellipsis() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.shunt_save = Some(cue_save(ShuntSaveKey::Remove(ShuntEntryKey::Upstream {
+        name: "abcd\u{2026}wxyz\u{2026}".into(),
+        occurrence: 0,
+    })));
+    app.exit_wait = true;
+    check_cue(&app, "abcd", 34);
+
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.shunt_save = Some(cue_save(ShuntSaveKey::Remove(ShuntEntryKey::Upstream {
+        name: "abc\u{2026}".into(),
+        occurrence: 0,
+    })));
+    app.exit_wait = true;
+    check_cue(&app, "abc\u{2026}", 80);
+    check_cue(&app, "abc\u{2026}", 34);
+}
+
+/// A route remove whose config view is unreadable names the kind word
+/// `route`, never `route N` (no card row reads that way).
+#[test]
+fn the_save_cue_names_a_vanished_route_route() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.shunt_save = Some(cue_save(ShuntSaveKey::Remove(ShuntEntryKey::Route(3))));
+    app.exit_wait = true;
+    check_cue(&app, "route", 80);
+}
+
+/// When a save, a `shunt_action` job and a pool remove run at once, the cue
+/// names them in the ruled order — the save, then the action, then the pool
+/// account — clearing each in turn as its write settles.
+#[test]
+fn the_save_cue_names_the_save_before_the_action_before_the_pool() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.shunt_save = Some(cue_save(ShuntSaveKey::Field(ShuntFieldKey::Bind)));
+    app.services.shunt_action.running = true;
+    app.pool_mutation_row = Some((
+        PoolFamily::Claude,
+        ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    app.pool_mutation_kind = Some(PoolMutationKind::Remove);
+    app.exit_wait = true;
+    check_cue(&app, "bind", 80);
+
+    app.services.shunt_save = None;
+    check_cue(&app, "shunt", 80);
+
+    app.services.shunt_action.running = false;
+    check_cue(&app, "alpha", 80);
 }
 
 /// A Setup `+ new` form of `account_type` with its cursor on `+ login` and the

@@ -1218,14 +1218,15 @@ impl Dirty {
 /// What a held switch/quit waits for beyond the save outcome itself.
 #[derive(Debug)]
 pub(crate) enum LossPendingSync {
-    /// One async item already started; these sync items commit (re-validated)
-    /// on its landing.
-    Deferred(Vec<Dirty>),
-    /// A field save already owned the worker when the save ran, so nothing
-    /// committed: the whole save re-runs over what is still changed on its
-    /// landing, and the warned items are the only ones it may commit (a new
-    /// item re-opens the warning).
+    /// A field or `+ add` save already owned the worker when the trigger ran,
+    /// so nothing committed: the whole save re-runs over what is still changed
+    /// on its landing, and the warned items are the only ones it may commit (a
+    /// new item re-opens the warning). A refusal re-runs the gate.
     RerunSave(Vec<Dirty>),
+    /// A lone async field or `+ add` save the trigger started: the gate re-runs
+    /// on landing, a refusal cancels the trigger, the item staying open with
+    /// its own `└` sentence.
+    CancelOnRefusal,
 }
 
 /// The lowercase tab label the tab bar shows, for the body's screen list.
@@ -5030,19 +5031,24 @@ pub(crate) struct App {
     /// Tick counter; advances the activity spinner frame each `on_tick`.
     pub(crate) tick_count: u64,
     pub(crate) quit: bool,
+    /// The quit is decided but the exit waits for a running shunt-card write:
+    /// the screen keeps drawing and the tick exits the moment no write runs. A
+    /// second quit during the wait exits at once.
+    pub(crate) exit_wait: bool,
     /// The armed 2-step quit: the key that armed it, `None` when disarmed. A
     /// second press of the SAME key confirms; the other quit key re-arms as
     /// itself.
     pub(crate) armed_quit: Option<QuitKey>,
-    /// The switch or quit target a loss-warning `save` is holding until an
-    /// async commit (a shunt save) lands: its success resolves it, its refusal
-    /// cancels it. While `Some`, a further switch/quit key does nothing new.
+    /// The switch or quit target a loss-warning `save` is holding until a
+    /// field or `+ add` save lands; the hold's sync decides the landing and
+    /// refusal. While `Some`, a further switch does nothing; a quit turns a
+    /// held switch into a held quit, and a second quit exits at once.
     pub(crate) loss_pending: Option<LossWarningTarget>,
-    /// The extra state a held `save` carries to its landing: the deferred sync
-    /// items of an already-started async item, or a marker that a field save
-    /// owned the worker so the whole save must re-run. `None` when the hold is
-    /// a direct switch/quit over an in-flight save: nothing to commit, and the
-    /// gate re-runs on both outcomes.
+    /// The extra state a held `save` carries to its landing: a marker that a
+    /// field or `+ add` save owned the worker so the whole save must re-run, or
+    /// the lone-async save's cancel-on-refusal rule. `None` when the hold is a
+    /// direct switch/quit over an in-flight field save: nothing to commit, and
+    /// the gate re-runs on both outcomes.
     pub(crate) loss_pending_sync: Option<LossPendingSync>,
     /// Live footer alert; replaces the hint bar in place while `Some`.
     /// Cleared on disarm, tab switch, or explicit `x` dismiss.
@@ -5724,6 +5730,7 @@ impl App {
             day_claim_notices: Vec::new(),
             tick_count: 0,
             quit: false,
+            exit_wait: false,
             armed_quit: None,
             loss_pending: None,
             loss_pending_sync: None,
@@ -7979,6 +7986,13 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The quit is decided and the exit waits for the running shunt-card writes:
+    // only `⌃c` and a top-level `q` get past here, everything else is ignored —
+    // an edit typed now would die with the exit.
+    if app.exit_wait && !(matches!(key.code, KeyCode::Char('q')) && !has_sub_focus(app)) {
+        return;
+    }
+
     let owner = keyboard_owner(app);
 
     // Every key but a top-level `q` (which reads the arm below) disarms the
@@ -8596,6 +8610,12 @@ fn changed_work(app: &App) -> Vec<Dirty> {
         ShuntAddKind::Model,
         ShuntAddKind::Route,
     ] {
+        // A draft whose own `save <kind>` is still checking is not changed work,
+        // exactly like a field whose own save is checking: a switch or quit over
+        // it holds on that save instead of warning.
+        if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
+            continue;
+        }
         if app.services.shunt_drafts.holds_typed_work(kind) || draft_editor == Some(kind) {
             out.push(Dirty::ShuntAdd(kind));
         }
@@ -8683,13 +8703,25 @@ fn changed_work_on(app: &App, screen: Tab) -> Vec<Dirty> {
         .collect()
 }
 
-/// An in-flight shunt field save: a switch or quit away from it is not changed
-/// work, but must hold until the save's outcome resolves it.
-fn in_flight_field_save(app: &App) -> bool {
+/// An in-flight shunt field or `+ add` save: its editor/draft is not changed
+/// work, but a switch, quit or jump over it, or a warning `save` beside it,
+/// must hold until the outcome resolves it. A landed save proceeds (or warns),
+/// a refusal re-runs the trigger's gate over the still-open, red item.
+fn in_flight_shunt_edit_save(app: &App) -> bool {
     app.services
         .shunt_save
         .as_ref()
-        .is_some_and(|save| matches!(save.key, ShuntSaveKey::Field(_)))
+        .is_some_and(|save| matches!(save.key, ShuntSaveKey::Field(_) | ShuntSaveKey::SaveAdd(_)))
+}
+
+/// A running shunt-card write the exit waits for: any shunt save (a field,
+/// `+ add`, remove, token or require save), the `shunt_action` worker, or a
+/// running pool account remove. The `require client tokens` restart wait is not
+/// a write — an exit drops it and the next `f` asks again.
+fn in_flight_shunt_card_write(app: &App) -> bool {
+    app.services.shunt_save.is_some()
+        || app.services.shunt_action.running
+        || app.pool_mutation_kind == Some(PoolMutationKind::Remove)
 }
 
 /// A switch the user asked for: disarm it, warn over changed work, hold on an
@@ -8708,7 +8740,7 @@ fn request_switch(app: &mut App, target: Tab) {
         open_loss_warning(app, LossWarningTarget::Switch(target), dirty);
         return;
     }
-    if in_flight_field_save(app) {
+    if in_flight_shunt_edit_save(app) {
         app.loss_pending = Some(LossWarningTarget::Switch(target));
         return;
     }
@@ -8716,24 +8748,54 @@ fn request_switch(app: &mut App, target: Tab) {
 }
 
 /// A quit the user asked for (a second `⌃c` or `q` at the top level): warn
-/// over changed work wherever it sits, hold on an in-flight shunt save, else
-/// quit.
+/// over changed work wherever it sits, hold on an in-flight field or `+ add`
+/// save, else quit or enter the exit wait. A quit pressed while a switch or
+/// jump is held turns that held target into a held quit (the landing quits,
+/// never switches). A second quit during the exit wait, or while a quit is
+/// held on a checking save, exits at once.
 fn request_quit(app: &mut App) {
-    if app.loss_pending.is_some() {
+    app.disarm_quit();
+    if app.exit_wait {
+        // A second quit during the exit wait exits at once, whatever still runs.
+        app.quit = true;
+        app.shutting_down.store(true, Ordering::SeqCst);
         return;
     }
-    app.disarm_quit();
+    if let Some(pending) = app.loss_pending.as_mut() {
+        if matches!(pending, LossWarningTarget::Quit) {
+            // A second quit while a quit is held on a checking field or `+ add`
+            // save exits at once, the same as during the exit wait.
+            app.quit = true;
+            app.shutting_down.store(true, Ordering::SeqCst);
+        } else {
+            *pending = LossWarningTarget::Quit;
+            // A held switch only ever waits on a field or `+ add` save, whose
+            // quit hold re-runs the gate on a refusal (the direct hold).
+            app.loss_pending_sync = None;
+        }
+        return;
+    }
     let dirty = changed_work(app);
     if !dirty.is_empty() {
         open_loss_warning(app, LossWarningTarget::Quit, dirty);
         return;
     }
-    if in_flight_field_save(app) {
+    quit_or_wait(app);
+}
+
+/// The one place a quit is decided: a field or `+ add` save in flight holds the
+/// quit (a refusal re-runs the gate over the red item); any other running
+/// shunt-card write enters the exit wait (the exit waits until the write
+/// finishes, whatever its outcome); otherwise it quits at once.
+fn quit_or_wait(app: &mut App) {
+    if in_flight_shunt_edit_save(app) {
         app.loss_pending = Some(LossWarningTarget::Quit);
-        return;
+    } else if in_flight_shunt_card_write(app) {
+        app.exit_wait = true;
+    } else {
+        app.quit = true;
+        app.shutting_down.store(true, Ordering::SeqCst);
     }
-    app.quit = true;
-    app.shutting_down.store(true, Ordering::SeqCst);
 }
 
 /// Open the loss warning over `dirty`. `save` is the default focus when any
@@ -10662,7 +10724,7 @@ fn handle_shunt_field_edit_key(app: &mut App, key: KeyEvent) {
             app.services.shunt_field_edit = None;
         }
         KeyCode::Enter => {
-            let _ = commit_shunt_field(app, &state.key);
+            let _ = commit_shunt_field(app);
         }
         KeyCode::Char(' ') if matches!(state.edit, ShuntFieldEdit::Pick { .. }) => {
             step_shunt_pick(app, &state.key);
@@ -10756,10 +10818,14 @@ fn shunt_field_confirm(app: &App, state: &ShuntFieldEditState) -> Option<Confirm
     None
 }
 
-fn commit_shunt_field(app: &mut App, key: &ShuntFieldKey) -> CommitResult {
+fn commit_shunt_field(app: &mut App) -> CommitResult {
     let Some(state) = app.services.shunt_field_edit.clone() else {
         return CommitResult::Refused;
     };
+    // The open editor's OWN key, never a key captured when a warning opened:
+    // a route remove can shift the key while the warning waits, and writing
+    // the captured key would land the typed value on the wrong route.
+    let key = &state.key;
     let typed = match &state.edit {
         ShuntFieldEdit::Typed { input, .. } => input.value.clone(),
         ShuntFieldEdit::Pick { picked, .. } => picked.clone(),
@@ -12298,69 +12364,19 @@ fn re_run_gate(app: &mut App, target: LossWarningTarget) {
     }
 }
 
-/// How committing a held save's deferred sync items resolved.
-enum DeferredSettle {
-    /// Every item committed; the gate may re-run.
-    Landed,
-    /// An item refused (focused, red); the gate re-runs and warns over it.
-    Refused,
-    /// An item's ↵ opened a dialog; input is owned by the dialog.
-    Dialog,
-}
-
-/// Commit the deferred sync items of a held save, re-validating and re-running
-/// the dialog check first (state may have moved during the hold). Each refusal
-/// or dialog focuses/opens its own surface and stops the rest.
-fn settle_deferred_sync(app: &mut App, sync: &[Dirty]) -> DeferredSettle {
-    for d in sync.iter().cloned() {
-        if !validate_dirty(app, d.clone()) {
-            focus_dirty(app, d.clone());
-            let _ = commit_dirty(app, d);
-            return DeferredSettle::Refused;
-        }
-    }
-    for d in sync.iter().cloned() {
-        if commit_opens_dialog(app, d.clone()) {
-            let _ = commit_dirty(app, d);
-            return DeferredSettle::Dialog;
-        }
-    }
-    for d in sync.iter().cloned() {
-        match commit_dirty(app, d.clone()) {
-            CommitResult::Landed => {}
-            CommitResult::Refused => {
-                focus_dirty(app, d);
-                return DeferredSettle::Refused;
-            }
-            CommitResult::Dialog => return DeferredSettle::Dialog,
-            CommitResult::AsyncStarted => {}
-        }
-    }
-    DeferredSettle::Landed
-}
-
-/// Resolve (or cancel) the switch/quit a held save is waiting on. A landed
-/// save commits its deferred sync items (re-validated) then re-runs the
-/// trigger's own gate; an in-flight-field hold re-runs the save over the warned
-/// items still changed on its landing, or the gate when anything outside them
-/// changed, and re-runs the gate on a refusal. A direct
-/// hold (no warning shown) re-runs the gate on both outcomes, so a refused
-/// field warns over its open, red, changed self; a save's hold cancels on
-/// refusal and leaves the item open with its own `└` sentence. A no-op when no
-/// save was held.
+/// Resolve (or cancel) the switch/quit a held field or `+ add` save is waiting
+/// on. A `RerunSave` hold (a field or `+ add` save already in flight) re-runs
+/// the save over the warned items still changed on its landing, or the gate
+/// when anything outside them changed, and re-runs the gate on a refusal. A
+/// `CancelOnRefusal` hold re-runs the gate on landing and cancels on refusal (a
+/// lone async save leaves the item open with its own `└` sentence). A direct
+/// hold (no warning shown) re-runs the gate on both outcomes, so a refused field
+/// warns over its open, red, changed self. A no-op when no save was held.
 fn settle_loss_pending(app: &mut App, success: bool) {
     let Some(target) = app.loss_pending.take() else {
         return;
     };
     match app.loss_pending_sync.take() {
-        Some(LossPendingSync::Deferred(sync)) => {
-            if success {
-                match settle_deferred_sync(app, &sync) {
-                    DeferredSettle::Landed | DeferredSettle::Refused => re_run_gate(app, target),
-                    DeferredSettle::Dialog => {}
-                }
-            }
-        }
         Some(LossPendingSync::RerunSave(warned)) => {
             if success {
                 let still = loss_dirty_for(app, &target);
@@ -12372,6 +12388,11 @@ fn settle_loss_pending(app: &mut App, success: bool) {
                     let _ = try_save_all(app, &still, target);
                 }
             } else {
+                re_run_gate(app, target);
+            }
+        }
+        Some(LossPendingSync::CancelOnRefusal) => {
+            if success {
                 re_run_gate(app, target);
             }
         }
@@ -15372,17 +15393,23 @@ fn handle_pool_mutation_result(app: &mut App, result: PoolMutationResult) {
             name,
             removed: true,
             error: None,
-        } => app.toast(ToastKind::Success, format!("removed {name}")),
+        } => {
+            app.toast(ToastKind::Success, format!("removed {name}"));
+        }
         // `removed: false` is shunt's "it did not exist", never "gone": the
         // account left the store behind the listing's back.
         PoolMutationResult::Removed {
             name,
             removed: false,
             error: None,
-        } => app.toast(ToastKind::Warning, format!("{name} was not in the pool")),
+        } => {
+            app.toast(ToastKind::Warning, format!("{name} was not in the pool"));
+        }
         PoolMutationResult::Removed {
             error: Some(error), ..
-        } => app.toast(ToastKind::Danger, escape_control(&error)),
+        } => {
+            app.toast(ToastKind::Danger, escape_control(&error));
+        }
         PoolMutationResult::Refreshed {
             name,
             needs_relogin: false,
@@ -19927,11 +19954,17 @@ fn jump_to_shunt_card(app: &mut App, focus: ShuntFocusLine) {
 }
 
 /// `jump_to_shunt_card`'s landing: switch to Services and settle the card.
-fn land_shunt_card(app: &mut App, focus: ShuntFocusLine) {
-    do_switch(app, Tab::Services);
+/// Move the Services selector cursor onto the `shunt` row, the one place every
+/// cross-surface jump to the card lands.
+fn select_shunt_check(app: &mut App) {
     if let Some(idx) = app.services.checks.iter().position(|c| c.label == "shunt") {
         app.services.cursor = idx;
     }
+}
+
+fn land_shunt_card(app: &mut App, focus: ShuntFocusLine) {
+    do_switch(app, Tab::Services);
+    select_shunt_check(app);
     app.services.focus = ServicesFocus::Detail;
     app.services.detail_scroll = 0;
     app.services.set_shunt_focus(
@@ -24028,14 +24061,10 @@ fn handle_loss_warning_key(app: &mut App, key: KeyEvent) {
                 LossWarningButton::GoBack => {}
                 LossWarningButton::Discard => {
                     discard_dirty(app, &dirty);
-                    // A quit beside an in-flight field save holds on that save
-                    // so the process does not exit under it; a switch keeps
-                    // running behind the switch.
-                    if matches!(&target, LossWarningTarget::Quit) && in_flight_field_save(app) {
-                        app.loss_pending = Some(target);
-                    } else {
-                        resolve_target(app, target);
-                    }
+                    // A quit goes through the one quit function, so it holds on
+                    // an in-flight field save and never exits under a running
+                    // write; a switch keeps running behind the switch.
+                    resolve_target(app, target);
                 }
                 LossWarningButton::Save => {
                     let _ = try_save_all(app, &dirty, target);
@@ -24118,7 +24147,7 @@ fn request_target(app: &mut App, target: LossWarningTarget) {
         open_loss_warning(app, target, dirty);
         return;
     }
-    if in_flight_field_save(app) {
+    if in_flight_shunt_edit_save(app) {
         app.loss_pending = Some(target);
         return;
     }
@@ -24129,10 +24158,7 @@ fn request_target(app: &mut App, target: LossWarningTarget) {
 fn resolve_target(app: &mut App, target: LossWarningTarget) {
     match target {
         LossWarningTarget::Switch(tab) => do_switch(app, tab),
-        LossWarningTarget::Quit => {
-            app.quit = true;
-            app.shutting_down.store(true, Ordering::SeqCst);
-        }
+        LossWarningTarget::Quit => quit_or_wait(app),
         LossWarningTarget::ShuntCard(focus) => land_shunt_card(app, focus),
         LossWarningTarget::NewAccount => land_new_account(app),
         LossWarningTarget::MintForm(require) => open_new_profile_form_inner(app, require),
@@ -24178,17 +24204,23 @@ fn discard_dirty(app: &mut App, dirty: &[Dirty]) {
 /// Run a loss-warning `save`: validate every saveable changed item (a refusal
 /// runs that item's own `↵`, so its own toast or `└` sentence says why and
 /// nothing commits), detect a commit whose `↵` opens a further dialog, then
-/// commit the rest through their own `↵` paths and resolve the target only
-/// once every commit landed. One async shunt item starts first and holds while
-/// the sync items commit (re-validated) on its landing; two async items stop.
-/// A mixed set commits the saveable items and reopens the two-button warning
-/// for the rest. Returns whether the target resolved.
+/// commit the rest through their own `↵` paths and resolve the target only once
+/// every commit landed. An async shunt item beside any other changed item
+/// commits the instant (sync) items, lands an open `+ add` draft-field editor
+/// into its in-memory draft, and opens the first async item for its own `↵`; a
+/// lone async item starts and holds, re-running the gate on landing and
+/// cancelling on refusal. A set of only sync items commits them and resolves
+/// the target (a quit entering the exit wait for a running write instead of
+/// exiting); a sync set beside the `+ new` form commits the saveable items and
+/// reopens the two-button warning for the rest. Returns `true` when every item
+/// committed and the target resolved, `false` when a hold, refusal or further
+/// dialog stopped it.
 fn try_save_all(app: &mut App, dirty: &[Dirty], target: LossWarningTarget) -> bool {
-    // A field save already in flight owns the one worker but is not changed
-    // work (it rode in no `dirty` list): commit nothing yet, hold the target,
-    // and re-run the save over the warned items still changed when it lands, or
-    // the gate when anything outside them changed.
-    if in_flight_field_save(app) {
+    // A field or `+ add` save already in flight owns the one worker but is not
+    // changed work (it rode in no `dirty` list): commit nothing yet, hold the
+    // target, and re-run the save over the warned items still changed when it
+    // lands, or the gate when anything outside them changed.
+    if in_flight_shunt_edit_save(app) {
         app.loss_pending = Some(target);
         app.loss_pending_sync = Some(LossPendingSync::RerunSave(dirty.to_vec()));
         return false;
@@ -24222,31 +24254,48 @@ fn try_save_all(app: &mut App, dirty: &[Dirty], target: LossWarningTarget) -> bo
     }
     let (saveable, unsaveable): (Vec<Dirty>, Vec<Dirty>) =
         dirty.iter().cloned().partition(|d| d.saveable());
-    // Two or more async shunt items (a changed shunt field plus a typed
-    // `+ add` draft, or two `+ add` kinds) share the one save worker, so they
-    // cannot save together: commits nothing, the warning closes, the first
-    // item (screen order) stays open to save one at a time.
     let async_items: Vec<Dirty> = saveable
         .iter()
         .filter(|d| dirty_is_async(d))
         .cloned()
         .collect();
-    if async_items.len() > 1 {
-        if let Some(first) = async_items.first() {
-            focus_dirty(app, first.clone());
-        }
-        return false;
-    }
     let sync_items: Vec<Dirty> = saveable
         .iter()
         .filter(|d| !dirty_is_async(d))
         .cloned()
         .collect();
+    // An async shunt item beside any other changed item (a sync item, the
+    // unsaveable `+ new` form, or a second async item) shares the one save
+    // worker: the instant (sync) items commit, no shunt save starts, and the
+    // first async item (screen order) opens for its own `↵`.
+    let mixed = !async_items.is_empty()
+        && (async_items.len() > 1 || !sync_items.is_empty() || !unsaveable.is_empty());
+    if mixed {
+        // Commit every instant (sync) item, then hand the keyboard to the first
+        // async item. A refusal or dialog here stops the save (the validate and
+        // dialog pre-checks already ran over the whole saveable set).
+        for d in sync_items.iter().cloned() {
+            match commit_dirty(app, d.clone()) {
+                CommitResult::Landed | CommitResult::AsyncStarted => {}
+                CommitResult::Refused => {
+                    focus_dirty(app, d);
+                    return false;
+                }
+                CommitResult::Dialog => return false,
+            }
+        }
+        land_open_draft_editor(app);
+        if let Some(first) = async_items.first() {
+            close_unchanged_services_editors(app, first);
+            focus_shunt_item(app, first.clone());
+        }
+        return false;
+    }
     if !unsaveable.is_empty() {
-        // A mixed set commits every saveable item (an async one starts, no
-        // hold), then the two-button form reopens for the rest (the `+ new`
-        // form, which only `discard` or `go back` settles).
-        for d in saveable.iter().cloned() {
+        // No async item here: commit every saveable sync item, then the
+        // two-button form reopens for the rest (the `+ new` form, which only
+        // `discard` or `go back` settles).
+        for d in sync_items.iter().cloned() {
             match commit_dirty(app, d.clone()) {
                 CommitResult::Landed | CommitResult::AsyncStarted => {}
                 CommitResult::Refused => {
@@ -24259,13 +24308,14 @@ fn try_save_all(app: &mut App, dirty: &[Dirty], target: LossWarningTarget) -> bo
         open_loss_warning(app, target, unsaveable);
         return false;
     }
-    // One async shunt item starts first and holds; the sync items commit only
-    // once it lands (re-validated), so a refused `shunt check` commits nothing.
+    // A lone async item starts and holds: the gate re-runs on landing, a
+    // refusal cancels the trigger and leaves the item open with its own `└`
+    // sentence.
     if let Some(async_item) = async_items.first().cloned() {
         match commit_dirty(app, async_item.clone()) {
             CommitResult::AsyncStarted => {
                 app.loss_pending = Some(target);
-                app.loss_pending_sync = Some(LossPendingSync::Deferred(sync_items));
+                app.loss_pending_sync = Some(LossPendingSync::CancelOnRefusal);
                 return false;
             }
             CommitResult::Refused => {
@@ -24287,6 +24337,8 @@ fn try_save_all(app: &mut App, dirty: &[Dirty], target: LossWarningTarget) -> bo
             CommitResult::Dialog => return false,
         }
     }
+    // A quit resolves through the one quit function, so it never exits under a
+    // running shunt-card write; a switch resolves straight through.
     resolve_target(app, target);
     true
 }
@@ -24483,10 +24535,7 @@ fn commit_dirty(app: &mut App, dirty: Dirty) -> CommitResult {
         Dirty::ContextNudge => CommitResult::from(commit_context_nudge_edit(app)),
         Dirty::WeeklyThreshold => CommitResult::from(commit_weekly_threshold_edit(app)),
         Dirty::HerdrTag => CommitResult::from(commit_herdr_tag_edit(app)),
-        Dirty::ShuntField(_) => match app.services.shunt_field_edit.clone() {
-            Some(state) => commit_shunt_field(app, &state.key),
-            None => CommitResult::Refused,
-        },
+        Dirty::ShuntField(_) => commit_shunt_field(app),
         Dirty::ShuntAdd(kind) => {
             // Land the open draft field first: its uncommitted buffer is the
             // typed work the save must read, then run the draft's own save.
@@ -24495,7 +24544,7 @@ fn commit_dirty(app: &mut App, dirty: Dirty) -> CommitResult {
                 && *k == kind
                 && shunt_edit_dirty(&state.edit)
             {
-                let _ = commit_shunt_field(app, &state.key);
+                let _ = commit_shunt_field(app);
             }
             commit_shunt_add(app, kind)
         }
@@ -24510,6 +24559,60 @@ fn focus_dirty(app: &mut App, dirty: Dirty) {
     let screen = dirty.screen();
     if screen != app.tab {
         do_switch(app, screen);
+    }
+}
+
+/// Land an open `+ add` draft-field editor into its in-memory draft (the
+/// `commit_shunt_field` draft arm writes memory only, no file): the mixed
+/// save's opened async item must own the keyboard, and an open draft editor
+/// would keep claiming it. A real field editor (a changed `ShuntField`) stays
+/// open.
+fn land_open_draft_editor(app: &mut App) {
+    let Some(state) = app.services.shunt_field_edit.clone() else {
+        return;
+    };
+    if matches!(state.key, ShuntFieldKey::Draft { .. }) {
+        let _ = commit_shunt_field(app);
+    }
+}
+
+/// Close the unchanged Services editors the mixed save does not open: a clean
+/// herdr tag editor, and a clean shunt field editor whose key is not the first
+/// item's own (nothing is lost — both read their unchanged value).
+fn close_unchanged_services_editors(app: &mut App, first: &Dirty) {
+    if app
+        .services
+        .herdr_tag_draft
+        .as_ref()
+        .is_some_and(|d| !d.dirty())
+    {
+        app.services.herdr_tag_draft = None;
+    }
+    let close_field = app.services.shunt_field_edit.as_ref().is_some_and(|state| {
+        !shunt_edit_dirty(&state.edit)
+            && !matches!(first, Dirty::ShuntField(key) if *key == state.key)
+            && !app.services.saving(&ShuntSaveKey::Field(state.key.clone()))
+    });
+    if close_field {
+        app.services.shunt_field_edit = None;
+    }
+}
+
+/// Open an async shunt item for its own `↵`: a field keeps its open editor
+/// (typed text intact); a `+ add` draft lands focus on the Services detail
+/// pane's own `save <kind>` row, switching to Services first when needed.
+fn focus_shunt_item(app: &mut App, item: Dirty) {
+    match item {
+        Dirty::ShuntAdd(kind) => {
+            if app.tab != Tab::Services {
+                do_switch(app, Tab::Services);
+            }
+            select_shunt_check(app);
+            app.services.focus = ServicesFocus::Detail;
+            app.services
+                .set_shunt_focus(Some(ShuntFocusLine::SaveAdd(kind)));
+        }
+        other => focus_dirty(app, other),
     }
 }
 
@@ -26204,6 +26307,14 @@ pub(crate) fn on_tick(app: &mut App) {
     warn_day_claim_notices(app);
     update_banner(app);
     app.prune_toasts();
+
+    // The quit is decided and the exit waits for the running shunt-card writes:
+    // resolve here, after every drain, so the tick that drains the last write is
+    // the one that exits.
+    if app.exit_wait && !in_flight_shunt_card_write(app) {
+        app.quit = true;
+        app.shutting_down.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Say once, per day and per config change, what today's day lists are doing
@@ -26402,8 +26513,13 @@ pub(crate) fn resolve_finished_speeds(app: &mut App) {
 /// ends the wait; a `healthy` slot whose pid is `Some` and differs from the one
 /// read before the mint runs the require. The one-save guard defers a run to a
 /// later tick rather than dropping it, and clearing the pending before starting
-/// means a second tick before the outcome drains starts nothing.
+/// means a second tick before the outcome drains starts nothing. The exit wait
+/// skips it: an exit drops the pending record with the process, so a restart
+/// during the wait starts no require save.
 fn poll_pending_require(app: &mut App) {
+    if app.exit_wait {
+        return;
+    }
     let Some(pending) = app.services.pending_require.clone() else {
         return;
     };

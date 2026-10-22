@@ -8,17 +8,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{
-    App, CodexDetailRow, CodexLoginSession, ConfigFocus, ConfigRow, FallbackHint, FooterAlert,
-    GLOBAL_CONFIG_ROWS, GlobalConfigRow, HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession,
-    MainItemKind, Modal, PaneState, PoolDetailRow, ScrollStamp, ServiceFix, ServicesFocus,
-    SetupSelection, ShuntFieldEdit, ShuntFieldKey, ShuntFocus, ShuntSaveKey, StatusFocus, Tab,
-    TokenView, build_action_menu, config_rows, fallback_hint, field_locked, fix_verb,
-    has_sub_focus, herdr_config_writable, is_cycle_field, keyboard_owner, pane_state,
-    token_model_count,
+    App, CodexDetailRow, CodexLoginSession, ConfigEntryRef, ConfigFocus, ConfigRow, FallbackHint,
+    FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow, HERDR_OPTIONS, HerdrOption, KeyOwner,
+    LoginSession, LossWarningTarget, MainItemKind, Modal, PaneState, PoolDetailRow,
+    PoolMutationKind, ScrollStamp, ServiceFix, ServicesFocus, SetupSelection, ShuntEntryKey,
+    ShuntFieldEdit, ShuntFieldKey, ShuntFocus, ShuntSaveKey, StatusFocus, Tab, TokenView,
+    build_action_menu, config_rows, config_view, entry_for_key, escape_control, fallback_hint,
+    field_locked, fix_verb, has_sub_focus, herdr_config_writable, is_cycle_field, keyboard_owner,
+    pane_state, token_model_count,
 };
 use super::super::theme;
-use super::format::{spinner_frame, truncate};
+use super::format::{grapheme_cells, prefix_in_cells, spinner_frame, truncate};
 use super::prose;
+use super::services::{field_label, route_label};
 
 const TAB_NAV: (&str, &str) = ("←→", "tabs");
 
@@ -130,11 +132,22 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let owner = keyboard_owner(app);
 
+    // The save cue is a state mirror, computed each frame (not a stored alert):
+    // it shows while the quit waits for a running write — the exit wait, or a
+    // quit held on a checking field/`+ add` save — on every tab, and `x` cannot
+    // dismiss it. It outranks any stored alert.
+    if app.exit_wait || app.loss_pending == Some(LossWarningTarget::Quit) {
+        let msg = save_cue(&saving_row_name(app), area.width);
+        draw_alert(frame, area, "i ", theme::info(), &msg);
+        return;
+    }
+
     // A live alert replaces the footer in place — one footer row, never
     // stacked — and outranks the login line: a ctrl+c arm can happen while a
     // login runs, and the quit prompt must be visible then.
     if let Some(alert) = &app.footer_alert {
-        draw_alert(frame, area, alert);
+        let FooterAlert::Warn(msg) = alert;
+        draw_alert(frame, area, "! ", theme::warning(), msg);
         return;
     }
 
@@ -1061,15 +1074,80 @@ fn inset_x(area: Rect, pad: u16) -> Rect {
     }
 }
 
-/// Render a footer alert in place of the hint bar.
-/// `! <message>` — glyph in `WARNING`, message in `TEXT_DIM`.
-fn draw_alert(frame: &mut Frame<'_>, area: Rect, alert: &FooterAlert) {
-    let FooterAlert::Warn(msg) = alert;
-    let mut spans = vec![Span::styled(
-        "! ",
-        Style::default().fg(theme::warning_color()),
-    )];
-    spans.extend(prose::spans(msg, theme::dim()));
+/// The row a running write is about, as the card labels it: a field's label, a
+/// `+ add` kind word, an entry's displayed name, `token`, `client tokens`,
+/// `shunt` for a `shunt_action` job, or a pool account's name. The save cue
+/// names this while the exit waits or a quit is held; the priority order
+/// matches the exit wait's own write predicate (save, then action, then pool).
+fn saving_row_name(app: &App) -> String {
+    if let Some(save) = &app.services.shunt_save {
+        return match &save.key {
+            ShuntSaveKey::Field(key) => escape_control(&field_label(key)),
+            ShuntSaveKey::SaveAdd(kind) => kind.word().to_string(),
+            ShuntSaveKey::Remove(key) => entry_display_name(app, key),
+            ShuntSaveKey::Token(name) => escape_control(name),
+            ShuntSaveKey::AddToken => "token".to_string(),
+            ShuntSaveKey::RequireTokens => "client tokens".to_string(),
+        };
+    }
+    if app.services.shunt_action.running {
+        return "shunt".to_string();
+    }
+    if app.pool_mutation_kind == Some(PoolMutationKind::Remove)
+        && let Some((_, name)) = &app.pool_mutation_row
+    {
+        return escape_control(name.as_str());
+    }
+    String::new()
+}
+
+/// An entry's displayed name, as the remove row labels it: the name/id for an
+/// upstream or model, the route row's whole label for a route (a route that
+/// left the config since its row rendered falls back to the kind word `route`).
+fn entry_display_name(app: &App, key: &ShuntEntryKey) -> String {
+    match key {
+        ShuntEntryKey::Upstream { name, .. } => escape_control(name),
+        ShuntEntryKey::Model { id, .. } => escape_control(id),
+        ShuntEntryKey::Route(_) => {
+            let Some(view) = config_view(app) else {
+                return "route".to_string();
+            };
+            match entry_for_key(view, key) {
+                Some(ConfigEntryRef::Route(route)) => route_label(route, usize::MAX),
+                _ => "route".to_string(),
+            }
+        }
+    }
+}
+
+/// The save cue's message: `saving {row}… · ⌃c ⌃c quit now`, the row name cut
+/// (grapheme-safe, one `…`) so the leader and `· ⌃c ⌃c quit now` stay whole
+/// down to the width floor. The `⌃c ⌃c` run is one key span. The name's budget
+/// is the cells the copy itself spends around it — the `i ` leader plus the
+/// same message with an empty name, measured — so a copy edit re-derives the
+/// cut instead of drifting a hand-counted fixed.
+fn save_cue(row: &str, width: u16) -> String {
+    let key = prose::key("\u{2303}c \u{2303}c");
+    let fixed = grapheme_cells("i ")
+        + grapheme_cells(&prose::plain(&format!("saving \u{2026} · {key} quit now")));
+    let budget = (width as usize).saturating_sub(fixed);
+    let mut name = prefix_in_cells(row, budget).0;
+    // A cut that stops right after a `…` inside the name would double it with
+    // the always-on `…`; trim a kept trailing `…` only when the cut dropped
+    // something, so an uncut name keeps its own characters.
+    if grapheme_cells(&name) < grapheme_cells(row) {
+        name = name.trim_end_matches('\u{2026}').to_string();
+    }
+    format!("saving {name}\u{2026} · {key} quit now")
+}
+
+/// Render a footer alert in place of the hint bar: a semantic leader glyph
+/// (`! ` warning, `i ` info) in its color, then the message in `TEXT_DIM` with
+/// key runs rendered as keys, cut to fit the row (grapheme-safe, trailing `…`).
+fn draw_alert(frame: &mut Frame<'_>, area: Rect, leader: &str, leader_style: Style, msg: &str) {
+    let mut spans = vec![Span::styled(leader, leader_style)];
+    let width = (area.width as usize).saturating_sub(grapheme_cells(leader));
+    spans.extend(prose::fit(msg, width, theme::dim()));
     frame.render_widget(
         Paragraph::new(Line::from(spans))
             .style(theme::base())
