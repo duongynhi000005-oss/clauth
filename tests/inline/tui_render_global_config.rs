@@ -1205,7 +1205,7 @@ fn reset_rows_hints_track_their_value() {
 /// The Config tab with the cursor on `row`, that row's typed editor holding
 /// `draft`.
 fn config_typed_app(row: crate::tui::app::GlobalConfigRow, draft: &str) -> crate::tui::app::App {
-    use crate::tui::app::{GLOBAL_CONFIG_ROWS, Tab};
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, SeededInput, Tab};
     let mut app = crate::tui::app::App::new(crate::profile::AppConfig {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
@@ -1217,13 +1217,13 @@ fn config_typed_app(row: crate::tui::app::GlobalConfigRow, draft: &str) -> crate
         .expect("the row is listed");
     match row {
         crate::tui::app::GlobalConfigRow::RefreshInterval => {
-            app.refresh_interval_draft = Some(InputState::new(draft));
+            app.refresh_interval_draft = Some(SeededInput::new(draft));
         }
         crate::tui::app::GlobalConfigRow::WeeklyThreshold => {
-            app.weekly_threshold_draft = Some(InputState::new(draft));
+            app.weekly_threshold_draft = Some(SeededInput::new(draft));
         }
         crate::tui::app::GlobalConfigRow::ContextNudge => {
-            app.context_nudge_draft = Some(InputState::new(draft));
+            app.context_nudge_draft = Some(SeededInput::new(draft));
         }
         _ => panic!("the row has no typed editor"),
     }
@@ -1331,7 +1331,11 @@ fn an_over_wide_refresh_buffer_scrolls_inside_its_row() {
     );
     let end_row = crate::testutil::buffer_rows(&buf)[end.y as usize].clone();
 
-    app.refresh_interval_draft.as_mut().expect("a draft").left();
+    app.refresh_interval_draft
+        .as_mut()
+        .expect("a draft")
+        .input
+        .left();
     let (left, buf) = draw_caret(&mut term, |f| draw(f, &app));
     assert_eq!(
         left,
@@ -1344,7 +1348,11 @@ fn an_over_wide_refresh_buffer_scrolls_inside_its_row() {
         "a move inside the window leaves the row alone"
     );
 
-    app.refresh_interval_draft.as_mut().expect("a draft").home();
+    app.refresh_interval_draft
+        .as_mut()
+        .expect("a draft")
+        .input
+        .home();
     let (home, buf) = draw_caret(&mut term, |f| draw(f, &app));
     assert_eq!(home.y, end.y, "Home stays on the field row");
     assert_eq!(

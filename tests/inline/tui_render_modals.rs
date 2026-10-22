@@ -3281,50 +3281,49 @@ fn up_into_a_later_blocks_first_account_shows_its_rows() {
     );
 }
 
-/// The loss warning renders its WARNING title, its sentence-case body (one
-/// line per sentence so a sentence never shares a row), and a right-aligned
-/// `go back` / `discard` pair for both the Setup- and the Fallback-held body.
-/// Exact rows at 80×24, the size the body once split `acc`/`ount.`.
+/// The loss warning renders its WARNING title, its lowercase body (ONE
+/// paragraph wrapped at the modal's width, never one line per sentence), and
+/// the right-aligned `go back · discard · save` row. Exact rows at 80×24, the
+/// size the body once split `acc`/`ount.`.
 #[test]
 fn the_loss_warning_renders_its_title_body_and_buttons() {
-    use crate::tui::app::{LossWarningDrop, LossWarningState, Modal};
+    use crate::tui::app::{
+        Dirty, LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget, Modal,
+    };
     use ratatui::{Terminal, backend::TestBackend};
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    for (drop, title, body) in [
+    let title = "╭─ WARNING ────────────────────────────────────╮";
+    let button = "                   go back   discard   save";
+    for (dirty, body) in [
         (
-            LossWarningDrop::SetupDraft,
-            "╭─ WARNING ───────────────────────────────────╮",
+            Dirty::SetupField,
             vec![
                 "",
-                "  discard the unsaved edit?",
                 "  there are unsaved edits on the setup tab.",
-                "  fallback also edits this account.",
+                "  save them before switching?",
                 "",
-                "                         go back   discard",
+                button,
                 "",
             ],
         ),
         (
-            LossWarningDrop::FallbackEdit,
-            "╭─ WARNING ────────────────────────────────────╮",
+            Dirty::FallbackField,
             vec![
                 "",
-                "  discard the unsaved edit?",
                 "  there are unsaved edits on the fallback",
-                "  tab.",
-                "  setup also edits this account.",
+                "  tab. save them before switching?",
                 "",
-                "                          go back   discard",
+                button,
                 "",
             ],
         ),
     ] {
         let app = empty_app(Tab::Overview);
         let modal = Modal::LossWarning(LossWarningState {
-            choice: false,
-            target: Tab::Overview,
-            drop,
+            focus: LossWarningButton::Save,
+            target: LossWarningTarget::Switch(Tab::Overview),
+            drop: LossWarningDrop { dirty: vec![dirty] },
         });
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| draw(f, f.area(), &app, &modal, &[])).unwrap();
@@ -3350,21 +3349,24 @@ fn the_loss_warning_renders_its_title_body_and_buttons() {
     }
 }
 
-/// The loss warning's third body (the mint path displacing a suspended
-/// `+ new` form) renders the same shell with its own second sentence.
-/// Exact rows at 80×24; the width is the Setup body's, since both longest
-/// sentences are 42 cells.
+/// The two-button form (changed work with nothing to save, the `+ new` form)
+/// renders the same shell with `go back · discard` and `go back` focused.
+/// Exact rows at 80×24.
 #[test]
 fn the_new_account_draft_warning_renders_its_body() {
-    use crate::tui::app::{LossWarningDrop, LossWarningState, Modal};
+    use crate::tui::app::{
+        Dirty, LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget, Modal,
+    };
     use ratatui::{Terminal, backend::TestBackend};
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let app = empty_app(Tab::Overview);
     let modal = Modal::LossWarning(LossWarningState {
-        choice: false,
-        target: Tab::Overview,
-        drop: LossWarningDrop::NewAccountDraft { require: false },
+        focus: LossWarningButton::GoBack,
+        target: LossWarningTarget::Switch(Tab::Overview),
+        drop: LossWarningDrop {
+            dirty: vec![Dirty::NewAccountForm],
+        },
     });
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| draw(f, f.area(), &app, &modal, &[])).unwrap();
@@ -3379,7 +3381,7 @@ fn the_new_account_draft_warning_renders_its_body() {
         .collect();
     assert_eq!(
         box_rows[0].trim(),
-        "╭─ WARNING ───────────────────────────────────╮",
+        "╭─ WARNING ────────────────────────────────────╮",
         "the title row"
     );
     let inner: Vec<String> = box_rows[1..box_rows.len() - 1]
@@ -3390,14 +3392,201 @@ fn the_new_account_draft_warning_renders_its_body() {
         inner.iter().map(String::as_str).collect::<Vec<_>>(),
         [
             "",
-            "  discard the unsaved edit?",
             "  there are unsaved edits on the setup tab.",
-            "  services also edits the new account form.",
+            "  discard them and switch?",
             "",
-            "                         go back   discard",
+            "                          go back   discard",
             "",
         ],
         "the body and button rows"
+    );
+}
+
+/// The three-button loss warning pins its button cells: `save` focused is a
+/// neutral inverse block (`fg = BG`, `bg = TEXT`, no bold), `discard` focused
+/// is a `DANGER` inverse block, and the button row's column positions are
+/// identical across the focus move (always-on insets).
+#[test]
+fn the_loss_warning_buttons_pin_their_cells() {
+    use crate::tui::app::{
+        Dirty, LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget, Modal,
+    };
+    use crate::tui::theme;
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = empty_app(Tab::Overview);
+    let state = |focus| {
+        Modal::LossWarning(LossWarningState {
+            focus,
+            target: LossWarningTarget::Switch(Tab::Overview),
+            drop: LossWarningDrop {
+                dirty: vec![Dirty::SetupField],
+            },
+        })
+    };
+    let render = |modal: &Modal| {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, f.area(), &app, modal, &[])).unwrap();
+        term
+    };
+    let button_cell = |term: &Terminal<TestBackend>, needle: &str| {
+        let buf = term.backend().buffer();
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if row.contains("go back") {
+                // Locate by CHAR position: the row holds multi-byte border
+                // glyphs (`│`), so a byte offset reads past the label's cell.
+                let x = row
+                    .find(needle)
+                    .map(|byte| row[..byte].chars().count())
+                    .unwrap_or_else(|| panic!("the button row lacks {needle}"));
+                return buf[(x as u16, y)].clone();
+            }
+        }
+        panic!("no button row");
+    };
+
+    let save_modal = state(LossWarningButton::Save);
+    let save_term = render(&save_modal);
+    let save_cell = button_cell(&save_term, "save");
+    assert_eq!(save_cell.fg, theme::bg(), "save focused fg");
+    assert_eq!(save_cell.bg, theme::text_color(), "save focused bg");
+    assert!(
+        !save_cell.modifier.contains(ratatui::style::Modifier::BOLD),
+        "save focused must not be bold"
+    );
+    // The destructive cue persists unfocused: discard keeps DANGER fg, and an
+    // unfocused neutral button reads dim.
+    let unfocused_discard = button_cell(&save_term, "discard");
+    assert_eq!(
+        unfocused_discard.fg,
+        theme::danger_color(),
+        "discard unfocused fg"
+    );
+    let unfocused_go_back = button_cell(&save_term, "go back");
+    assert_eq!(
+        unfocused_go_back.fg,
+        theme::text_dim_color(),
+        "go back unfocused fg"
+    );
+
+    let discard_modal = state(LossWarningButton::Discard);
+    let discard_term = render(&discard_modal);
+    let discard_cell = button_cell(&discard_term, "discard");
+    assert_eq!(discard_cell.fg, theme::bg(), "discard focused fg");
+    assert_eq!(discard_cell.bg, theme::danger_color(), "discard focused bg");
+    let unfocused_save = button_cell(&discard_term, "save");
+    assert_eq!(
+        unfocused_save.fg,
+        theme::text_dim_color(),
+        "save unfocused fg"
+    );
+
+    // The button row's glyphs are identical across the focus move: the insets
+    // are always reserved, so no button shifts.
+    let row_of = |term: &Terminal<TestBackend>| {
+        crate::testutil::buffer_rows(term.backend().buffer())
+            .into_iter()
+            .find(|r| r.contains("go back") && r.contains("discard") && r.contains("save"))
+            .map(|r| r.trim().to_string())
+    };
+    assert_eq!(
+        row_of(&save_term),
+        row_of(&discard_term),
+        "the button row shifted when the focus moved"
+    );
+}
+
+/// The quit and two-button quit forms render their exact body rows (the quit
+/// question, wrapped as one paragraph).
+#[test]
+fn the_quit_and_two_button_quit_forms_render_their_bodies() {
+    use crate::tui::app::{
+        Dirty, LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget, Modal,
+    };
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for (focus, saveable, body) in [
+        (
+            LossWarningButton::Save,
+            true,
+            vec![
+                "",
+                "  there are unsaved edits on the setup tab.",
+                "  save them before quitting?",
+                "",
+                "                   go back   discard   save",
+                "",
+            ],
+        ),
+        (
+            LossWarningButton::GoBack,
+            false,
+            vec![
+                "",
+                "  there are unsaved edits on the setup tab.",
+                "  discard them and quit?",
+                "",
+                "                          go back   discard",
+                "",
+            ],
+        ),
+    ] {
+        let app = empty_app(Tab::Overview);
+        let dirty = if saveable {
+            vec![Dirty::SetupField]
+        } else {
+            vec![Dirty::NewAccountForm]
+        };
+        let modal = Modal::LossWarning(LossWarningState {
+            focus,
+            target: LossWarningTarget::Quit,
+            drop: LossWarningDrop { dirty },
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, f.area(), &app, &modal, &[])).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let box_rows: Vec<&str> = rows
+            .iter()
+            .map(String::as_str)
+            .filter(|r| {
+                let t = r.trim();
+                t.starts_with('╭') || t.starts_with('│') || t.starts_with('╰')
+            })
+            .collect();
+        let inner: Vec<String> = box_rows[1..box_rows.len() - 1]
+            .iter()
+            .map(|r| r.split('│').nth(1).unwrap().trim_end().to_string())
+            .collect();
+        assert_eq!(
+            inner.iter().map(String::as_str).collect::<Vec<_>>(),
+            body,
+            "the quit body rows for saveable={saveable}"
+        );
+    }
+}
+
+/// The multi-screen join is unit-pinned on the formatter: no producer reaches
+/// two dirty screens (changed work never suspends across a switch or jump), so
+/// the joined copy is checked directly, in `Tab::ALL` order.
+#[test]
+fn the_multi_screen_join_names_the_tabs_in_order() {
+    use crate::tui::app::{
+        Dirty, LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget,
+    };
+    let state = LossWarningState {
+        focus: LossWarningButton::Save,
+        target: LossWarningTarget::Switch(crate::tui::app::Tab::Overview),
+        drop: LossWarningDrop {
+            dirty: vec![Dirty::Note, Dirty::SetupField],
+        },
+    };
+    assert_eq!(
+        state.body_lines(),
+        vec!["there are unsaved edits on the usage and setup tabs. save them before switching?"],
+        "the two-screen join"
     );
 }
 
@@ -3660,8 +3849,9 @@ fn the_modal_caps_at_sixty_percent_from_eighty_columns() {
 #[test]
 fn the_modal_button_groups_keep_a_one_cell_gap() {
     use crate::tui::app::{
-        ConfirmAction, ConfirmScroll, ConfirmState, EnvCollisionForm, LossWarningDrop,
-        LossWarningState, PresetApplyButton, PresetApplyForm, PresetTarget, Tab,
+        ConfirmAction, ConfirmScroll, ConfirmState, Dirty, EnvCollisionForm, LossWarningButton,
+        LossWarningDrop, LossWarningState, LossWarningTarget, PresetApplyButton, PresetApplyForm,
+        PresetTarget, Tab,
     };
     use ratatui::layout::Rect;
 
@@ -3741,16 +3931,22 @@ fn the_modal_button_groups_keep_a_one_cell_gap() {
     );
 
     let loss = LossWarningState {
-        choice: false,
-        target: Tab::Overview,
-        drop: LossWarningDrop::SetupDraft,
+        focus: LossWarningButton::Save,
+        target: LossWarningTarget::Switch(Tab::Overview),
+        drop: LossWarningDrop {
+            dirty: vec![Dirty::SetupField],
+        },
     };
     let rows = slice_modal(&render_rows(
         80,
         24,
         &|f: &mut ratatui::Frame<'_>, a: Rect| draw_loss_warning(f, a, &loss),
     ));
-    assert_eq!(button_tail(&rows), "go back   discard", "loss warning gap");
+    assert_eq!(
+        button_tail(&rows),
+        "go back   discard   save",
+        "loss warning gap"
+    );
 
     let rows = render_rebind(&rebind_render_form(), 80, 40);
     assert_eq!(button_tail(&rows), "not now   apply", "rebind gap");
@@ -5096,13 +5292,17 @@ fn the_acknowledgment_button_reads_close() {
 /// tab names included, pinned row by row.
 #[test]
 fn the_loss_warning_body_is_lowercase() {
-    use crate::tui::app::{LossWarningDrop, LossWarningState, Modal, Tab};
+    use crate::tui::app::{
+        Dirty, LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget, Modal, Tab,
+    };
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = empty_app(Tab::Setup);
     app.open_modal(Modal::LossWarning(LossWarningState {
-        choice: false,
-        target: Tab::Usage,
-        drop: LossWarningDrop::SetupDraft,
+        focus: LossWarningButton::Save,
+        target: LossWarningTarget::Switch(Tab::Usage),
+        drop: LossWarningDrop {
+            dirty: vec![Dirty::SetupField],
+        },
     }));
     let buf = frame_buffer(&app);
     let (top, bottom, left, right) = modal_bounds(&buf);
@@ -5120,9 +5320,9 @@ fn the_loss_warning_body_is_lowercase() {
     assert_eq!(
         body,
         [
-            "discard the unsaved edit?",
             "there are unsaved edits on the setup tab.",
-            "fallback also edits this account.",
+            "save them before switching?",
+            "go back   discard   save",
         ],
         "the loss warning body rows"
     );

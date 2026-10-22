@@ -171,6 +171,45 @@ impl InputState {
     }
 }
 
+/// A typed editor's buffer beside the value it opened from. Changed work is
+/// `input.value != seed`; a clean edit re-seeds both from a newer stored value
+/// (caret at the end) while a dirty edit keeps its text whatever the store
+/// does. This is the one shape every editor that opens from a stored value
+/// uses, so a later editor can never compare against the live store by
+/// accident (the stale-but-clean false dirty).
+#[derive(Debug, Clone)]
+pub(crate) struct SeededInput {
+    pub(crate) input: InputState,
+    pub(crate) seed: String,
+}
+
+impl SeededInput {
+    pub(crate) fn new(initial: &str) -> Self {
+        Self {
+            input: InputState::new(initial),
+            seed: initial.to_string(),
+        }
+    }
+
+    /// Whether the buffer differs from the value it opened from.
+    pub(crate) fn dirty(&self) -> bool {
+        self.input.value != self.seed
+    }
+
+    /// Re-seed a clean edit (buffer == seed) from a NEWER stored value; an
+    /// unchanged value is a no-op and keeps the caret, and a dirty edit is left
+    /// alone. Returns whether the buffer changed.
+    pub(crate) fn reseed(&mut self, new_seed: &str) -> bool {
+        if self.input.value == self.seed && new_seed != self.seed {
+            self.input = InputState::new(new_seed);
+            self.seed = new_seed.to_string();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// The byte offsets of `s`'s grapheme boundaries, ascending, `0` through
 /// `s.len()`: the steps an editor's caret takes. The segmenter is ratatui's
 /// (`styled_graphemes`, the one the buffer draws with), which drops control
@@ -390,6 +429,9 @@ impl NoteBuffer {
 pub(crate) struct NoteEditor {
     pub(crate) profile: crate::profile::ProfileName,
     pub(crate) buf: NoteBuffer,
+    /// The note text the editor opened from; the changed-work derivation and
+    /// re-seed compare against this, never a fresh disk read.
+    pub(crate) seed: String,
 }
 
 // ── Modals ────────────────────────────────────────────────────────────────────
@@ -856,6 +898,10 @@ pub(crate) struct ConfigDraft {
     pub(crate) env_just_added: Option<String>,
     /// `Some(row)` while a text row (or the `model` custom field) owns the keyboard.
     pub(crate) active: Option<ConfigRow>,
+    /// The value the open field's buffer held when it opened — the seed the
+    /// changed-work derivation and the re-seed compare against (an out-of-band
+    /// store change under a clean suspended edit re-seeds, never warns).
+    pub(crate) field_seed: Option<String>,
     /// The account-action row (`Delete`, `ClearSessionToken`, or `Disabled` in
     /// the disable direction only — enabling is immediate, never armed)
     /// currently armed by a first ⏎; a second ⏎ on that same row confirms. Any
@@ -1060,51 +1106,158 @@ pub(crate) struct ConfirmState {
     pub(crate) on_confirm: ConfirmAction,
 }
 
-/// The loss warning a screen switch opens over unsaved work another screen
-/// also writes. `go back` is the default focus; `discard` drops the work and
-/// performs the switch that opened it, to the target fixed at that keypress.
+/// The loss warning a switch or quit opens over changed work. `save` is the
+/// default focus on the three-button form; `go back` is on the two-button form
+/// (changed work with nothing to save, the `+ new` form). `discard` drops the
+/// work, `save` commits it, and whichever lands then performs the target fixed
+/// at that keypress.
 #[derive(Debug, Clone)]
 pub(crate) struct LossWarningState {
-    /// Highlighted choice: false = `go back`, true = `discard`.
-    pub(crate) choice: bool,
-    /// The tab the keypress that opened the warning targets.
-    pub(crate) target: Tab,
-    /// The work `discard` drops (only the warned work, nothing else).
+    pub(crate) focus: LossWarningButton,
+    /// The landing the warning resolves into.
+    pub(crate) target: LossWarningTarget,
+    /// The changed work `discard` drops and `save` commits, in screen order.
     pub(crate) drop: LossWarningDrop,
 }
 
-/// What `discard` on the loss warning drops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LossWarningDrop {
-    /// The Setup existing-account draft (an open typed field).
-    SetupDraft,
-    /// The Fallback member-card edit (an open typed field).
-    FallbackEdit,
-    /// The suspended `+ new` form the Services mint path would displace. The
-    /// `require` flag is the picker's, carried so `discard` can reopen the mint
-    /// form exactly as the picker would.
-    NewAccountDraft { require: bool },
+pub(crate) enum LossWarningButton {
+    GoBack,
+    Discard,
+    Save,
+}
+
+/// What the warning's buttons resolve into: the switch or quit a key asked
+/// for, or a cross-screen jump's own landing (one variant per jump).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LossWarningTarget {
+    Switch(Tab),
+    Quit,
+    /// `jump_to_shunt_card`'s landing on the shunt card.
+    ShuntCard(ShuntFocusLine),
+    /// `start_new_account`'s landing on Setup's `+ new` row.
+    NewAccount,
+    /// The Services `+ new profile` mint form.
+    MintForm(bool),
+}
+
+/// The changed work set. `dirty` is non-empty by construction: the warning is
+/// never opened over unchanged work.
+#[derive(Debug, Clone)]
+pub(crate) struct LossWarningDrop {
+    pub(crate) dirty: Vec<Dirty>,
 }
 
 impl LossWarningDrop {
-    /// The two-sentence body, one line per sentence, naming the screen holding
-    /// the work and the other writer, the owner's example wording. Two lines
-    /// keep the renderer from splitting a word across rows at 80 columns.
-    pub(crate) fn detail_lines(self) -> [&'static str; 2] {
-        match self {
-            Self::SetupDraft => [
-                "there are unsaved edits on the setup tab.",
-                "fallback also edits this account.",
-            ],
-            Self::FallbackEdit => [
-                "there are unsaved edits on the fallback tab.",
-                "setup also edits this account.",
-            ],
-            Self::NewAccountDraft { .. } => [
-                "there are unsaved edits on the setup tab.",
-                "services also edits the new account form.",
-            ],
+    /// The screens holding changed work, in `Tab::ALL` order (the order the
+    /// derivation produced), each once.
+    pub(crate) fn screens(&self) -> Vec<Tab> {
+        let mut out = Vec::new();
+        for dirty in &self.dirty {
+            let screen = dirty.screen();
+            if !out.contains(&screen) {
+                out.push(screen);
+            }
         }
+        out
+    }
+
+    /// Whether any changed item has a `save` (only a `+ new` form has none).
+    pub(crate) fn saveable(&self) -> bool {
+        self.dirty.iter().any(|d| d.saveable())
+    }
+}
+
+/// One changed edit or staged pick. The derivation is the single source every
+/// trigger (switch, quit, retarget, `save` validation, the body's screen list)
+/// reads, so a new editor can never warn on a switch and not on a quit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Dirty {
+    /// A Setup existing-account field (an open typed field).
+    SetupField,
+    /// The `+ new` form holding typed work, a field open or not, at rest or
+    /// suspended.
+    NewAccountForm,
+    /// A Fallback member-card typed field (`rotate at`, `weekly at`, `max
+    /// spend`).
+    FallbackField,
+    /// The Config tab's refresh-interval custom field.
+    RefreshInterval,
+    /// The Config tab's context-nudge custom field.
+    ContextNudge,
+    /// The Config tab's weekly-threshold custom field.
+    WeeklyThreshold,
+    /// The Services tab's herdr tag-refresh field.
+    HerdrTag,
+    /// The shunt card's open field editor (a typed field or a pending pick),
+    /// keyed so a different field opened later does not match the warned one.
+    ShuntField(ShuntFieldKey),
+    /// A shunt `+ add <kind>` draft holding typed values (in memory until its
+    /// `save <kind>` row writes it).
+    ShuntAdd(ShuntAddKind),
+    /// The Usage tab's note editor.
+    Note,
+}
+
+impl Dirty {
+    pub(crate) fn screen(&self) -> Tab {
+        match self {
+            Self::SetupField | Self::NewAccountForm => Tab::Setup,
+            Self::FallbackField => Tab::Fallback,
+            Self::RefreshInterval | Self::ContextNudge | Self::WeeklyThreshold => Tab::Config,
+            Self::HerdrTag | Self::ShuntField(_) | Self::ShuntAdd(_) => Tab::Services,
+            Self::Note => Tab::Usage,
+        }
+    }
+
+    pub(crate) fn saveable(&self) -> bool {
+        !matches!(self, Self::NewAccountForm)
+    }
+}
+
+/// What a held switch/quit waits for beyond the save outcome itself.
+#[derive(Debug)]
+pub(crate) enum LossPendingSync {
+    /// One async item already started; these sync items commit (re-validated)
+    /// on its landing.
+    Deferred(Vec<Dirty>),
+    /// A field save already owned the worker when the save ran, so nothing
+    /// committed: the whole save re-runs over what is still changed on its
+    /// landing, and the warned items are the only ones it may commit (a new
+    /// item re-opens the warning).
+    RerunSave(Vec<Dirty>),
+}
+
+/// The lowercase tab label the tab bar shows, for the body's screen list.
+fn tab_label(tab: Tab) -> String {
+    tab.title().to_lowercase()
+}
+
+/// `the a, b and c tabs.` — one screen singular, the rest plural, no Oxford
+/// comma.
+fn join_screens(screens: &[Tab]) -> String {
+    let labels: Vec<String> = screens.iter().copied().map(tab_label).collect();
+    match labels.as_slice() {
+        [] => String::new(),
+        [one] => format!("the {one} tab."),
+        [first, second] => format!("the {first} and {second} tabs."),
+        [rest @ .., last] => format!("the {} and {last} tabs.", rest.join(", ")),
+    }
+}
+
+impl LossWarningState {
+    /// The body as ONE paragraph: the screen-list sentence, a space, then the
+    /// question the buttons answer. The renderer wraps it at the modal's
+    /// width, never one line per sentence.
+    pub(crate) fn body_lines(&self) -> Vec<String> {
+        let screens = join_screens(&self.drop.screens());
+        let question = match (self.target.clone(), self.drop.saveable()) {
+            (LossWarningTarget::Quit, true) => "save them before quitting?",
+            (LossWarningTarget::Quit, false) => "discard them and quit?",
+            (_, true) => "save them before switching?",
+            (_, false) => "discard them and switch?",
+        };
+        vec![format!("there are unsaved edits on {screens} {question}")]
     }
 }
 
@@ -2687,6 +2840,38 @@ impl ShuntDrafts {
         }
     }
 
+    /// Whether the `+ add <kind>` draft holds any typed value (changed work:
+    /// a draft lives in memory until its `save <kind>` row writes it).
+    pub(crate) fn holds_typed_work(&self, kind: ShuntAddKind) -> bool {
+        match kind {
+            ShuntAddKind::Upstream => self.upstream.as_ref().is_some_and(|d| {
+                d.name.is_some()
+                    || d.provider.is_some()
+                    || d.kind.is_some()
+                    || d.base_url.is_some()
+                    || d.auth_mode.is_some()
+                    || d.account.is_some()
+                    || d.accounts.is_some()
+                    || d.env.is_some()
+                    || d.header.is_some()
+                    || d.effort.is_some()
+                    || d.service_tier.is_some()
+            }),
+            ShuntAddKind::Model => self.model.as_ref().is_some_and(|d| {
+                d.id.is_some()
+                    || d.display_name.is_some()
+                    || d.upstream_model.iter().any(|(_, v)| v.is_some())
+            }),
+            ShuntAddKind::Route => self.route.as_ref().is_some_and(|d| {
+                d.model.is_some()
+                    || d.provider.is_some()
+                    || d.upstream_model.is_some()
+                    || d.effort.is_some()
+                    || d.service_tier.is_some()
+            }),
+        }
+    }
+
     /// Open (or reseed) the `+ add <kind>` draft in place, dropping any
     /// committed values and refusal from a previous open of the same kind. A
     /// model draft's `upstream_model` rows derive from the config's current
@@ -3591,7 +3776,7 @@ pub(crate) struct ServicesState {
     pub(crate) herdr_fix_focus: bool,
     /// Typed editor for the `tag refresh` stepper — the Config-tab
     /// refresh-interval editor's shape. `None` = not editing.
-    pub(crate) herdr_tag_draft: Option<InputState>,
+    pub(crate) herdr_tag_draft: Option<SeededInput>,
     /// The herdr config verdict from the last recompute (a cheap file re-read
     /// that rides the per-tick refresh), cached so the render and the key
     /// handler never re-read the file per frame. `None` = unreadable or no
@@ -4594,13 +4779,13 @@ pub(crate) struct App {
     pub(crate) global_config_cursor: usize,
     /// `Some` while the refresh-interval custom-value field is open (⏎ opens,
     /// owns keyboard). Space/`+`/`-` still cycle the presets when `None`.
-    pub(crate) refresh_interval_draft: Option<InputState>,
+    pub(crate) refresh_interval_draft: Option<SeededInput>,
     /// In-flight custom value for the Config tab's context-nudge editor
     /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
-    pub(crate) context_nudge_draft: Option<InputState>,
+    pub(crate) context_nudge_draft: Option<SeededInput>,
     /// In-flight custom value for the Config tab's weekly-threshold editor
     /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
-    pub(crate) weekly_threshold_draft: Option<InputState>,
+    pub(crate) weekly_threshold_draft: Option<SeededInput>,
     /// The selected account's note (the usage tab's `notes:` row). Loaded on
     /// cursor moves, tab switches with a clamped cursor, and saves — never per
     /// frame.
@@ -4849,6 +5034,16 @@ pub(crate) struct App {
     /// second press of the SAME key confirms; the other quit key re-arms as
     /// itself.
     pub(crate) armed_quit: Option<QuitKey>,
+    /// The switch or quit target a loss-warning `save` is holding until an
+    /// async commit (a shunt save) lands: its success resolves it, its refusal
+    /// cancels it. While `Some`, a further switch/quit key does nothing new.
+    pub(crate) loss_pending: Option<LossWarningTarget>,
+    /// The extra state a held `save` carries to its landing: the deferred sync
+    /// items of an already-started async item, or a marker that a field save
+    /// owned the worker so the whole save must re-run. `None` when the hold is
+    /// a direct switch/quit over an in-flight save: nothing to commit, and the
+    /// gate re-runs on both outcomes.
+    pub(crate) loss_pending_sync: Option<LossPendingSync>,
     /// Live footer alert; replaces the hint bar in place while `Some`.
     /// Cleared on disarm, tab switch, or explicit `x` dismiss.
     pub(crate) footer_alert: Option<FooterAlert>,
@@ -5530,6 +5725,8 @@ impl App {
             tick_count: 0,
             quit: false,
             armed_quit: None,
+            loss_pending: None,
+            loss_pending_sync: None,
             footer_alert: None,
             banner: None,
             last_divergence_check: Some(Instant::now()),
@@ -7759,8 +7956,19 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     // modal, an editor or an ⌥-jump never sees the key.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if app.armed_quit == Some(QuitKey::CtrlC) {
-            app.quit = true;
-            app.shutting_down.store(true, Ordering::SeqCst);
+            // A second ⌃c over an open switch warning retargets it to the quit
+            // form; over a quit warning it does nothing more; elsewhere it
+            // quits, or opens the quit warning over changed work.
+            let warning_open = matches!(app.modals.last(), Some(Modal::LossWarning(_)));
+            if let Some(Modal::LossWarning(state)) = app.modals.last_mut()
+                && state.target != LossWarningTarget::Quit
+            {
+                state.target = LossWarningTarget::Quit;
+            }
+            app.disarm_quit();
+            if !warning_open {
+                request_quit(app);
+            }
         } else {
             app.armed_quit = Some(QuitKey::CtrlC);
             app.footer_alert = Some(FooterAlert::Warn(format!(
@@ -7987,8 +8195,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                     app.status.focus = StatusFocus::List;
                 }
             } else if app.armed_quit == Some(QuitKey::Q) {
-                app.quit = true;
-                app.shutting_down.store(true, Ordering::SeqCst);
+                request_quit(app);
             } else {
                 // Armed by ctrl+c, or not armed: q runs its own job and arms
                 // (or re-arms) its own quit.
@@ -8312,81 +8519,236 @@ fn dash_row_start(rows: &[(u16, u16)], mut i: usize) -> usize {
     i
 }
 
-/// The warned work: an open typed field on an existing account (Setup) or a
-/// member card (Fallback) whose buffer differs from that field's saved value.
-/// Everything else suspends with no warning.
-fn shared_draft(app: &App) -> Option<LossWarningDrop> {
-    if app.tab == Tab::Setup
-        && app.config_focus == ConfigFocus::Actions
-        && let Some(d) = app.config_draft.as_ref()
-        && let Some(name) = d.editing_name.as_deref()
+/// Every changed edit and staged pick, in `Tab::ALL` order. The single source
+/// the switch, quit, retarget, `save` validation and the body's screen list
+/// all read, so a new editor can never warn on a switch and not on a quit. An
+/// edit is changed when its buffer differs from the value it opened from; a
+/// staged pick when the staged value differs from the saved one. Clean edits
+/// never appear here and suspend silently.
+fn changed_work(app: &App) -> Vec<Dirty> {
+    let mut out = Vec::new();
+    // Usage: the note editor (Tab::ALL puts Usage before Setup).
+    if app.note_editor.as_ref().is_some_and(note_dirty) {
+        out.push(Dirty::Note);
+    }
+    // Setup: an open existing-account field, then the `+ new` form (typed work,
+    // open or suspended, a field open or not).
+    if let Some(d) = app.config_draft.as_ref()
+        && d.editing_name.is_some()
         && let Some(field) = d.active
+        && d.field(field)
+            .is_some_and(|input| Some(input.value.as_str()) != d.field_seed.as_deref())
     {
-        let name = ProfileName::from(name);
-        let saved = {
-            let cfg = app.config();
-            row_committed_value(cfg.find(&name), &name, field)
-        };
-        if d.field(field).is_some_and(|input| input.value != saved) {
-            return Some(LossWarningDrop::SetupDraft);
+        out.push(Dirty::SetupField);
+    }
+    let new_form_dirty = app
+        .config_draft
+        .as_ref()
+        .is_some_and(|d| d.editing_name.is_none() && d.holds_typed_work())
+        || app
+            .new_account_draft
+            .as_ref()
+            .is_some_and(ConfigDraft::holds_typed_work);
+    if new_form_dirty {
+        out.push(Dirty::NewAccountForm);
+    }
+    // Fallback: the member-card typed field. The day picker saves each toggle
+    // and the custom stop is UI state dropped with the card, so neither is
+    // changed work.
+    if fallback_field_dirty(app) {
+        out.push(Dirty::FallbackField);
+    }
+    if app
+        .refresh_interval_draft
+        .as_ref()
+        .is_some_and(SeededInput::dirty)
+    {
+        out.push(Dirty::RefreshInterval);
+    }
+    if app
+        .context_nudge_draft
+        .as_ref()
+        .is_some_and(SeededInput::dirty)
+    {
+        out.push(Dirty::ContextNudge);
+    }
+    if app
+        .weekly_threshold_draft
+        .as_ref()
+        .is_some_and(SeededInput::dirty)
+    {
+        out.push(Dirty::WeeklyThreshold);
+    }
+    if app
+        .services
+        .herdr_tag_draft
+        .as_ref()
+        .is_some_and(SeededInput::dirty)
+    {
+        out.push(Dirty::HerdrTag);
+    }
+    if let Some(key) = shunt_field_dirty(app) {
+        out.push(Dirty::ShuntField(key));
+    }
+    let draft_editor = draft_editor_dirty(app);
+    for kind in [
+        ShuntAddKind::Upstream,
+        ShuntAddKind::Model,
+        ShuntAddKind::Route,
+    ] {
+        if app.services.shunt_drafts.holds_typed_work(kind) || draft_editor == Some(kind) {
+            out.push(Dirty::ShuntAdd(kind));
         }
     }
-    if app.tab == Tab::Fallback
-        && app.fallback_focus == FallbackFocus::Detail
-        && let Some(edit) = app.fallback_edit.as_ref()
-    {
-        let cfg = app.config();
-        let profile = cfg.find(&edit.member);
-        let differs = match &edit.state {
-            CardEdit::Threshold(input) => {
-                // Compare against the value `run_fallback_row` seeds the field
-                // from (`threshold_for`: the stored threshold or the default),
-                // so an untouched field on a default-threshold member is clean.
-                let saved = profile
-                    .map(crate::fallback::threshold_for)
-                    .map(|v| format!("{v:.0}"))
-                    .unwrap_or_default();
-                input.value != saved
-            }
-            CardEdit::Weekly(input) => {
-                let saved = profile
-                    .and_then(|p| p.weekly_threshold)
-                    .map(|v| format!("{v:.0}"))
-                    .unwrap_or_default();
-                input.value != saved
-            }
-            CardEdit::MaxSpend(input) => {
-                let saved = format!(
-                    "{:.2}",
-                    profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0)
-                );
-                input.value != saved
-            }
-            CardEdit::Days(_) | CardEdit::ArmedRemove => false,
-        };
-        if differs {
-            return Some(LossWarningDrop::FallbackEdit);
-        }
-    }
-    None
+    out
 }
 
-/// A switch the user asked for: disarm it, warn over shared unsaved work, else
-/// perform it. `target == app.tab` (a jump to the active tab) does nothing.
+/// The seed `begin_refresh_interval_edit` opens the field with, in the atomic's
+/// whole seconds — the value the editor opened from.
+fn refresh_interval_seed(app: &App) -> String {
+    (app.refresh_interval.load(Ordering::Relaxed) / 1000).to_string()
+}
+
+/// The seed `begin_context_nudge_edit` opens the field with.
+fn context_nudge_seed(current: Option<u64>) -> String {
+    match current {
+        None => String::from("300k"),
+        Some(v) if v.is_multiple_of(1_000_000) => format!("{}k", v / 1000),
+        Some(v) => format_threshold_tokens(v),
+    }
+}
+
+/// Whether the Fallback member-card's open typed field differs from the value
+/// it opened from (its stored seed). The day picker saves each toggle, so it
+/// never differs.
+fn fallback_field_dirty(app: &App) -> bool {
+    let Some(edit) = app.fallback_edit.as_ref() else {
+        return false;
+    };
+    match &edit.state {
+        CardEdit::Threshold(input) | CardEdit::Weekly(input) | CardEdit::MaxSpend(input) => {
+            edit.seed.as_deref() != Some(input.value.as_str())
+        }
+        CardEdit::Days(_) | CardEdit::ArmedRemove => false,
+    }
+}
+
+/// Whether a field editor's value differs from the one it opened on. A pending
+/// cycle pick differs only when its staged value is not the saved one.
+fn shunt_edit_dirty(edit: &ShuntFieldEdit) -> bool {
+    match edit {
+        ShuntFieldEdit::Typed { input, saved } => {
+            saved.as_deref().unwrap_or("") != input.value.as_str()
+        }
+        ShuntFieldEdit::Pick { saved, picked } => saved.as_deref() != Some(picked.as_str()),
+    }
+}
+
+/// The key of the shunt field editor when it holds a value differing from the
+/// one it opened on. A `+ add` draft's field editor is its kind's typed work,
+/// never a field, and a field whose own save is still checking is not changed
+/// work (a switch or quit holds on that save instead of warning).
+fn shunt_field_dirty(app: &App) -> Option<ShuntFieldKey> {
+    let state = app.services.shunt_field_edit.as_ref()?;
+    if matches!(state.key, ShuntFieldKey::Draft { .. }) {
+        return None;
+    }
+    if app.services.saving(&ShuntSaveKey::Field(state.key.clone())) {
+        return None;
+    }
+    shunt_edit_dirty(&state.edit).then(|| state.key.clone())
+}
+
+/// The `+ add` kind whose open draft field editor holds uncommitted typed work
+/// (its buffer differs from the value it opened on), if any.
+fn draft_editor_dirty(app: &App) -> Option<ShuntAddKind> {
+    let state = app.services.shunt_field_edit.as_ref()?;
+    let ShuntFieldKey::Draft { kind, .. } = &state.key else {
+        return None;
+    };
+    shunt_edit_dirty(&state.edit).then_some(*kind)
+}
+
+/// Whether the note editor's draft differs from the note it opened from.
+fn note_dirty(editor: &NoteEditor) -> bool {
+    editor.buf.text() != editor.seed
+}
+
+/// The changed work a SWITCH away from `screen` warns over: only what sits on
+/// the screen being left. A quit keeps the whole set ([`changed_work`]).
+fn changed_work_on(app: &App, screen: Tab) -> Vec<Dirty> {
+    changed_work(app)
+        .into_iter()
+        .filter(|d| d.screen() == screen)
+        .collect()
+}
+
+/// An in-flight shunt field save: a switch or quit away from it is not changed
+/// work, but must hold until the save's outcome resolves it.
+fn in_flight_field_save(app: &App) -> bool {
+    app.services
+        .shunt_save
+        .as_ref()
+        .is_some_and(|save| matches!(save.key, ShuntSaveKey::Field(_)))
+}
+
+/// A switch the user asked for: disarm it, warn over changed work, hold on an
+/// in-flight shunt save, else perform it. `target == app.tab` (a jump to the
+/// active tab) does nothing.
 fn request_switch(app: &mut App, target: Tab) {
+    if app.loss_pending.is_some() {
+        return;
+    }
     if app.tab == target {
         return;
     }
     disarm_switch(app);
-    if let Some(drop) = shared_draft(app) {
-        app.open_modal(Modal::LossWarning(LossWarningState {
-            choice: false,
-            target,
-            drop,
-        }));
+    let dirty = changed_work_on(app, app.tab);
+    if !dirty.is_empty() {
+        open_loss_warning(app, LossWarningTarget::Switch(target), dirty);
+        return;
+    }
+    if in_flight_field_save(app) {
+        app.loss_pending = Some(LossWarningTarget::Switch(target));
         return;
     }
     do_switch(app, target);
+}
+
+/// A quit the user asked for (a second `⌃c` or `q` at the top level): warn
+/// over changed work wherever it sits, hold on an in-flight shunt save, else
+/// quit.
+fn request_quit(app: &mut App) {
+    if app.loss_pending.is_some() {
+        return;
+    }
+    app.disarm_quit();
+    let dirty = changed_work(app);
+    if !dirty.is_empty() {
+        open_loss_warning(app, LossWarningTarget::Quit, dirty);
+        return;
+    }
+    if in_flight_field_save(app) {
+        app.loss_pending = Some(LossWarningTarget::Quit);
+        return;
+    }
+    app.quit = true;
+    app.shutting_down.store(true, Ordering::SeqCst);
+}
+
+/// Open the loss warning over `dirty`. `save` is the default focus when any
+/// item can save; `go back` is, for the two-button `+ new` form.
+fn open_loss_warning(app: &mut App, target: LossWarningTarget, dirty: Vec<Dirty>) {
+    let focus = if dirty.iter().any(|d| d.saveable()) {
+        LossWarningButton::Save
+    } else {
+        LossWarningButton::GoBack
+    };
+    app.open_modal(Modal::LossWarning(LossWarningState {
+        focus,
+        target,
+        drop: LossWarningDrop { dirty },
+    }));
 }
 
 /// Perform a switch: suspend the pane it leaves, then land.
@@ -8410,23 +8772,13 @@ fn disarm_switch(app: &mut App) {
     }
 }
 
-/// Whether a suspended `+ new` form holds typed work: the form's own home
-/// (`new_account_draft`, an at-rest suspend) or a field-open one still sitting
-/// in `config_draft` (a suspend that kept the edit open).
-fn suspended_new_form_holds_typed_work(app: &App) -> bool {
-    app.new_account_draft
-        .as_ref()
-        .is_some_and(ConfigDraft::holds_typed_work)
-        || app
-            .config_draft
-            .as_ref()
-            .is_some_and(|d| d.editing_name.is_none() && d.holds_typed_work())
-}
-
 /// The one writer of `new_account_draft`. A suspended `+ new` form holding
 /// typed work is never overwritten: the incoming draft is handed back to the
 /// caller, which keeps it, so no slot write can drop a form and no UI path
-/// panics. `Some(draft)` = refused and returned; `None` = stored.
+/// panics. `Some(draft)` = refused and returned; `None` = stored. Only a clean
+/// form reaches the slot (a switch or jump over a typed form warns instead,
+/// and the preset-picker cancel restores a clean one); the guard stays so no
+/// slot write can drop whatever it holds.
 fn set_new_account_draft(app: &mut App, draft: ConfigDraft) -> Option<ConfigDraft> {
     if app
         .new_account_draft
@@ -8647,6 +8999,136 @@ fn switch_tab(app: &mut App, tab: Tab) {
             recompute_services_checks(app, false, ShuntRefresh::Restart);
         }
     }
+    reseed_edits(app);
+}
+
+/// Re-seed every suspended open editor from its current stored value on
+/// landing, but only the CLEAN ones (buffer == seed): a clean edit whose
+/// stored value changed while it was suspended (an out-of-band reload) returns
+/// holding the new value, caret at the end, so it never returns changed; a
+/// dirty edit keeps its typed text and stays dirty whatever the store did.
+fn reseed_edits(app: &mut App) {
+    // Setup existing-account field.
+    if let Some((name, field)) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| Some((d.editing_name.clone()?, d.active?)))
+    {
+        let name = ProfileName::from(name.as_str());
+        let saved = {
+            let cfg = app.config();
+            row_committed_value(cfg.find(&name), &name, field)
+        };
+        if let Some(d) = app.config_draft.as_mut() {
+            let clean = d
+                .field(field)
+                .is_some_and(|input| d.field_seed.as_deref() == Some(input.value.as_str()));
+            if clean && d.field(field).is_some_and(|input| input.value != saved) {
+                if let Some(input) = d.field_mut(field) {
+                    *input = InputState::new(&saved);
+                }
+                d.field_seed = Some(saved);
+            }
+        }
+    }
+    // Fallback member field.
+    let fallback_saved: Option<String> = app.fallback_edit.as_ref().and_then(|edit| {
+        let cfg = app.config();
+        let profile = cfg.find(&edit.member);
+        match &edit.state {
+            CardEdit::Threshold(_) => Some(
+                profile
+                    .map(crate::fallback::threshold_for)
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_default(),
+            ),
+            CardEdit::Weekly(_) => Some(
+                profile
+                    .and_then(|p| p.weekly_threshold)
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_default(),
+            ),
+            CardEdit::MaxSpend(_) => Some(format!(
+                "{:.2}",
+                profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0)
+            )),
+            CardEdit::Days(_) | CardEdit::ArmedRemove => None,
+        }
+    });
+    if let Some(saved) = fallback_saved
+        && let Some(edit) = app.fallback_edit.as_mut()
+        && let Some(input) = edit.state.input_mut()
+        && edit.seed.as_deref() == Some(input.value.as_str())
+        && input.value != saved
+    {
+        *input = InputState::new(&saved);
+        edit.seed = Some(saved);
+    }
+    // Config editors.
+    let refresh_seed = refresh_interval_seed(app);
+    if let Some(draft) = app.refresh_interval_draft.as_mut() {
+        draft.reseed(&refresh_seed);
+    }
+    let nudge_seed = context_nudge_seed(app.config().state.context_nudge_threshold_tokens());
+    if let Some(draft) = app.context_nudge_draft.as_mut() {
+        draft.reseed(&nudge_seed);
+    }
+    let weekly_seed = format_weekly_pct(app.config().state.weekly_switch_threshold_pct());
+    if let Some(draft) = app.weekly_threshold_draft.as_mut() {
+        draft.reseed(&weekly_seed);
+    }
+    // Services herdr tag.
+    let herdr_seed = app.config().state.herdr.tag_watch_secs.to_string();
+    if let Some(draft) = app.services.herdr_tag_draft.as_mut() {
+        draft.reseed(&herdr_seed);
+    }
+    // Shunt field editor: re-seed the typed input and its `saved` seed from the
+    // current view when clean; a pending pick re-seeds its `saved` too.
+    reseed_shunt_field(app);
+    // Usage note editor.
+    if let Some(editor) = app.note_editor.as_mut() {
+        let saved = crate::profile_notes::load_note(&editor.profile).unwrap_or_default();
+        if editor.buf.text() == editor.seed && saved != editor.seed {
+            editor.buf = NoteBuffer::new(&saved);
+            editor.seed = saved;
+        }
+    }
+}
+
+/// Re-seed a clean suspended shunt `Typed` editor from the current config
+/// view: a buffer equal to its `saved` seed takes the newer stored value
+/// (buffer and seed), caret at the end. A dirty editor stays untouched; a
+/// pending `Pick` is staged work and is left alone.
+fn reseed_shunt_field(app: &mut App) {
+    let Some(state) = app.services.shunt_field_edit.as_ref() else {
+        return;
+    };
+    if let ShuntFieldKey::Draft { .. } = state.key {
+        return;
+    }
+    let ShuntFieldEdit::Typed { input, saved } = &state.edit else {
+        return;
+    };
+    // The same clean test `shunt_field_dirty` uses: an unset field reads as
+    // empty, so a buffer equal to its (unset or set) seed is clean.
+    if saved.as_deref().unwrap_or("") != input.value.as_str() {
+        return;
+    }
+    let Some(view) = config_view(app) else {
+        return;
+    };
+    let current = shunt_field_value(view, &app.services.shunt_drafts, &state.key).flatten();
+    if current == *saved {
+        return;
+    }
+    let Some(state) = app.services.shunt_field_edit.as_mut() else {
+        return;
+    };
+    let ShuntFieldEdit::Typed { input, saved } = &mut state.edit else {
+        return;
+    };
+    *input = InputState::new(current.as_deref().unwrap_or(""));
+    *saved = current;
 }
 
 /// Move `profile_cursor` by `delta`, wrapping in `0..len`.
@@ -8936,25 +9418,29 @@ fn open_note_editor(app: &mut App) {
     let text = crate::profile_notes::load_note(&name).unwrap_or_default();
     app.note_editor = Some(NoteEditor {
         profile: name,
+        seed: text.clone(),
         buf: NoteBuffer::new(&text),
     });
 }
 
 /// `⏎` in the note editor: persist the draft (an empty draft clears the note).
-/// A failed save keeps the editor open — the draft is the only copy.
-fn commit_note(app: &mut App) {
+/// A failed save keeps the editor open — the draft is the only copy. Returns
+/// whether the commit landed.
+fn commit_note(app: &mut App) -> bool {
     let Some(editor) = app.note_editor.take() else {
-        return;
+        return true;
     };
     let text = editor.buf.text();
     match crate::profile_notes::save_note(&editor.profile, &text) {
         Ok(()) => {
             app.note_text = crate::profile_notes::load_note(&editor.profile);
             app.toast(ToastKind::Success, "note saved");
+            true
         }
         Err(e) => {
             app.note_editor = Some(editor);
             app.toast(ToastKind::Danger, format!("couldn't save the note: {e}"));
+            false
         }
     }
 }
@@ -8995,7 +9481,9 @@ fn handle_note_editor_key(app: &mut App, key: KeyEvent) {
         _ => return,
     };
     match action {
-        NoteKey::Commit => commit_note(app),
+        NoteKey::Commit => {
+            let _ = commit_note(app);
+        }
         NoteKey::Cancel => app.note_editor = None,
         _ => {
             let Some(editor) = app.note_editor.as_mut() else {
@@ -9445,7 +9933,9 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
                 open_shunt_field_editor(app, &key);
             }
             Some(ShuntFocus::Add { kind }) => toggle_shunt_add(app, *kind),
-            Some(ShuntFocus::SaveAdd { kind }) => commit_shunt_add(app, *kind),
+            Some(ShuntFocus::SaveAdd { kind }) => {
+                let _ = commit_shunt_add(app, *kind);
+            }
             Some(ShuntFocus::Remove { key }) => {
                 let key = key.clone();
                 confirm_shunt_remove(app, &key);
@@ -9783,8 +10273,19 @@ fn toggle_shunt_add(app: &mut App, kind: ShuntAddKind) {
         app.services.shunt_drafts.open(kind);
     }
     // A folded draft closes its field editor too (a draft field's included).
-    if was_open
-        && let Some(state) = &app.services.shunt_field_edit
+    if was_open {
+        close_draft_editor_if_open(app, kind);
+    }
+    rebuild_shunt_config_stops(app);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Add(kind)));
+}
+
+/// Close a folded `+ add <kind>` draft's field editor when the open editor is
+/// that kind's draft field; an editor of another kind (or a real field) stays
+/// open.
+fn close_draft_editor_if_open(app: &mut App, kind: ShuntAddKind) {
+    if let Some(state) = &app.services.shunt_field_edit
         && let ShuntFieldKey::Draft {
             kind: state_kind, ..
         } = state.key
@@ -9792,27 +10293,30 @@ fn toggle_shunt_add(app: &mut App, kind: ShuntAddKind) {
     {
         app.services.shunt_field_edit = None;
     }
-    rebuild_shunt_config_stops(app);
-    app.services
-        .set_shunt_focus(Some(ShuntFocusLine::Add(kind)));
 }
 
 /// `↵` on `save <kind>`: build the `New*` from the draft (a blank field is
 /// left out) and run it through the save worker. A required field left blank
 /// refuses before any worker runs, on the `└` line under `save <kind>`.
-fn commit_shunt_add(app: &mut App, kind: ShuntAddKind) {
+/// Returns `AsyncStarted` once the worker runs, `Refused` otherwise.
+fn commit_shunt_add(app: &mut App, kind: ShuntAddKind) -> CommitResult {
     if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
-        return;
+        return CommitResult::AsyncStarted;
     }
     let Some(view) = config_view(app).cloned() else {
-        return;
+        return CommitResult::Refused;
     };
     match build_add_edit(&view, &app.services.shunt_drafts, kind) {
         AddDraft::Refuse(sentence) => {
             app.services.shunt_drafts.set_refusal(kind, sentence);
+            CommitResult::Refused
         }
         AddDraft::Edit(edit) => {
-            start_shunt_save(app, ShuntSaveKey::SaveAdd(kind), *edit, false);
+            if start_shunt_save(app, ShuntSaveKey::SaveAdd(kind), *edit, false) {
+                CommitResult::AsyncStarted
+            } else {
+                CommitResult::Refused
+            }
         }
     }
 }
@@ -10157,7 +10661,9 @@ fn handle_shunt_field_edit_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             app.services.shunt_field_edit = None;
         }
-        KeyCode::Enter => commit_shunt_field(app, &state.key),
+        KeyCode::Enter => {
+            let _ = commit_shunt_field(app, &state.key);
+        }
         KeyCode::Char(' ') if matches!(state.edit, ShuntFieldEdit::Pick { .. }) => {
             step_shunt_pick(app, &state.key);
         }
@@ -10173,9 +10679,86 @@ fn handle_shunt_field_edit_key(app: &mut App, key: KeyEvent) {
 
 /// `↵` in a field editor: build the edit and either save it (through a confirm
 /// for a bind restart or a cascading rename) or show the dry run's refusal.
-fn commit_shunt_field(app: &mut App, key: &ShuntFieldKey) {
+/// How one changed item's commit resolved under a loss-warning `save`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitResult {
+    /// Committed synchronously.
+    Landed,
+    /// An async save worker started; its outcome resolves (or cancels) the
+    /// hold on the switch/quit target.
+    AsyncStarted,
+    /// The item refused at commit time; the editor stays open.
+    Refused,
+    /// The commit opened a further dialog instead of landing.
+    Dialog,
+}
+
+/// The further confirm a real shunt field's save opens instead of starting
+/// the save: a rename cascade, or a bind restart. `None` = save directly. The
+/// save's dialog pre-check and the commit both read this, so the two can never
+/// disagree.
+fn shunt_field_confirm(app: &App, state: &ShuntFieldEditState) -> Option<ConfirmState> {
+    if matches!(state.key, ShuntFieldKey::Draft { .. }) {
+        return None;
+    }
+    let typed = match &state.edit {
+        ShuntFieldEdit::Typed { input, .. } => input.value.clone(),
+        ShuntFieldEdit::Pick { picked, .. } => picked.clone(),
+    };
+    let view = config_view(app)?;
+    let edit = edit_for_field(view, &state.key, &typed)?;
+    if is_rename_field(&state.key) {
+        let record = app.services.shunt_record.clone()?;
+        if let Ok(Some(cascade)) = crate::gateway_edit::plan_cascade(&record, &edit)
+            && cascade_has_refs(&cascade, &state.key)
+        {
+            let counts = rename_counts_line(&cascade, &state.key);
+            let kind = match &state.key {
+                ShuntFieldKey::Upstream { .. } => "upstream",
+                _ => "model",
+            };
+            let from = rename_from(&state.key);
+            return Some(ConfirmState {
+                message: format!(
+                    "rename {kind} \"{from}\" to \"{}\"?",
+                    escape_control(&typed)
+                ),
+                detail: Some(format!("also renames it in {counts}.")),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::RenameField {
+                    key: state.key.clone(),
+                    edit: Box::new(edit),
+                },
+            });
+        }
+        return None;
+    }
+    if state.key == ShuntFieldKey::Bind {
+        let changed = match &state.edit {
+            ShuntFieldEdit::Typed { saved, .. } => saved.as_deref().unwrap_or("") != typed.as_str(),
+            ShuntFieldEdit::Pick { .. } => true,
+        };
+        if changed && bind_save_needs_confirm(app) {
+            let detail = bind_restart_detail(app, &typed);
+            return Some(ConfirmState {
+                message: "restart shunt?".to_string(),
+                detail: Some(detail),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::RestartBind {
+                    key: state.key.clone(),
+                    edit: Box::new(edit),
+                },
+            });
+        }
+    }
+    None
+}
+
+fn commit_shunt_field(app: &mut App, key: &ShuntFieldKey) -> CommitResult {
     let Some(state) = app.services.shunt_field_edit.clone() else {
-        return;
+        return CommitResult::Refused;
     };
     let typed = match &state.edit {
         ShuntFieldEdit::Typed { input, .. } => input.value.clone(),
@@ -10190,79 +10773,36 @@ fn commit_shunt_field(app: &mut App, key: &ShuntFieldKey) {
         app.services.shunt_drafts.clear_refusal(*kind);
         app.services.shunt_field_edit = None;
         rebuild_shunt_config_stops(app);
-        return;
+        return CommitResult::Landed;
+    }
+    // A rename cascade or a bind restart opens a confirm instead of saving.
+    if let Some(confirm) = shunt_field_confirm(app, &state) {
+        app.disarm_quit();
+        app.open_modal(Modal::Confirm(confirm));
+        return CommitResult::Dialog;
     }
     let Some(record) = app.services.shunt_record.clone() else {
-        return;
+        return CommitResult::Refused;
     };
     let Some(view) = config_view(app).cloned() else {
-        return;
+        return CommitResult::Refused;
     };
     let Some(edit) = edit_for_field(&view, key, &typed) else {
-        return;
+        return CommitResult::Refused;
     };
-
-    // A rename dry-runs the same edit (no write, no check) and counts what
-    // else it touches; any count confirms first.
-    if is_rename_field(key) {
-        match crate::gateway_edit::plan_cascade(&record, &edit) {
-            Ok(Some(cascade)) if cascade_has_refs(&cascade, key) => {
-                let counts = rename_counts_line(&cascade, key);
-                let kind = match key {
-                    ShuntFieldKey::Upstream { .. } => "upstream",
-                    _ => "model",
-                };
-                let from = rename_from(key);
-                app.disarm_quit();
-                app.open_modal(Modal::Confirm(ConfirmState {
-                    message: format!(
-                        "rename {kind} \"{from}\" to \"{}\"?",
-                        escape_control(&typed)
-                    ),
-                    detail: Some(format!("also renames it in {counts}.")),
-                    choice: false,
-                    scroll: ConfirmScroll::default(),
-                    on_confirm: ConfirmAction::RenameField {
-                        key: key.clone(),
-                        edit: Box::new(edit),
-                    },
-                }));
-                return;
-            }
-            Err(e) => {
-                show_field_refusal(app, key, &e);
-                return;
-            }
-            Ok(_) => {}
-        }
+    // A rename with no cascade still dry-runs; a refused dry-run keeps the
+    // editor open with its `└` sentence.
+    if is_rename_field(key)
+        && let Err(e) = crate::gateway_edit::plan_cascade(&record, &edit)
+    {
+        show_field_refusal(app, key, &e);
+        return CommitResult::Refused;
     }
-
-    // A bind save restarts the gateway: confirm while supervised and running
-    // (and the value actually changed — an equal-value save writes nothing;
-    // an emptied bind over an unset one is no change either).
-    if key == &ShuntFieldKey::Bind {
-        let changed = match &state.edit {
-            ShuntFieldEdit::Typed { saved, .. } => saved.as_deref().unwrap_or("") != typed.as_str(),
-            ShuntFieldEdit::Pick { .. } => true,
-        };
-        if changed && bind_save_needs_confirm(app) {
-            let detail = bind_restart_detail(app, &typed);
-            app.disarm_quit();
-            app.open_modal(Modal::Confirm(ConfirmState {
-                message: "restart shunt?".to_string(),
-                detail: Some(detail),
-                choice: false,
-                scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::RestartBind {
-                    key: key.clone(),
-                    edit: Box::new(edit),
-                },
-            }));
-            return;
-        }
+    if start_shunt_save(app, ShuntSaveKey::Field(key.clone()), edit, false) {
+        CommitResult::AsyncStarted
+    } else {
+        CommitResult::Refused
     }
-
-    start_shunt_save(app, ShuntSaveKey::Field(key.clone()), edit, false);
 }
 
 /// The rename confirm's `from`: the entry's current name/id, control-escaped
@@ -10400,20 +10940,21 @@ fn show_field_refusal(app: &mut App, key: &ShuntFieldKey, err: &anyhow::Error) {
 /// every config save, token add and token remove shares; a second toasts the
 /// guard). `value`/`entry` are the [`ShuntSave`] fields the config-save path
 /// carries for its row; token jobs pass none. A field's editor stays open with
-/// the typed text until the outcome lands.
+/// the typed text until the outcome lands. Returns whether the worker started;
+/// `false` means the guard refused and nothing was enqueued.
 fn start_on_save_worker(
     app: &mut App,
     key: ShuntSaveKey,
     value: Option<String>,
     entry: Option<ShuntEntryKey>,
     job: ShuntActionJob,
-) {
+) -> bool {
     if app.services.shunt_save_worker.running {
         app.toast(
             ToastKind::Info,
             "a save is still checking\nwait for it, then save again",
         );
-        return;
+        return false;
     }
     app.services.shunt_save = Some(ShuntSave {
         key,
@@ -10422,17 +10963,20 @@ fn start_on_save_worker(
         entry,
     });
     app.services.shunt_save_worker.start(job);
+    true
 }
 
 /// Start the save worker for one config row (the outcome drains on the tick).
+/// Returns whether the worker started, so a one-save-guard refusal is a real
+/// refusal, never an "async started".
 fn start_shunt_save(
     app: &mut App,
     key: ShuntSaveKey,
     edit: crate::gateway_edit::Edit,
     confirmed: bool,
-) {
+) -> bool {
     let Some(record) = app.services.shunt_record.clone() else {
-        return;
+        return false;
     };
     let entry = add_edit_entry_key(&edit, config_view(app));
     start_on_save_worker(
@@ -10446,7 +10990,7 @@ fn start_shunt_save(
             key,
             confirmed,
         },
-    );
+    )
 }
 
 /// Start a token remove on the one save worker (the same one-save slot every
@@ -11039,17 +11583,19 @@ fn cycle_herdr_popup_width(app: &mut App) {
 /// refresh-interval editor's mechanism.
 fn begin_herdr_tag_edit(app: &mut App) {
     let secs = app.config().state.herdr.tag_watch_secs;
-    app.services.herdr_tag_draft = Some(InputState::new(&secs.to_string()));
+    app.services.herdr_tag_draft = Some(SeededInput::new(&secs.to_string()));
 }
 
 /// Keystrokes while the herdr tag-refresh editor is open: ⏎ saves, ⎋ discards.
 fn handle_herdr_tag_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.services.herdr_tag_draft = None,
-        KeyCode::Enter => commit_herdr_tag_edit(app),
+        KeyCode::Enter => {
+            let _ = commit_herdr_tag_edit(app);
+        }
         _ => {
-            if let Some(input) = app.services.herdr_tag_draft.as_mut() {
-                apply_input_edit(input, key);
+            if let Some(draft) = app.services.herdr_tag_draft.as_mut() {
+                apply_input_edit(&mut draft.input, key);
             }
         }
     }
@@ -11057,20 +11603,31 @@ fn handle_herdr_tag_edit_key(app: &mut App, key: KeyEvent) {
 
 /// Parse and persist the typed tag-refresh seconds. A value under 1s keeps the
 /// draft open so the inline Invalid-input treatment stays on screen — no toast.
-fn commit_herdr_tag_edit(app: &mut App) {
-    let Some(raw) = app.services.herdr_tag_draft.as_ref().map(|i| i.trimmed()) else {
-        return;
+/// Returns whether the commit landed.
+fn commit_herdr_tag_edit(app: &mut App) -> bool {
+    let Some(raw) = app
+        .services
+        .herdr_tag_draft
+        .as_ref()
+        .map(|i| i.input.trimmed())
+    else {
+        return true;
     };
     let Some(secs) = parse_herdr_tag_secs(raw) else {
-        return;
+        return false;
     };
-    {
+    let saved = {
         let mut cfg = app.config();
         cfg.state.herdr.tag_watch_secs = secs;
-        let _ = save_app_state(&cfg.state);
+        save_app_state(&cfg.state)
+    };
+    if let Err(e) = saved {
+        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        return false;
     }
     app.rebaseline_and_forget(reload_fingerprint());
     app.services.herdr_tag_draft = None;
+    true
 }
 
 /// A typed tag-refresh value is valid only as a whole number of seconds, at
@@ -11731,6 +12288,106 @@ fn refusal_row_visible(app: &App, on_row: bool) -> bool {
         && on_row
 }
 
+/// Re-run the held trigger's own gate: a quit or the original switch/jump
+/// target, re-deriving changed work so it never lands over work opened during
+/// the hold.
+fn re_run_gate(app: &mut App, target: LossWarningTarget) {
+    match target {
+        LossWarningTarget::Quit => request_quit(app),
+        target => request_target(app, target),
+    }
+}
+
+/// How committing a held save's deferred sync items resolved.
+enum DeferredSettle {
+    /// Every item committed; the gate may re-run.
+    Landed,
+    /// An item refused (focused, red); the gate re-runs and warns over it.
+    Refused,
+    /// An item's ↵ opened a dialog; input is owned by the dialog.
+    Dialog,
+}
+
+/// Commit the deferred sync items of a held save, re-validating and re-running
+/// the dialog check first (state may have moved during the hold). Each refusal
+/// or dialog focuses/opens its own surface and stops the rest.
+fn settle_deferred_sync(app: &mut App, sync: &[Dirty]) -> DeferredSettle {
+    for d in sync.iter().cloned() {
+        if !validate_dirty(app, d.clone()) {
+            focus_dirty(app, d.clone());
+            let _ = commit_dirty(app, d);
+            return DeferredSettle::Refused;
+        }
+    }
+    for d in sync.iter().cloned() {
+        if commit_opens_dialog(app, d.clone()) {
+            let _ = commit_dirty(app, d);
+            return DeferredSettle::Dialog;
+        }
+    }
+    for d in sync.iter().cloned() {
+        match commit_dirty(app, d.clone()) {
+            CommitResult::Landed => {}
+            CommitResult::Refused => {
+                focus_dirty(app, d);
+                return DeferredSettle::Refused;
+            }
+            CommitResult::Dialog => return DeferredSettle::Dialog,
+            CommitResult::AsyncStarted => {}
+        }
+    }
+    DeferredSettle::Landed
+}
+
+/// Resolve (or cancel) the switch/quit a held save is waiting on. A landed
+/// save commits its deferred sync items (re-validated) then re-runs the
+/// trigger's own gate; an in-flight-field hold re-runs the save over the warned
+/// items still changed on its landing, or the gate when anything outside them
+/// changed, and re-runs the gate on a refusal. A direct
+/// hold (no warning shown) re-runs the gate on both outcomes, so a refused
+/// field warns over its open, red, changed self; a save's hold cancels on
+/// refusal and leaves the item open with its own `└` sentence. A no-op when no
+/// save was held.
+fn settle_loss_pending(app: &mut App, success: bool) {
+    let Some(target) = app.loss_pending.take() else {
+        return;
+    };
+    match app.loss_pending_sync.take() {
+        Some(LossPendingSync::Deferred(sync)) => {
+            if success {
+                match settle_deferred_sync(app, &sync) {
+                    DeferredSettle::Landed | DeferredSettle::Refused => re_run_gate(app, target),
+                    DeferredSettle::Dialog => {}
+                }
+            }
+        }
+        Some(LossPendingSync::RerunSave(warned)) => {
+            if success {
+                let still = loss_dirty_for(app, &target);
+                if still.iter().any(|d| !warned.contains(d)) {
+                    re_run_gate(app, target);
+                } else if still.is_empty() {
+                    resolve_target(app, target);
+                } else {
+                    let _ = try_save_all(app, &still, target);
+                }
+            } else {
+                re_run_gate(app, target);
+            }
+        }
+        None => re_run_gate(app, target),
+    }
+}
+
+/// The changed work a held target's save covers: everything for a quit, the
+/// screen being left for a switch or jump.
+fn loss_dirty_for(app: &App, target: &LossWarningTarget) -> Vec<Dirty> {
+    match target {
+        LossWarningTarget::Quit => changed_work(app),
+        _ => changed_work_on(app, app.tab),
+    }
+}
+
 /// One shunt-card action's result: the toast, every error `Display` escaped
 /// (it can interpolate an untrusted path), the moved count singular at 1. The
 /// plan/pool caches are dropped by the drain's recompute (which restarts their
@@ -11971,6 +12628,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                     );
                 }
             }
+            settle_loss_pending(app, true);
         }
         ShuntActionOutcome::ConfigRefused { key, sentence } => {
             app.services.shunt_save = None;
@@ -12042,6 +12700,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                     unreachable!("the require never yields ConfigRefused")
                 }
             }
+            settle_loss_pending(app, false);
         }
         ShuntActionOutcome::ConfigCheckFailed {
             error,
@@ -12054,6 +12713,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                 format!("save failed\n{}", escape_control(&error)),
             );
             hold_check_output(app, &config, CheckOutputSource::ConfigSave, check_output);
+            settle_loss_pending(app, false);
         }
         ShuntActionOutcome::ConfigFailed { error } => {
             app.services.shunt_save = None;
@@ -12061,6 +12721,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                 ToastKind::Danger,
                 format!("save failed\n{}", escape_control(&error)),
             );
+            settle_loss_pending(app, false);
         }
         ShuntActionOutcome::TokenRemoved { profile, removed } => {
             app.services.shunt_save = None;
@@ -12366,23 +13027,13 @@ fn open_token_picker(app: &mut App, require: bool) {
     }));
 }
 
+/// Whether a suspended `+ new` form holds typed work: the form's own home
 /// The `+ new profile` row: open a fresh new-account form seeded with the
-/// gateway's base url and the marker naming the record it mints for, never a
-/// suspended form the user typed. A suspended `+ new` form holding typed work
-/// is displaced by the mint form (one slot cannot hold both), so the loss
-/// warning asks first; `discard` drops it and opens the mint form, `go back`
-/// leaves it and the tab alone.
+/// gateway's base url and the marker naming the record it mints for. The jump
+/// routes through the loss warning like every cross-screen jump: changed work
+/// on Services warns first, `discard` drops it and opens the mint form.
 fn open_new_profile_form(app: &mut App, require: bool) {
-    if suspended_new_form_holds_typed_work(app) {
-        disarm_switch(app);
-        app.open_modal(Modal::LossWarning(LossWarningState {
-            choice: false,
-            target: Tab::Setup,
-            drop: LossWarningDrop::NewAccountDraft { require },
-        }));
-        return;
-    }
-    open_new_profile_form_inner(app, require);
+    request_target(app, LossWarningTarget::MintForm(require));
 }
 
 /// The mint form's own open, after the warning's guard has passed: close the
@@ -16499,6 +17150,9 @@ fn cycle_theme(app: &mut App) {
 pub(crate) struct MemberEdit<T> {
     pub(crate) member: ProfileName,
     pub(crate) state: T,
+    /// The value a typed field opened from (its buffer's seed); `None` for the
+    /// day picker and the armed remove, which hold no buffer.
+    pub(crate) seed: Option<String>,
 }
 
 /// What is open on the member card. One at a time: every typed field and the
@@ -17000,18 +17654,19 @@ fn step_context_nudge(app: &mut App) {
 /// Open the inline custom-value editor for the global refresh interval, seeded
 /// with the current value in whole seconds. ⏎ commits, ⎋ discards.
 fn begin_refresh_interval_edit(app: &mut App) {
-    let secs = app.refresh_interval.load(Ordering::Relaxed) / 1000;
-    app.refresh_interval_draft = Some(InputState::new(&secs.to_string()));
+    app.refresh_interval_draft = Some(SeededInput::new(&refresh_interval_seed(app)));
 }
 
 /// Keystrokes while the refresh-interval field is open: ⏎ saves, ⎋ discards.
 fn handle_refresh_interval_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.refresh_interval_draft = None,
-        KeyCode::Enter => commit_refresh_interval_edit(app),
+        KeyCode::Enter => {
+            let _ = commit_refresh_interval_edit(app);
+        }
         _ => {
-            if let Some(input) = app.refresh_interval_draft.as_mut() {
-                apply_input_edit(input, key);
+            if let Some(draft) = app.refresh_interval_draft.as_mut() {
+                apply_input_edit(&mut draft.input, key);
             }
         }
     }
@@ -17020,21 +17675,31 @@ fn handle_refresh_interval_edit_key(app: &mut App, key: KeyEvent) {
 /// Parse and persist the typed custom interval. Invalid input keeps the draft
 /// open so the Config card's inline Invalid-input treatment (DANGER value +
 /// `└ 10–3600 s` tooltip) stays on screen until corrected — no toast.
-fn commit_refresh_interval_edit(app: &mut App) {
-    let Some(raw) = app.refresh_interval_draft.as_ref().map(|i| i.trimmed()) else {
-        return;
+/// Returns whether the commit landed.
+fn commit_refresh_interval_edit(app: &mut App) -> bool {
+    let Some(raw) = app
+        .refresh_interval_draft
+        .as_ref()
+        .map(|i| i.input.trimmed())
+    else {
+        return true;
     };
     let Some(ms) = parse_refresh_secs(raw) else {
-        return;
+        return false;
     };
     app.refresh_interval.store(ms, Ordering::Relaxed);
-    {
+    let saved = {
         let mut cfg = app.config();
         cfg.state.refresh_interval_ms = ms;
-        let _ = save_app_state(&cfg.state);
+        save_app_state(&cfg.state)
+    };
+    if let Err(e) = saved {
+        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        return false;
     }
     app.rebaseline_and_forget(reload_fingerprint());
     app.refresh_interval_draft = None;
+    true
 }
 
 /// A typed custom interval is valid only as a whole number of **seconds** that
@@ -17053,25 +17718,19 @@ pub(crate) fn parse_refresh_secs(raw: &str) -> Option<u64> {
 /// discards.
 fn begin_context_nudge_edit(app: &mut App) {
     let current = app.config().state.context_nudge_threshold_tokens();
-    let seed = match current {
-        None => String::from("300k"),
-        // Exact millions seed in k form (`2000k`), never `2M`: the parser's
-        // grammar takes digits or a single trailing k, so an M-form seed
-        // would open the editor in DANGER.
-        Some(v) if v.is_multiple_of(1_000_000) => format!("{}k", v / 1000),
-        Some(v) => format_threshold_tokens(v),
-    };
-    app.context_nudge_draft = Some(InputState::new(&seed));
+    app.context_nudge_draft = Some(SeededInput::new(&context_nudge_seed(current)));
 }
 
 /// Keystrokes while the context-nudge field is open: ⏎ saves, ⎋ discards.
 fn handle_context_nudge_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.context_nudge_draft = None,
-        KeyCode::Enter => commit_context_nudge_edit(app),
+        KeyCode::Enter => {
+            let _ = commit_context_nudge_edit(app);
+        }
         _ => {
-            if let Some(input) = app.context_nudge_draft.as_mut() {
-                apply_input_edit(input, key);
+            if let Some(draft) = app.context_nudge_draft.as_mut() {
+                apply_input_edit(&mut draft.input, key);
             }
         }
     }
@@ -17080,20 +17739,26 @@ fn handle_context_nudge_edit_key(app: &mut App, key: KeyEvent) {
 /// Parse and persist the typed threshold. Invalid input keeps the draft open
 /// so the Config card's inline Invalid-input treatment (DANGER value +
 /// `└ 50k-2M tokens` tooltip) stays on screen until corrected — no toast.
-fn commit_context_nudge_edit(app: &mut App) {
-    let Some(raw) = app.context_nudge_draft.as_ref().map(|i| i.trimmed()) else {
-        return;
+/// Returns whether the commit landed.
+fn commit_context_nudge_edit(app: &mut App) -> bool {
+    let Some(raw) = app.context_nudge_draft.as_ref().map(|i| i.input.trimmed()) else {
+        return true;
     };
     let Some(tokens) = parse_context_nudge_tokens(raw) else {
-        return;
+        return false;
     };
-    {
+    let saved = {
         let mut cfg = app.config();
         cfg.state.context_nudge_threshold_tokens = Some(tokens);
-        let _ = save_app_state(&cfg.state);
+        save_app_state(&cfg.state)
+    };
+    if let Err(e) = saved {
+        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        return false;
     }
     app.rebaseline_and_forget(reload_fingerprint());
     app.context_nudge_draft = None;
+    true
 }
 
 /// A typed context-nudge threshold is valid only as whole tokens — a plain
@@ -17134,17 +17799,19 @@ fn step_weekly_threshold(app: &mut App) {
 /// current value. ⏎ commits, ⎋ discards.
 fn begin_weekly_threshold_edit(app: &mut App) {
     let current = app.config().state.weekly_switch_threshold_pct();
-    app.weekly_threshold_draft = Some(InputState::new(&format_weekly_pct(current)));
+    app.weekly_threshold_draft = Some(SeededInput::new(&format_weekly_pct(current)));
 }
 
 /// Keystrokes while the weekly-threshold field is open: ⏎ saves, ⎋ discards.
 fn handle_weekly_threshold_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.weekly_threshold_draft = None,
-        KeyCode::Enter => commit_weekly_threshold_edit(app),
+        KeyCode::Enter => {
+            let _ = commit_weekly_threshold_edit(app);
+        }
         _ => {
-            if let Some(input) = app.weekly_threshold_draft.as_mut() {
-                apply_input_edit(input, key);
+            if let Some(draft) = app.weekly_threshold_draft.as_mut() {
+                apply_input_edit(&mut draft.input, key);
             }
         }
     }
@@ -17152,21 +17819,30 @@ fn handle_weekly_threshold_edit_key(app: &mut App, key: KeyEvent) {
 
 /// Parse and persist the typed custom weekly line. Invalid input keeps the
 /// draft open with the inline Invalid-input treatment, same as the refresh
-/// editor — no toast.
-fn commit_weekly_threshold_edit(app: &mut App) {
-    let Some(raw) = app.weekly_threshold_draft.as_ref().map(|i| i.trimmed()) else {
-        return;
+/// editor — no toast. Returns whether the commit landed.
+fn commit_weekly_threshold_edit(app: &mut App) -> bool {
+    let Some(raw) = app
+        .weekly_threshold_draft
+        .as_ref()
+        .map(|i| i.input.trimmed())
+    else {
+        return true;
     };
     let Some(pct) = parse_weekly_pct(raw) else {
-        return;
+        return false;
     };
-    {
+    let saved = {
         let mut cfg = app.config();
         cfg.state.weekly_switch_threshold = Some(pct);
-        let _ = save_app_state(&cfg.state);
+        save_app_state(&cfg.state)
+    };
+    if let Err(e) = saved {
+        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        return false;
     }
     app.rebaseline_and_forget(reload_fingerprint());
     app.weekly_threshold_draft = None;
+    true
 }
 
 /// A typed custom weekly line is valid as a finite percent (decimals allowed)
@@ -17526,17 +18202,21 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
             Some(MemberEdit {
                 member,
                 state: CardEdit::ArmedRemove,
+                ..
             }) => remove_chain_member(app, &member),
             _ => open_card_edit(app, CardEdit::ArmedRemove),
         },
     }
 }
 
-/// Open `edit` on the card, pinned to the member under the cursor.
+/// Open `edit` on the card, pinned to the member under the cursor. A typed
+/// field's seed is the value it was just constructed with.
 fn open_card_edit(app: &mut App, edit: CardEdit) {
+    let seed = edit.input().map(|i| i.value.clone());
     app.fallback_edit = selected_member_name(app).map(|member| MemberEdit {
         member,
         state: edit,
+        seed,
     });
 }
 
@@ -17544,7 +18224,9 @@ fn open_card_edit(app: &mut App, edit: CardEdit) {
 fn handle_member_field_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.fallback_edit = None,
-        KeyCode::Enter => commit_member_field(app),
+        KeyCode::Enter => {
+            let _ = commit_member_field(app);
+        }
         _ => {
             if let Some(input) = app.fallback_edit.as_mut().and_then(|e| e.state.input_mut()) {
                 apply_input_edit(input, key);
@@ -17557,33 +18239,36 @@ fn handle_member_field_key(app: &mut App, key: KeyEvent) {
 /// sits under the cursor now. Invalid input keeps the field open so the card's
 /// inline Invalid-input treatment (DANGER value + range tooltip) stays on
 /// screen until corrected — no toast.
-fn commit_member_field(app: &mut App) {
-    let Some(MemberEdit { member, state }) = app.fallback_edit.clone() else {
-        return;
+fn commit_member_field(app: &mut App) -> bool {
+    let Some(MemberEdit { member, state, .. }) = app.fallback_edit.clone() else {
+        return false;
     };
-    match state {
+    let landed = match state {
         CardEdit::Threshold(input) => {
             let Some(value) = parse_threshold(input.trimmed()) else {
-                return;
+                return false;
             };
-            write_threshold(app, &member, value);
+            write_threshold(app, &member, value)
         }
         // An EMPTY commit clears the override back to the chain-wide default.
         CardEdit::Weekly(input) => {
             let Some(value) = parse_weekly_override(input.trimmed()) else {
-                return;
+                return false;
             };
-            write_weekly_override(app, &member, value);
+            write_weekly_override(app, &member, value)
         }
         CardEdit::MaxSpend(input) => {
             let Some(value) = parse_max_spend(input.trimmed()) else {
-                return;
+                return false;
             };
-            write_max_spend(app, &member, value);
+            write_max_spend(app, &member, value)
         }
-        CardEdit::Days(_) | CardEdit::ArmedRemove => return,
+        CardEdit::Days(_) | CardEdit::ArmedRemove => return false,
+    };
+    if landed {
+        app.fallback_edit = None;
     }
-    app.fallback_edit = None;
+    landed
 }
 
 /// A typed override is a number in `0..=100`, or EMPTY — the explicit
@@ -17607,7 +18292,7 @@ fn selected_weekly_override(app: &App) -> Option<(Option<f64>, bool)> {
 }
 
 /// Write (or clear) `name`'s weekly-line override and persist.
-fn write_weekly_override(app: &mut App, name: &ProfileName, value: Option<f64>) {
+fn write_weekly_override(app: &mut App, name: &ProfileName, value: Option<f64>) -> bool {
     let save_err = {
         let mut cfg = app.config();
         match cfg.find_mut(name) {
@@ -17620,6 +18305,9 @@ fn write_weekly_override(app: &mut App, name: &ProfileName, value: Option<f64>) 
     };
     if let Some(e) = save_err {
         app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        false
+    } else {
+        true
     }
 }
 
@@ -17644,7 +18332,7 @@ fn selected_max_spend(app: &App) -> Option<f64> {
 }
 
 /// Write `name`'s ceiling and persist.
-fn write_max_spend(app: &mut App, name: &ProfileName, value: f64) {
+fn write_max_spend(app: &mut App, name: &ProfileName, value: f64) -> bool {
     let save_err = {
         let mut cfg = app.config();
         match cfg.find_mut(name) {
@@ -17657,6 +18345,9 @@ fn write_max_spend(app: &mut App, name: &ProfileName, value: f64) {
     };
     if let Some(e) = save_err {
         app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        false
+    } else {
+        true
     }
 }
 
@@ -17725,6 +18416,7 @@ fn step_preferred_days(app: &mut App) {
             app.fallback_day_stop = Some(MemberEdit {
                 member: name.clone(),
                 state: shown,
+                seed: None,
             });
             preferred_days_at(0)
         }
@@ -17744,6 +18436,7 @@ fn open_day_picker(app: &mut App) {
         app.fallback_edit = Some(MemberEdit {
             member,
             state: CardEdit::Days(DayPicker::default()),
+            seed: None,
         });
     }
 }
@@ -17787,6 +18480,7 @@ fn toggle_picked_day(app: &mut App) {
     let Some(MemberEdit {
         member,
         state: CardEdit::Days(state),
+        ..
     }) = app.fallback_edit.clone()
     else {
         return;
@@ -17872,13 +18566,13 @@ fn selected_threshold(app: &App) -> Option<f64> {
 }
 
 /// Write `name`'s threshold and persist.
-fn write_threshold(app: &mut App, name: &ProfileName, value: f64) {
+fn write_threshold(app: &mut App, name: &ProfileName, value: f64) -> bool {
     let save_err = {
         let mut cfg = app.config();
         set_member_threshold(&mut cfg, name, value).err()
     };
     let Some(e) = save_err else {
-        return;
+        return true;
     };
     // A member whose roster row vanished inside the reload window is the
     // baseline's silent no-op: the account has already left, so there is
@@ -17888,9 +18582,10 @@ fn write_threshold(app: &mut App, name: &ProfileName, value: f64) {
         ..
     }) = e.downcast_ref::<ChainEditRefusal>()
     {
-        return;
+        return true;
     }
     app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+    false
 }
 
 /// Step the threshold by `delta`, clamped to 0..=100, and persist.
@@ -19228,7 +19923,11 @@ fn profiles_naming_bind<'a>(
 /// offer leaves the focus to the descend rule (the first line in view, else
 /// none).
 fn jump_to_shunt_card(app: &mut App, focus: ShuntFocusLine) {
-    disarm_switch(app);
+    request_target(app, LossWarningTarget::ShuntCard(focus));
+}
+
+/// `jump_to_shunt_card`'s landing: switch to Services and settle the card.
+fn land_shunt_card(app: &mut App, focus: ShuntFocusLine) {
     do_switch(app, Tab::Services);
     if let Some(idx) = app.services.checks.iter().position(|c| c.label == "shunt") {
         app.services.cursor = idx;
@@ -20114,7 +20813,12 @@ fn enter_config_detail(app: &mut App) {
 /// like any other switch, then land on the `+ new` row restoring a
 /// suspended form instead of building over it.
 fn start_new_account(app: &mut App) {
-    disarm_switch(app);
+    request_target(app, LossWarningTarget::NewAccount);
+}
+
+/// `start_new_account`'s landing: switch to Setup and open (or restore) the
+/// `+ new` form.
+fn land_new_account(app: &mut App) {
     // `n` presets the type from the Overview cursor's section; with nothing
     // under the cursor it falls back on the visible filter (shunt → shunt,
     // codex → codex, else claude); any other tab (Setup included) opens on
@@ -20175,6 +20879,7 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         env_new_key: InputState::new(""),
         env_just_added: None,
         active: None,
+        field_seed: None,
         armed_action: None,
         relogin_chain: false,
         overrides_expanded: false,
@@ -20212,6 +20917,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         env_new_key: InputState::new(""),
         env_just_added: None,
         active: None,
+        field_seed: None,
         armed_action: None,
         relogin_chain: false,
         overrides_expanded: false,
@@ -20307,6 +21013,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         }
         if let Some(d) = app.config_draft.as_mut() {
             d.active = Some(row);
+            d.field_seed = d.field(row).map(|i| i.value.clone());
             if let Some(input) = d.field_mut(row) {
                 input.end();
             }
@@ -20760,6 +21467,7 @@ fn start_api_relogin(app: &mut App) {
         d.base_url.end();
         d.relogin_chain = true;
         d.active = Some(ConfigRow::BaseUrl);
+        d.field_seed = d.field(ConfigRow::BaseUrl).map(|i| i.value.clone());
     }
     if let Some(pos) = config_row_index(app, ConfigRow::BaseUrl) {
         app.config_action_cursor = pos;
@@ -21020,7 +21728,9 @@ fn handle_config_edit_key(app: &mut App, key: KeyEvent) {
     };
     match key.code {
         KeyCode::Esc => cancel_config_edit(app, active),
-        KeyCode::Enter => commit_config_field(app, active),
+        KeyCode::Enter => {
+            let _ = commit_config_field(app, active);
+        }
         _ => {
             if let Some(d) = app.config_draft.as_mut()
                 && let Some(input) = d.field_mut(active)
@@ -21191,7 +21901,7 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
 }
 
 /// ⏎ inside a field: new draft buffers; existing accounts persist per field.
-fn commit_config_field(app: &mut App, field: ConfigRow) {
+fn commit_config_field(app: &mut App, field: ConfigRow) -> CommitResult {
     let is_new = app
         .config_draft
         .as_ref()
@@ -21206,38 +21916,47 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
                 d.create_refusal = None;
             }
         }
-        return;
+        return CommitResult::Landed;
     }
     match field {
-        ConfigRow::Name => commit_rename(app),
-        ConfigRow::BaseUrl | ConfigRow::ApiKey => commit_endpoint(app),
+        ConfigRow::Name => CommitResult::from(commit_rename(app)),
+        ConfigRow::BaseUrl | ConfigRow::ApiKey => CommitResult::from(commit_endpoint(app)),
         ConfigRow::Model
         | ConfigRow::OpusModel
         | ConfigRow::SonnetModel
         | ConfigRow::HaikuModel
         | ConfigRow::FableModel
-        | ConfigRow::SubagentModel => commit_model_field(app, field),
-        ConfigRow::EnvEntry(i) => commit_env_value(app, i),
+        | ConfigRow::SubagentModel => CommitResult::from(commit_model_field(app, field)),
+        ConfigRow::EnvEntry(i) => CommitResult::from(commit_env_value(app, i)),
         ConfigRow::EnvAdd => commit_env_new_key(app),
-        ConfigRow::BellThreshold => commit_bell_threshold(app),
+        ConfigRow::BellThreshold => CommitResult::from(commit_bell_threshold(app)),
         _ => {
             if let Some(d) = app.config_draft.as_mut() {
                 d.active = None;
             }
+            CommitResult::Landed
         }
+    }
+}
+
+/// `true` = a synchronous commit landed; `false` = refused (the editor stays
+/// open with its own refusal treatment).
+impl From<bool> for CommitResult {
+    fn from(landed: bool) -> Self {
+        if landed { Self::Landed } else { Self::Refused }
     }
 }
 
 /// ⏎ on a model field: fold the trimmed buffer into the profile's
 /// [`ModelSettings`], persist, then reseed the buffer from the saved value.
-fn commit_model_field(app: &mut App, field: ConfigRow) {
+fn commit_model_field(app: &mut App, field: ConfigRow) -> bool {
     let Some(name) = app
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
         .map(ProfileName::from)
     else {
-        return;
+        return false;
     };
     let raw = app
         .config_draft
@@ -21268,24 +21987,28 @@ fn commit_model_field(app: &mut App, field: ConfigRow) {
                 }
                 d.active = None;
             }
+            true
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("model update failed\n{e}")),
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("model update failed\n{e}"));
+            false
+        }
     }
 }
 
 /// ⏎ on the `alert at` field: a value in `0..=100` sets the bell, an empty one
 /// turns it off; anything else keeps the editor open, as the Fallback card's
 /// threshold editor does.
-fn commit_bell_threshold(app: &mut App) {
+fn commit_bell_threshold(app: &mut App) -> bool {
     let raw = app
         .config_draft
         .as_ref()
         .map(|d| d.bell_threshold.trimmed().to_string())
         .unwrap_or_default();
     let Some(value) = parse_bell_threshold(&raw) else {
-        return;
+        return false;
     };
-    write_bell_threshold(app, value);
+    write_bell_threshold(app, value)
 }
 
 /// A typed `alert at` value: a number in `0..=100`, or EMPTY, which turns the
@@ -21327,14 +22050,14 @@ const DEFAULT_BELL_THRESHOLD: f64 = 95.0;
 
 /// Persist the drafted account's alert threshold, rolling memory back on a
 /// failed save, then reseed the row's buffer from what was saved.
-fn write_bell_threshold(app: &mut App, value: Option<f64>) {
+fn write_bell_threshold(app: &mut App, value: Option<f64>) -> bool {
     let Some(name) = app
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
         .map(ProfileName::from)
     else {
-        return;
+        return false;
     };
     // `-0` saves as `0`, the value a reload reads back.
     let value = value.map(|v| v + 0.0);
@@ -21362,6 +22085,7 @@ fn write_bell_threshold(app: &mut App, value: Option<f64>) {
             if let Some(d) = app.config_draft.as_mut() {
                 d.active = None;
             }
+            true
         }
         Some(Ok(())) => {
             let shown = {
@@ -21372,8 +22096,12 @@ fn write_bell_threshold(app: &mut App, value: Option<f64>) {
                 d.bell_threshold = InputState::new(&shown);
                 d.active = None;
             }
+            true
         }
-        Some(Err(e)) => app.toast(ToastKind::Danger, format!("alert update failed\n{e}")),
+        Some(Err(e)) => {
+            app.toast(ToastKind::Danger, format!("alert update failed\n{e}"));
+            false
+        }
     }
 }
 
@@ -21803,6 +22531,7 @@ fn enter_env_value_edit(app: &mut App, i: usize) {
     if let Some(d) = app.config_draft.as_mut() {
         d.env_value = InputState::new(&value);
         d.active = Some(ConfigRow::EnvEntry(i));
+        d.field_seed = Some(d.env_value.value.clone());
     }
 }
 
@@ -21811,6 +22540,7 @@ fn enter_env_add_edit(app: &mut App) {
     if let Some(d) = app.config_draft.as_mut() {
         d.env_new_key = InputState::new("");
         d.active = Some(ConfigRow::EnvAdd);
+        d.field_seed = Some(d.env_new_key.value.clone());
     }
 }
 
@@ -21818,14 +22548,14 @@ fn enter_env_add_edit(app: &mut App) {
 /// persist via [`edit_profile_env`], then reseed from the saved value.
 /// An emptied value is an unset — the entry is dropped, so neither the
 /// profile's config.toml nor the live settings.json keeps `key = ""`.
-fn commit_env_value(app: &mut App, i: usize) {
+fn commit_env_value(app: &mut App, i: usize) -> bool {
     let Some(name) = app
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
         .map(ProfileName::from)
     else {
-        return;
+        return false;
     };
     let value = app
         .config_draft
@@ -21856,7 +22586,7 @@ fn commit_env_value(app: &mut App, i: usize) {
         if let Some(d) = app.config_draft.as_mut() {
             d.active = None;
         }
-        return;
+        return true;
     };
     let result = {
         let mut cfg = app.config();
@@ -21884,21 +22614,25 @@ fn commit_env_value(app: &mut App, i: usize) {
                 d.env_value = InputState::new(&saved);
                 d.active = None;
             }
+            true
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("env update failed\n{e}")),
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("env update failed\n{e}"));
+            false
+        }
     }
 }
 
 /// ⏎ in the add-env key editor: validate, run the 3-source collision check, and
 /// either prompt (overwrite/keep/cancel) or add the key and drop into value-edit.
-fn commit_env_new_key(app: &mut App) {
+fn commit_env_new_key(app: &mut App) -> CommitResult {
     let Some(name) = app
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
         .map(ProfileName::from)
     else {
-        return;
+        return CommitResult::Refused;
     };
     let key = app
         .config_draft
@@ -21909,7 +22643,7 @@ fn commit_env_new_key(app: &mut App) {
         if let Some(d) = app.config_draft.as_mut() {
             d.active = None;
         }
-        return;
+        return CommitResult::Landed;
     }
     // A settings.json env key is a shell-style name; spaces or `=` are never valid.
     if key.contains(char::is_whitespace) || key.contains('=') {
@@ -21917,7 +22651,7 @@ fn commit_env_new_key(app: &mut App) {
             ToastKind::Danger,
             "env key can't contain spaces or '='".to_string(),
         );
-        return; // keep the editor open so the user can fix it
+        return CommitResult::Refused; // keep the editor open so the user can fix it
     }
     let base_env_keys = claude_settings_env_keys().unwrap_or_default();
     let collision = {
@@ -21929,19 +22663,28 @@ fn commit_env_new_key(app: &mut App) {
         d.active = None;
     }
     match collision {
-        Some(c) => app.open_modal(Modal::EnvCollision(env_collision_form(
-            name.to_string(),
-            key,
-            c,
-        ))),
-        None => env_add_commit(app, &name, &key),
+        Some(c) => {
+            app.open_modal(Modal::EnvCollision(env_collision_form(
+                name.to_string(),
+                key,
+                c,
+            )));
+            CommitResult::Dialog
+        }
+        None => {
+            if env_add_commit(app, &name, &key) {
+                CommitResult::Landed
+            } else {
+                CommitResult::Refused
+            }
+        }
     }
 }
 
 /// Add (when new) the custom key with an empty value, then focus its row and open
 /// the value editor. An existing key (overwrite chosen on the prompt) is edited in
-/// place — never re-blanked.
-fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) {
+/// place — never re-blanked. Returns whether the commit landed.
+fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) -> bool {
     let exists = {
         let cfg = app.config();
         cfg.find(name)
@@ -21958,14 +22701,14 @@ fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) {
             })
         };
         let Some(new_env) = new_env else {
-            return;
+            return false;
         };
         if let Err(e) = {
             let mut cfg = app.config();
             edit_profile_env(&mut cfg, name, new_env)
         } {
             app.toast(ToastKind::Danger, format!("env update failed\n{e}"));
-            return;
+            return false;
         }
         // The add persisted an empty placeholder; arm the cancel so an escape
         // in the value editor removes the row instead of keeping `key = ""`.
@@ -21979,12 +22722,13 @@ fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) {
             .and_then(|p| p.env.keys().position(|k| k == key))
     };
     let Some(idx) = idx else {
-        return;
+        return false;
     };
     if let Some(row_pos) = config_row_index(app, ConfigRow::EnvEntry(idx)) {
         app.config_action_cursor = row_pos;
     }
     enter_env_value_edit(app, idx);
+    true
 }
 
 /// Position of `row` in the current detail-row list, if present.
@@ -22137,7 +22881,9 @@ fn run_env_collision_choice(
     choice: EnvCollisionChoice,
 ) {
     match choice {
-        EnvCollisionChoice::Overwrite => env_add_commit(app, name, key),
+        EnvCollisionChoice::Overwrite => {
+            let _ = env_add_commit(app, name, key);
+        }
         EnvCollisionChoice::KeepExisting => {
             // For an own-field clash, jump to the existing entry; else just dismiss.
             if let Some(idx) = existing_idx
@@ -22172,24 +22918,24 @@ fn rebind_name_keyed_state(app: &mut App, old: &ProfileName, new: &ProfileName) 
     }
 }
 
-fn commit_rename(app: &mut App) {
+fn commit_rename(app: &mut App) -> bool {
     let Some(d) = app.config_draft.as_ref() else {
-        return;
+        return false;
     };
     let Some(old) = d.editing_name.clone() else {
-        return;
+        return false;
     };
     let new = d.name.trimmed().to_string();
     if new == old {
         if let Some(d) = app.config_draft.as_mut() {
             d.active = None;
         }
-        return;
+        return true;
     }
     let validation = validate_profile_name(&new, Harness::Claude, Some(old.as_str()));
     if let Err(e) = validation {
         app.toast(ToastKind::Danger, format!("{e}"));
-        return;
+        return false;
     }
     // The rotation guard is taken BEFORE `app.config()`: ROTATION ranks outside
     // `Config`, so acquiring it under the config guard is the inversion
@@ -22212,17 +22958,21 @@ fn commit_rename(app: &mut App) {
                 d.active = None;
             }
             app.toast(ToastKind::Success, format!("renamed '{old}' → '{new}'"));
+            true
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("rename failed\n{e}")),
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("rename failed\n{e}"));
+            false
+        }
     }
 }
 
-fn commit_endpoint(app: &mut App) {
+fn commit_endpoint(app: &mut App) -> bool {
     let Some(d) = app.config_draft.as_ref() else {
-        return;
+        return false;
     };
     let Some(name) = d.editing_name.clone().map(ProfileName::from) else {
-        return;
+        return false;
     };
     let active_field = d.active;
     let base_url = d.base_url.trimmed_some();
@@ -22262,13 +23012,18 @@ fn commit_endpoint(app: &mut App) {
                 if d.relogin_chain && active_field == Some(ConfigRow::BaseUrl) && !base.is_empty() {
                     d.api_key.end();
                     d.active = Some(ConfigRow::ApiKey);
+                    d.field_seed = Some(d.api_key.value.clone());
                 } else {
                     d.relogin_chain = false;
                     d.active = None;
                 }
             }
+            true
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("edit failed\n{e}")),
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("edit failed\n{e}"));
+            false
+        }
     }
 }
 
@@ -23240,53 +23995,521 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// The loss warning's grammar over its two buttons: `←`/`→`/`tab` step,
-/// `↵`/space choose, `esc`/`q` = `go back`. `discard` drops only the warned
-/// work and performs the action that opened it — a switch for the Setup and
-/// Fallback edits, the mint-form open for a suspended `+ new` form.
+/// The loss warning's grammar over its buttons: `←`/`→` step and stop at the
+/// ends, `tab`/`⇧tab` wrap, `↵`/space choose, `esc`/`q` = `go back`. `discard`
+/// drops the warned work, `save` validates then commits it, and whichever lands
+/// performs the switch or quit that opened the warning.
 fn handle_loss_warning_key(app: &mut App, key: KeyEvent) {
     let Some(Modal::LossWarning(state)) = app.modals.last_mut() else {
         return;
     };
     match key.code {
-        KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-            state.choice = !state.choice;
+        KeyCode::Left => {
+            state.focus = step_loss_button(state.focus, state.drop.saveable(), -1);
+        }
+        KeyCode::Right => {
+            state.focus = step_loss_button(state.focus, state.drop.saveable(), 1);
+        }
+        KeyCode::Tab => {
+            state.focus = wrap_loss_button(state.focus, state.drop.saveable(), 1);
+        }
+        KeyCode::BackTab => {
+            state.focus = wrap_loss_button(state.focus, state.drop.saveable(), -1);
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.pop_modal();
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            let discard = state.choice;
-            let target = state.target;
-            let drop = state.drop;
+            let focus = state.focus;
+            let target = state.target.clone();
+            let dirty = state.drop.dirty.clone();
             app.pop_modal();
-            if !discard {
-                return;
-            }
-            match drop {
-                LossWarningDrop::SetupDraft => {
-                    app.config_draft = None;
-                    app.config_focus = ConfigFocus::Profiles;
-                    do_switch(app, target);
-                }
-                LossWarningDrop::FallbackEdit => {
-                    app.fallback_edit = None;
-                    do_switch(app, target);
-                }
-                LossWarningDrop::NewAccountDraft { require } => {
-                    app.new_account_draft = None;
-                    if app
-                        .config_draft
-                        .as_ref()
-                        .is_some_and(|d| d.editing_name.is_none())
-                    {
-                        app.config_draft = None;
+            match focus {
+                LossWarningButton::GoBack => {}
+                LossWarningButton::Discard => {
+                    discard_dirty(app, &dirty);
+                    // A quit beside an in-flight field save holds on that save
+                    // so the process does not exit under it; a switch keeps
+                    // running behind the switch.
+                    if matches!(&target, LossWarningTarget::Quit) && in_flight_field_save(app) {
+                        app.loss_pending = Some(target);
+                    } else {
+                        resolve_target(app, target);
                     }
-                    open_new_profile_form_inner(app, require);
+                }
+                LossWarningButton::Save => {
+                    let _ = try_save_all(app, &dirty, target);
                 }
             }
         }
         _ => {}
+    }
+}
+
+/// Step the highlighted button one position left (-1) or right (1), stopping at
+/// the ends. `[go back, discard]` with nothing to save, `[go back, discard,
+/// save]` otherwise.
+fn step_loss_button(focus: LossWarningButton, saveable: bool, dir: i8) -> LossWarningButton {
+    let idx = loss_button_index(focus);
+    let count = loss_button_count(saveable);
+    let next = if dir < 0 {
+        idx.saturating_sub(1)
+    } else {
+        (idx + 1).min(count - 1)
+    };
+    loss_button_at(next)
+}
+
+/// Wrap the highlighted button forward (1) or backward (-1).
+fn wrap_loss_button(focus: LossWarningButton, saveable: bool, dir: i8) -> LossWarningButton {
+    let idx = loss_button_index(focus);
+    let count = loss_button_count(saveable);
+    let next = if dir < 0 {
+        (idx + count - 1) % count
+    } else {
+        (idx + 1) % count
+    };
+    loss_button_at(next)
+}
+
+fn loss_button_count(saveable: bool) -> usize {
+    if saveable { 3 } else { 2 }
+}
+
+fn loss_button_index(focus: LossWarningButton) -> usize {
+    match focus {
+        LossWarningButton::GoBack => 0,
+        LossWarningButton::Discard => 1,
+        LossWarningButton::Save => 2,
+    }
+}
+
+fn loss_button_at(index: usize) -> LossWarningButton {
+    match index {
+        0 => LossWarningButton::GoBack,
+        1 => LossWarningButton::Discard,
+        _ => LossWarningButton::Save,
+    }
+}
+
+/// The tab a switch-form target lands on.
+fn target_tab(target: &LossWarningTarget) -> Tab {
+    match target {
+        LossWarningTarget::Switch(tab) => *tab,
+        LossWarningTarget::ShuntCard(_) => Tab::Services,
+        LossWarningTarget::NewAccount | LossWarningTarget::MintForm(_) => Tab::Setup,
+        LossWarningTarget::Quit => Tab::Overview,
+    }
+}
+
+/// A cross-screen jump's entry: disarm, warn over changed work on the screen
+/// being left (with the jump's own landing as the target), else land.
+fn request_target(app: &mut App, target: LossWarningTarget) {
+    if app.loss_pending.is_some() {
+        return;
+    }
+    disarm_switch(app);
+    if app.tab == target_tab(&target) {
+        resolve_target(app, target);
+        return;
+    }
+    let dirty = changed_work_on(app, app.tab);
+    if !dirty.is_empty() {
+        open_loss_warning(app, target, dirty);
+        return;
+    }
+    if in_flight_field_save(app) {
+        app.loss_pending = Some(target);
+        return;
+    }
+    resolve_target(app, target);
+}
+
+/// Resolve the landing the warning's buttons answered.
+fn resolve_target(app: &mut App, target: LossWarningTarget) {
+    match target {
+        LossWarningTarget::Switch(tab) => do_switch(app, tab),
+        LossWarningTarget::Quit => {
+            app.quit = true;
+            app.shutting_down.store(true, Ordering::SeqCst);
+        }
+        LossWarningTarget::ShuntCard(focus) => land_shunt_card(app, focus),
+        LossWarningTarget::NewAccount => land_new_account(app),
+        LossWarningTarget::MintForm(require) => open_new_profile_form_inner(app, require),
+    }
+}
+
+/// Drop every changed item as its `esc` would (the open edit closes, the
+/// `+ new` form is dropped whole, a shunt `+ add` draft is folded).
+fn discard_dirty(app: &mut App, dirty: &[Dirty]) {
+    for d in dirty.iter().cloned() {
+        match d {
+            Dirty::SetupField => {
+                if let Some(field) = app.config_draft.as_ref().and_then(|d| d.active) {
+                    cancel_config_edit(app, field);
+                }
+            }
+            Dirty::NewAccountForm => {
+                if app
+                    .config_draft
+                    .as_ref()
+                    .is_some_and(|d| d.editing_name.is_none())
+                {
+                    app.config_draft = None;
+                }
+                app.new_account_draft = None;
+                app.config_focus = ConfigFocus::Profiles;
+            }
+            Dirty::FallbackField => app.fallback_edit = None,
+            Dirty::RefreshInterval => app.refresh_interval_draft = None,
+            Dirty::ContextNudge => app.context_nudge_draft = None,
+            Dirty::WeeklyThreshold => app.weekly_threshold_draft = None,
+            Dirty::HerdrTag => app.services.herdr_tag_draft = None,
+            Dirty::ShuntField(_) => app.services.shunt_field_edit = None,
+            Dirty::ShuntAdd(kind) => {
+                app.services.shunt_drafts.fold(kind);
+                close_draft_editor_if_open(app, kind);
+            }
+            Dirty::Note => app.note_editor = None,
+        }
+    }
+}
+
+/// Run a loss-warning `save`: validate every saveable changed item (a refusal
+/// runs that item's own `↵`, so its own toast or `└` sentence says why and
+/// nothing commits), detect a commit whose `↵` opens a further dialog, then
+/// commit the rest through their own `↵` paths and resolve the target only
+/// once every commit landed. One async shunt item starts first and holds while
+/// the sync items commit (re-validated) on its landing; two async items stop.
+/// A mixed set commits the saveable items and reopens the two-button warning
+/// for the rest. Returns whether the target resolved.
+fn try_save_all(app: &mut App, dirty: &[Dirty], target: LossWarningTarget) -> bool {
+    // A field save already in flight owns the one worker but is not changed
+    // work (it rode in no `dirty` list): commit nothing yet, hold the target,
+    // and re-run the save over the warned items still changed when it lands, or
+    // the gate when anything outside them changed.
+    if in_flight_field_save(app) {
+        app.loss_pending = Some(target);
+        app.loss_pending_sync = Some(LossPendingSync::RerunSave(dirty.to_vec()));
+        return false;
+    }
+    // Validate first so a commit-time refusal is only an I/O failure; a refusal
+    // runs the item's own ↵ path, which raises its own toast or `└` sentence
+    // and commits nothing.
+    for d in dirty.iter().cloned() {
+        if d.saveable() && !validate_dirty(app, d.clone()) {
+            focus_dirty(app, d.clone());
+            if let Dirty::ShuntAdd(kind) = d
+                && app.services.shunt_field_edit.as_ref().is_none_or(|state| {
+                    matches!(&state.key, ShuntFieldKey::Draft { kind: k, .. } if *k == kind)
+                })
+            {
+                app.services.focus = ServicesFocus::Detail;
+                app.services
+                    .set_shunt_focus(Some(ShuntFocusLine::SaveAdd(kind)));
+            }
+            let _ = commit_dirty(app, d);
+            return false;
+        }
+    }
+    // A commit that opens a further dialog stops the save before anything
+    // commits; that item's own ↵ runs and opens the dialog.
+    for d in dirty.iter().cloned() {
+        if d.saveable() && commit_opens_dialog(app, d.clone()) {
+            let _ = commit_dirty(app, d);
+            return false;
+        }
+    }
+    let (saveable, unsaveable): (Vec<Dirty>, Vec<Dirty>) =
+        dirty.iter().cloned().partition(|d| d.saveable());
+    // Two or more async shunt items (a changed shunt field plus a typed
+    // `+ add` draft, or two `+ add` kinds) share the one save worker, so they
+    // cannot save together: commits nothing, the warning closes, the first
+    // item (screen order) stays open to save one at a time.
+    let async_items: Vec<Dirty> = saveable
+        .iter()
+        .filter(|d| dirty_is_async(d))
+        .cloned()
+        .collect();
+    if async_items.len() > 1 {
+        if let Some(first) = async_items.first() {
+            focus_dirty(app, first.clone());
+        }
+        return false;
+    }
+    let sync_items: Vec<Dirty> = saveable
+        .iter()
+        .filter(|d| !dirty_is_async(d))
+        .cloned()
+        .collect();
+    if !unsaveable.is_empty() {
+        // A mixed set commits every saveable item (an async one starts, no
+        // hold), then the two-button form reopens for the rest (the `+ new`
+        // form, which only `discard` or `go back` settles).
+        for d in saveable.iter().cloned() {
+            match commit_dirty(app, d.clone()) {
+                CommitResult::Landed | CommitResult::AsyncStarted => {}
+                CommitResult::Refused => {
+                    focus_dirty(app, d);
+                    return false;
+                }
+                CommitResult::Dialog => return false,
+            }
+        }
+        open_loss_warning(app, target, unsaveable);
+        return false;
+    }
+    // One async shunt item starts first and holds; the sync items commit only
+    // once it lands (re-validated), so a refused `shunt check` commits nothing.
+    if let Some(async_item) = async_items.first().cloned() {
+        match commit_dirty(app, async_item.clone()) {
+            CommitResult::AsyncStarted => {
+                app.loss_pending = Some(target);
+                app.loss_pending_sync = Some(LossPendingSync::Deferred(sync_items));
+                return false;
+            }
+            CommitResult::Refused => {
+                focus_dirty(app, async_item);
+                return false;
+            }
+            CommitResult::Landed => {}
+            CommitResult::Dialog => return false,
+        }
+    }
+    for d in sync_items.iter().cloned() {
+        match commit_dirty(app, d.clone()) {
+            CommitResult::Landed => {}
+            CommitResult::AsyncStarted => {}
+            CommitResult::Refused => {
+                focus_dirty(app, d);
+                return false;
+            }
+            CommitResult::Dialog => return false,
+        }
+    }
+    resolve_target(app, target);
+    true
+}
+
+/// Whether a changed item's own `↵` path accepts it — the same predicate the
+/// `↵` path refuses on, so a `save` can never commit what the field's own ⏎
+/// would refuse.
+fn validate_dirty(app: &App, dirty: Dirty) -> bool {
+    match dirty {
+        Dirty::SetupField => setup_field_valid(app),
+        Dirty::FallbackField => fallback_field_valid(app),
+        Dirty::RefreshInterval => app
+            .refresh_interval_draft
+            .as_ref()
+            .is_some_and(|d| parse_refresh_secs(d.input.trimmed()).is_some()),
+        Dirty::ContextNudge => app
+            .context_nudge_draft
+            .as_ref()
+            .is_some_and(|d| parse_context_nudge_tokens(d.input.trimmed()).is_some()),
+        Dirty::WeeklyThreshold => app
+            .weekly_threshold_draft
+            .as_ref()
+            .is_some_and(|d| parse_weekly_pct(d.input.trimmed()).is_some()),
+        Dirty::HerdrTag => app
+            .services
+            .herdr_tag_draft
+            .as_ref()
+            .is_some_and(|d| parse_herdr_tag_secs(d.input.trimmed()).is_some()),
+        Dirty::ShuntField(_) => shunt_field_valid(app),
+        Dirty::ShuntAdd(kind) => shunt_add_valid(app, kind),
+        Dirty::Note | Dirty::NewAccountForm => true,
+    }
+}
+
+/// Whether a changed item's `↵` path opens a further dialog instead of
+/// committing: an env-key collision, a shunt rename cascade, or a bind
+/// restart. The save's dialog pre-check reads this before anything commits.
+fn commit_opens_dialog(app: &App, dirty: Dirty) -> bool {
+    match dirty {
+        Dirty::SetupField => setup_field_opens_dialog(app),
+        Dirty::ShuntField(_) => app
+            .services
+            .shunt_field_edit
+            .as_ref()
+            .is_some_and(|state| shunt_field_confirm(app, state).is_some()),
+        _ => false,
+    }
+}
+
+/// Whether a changed item commits through the one async save worker: a shunt
+/// `+ add` draft, or a real shunt field (a draft field commits in memory, never
+/// the worker). Two such items cannot save together.
+fn dirty_is_async(dirty: &Dirty) -> bool {
+    match dirty {
+        Dirty::ShuntAdd(_) => true,
+        // A `ShuntField` only ever carries a real field key (a draft field's
+        // editor is its kind's `ShuntAdd` work), so it always commits through
+        // the one async save worker.
+        Dirty::ShuntField(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether the open Setup field's `↵` path accepts its buffer — the same
+/// refusals the field's own ⏎ raises (the bell range, a bad name, an env key
+/// with a space or `=`).
+fn setup_field_valid(app: &App) -> bool {
+    let Some(d) = app.config_draft.as_ref() else {
+        return true;
+    };
+    let Some(field) = d.active else {
+        return true;
+    };
+    match field {
+        ConfigRow::BellThreshold => parse_bell_threshold(d.bell_threshold.trimmed()).is_some(),
+        ConfigRow::Name => {
+            let old = d.editing_name.clone();
+            let new = d.name.trimmed().to_string();
+            if let Some(old) = old
+                && new != old
+            {
+                validate_profile_name(&new, Harness::Claude, Some(old.as_str())).is_ok()
+            } else {
+                true
+            }
+        }
+        ConfigRow::EnvAdd => {
+            let key = d.env_new_key.trimmed();
+            // An empty key closes the editor (a no-op commit), never refuses.
+            !(key.contains(char::is_whitespace) || key.contains('='))
+        }
+        _ => true,
+    }
+}
+
+/// Whether the open Setup field's `↵` opens the env-collision dialog.
+fn setup_field_opens_dialog(app: &App) -> bool {
+    let Some(d) = app.config_draft.as_ref() else {
+        return false;
+    };
+    if d.active != Some(ConfigRow::EnvAdd) {
+        return false;
+    }
+    let Some(name) = d.editing_name.clone() else {
+        return false;
+    };
+    let key = d.env_new_key.trimmed().to_string();
+    if key.is_empty() || key.contains(char::is_whitespace) || key.contains('=') {
+        return false;
+    }
+    let base_env_keys = claude_settings_env_keys().unwrap_or_default();
+    let cfg = app.config();
+    cfg.find(&ProfileName::from(name.as_str()))
+        .and_then(|p| classify_env_key(p, &base_env_keys, &key))
+        .is_some()
+}
+
+/// Whether the Fallback member-card field's `↵` path accepts its buffer.
+fn fallback_field_valid(app: &App) -> bool {
+    let Some(edit) = app.fallback_edit.as_ref() else {
+        return true;
+    };
+    match &edit.state {
+        CardEdit::Threshold(input) => parse_threshold(input.trimmed()).is_some(),
+        CardEdit::Weekly(input) => parse_weekly_override(input.trimmed()).is_some(),
+        CardEdit::MaxSpend(input) => parse_max_spend(input.trimmed()).is_some(),
+        CardEdit::Days(_) | CardEdit::ArmedRemove => true,
+    }
+}
+
+/// Whether the shunt field editor's `↵` path can build its edit. A draft field
+/// always commits; a real field's edit must build (a rename's cascade dry run
+/// is the one further refusal, resolved by the commit itself).
+fn shunt_field_valid(app: &App) -> bool {
+    let Some(state) = app.services.shunt_field_edit.as_ref() else {
+        return true;
+    };
+    if matches!(state.key, ShuntFieldKey::Draft { .. }) {
+        return true;
+    }
+    let typed = match &state.edit {
+        ShuntFieldEdit::Typed { input, .. } => input.value.clone(),
+        ShuntFieldEdit::Pick { picked, .. } => picked.clone(),
+    };
+    let Some(view) = config_view(app).cloned() else {
+        return false;
+    };
+    edit_for_field(&view, &state.key, &typed).is_some()
+}
+
+/// The `+ add` drafts with the open draft field editor's uncommitted buffer
+/// folded in, so validation reads the text the editor holds, not just the
+/// committed draft.
+fn drafts_with_open_editor(app: &App) -> ShuntDrafts {
+    let mut drafts = app.services.shunt_drafts.clone();
+    if let Some(state) = app.services.shunt_field_edit.as_ref()
+        && let ShuntFieldKey::Draft { kind, field } = &state.key
+    {
+        let value = match &state.edit {
+            ShuntFieldEdit::Typed { input, .. } => input.value.clone(),
+            ShuntFieldEdit::Pick { picked, .. } => picked.clone(),
+        };
+        set_draft_field_value(&mut drafts, *kind, field, &value);
+    }
+    drafts
+}
+
+/// Whether a shunt `+ add` draft's own `save <kind>` path accepts it: the add
+/// must build (a required field left blank refuses). The open draft field
+/// editor's uncommitted buffer counts, so a name held only in the open editor
+/// passes.
+fn shunt_add_valid(app: &App, kind: ShuntAddKind) -> bool {
+    let Some(view) = config_view(app) else {
+        return false;
+    };
+    matches!(
+        build_add_edit(view, &drafts_with_open_editor(app), kind),
+        AddDraft::Edit(_)
+    )
+}
+
+/// Commit one changed item through its own `↵` path.
+fn commit_dirty(app: &mut App, dirty: Dirty) -> CommitResult {
+    match dirty {
+        Dirty::SetupField => {
+            if let Some(field) = app.config_draft.as_ref().and_then(|d| d.active) {
+                commit_config_field(app, field)
+            } else {
+                CommitResult::Refused
+            }
+        }
+        Dirty::FallbackField => CommitResult::from(commit_member_field(app)),
+        Dirty::RefreshInterval => CommitResult::from(commit_refresh_interval_edit(app)),
+        Dirty::ContextNudge => CommitResult::from(commit_context_nudge_edit(app)),
+        Dirty::WeeklyThreshold => CommitResult::from(commit_weekly_threshold_edit(app)),
+        Dirty::HerdrTag => CommitResult::from(commit_herdr_tag_edit(app)),
+        Dirty::ShuntField(_) => match app.services.shunt_field_edit.clone() {
+            Some(state) => commit_shunt_field(app, &state.key),
+            None => CommitResult::Refused,
+        },
+        Dirty::ShuntAdd(kind) => {
+            // Land the open draft field first: its uncommitted buffer is the
+            // typed work the save must read, then run the draft's own save.
+            if let Some(state) = app.services.shunt_field_edit.clone()
+                && let ShuntFieldKey::Draft { kind: k, .. } = &state.key
+                && *k == kind
+                && shunt_edit_dirty(&state.edit)
+            {
+                let _ = commit_shunt_field(app, &state.key);
+            }
+            commit_shunt_add(app, kind)
+        }
+        Dirty::Note => CommitResult::from(commit_note(app)),
+        Dirty::NewAccountForm => CommitResult::Landed,
+    }
+}
+
+/// Land on the first failing item's screen so its invalid-input treatment is
+/// visible; the item is the open edit itself, so no reopen is needed.
+fn focus_dirty(app: &mut App, dirty: Dirty) {
+    let screen = dirty.screen();
+    if screen != app.tab {
+        do_switch(app, screen);
     }
 }
 

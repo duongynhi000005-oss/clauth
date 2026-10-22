@@ -76,6 +76,11 @@ const Q_BACK: &[(&str, &str)] = &[("q", "back")];
 /// ↵ / space commit the highlighted one, `q` backs out.
 const BUTTON_KEYS: &[(&str, &str)] = &[("←→", "pick"), ("↵", "choose"), ("q", "back")];
 
+/// The loss warning's three buttons: ←→ steps and tab wraps between them, ↵ /
+/// space choose the highlighted one, `esc` and `q` both `go back`.
+const LOSS_WARNING_KEYS: &[(&str, &str)] =
+    &[("←→", "pick"), ("↵", "choose"), ("esc · q", "go back")];
+
 /// The same confirm with `↑↓ scroll` after the choose keys when its body
 /// overflows, so a narrow terminal sheds the scroll hint before the choice
 /// keys.
@@ -261,9 +266,9 @@ fn owner_hints(
                 Some(BUTTON_SCROLL_KEYS)
             }
             Some(Modal::Confirm(_)) => Some(BUTTON_KEYS),
-            // The loss warning's two buttons never scroll: it stays the plain
-            // button row.
-            Some(Modal::LossWarning(_)) => Some(BUTTON_KEYS),
+            // The loss warning's three buttons never scroll: it stays the plain
+            // button row, with `esc` named beside `q` as `go back`.
+            Some(Modal::LossWarning(_)) => Some(LOSS_WARNING_KEYS),
             Some(Modal::PresetApply(form))
                 if form.scroll.max_scroll.get() > 0
                     && bound_is_current(form.scroll.stamp.get(), area, app) =>

@@ -19,6 +19,7 @@ fn bootstrap_busy(flag: &Arc<AtomicBool>, activity: &ActivityStore) -> bool {
 }
 
 use super::InputState;
+use super::SeededInput;
 use crate::fallback::parse_threshold;
 use crate::profile::ProfileName;
 use crate::testutil::write_live_creds;
@@ -11086,7 +11087,10 @@ fn refresh_interval_enter_opens_editor_seeded_in_seconds() {
         .refresh_interval_draft
         .as_ref()
         .expect("⏎ opens the custom-value editor");
-    assert_eq!(draft.value, "90", "seeded with the default 90s in seconds");
+    assert_eq!(
+        draft.input.value, "90",
+        "seeded with the default 90s in seconds"
+    );
 }
 
 #[test]
@@ -11355,7 +11359,7 @@ fn context_nudge_enter_opens_editor_seeded() {
         .as_ref()
         .expect("⏎ opens the custom-value editor");
     assert_eq!(
-        draft.value, "300k",
+        draft.input.value, "300k",
         "off seeds the first preset, the value one space-press would pick"
     );
 
@@ -11364,7 +11368,11 @@ fn context_nudge_enter_opens_editor_seeded() {
     app.config().state.context_nudge_threshold_tokens = Some(600_000);
     super::handle_global_config_key(&mut app, key(KeyCode::Enter));
     assert_eq!(
-        app.context_nudge_draft.as_ref().expect("editor open").value,
+        app.context_nudge_draft
+            .as_ref()
+            .expect("editor open")
+            .input
+            .value,
         "600k",
         "a preset seeds in k form"
     );
@@ -11375,7 +11383,11 @@ fn context_nudge_enter_opens_editor_seeded() {
     app.config().state.context_nudge_threshold_tokens = Some(2_000_000);
     super::handle_global_config_key(&mut app, key(KeyCode::Enter));
     assert_eq!(
-        app.context_nudge_draft.as_ref().expect("editor open").value,
+        app.context_nudge_draft
+            .as_ref()
+            .expect("editor open")
+            .input
+            .value,
         "2000k",
         "an exact million seeds as typeable k, never M"
     );
@@ -11396,11 +11408,11 @@ fn context_nudge_reopened_editor_seeds_a_custom_value_as_plain_tokens() {
         .as_ref()
         .expect("⏎ reopens the custom-value editor");
     assert_eq!(
-        draft.value, "450500",
+        draft.input.value, "450500",
         "a custom value seeds as plain tokens"
     );
     assert!(
-        parse_context_nudge_tokens(&draft.value).is_some(),
+        parse_context_nudge_tokens(&draft.input.value).is_some(),
         "the seed is typeable — the editor opens out of DANGER"
     );
 }
@@ -30941,6 +30953,85 @@ fn route_editor_open_across_a_remove_keeps_its_route() {
     );
 }
 
+/// Open route 3's (m3) `upstream_model` editor and type `zzz` while route 2's
+/// (m2) remove checks.
+#[cfg(unix)]
+fn type_m3_upstream_model_while_m2_remove_checks(rig: &mut ConfigEditRig) {
+    rig.app
+        .services
+        .shunt_expanded
+        .insert(super::ShuntEntryKey::Route(3));
+    remove_entry_via_confirm(rig, super::ShuntEntryKey::Route(2));
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "precondition: route 2's remove checks"
+    );
+    rig.focus_field(super::ShuntFieldKey::Route {
+        position: 3,
+        field: super::RouteFieldKind::UpstreamModel,
+    });
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    for c in "zzz".chars() {
+        super::handle_key(&mut rig.app, key(KeyCode::Char(c)));
+    }
+}
+
+/// A loss-warning `save` commits through the open editor's own key: a route
+/// remove landing under the open warning must not move the typed value into
+/// the shifted route.
+#[cfg(unix)]
+#[test]
+fn a_warning_save_across_a_route_remove_writes_the_editors_own_route() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, ROUTES_FIXTURE);
+    type_m3_upstream_model_while_m2_remove_checks(&mut rig);
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "no warning over route 3's typed field"
+    );
+    rig.drain();
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.drain();
+    let text = rig.config_text();
+    eprintln!("file after:\n{text}");
+    assert!(
+        text.contains("model = \"m3\"\nprovider = \"a\"\nupstream_model = \"zzz\""),
+        "the value typed on m3's row did not land on m3:\n{text}"
+    );
+    assert!(
+        !text.contains("model = \"m4\"\nprovider = \"a\"\nupstream_model = \"zzz\""),
+        "the value typed on m3's row landed on m4:\n{text}"
+    );
+}
+
+/// Control: the remove lands before the switch key, so the warning captures
+/// the shifted key; `save` writes m3's row and switches.
+#[cfg(unix)]
+#[test]
+fn a_warning_after_the_remove_lands_writes_the_shifted_route() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, ROUTES_FIXTURE);
+    type_m3_upstream_model_while_m2_remove_checks(&mut rig);
+    rig.drain();
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "no warning"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.drain();
+    let text = rig.config_text();
+    eprintln!("file after:\n{text}");
+    assert!(
+        text.contains("model = \"m3\"\nprovider = \"a\"\nupstream_model = \"zzz\""),
+        "m3 not written"
+    );
+    assert_eq!(rig.app.tab, Tab::Overview, "no switch");
+}
+
 /// The upstream draft's hidden mode rows: a value typed under `api_key`
 /// (`auth env`) must not ride into an add under `claude_oauth`, whose rows
 /// never show it.
@@ -34057,10 +34148,10 @@ fn cancelling_the_minted_form_mints_nothing() {
     assert!(app.config_draft.is_none(), "the form dropped");
 }
 
-/// A mint save under an in-flight shunt save toasts the one-save guard and
-/// mints nothing.
+/// A jump to the mint form over an in-flight field save holds on that save;
+/// the form opens once it lands.
 #[test]
-fn the_mint_save_guards_while_a_shunt_save_is_in_flight() {
+fn a_mint_form_jump_over_an_in_flight_field_holds_until_it_lands() {
     use crate::profile::Profile;
     use ratatui::crossterm::event::KeyCode;
     const RIG: &str = "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n";
@@ -34110,32 +34201,92 @@ fn the_mint_save_guards_while_a_shunt_save_is_in_flight() {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    // Step off the locked editor, then open the minted form and commit.
+    // Step off the locked editor, then jump to the mint form: the jump holds
+    // on the running save.
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     open_minted_form(&mut app);
-    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    assert!(app.loss_pending.is_some(), "the mint jump did not hold");
+    assert!(app.config_draft.is_none(), "the mint form opened early");
+    drain_shunt_action(&mut app);
+    assert!(
+        app.config_draft.is_some(),
+        "the mint form did not open on landing"
+    );
+}
+
+/// A mint save under a running token remove toasts the one-save guard and
+/// mints nothing.
+#[test]
+fn the_mint_save_guards_while_a_token_remove_is_in_flight() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    use std::sync::{Condvar, Mutex};
+    const RIG: &str = "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let record = adopt_token_record(&home, RIG, "");
+    crate::gateway_tokens::add_client_token(&record, "alice").unwrap();
+    let held = Arc::new((Mutex::new(false), Condvar::new()));
+    let held_in = Arc::clone(&held);
+    crate::gateway_tokens::set_pre_hold_hook(
+        "alice",
+        Arc::new(move || {
+            let (lock, cvar) = &*held_in;
+            let released = lock.lock().unwrap();
+            let _ =
+                cvar.wait_timeout_while(released, std::time::Duration::from_secs(10), |released| {
+                    !*released
+                });
+        }),
+    );
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Token("alice".into())));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if app.services.shunt_save_worker.running {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the remove never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    open_minted_form(&mut app);
+    assert!(
+        app.config_draft.is_some(),
+        "the mint form did not open under a token job"
+    );
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("carol");
     let create = super::config_rows(&app)
         .iter()
-        .position(|r| *r == super::ConfigRow::Create)
-        .expect("create row");
-    app.config_action_cursor = create;
-    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        .position(|r| *r == super::ConfigRow::Create);
+    if let Some(c) = create {
+        app.config_action_cursor = c;
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    }
     assert_eq!(
-        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        app.toasts.back().map(|t| (t.kind, t.body.clone())),
         Some((
             super::ToastKind::Info,
-            "a save is still checking\nwait for it, then save again"
+            "a save is still checking\nwait for it, then save again".to_string()
         )),
-        "the mint save toasts the one-save guard"
+        "the mint save under a running token job did not toast the guard"
     );
-    assert_eq!(token_names(), Vec::<String>::new(), "nothing minted");
     assert!(
-        app.config()
-            .profiles
-            .iter()
-            .all(|p| p.name.as_str() != "alice"),
-        "no profile created"
+        !token_names().iter().any(|n| n == "carol"),
+        "minted under a running token job"
     );
+    {
+        let (lock, cvar) = &*held;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
     drain_shunt_action(&mut app);
 }
 
@@ -37547,6 +37698,13 @@ fn alt_digit(d: char) -> ratatui::crossterm::event::KeyEvent {
     )
 }
 
+fn ctrl_c() -> ratatui::crossterm::event::KeyEvent {
+    with_mods(
+        KeyCode::Char('c'),
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    )
+}
+
 /// `tab` / `shift+tab` switch with no modifier besides shift; a reported
 /// ctrl or alt makes them inert.
 #[test]
@@ -37753,8 +37911,8 @@ fn alt_digits_jump_to_tabs() {
     );
 }
 
-/// `⌥digit` leaves an open Config field: the switch keeps its typed text and
-/// caret uncommitted, and the return lands back in the edit.
+/// `⌥digit` over a dirty Config field opens the loss warning; `esc` = `go
+/// back` keeps the open field, its typed text and caret, and commits nothing.
 #[test]
 fn a_jump_suspends_an_open_config_field_and_returns_into_it() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -37768,24 +37926,22 @@ fn a_jump_suspends_an_open_config_field_and_returns_into_it() {
     let (value, cursor) = app
         .refresh_interval_draft
         .as_ref()
-        .map(|d| (d.value.clone(), d.cursor))
+        .map(|d| (d.input.value.clone(), d.input.cursor))
         .expect("precondition: the editor is open");
     assert_eq!(value, "95", "precondition: the typed buffer");
 
     super::handle_key(&mut app, alt_digit('1'));
-    assert_eq!(app.tab, Tab::Overview, "⌥1 leaves the open field");
-    assert!(
-        app.modals.is_empty(),
-        "no other screen writes the refresh interval"
-    );
-    super::handle_key(&mut app, alt_digit('6'));
-    assert_eq!(app.tab, Tab::Config);
+    assert_eq!(app.tab, Tab::Config, "the warning holds the switch");
+    assert!(!app.modals.is_empty(), "the dirty field opened no warning");
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert!(app.modals.is_empty(), "esc closed the warning");
+    assert_eq!(app.tab, Tab::Config, "go back did not switch");
     assert_eq!(
         app.refresh_interval_draft
             .as_ref()
-            .map(|d| (d.value.clone(), d.cursor)),
+            .map(|d| (d.input.value.clone(), d.input.cursor)),
         Some((value, cursor)),
-        "the return lands in the edit with its text and caret"
+        "go back keeps the text and caret"
     );
     assert_eq!(
         super::keyboard_owner(&app),
@@ -37799,11 +37955,10 @@ fn a_jump_suspends_an_open_config_field_and_returns_into_it() {
     );
 }
 
-/// The `+ new` form's typed values survive a jump away: the pane ascends on
-/// the way out, and descending into `+ new` again restores them.
+/// A jump over a typed `+ new` form opens the two-button warning: `go back`
+/// (the default) keeps the form and the tab, `discard` drops it and switches.
 #[test]
 fn a_jump_keeps_the_new_account_form() {
-    use super::ConfigFocus;
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![crate::testutil::blank_profile(
         &crate::profile::ProfileName::from("a"),
@@ -37830,26 +37985,29 @@ fn a_jump_keeps_the_new_account_form() {
     );
 
     super::handle_key(&mut app, alt_digit('1'));
-    assert_eq!(app.tab, Tab::Overview);
-    super::handle_key(&mut app, alt_digit('4'));
-    assert_eq!(app.tab, Tab::Setup);
-    assert_eq!(
-        app.config_focus,
-        ConfigFocus::Profiles,
-        "the pane ascended on the way out"
-    );
-    assert_eq!(
-        app.profile_cursor.read(),
-        app.profile_count(),
-        "the selector still rests on `+ new`"
+    assert_eq!(app.tab, Tab::Setup, "the warning holds the switch");
+    assert!(
+        matches!(app.modals.last(), Some(Modal::LossWarning(_))),
+        "the typed form opened no warning"
     );
     super::handle_key(&mut app, key(KeyCode::Enter));
-    assert_eq!(app.config_focus, ConfigFocus::Actions);
+    assert!(app.modals.is_empty(), "go back closed the warning");
+    assert_eq!(app.tab, Tab::Setup, "go back did not switch");
     assert!(
         app.config_draft
             .as_ref()
             .is_some_and(|d| d.editing_name.is_none() && d.name.value == "zed"),
-        "descending into `+ new` restored the typed name"
+        "go back kept the typed form"
+    );
+
+    super::handle_key(&mut app, alt_digit('1'));
+    assert!(!app.modals.is_empty(), "the second jump warns again");
+    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(app.tab, Tab::Overview, "discard performed the jump");
+    assert!(
+        app.config_draft.is_none() && app.new_account_draft.is_none(),
+        "discard dropped the typed form"
     );
 }
 
@@ -37894,8 +38052,8 @@ fn a_jump_disarms_an_armed_remove() {
 }
 
 /// An open member-card field holds account data Setup also writes: a jump
-/// opens the loss warning. `go back` (the default) keeps the field and the
-/// tab; `discard` drops the field and performs the jump.
+/// opens the loss warning. `esc` = `go back` keeps the field and the tab;
+/// `discard` drops the field and performs the jump.
 #[test]
 fn a_jump_out_of_a_member_field_asks_before_dropping_it() {
     use super::{CardEdit, FallbackFocus, FallbackRow};
@@ -37929,8 +38087,11 @@ fn a_jump_out_of_a_member_field_asks_before_dropping_it() {
     assert!(renders(&app, "WARNING"), "the modal is titled WARNING");
     assert!(renders(&app, "go back"), "the modal offers go back");
     assert!(renders(&app, "discard"), "the modal offers discard");
-    super::handle_key(&mut app, key(KeyCode::Enter));
-    assert!(app.modals.is_empty(), "↵ on the default closes the warning");
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert!(
+        app.modals.is_empty(),
+        "esc on the default closes the warning"
+    );
     assert_eq!(app.tab, Tab::Fallback, "go back stays on the tab");
     assert_eq!(
         typed(&app).as_deref(),
@@ -37940,7 +38101,7 @@ fn a_jump_out_of_a_member_field_asks_before_dropping_it() {
 
     super::handle_key(&mut app, alt_digit('1'));
     assert!(!app.modals.is_empty(), "the second jump warns again");
-    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Left));
     super::handle_key(&mut app, key(KeyCode::Enter));
     assert!(app.modals.is_empty(), "discard closes the warning");
     assert_eq!(app.tab, Tab::Overview, "discard performs the jump");
@@ -38017,7 +38178,7 @@ fn a_dirty_setup_field_warns_and_a_clean_one_suspends() {
     assert!(app.modals.is_empty(), "esc left the warning open");
     assert_eq!(app.tab, Tab::Setup, "go back switched the tab");
     super::handle_key(&mut app, alt_digit('1'));
-    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Left));
     super::handle_key(&mut app, key(KeyCode::Enter));
     assert!(app.modals.is_empty(), "discard left the warning open");
     assert_eq!(app.tab, Tab::Overview, "discard did not perform the jump");
@@ -38057,10 +38218,16 @@ fn a_jump_suspends_each_config_and_herdr_editor() {
     app.tab = Tab::Config;
     let mut nudge = InputState::new("300k");
     nudge.cursor = 3;
-    app.context_nudge_draft = Some(nudge);
-    let mut weekly = InputState::new("95");
+    app.context_nudge_draft = Some(SeededInput {
+        input: nudge,
+        seed: "300k".to_string(),
+    });
+    let mut weekly = InputState::new("98");
     weekly.cursor = 1;
-    app.weekly_threshold_draft = Some(weekly);
+    app.weekly_threshold_draft = Some(SeededInput {
+        input: weekly,
+        seed: "98".to_string(),
+    });
     super::handle_key(&mut app, alt_digit('1'));
     assert_eq!(app.tab, Tab::Overview);
     super::handle_key(&mut app, alt_digit('6'));
@@ -38068,14 +38235,14 @@ fn a_jump_suspends_each_config_and_herdr_editor() {
     assert_eq!(
         app.context_nudge_draft
             .as_ref()
-            .map(|d| (d.value.clone(), d.cursor)),
+            .map(|d| (d.input.value.clone(), d.input.cursor)),
         Some(("300k".into(), 3))
     );
     assert_eq!(
         app.weekly_threshold_draft
             .as_ref()
-            .map(|d| (d.value.clone(), d.cursor)),
-        Some(("95".into(), 1))
+            .map(|d| (d.input.value.clone(), d.input.cursor)),
+        Some(("98".into(), 1))
     );
 
     // The herdr tag editor on the Services tab, opened from the detail.
@@ -38084,7 +38251,10 @@ fn a_jump_suspends_each_config_and_herdr_editor() {
     app.services.focus = super::ServicesFocus::Detail;
     let mut tag = InputState::new("5");
     tag.cursor = 1;
-    app.services.herdr_tag_draft = Some(tag);
+    app.services.herdr_tag_draft = Some(SeededInput {
+        input: tag,
+        seed: "5".to_string(),
+    });
     super::handle_key(&mut app, alt_digit('1'));
     assert_eq!(app.tab, Tab::Overview);
     super::handle_key(&mut app, alt_digit('8'));
@@ -38098,7 +38268,7 @@ fn a_jump_suspends_each_config_and_herdr_editor() {
         app.services
             .herdr_tag_draft
             .as_ref()
-            .map(|d| (d.value.clone(), d.cursor)),
+            .map(|d| (d.input.value.clone(), d.input.cursor)),
         Some(("5".into(), 1))
     );
 }
@@ -38119,16 +38289,18 @@ fn a_jump_suspends_the_note_editor_and_day_picker() {
         app.note_editor.is_some(),
         "precondition: the note editor is open"
     );
-    super::handle_key(&mut app, key(KeyCode::Char('h')));
-    super::handle_key(&mut app, key(KeyCode::Char('i')));
     super::handle_key(&mut app, alt_digit('1'));
     assert_eq!(app.tab, Tab::Overview);
     super::handle_key(&mut app, alt_digit('2'));
     assert_eq!(app.tab, Tab::Usage);
+    assert!(
+        app.note_editor.is_some(),
+        "the jump dropped the note editor"
+    );
     assert_eq!(
         app.note_editor.as_ref().map(|e| e.buf.text()),
-        Some("hi".to_string()),
-        "the jump dropped the note draft"
+        Some(String::new()),
+        "the jump changed the note draft"
     );
 
     // The day picker: an open edit reached by `↵` on `preferred days`.
@@ -38309,10 +38481,9 @@ fn a_suspended_new_form_survives_descending_into_another_account() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
     }
     super::handle_key(&mut app, key(KeyCode::Enter));
-    super::handle_key(&mut app, alt_digit('1'));
-    assert_eq!(app.tab, Tab::Overview);
-    super::handle_key(&mut app, alt_digit('4'));
-    assert_eq!(app.tab, Tab::Setup);
+    // Suspend the typed form directly: a switch over it would warn.
+    app.new_account_draft = app.config_draft.take();
+    app.config_focus = ConfigFocus::Profiles;
 
     // Descend into the existing account, then back into `+ new`.
     app.profile_cursor.set(0);
@@ -38352,7 +38523,9 @@ fn n_restores_the_suspended_new_form_with_an_open_field() {
     for c in "zed".chars() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
     }
-    super::handle_key(&mut app, alt_digit('1'));
+    // Suspend directly (the action-menu shunt jump's path, not a switch key):
+    // a switch key over the typed open field would warn.
+    super::do_switch(&mut app, Tab::Overview);
     assert_eq!(app.tab, Tab::Overview, "precondition: the jump left");
     super::handle_key(&mut app, key(KeyCode::Char('n')));
     assert_eq!(app.tab, Tab::Setup, "precondition: n came back");
@@ -38488,6 +38661,876 @@ fn an_untouched_default_threshold_field_does_not_warn() {
         app.tab,
         Tab::Overview,
         "the clean field did not suspend and switch"
+    );
+}
+
+/// A Fallback `rotate at` field on member `a` (stored 80) opened and retyped
+/// to `typed`, the tab left on Fallback with the field still open.
+/// A Fallback member card with `stored` as the `rotate at` value, the
+/// threshold field OPEN (clean: buffer == seed == `stored`).
+fn open_threshold_app(stored: f64) -> App {
+    use super::{FallbackFocus, FallbackRow};
+    let mut pa = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    pa.fallback_threshold = Some(stored);
+    let mut app = app_with_unlinked_profiles(vec![pa]);
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 0;
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Threshold)
+        .unwrap();
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(app.fallback_edit.is_some(), "precondition: field open");
+    app
+}
+
+/// The open threshold field's typed buffer, if it is the threshold field.
+fn threshold_buf(app: &App) -> Option<String> {
+    match app.fallback_edit.as_ref().map(|e| &e.state) {
+        Some(super::CardEdit::Threshold(i)) => Some(i.value.clone()),
+        _ => None,
+    }
+}
+
+/// Move the stored threshold out of band (as another surface's save would).
+fn set_threshold_store(app: &App, v: f64) {
+    let mut cfg = app.config();
+    if let Some(p) = cfg.find_mut(&crate::profile::ProfileName::from("a")) {
+        p.fallback_threshold = Some(v);
+    }
+}
+
+fn dirty_threshold_app(typed: &str) -> App {
+    let mut app = open_threshold_app(80.0);
+    for _ in 0..4 {
+        super::handle_key(&mut app, key(KeyCode::Backspace));
+    }
+    for c in typed.chars() {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    app
+}
+
+fn stored_threshold(app: &App) -> Option<f64> {
+    app.config()
+        .find(&crate::profile::ProfileName::from("a"))
+        .and_then(|p| p.fallback_threshold)
+}
+
+/// One table over every changed-work kind: a switch key opens the switch form,
+/// and a second `⌃c` opens the quit form. Each leg drives
+/// [`super::handle_key`], so a kind dropped from the derivation reds this
+/// test.
+#[test]
+fn every_dirty_kind_warns_on_switch_and_quit() {
+    use super::LossWarningTarget;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let ctrl_c = with_mods(
+        KeyCode::Char('c'),
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    );
+    type Case = (&'static str, Box<dyn Fn() -> App>);
+    let mut cases: Vec<Case> = Vec::new();
+    cases.push((
+        "setup field",
+        Box::new(|| {
+            let mut app = app_with(vec![crate::testutil::blank_profile(
+                &crate::profile::ProfileName::from("a"),
+            )]);
+            app.tab = Tab::Setup;
+            app.profile_cursor.set(0);
+            super::handle_key(&mut app, key(KeyCode::Enter));
+            super::handle_key(&mut app, key(KeyCode::Enter));
+            super::handle_key(&mut app, key(KeyCode::Char('x')));
+            app
+        }),
+    ));
+    cases.push((
+        "new account form",
+        Box::new(|| {
+            let mut app = app_with(vec![crate::testutil::blank_profile(
+                &crate::profile::ProfileName::from("a"),
+            )]);
+            super::handle_key(&mut app, key(KeyCode::Char('n')));
+            super::handle_key(&mut app, key(KeyCode::Down)); // off the `type` row
+            super::handle_key(&mut app, key(KeyCode::Enter));
+            super::handle_key(&mut app, key(KeyCode::Char('z')));
+            super::handle_key(&mut app, key(KeyCode::Enter));
+            app
+        }),
+    ));
+    cases.push(("fallback field", Box::new(|| dirty_threshold_app("70"))));
+    cases.push((
+        "refresh interval",
+        Box::new(|| {
+            let mut app = bare_app();
+            app.tab = Tab::Config;
+            app.global_config_cursor = 0;
+            app.refresh_interval_draft = Some(SeededInput {
+                input: InputState::new("61"),
+                seed: "60".to_string(),
+            });
+            app
+        }),
+    ));
+    cases.push((
+        "context nudge",
+        Box::new(|| {
+            let mut app = bare_app();
+            app.tab = Tab::Config;
+            app.global_config_cursor = 0;
+            app.context_nudge_draft = Some(SeededInput {
+                input: InputState::new("600001"),
+                seed: "600k".to_string(),
+            });
+            app
+        }),
+    ));
+    cases.push((
+        "weekly threshold",
+        Box::new(|| {
+            let mut app = bare_app();
+            app.tab = Tab::Config;
+            app.global_config_cursor = 0;
+            app.weekly_threshold_draft = Some(SeededInput {
+                input: InputState::new("96"),
+                seed: "95".to_string(),
+            });
+            app
+        }),
+    ));
+    cases.push((
+        "herdr tag",
+        Box::new(|| {
+            let mut app = bare_app();
+            app.tab = Tab::Services;
+            app.services.focus = super::ServicesFocus::Detail;
+            app.services.herdr_tag_draft = Some(SeededInput {
+                input: InputState::new("6"),
+                seed: "5".to_string(),
+            });
+            app
+        }),
+    ));
+    cases.push((
+        "note editor",
+        Box::new(|| {
+            let mut app = app_with(vec![crate::testutil::blank_profile(
+                &crate::profile::ProfileName::from("a"),
+            )]);
+            app.tab = Tab::Usage;
+            app.profile_cursor.set(0);
+            super::handle_key(&mut app, key(KeyCode::Char('n')));
+            super::handle_key(&mut app, key(KeyCode::Char('x')));
+            app
+        }),
+    ));
+
+    for (label, setup) in cases {
+        let mut app = setup();
+        let switch = if app.tab == Tab::Overview {
+            alt_digit('2')
+        } else {
+            alt_digit('1')
+        };
+        super::handle_key(&mut app, switch);
+        assert!(
+            matches!(
+                app.modals.last(),
+                Some(Modal::LossWarning(s))
+                    if matches!(s.target, LossWarningTarget::Switch(_))
+            ),
+            "{label}: a switch key opened no switch warning"
+        );
+        let mut app = setup();
+        super::handle_key(&mut app, ctrl_c);
+        super::handle_key(&mut app, ctrl_c);
+        assert!(
+            matches!(
+                app.modals.last(),
+                Some(Modal::LossWarning(s)) if matches!(s.target, LossWarningTarget::Quit)
+            ),
+            "{label}: a second ⌃c opened no quit warning"
+        );
+    }
+}
+
+/// The `q` route: a second `q` at the top level (no editor owns `q`, no
+/// sub-focus) warns over changed work instead of quitting. A typed shunt
+/// `+ add` draft held at the Services list is the at-rest changed-work state
+/// `q` reaches at the top level.
+#[cfg(unix)]
+#[test]
+fn a_second_q_at_top_level_warns_over_changed_work() {
+    use super::{
+        LossWarningTarget, ServicesFocus, ShuntAddKind, ShuntDraftField, UpstreamFieldKind,
+    };
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.app.services.focus = ServicesFocus::List;
+    super::handle_key(&mut rig.app, key(KeyCode::Char('q')));
+    assert!(!rig.app.quit, "the first q quit");
+    super::handle_key(&mut rig.app, key(KeyCode::Char('q')));
+    assert!(!rig.app.quit, "the second q quit over changed work");
+    assert!(
+        matches!(
+            rig.app.modals.last(),
+            Some(Modal::LossWarning(s)) if matches!(s.target, LossWarningTarget::Quit)
+        ),
+        "the second q opened no quit warning"
+    );
+}
+
+/// A switch over changed work opens the three-button warning with `save`
+/// focused, and `↵` there saves the field and performs the switch.
+#[test]
+fn a_dirty_switch_offers_save_first_and_save_switches() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = dirty_threshold_app("70");
+    super::handle_key(&mut app, alt_digit('1'));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::LossWarning(_))),
+        "the dirty switch opened no loss warning"
+    );
+    assert!(
+        renders(&app, "switching?"),
+        "the warning does not ask about switching"
+    );
+    assert!(
+        renders(&app, "go back   discard   save"),
+        "the warning lacks the go back · discard · save row"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.modals.is_empty(), "save left the warning open");
+    assert_eq!(app.tab, Tab::Overview, "save did not perform the switch");
+    assert_eq!(stored_threshold(&app), Some(70.0), "save did not commit");
+    assert!(app.fallback_edit.is_none(), "save left the field open");
+}
+
+/// A second `⌃c` over changed work opens the quit form of the warning instead
+/// of quitting; `discard` then quits without committing.
+#[test]
+fn a_second_ctrl_c_over_changed_work_warns_before_quitting() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = dirty_threshold_app("70");
+    let ctrl_c = with_mods(
+        KeyCode::Char('c'),
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    );
+    super::handle_key(&mut app, ctrl_c);
+    assert!(!app.quit, "the first ⌃c quit");
+    super::handle_key(&mut app, ctrl_c);
+    assert!(!app.quit, "the second ⌃c quit over changed work");
+    assert!(
+        matches!(app.modals.last(), Some(Modal::LossWarning(_))),
+        "the second ⌃c opened no loss warning"
+    );
+    assert!(
+        renders(&app, "quitting?"),
+        "the warning does not ask about quitting"
+    );
+    super::handle_key(&mut app, key(KeyCode::Left));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.quit, "discard did not quit");
+    assert_eq!(stored_threshold(&app), Some(80.0), "discard committed");
+}
+
+/// `save` validates every changed item first: an invalid Fallback threshold
+/// commits nothing, holds the switch, and leaves the failing field open with
+/// its typed text and its DANGER tooltip. `save` is the default focus, so the
+/// `↵` this test drives IS `save`.
+#[test]
+fn save_validates_every_changed_item_before_committing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = dirty_threshold_app("abc");
+    super::handle_key(&mut app, alt_digit('1'));
+    let Some(Modal::LossWarning(state)) = app.modals.last() else {
+        panic!("the dirty switch opened no loss warning");
+    };
+    assert_eq!(
+        state.focus,
+        super::LossWarningButton::Save,
+        "save is not the default focus, so ↵ would not save"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.modals.is_empty(), "save left the warning open");
+    assert_eq!(app.tab, Tab::Fallback, "save switched over the refusal");
+    assert_eq!(
+        stored_threshold(&app),
+        Some(80.0),
+        "save committed a refusal"
+    );
+    assert!(
+        matches!(
+            app.fallback_edit.as_ref().map(|e| &e.state),
+            Some(super::CardEdit::Threshold(input)) if input.value == "abc"
+        ),
+        "the failing field did not stay open with its typed text"
+    );
+    assert!(
+        render_rows(&app).iter().any(|r| r.contains("└ 0-100 %")),
+        "the failing field's DANGER tooltip did not render: {:?}",
+        render_rows(&app)
+    );
+}
+
+/// All-or-nothing with two changed items on one screen: the first is valid, the
+/// second invalid, so the valid first is NOT committed. Services is the one
+/// screen where a keyboard owner reaches two changed items at once: a valid
+/// shunt field plus a typed `+ add` draft whose required name is blank.
+#[cfg(unix)]
+#[test]
+fn save_commits_nothing_when_a_later_item_is_invalid() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFieldEdit, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    // A typed `+ add` draft with its required name blank: dirty, but invalid.
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Provider),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("deepseek");
+    // A valid changed shunt field.
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    for c in "high".chars() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the two changed Services items opened no warning"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(rig.app.modals.is_empty(), "save left the warning open");
+    assert_eq!(rig.app.tab, Tab::Services, "save switched over the refusal");
+    assert!(
+        !rig.config_text().contains("effort = \"high\""),
+        "the valid first item committed despite the invalid second"
+    );
+    assert!(
+        matches!(
+            rig.app.services.shunt_field_edit.as_ref().map(|s| &s.edit),
+            Some(ShuntFieldEdit::Typed { input, .. }) if input.value == "high"
+        ),
+        "the valid first item did not stay open with its typed text"
+    );
+    assert!(
+        rig.app
+            .services
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "the invalid draft was dropped"
+    );
+}
+
+/// A second `⌃c` over a switch warning retargets it to the quit form; a
+/// further `⌃c ⌃c` over the quit warning changes nothing.
+#[test]
+fn a_second_ctrl_c_over_a_switch_warning_retargets_to_the_quit_form() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = dirty_threshold_app("70");
+    let ctrl_c = with_mods(
+        KeyCode::Char('c'),
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    );
+    super::handle_key(&mut app, alt_digit('1'));
+    assert!(
+        renders(&app, "switching?"),
+        "precondition: the switch warning is open"
+    );
+    super::handle_key(&mut app, ctrl_c);
+    assert!(!app.quit, "the first ⌃c quit");
+    super::handle_key(&mut app, ctrl_c);
+    assert!(!app.quit, "the second ⌃c quit over the switch warning");
+    assert!(
+        renders(&app, "quitting?"),
+        "the second ⌃c did not retarget the warning to the quit form"
+    );
+    super::handle_key(&mut app, ctrl_c);
+    super::handle_key(&mut app, ctrl_c);
+    assert!(!app.quit, "a further ⌃c pair quit over the quit warning");
+    assert!(
+        renders(&app, "quitting?"),
+        "a further ⌃c pair changed the quit warning"
+    );
+}
+
+/// A clean suspended edit whose stored value changed meanwhile returns holding
+/// the new value, caret at its end, and no later switch warns over it.
+#[test]
+fn a_clean_suspended_edit_reseeds_from_the_newer_saved_value() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = open_threshold_app(80.0);
+    assert!(
+        matches!(
+            app.fallback_edit.as_ref().map(|e| &e.state),
+            Some(super::CardEdit::Threshold(_))
+        ),
+        "precondition: the clean field is open"
+    );
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview, "the clean field did not suspend");
+    set_threshold_store(&app, 90.0);
+    // Land back through a real switch key: a clean suspended edit re-seeds, so
+    // this opens no warning.
+    super::handle_key(&mut app, alt_digit('5'));
+    assert_eq!(app.tab, Tab::Fallback);
+    let (value, cursor) = match app.fallback_edit.as_ref().map(|e| &e.state) {
+        Some(super::CardEdit::Threshold(input)) => (input.value.clone(), input.cursor),
+        _ => panic!("the field did not return open"),
+    };
+    assert_eq!(value, "90", "the return did not reseed from the new value");
+    assert_eq!(cursor, value.len(), "the caret did not sit at the end");
+    super::handle_key(&mut app, alt_digit('1'));
+    assert!(
+        app.modals.is_empty(),
+        "a switch away from the reseeded field opened a warning"
+    );
+    assert_eq!(app.tab, Tab::Overview, "the reseeded field did not switch");
+}
+
+/// A clean suspended edit whose stored value moved out of band never writes its
+/// stale buffer back: switch away, quit, and the store keeps the newer value.
+#[test]
+fn a_clean_suspended_edit_never_writes_its_stale_value_back() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = open_threshold_app(80.0);
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview, "the clean field did not suspend");
+    set_threshold_store(&app, 90.0);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    let warned = matches!(app.modals.last(), Some(Modal::LossWarning(_)));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(!warned, "the quit warned over an unchanged suspended edit");
+    assert_eq!(
+        stored_threshold(&app),
+        Some(90.0),
+        "the stale buffer wrote the old value back"
+    );
+}
+
+/// A clean field OPEN on screen while the store moves (an on-screen reload):
+/// leaving it warns nothing and switches.
+#[test]
+fn a_clean_open_field_whose_store_moved_switches_without_warning() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = open_threshold_app(80.0);
+    set_threshold_store(&app, 90.0);
+    super::handle_key(&mut app, alt_digit('1'));
+    assert!(
+        app.modals.is_empty(),
+        "a warning opened over an unchanged edit whose store moved"
+    );
+    assert_eq!(app.tab, Tab::Overview, "no switch");
+}
+
+/// A DIRTY edit whose store also moved keeps its typed text and still warns.
+#[test]
+fn a_dirty_edit_whose_store_moved_still_warns_and_keeps_its_text() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = dirty_threshold_app("70");
+    set_threshold_store(&app, 90.0);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        matches!(app.modals.last(), Some(Modal::LossWarning(_))),
+        "the dirty edit did not warn on quit"
+    );
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    // A same-tab jump lands through `switch_tab`, which re-seeds clean edits
+    // only; the dirty buffer stays.
+    let tab = app.tab;
+    super::request_target(&mut app, super::LossWarningTarget::Switch(tab));
+    assert_eq!(
+        threshold_buf(&app).as_deref(),
+        Some("70"),
+        "the re-seed overwrote the dirty buffer"
+    );
+}
+
+/// A shunt field editor on the effort row, opened and typed to `high`.
+#[cfg(unix)]
+fn shunt_effort_rig(home: &crate::testutil::HomeSandbox) -> ConfigEditRig {
+    use super::{ShuntFieldKey, UpstreamFieldKind};
+    let mut rig = config_edit_rig(home, RIG_TEXT);
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    for c in "high".chars() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    rig
+}
+
+/// An async shunt save whose check fails: the held switch is cancelled and the
+/// hold clears, never switching before or after the refusal.
+#[cfg(unix)]
+#[test]
+fn an_async_shunt_save_refusal_cancels_the_held_switch() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        rig.app.tab,
+        Tab::Services,
+        "the switch landed before the commit outcome"
+    );
+    rig.drain();
+    assert_eq!(
+        rig.app.tab,
+        Tab::Services,
+        "the switch landed after a refused commit"
+    );
+    assert!(rig.app.loss_pending.is_none(), "the hold was not cleared");
+}
+
+/// An async shunt save that lands: the held switch is performed only after the
+/// save lands, and the bytes land in the file.
+#[cfg(unix)]
+#[test]
+fn an_async_shunt_save_landing_performs_the_held_switch() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(rig.app.tab, Tab::Services, "the switch landed early");
+    rig.drain();
+    assert_eq!(
+        rig.app.tab,
+        Tab::Overview,
+        "the landed save did not perform the held switch"
+    );
+    assert!(rig.config_text().contains("effort = \"high\""), "not saved");
+}
+
+/// A shunt cycle pick stepped back onto its saved option is clean: a switch
+/// away opens no warning.
+#[cfg(unix)]
+#[test]
+fn a_shunt_pick_back_on_its_saved_option_is_clean() {
+    use super::{ShuntFieldEdit, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::AuthMode,
+    });
+    let mut back = false;
+    for _ in 0..12 {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+        if let Some(ShuntFieldEdit::Pick { saved, picked }) =
+            rig.app.services.shunt_field_edit.as_ref().map(|s| &s.edit)
+            && saved.as_deref() == Some(picked.as_str())
+        {
+            back = true;
+            break;
+        }
+    }
+    assert!(
+        back,
+        "precondition: the pick never returned to its saved option"
+    );
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        !matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "a pick on its saved option warned"
+    );
+}
+
+/// A mixed save commits the saveable items, then the two-button
+/// `discard them and switch?` warning reopens for the `+ new` form. The typed
+/// form is written into its slot directly: a typed `+ new` form and an
+/// existing-account field share `config_draft`, and a switch over the form
+/// warns first, so no key path reaches this mixed set today. The test pins the
+/// partition's commit-then-reopen behaviour, not the reachability of the pair.
+#[test]
+fn a_mixed_save_commits_the_saveable_and_reopens_the_two_button_form() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Setup;
+    let mut draft = super::build_draft_new();
+    draft.name = InputState::new("zed");
+    app.new_account_draft = Some(draft);
+    app.profile_cursor.set(0);
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    if let Some(d) = app.config_draft.as_mut() {
+        d.bell_threshold = InputState::new("50");
+        d.active = Some(super::ConfigRow::BellThreshold);
+        d.field_seed = Some(String::new());
+    }
+    super::handle_key(&mut app, alt_digit('1'));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    let body = match app.modals.last() {
+        Some(Modal::LossWarning(s)) => s.body_lines(),
+        _ => vec![],
+    };
+    assert_eq!(app.tab, Tab::Setup, "the save switched");
+    assert_eq!(
+        body,
+        vec!["there are unsaved edits on the setup tab. discard them and switch?".to_string()],
+        "the two-button form did not reopen"
+    );
+    let bell = app
+        .config()
+        .find(&crate::profile::ProfileName::from("a"))
+        .and_then(|p| p.bell_threshold);
+    assert_eq!(bell, Some(50.0), "the saveable item did not commit");
+}
+
+/// While a quit is held on an async save, the user opens and dirties another
+/// field; the landing must not quit over that new changed work — the quit gate
+/// re-runs and warns again.
+#[cfg(unix)]
+#[test]
+fn a_held_quit_does_not_land_over_work_opened_during_the_hold() {
+    use super::{ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: the quit form is open"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app.loss_pending.is_some() && !rig.app.quit,
+        "precondition: the quit is held"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Down));
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::BaseUrl,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    for c in "http://x".chars() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    let dirty_before = format!("{:?}", super::changed_work(&rig.app));
+    rig.drain();
+    assert!(
+        !rig.app.quit,
+        "the held quit landed over new changed work {dirty_before}"
+    );
+}
+
+/// The switch twin of the held quit: a held switch re-runs its own gate on the
+/// async save's landing, so work opened during the hold warns and nothing
+/// switches.
+#[cfg(unix)]
+#[test]
+fn a_held_switch_does_not_land_over_work_opened_during_the_hold() {
+    use super::{LossWarningTarget, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app.loss_pending.is_some() && rig.app.tab == Tab::Services,
+        "precondition: the switch is held"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Down));
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::BaseUrl,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    for c in "http://x".chars() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    let dirty_before = format!("{:?}", super::changed_work(&rig.app));
+    rig.drain();
+    assert_eq!(
+        rig.app.tab,
+        Tab::Services,
+        "the held switch landed over new changed work {dirty_before}"
+    );
+    assert!(
+        matches!(
+            rig.app.modals.last(),
+            Some(Modal::LossWarning(s)) if matches!(s.target, LossWarningTarget::Switch(_))
+        ),
+        "the held switch did not re-open the warning over the new work"
+    );
+}
+
+/// Two async shunt items in one save (a dirty shunt field plus a typed `+ add`
+/// draft) commit nothing: the warning closes, nothing quits, and both items
+/// stay open to save one at a time.
+#[cfg(unix)]
+#[test]
+fn a_save_over_two_async_items_commits_nothing_and_opens_the_first() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFieldEdit, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    for c in "high".chars() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    let dirty = format!("{:?}", super::changed_work(&rig.app));
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: the quit form is open"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(!rig.app.quit, "two async items quit: {dirty}");
+    assert!(rig.app.modals.is_empty(), "the save left a warning open");
+    assert!(
+        rig.app.loss_pending.is_none(),
+        "two async items set a hold: {dirty}"
+    );
+    assert!(
+        rig.app.services.shunt_save.is_none(),
+        "a shunt save started despite the second async item: {dirty}"
+    );
+    let text = rig.config_text();
+    assert!(
+        !text.contains("effort = \"high\""),
+        "the shunt field committed despite the second async item: {dirty}"
+    );
+    assert!(
+        !text.contains("name = \"zz\""),
+        "the + add draft committed despite the second async item: {dirty}"
+    );
+    assert!(
+        matches!(
+            rig.app.services.shunt_field_edit.as_ref().map(|s| &s.edit),
+            Some(ShuntFieldEdit::Typed { input, .. }) if input.value == "high"
+        ),
+        "the first async item did not stay open"
+    );
+    assert!(
+        rig.app
+            .services
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "the + add draft was dropped"
+    );
+}
+
+/// A suspended clean shunt `Typed` editor whose file gained a value out of band
+/// re-seeds from it on return, caret at the end, and no warning opens.
+#[cfg(unix)]
+#[test]
+fn a_suspended_clean_shunt_editor_reseeds_from_an_out_of_band_change() {
+    use super::{ShuntFieldEdit, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert_eq!(
+        rig.app.tab,
+        Tab::Overview,
+        "the clean editor did not suspend"
+    );
+    std::fs::write(
+        &rig.config,
+        RIG_TEXT.replace(
+            "auth = \"claude_oauth\"",
+            "effort = \"high\"\nauth = \"claude_oauth\"",
+        ),
+    )
+    .unwrap();
+    super::handle_key(&mut rig.app, alt_digit('8'));
+    assert!(
+        rig.app.modals.is_empty(),
+        "a warning opened over the clean shunt editor"
+    );
+    assert_eq!(rig.app.tab, Tab::Services);
+    let (value, cursor) = match rig.app.services.shunt_field_edit.as_ref().map(|s| &s.edit) {
+        Some(ShuntFieldEdit::Typed { input, .. }) => (input.value.clone(), input.cursor),
+        _ => panic!("the shunt editor did not return open"),
+    };
+    assert_eq!(value, "high", "the shunt editor did not reseed");
+    assert_eq!(cursor, value.len(), "the caret did not sit at the end");
+}
+
+/// A suspended clean note editor whose disk note moved out of band re-seeds
+/// from it on return, and no warning opens.
+#[test]
+fn a_suspended_clean_note_editor_reseeds_from_an_out_of_band_change() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    crate::profile_notes::save_note(&crate::profile::ProfileName::from("a"), "orig").unwrap();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Usage;
+    app.profile_cursor.set(0);
+    super::handle_key(&mut app, key(KeyCode::Char('n')));
+    assert!(
+        app.note_editor.is_some(),
+        "precondition: the note editor is open"
+    );
+    super::handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview, "the clean editor did not suspend");
+    crate::profile_notes::save_note(&crate::profile::ProfileName::from("a"), "ext").unwrap();
+    super::handle_key(&mut app, alt_digit('2'));
+    assert!(
+        app.modals.is_empty(),
+        "a warning opened over the clean note editor"
+    );
+    assert_eq!(app.tab, Tab::Usage);
+    assert_eq!(
+        app.note_editor.as_ref().map(|e| e.buf.text()).as_deref(),
+        Some("ext"),
+        "the note editor did not reseed"
     );
 }
 
@@ -38641,11 +39684,12 @@ fn the_note_editor_keeps_the_usage_descent_and_caret() {
     );
 }
 
-/// A `+ add` shunt draft (a typed upstream name) survives a jump away and
-/// back.
+/// A `+ add` shunt draft holding a typed value is changed work: a jump away
+/// warns instead of silently suspending it. `go back` keeps the draft; the
+/// switch never lands.
 #[cfg(unix)]
 #[test]
-fn a_jump_keeps_an_open_shunt_add_draft() {
+fn a_jump_warns_over_a_typed_shunt_add_draft() {
     use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
     let home = crate::testutil::HomeSandbox::new();
     let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
@@ -38658,31 +39702,55 @@ fn a_jump_keeps_an_open_shunt_add_draft() {
     super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
     rig.type_and_commit("zz");
     assert!(
-        rig.app.services.shunt_field_edit.is_none(),
-        "precondition: no field editing"
-    );
-    assert!(
         rig.app
             .services
             .shunt_drafts
-            .is_open(ShuntAddKind::Upstream),
-        "precondition: draft open"
+            .holds_typed_work(ShuntAddKind::Upstream),
+        "precondition: the draft holds a typed name"
     );
     super::handle_key(&mut rig.app, alt_digit('1'));
-    assert_eq!(rig.app.tab, Tab::Overview, "precondition: jumped");
-    super::handle_key(&mut rig.app, alt_digit('8'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the typed + add draft jumped away with no warning"
+    );
+    assert_eq!(
+        rig.app.tab,
+        Tab::Services,
+        "the warning let the switch land"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Esc));
     assert!(
         rig.app
             .services
             .shunt_drafts
             .is_open(ShuntAddKind::Upstream),
-        "the jump folded (dropped) the open shunt add-draft"
+        "go back folded the typed + add draft"
+    );
+    // A second ⌃c over the same draft opens the quit form, never quits.
+    let ctrl_c = with_mods(
+        KeyCode::Char('c'),
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    );
+    super::handle_key(&mut rig.app, ctrl_c);
+    super::handle_key(&mut rig.app, ctrl_c);
+    assert!(
+        !rig.app.quit,
+        "the second ⌃c quit over the typed + add draft"
+    );
+    assert!(
+        matches!(
+            rig.app.modals.last(),
+            Some(Modal::LossWarning(s)) if matches!(s.target, super::LossWarningTarget::Quit)
+        ),
+        "the second ⌃c opened no quit warning over the typed + add draft"
     );
 }
 
-/// The action-menu shunt jump keeps a suspended `+ new` form's typed values.
+/// The action-menu shunt jump over a typed `+ new` form warns (the two-button
+/// form) instead of silently suspending the form. `go back` keeps the form and
+/// the tab.
 #[test]
-fn the_shunt_jump_keeps_the_new_form() {
+fn the_shunt_jump_warns_over_a_typed_new_form() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![crate::testutil::blank_profile(
         &crate::profile::ProfileName::from("a"),
@@ -38695,23 +39763,19 @@ fn the_shunt_jump_keeps_the_new_form() {
     }
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::jump_to_shunt_card(&mut app, super::ShuntFocusLine::Adopt);
-    assert_eq!(
-        app.tab,
-        Tab::Services,
-        "precondition: jumped to the shunt card"
+    assert!(
+        matches!(app.modals.last(), Some(Modal::LossWarning(_))),
+        "the shunt jump over the typed form opened no warning"
     );
-    super::handle_key(&mut app, alt_digit('4'));
-    assert_eq!(app.tab, Tab::Setup);
-    app.profile_cursor.set(app.profile_count());
-    super::handle_key(&mut app, key(KeyCode::Enter));
-    assert_eq!(
+    assert_eq!(app.tab, Tab::Setup, "the warning let the jump land");
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert!(
         app.config_draft
             .as_ref()
-            .map(|d| d.name.value.clone())
-            .as_deref(),
-        Some("zed"),
-        "the action-menu shunt jump lost the + new form"
+            .is_some_and(|d| d.editing_name.is_none() && d.name.value == "zed"),
+        "go back dropped the typed form"
     );
+    assert_eq!(app.tab, Tab::Setup, "go back moved the tab");
 }
 
 /// The herdr tag editor keeps the Services descent across a jump.
@@ -38722,7 +39786,7 @@ fn the_herdr_tag_editor_keeps_the_services_descent() {
     let mut app = bare_app();
     app.tab = Tab::Services;
     app.services.focus = ServicesFocus::Detail;
-    app.services.herdr_tag_draft = Some(InputState::new("5"));
+    app.services.herdr_tag_draft = Some(SeededInput::new("5"));
     super::handle_key(&mut app, alt_digit('1'));
     assert_eq!(app.tab, Tab::Overview, "precondition: jumped");
     super::handle_key(&mut app, alt_digit('8'));
@@ -38779,13 +39843,10 @@ fn a_jump_keeps_an_open_shunt_field_editor() {
         field: UpstreamFieldKind::Effort,
     });
     super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
-    assert!(
-        rig.app.services.shunt_field_edit.is_some(),
-        "precondition: field editor open"
-    );
-    for c in "high".chars() {
-        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
-    }
+    let (value, cursor) = match rig.app.services.shunt_field_edit.as_ref().map(|s| &s.edit) {
+        Some(ShuntFieldEdit::Typed { input, .. }) => (input.value.clone(), input.cursor),
+        other => panic!("precondition: a typed field editor open, got {other:?}"),
+    };
     super::handle_key(&mut rig.app, alt_digit('1'));
     assert_eq!(rig.app.tab, Tab::Overview, "precondition: jumped away");
     super::handle_key(&mut rig.app, alt_digit('8'));
@@ -38795,26 +39856,24 @@ fn a_jump_keeps_an_open_shunt_field_editor() {
         ServicesFocus::Detail,
         "the jump ascended the shunt detail under an open field editor"
     );
-    let typed = match rig.app.services.shunt_field_edit.as_ref().map(|s| &s.edit) {
-        Some(ShuntFieldEdit::Typed { input, .. }) => Some(input.value.clone()),
-        _ => None,
-    };
-    assert_eq!(
-        typed.as_deref(),
-        Some("high"),
-        "the jump dropped or changed the typed field"
-    );
+    match rig.app.services.shunt_field_edit.as_ref().map(|s| &s.edit) {
+        Some(ShuntFieldEdit::Typed { input, .. }) => {
+            assert_eq!(input.value, value, "the jump changed the field's value");
+            assert_eq!(input.cursor, cursor, "the jump moved the field's caret");
+        }
+        other => panic!("the jump dropped the open field editor: {other:?}"),
+    }
 }
 
 /// A jump away from an open Config or herdr editor commits nothing: the saved
-/// value under each draft stays put while the draft survives (F8f).
+/// value under each draft stays put while the draft survives.
 #[test]
 fn a_jump_commits_no_config_or_herdr_draft() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = Tab::Config;
-    app.context_nudge_draft = Some(InputState::new("300k"));
-    app.weekly_threshold_draft = Some(InputState::new("95"));
+    app.context_nudge_draft = Some(SeededInput::new("300k"));
+    app.weekly_threshold_draft = Some(SeededInput::new("95"));
     let nudge_saved = app.config().state.context_nudge_threshold_tokens;
     let weekly_saved = app.config().state.weekly_switch_threshold;
     super::handle_key(&mut app, alt_digit('1'));
@@ -38842,7 +39901,7 @@ fn a_jump_commits_no_config_or_herdr_draft() {
     let mut app = bare_app();
     app.tab = Tab::Services;
     app.services.focus = super::ServicesFocus::Detail;
-    app.services.herdr_tag_draft = Some(InputState::new("7"));
+    app.services.herdr_tag_draft = Some(SeededInput::new("7"));
     let tag_saved = app.config().state.herdr.tag_watch_secs;
     super::handle_key(&mut app, alt_digit('1'));
     super::handle_key(&mut app, alt_digit('8'));
@@ -38925,9 +39984,6 @@ fn a_suspended_note_editor_returns_under_its_own_account() {
         app.note_editor.is_some(),
         "precondition: a's note editor open"
     );
-    for c in "hi".chars() {
-        super::handle_key(&mut app, key(KeyCode::Char(c)));
-    }
     super::handle_key(&mut app, alt_digit('4'));
     assert_eq!(app.tab, Tab::Setup, "precondition: jumped");
     super::handle_key(&mut app, key(KeyCode::Down));
@@ -38952,10 +40008,9 @@ fn a_suspended_note_editor_returns_under_its_own_account() {
         "the note editor returned under b's selection; ↵ wrote a's note"
     );
     super::handle_key(&mut app, key(KeyCode::Enter));
-    assert_eq!(
-        crate::profile_notes::load_note(&crate::profile::ProfileName::from("a")).as_deref(),
-        Some("hi"),
-        "the save did not write a's note"
+    assert!(
+        crate::profile_notes::load_note(&crate::profile::ProfileName::from("a")).is_none(),
+        "the save wrote a's empty note as text"
     );
     assert!(
         crate::profile_notes::load_note(&crate::profile::ProfileName::from("b")).is_none(),
@@ -39039,175 +40094,61 @@ fn a_note_editor_opened_from_the_list_returns_without_a_descent() {
     );
 }
 
-/// Suspend a typed `+ new` form into its home (`new_account_draft`): Setup
-/// `+ new` → base-url field → type → commit → `⌥8` to Services at rest.
+/// The mint `+ new profile` path routes through the loss warning like every
+/// cross-screen jump: changed work on Services warns first, `discard` drops it
+/// and opens the mint form. A typed `+ new` form can no longer suspend (a
+/// switch or jump over it warns), so no separate mint warning is needed.
 #[cfg(unix)]
-fn suspend_a_typed_new_form(app: &mut App) {
-    app.tab = Tab::Setup;
-    app.profile_cursor.set(app.profile_count());
-    super::handle_key(app, key(KeyCode::Enter));
-    let base_row = super::config_rows(app)
-        .iter()
-        .position(|r| *r == super::ConfigRow::BaseUrl)
-        .unwrap();
-    app.config_action_cursor = base_row;
-    super::handle_key(app, key(KeyCode::Enter));
-    for c in "https://typed.example".chars() {
-        super::handle_key(app, key(KeyCode::Char(c)));
+#[test]
+fn the_mint_path_warns_over_changed_services_work() {
+    use super::{ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    for c in "high".chars() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
     }
-    super::handle_key(app, key(KeyCode::Enter));
-    super::handle_key(app, alt_digit('8'));
-    assert!(
-        app.new_account_draft
-            .as_ref()
-            .is_some_and(|d| d.base_url.value == "https://typed.example"),
-        "precondition: the typed form is suspended in its home"
-    );
-}
-
-/// Whether the typed `+ new` form survives in either slot.
-#[cfg(unix)]
-fn typed_new_form_survives(app: &App) -> bool {
-    let typed = |d: &Option<super::ConfigDraft>| {
-        d.as_ref()
-            .is_some_and(|d| d.base_url.value == "https://typed.example")
-    };
-    typed(&app.config_draft) || typed(&app.new_account_draft)
-}
-
-/// The mint `+ new profile` path asks before opening over a suspended typed
-/// `+ new` form: the loss warning opens, the mint form does not, and the typed
-/// form stays in its home.
-#[cfg(unix)]
-#[test]
-fn the_mint_new_profile_warns_over_a_suspended_typed_form() {
-    let home = crate::testutil::HomeSandbox::new();
-    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
-    let mut rig = config_edit_rig(&home, RIG_TEXT);
-    suspend_a_typed_new_form(&mut rig.app);
     super::open_new_profile_form(&mut rig.app, false);
     assert!(
         matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
-        "the mint path opened the mint form instead of the warning"
+        "the mint path over a dirty shunt field opened no warning"
     );
-    assert_eq!(rig.app.tab, Tab::Services, "the warning switched the tab");
-    assert!(
-        rig.app.config_draft.is_none(),
-        "the mint form did not open over the suspended form"
-    );
-    assert_eq!(
-        rig.app
-            .new_account_draft
-            .as_ref()
-            .map(|d| d.base_url.value.clone())
-            .as_deref(),
-        Some("https://typed.example"),
-        "the suspended typed form did not survive in its home"
-    );
-}
-
-/// `go back` on the mint warning leaves everything as it was: the warning
-/// closes, the tab stays on Services, and the suspended form is untouched.
-#[cfg(unix)]
-#[test]
-fn go_back_on_the_mint_warning_keeps_the_suspended_form() {
-    let home = crate::testutil::HomeSandbox::new();
-    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
-    let mut rig = config_edit_rig(&home, RIG_TEXT);
-    suspend_a_typed_new_form(&mut rig.app);
-    super::open_new_profile_form(&mut rig.app, false);
-    assert!(
-        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
-        "precondition: the warning opened"
-    );
-    super::handle_key(&mut rig.app, key(KeyCode::Esc));
-    assert!(rig.app.modals.is_empty(), "go back left the warning open");
     assert_eq!(
         rig.app.tab,
         Tab::Services,
-        "go back moved the tab off Services"
+        "the warning let the mint jump land"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Esc));
+    assert_eq!(rig.app.tab, Tab::Services, "go back moved the tab");
+    assert!(
+        rig.app.services.shunt_field_edit.as_ref().is_some_and(|s| {
+            matches!(&s.edit, super::ShuntFieldEdit::Typed { input, .. } if input.value == "high")
+        }),
+        "go back dropped the dirty shunt field"
+    );
+    // A second ⌃c over the same field opens the quit form, never quits.
+    let ctrl_c = with_mods(
+        KeyCode::Char('c'),
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    );
+    super::handle_key(&mut rig.app, ctrl_c);
+    super::handle_key(&mut rig.app, ctrl_c);
+    assert!(
+        !rig.app.quit,
+        "the second ⌃c quit over the dirty shunt field"
     );
     assert!(
-        rig.app.config_draft.is_none(),
-        "go back opened no mint form"
-    );
-    assert_eq!(
-        rig.app
-            .new_account_draft
-            .as_ref()
-            .map(|d| d.base_url.value.clone())
-            .as_deref(),
-        Some("https://typed.example"),
-        "go back dropped the suspended form"
-    );
-}
-
-/// `discard` on the mint warning drops the suspended form and opens the mint
-/// form exactly as the picker would.
-#[cfg(unix)]
-#[test]
-fn discard_on_the_mint_warning_drops_the_form_and_opens_the_mint_form() {
-    let home = crate::testutil::HomeSandbox::new();
-    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
-    let mut rig = config_edit_rig(&home, RIG_TEXT);
-    suspend_a_typed_new_form(&mut rig.app);
-    super::open_new_profile_form(&mut rig.app, false);
-    assert!(
-        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
-        "precondition: the warning opened"
-    );
-    super::handle_key(&mut rig.app, key(KeyCode::Right));
-    super::handle_key(&mut rig.app, key(KeyCode::Enter));
-    assert!(rig.app.modals.is_empty(), "discard left the warning open");
-    assert_eq!(
-        rig.app.tab,
-        Tab::Setup,
-        "discard did not open the mint form on Setup"
-    );
-    assert!(
-        rig.app.new_account_draft.is_none(),
-        "discard kept the suspended form"
-    );
-    assert!(
-        rig.app
-            .config_draft
-            .as_ref()
-            .is_some_and(|d| d.editing_name.is_none() && d.mint_for.is_some()),
-        "the mint form did not open"
-    );
-}
-
-/// A jump off the mint path never loses the suspended typed form: the warning
-/// (not the mint form) owns the jump, so the form stays in its home.
-#[cfg(unix)]
-#[test]
-fn a_jump_off_the_mint_form_never_loses_the_suspended_typed_form() {
-    let home = crate::testutil::HomeSandbox::new();
-    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
-    let mut rig = config_edit_rig(&home, RIG_TEXT);
-    suspend_a_typed_new_form(&mut rig.app);
-    super::open_new_profile_form(&mut rig.app, false);
-    super::handle_key(&mut rig.app, alt_digit('8'));
-    assert!(
-        typed_new_form_survives(&rig.app),
-        "a jump off the mint path overwrote the suspended typed form"
-    );
-}
-
-/// `n` on the mint path never loses the suspended typed form: the warning owns
-/// the key, so the form stays in its home.
-#[cfg(unix)]
-#[test]
-fn n_on_the_mint_form_never_loses_the_suspended_typed_form() {
-    let home = crate::testutil::HomeSandbox::new();
-    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
-    let mut rig = config_edit_rig(&home, RIG_TEXT);
-    suspend_a_typed_new_form(&mut rig.app);
-    super::open_new_profile_form(&mut rig.app, false);
-    super::handle_key(&mut rig.app, key(KeyCode::Char('n')));
-    assert!(
-        typed_new_form_survives(&rig.app),
-        "n on the mint path overwrote the suspended typed form"
+        matches!(
+            rig.app.modals.last(),
+            Some(Modal::LossWarning(s)) if matches!(s.target, super::LossWarningTarget::Quit)
+        ),
+        "the second ⌃c opened no quit warning over the dirty shunt field"
     );
 }
 
@@ -39253,10 +40194,11 @@ fn a_rename_rebinds_the_suspended_note_editor() {
     ]);
     app.tab = Tab::Usage;
     app.profile_cursor.set(0);
+    // Pre-save the note so the editor opens clean with a non-empty draft (a
+    // typed draft would warn on the jump instead of suspending).
+    crate::profile_notes::save_note(&crate::profile::ProfileName::from("a"), "keep me")
+        .expect("precondition: seed a's note");
     super::handle_key(&mut app, key(KeyCode::Char('n')));
-    for c in "keep me".chars() {
-        super::handle_key(&mut app, key(KeyCode::Char(c)));
-    }
     super::handle_key(&mut app, alt_digit('4'));
     assert_eq!(app.tab, Tab::Setup, "precondition: jumped");
     app.profile_cursor.set(0);
@@ -39352,10 +40294,12 @@ fn a_rename_rebinds_the_suspended_fallback_day_stop() {
     app.fallback_edit = Some(super::MemberEdit {
         member: crate::profile::ProfileName::from("a"),
         state: CardEdit::Days(super::DayPicker::default()),
+        seed: None,
     });
     app.fallback_day_stop = Some(super::MemberEdit {
         member: crate::profile::ProfileName::from("a"),
         state: vec![chrono::Weekday::Mon],
+        seed: None,
     });
     super::handle_key(&mut app, alt_digit('4'));
     assert_eq!(app.tab, Tab::Setup, "precondition: jumped to Setup");
@@ -39397,9 +40341,6 @@ fn a_name_miss_on_the_usage_landing_closes_the_note_editor() {
     app.tab = Tab::Usage;
     app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Char('n')));
-    for c in "keep me".chars() {
-        super::handle_key(&mut app, key(KeyCode::Char(c)));
-    }
     super::handle_key(&mut app, alt_digit('4'));
     assert_eq!(app.tab, Tab::Setup, "precondition: jumped");
     // Rename out from under the app (the CLI shape): the same path the CLI
@@ -39462,10 +40403,10 @@ fn the_guarded_writer_returns_the_refused_draft_without_dropping_it() {
     );
 }
 
-/// A preset stamped onto a suspended `+ new` form lands on the user's own
-/// form, and no later switch drops it or panics: the preset restores the
-/// suspended form instead of building a fresh one, and the guarded writer
-/// refuses to overwrite an occupied slot.
+/// A preset stamped onto a `+ new` form lands on the user's own form, and a
+/// later switch over that typed form warns instead of dropping it: the preset
+/// restores the suspended form (the guarded writer's slot) rather than
+/// building a fresh one, and a typed form is never silently suspended.
 #[cfg(unix)]
 #[test]
 fn a_preset_stamped_new_form_then_n_then_a_jump_keeps_the_typed_form() {
@@ -39473,31 +40414,13 @@ fn a_preset_stamped_new_form_then_n_then_a_jump_keeps_the_typed_form() {
     let mut app = app_with(vec![crate::testutil::blank_profile(
         &crate::profile::ProfileName::from("a"),
     )]);
-    super::handle_key(&mut app, key(KeyCode::Char('n')));
-    super::handle_key(&mut app, key(KeyCode::Down)); // off the `type` row
-    super::handle_key(&mut app, key(KeyCode::Enter));
-    for c in "zed".chars() {
-        super::handle_key(&mut app, key(KeyCode::Char(c)));
-    }
-    super::handle_key(&mut app, key(KeyCode::Enter));
-    super::handle_key(&mut app, alt_digit('1'));
-    super::handle_key(&mut app, alt_digit('4'));
-    assert_eq!(
-        app.profile_cursor.read(),
-        app.profile_count(),
-        "precondition: selector on + new"
-    );
-    assert_eq!(
-        app.config_focus,
-        super::ConfigFocus::Profiles,
-        "precondition: at rest"
-    );
-    assert!(
-        app.new_account_draft
-            .as_ref()
-            .is_some_and(|d| d.name.value == "zed"),
-        "precondition: typed form suspended"
-    );
+    // A typed form in its home, written directly: a switch would warn instead
+    // of suspending it, so the slot is the one writer's.
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(app.profile_count());
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("zed");
+    app.new_account_draft = Some(draft);
     super::handle_key(&mut app, key(KeyCode::Char('a')));
     super::handle_key(&mut app, key(KeyCode::Enter));
     while !app.modals.is_empty() {
@@ -39527,15 +40450,10 @@ fn a_preset_stamped_new_form_then_n_then_a_jump_keeps_the_typed_form() {
     );
     super::handle_key(&mut app, alt_digit('1'));
     assert!(
-        app.config_draft
-            .as_ref()
-            .is_some_and(|d| d.name.value == "zed")
-            || app
-                .new_account_draft
-                .as_ref()
-                .is_some_and(|d| d.name.value == "zed"),
-        "the jump dropped the typed name or the stamped form"
+        matches!(app.modals.last(), Some(Modal::LossWarning(_))),
+        "the jump over the typed form opened no warning"
     );
+    assert_eq!(app.tab, Tab::Setup, "the warning did not hold the switch");
 }
 
 /// `apply preset` on the `+ new` form restores the suspended form first, so a
@@ -39600,9 +40518,6 @@ fn an_in_app_delete_closes_the_suspended_note_editor() {
     app.profile_cursor.set(0);
     super::handle_key(&mut app, key(KeyCode::Enter));
     super::handle_key(&mut app, key(KeyCode::Char('n')));
-    for c in "keep me".chars() {
-        super::handle_key(&mut app, key(KeyCode::Char(c)));
-    }
     super::handle_key(&mut app, alt_digit('4'));
     assert_eq!(app.tab, Tab::Setup, "precondition: jumped");
     super::perform_delete(&mut app, &crate::profile::ProfileName::from("a"));
@@ -39648,7 +40563,9 @@ fn a_refused_slot_write_puts_the_form_back_and_keeps_the_descent() {
     let mut pane = super::build_draft_new();
     pane.base_url = super::InputState::new("https://pane.example");
     app.config_draft = Some(pane);
-    super::handle_key(&mut app, alt_digit('1'));
+    // Suspend directly (the action-menu jump's path, not a switch key): a
+    // switch key over either typed form would warn.
+    super::do_switch(&mut app, Tab::Overview);
     assert_eq!(app.tab, Tab::Overview, "the jump did not land on Overview");
     assert!(
         app.config_draft
@@ -39686,8 +40603,10 @@ fn a_preset_on_the_new_row_lands_descended_on_the_stamped_form() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
     }
     super::handle_key(&mut app, key(KeyCode::Enter));
-    super::handle_key(&mut app, alt_digit('1'));
-    super::handle_key(&mut app, alt_digit('4'));
+    // Suspend the typed form directly: a switch over it would warn.
+    app.new_account_draft = app.config_draft.take();
+    app.config_focus = super::ConfigFocus::Profiles;
+    app.profile_cursor.set(app.profile_count());
     super::handle_key(&mut app, key(KeyCode::Char('a')));
     super::handle_key(&mut app, key(KeyCode::Enter));
     while !app.modals.is_empty() {
@@ -39825,14 +40744,13 @@ fn no_slot_write_drops_a_typed_value_across_the_switch_sequences() {
     super::handle_key(app, key(KeyCode::Down)); // off the `type` row
     super::handle_key(app, key(KeyCode::Enter));
     super::handle_key(app, alt_digit('8'));
-    super::open_new_profile_form(app, false);
     assert!(
         matches!(app.modals.last(), Some(Modal::LossWarning(_))),
-        "the mint path did not warn over the field-open form"
+        "a typed open-field form switched away with no warning"
     );
+    assert_eq!(app.tab, Tab::Setup, "the warning let the switch land");
     super::handle_key(app, key(KeyCode::Esc));
     assert!(intact(app), "`go back` dropped a field or the login");
-    super::handle_key(app, alt_digit('4'));
     assert!(
         app.config_draft
             .as_ref()
@@ -39920,8 +40838,10 @@ fn a_preset_apply_early_return_clears_the_picker_flag() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
     }
     super::handle_key(&mut app, key(KeyCode::Enter));
-    super::handle_key(&mut app, alt_digit('1'));
-    super::handle_key(&mut app, alt_digit('4'));
+    // Suspend the typed form directly: a switch over it would warn.
+    app.new_account_draft = app.config_draft.take();
+    app.config_focus = super::ConfigFocus::Profiles;
+    app.profile_cursor.set(app.profile_count());
 
     super::open_preset_picker(&mut app);
     assert_eq!(
@@ -44451,8 +45371,10 @@ fn a_suspended_claude_form_previews_its_typed_values_at_rest() {
         d.api_key = super::InputState::new("typed-key-0123");
         d.model = super::InputState::new("typed-model");
     }
-    super::handle_key(&mut app, alt_digit('8'));
-    super::handle_key(&mut app, alt_digit('4'));
+    // Suspend the typed form directly: a switch over it would warn.
+    app.new_account_draft = app.config_draft.take();
+    app.config_focus = super::ConfigFocus::Profiles;
+    app.profile_cursor.set(app.profile_count());
     assert!(
         app.config_draft.is_none() && app.new_account_draft.is_some(),
         "precondition: the form is suspended at rest"
@@ -44486,8 +45408,10 @@ fn a_new_forms_api_key_renders_masked_at_rest_and_descended() {
         d.base_url = super::InputState::new("https://typed.example");
         d.api_key = super::InputState::new("sk-typed-key-0123");
     }
-    super::handle_key(&mut app, alt_digit('8'));
-    super::handle_key(&mut app, alt_digit('4'));
+    // Suspend the typed form directly: a switch over it would warn.
+    app.new_account_draft = app.config_draft.take();
+    app.config_focus = super::ConfigFocus::Profiles;
+    app.profile_cursor.set(app.profile_count());
     assert!(
         app.config_draft.is_none() && app.new_account_draft.is_some(),
         "precondition: the form is suspended at rest"
@@ -44532,8 +45456,10 @@ fn the_new_forms_action_menu_names_the_suspended_form_at_rest() {
         Some("fresh-one"),
         "precondition: the descended form's menu names it"
     );
-    super::handle_key(&mut app, alt_digit('8'));
-    super::handle_key(&mut app, alt_digit('4'));
+    // Suspend the typed form directly: a switch over it would warn.
+    app.new_account_draft = app.config_draft.take();
+    app.config_focus = super::ConfigFocus::Profiles;
+    app.profile_cursor.set(app.profile_count());
     assert!(
         app.config_draft.is_none() && app.new_account_draft.is_some(),
         "precondition: the form is suspended at rest"
@@ -44572,8 +45498,10 @@ fn a_suspended_services_mint_form_previews_its_gateway_base_url_at_rest() {
         app.config_draft.as_ref().is_some_and(|d| d.mint_armed()),
         "precondition: the mint form's api key row is read-only"
     );
-    super::handle_key(&mut app, alt_digit('8'));
-    super::handle_key(&mut app, alt_digit('4'));
+    // Suspend the mint form directly: a switch over it would warn.
+    app.new_account_draft = app.config_draft.take();
+    app.config_focus = super::ConfigFocus::Profiles;
+    app.profile_cursor.set(app.profile_count());
     assert!(
         app.config_draft.is_none() && app.new_account_draft.is_some(),
         "precondition: the mint form is suspended at rest"
@@ -45083,5 +46011,1067 @@ fn a_setup_rehome_onto_a_codex_first_row_keeps_the_held_usage_row() {
         app.usage_selection(),
         super::SetupSelection::Item(super::MainItemKind::Shunt(0, 1)),
         "no user step happened, so Usage's held row returns"
+    );
+}
+
+// ── open draft fields, deferred sync items, in-flight saves ──
+
+/// A `+ add` draft's open name editor holding typed text is that kind's typed
+/// work: a switch over it warns, and `save` lands the open field into the
+/// draft first, then runs `save upstream`, so the switch leaves nothing typed
+/// unwritten.
+#[cfg(unix)]
+#[test]
+fn a_save_lands_an_open_draft_field_before_switching() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    for c in "zz".chars() {
+        super::handle_key(&mut rig.app, key(KeyCode::Char(c)));
+    }
+    let dirty = format!("{:?}", super::changed_work(&rig.app));
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the open draft field did not warn: {dirty}"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(rig.app.loss_pending.is_some(), "the save did not hold");
+    rig.drain();
+    assert_eq!(rig.app.tab, Tab::Overview, "the landed save did not switch");
+    assert!(rig.config_text().contains("name = \"zz\""), "not written");
+}
+
+/// The quit twin: a `save` over an open draft field lands the field, saves the
+/// draft, then quits.
+#[cfg(unix)]
+#[test]
+fn a_save_lands_an_open_draft_field_before_quitting() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    for c in "zz".chars() {
+        super::handle_key(&mut rig.app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the open draft field did not warn"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.drain();
+    assert!(rig.app.quit, "the landed save did not quit");
+    assert!(rig.config_text().contains("name = \"zz\""), "not written");
+}
+
+/// A `+ add` draft's open cycle pick is that kind's typed work too: `save`
+/// lands the pick into the draft, then saves the draft.
+#[cfg(unix)]
+#[test]
+fn a_save_lands_a_draft_cycle_pick_then_switches() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::AuthMode),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Char(' ')));
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the draft pick did not warn"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(rig.app.tab, Tab::Overview, "the save did not switch");
+    let text = rig.config_text();
+    assert!(text.contains("name = \"zz\""), "the name did not land");
+    assert!(
+        text.contains("passthrough"),
+        "the pick did not land: {text}"
+    );
+}
+
+/// Blanking a committed draft field is changed work: the save refuses the now
+/// blank required name, and nothing writes.
+#[cfg(unix)]
+#[test]
+fn a_draft_field_typed_back_to_blank_warns_and_refuses() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFocus, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    for _ in 0..2 {
+        super::handle_key(&mut rig.app, key(KeyCode::Backspace));
+    }
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the blanked field did not warn"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert_eq!(
+        rig.app
+            .services
+            .shunt_drafts
+            .refusal(ShuntAddKind::Upstream)
+            .map(str::to_string),
+        Some("cannot add upstream: set its name first".to_string()),
+        "the blanked name did not refuse"
+    );
+    assert!(
+        !rig.config_text().contains("name = \"zz\""),
+        "a blanked name still wrote"
+    );
+    assert_eq!(
+        rig.app.services.focused_shunt_focus(),
+        Some(&ShuntFocus::SaveAdd {
+            kind: ShuntAddKind::Upstream
+        }),
+        "the refusal did not land on the save <kind> row"
+    );
+}
+
+/// A save holding one async shunt item plus a sync item starts the async item
+/// first and holds; on its landing the sync item commits (re-validated) and the
+/// switch then runs its own gate, so both land and the switch proceeds.
+#[cfg(unix)]
+#[test]
+fn a_save_starts_the_async_item_first_then_commits_the_sync_items() {
+    use super::{ServicesFocus, ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.app.services.focus = ServicesFocus::List;
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let typed = before + 7;
+    let mut d = SeededInput::new(&before.to_string());
+    d.input = InputState::new(&typed.to_string());
+    rig.app.services.herdr_tag_draft = Some(d);
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the two changed Services items opened no warning"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(rig.app.loss_pending.is_some(), "the save did not hold");
+    assert!(
+        rig.app.config().state.herdr.tag_watch_secs == before,
+        "the sync item committed before the async item landed"
+    );
+    rig.drain();
+    assert_eq!(rig.app.tab, Tab::Overview, "the save did not switch");
+    assert!(
+        rig.config_text().contains("name = \"zz\""),
+        "the async item did not land"
+    );
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        typed,
+        "the sync item did not commit after the async item landed"
+    );
+}
+
+/// A refused `shunt check` commits nothing: the held sync item stays uncommitted,
+/// nothing switches, and the shunt item stays open.
+#[cfg(unix)]
+#[test]
+fn a_refused_check_commits_nothing_and_opens_the_shunt_item() {
+    use super::{ServicesFocus, ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.app.services.focus = ServicesFocus::List;
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let typed = before + 7;
+    let mut d = SeededInput::new(&before.to_string());
+    d.input = InputState::new(&typed.to_string());
+    rig.app.services.herdr_tag_draft = Some(d);
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    let pending = rig.app.loss_pending.is_some();
+    rig.drain();
+    assert_eq!(rig.app.tab, Tab::Services, "switched over the refusal");
+    assert!(
+        !rig.config_text().contains("name = \"zz\""),
+        "the add committed"
+    );
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before,
+        "the herdr tag committed though the async item in the same save was refused: pending={pending} typed={typed}"
+    );
+    assert!(
+        rig.app
+            .services
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "the shunt item was not kept open"
+    );
+}
+
+/// A sync item made invalid while the async item's save is held commits
+/// nothing more: the re-run gate warns over it and it stays open, invalid.
+#[cfg(unix)]
+#[test]
+fn a_sync_item_made_invalid_during_the_hold_commits_nothing_more_and_warns() {
+    use super::{ServicesFocus, ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.app.services.focus = ServicesFocus::List;
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let mut d = SeededInput::new(&before.to_string());
+    d.input = InputState::new(&(before + 7).to_string());
+    rig.app.services.herdr_tag_draft = Some(d);
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(rig.app.loss_pending.is_some(), "precondition: held");
+    if let Some(d) = rig.app.services.herdr_tag_draft.as_mut() {
+        d.input = InputState::new("x");
+    }
+    rig.drain();
+    assert!(
+        rig.config_text().contains("name = \"zz\""),
+        "the async item did not land"
+    );
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before,
+        "the invalidated sync item committed"
+    );
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the invalidated sync item did not warn"
+    );
+    assert!(
+        rig.app
+            .services
+            .herdr_tag_draft
+            .as_ref()
+            .is_some_and(|d| d.input.value == "x"),
+        "the invalid sync item did not stay open"
+    );
+}
+
+/// A field whose own save is still checking is not changed work: a switch over
+/// it alone opens no warning, holds on the save, and the landing switches.
+#[cfg(unix)]
+#[test]
+fn an_in_flight_field_alone_holds_and_switches_on_landing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: the save is in flight"
+    );
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        !matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the in-flight field warned"
+    );
+    assert!(rig.app.loss_pending.is_some(), "the save did not hold");
+    assert_eq!(rig.app.tab, Tab::Services);
+    rig.drain();
+    assert_eq!(rig.app.tab, Tab::Overview, "the landed save did not switch");
+    assert!(rig.config_text().contains("effort = \"high\""), "not saved");
+}
+
+/// The refused twin: the field is open, changed, and the re-run gate opens the
+/// warning over it.
+#[cfg(unix)]
+#[test]
+fn an_in_flight_field_alone_whose_save_refuses_warns_on_landing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        !matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the in-flight field warned"
+    );
+    assert!(rig.app.loss_pending.is_some(), "the save did not hold");
+    rig.drain();
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the refused save did not warn over the open field"
+    );
+    assert_eq!(rig.app.tab, Tab::Services);
+    assert!(rig.app.loss_pending.is_none(), "the hold was not cleared");
+}
+
+/// An in-flight field beside other changed work warns over the other work;
+/// `save` holds everything until the running save lands, then commits the
+/// still-changed other work and switches. The herdr tag draft is written
+/// directly beside the locked, in-flight field editor: no key path can hold
+/// two keyboard owners open at once, so the fixture shortcuts the state.
+#[cfg(unix)]
+#[test]
+fn an_in_flight_field_beside_other_work_save_waits_then_switches() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let typed = before + 7;
+    let mut d = SeededInput::new(&before.to_string());
+    d.input = InputState::new(&typed.to_string());
+    rig.app.services.herdr_tag_draft = Some(d);
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "no warning over the other work"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(rig.app.loss_pending.is_some(), "the save did not wait");
+    rig.drain();
+    assert_eq!(rig.app.tab, Tab::Overview, "the save did not switch");
+    assert!(
+        rig.config_text().contains("effort = \"high\""),
+        "the field save did not land"
+    );
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        typed,
+        "the herdr tag did not commit"
+    );
+}
+
+/// `discard` over the other work switches at once and lets the running field
+/// save land: the file still holds the value, the discarded item does not
+/// commit. The herdr tag draft is written directly beside the locked,
+/// in-flight field editor (no key path holds two keyboard owners open at once).
+#[cfg(unix)]
+#[test]
+fn an_in_flight_field_beside_other_work_discard_switches_and_the_save_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let mut d = SeededInput::new(&before.to_string());
+    d.input = InputState::new(&(before + 7).to_string());
+    rig.app.services.herdr_tag_draft = Some(d);
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    super::handle_key(&mut rig.app, key(KeyCode::Left));
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert_eq!(rig.app.tab, Tab::Overview, "discard did not switch");
+    rig.drain();
+    assert!(
+        rig.config_text().contains("effort = \"high\""),
+        "the running field save did not land"
+    );
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before,
+        "discard committed the herdr tag"
+    );
+}
+
+/// A refused `save` runs the failing item's own ↵ path, so the `+ add` draft
+/// shows its own refusal sentence and nothing else commits.
+#[cfg(unix)]
+#[test]
+fn a_refused_add_draft_save_shows_its_refusal() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFieldKey, ShuntFocus, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Provider),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("deepseek");
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    for c in "high".chars() {
+        super::handle_key(&mut rig.app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert_eq!(
+        rig.app
+            .services
+            .shunt_drafts
+            .refusal(ShuntAddKind::Upstream)
+            .map(str::to_string),
+        Some("cannot add upstream: set its name first".to_string()),
+        "the failing + add draft shows no refusal"
+    );
+    assert!(
+        !rig.config_text().contains("effort = \"high\""),
+        "the valid field committed despite the refused draft"
+    );
+    assert_eq!(
+        rig.app.services.focused_shunt_focus(),
+        Some(&ShuntFocus::Field {
+            key: ShuntFieldKey::Upstream {
+                name: "a".into(),
+                occurrence: 0,
+                field: UpstreamFieldKind::Effort,
+            }
+        }),
+        "the refused draft stole focus off the open field editor"
+    );
+}
+
+/// `discard` over an open, typed `+ add` draft field closes the editor (as
+/// `esc` would) and leaves no changed work; a later quit does not warn and the
+/// discarded value never writes.
+#[cfg(unix)]
+#[test]
+fn a_discard_over_an_open_draft_field_closes_it_and_writes_nothing() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    for c in "zz".chars() {
+        super::handle_key(&mut rig.app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the typed draft field did not warn"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Left));
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_field_edit.is_none(),
+        "the discarded draft field editor stayed open"
+    );
+    assert!(
+        super::changed_work(&rig.app).is_empty(),
+        "changed work survived the discard"
+    );
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        !matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the later quit warned over discarded work"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.drain();
+    assert!(
+        !rig.config_text().contains("name = \"zz\""),
+        "the discarded value was written"
+    );
+}
+
+/// A `+ add` draft beside a running field save: `save` holds without the
+/// one-save guard toast, and on the field save's landing the draft saves and
+/// the switch proceeds.
+#[cfg(unix)]
+#[test]
+fn a_save_beside_an_in_flight_field_holds_then_writes_the_draft_and_switches() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("high");
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: the field save is in flight"
+    );
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "no warning over the draft"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(rig.app.loss_pending.is_some(), "the save did not hold");
+    assert!(
+        !rig.app
+            .toasts
+            .iter()
+            .any(|t| t.body.starts_with("a save is still checking")),
+        "the one-save guard toast showed"
+    );
+    assert_eq!(rig.app.tab, Tab::Services, "the switch landed early");
+    rig.drain();
+    rig.drain();
+    assert_eq!(
+        rig.app.tab,
+        Tab::Overview,
+        "the save did not switch after landing"
+    );
+    let text = rig.config_text();
+    assert!(
+        text.contains("effort = \"high\""),
+        "the field save did not land"
+    );
+    assert!(text.contains("name = \"zz\""), "the draft was not written");
+}
+
+/// A herdr tag beside a field save whose check refuses, with the locked field
+/// editor closed by `↓`: nothing commits while the save runs and nothing
+/// commits after the refusal. The herdr tag editor opens through its row
+/// handler directly: the herdr card never resolves in this rig, so no key
+/// path reaches it.
+#[cfg(unix)]
+#[test]
+fn a_closed_editor_beside_a_sync_item_whose_field_save_refuses_commits_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: the save is in flight"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Down));
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    super::activate_herdr_option(&mut rig.app, super::HerdrOption::TagRefresh);
+    super::handle_key(&mut rig.app, key(KeyCode::Char('7')));
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "no warning over the sync item"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(rig.app.loss_pending.is_some(), "the save did not hold");
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before,
+        "the sync item committed before the running save landed"
+    );
+    rig.drain();
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before,
+        "the sync item committed after the refused check"
+    );
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the warning did not reopen over the uncommitted sync item"
+    );
+}
+
+/// A herdr tag beside a locked, in-flight field editor whose check refuses:
+/// nothing commits mid-hold or after. The herdr tag draft is written directly
+/// beside the locked editor (no key path holds two keyboard owners at once).
+#[cfg(unix)]
+#[test]
+fn a_sync_item_beside_a_locked_in_flight_field_whose_check_refuses_commits_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let typed = before + 7;
+    let mut d = SeededInput::new(&before.to_string());
+    d.input = InputState::new(&typed.to_string());
+    rig.app.services.herdr_tag_draft = Some(d);
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "no warning over the sync item"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(rig.app.loss_pending.is_some(), "the save did not hold");
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before,
+        "the sync item committed before the running save landed"
+    );
+    rig.drain();
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before,
+        "the sync item committed after the refused check"
+    );
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the warning did not reopen over the uncommitted sync item"
+    );
+}
+
+/// A quit `discard` beside an in-flight field save holds until the save lands,
+/// then quits.
+#[cfg(unix)]
+#[test]
+fn a_quit_discard_beside_an_in_flight_field_waits_then_quits() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("high");
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: the field save is in flight"
+    );
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "no quit warning"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Left));
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        !(rig.app.quit && rig.app.services.shunt_save.is_some()),
+        "the quit completed while the save ran"
+    );
+    assert!(rig.app.loss_pending.is_some(), "the discard did not hold");
+    rig.drain();
+    assert!(rig.app.quit, "the held quit did not land");
+    assert!(
+        rig.config_text().contains("effort = \"high\""),
+        "the running save did not land"
+    );
+}
+
+/// A cross-screen jump (`n`, new account) over an in-flight field (editor
+/// closed by `↓`) holds on that save and lands when it does.
+#[cfg(unix)]
+#[test]
+fn a_jump_over_an_in_flight_field_alone_holds() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: the save is in flight"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Down));
+    super::handle_key(&mut rig.app, key(KeyCode::Char('n')));
+    assert!(rig.app.loss_pending.is_some(), "the jump did not hold");
+    assert_eq!(rig.app.tab, Tab::Services, "the jump landed early");
+    rig.drain();
+    assert_eq!(
+        rig.app.tab,
+        Tab::Setup,
+        "the landed save did not perform the jump"
+    );
+}
+
+/// The quit twin of the in-flight-alone hold: a quit over an in-flight field
+/// alone holds with no warning and quits on landing.
+#[cfg(unix)]
+#[test]
+fn an_in_flight_field_alone_holds_and_quits_on_landing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: the save is in flight"
+    );
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        !matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the in-flight field warned"
+    );
+    assert!(!rig.app.quit, "the quit landed early");
+    assert!(rig.app.loss_pending.is_some(), "the save did not hold");
+    rig.drain();
+    assert!(rig.app.quit, "the landed save did not quit");
+    assert!(rig.config_text().contains("effort = \"high\""), "not saved");
+}
+
+/// A `save` held behind a running field save commits only what the warning
+/// asked about: work typed during the hold stays put, the warning reopens, and
+/// the switch does not land. The herdr tag editor opens through its row
+/// handler directly: the herdr card never resolves in this rig, so no key
+/// path reaches it.
+#[cfg(unix)]
+#[test]
+fn a_save_held_on_an_in_flight_field_warns_again_over_work_opened_during_the_hold() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("high");
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: in flight"
+    );
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "no warning"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(rig.app.loss_pending.is_some(), "no hold");
+    super::handle_key(&mut rig.app, key(KeyCode::Down));
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    super::activate_herdr_option(&mut rig.app, super::HerdrOption::TagRefresh);
+    super::handle_key(&mut rig.app, key(KeyCode::Char('7')));
+    rig.drain();
+    rig.drain();
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before,
+        "the herdr tag typed during the hold committed with no warning"
+    );
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "work opened during the hold was not asked about"
+    );
+    assert_eq!(
+        rig.app.tab,
+        Tab::Services,
+        "the switch landed without a warning"
+    );
+}
+
+/// A different shunt field opened during a held save is not the field the
+/// warning asked about: the landing re-warns and commits nothing.
+#[cfg(unix)]
+#[test]
+fn a_different_field_opened_during_the_hold_warns_again_and_commits_nothing() {
+    use super::{ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("high");
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: in flight"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Down));
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::ServiceTier,
+    });
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    for c in "fast".chars() {
+        super::handle_key(&mut rig.app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "no warning"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(rig.app.loss_pending.is_some(), "no hold");
+    super::handle_key(&mut rig.app, key(KeyCode::Esc));
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Provider,
+    });
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    for c in "slow".chars() {
+        super::handle_key(&mut rig.app, key(KeyCode::Char(c)));
+    }
+    rig.drain();
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the warning did not reopen over the field opened during the hold"
+    );
+    assert!(
+        !rig.config_text().contains("slow"),
+        "the field opened during the hold committed with no warning"
+    );
+    assert_eq!(
+        rig.app.tab,
+        Tab::Services,
+        "the switch landed without a warning"
+    );
+}
+
+/// A warned sync item (herdr tag) typed further during a held save is still
+/// the item the warning asked about: its landing value commits and the switch
+/// lands with no second warning. The herdr tag editor opens through its row
+/// handler directly: the herdr card never resolves in this rig, so no key
+/// path reaches it.
+#[cfg(unix)]
+#[test]
+fn a_warned_item_typed_further_during_the_hold_commits_its_landing_value() {
+    use super::{ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("high");
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: in flight"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Down));
+    super::activate_herdr_option(&mut rig.app, super::HerdrOption::TagRefresh);
+    super::handle_key(&mut rig.app, key(KeyCode::Char('7')));
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "no warning over the herdr tag"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            rig.app.loss_pending_sync.as_ref(),
+            Some(super::LossPendingSync::RerunSave(dirty))
+                if dirty == &vec![super::Dirty::HerdrTag]
+        ),
+        "the save did not hold on the warned tag: {:?}",
+        rig.app.loss_pending_sync
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Char('8')));
+    rig.drain();
+    rig.drain();
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        578,
+        "the tag's landing value did not commit"
+    );
+    assert_eq!(rig.app.tab, Tab::Overview, "the switch did not land");
+    assert!(
+        !matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "the warning reopened over the warned item"
+    );
+}
+
+/// The quit twin: a `save` held behind a running field save re-warns over work
+/// typed during the hold instead of quitting. The herdr tag editor opens
+/// through its row handler directly: the herdr card never resolves in this
+/// rig, so no key path reaches it.
+#[cfg(unix)]
+#[test]
+fn a_save_held_on_an_in_flight_field_re_warns_over_work_typed_during_a_quit() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    rig.type_and_commit("high");
+    assert!(
+        rig.app.services.shunt_save.is_some(),
+        "precondition: in flight"
+    );
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "no quit warning"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(rig.app.loss_pending.is_some(), "no hold");
+    super::handle_key(&mut rig.app, key(KeyCode::Down));
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    super::activate_herdr_option(&mut rig.app, super::HerdrOption::TagRefresh);
+    super::handle_key(&mut rig.app, key(KeyCode::Char('7')));
+    rig.drain();
+    rig.drain();
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before,
+        "the herdr tag typed during the hold committed with no warning"
+    );
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "work opened during the hold was not asked about"
+    );
+    assert!(!rig.app.quit, "the quit landed without a warning");
+}
+
+/// A refused existing-account rename inside `save` toasts the field's own
+/// reason.
+#[test]
+fn a_refused_rename_save_toasts_the_reason() {
+    use super::ConfigRow;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    if let Some(d) = app.config_draft.as_mut() {
+        d.name = InputState::new("BAD NAME");
+        d.active = Some(ConfigRow::Name);
+        d.field_seed = Some("a".to_string());
+    }
+    super::handle_key(&mut app, alt_digit('1'));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::LossWarning(_))),
+        "the dirty rename did not warn"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.toasts.iter().any(|t| {
+            t.body == "name: letters, digits and - _ . @ + only, and can't start with '.'"
+        }),
+        "the refused rename said nothing: {:?}",
+        app.toasts
+            .iter()
+            .map(|t| t.body.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Another save holding the one-save guard: a `save` over a dirty field is a
+/// real refusal (no hold), the guard toast shows, and nothing switches.
+#[cfg(unix)]
+#[test]
+fn a_one_save_guard_refusal_sets_no_hold() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = shunt_effort_rig(&home);
+    rig.app.services.shunt_save_worker.running = true;
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: warning"
+    );
+    super::handle_key(&mut rig.app, key(KeyCode::Enter));
+    assert!(
+        rig.app.loss_pending.is_none(),
+        "a one-save-guard refusal set a hold"
+    );
+    assert_eq!(rig.app.tab, Tab::Services);
+    assert!(
+        rig.app
+            .toasts
+            .iter()
+            .any(|t| { t.body == "a save is still checking\nwait for it, then save again" }),
+        "the guard toast did not show: {:?}",
+        rig.app
+            .toasts
+            .iter()
+            .map(|t| t.body.clone())
+            .collect::<Vec<_>>()
     );
 }

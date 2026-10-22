@@ -1531,7 +1531,7 @@ fn status_tab_incident_stamps_render_local_wall_clock() {
 #[test]
 fn config_refresh_interval_custom_editor_renders() {
     let _home = crate::testutil::HomeSandbox::new();
-    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState, Tab};
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, SeededInput, Tab};
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: Vec::new(),
@@ -1542,14 +1542,14 @@ fn config_refresh_interval_custom_editor_renders() {
         .position(|r| *r == GlobalConfigRow::RefreshInterval)
         .unwrap();
 
-    app.refresh_interval_draft = Some(InputState::new("45"));
+    app.refresh_interval_draft = Some(SeededInput::new("45"));
     let valid = dump(&app, 90, 20);
     assert!(valid.contains("refresh"), "refresh row label renders");
     assert!(valid.contains("45"), "typed seconds render in the field");
     assert!(valid.contains("10-3600 s"), "valid-range tooltip renders");
 
     // An out-of-range buffer still renders (DANGER value) without panicking.
-    app.refresh_interval_draft = Some(InputState::new("99999"));
+    app.refresh_interval_draft = Some(SeededInput::new("99999"));
     let invalid = dump(&app, 90, 20);
     assert!(invalid.contains("99999"));
     assert!(invalid.contains("10-3600 s"));
@@ -1569,7 +1569,7 @@ fn config_refresh_interval_custom_editor_renders() {
 #[test]
 fn config_context_nudge_custom_editor_renders() {
     let _home = crate::testutil::HomeSandbox::new();
-    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState, Tab};
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, SeededInput, Tab};
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: Vec::new(),
@@ -1580,7 +1580,7 @@ fn config_context_nudge_custom_editor_renders() {
         .position(|r| *r == GlobalConfigRow::ContextNudge)
         .unwrap();
 
-    app.context_nudge_draft = Some(InputState::new("600k"));
+    app.context_nudge_draft = Some(SeededInput::new("600k"));
     let valid = dump(&app, 90, 20);
     assert!(valid.contains("context nudge"), "nudge row label renders");
     assert!(valid.contains("600k"), "typed tokens render in the field");
@@ -1590,7 +1590,7 @@ fn config_context_nudge_custom_editor_renders() {
     );
 
     // An out-of-range buffer still renders (DANGER value) without panicking.
-    app.context_nudge_draft = Some(InputState::new("49999"));
+    app.context_nudge_draft = Some(SeededInput::new("49999"));
     let invalid = dump(&app, 90, 20);
     assert!(invalid.contains("49999"));
     assert!(invalid.contains("50k-2M tokens"));
@@ -1620,6 +1620,7 @@ fn fallback_threshold_editor_shows_range_tooltip() {
     app.fallback_edit = Some(MemberEdit {
         member: "uwuclxdy".into(),
         state: CardEdit::Threshold(InputState::new("70")),
+        seed: Some("70".to_string()),
     });
     let valid = dump(&app, 90, 20);
     assert!(valid.contains("rotate at"), "threshold row label renders");
@@ -1633,6 +1634,7 @@ fn fallback_threshold_editor_shows_range_tooltip() {
     app.fallback_edit = Some(MemberEdit {
         member: "uwuclxdy".into(),
         state: CardEdit::Threshold(InputState::new("150")),
+        seed: Some("150".to_string()),
     });
     let invalid = dump(&app, 90, 20);
     assert!(invalid.contains("150"));
@@ -2775,6 +2777,7 @@ fn fallback_edit_caret_follows_the_blocked_reason_pill() {
         app.fallback_edit = Some(crate::tui::app::MemberEdit {
             member: "a".into(),
             state: crate::tui::app::CardEdit::Threshold(crate::tui::app::InputState::new("90")),
+            seed: Some("90".to_string()),
         });
         let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
         term.draw(|f| super::draw(f, &app)).unwrap();
@@ -4297,7 +4300,9 @@ fn fallback_preferred_days_footer_hints() {
 fn an_editor_owning_the_arrows_names_them_and_drops_the_tab_hint() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::testutil::key;
-    use crate::tui::app::{FALLBACK_ROWS, FallbackRow, InputState, ServicesFocus, Tab, handle_key};
+    use crate::tui::app::{
+        FALLBACK_ROWS, FallbackRow, SeededInput, ServicesFocus, Tab, handle_key,
+    };
     use ratatui::crossterm::event::KeyCode;
     const TYPED: &str = "↵ save   ←→ caret   esc revert";
 
@@ -4361,28 +4366,28 @@ fn an_editor_owning_the_arrows_names_them_and_drops_the_tab_hint() {
         (
             "refresh",
             on_tab(Tab::Config),
-            Box::new(|app| app.refresh_interval_draft = Some(InputState::new("60"))),
+            Box::new(|app| app.refresh_interval_draft = Some(SeededInput::new("60"))),
             NAV,
             TYPED,
         ),
         (
             "context nudge",
             on_tab(Tab::Config),
-            Box::new(|app| app.context_nudge_draft = Some(InputState::new("300k"))),
+            Box::new(|app| app.context_nudge_draft = Some(SeededInput::new("300k"))),
             NAV,
             TYPED,
         ),
         (
             "weekly limit",
             on_tab(Tab::Config),
-            Box::new(|app| app.weekly_threshold_draft = Some(InputState::new("95"))),
+            Box::new(|app| app.weekly_threshold_draft = Some(SeededInput::new("95"))),
             NAV,
             TYPED,
         ),
         (
             "herdr tag refresh",
             plugin,
-            Box::new(|app| app.services.herdr_tag_draft = Some(InputState::new("5"))),
+            Box::new(|app| app.services.herdr_tag_draft = Some(SeededInput::new("5"))),
             BACK,
             TYPED,
         ),
@@ -4482,7 +4487,7 @@ fn a_modal_owns_the_arrows_so_the_footer_drops_the_tab_hint() {
 fn the_login_line_names_the_keys_an_open_editor_takes_first() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::testutil::key;
-    use crate::tui::app::{InputState, Tab, handle_key};
+    use crate::tui::app::{SeededInput, Tab, handle_key};
     use ratatui::crossterm::event::KeyCode;
     let mut app = App::new(AppConfig {
         state: AppState::default(),
@@ -4493,7 +4498,7 @@ fn the_login_line_names_the_keys_an_open_editor_takes_first() {
     app.login = Some(session);
     let spinner = super::format::spinner_frame(app.tick_count);
 
-    app.refresh_interval_draft = Some(InputState::new("60"));
+    app.refresh_interval_draft = Some(SeededInput::new("60"));
     assert_eq!(
         footer_of(&dump(&app, 100, 30)),
         format!("{spinner} logging in 'fresh'   ↵ save   ←→ caret   esc revert"),
@@ -4522,7 +4527,7 @@ fn the_login_line_names_the_keys_an_open_editor_takes_first() {
 fn a_narrow_login_line_keeps_the_open_editors_exit_hint() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::testutil::key;
-    use crate::tui::app::{InputState, Tab, handle_key};
+    use crate::tui::app::{SeededInput, Tab, handle_key};
     use ratatui::crossterm::event::KeyCode;
 
     let mut field = App::new(AppConfig {
@@ -4532,7 +4537,7 @@ fn a_narrow_login_line_keeps_the_open_editors_exit_hint() {
     field.tab = Tab::Config;
     let (session, _field_rx) = paste_session();
     field.login = Some(session);
-    field.refresh_interval_draft = Some(InputState::new("60"));
+    field.refresh_interval_draft = Some(SeededInput::new("60"));
     let spinner = super::format::spinner_frame(field.tick_count);
 
     let mut picker = preferred_days_card(Vec::new());

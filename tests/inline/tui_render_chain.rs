@@ -1726,6 +1726,7 @@ fn typed_threshold_caret_lands_on_the_rotate_at_row_at_every_header_height() {
         app.fallback_edit = Some(crate::tui::app::MemberEdit {
             member: "a".into(),
             state: CardEdit::Threshold(InputState::new("80")),
+            seed: Some("80".to_string()),
         });
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
@@ -1792,6 +1793,7 @@ fn typed_threshold_row_scrolls_into_view_and_carries_the_caret() {
     app.fallback_edit = Some(crate::tui::app::MemberEdit {
         member: "a".into(),
         state: CardEdit::Threshold(InputState::new("80")),
+        seed: Some("80".to_string()),
     });
 
     // 26x17: without the scroll, the two wrapped fix lines pushed the rows
@@ -1843,6 +1845,7 @@ fn typed_max_spend_caret_lands_on_its_row_under_a_wrapped_day_list() {
     app.fallback_edit = Some(crate::tui::app::MemberEdit {
         member: "a".into(),
         state: CardEdit::MaxSpend(InputState::new("5")),
+        seed: Some("5".to_string()),
     });
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
@@ -3500,6 +3503,7 @@ fn threshold_app(draft: Option<&str>) -> (App, ReadingsSnapshot) {
     app.fallback_edit = draft.map(|d| crate::tui::app::MemberEdit {
         member: "a".into(),
         state: CardEdit::Threshold(InputState::new(d)),
+        seed: Some(d.to_string()),
     });
     (app, readings)
 }
@@ -3624,6 +3628,7 @@ fn member_typed_app(row: FallbackRow, draft: &str) -> (App, ReadingsSnapshot) {
     app.fallback_edit = Some(crate::tui::app::MemberEdit {
         member: "a".into(),
         state,
+        seed: None,
     });
     (app, readings)
 }
@@ -4014,7 +4019,8 @@ fn a_toast_over_a_fallback_field_caret_hides_the_native_cursor() {
 fn a_body_caret_hides_under_an_open_modal_but_a_modal_field_keeps_its_caret() {
     use crate::actions::{AnchorAction, CaptureSnapshot};
     use crate::tui::app::{
-        CaptureNameForm, InputState, LossWarningDrop, LossWarningState, Modal, Tab,
+        CaptureNameForm, Dirty, InputState, LossWarningButton, LossWarningDrop, LossWarningState,
+        LossWarningTarget, Modal, Tab,
     };
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
@@ -4023,9 +4029,11 @@ fn a_body_caret_hides_under_an_open_modal_but_a_modal_field_keeps_its_caret() {
     let (mut body, _readings) = member_typed_app(FallbackRow::Threshold, "80");
     body.tab = Tab::Fallback;
     body.modals.push(Modal::LossWarning(LossWarningState {
-        choice: false,
-        target: Tab::Setup,
-        drop: LossWarningDrop::FallbackEdit,
+        focus: LossWarningButton::Save,
+        target: LossWarningTarget::Switch(Tab::Setup),
+        drop: LossWarningDrop {
+            dirty: vec![Dirty::FallbackField],
+        },
     }));
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
     term.draw(|f| crate::tui::render::draw(f, &body)).unwrap();

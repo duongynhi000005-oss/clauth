@@ -314,9 +314,10 @@ fn modal_cases() -> Vec<ModalCase> {
     use crate::presets::{Preset, RebindBlock, RowMove};
     use crate::tui::app::{
         ActionMenuAction, ActionMenuState, CaptureNameForm, ConfirmAction, ConfirmScroll,
-        ConfirmState, DivergenceForm, DivergenceTargetForm, EnvCollisionForm, InputState,
-        LossWarningDrop, LossWarningState, NamePromptAction, NamePromptForm, PresetApplyButton,
-        PresetApplyForm, PresetPickerForm, PresetTarget, RebindForm, TokenPickerForm,
+        ConfirmState, Dirty, DivergenceForm, DivergenceTargetForm, EnvCollisionForm, InputState,
+        LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget, NamePromptAction,
+        NamePromptForm, PresetApplyButton, PresetApplyForm, PresetPickerForm, PresetTarget,
+        RebindForm, TokenPickerForm,
     };
     use std::cell::{Cell, RefCell};
 
@@ -436,13 +437,15 @@ fn modal_cases() -> Vec<ModalCase> {
         ModalCase {
             name: "loss warning",
             modal: Modal::LossWarning(LossWarningState {
-                choice: false,
-                target: Tab::Usage,
-                drop: LossWarningDrop::SetupDraft,
+                focus: LossWarningButton::Save,
+                target: LossWarningTarget::Switch(Tab::Usage),
+                drop: LossWarningDrop {
+                    dirty: vec![Dirty::SetupField],
+                },
             }),
-            row: Some("←→ pick   ↵ choose   q back"),
+            row: Some("←→ pick   ↵ choose   esc · q go back"),
             row_45: None,
-            hints: &[("←→", "pick"), ("↵", "choose"), ("q", "back")],
+            hints: &[("←→", "pick"), ("↵", "choose"), ("esc · q", "go back")],
             prep: |_| {},
         },
         ModalCase {
@@ -743,7 +746,7 @@ fn modal_selection(app: &App) -> String {
     }
     match top {
         Some(Modal::Confirm(s)) => format!("{}:{}", s.choice, s.scroll.offset),
-        Some(Modal::LossWarning(s)) => format!("{}", s.choice),
+        Some(Modal::LossWarning(s)) => format!("{:?}", s.focus),
         Some(Modal::PresetApply(f)) => format!("{:?}:{}", f.focus, f.scroll.offset),
         Some(Modal::Divergence(f)) => format!("{}", f.cursor),
         Some(Modal::DivergenceTarget(f)) => format!("{}", f.cursor),
@@ -920,10 +923,14 @@ fn the_every_modal_hint_derives_from_the_handler() {
                 "←→" if case.name == "capture name" || case.name == "name prompt" => {
                     KeyCode::Left
                 }
+                // The loss warning defaults to `save` (rightmost), so `→` is a
+                // no-op there; `←` steps to `discard`.
+                "←→" if case.name == "loss warning" => KeyCode::Left,
                 "←→" => KeyCode::Right,
                 "↵" => KeyCode::Enter,
                 "space" => KeyCode::Char(' '),
                 "esc" => KeyCode::Esc,
+                "esc · q" => KeyCode::Esc,
                 "q" => KeyCode::Char('q'),
                 "d" => KeyCode::Char('d'),
                 other => unreachable!("unmapped hint key {other}"),
@@ -1240,6 +1247,7 @@ fn member_field_app() -> App {
     app.fallback_edit = Some(MemberEdit {
         member: "a".into(),
         state: CardEdit::Threshold(InputState::new("70")),
+        seed: Some("70".to_string()),
     });
     app
 }
@@ -1260,39 +1268,40 @@ fn day_picker_app() -> App {
     app.fallback_edit = Some(MemberEdit {
         member: "a".into(),
         state: CardEdit::Days(DayPicker::default()),
+        seed: None,
     });
     app
 }
 
 fn refresh_interval_app() -> App {
-    use crate::tui::app::InputState;
+    use crate::tui::app::SeededInput;
     let mut app = bare_app();
     app.tab = Tab::Config;
-    app.refresh_interval_draft = Some(InputState::new("30"));
+    app.refresh_interval_draft = Some(SeededInput::new("30"));
     app
 }
 
 fn context_nudge_app() -> App {
-    use crate::tui::app::InputState;
+    use crate::tui::app::SeededInput;
     let mut app = bare_app();
     app.tab = Tab::Config;
-    app.context_nudge_draft = Some(InputState::new("300k"));
+    app.context_nudge_draft = Some(SeededInput::new("300k"));
     app
 }
 
 fn weekly_threshold_app() -> App {
-    use crate::tui::app::InputState;
+    use crate::tui::app::SeededInput;
     let mut app = bare_app();
     app.tab = Tab::Config;
-    app.weekly_threshold_draft = Some(InputState::new("50"));
+    app.weekly_threshold_draft = Some(SeededInput::new("50"));
     app
 }
 
 fn herdr_tag_app() -> App {
-    use crate::tui::app::InputState;
+    use crate::tui::app::SeededInput;
     let mut app = bare_app();
     app.tab = Tab::Services;
-    app.services.herdr_tag_draft = Some(InputState::new("30"));
+    app.services.herdr_tag_draft = Some(SeededInput::new("30"));
     app
 }
 
@@ -1413,6 +1422,7 @@ fn note_editor_app() -> App {
     app.tab = Tab::Usage;
     app.note_editor = Some(NoteEditor {
         profile: "a".into(),
+        seed: "x".to_string(),
         buf: NoteBuffer::new("x"),
     });
     app

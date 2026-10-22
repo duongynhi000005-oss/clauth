@@ -2074,7 +2074,7 @@ fn draw_herdr_detail(
     lines.push(Line::from(Span::styled("OPTIONS", section_style)));
 
     let settings = app.config().state.herdr.clone();
-    let editing = app.services.herdr_tag_draft.as_ref();
+    let editing = app.services.herdr_tag_draft.as_ref().map(|d| &d.input);
     let writable = herdr_config_writable(app);
     // The focused row's block (row + its tooltip lines) for the scroll focus,
     // and the native-cursor slot for the tag editor.

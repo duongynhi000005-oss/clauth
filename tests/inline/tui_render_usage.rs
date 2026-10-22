@@ -4660,6 +4660,7 @@ fn a_toast_over_the_note_editor_caret_hides_the_native_cursor() {
     app.tab = Tab::Usage;
     app.note_editor = Some(NoteEditor {
         profile: name.clone(),
+        seed: "ab".to_string(),
         buf: NoteBuffer::new("ab"),
     });
     app.usage_detail_focus = StatusFocus::Detail;

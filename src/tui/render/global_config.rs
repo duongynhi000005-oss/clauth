@@ -90,9 +90,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[
     let cursor = app
         .global_config_cursor
         .min(GLOBAL_CONFIG_ROWS.len().saturating_sub(1));
-    let editing = app.refresh_interval_draft.as_ref();
-    let weekly_editing = app.weekly_threshold_draft.as_ref();
-    let context_nudge_editing = app.context_nudge_draft.as_ref();
+    let editing = app.refresh_interval_draft.as_ref().map(|d| &d.input);
+    let weekly_editing = app.weekly_threshold_draft.as_ref().map(|d| &d.input);
+    let context_nudge_editing = app.context_nudge_draft.as_ref().map(|d| &d.input);
 
     let focused_band = GLOBAL_CONFIG_ROWS[cursor].band();
 

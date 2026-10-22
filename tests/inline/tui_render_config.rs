@@ -2240,7 +2240,10 @@ fn the_alert_editor_caret_stays_inside_the_field_on_a_narrow_pane() {
 #[test]
 fn a_toast_over_a_setup_field_caret_hides_the_native_cursor() {
     use crate::profile::{AppConfig, AppState};
-    use crate::tui::app::{LossWarningDrop, LossWarningState, Modal, Tab, ToastKind};
+    use crate::tui::app::{
+        Dirty, LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget, Modal, Tab,
+        ToastKind,
+    };
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
 
@@ -2284,9 +2287,11 @@ fn a_toast_over_a_setup_field_caret_hides_the_native_cursor() {
     // which modal is open.
     app.toasts.clear();
     app.open_modal(Modal::LossWarning(LossWarningState {
-        choice: false,
-        target: Tab::Fallback,
-        drop: LossWarningDrop::NewAccountDraft { require: false },
+        focus: LossWarningButton::Save,
+        target: LossWarningTarget::Switch(Tab::Fallback),
+        drop: LossWarningDrop {
+            dirty: vec![Dirty::NewAccountForm],
+        },
     }));
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
     term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();

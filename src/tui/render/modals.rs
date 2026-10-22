@@ -12,9 +12,9 @@ use crate::profile::DivergenceChoice;
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
     DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
-    LoginStage, LossWarningState, Modal, NamePromptForm, PaneState, PresetApplyButton,
-    PresetApplyForm, PresetPickerForm, RebindForm, ScrollStamp, StatusFocus, Tab, TokenPickerForm,
-    TokenView, pane_state, token_model_count,
+    LoginStage, LossWarningButton, LossWarningState, Modal, NamePromptForm, PaneState,
+    PresetApplyButton, PresetApplyForm, PresetPickerForm, RebindForm, ScrollStamp, StatusFocus,
+    Tab, TokenPickerForm, TokenView, pane_state, token_model_count,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -955,21 +955,19 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     state.scroll.viewport.set(d.viewport);
 }
 
-/// The loss warning a screen switch raises over unsaved work another screen
-/// also writes: `WARNING` title, lowercase body naming the screen holding
-/// the work and the other writer, and a `go back` / `discard` pair reusing the
-/// confirm modal's button machinery.
+/// The loss warning a switch or quit raises over changed work: `WARNING`
+/// title, lowercase body naming every screen holding the work and the question
+/// its buttons answer, and the `go back · discard · save` (or two-button
+/// `go back · discard`) group under the modals button rule.
 fn draw_loss_warning(frame: &mut Frame<'_>, area: Rect, state: &LossWarningState) {
-    let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(
-        "discard the unsaved edit?",
-        theme::body(),
-    ))];
     // One line per sentence so a sentence never shares a row with the next.
-    for sentence in state.drop.detail_lines() {
-        lines.push(Line::from(prose::spans(sentence, theme::dim())));
-    }
+    let lines: Vec<Line<'_>> = state
+        .body_lines()
+        .into_iter()
+        .map(|sentence| Line::from(prose::spans(&sentence, theme::body())))
+        .collect();
 
-    let buttons = choice_buttons(state.choice, "go back", true, "discard");
+    let buttons = loss_warning_buttons(state);
 
     draw_modal_scrolled(
         frame,
@@ -983,6 +981,26 @@ fn draw_loss_warning(frame: &mut Frame<'_>, area: Rect, state: &LossWarningState
             toast_rects: &[],
         },
     );
+}
+
+/// The loss warning's button row: `save` is a neutral inverse block (the
+/// default focus), `discard` destructive (`DANGER` focused or not), `go back`
+/// neutral. Every button carries its always-on insets so none shifts when the
+/// focus moves.
+fn loss_warning_buttons(state: &LossWarningState) -> Line<'static> {
+    let mut spans = vec![
+        modal_button(" go back ", state.focus == LossWarningButton::GoBack),
+        Span::raw(" "),
+        danger_button(" discard ", state.focus == LossWarningButton::Discard),
+    ];
+    if state.drop.saveable() {
+        spans.push(Span::raw(" "));
+        spans.push(modal_button(
+            " save ",
+            state.focus == LossWarningButton::Save,
+        ));
+    }
+    Line::from(spans)
 }
 
 /// The startup re-bind confirm: grouped account moves, one toggle line per

@@ -3473,7 +3473,7 @@ fn herdr_tag_refresh_editor_renders_the_edit_state() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = herdr_options_app(healthy_config());
     app.services.herdr_options_cursor = 2;
-    app.services.herdr_tag_draft = Some(crate::tui::app::InputState::new("5"));
+    app.services.herdr_tag_draft = Some(crate::tui::app::SeededInput::new("5"));
     let (rows, _) = render(&app);
     let screen = rows.join("\n");
     let tag_row = rows
@@ -8534,7 +8534,7 @@ fn the_herdr_tag_refresh_editor_adds_its_range_line_below_the_row() {
     let mut app = herdr_options_app(healthy_config());
     app.services.herdr_options_cursor = 2;
     let resting = herdr_frame(&app);
-    app.services.herdr_tag_draft = Some(crate::tui::app::InputState::new("5"));
+    app.services.herdr_tag_draft = Some(crate::tui::app::SeededInput::new("5"));
     let editing = herdr_frame(&app);
     let at = |rows: &[String], label: &str| {
         rows.iter()
@@ -8561,12 +8561,15 @@ fn an_over_wide_tag_refresh_buffer_scrolls_inside_its_row() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = herdr_options_app(healthy_config());
     app.services.herdr_options_cursor = 2;
-    app.services.herdr_tag_draft = Some(crate::tui::app::InputState::new(&"1234567890".repeat(12)));
+    app.services.herdr_tag_draft =
+        Some(crate::tui::app::SeededInput::new(&"1234567890".repeat(12)));
     fn draft(app: &mut App) -> &mut crate::tui::app::InputState {
-        app.services
+        &mut app
+            .services
             .herdr_tag_draft
             .as_mut()
             .expect("the editor is open")
+            .input
     }
     let mut term = Terminal::new(TestBackend::new(W, 60)).unwrap();
 
@@ -8733,7 +8736,7 @@ fn a_typed_herdr_tag_refresh_keeps_its_caret_inside_on_a_narrow_pane() {
     for w in [16u16, 18, 20, 22, 28, 34] {
         let mut app = herdr_options_app(healthy_config());
         app.services.herdr_options_cursor = 2;
-        app.services.herdr_tag_draft = Some(crate::tui::app::InputState::new("5"));
+        app.services.herdr_tag_draft = Some(crate::tui::app::SeededInput::new("5"));
         let mut term = Terminal::new(TestBackend::new(w, 100)).unwrap();
         let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &[]));
         let border = right_border(&buf, end.y);
@@ -9209,7 +9212,7 @@ fn a_toast_over_the_herdr_tag_field_caret_hides_the_native_cursor() {
     let mut app = herdr_options_app(healthy_config());
     app.tab = Tab::Services;
     app.services.herdr_options_cursor = 2;
-    app.services.herdr_tag_draft = Some(crate::tui::app::InputState::new("5"));
+    app.services.herdr_tag_draft = Some(crate::tui::app::SeededInput::new("5"));
 
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
