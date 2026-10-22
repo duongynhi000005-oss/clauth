@@ -1228,6 +1228,62 @@ fn a_synthetic_error_line_does_not_drag_speed() {
     );
 }
 
+/// A spend-cap 429 row is recognized and drained once, but folds no tokens: the
+/// error row's only effect is the trigger-b signal the scheduler consumes.
+#[test]
+fn a_spend_cap_429_row_adds_no_tokens_and_drains_once() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let cap = serde_json::json!({
+        "type": "assistant",
+        "timestamp": iso(ms(END) + 2_000),
+        "isApiErrorMessage": true,
+        "error": "rate_limit",
+        "apiError": "model_requires_usage_credits",
+        "message": {"model": "<synthetic>", "role": "assistant"},
+    })
+    .to_string();
+    let transcript = iso_kerry(home.home()).join("cap.jsonl");
+    write_lines(
+        &transcript,
+        &[
+            user(START, "cap"),
+            assistant(END, "cap", "msg_cap", 1222),
+            user(&iso(ms(END) + 1_000), "cap"),
+            cap,
+        ],
+    );
+    let mut p = Producer::new();
+    let snap = p.tick(ms(END) + 62_000);
+    close(
+        snap.sessions["cap"].figures.m5.speed.unwrap(),
+        SPEED,
+        "the spend-cap row must not enter the speed denominator",
+    );
+    assert!(
+        !snap.days["2026-09-22"]["kerry"].contains_key("<synthetic>"),
+        "no synthetic day row"
+    );
+    let drained = p.drain_spend_cap();
+    assert_eq!(
+        drained.pending.get("cap").map(|f| f.ts),
+        Some(ms(END) + 2_000),
+        "the spend-cap 429 drains once, keyed by conversation"
+    );
+    assert_eq!(
+        drained
+            .recoveries
+            .get("cap")
+            .and_then(|by_file| by_file.get(&transcript).copied()),
+        Some(ms(END)),
+        "the successful turn before the 429 is the recovery half, keyed by file"
+    );
+    assert!(
+        p.drain_spend_cap().pending.is_empty(),
+        "a fact is delivered exactly once"
+    );
+}
+
 /// The core tail property: a tick advances the file's byte offset to its length,
 /// and an equal-length in-place rewrite before that offset is not re-read.
 #[test]

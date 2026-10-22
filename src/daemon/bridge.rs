@@ -1635,7 +1635,7 @@ impl Hub {
 fn process_gone_or_moved(pid: u32, proc_start: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
-        !proc_start_matches(pid, proc_start)
+        !crate::session_record::proc_start_matches(pid, proc_start)
     }
     #[cfg(target_os = "macos")]
     {
@@ -2541,7 +2541,7 @@ pub(crate) fn production_resolver() -> PeerResolver {
         // The macOS `procStart` form is unmeasured, so nothing there compares it
         // and a recycled pid is not detectable on macOS until it is measured.
         #[cfg(target_os = "linux")]
-        if !proc_start_matches(pid, &record.proc_start) {
+        if !crate::session_record::process_matches_record(pid, &record) {
             return None;
         }
         Some(Instance {
@@ -2635,13 +2635,7 @@ fn session_row_for(pid: u32) -> Option<crate::live_sessions::LiveSession> {
 fn session_config_dir_for(pid: u32) -> Option<PathBuf> {
     match session_row_for(pid) {
         Some(row) => {
-            let profile = crate::profile::ProfileName::from(row.start_profile.as_str());
-            let trees =
-                crate::runtime::session_runtime_trees(&profile, row.isolated, &row.session_id)
-                    .ok()?;
-            trees
-                .into_iter()
-                .find(|tree| tree.join("sessions").is_dir())
+            crate::runtime::session_sessions_tree(&row.start_profile, row.isolated, &row.session_id)
         }
         None => crate::profile::claude_dir().ok(),
     }
@@ -2654,23 +2648,6 @@ fn parent_pid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = stat.rsplit_once(')')?.1;
     rest.split_whitespace().nth(1)?.parse().ok()
-}
-
-/// Whether field 22 of `/proc/<pid>/stat` (the start time in clock ticks since
-/// boot) equals the record's `procStart` (measured 2.1.301). Split out so a
-/// test can feed it the test process's own `/proc/self/stat`.
-#[cfg(target_os = "linux")]
-fn proc_start_matches(pid: u32, proc_start: &str) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    let Some(rest) = stat.rsplit_once(')') else {
-        return false;
-    };
-    let Some(field) = rest.1.split_whitespace().nth(19) else {
-        return false;
-    };
-    field == proc_start
 }
 
 #[cfg(target_os = "linux")]

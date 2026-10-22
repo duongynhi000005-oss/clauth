@@ -294,6 +294,8 @@ fn register_self_row(session_id: &str) {
         session_id: session_id.to_string(),
         start_profile: "alpha".to_string(),
         pid: std::process::id(),
+        claude_pid: None,
+        launch_families: None,
         started_at: 0,
         cwd: None,
         isolated: false,
@@ -318,15 +320,7 @@ fn the_production_resolver_reads_a_sandbox_tree() {
     let _home = HomeSandbox::new();
     let pid = std::process::id();
     let sid = format!("{pid}-0");
-    let stat = std::fs::read_to_string("/proc/self/stat").expect("stat");
-    let start = stat
-        .rsplit_once(')')
-        .expect("comm")
-        .1
-        .split_whitespace()
-        .nth(19)
-        .expect("field 22")
-        .to_string();
+    let start = crate::testutil::proc_start_of(pid).expect("field 22");
     register_self_row(&sid);
     let profile = crate::profile::ProfileName::from("alpha");
     let [real, _fake] =
@@ -351,15 +345,7 @@ fn the_production_resolver_reads_the_fake_tree() {
     let _home = HomeSandbox::new();
     let pid = std::process::id();
     let sid = format!("{pid}-0");
-    let stat = std::fs::read_to_string("/proc/self/stat").expect("stat");
-    let start = stat
-        .rsplit_once(')')
-        .expect("comm")
-        .1
-        .split_whitespace()
-        .nth(19)
-        .expect("field 22")
-        .to_string();
+    let start = crate::testutil::proc_start_of(pid).expect("field 22");
     register_self_row(&sid);
     let profile = crate::profile::ProfileName::from("alpha");
     let [_real, fake] =

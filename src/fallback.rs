@@ -2173,6 +2173,8 @@ pub(crate) fn next_auto_switch_target(
         &usage_snapshot(store),
         &HashSet::new(),
         ActiveBurnRate::FromDisk,
+        false,
+        false,
     )
 }
 
@@ -2185,7 +2187,14 @@ pub(crate) fn next_auto_switch_target_for_test(
     snapshot: &ChainSnapshot,
     usage: &HashMap<String, UsageInfo>,
 ) -> Option<SwitchAction> {
-    next_auto_switch_target_with_usage(snapshot, usage, &HashSet::new(), ActiveBurnRate::FromDisk)
+    next_auto_switch_target_with_usage(
+        snapshot,
+        usage,
+        &HashSet::new(),
+        ActiveBurnRate::FromDisk,
+        false,
+        false,
+    )
 }
 
 /// The simple (no-cause) "with key rejection" evaluation: the active's effective
@@ -2193,14 +2202,29 @@ pub(crate) fn next_auto_switch_target_for_test(
 /// folded key rejection into `broken` and `preferred`. `third_party_names` is
 /// the picker's classification, carried so the burn-aware active check never
 /// pairs a third-party member's provider window with the OAuth burn history.
-/// `rate` is the ACTIVE burn-rate source (see [`ActiveBurnRate`]).
+/// `rate` is the ACTIVE burn-rate source (see [`ActiveBurnRate`]). `must_leave`
+/// forces the leave guard open (a credit-billed launch on a capped member, or
+/// the session's own spend-cap 429). `credit_demand` makes every target pass
+/// read a capped member off the RAW cap verdict, its `check_credit_cap` gate
+/// ignored — a credit-billed launch stays credit-billed after the leave lands,
+/// so the home passes must keep skipping the capped member it just left. Every
+/// caller with no such fact passes `false` for both.
 pub(crate) fn next_auto_switch_target_with_usage(
     snapshot: &ChainSnapshot,
     usage: &HashMap<String, UsageInfo>,
     third_party_names: &HashSet<ProfileName>,
     rate: ActiveBurnRate,
+    must_leave: bool,
+    credit_demand: bool,
 ) -> Option<SwitchAction> {
-    next_auto_switch_target_core(snapshot, usage, third_party_names, rate)
+    next_auto_switch_target_core(
+        snapshot,
+        usage,
+        third_party_names,
+        rate,
+        must_leave,
+        credit_demand,
+    )
 }
 
 /// Evaluate twice and compare: once on `with_snapshot` (key rejection folded
@@ -2215,9 +2239,25 @@ pub(crate) fn next_auto_switch_decision_with_usage(
     usage: &HashMap<String, UsageInfo>,
     third_party_names: &HashSet<ProfileName>,
     rate: ActiveBurnRate,
+    must_leave: bool,
+    credit_demand: bool,
 ) -> Option<AutoSwitchDecision> {
-    let with = next_auto_switch_target_core(with_snapshot, usage, third_party_names, rate)?;
-    let without = next_auto_switch_target_core(without_snapshot, usage, third_party_names, rate);
+    let with = next_auto_switch_target_core(
+        with_snapshot,
+        usage,
+        third_party_names,
+        rate,
+        must_leave,
+        credit_demand,
+    )?;
+    let without = next_auto_switch_target_core(
+        without_snapshot,
+        usage,
+        third_party_names,
+        rate,
+        must_leave,
+        credit_demand,
+    );
     let key_rejection_necessary = Some(&with) != without.as_ref();
     Some(AutoSwitchDecision {
         action: with,
@@ -2233,6 +2273,8 @@ fn next_auto_switch_target_core(
     usage: &HashMap<String, UsageInfo>,
     third_party_names: &HashSet<ProfileName>,
     rate: ActiveBurnRate,
+    must_leave: bool,
+    credit_demand: bool,
 ) -> Option<SwitchAction> {
     let active_idx = snapshot
         .chain
@@ -2305,13 +2347,35 @@ fn next_auto_switch_target_core(
             .find(|&i| !skip(i) && accept(&snapshot.chain[i]))
             .map(|i| snapshot.chain[i].name.to_string())
     };
+    // A credit-forced leave (a credit-billed launch on a capped member, or the
+    // session's own spend-cap 429) may only land on a member whose usage
+    // credits are not spent: the leave side reads the raw cap verdict (a known
+    // credit-billed demand decides by its own families whatever the gate), so
+    // the target side must too, or the session bounces between capped members
+    // every tick. `credit_demand` (not `must_leave`) is what widens that skip
+    // to the home passes: the launch stays credit-billed after the leave
+    // lands, so a capped gate-off preferred member must not pull the session
+    // back. Every other caller passes `false` for both and keeps the
+    // gate-honouring check.
+    let raw_capped = |m: &ChainMember| {
+        usage
+            .get(m.name.as_str())
+            .is_some_and(UsageInfo::credit_capped)
+    };
+    let credit_blocked = |m: &ChainMember| {
+        if credit_demand {
+            raw_capped(m)
+        } else {
+            credit_capped_from_usage(m, usage)
+        }
+    };
     // Headroom accept: clear on the aggregate
     // gates AND — per the member's own `check_scoped` gate — every per-model
     // weekly window (see `scoped_weekly_blocked_info`).
     let clear = |m: &ChainMember| {
         !is_exhausted_from_usage(m, usage, m.weekly_line)
             && !scoped_blocked_from_usage(m, usage)
-            && !credit_capped_from_usage(m, usage)
+            && !credit_blocked(m)
     };
 
     if !active_broken
@@ -2319,6 +2383,7 @@ fn next_auto_switch_target_core(
         && !active_canceled
         && !active_reading_dead
         && !active_exhausted
+        && !must_leave
     {
         // Scoped active trigger: a per-model weekly line crossed on an
         // otherwise-healthy active (its `check_scoped` gate on) hops ONLY
@@ -2459,8 +2524,11 @@ fn next_auto_switch_target_core(
         return None;
     }
     if !active_is_last_resort
-        && let Some(name) =
-            walk(&|m| m.last_resort && !is_exhausted_from_usage(m, usage, WEEKLY_HARD_BLOCK_PCT))
+        && let Some(name) = walk(&|m| {
+            m.last_resort
+                && !is_exhausted_from_usage(m, usage, WEEKLY_HARD_BLOCK_PCT)
+                && (!credit_demand || !raw_capped(m))
+        })
     {
         return Some(SwitchAction::To(name));
     }
@@ -2479,7 +2547,7 @@ fn next_auto_switch_target_core(
         return None;
     }
     if let Some(name) = walk(&|m| {
-        !credit_capped_from_usage(m, usage)
+        !credit_blocked(m)
             && spend_armed(
                 usage.get(m.name.as_str()),
                 snapshot.spend_budget,
@@ -2494,7 +2562,7 @@ fn next_auto_switch_target_core(
     if active_is_last_resort {
         return None;
     }
-    if let Some(name) = walk(&|m| m.last_resort) {
+    if let Some(name) = walk(&|m| m.last_resort && (!credit_demand || !raw_capped(m))) {
         return Some(SwitchAction::To(name));
     }
 
@@ -2871,6 +2939,8 @@ pub(crate) fn auto_switch_if_needed(
             &usage,
             &third_party_names,
             ActiveBurnRate::Supplied(active_burn_pct_per_hour),
+            false,
+            false,
         );
         (active, decision)
     };

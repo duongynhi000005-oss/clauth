@@ -1110,6 +1110,131 @@ fn a_clauth_start_row_is_seen_and_reads_own() {
     );
 }
 
+/// The spend-cap decision leg reads the launch demand off the row `run` writes,
+/// never re-deriving it. Drives the real `run` against the slow shim and reads
+/// the live row MID-run (its drop removes the tree once the child exits):
+/// the recorded `launch_families` must name what THIS launch ran — the outgoing
+/// profile's `[env] ANTHROPIC_MODEL` must not leak into an opus launch, and a
+/// `--model fable` passthrough on a member with no default must record fable —
+/// and the recorded `claude_pid` must be the spawned child.
+#[cfg(unix)]
+#[test]
+fn a_start_run_records_the_launch_demand_and_the_child_pid() {
+    use crate::testutil::{HomeSandbox, SlowClaude};
+
+    // Poll the registry until the child pid lands (the write happens right
+    // after the spawn), then hand back the recorded demand and pid. Bounded so
+    // a run that never records fails the test instead of hanging the suite.
+    let observe =
+        |target: &'static str| -> std::thread::JoinHandle<(Option<Vec<String>>, Option<u32>)> {
+            std::thread::spawn(move || {
+                let dir = crate::profile::clauth_dir()
+                    .expect("clauth dir")
+                    .join("live_sessions");
+                let seen = crate::testutil::live_session_rows_until(
+                    &dir,
+                    |r| r.start_profile == target && r.claude_pid.is_some(),
+                    std::time::Duration::from_secs(20),
+                );
+                seen.into_iter()
+                    .find(|r| r.start_profile == target && r.claude_pid.is_some())
+                    .map(|r| (r.launch_families, r.claude_pid))
+                    .unwrap_or((None, None))
+            })
+        };
+
+    // The outgoing (active) profile pins ANTHROPIC_MODEL=fable in its `[env]`,
+    // so `outgoing_env_keys` scrubs it from the started session.
+    let stage = |a_default: Option<&str>| {
+        let sb = HomeSandbox::new();
+        fs::create_dir_all(sb.home().join(".claude")).expect("~/.claude");
+        let mut x = Profile::new("x".to_string(), None, None);
+        x.env
+            .insert("ANTHROPIC_MODEL".to_string(), "fable".to_string());
+        let mut a = Profile::new("a".to_string(), None, None);
+        a.models.default = a_default.map(str::to_string);
+        crate::profile::save_profile(&x).expect("save x");
+        crate::profile::save_profile(&a).expect("save a");
+        crate::claude::apply_profile_to_claude_settings(&x, &[]).expect("seed x's env live");
+        let config = AppConfig {
+            state: AppState {
+                profiles: vec!["a".into(), "x".into()],
+                active_profile: Some("x".into()),
+                ..AppState::default()
+            },
+            profiles: vec![a, x],
+        };
+        crate::profile::save_app_state(&config.state).expect("persist state");
+        (sb, config)
+    };
+
+    // Scenario 1: an opus launch — the outgoing profile's fable env must not
+    // make the recorded demand credit-billed.
+    {
+        let (sb, config) = stage(Some("opus"));
+        let shim = SlowClaude::new(&sb);
+        let observer = observe("a");
+        run(
+            &config,
+            &crate::profile::ProfileName::from("a"),
+            &[],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect("start");
+        let (families, pid) = observer.join().expect("observer");
+        let shim_pid = std::fs::read_to_string(sb.home().join(".slow-claude.pid"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        assert!(pid.is_some(), "the row records the spawned claude pid");
+        assert_eq!(
+            pid, shim_pid,
+            "the recorded pid is the spawned claude, not clauth's own"
+        );
+        assert_eq!(
+            families,
+            Some(vec!["opus".to_string()]),
+            "an opus launch must not be credit-billed off the outgoing profile's env model"
+        );
+        drop(shim);
+    }
+
+    // Scenario 2: a member with no default, started with `--model fable` — the
+    // passthrough is the launch demand.
+    {
+        let (sb, config) = stage(None);
+        let shim = SlowClaude::new(&sb);
+        let observer = observe("a");
+        run(
+            &config,
+            &crate::profile::ProfileName::from("a"),
+            &["--model".to_owned(), "fable".to_owned()],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect("start");
+        let (families, pid) = observer.join().expect("observer");
+        let shim_pid = std::fs::read_to_string(sb.home().join(".slow-claude.pid"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        assert!(pid.is_some(), "the row records the spawned claude pid");
+        assert_eq!(
+            pid, shim_pid,
+            "the recorded pid is the spawned claude, not clauth's own"
+        );
+        assert_eq!(
+            families,
+            Some(vec!["fable".to_string()]),
+            "a --model fable passthrough must record fable as the launch demand"
+        );
+        drop(shim);
+    }
+}
+
 // ── start-time model demand + the extracted admit ───────────────────────────
 
 #[test]

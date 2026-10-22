@@ -363,7 +363,28 @@ pub(crate) fn run(
     } else {
         command.args(claude_args);
     }
+    // Resolve the launch demand's model families before the spawn so the
+    // post-spawn flock hold covers only the field writes: the row's update
+    // below takes the state flock, and the demand must name what this launch
+    // actually ran.
+    let launch_families = crate::fallback::demand_from(member_launch_models(
+        profile,
+        isolation,
+        &stale_env_keys,
+        claude_args,
+        &process_model_env(),
+    ));
     let mut child = command.spawn().context("failed to spawn claude")?;
+    // Record the child's pid and the launch demand's resolved families on the
+    // row once the child exists: the daemon's spend-cap decision leg joins a
+    // 429 transcript to this session through the pid, and decides a
+    // credit-billed leave off the recorded families — it has no process env or
+    // passthrough args, so re-deriving the demand there would read today's
+    // config instead of what this launch actually ran.
+    let _ = crate::live_sessions::update_as_session(runtime.session_id(), |fields| {
+        fields.set_claude_pid(child.id());
+        fields.set_launch_families(launch_families);
+    });
 
     #[cfg(unix)]
     let outcome = wait_for_child(&mut child, signal_watcher.receiver())?;

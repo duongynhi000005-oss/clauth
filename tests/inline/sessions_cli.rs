@@ -1160,6 +1160,8 @@ fn registry_row(sid: &str, profile: &str, harness: crate::harness::Harness) {
         start_profile: profile.to_string(),
         harness,
         pid: 4242,
+        claude_pid: None,
+        launch_families: None,
         started_at: 0,
         cwd: None,
         isolated: false,

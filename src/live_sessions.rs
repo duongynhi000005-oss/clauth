@@ -66,6 +66,21 @@ pub(crate) struct LiveSession {
     #[serde(default)]
     pub(crate) harness: crate::harness::Harness,
     pub(crate) pid: u32,
+    /// The spawned `claude` child's pid, written by `clauth start` once the
+    /// child exists, in the same update as `launch_families`. `None` until
+    /// then, and for a row written by a clauth that predates the field (or a
+    /// delegate row): such a row carries neither field, so the scheduler can
+    /// join no spend-cap 429 to it and reads no launch demand off it, and no
+    /// credit-cap trigger moves it. `serde` omits the key when absent, so a
+    /// row the older clauth wrote round-trips byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) claude_pid: Option<u32>,
+    /// The launch demand's resolved model families, written by `clauth start`
+    /// in the same update as `claude_pid`. `None` exactly when `claude_pid` is
+    /// (see there). `serde` omits the key when absent, so an older row
+    /// round-trips byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_families: Option<Vec<String>>,
     pub(crate) started_at: u64,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) isolated: bool,
@@ -138,6 +153,8 @@ impl LiveSession {
             start_profile: start_profile.to_string(),
             harness,
             pid: std::process::id(),
+            claude_pid: None,
+            launch_families: None,
             started_at: crate::usage::now_ms(),
             cwd: std::env::current_dir().ok(),
             isolated,
@@ -195,6 +212,22 @@ impl SessionFields<'_> {
     /// names a delegate's account for the pane hosting its parent session.
     pub(crate) fn set_pid(&mut self, pid: u32) {
         self.0.pid = pid;
+    }
+
+    /// Record the spawned `claude` child's pid, once `clauth start` has it. The
+    /// daemon's join of the session's own spend-cap 429 keys off this: it reads
+    /// the child's session record and matches its `sessionId` to a transcript
+    /// conversation id.
+    pub(crate) fn set_claude_pid(&mut self, pid: u32) {
+        self.0.claude_pid = Some(pid);
+    }
+
+    /// Record the launch demand's resolved families, written by `clauth start`
+    /// beside `claude_pid`. The daemon's credit-billed leave check reads this,
+    /// never re-deriving the demand from today's config (the launch env and
+    /// args are gone by the time the daemon scans).
+    pub(crate) fn set_launch_families(&mut self, families: Vec<String>) {
+        self.0.launch_families = Some(families);
     }
 }
 

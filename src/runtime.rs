@@ -504,7 +504,9 @@ fn session_marker_paths(
 /// `CLAUDE_CONFIG_DIR` — the [`LinkMode::Real`] per-session layout and the
 /// [`LinkMode::Fake`] fallback — derived from [`paired_dir_names`] so no other
 /// module rebuilds the layout. The bridge reads the peer's session record
-/// under whichever tree holds its `sessions` dir.
+/// under whichever tree holds its `sessions` dir. Both modes exist on every
+/// platform (`Real` also on Windows when the process can create symlinks), so
+/// this is not unix-gated.
 pub(crate) fn session_runtime_trees(
     profile: &ProfileName,
     isolated: bool,
@@ -520,6 +522,23 @@ pub(crate) fn session_runtime_trees(
         profile_subpath(profile, &runtime_name)
     };
     Ok([tree(LinkMode::Real)?, tree(LinkMode::Fake)?])
+}
+
+/// The runtime tree (if any) a live-sessions row reads its `sessions/` records
+/// from: the first [`session_runtime_trees`] layout holding a `sessions` dir.
+/// On a fake-link box that dir is a copied tree, so the record is not under
+/// `~/.claude/sessions`; the bridge and the scheduler share this pick so the
+/// rule lives once.
+pub(crate) fn session_sessions_tree(
+    start_profile: &str,
+    isolated: bool,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let profile = ProfileName::from(start_profile);
+    let trees = session_runtime_trees(&profile, isolated, session_id).ok()?;
+    trees
+        .into_iter()
+        .find(|tree| tree.join("sessions").is_dir())
 }
 
 /// Whether the session a registry row names is still running. `true` on anything
@@ -3639,15 +3658,18 @@ impl SessionSwap {
             if let Err(e) =
                 crate::live_sessions::update_as_session(self.session.as_str(), |fields| {
                     fields.set_current_member(plan.member.as_str());
+                    // The swap stamp lands here on EVERY platform, the instant
+                    // the row first names the incoming member, so a 429 the
+                    // outgoing account served just before this hold ages out
+                    // instead of latching against the member it just moved to;
+                    // macOS re-stamps it in `repoint_row_store` once a keychain
+                    // leg lands, so a 429 served during the legs ages out
+                    // against that later stamp. `set_launch_store` stays
+                    // deferred on macOS: the session reads the item, not the
+                    // file link, until a leg lands, so naming the incoming
+                    // store here would exempt a rotation of the member it is
+                    // still reading.
                     fields.set_last_swap_at(crate::usage::now_ms());
-                    // Off macOS the link this hold just moved IS what the
-                    // session reads, so the row's rotation verdict follows it
-                    // here. macOS defers this write to past the keychain legs
-                    // below: the session's Claude Code resolves the item
-                    // first, so until those legs land it is still holding the
-                    // outgoing member's pair, and a row already naming the
-                    // incoming store would exempt a rotation of the member it
-                    // is still reading.
                     #[cfg(not(target_os = "macos"))]
                     fields.set_launch_store(plan.store.clone());
                 })
@@ -4054,17 +4076,22 @@ impl SessionSwap {
     }
 
     /// Point the row's rotation verdict at the store the plan repointed the
-    /// link at. macOS only, and always AFTER the state flock (each call site
-    /// holds no lock, so `update_as_session` takes a FIRST-LEVEL acquisition
-    /// there, not a reentry): the write loads a fresh row inside that hold, so
-    /// it cannot revert a daemon-owned field, and a failed write leaves the row
-    /// naming the outgoing member's store — rotations stay refused for the
-    /// member the session may still be reading, never exempted for one it is
-    /// not.
+    /// link at, and RE-stamp the swap's `last_swap_at` — the hold already
+    /// stamped it when the row first named the incoming member, and this moves
+    /// it to the instant the session actually reads that member, which on macOS
+    /// is only once a keychain leg lands (a 429 served during the legs must age
+    /// out against this later stamp). macOS only, and always AFTER the state
+    /// flock (each call site holds no lock, so `update_as_session` takes a
+    /// FIRST-LEVEL acquisition there, not a reentry): the write loads a fresh row inside
+    /// that hold, so it cannot revert a daemon-owned field, and a failed write
+    /// leaves the row naming the outgoing member's store — rotations stay
+    /// refused for the member the session may still be reading, never exempted
+    /// for one it is not.
     #[cfg(target_os = "macos")]
     fn repoint_row_store(&self, plan: &SwapPlan) {
         if let Err(e) = crate::live_sessions::update_as_session(self.session.as_str(), |fields| {
-            fields.set_launch_store(plan.store.clone())
+            fields.set_launch_store(plan.store.clone());
+            fields.set_last_swap_at(crate::usage::now_ms());
         }) {
             logline!(
                 "clauth: session {} swapped onto {} but its row's store did not follow: {e:#}. \

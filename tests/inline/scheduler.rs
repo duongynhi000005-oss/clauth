@@ -4180,6 +4180,8 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
         start_profile: start_profile.to_string(),
         harness: crate::harness::Harness::Claude,
         pid: 4242,
+        claude_pid: None,
+        launch_families: None,
         started_at: 1_700_000_000_000,
         cwd: None,
         isolated: false,
@@ -4425,6 +4427,1714 @@ fn two_opted_in_sessions_on_different_members_get_different_intended_members() {
         decision_of("4242-1"),
         (Some("a".to_string()), Some(0)),
         "the session on d must WRAP to a — the same chain, a different cursor"
+    );
+}
+
+// ── the usage-credit cap moves a live session (trigger a) ───────────────────
+//
+// Claude Code refuses a credit-billed model (fable, plus its cached
+// `tengu_calm_seal` families) on an account whose usage-credit cap is spent,
+// whatever the windows say. A session whose LAUNCH demand is credit-billed
+// moves off such an account at once; one whose demand resolves no family moves
+// only on its own spend-cap 429 row; an opus session never moves.
+
+/// [`session_config`] with each named member's `[models] default` and the
+/// named members' credit gate switched off. A member NOT named in `defaults`
+/// carries the launch profile's default: a live session's model is a property
+/// of the whole chain, and `swap_eligible` drops a target whose `[models]`
+/// differs from the launch — so a heterogeneous chain would leave the walk with
+/// no target before trigger a ever runs.
+fn session_config_models(
+    names: &[&str],
+    defaults: &[(&str, &str)],
+    gate_off: &[&str],
+) -> crate::profile::ConfigHandle {
+    use crate::profile::{AppConfig, AppState, Profile};
+    let launch_default = defaults.first().map(|(_, model)| *model);
+    Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: names.first().map(|n| (*n).into()),
+            profiles: names.iter().map(|n| (*n).into()).collect(),
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles: names
+            .iter()
+            .map(|n| {
+                let mut p = Profile::new((*n).to_string(), None, None);
+                p.models.default = defaults
+                    .iter()
+                    .find(|(name, _)| name == n)
+                    .map(|(_, model)| (*model).to_string())
+                    .or_else(|| launch_default.map(str::to_string));
+                p.check_credit_cap = !gate_off.contains(n);
+                p
+            })
+            .collect(),
+    }))
+}
+
+/// [`session_store`] at 10% on every member, the named ones with their
+/// usage-credit cap spent (billing on, used == limit).
+fn credit_store(names: &[&str], capped: &[&str]) -> UsageStore {
+    let store = session_store(&names.iter().map(|n| (*n, 10.0)).collect::<Vec<_>>());
+    {
+        let mut map = store.lock().unwrap();
+        for n in capped {
+            let info = map.get_mut(*n).expect("member in the store");
+            info.spend = Some(crate::usage::SpendInfo {
+                enabled: true,
+                used: Some(50.0),
+                limit: Some(50.0),
+                percent: Some(100.0),
+                currency: Some("USD".to_owned()),
+            });
+            assert!(
+                info.credit_capped(),
+                "fixture control: {n}'s cap reads spent"
+            );
+        }
+    }
+    store
+}
+
+#[test]
+fn a_fable_session_moves_off_an_account_whose_credit_cap_is_spent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "fable")], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a fable session fails every turn on a spent cap, so it must leave a"
+    );
+}
+
+/// A known demand decides by its own families, whatever the gate says.
+#[test]
+fn a_fable_session_moves_off_a_capped_account_whose_credit_gate_is_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "fable")], &["a"]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (Some("b".to_string()), Some(1)));
+}
+
+/// The target must not be capped either: `b` is skipped for `c`.
+#[test]
+fn a_fable_session_skips_a_capped_target_for_the_next_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[("a", "fable")], &[]),
+        &credit_store(&["a", "b", "c"], &["a", "b"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (Some("c".to_string()), Some(2)));
+}
+
+#[test]
+fn an_opus_session_stays_on_an_account_whose_credit_cap_is_spent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["opus".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "opus")], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "opus bills the subscription; a spent credit cap never stops it"
+    );
+}
+
+/// No `[models] default`: clauth cannot tell the session's model, so the cap
+/// alone moves nothing; only the session's own 429 row does.
+#[test]
+fn a_session_with_no_known_model_stays_until_its_own_spend_cap_429() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&session_row("4242-0", "a"));
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (None, None));
+}
+
+// ── trigger b: the session's own spend-cap 429 row ──────────────────────────
+
+/// The child's `sessions/<pid>.json` record, naming the conversation id the
+/// transcript stem keys on — trigger b's join reads this, never the account.
+fn seed_session_record(home: &crate::testutil::HomeSandbox, conv: &str, child_pid: u32) {
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{child_pid}.json")),
+        serde_json::json!({ "sessionId": conv, "pid": child_pid }).to_string(),
+    )
+    .unwrap();
+}
+
+/// A session record for a live child whose `procStart` carries that process's
+/// real field-22 start, so the ambiguity scan's identity compare (linux) counts
+/// it as the process it names. On non-linux unix the scan compares liveness
+/// only, so the plain record is equivalent.
+#[cfg(unix)]
+fn seed_live_session_record(home: &crate::testutil::HomeSandbox, conv: &str, child_pid: u32) {
+    #[cfg(target_os = "linux")]
+    {
+        let start = crate::testutil::proc_start_of(child_pid).expect("live child start");
+        let sessions = home.home().join(".claude/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("{child_pid}.json")),
+            serde_json::json!({ "sessionId": conv, "pid": child_pid, "procStart": start })
+                .to_string(),
+        )
+        .unwrap();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        seed_session_record(home, conv, child_pid);
+    }
+}
+
+/// The measured spend-cap 429 row: `timestamp`, `isApiErrorMessage`, `error`,
+/// `apiError`, `message.model == "<synthetic>"`. `ms_ago` ages the fact so a
+/// stale-row test can age it out.
+fn spend_cap_row(ms_ago: u64) -> String {
+    let ms = crate::usage::now_ms().saturating_sub(ms_ago);
+    let ts = chrono::DateTime::from_timestamp_millis(ms as i64)
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    serde_json::json!({
+        "type": "assistant",
+        "timestamp": ts,
+        "isApiErrorMessage": true,
+        "error": "rate_limit",
+        "apiError": "model_requires_usage_credits",
+        "message": {"model": "<synthetic>", "role": "assistant"},
+    })
+    .to_string()
+}
+
+/// A transcript holding the spend-cap 429 row (conversation id = its stem).
+fn seed_spend_cap_transcript(home: &crate::testutil::HomeSandbox, conv: &str) {
+    let proj = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join(format!("{conv}.jsonl")),
+        format!("{}\n", spend_cap_row(0)),
+    )
+    .unwrap();
+}
+
+/// A transcript whose 429 is HISTORY: the spend-cap row two hours ago, then a
+/// successful turn an hour ago. A cold-start reread latches the 429, then the
+/// drained same-file success drops the latch in the same scan; the session does
+/// not move.
+fn seed_history(home: &crate::testutil::HomeSandbox, conv: &str) {
+    let proj = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cap = spend_cap_row(7_200_000);
+    let ok_ts = {
+        let ms = crate::usage::now_ms().saturating_sub(3_600_000);
+        chrono::DateTime::from_timestamp_millis(ms as i64)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+    let ok = serde_json::json!({
+        "type": "assistant",
+        "timestamp": ok_ts,
+        "message": {"id": "msg_ok", "model": "claude-opus-4", "role": "assistant",
+            "usage": {"input_tokens": 10, "output_tokens": 500}},
+    })
+    .to_string();
+    std::fs::write(proj.join(format!("{conv}.jsonl")), format!("{cap}\n{ok}\n")).unwrap();
+}
+
+/// Run the tps tailer once so the spend-cap row lands in the producer's drain
+/// set, exactly as a lease-holder tick would before the scan consumes it.
+fn tail_transcripts() {
+    super::tps_producer_tick(crate::usage::now_ms());
+}
+
+/// A live OS process whose pid a session record can be seeded under, so the
+/// ambiguity scan counts it as a second live claimant on a conversation (seed
+/// it with [`seed_live_session_record`] so the linux start compare matches).
+/// Unix-only: a `sleep` child, and the scan's check is false off linux and
+/// macOS by design, so the scan there finds nothing ambiguous (the accepted
+/// degraded case).
+#[cfg(unix)]
+struct LiveChild(std::process::Child);
+
+#[cfg(unix)]
+impl LiveChild {
+    fn spawn() -> Self {
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a live claude child");
+        Self(child)
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LiveChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_session_moves_on_its_own_spend_cap_429_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "the session's own 429 joins through the child pid, not the account"
+    );
+}
+
+#[test]
+fn a_429_in_a_different_conversation_does_not_move_the_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    // The child's record names `conv-a`; the 429 lands in another conversation.
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-other");
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a 429 must join THIS session's conversation, never the account"
+    );
+}
+
+#[test]
+fn a_row_without_a_child_pid_ignores_429s() {
+    let home = crate::testutil::HomeSandbox::new();
+    let row = session_row("4242-0", "a");
+    assert!(row.claude_pid.is_none(), "fixture: no recorded child pid");
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", 77_777);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "an unjoined row moves on trigger a only"
+    );
+}
+
+#[test]
+fn a_credit_billed_launch_does_not_move_on_a_stale_cap_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    // `a`'s reading is Cached, not Fresh: trigger a joins the freshness gate.
+    let status: super::StatusStore = Arc::new(RankedMutex::new(
+        [
+            ("a".to_string(), super::FetchStatus::Cached),
+            ("b".to_string(), super::FetchStatus::Fresh),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "fable")], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &status,
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a stale cap reading may be last month's; trigger a must not fire on it"
+    );
+}
+
+#[test]
+fn a_429_latched_while_no_target_exists_moves_once_a_member_frees() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+
+    // Every member's cap is spent: the walk has no target, so the tick must not
+    // drop the fact.
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "no moveable target yet"
+    );
+
+    // `b`'s cap clears; the latched 429 must now land the move.
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "the latch holds the 429 past the tick that had no target"
+    );
+}
+
+/// A `--model fable` passthrough on a member with no `[models] default` is a
+/// credit-billed launch demand: the row records fable, so trigger a moves.
+#[test]
+fn a_fable_passthrough_launch_moves_off_a_capped_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a credit-billed passthrough launch moves at once, like a known start demand"
+    );
+}
+
+/// Trigger b bypasses the freshness gate: the 429 row is direct evidence, so a
+/// `Cached` reading of the member still moves.
+#[test]
+fn a_session_moves_on_its_own_spend_cap_429_even_with_a_cached_reading() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+
+    let status: super::StatusStore = Arc::new(RankedMutex::new(
+        [
+            ("a".to_string(), super::FetchStatus::Cached),
+            ("b".to_string(), super::FetchStatus::Fresh),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &status,
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "the 429 row is direct evidence; a Cached reading does not gate it"
+    );
+}
+
+/// A latched 429 must not re-fire after the session moves: latch on `a` with no
+/// target, then the member changes to `b`, and the next scan must not move the
+/// session off `b`.
+#[test]
+fn a_latched_429_does_not_re_fire_after_the_member_changes() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+
+    // Every member's cap is spent: the 429 latches under `a`, with no target.
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[], &[]),
+        &credit_store(&["a", "b", "c"], &["a", "b", "c"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "no moveable target yet"
+    );
+
+    // The session swaps to `b`.
+    crate::live_sessions::update_as_session("4242-0", |f| f.set_current_member("b".to_string()))
+        .expect("move the session");
+    let _moved = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved row's liveness marker");
+
+    // Only `a` stays capped: the 429 was for the stint on `a`, and must not
+    // move the session off `b` toward `c`.
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[], &[]),
+        &credit_store(&["a", "b", "c"], &["a"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a latched 429 must not re-fire after a member change"
+    );
+}
+
+/// A cold-start reread of the whole transcript must not move a session off a
+/// healthy member: the 429 (from an earlier stint) is followed by a successful
+/// turn, so it is history.
+#[test]
+fn a_stale_429_followed_by_a_success_does_not_move_a_session_off_its_healthy_member() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_history(&home, "conv-a");
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[], &[]),
+        &credit_store(&["a", "b", "c"], &["a"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a 429 from the session's stint on `a` must not move it off healthy `b`"
+    );
+}
+
+/// A 429 followed by a successful turn on an uncapped member is history: the
+/// session recovered, so the fact must not latch.
+#[test]
+fn a_429_followed_by_a_successful_turn_is_history() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_history(&home, "conv-a");
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &[]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (None, None));
+}
+
+/// Two capped members with their credit gates off: a fable session must not hop
+/// between them every tick. A credit-forced leave excludes every capped member
+/// as a target whatever the gate.
+#[test]
+fn a_fable_session_does_not_hop_between_two_capped_gate_off_members() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut r1 = session_row("4242-0", "a");
+    r1.launch_families = Some(vec!["fable".to_string()]);
+    let mut r2 = session_row("4243-0", "b");
+    r2.launch_families = Some(vec!["fable".to_string()]);
+    let _m1 = register_live_row(&r1);
+    let _m2 = register_live_row(&r2);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &["a", "b"]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        (decision_of("4242-0"), decision_of("4243-0")),
+        ((None, None), (None, None)),
+        "a fable session must not hop between two capped members"
+    );
+}
+
+/// The globally active profile `x` (not in the chain) pins `ANTHROPIC_MODEL`
+/// fable in its `[env]`, so the shared `~/.claude/settings.json` carries it. A
+/// `clauth start a` session strips `x`'s keys (`outgoing_env_keys`) and runs
+/// opus, so the row records opus — the daemon must not read fable off the
+/// outgoing profile's env.
+#[test]
+fn an_outgoing_profiles_env_model_does_not_make_an_opus_session_credit_billed() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).unwrap();
+    std::fs::write(
+        home.home().join(".claude/settings.json"),
+        r#"{"env":{"ANTHROPIC_MODEL":"fable"}}"#,
+    )
+    .unwrap();
+    let mk = |n: &str| {
+        let mut p = Profile::new(n.to_string(), None, None);
+        p.models.default = Some("opus".to_string());
+        p
+    };
+    let mut x = Profile::new("x".to_string(), None, None);
+    x.env
+        .insert("ANTHROPIC_MODEL".to_string(), "fable".to_string());
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: Some("x".into()),
+            profiles: vec!["a".into(), "b".into(), "x".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![mk("a"), mk("b"), x],
+    }));
+    // Control: the real launch strips x's keys, so its demand is opus alone.
+    let stale = crate::actions::outgoing_env_keys(&config.lock().unwrap());
+    let launch = crate::fallback::demand_from(crate::start::member_launch_models(
+        config.lock().unwrap().find(&"a".into()).unwrap(),
+        crate::runtime::Isolation::Shared,
+        &stale,
+        &[],
+        &[None, None],
+    ));
+    assert_eq!(
+        launch,
+        vec!["opus".to_string()],
+        "control: the launch runs opus only"
+    );
+
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(launch);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "an opus launch must not move on the outgoing profile's env model"
+    );
+}
+
+// ── spend-cap recovery, home passes and sinks ────────────────────────────────
+
+/// A successful assistant turn `ms_ago` old: the recovery half of a drain.
+fn ok_row(ms_ago: u64) -> String {
+    let ms = crate::usage::now_ms().saturating_sub(ms_ago);
+    let ts = chrono::DateTime::from_timestamp_millis(ms as i64)
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    serde_json::json!({
+        "type": "assistant",
+        "timestamp": ts,
+        "message": {"id": "msg_ok", "model": "claude-opus-4", "role": "assistant",
+            "usage": {"input_tokens": 10, "output_tokens": 500}},
+    })
+    .to_string()
+}
+
+/// (Re)write one conversation transcript from whole lines, so a test can append
+/// a recovery row after the first tail already consumed the file.
+fn write_conv(home: &crate::testutil::HomeSandbox, conv: &str, lines: &[String]) {
+    let proj = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let mut body = String::new();
+    for l in lines {
+        body.push_str(l);
+        body.push('\n');
+    }
+    std::fs::write(proj.join(format!("{conv}.jsonl")), body).unwrap();
+}
+
+/// A subagent transcript: its `session_key` folds `subagents/` into the parent
+/// conversation, so its rows share the parent's key but a DIFFERENT file.
+fn write_subagent(home: &crate::testutil::HomeSandbox, conv: &str, lines: &[String]) {
+    let dir = home
+        .home()
+        .join(".claude/projects/-home-u-proj")
+        .join(conv)
+        .join("subagents")
+        .join("agent-1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut body = String::new();
+    for l in lines {
+        body.push_str(l);
+        body.push('\n');
+    }
+    std::fs::write(dir.join("task.jsonl"), body).unwrap();
+}
+
+/// A 429 older than the session's last swap must not move it: the row's
+/// timestamp compare ages the fact out, so a cold-start reread of an old 429
+/// cannot latch against the member the session moved to.
+#[test]
+fn a_429_older_than_the_last_swap_does_not_move_the_session() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - 3_600_000);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    write_conv(&home, "conv-a", &[spend_cap_row(7_200_000)]);
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[], &[]),
+        &credit_store(&["a", "b", "c"], &["a"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a 429 from before the swap onto `b` is history"
+    );
+}
+
+/// A 429 latched with no target, then the session recovers on `a` (a later
+/// successful turn; the cap is lifted). Once `b` frees, the stale latch must
+/// not move the recovered session off `a`.
+#[test]
+fn a_latched_429_is_cleared_by_a_later_successful_turn() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    let cap = spend_cap_row(600_000);
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "control: no target yet"
+    );
+
+    write_conv(&home, "conv-a", &[cap, ok_row(60_000)]);
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &[]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "the session recovered on `a`; the latch must not outlive that"
+    );
+}
+
+/// A subagent's success shares the parent's conversation key but a different
+/// transcript file: it must NOT clear the main loop's 429, or one more failed
+/// fable turn is needed before the session moves.
+#[test]
+fn a_subagent_success_does_not_clear_the_main_loops_429() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    write_conv(&home, "conv-a", &[spend_cap_row(600_000)]);
+    write_subagent(&home, "conv-a", &[ok_row(60_000)]);
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a subagent's success must not clear the main loop's 429"
+    );
+}
+
+/// `a` is the preferred home, capped, its credit gate off; a fable launch
+/// leaves it. Once on `b`, the return-to-preferred pass must read `a` as raw-
+/// capped (its gate ignored) and NOT walk the session home — otherwise it
+/// flips back every other tick.
+#[test]
+fn a_fable_session_does_not_return_to_a_capped_gate_off_preferred_home() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: trigger a leaves the capped home"
+    );
+
+    crate::live_sessions::update_as_session("4242-0", |f| {
+        f.set_current_member("b".to_string());
+        f.set_last_swap_at(crate::usage::now_ms());
+    })
+    .expect("move the session");
+    let _moved = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved row's liveness marker");
+
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a fable session must not be walked home onto the capped account it just left"
+    );
+}
+
+/// The soonest-weekly-reset home pass is the same class: with no `preferred`
+/// member, a capped gate-off member whose weekly reset is soonest must not
+/// pull the credit-billed session back.
+#[test]
+fn a_fable_session_does_not_walk_home_to_a_capped_soonest_reset_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &["a"]);
+    config.lock().unwrap().state.walk_order = Some(crate::profile::WalkOrder::SoonestWeeklyReset);
+
+    // `a` (capped, gate off) resets sooner than `b`, so it ranks as home.
+    let store = credit_store(&["a", "b"], &["a"]);
+    {
+        use crate::usage::{UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+        let mut map = store.lock().unwrap();
+        map.get_mut("a").unwrap().seven_day = Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 2 * 3600)),
+        });
+        map.get_mut("b").unwrap().seven_day = Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3 * 86_400)),
+        });
+    }
+
+    scan_sessions(&config, &store, &all_fresh(&["a", "b"]));
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: trigger a leaves the capped soonest-reset home"
+    );
+
+    crate::live_sessions::update_as_session("4242-0", |f| {
+        f.set_current_member("b".to_string());
+        f.set_last_swap_at(crate::usage::now_ms());
+    })
+    .expect("move the session");
+    let _moved = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved row's liveness marker");
+
+    scan_sessions(&config, &store, &all_fresh(&["a", "b"]));
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "the soonest-reset home pass must not walk the session back onto the capped member"
+    );
+}
+
+/// An unknown-demand session (no `launch_families`) moved off a capped gate-off
+/// preferred home by its OWN spend-cap 429 must stay off it: the per-session
+/// credit-seen mark survives the member change, so the return-to-preferred pass
+/// keeps reading the raw cap against the member it just left — one swap per
+/// failed turn would be the alternative.
+#[test]
+fn an_unknown_demand_session_stays_off_its_capped_gate_off_home_after_a_429_move() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+
+    // The session's own 429 latches and moves it off capped `a` to `b`.
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: the session's own 429 leaves the capped home"
+    );
+
+    crate::live_sessions::update_as_session("4242-0", |f| {
+        f.set_current_member("b".to_string());
+        f.set_last_swap_at(crate::usage::now_ms());
+    })
+    .expect("move the session");
+    let _moved = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved row's liveness marker");
+
+    // The 429 is drained and no new one lands: the per-member latch is pruned
+    // on the member change, but the credit-seen mark must keep the home pass
+    // from walking the session back onto capped gate-off `a`.
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "an unknown-demand session moved by its own 429 must not walk home onto the capped account"
+    );
+}
+
+/// A later subagent success in the same drain must not mask the main loop's
+/// recovery: the recovery half keys by FILE, so the main file's own success
+/// still clears the main loop's 429 even when a subagent success is newer.
+#[test]
+fn a_later_subagent_success_does_not_mask_the_main_loops_recovery() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    write_conv(&home, "conv-a", &[spend_cap_row(600_000), ok_row(120_000)]);
+    write_subagent(&home, "conv-a", &[ok_row(60_000)]);
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "the main loop recovered after its 429; a subagent's later success must not undo that"
+    );
+}
+
+/// The credit-seen mark must survive the session's life, but a scan in which
+/// the session's member is briefly out of the chain drops the row from the
+/// walk, never inserts it into the live map, and prunes the mark — so the next
+/// scan walks the session back onto its capped gate-off home.
+#[test]
+fn the_credit_seen_mark_survives_a_scan_with_the_member_out_of_the_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: the 429 moves it"
+    );
+    crate::live_sessions::update_as_session("4242-0", |f| {
+        f.set_current_member("b".to_string());
+        f.set_last_swap_at(crate::usage::now_ms());
+    })
+    .expect("move the session");
+    let _moved = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved row's liveness marker");
+    // Control: with the chain intact, the mark holds the session on `b`.
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: the mark holds the session on b"
+    );
+    // One scan with `b` out of the chain (an operator edit), then back in.
+    config.lock().unwrap().state.fallback_chain = vec!["a".into()];
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    config.lock().unwrap().state.fallback_chain = vec!["a".into(), "b".into()];
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "the session is still live; its credit-seen mark must not be pruned"
+    );
+}
+
+/// A scheduler restart (a lease change: daemon restart, self-update, TUI <->
+/// daemon handover) starts with empty thread-locals. The cold re-read of the
+/// still-hot transcript redelivers the session's own 429, which still proves a
+/// credit-billed model, but the mark is only set inside the `ts > last_change`
+/// latch branch, so it is not rebuilt and the home pass walks the session back.
+/// A fresh thread stands in for the fresh process: every thread-local is new.
+#[test]
+fn the_credit_seen_mark_is_rebuilt_after_a_scheduler_restart() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: the 429 moves it"
+    );
+    crate::live_sessions::update_as_session("4242-0", |f| {
+        f.set_current_member("b".to_string());
+        f.set_last_swap_at(crate::usage::now_ms());
+    })
+    .expect("move the session");
+    let _moved = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved row's liveness marker");
+    // Control: same process, the mark holds it on `b`.
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: the mark holds the session on b"
+    );
+    let cfg = config.clone();
+    std::thread::spawn(move || {
+        tail_transcripts();
+        scan_sessions(
+            &cfg,
+            &credit_store(&["a", "b"], &["a"]),
+            &all_fresh(&["a", "b"]),
+        );
+    })
+    .join()
+    .expect("restarted scheduler thread");
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "after a restart the redelivered 429 must still mark the session credit-billed"
+    );
+}
+
+/// A credit-forced leave must not park on a capped `last_resort` sink: `s` is
+/// gate-off and capped, and every other member is exhausted, so the sink pass
+/// would be the only target — but the raw cap excludes it.
+#[test]
+fn a_fable_session_does_not_park_on_a_capped_gate_off_sink() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b", "s"], &[("a", "fable")], &["s"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("s"))
+        .unwrap()
+        .last_resort = true;
+
+    // `a` and `s` are capped (s's gate is off); `b` is exhausted.
+    let store = session_store(&[("a", 10.0), ("b", 100.0), ("s", 10.0)]);
+    {
+        let mut map = store.lock().unwrap();
+        for n in ["a", "s"] {
+            let info = map.get_mut(n).unwrap();
+            info.spend = Some(crate::usage::SpendInfo {
+                enabled: true,
+                used: Some(50.0),
+                limit: Some(50.0),
+                percent: Some(100.0),
+                currency: Some("USD".to_owned()),
+            });
+        }
+    }
+
+    scan_sessions(&config, &store, &all_fresh(&["a", "b", "s"]));
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a credit-forced leave must not park on a capped gate-off sink"
+    );
+}
+
+/// Probe C's missing half: with an uncapped third member, a credit-forced
+/// leave skips both capped gate-off members and lands there.
+#[test]
+fn a_fable_session_skips_two_capped_gate_off_members_for_the_uncapped_third() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[("a", "fable")], &["a", "b"]),
+        &credit_store(&["a", "b", "c"], &["a", "b"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("c".to_string()), Some(2)),
+        "a credit-forced leave skips both capped gate-off members for the uncapped third"
+    );
+}
+
+/// A session that ends with its 429 latched and marked — no target to move to,
+/// so the decision writes nothing — leaves both in the thread-local maps once
+/// no chain row is live: the per-row prunes never run with zero rows, only the
+/// empty scan's clear drops them. A later session minted with the same
+/// `<pid>-<seq>` id must not inherit the mark through the empty scan (the
+/// reused row keeps the same `started_at`, so only the clear separates it).
+#[test]
+fn a_dead_sessions_mark_is_not_inherited_through_an_empty_scan() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    // A current stint start: the 429 seeded a beat later postdates it, and the
+    // reused row below keeps the SAME stint so the `started_at` key matches —
+    // only the empty-scan clear then separates the dead session's mark from
+    // the new one.
+    let started_at = crate::usage::now_ms().saturating_sub(1_000);
+    let mut row = session_row("8021-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.started_at = started_at;
+    let marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8021-0"),
+        (None, None),
+        "control: no target yet"
+    );
+    drop(marker);
+    crate::live_sessions::unregister("8021-0").expect("unregister");
+    // Zero live chain rows: the scan must clear the dead session's mark.
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    // A new opus session reusing the id, on the non-preferred member with a
+    // capped gate-off preferred home. Unmarked, the home pass walks it back
+    // onto the home — the mark did not leak through the empty scan.
+    let mut fresh = session_row("8021-0", "a");
+    fresh.started_at = started_at;
+    fresh.current_member = Some("b".to_string());
+    fresh.intended_member = Some("b".to_string());
+    fresh.chain_cursor = Some(1);
+    fresh.launch_families = Some(vec!["opus".to_string()]);
+    let _m2 = register_live_row(&fresh);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8021-0"),
+        (Some("a".to_string()), Some(0)),
+        "the dead session's mark must not leak through an empty scan; the unmarked session returns home"
+    );
+}
+
+/// Control: with another live chain row present, the scan prunes the dead
+/// session's latch, so the new session stays.
+#[test]
+fn a_non_empty_scan_prunes_the_dead_sessions_latch() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8022-0", "a");
+    row.claude_pid = Some(child_pid);
+    let marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8022-0"),
+        (None, None),
+        "control: no target yet"
+    );
+    drop(marker);
+    crate::live_sessions::unregister("8022-0").expect("unregister");
+    let _other = register_live_row(&session_row("8023-0", "b"));
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    let mut fresh = session_row("8022-0", "a");
+    fresh.launch_families = Some(vec!["opus".to_string()]);
+    let _m2 = register_live_row(&fresh);
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "opus")], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("8022-0"), (None, None));
+}
+
+/// Two live sessions resumed onto ONE conversation id (CC reuses the id on
+/// `--resume` unless `--fork-session`): one 429 row joins both rows. The 429
+/// names no process, so the conversation is ambiguous and neither row latches
+/// or marks — an opus session must never move on the other session's 429.
+/// Unix-only: the claimants are live `sleep` children.
+#[cfg(unix)]
+#[test]
+fn an_opus_session_does_not_move_on_another_sessions_429_in_a_shared_conversation() {
+    let home = crate::testutil::HomeSandbox::new();
+    let fable_child = LiveChild::spawn();
+    let opus_child = LiveChild::spawn();
+    let mut fable = session_row("8024-0", "a");
+    fable.claude_pid = Some(fable_child.pid());
+    let _m1 = register_live_row(&fable);
+    let mut opus = session_row("8025-0", "a");
+    opus.claude_pid = Some(opus_child.pid());
+    opus.launch_families = Some(vec!["opus".to_string()]);
+    let _m2 = register_live_row(&opus);
+    seed_live_session_record(&home, "conv-a", fable_child.pid());
+    seed_live_session_record(&home, "conv-a", opus_child.pid());
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8024-0"),
+        (None, None),
+        "a shared 429 is ambiguous; neither claimant latches it"
+    );
+    assert_eq!(
+        decision_of("8025-0"),
+        (None, None),
+        "an opus session must not move on the other session's 429"
+    );
+}
+
+/// Control for the shared-conversation rule: a second live row on a DIFFERENT
+/// conversation leaves the 429 unambiguous, so the row it joins still moves and
+/// the other row stays.
+#[test]
+fn a_second_live_row_on_a_different_conversation_does_not_mask_the_429() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut first = session_row("8026-0", "a");
+    first.claude_pid = Some(77_777);
+    let _m1 = register_live_row(&first);
+    let mut second = session_row("8027-0", "a");
+    second.claude_pid = Some(88_888);
+    let _m2 = register_live_row(&second);
+    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-b", 88_888);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8026-0"),
+        (Some("b".to_string()), Some(1)),
+        "one live row on the conversation: the 429 is unambiguous and moves it"
+    );
+    assert_eq!(
+        decision_of("8027-0"),
+        (None, None),
+        "the other row's conversation has no 429"
+    );
+}
+
+/// A row whose `started_at` is now, a joined 429 one minute earlier, and a
+/// capped gate-off preferred home that would pull an unmarked session back: the
+/// 429 predates the session's stint, so it must not mark the session — the
+/// session returns home (unmarked).
+#[test]
+fn a_joined_429_from_before_the_session_start_does_not_mark_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8028-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.started_at = crate::usage::now_ms();
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    seed_session_record(&home, "conv-a", child_pid);
+    write_conv(&home, "conv-a", &[spend_cap_row(60_000)]);
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8028-0"),
+        (Some("a".to_string()), Some(0)),
+        "a 429 from before the session's start must not mark it; the home pass pulls it back"
+    );
+}
+
+/// A 429 drained in a scan where the member is out of the chain still marks the
+/// session: the mark insert runs over the live rows before the chain filter, so
+/// once the member is re-added a capped gate-off home does not pull it back.
+#[test]
+fn a_429_drained_while_the_member_is_out_of_the_chain_still_marks_the_session() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8029-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.intended_member = Some("b".to_string());
+    row.chain_cursor = Some(1);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    // The 429 lands while `b` is out of the chain: the row is dropped from the
+    // walk, but the mark insert must still run over the live rows.
+    config.lock().unwrap().state.fallback_chain = vec!["a".into()];
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    // `b` is re-added. The session is marked, so the capped gate-off home `a`
+    // must not pull it back.
+    config.lock().unwrap().state.fallback_chain = vec!["a".into(), "b".into()];
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8029-0"),
+        (Some("b".to_string()), Some(1)),
+        "the session is marked; the capped gate-off home must not pull it back"
+    );
+}
+
+/// A 429 drained while the row still names the OUTGOING member's store is that
+/// member's, not the incoming one's: the latch insert must refuse it outright.
+/// The decision shows no move either way (no reachable target), so the test
+/// pins the refusal on the latch map directly.
+#[test]
+fn a_429_does_not_latch_while_the_row_names_the_outgoing_members_store() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8030-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.launch_store = Some(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .join("credentials.json"),
+    );
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8030-0"),
+        (None, None),
+        "the refused latch leaves the decision at no move"
+    );
+    let latched = super::SPEND_CAP_LATCH.with(|l| l.borrow().contains_key("8030-0"));
+    assert!(
+        !latched,
+        "a 429 must not latch against the member whose store the row no longer names"
+    );
+}
+
+/// A landed swap on linux repoints `launch_store` at the incoming member's
+/// store, so a 429 after the swap is that member's and must still move the
+/// session: the `reads_member_store` gate must not suppress it.
+#[test]
+fn a_429_still_moves_after_a_landed_swap_names_the_incoming_store() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8031-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - 3_600_000);
+    row.launch_store = Some(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .join("credentials.json"),
+    );
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8031-0"),
+        (Some("a".to_string()), Some(0)),
+        "a 429 on the incoming member's store must still move the session off it"
+    );
+}
+
+/// The `reads_member_store` gate matches by PROFILE DIR, never exact file: a
+/// landed swap whose `launch_store` names `session-token.json` while no sidecar
+/// is on disk (so `install_source_path` still resolves `credentials.json`) must
+/// still read as the incoming member's store and let trigger b fire. An
+/// exact-file narrowing would suppress the 429 here.
+#[test]
+fn a_429_still_moves_when_the_store_names_a_sidecar_that_is_not_on_disk() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8033-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - 3_600_000);
+    row.launch_store = Some(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .join("session-token.json"),
+    );
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8033-0"),
+        (Some("a".to_string()), Some(0)),
+        "a store under the member's profile dir must read as that member's, sidecar or not"
+    );
+}
+
+/// A 429 landing within the in-flight grace after the swap stamp must not
+/// latch: a request in flight across the hold answers after it, and its 429
+/// belongs to the outgoing member.
+#[test]
+fn a_429_within_the_in_flight_grace_does_not_latch() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8034-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - 10_000);
+    row.launch_store = Some(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .join("credentials.json"),
+    );
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8034-0"),
+        (None, None),
+        "no move: the 429 is inside the grace"
+    );
+}
+
+/// A 429 past the grace is the incoming member's own: it latches and moves the
+/// session. (A genuine 429 on the new member re-latches on the next turn, so
+/// the grace only delays it.)
+#[test]
+fn a_429_past_the_in_flight_grace_latches_and_moves() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8035-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - 40_000);
+    row.launch_store = Some(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .join("credentials.json"),
+    );
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8035-0"),
+        (Some("a".to_string()), Some(0)),
+        "a 429 past the grace is the incoming member's and still moves the session off it"
+    );
+}
+
+/// A latched 429 with no target, then a same-member convergence re-stamps
+/// `last_swap_at` without a member change: the latch is keyed by the row's
+/// `started_at`, never the swap stamp, so the re-stamp must NOT age it out —
+/// a credit cap is per account, and the convergence keeps the same account.
+/// When a target frees, the session still moves.
+#[test]
+fn a_latched_429_survives_a_same_member_convergence_restamp() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8032-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.last_swap_at = Some(crate::usage::now_ms() - 3_600_000);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    // All capped: the 429 latches against "b" but has no target.
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[], &[]),
+        &credit_store(&["a", "b", "c"], &["a", "b", "c"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+    assert_eq!(decision_of("8032-0"), (None, None), "no target yet");
+    // A same-member convergence re-stamps last_swap_at past the 429, without a
+    // member change. The latch must survive: its `started_at` key is unchanged.
+    crate::live_sessions::update_as_session("8032-0", |f| {
+        f.set_last_swap_at(crate::usage::now_ms());
+    })
+    .expect("re-stamp");
+    // "c" frees: the surviving latch still moves the session off "b".
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[], &[]),
+        &credit_store(&["a", "b", "c"], &["a", "b"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+    assert_eq!(
+        decision_of("8032-0"),
+        (Some("c".to_string()), Some(2)),
+        "a same-member re-stamp must not drop the standing latch"
     );
 }
 
@@ -18022,5 +19732,465 @@ fn a_reading_returns_after_the_next_successful_profile() {
     assert!(
         state.store.lock().unwrap().contains_key("ret"),
         "the reading returns after the next successful /profile"
+    );
+}
+
+/// A NON-chain live row (a plain `clauth start` without the chain) resumed onto
+/// the same conversation as an opus chain row. The other row's live claude
+/// process holds a record naming the conversation, so the 429 is
+/// unattributable: the opus row must not move on it. Unix-only (the second
+/// claimant is a live `sleep` child).
+#[cfg(unix)]
+#[test]
+fn a_non_chain_row_on_the_same_conversation_does_not_move_the_opus_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let other_child = LiveChild::spawn();
+    let mut other = session_row("8050-0", "a");
+    other.follows_chain = false;
+    other.claude_pid = Some(other_child.pid());
+    let _m1 = register_live_row(&other);
+    let mut opus = session_row("8051-0", "a");
+    opus.claude_pid = Some(88_888);
+    opus.launch_families = Some(vec!["opus".to_string()]);
+    let _m2 = register_live_row(&opus);
+    seed_live_session_record(&home, "conv-a", other_child.pid());
+    seed_session_record(&home, "conv-a", 88_888);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8051-0"),
+        (None, None),
+        "an opus chain row must not move on a non-chain row's 429"
+    );
+}
+
+/// A second Claude Code process with NO clauth row (a plain `claude --resume`,
+/// or a `claude` wrapper's grandchild) holds a session record naming the same
+/// conversation. The row-count never sees it, but the record is a live
+/// process's, so the 429 is unattributable. Unix-only.
+#[cfg(unix)]
+#[test]
+fn an_unregistered_process_on_the_same_conversation_does_not_move_the_opus_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let other = LiveChild::spawn();
+    let mut opus = session_row("8052-0", "a");
+    opus.claude_pid = Some(88_888);
+    opus.launch_families = Some(vec!["opus".to_string()]);
+    let _m = register_live_row(&opus);
+    seed_session_record(&home, "conv-a", 88_888);
+    seed_live_session_record(&home, "conv-a", other.pid());
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8052-0"),
+        (None, None),
+        "an opus chain row must not move on another process's 429"
+    );
+}
+
+/// The credit-seen mark is keyed by the row's `started_at`. A
+/// session that ends marked and a new session minted with the same id before
+/// the next scan (rows stay non-empty) has a different `started_at`, so it must
+/// not inherit the mark: the capped gate-off preferred home pulls it back.
+#[test]
+fn a_reused_id_does_not_inherit_the_credit_seen_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut old = session_row("8055-0", "a");
+    old.claude_pid = Some(77_777);
+    let marker = register_live_row(&old);
+    seed_session_record(&home, "conv-a", 77_777);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert!(
+        super::SPEND_CAP_CREDIT_SEEN.with(|s| s.borrow().get("8055-0") == Some(&old.started_at)),
+        "control: the old session is marked under its started_at"
+    );
+    drop(marker);
+    crate::live_sessions::unregister("8055-0").expect("unregister");
+    let mut fresh = session_row("8055-0", "a");
+    fresh.current_member = Some("b".to_string());
+    fresh.intended_member = Some("b".to_string());
+    fresh.chain_cursor = Some(1);
+    fresh.started_at = crate::usage::now_ms() + 1;
+    fresh.launch_families = Some(vec!["opus".to_string()]);
+    let _m2 = register_live_row(&fresh);
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8055-0"),
+        (Some("a".to_string()), Some(0)),
+        "a new opus session must not inherit the dead session's mark"
+    );
+}
+
+/// A shared conversation (a second live record names it) makes the 429
+/// ambiguous, so it sets NO mark: an unknown-demand row on the non-preferred
+/// member is walked home by the return-to-preferred pass — an unmarked row's
+/// demand does not read credit-billed. Unix-only (the second claimant is a live
+/// `sleep` child).
+#[cfg(unix)]
+#[test]
+fn an_ambiguous_429_sets_no_mark_and_the_row_returns_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let other = LiveChild::spawn();
+    let mut row = session_row("8057-0", "a");
+    row.claude_pid = Some(77_777);
+    row.current_member = Some("b".to_string());
+    row.intended_member = Some("b".to_string());
+    row.chain_cursor = Some(1);
+    let _m = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    seed_session_record(&home, "conv-a", 77_777);
+    seed_live_session_record(&home, "conv-a", other.pid());
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8057-0"),
+        (Some("a".to_string()), Some(0)),
+        "an ambiguous 429 sets no mark; the unmarked row's home pass walks it onto a"
+    );
+}
+
+/// A record naming the conversation under a LIVE pid whose `procStart` names a
+/// different process is not that live process's record: the identity compare
+/// skips it, so the conversation is not ambiguous and the session's own 429
+/// moves it. Linux-only (the start compare is linux-only).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_pid_record_with_a_mismatched_start_does_not_make_the_429_ambiguous() {
+    let home = crate::testutil::HomeSandbox::new();
+    let other = LiveChild::spawn();
+    let mut row = session_row("8058-0", "a");
+    row.claude_pid = Some(77_777);
+    let _m = register_live_row(&row);
+    seed_session_record(&home, "conv-a", 77_777);
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::write(
+        sessions.join(format!("{}.json", other.pid())),
+        serde_json::json!({ "sessionId": "conv-a", "pid": other.pid(), "procStart": "999999999999" })
+            .to_string(),
+    )
+    .unwrap();
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8058-0"),
+        (Some("b".to_string()), Some(1)),
+        "a mismatched-start record is not the live process; the 429 stays the session's own"
+    );
+}
+
+/// A fresh session (no swap yet) whose own 429 lands 5 s after its start. No
+/// outgoing member exists, so the in-flight grace has nothing to protect.
+#[test]
+fn a_fresh_sessions_own_429_moves_it_without_a_swap() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8090-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.started_at = crate::usage::now_ms().saturating_sub(5_000);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8090-0"),
+        (Some("b".to_string()), Some(1)),
+        "a fresh session's own 429 must move it"
+    );
+}
+
+/// Control: the same fresh row started a minute ago still moves.
+#[test]
+fn a_fresh_sessions_own_429_moves_it_a_minute_after_start() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8091-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.started_at = crate::usage::now_ms().saturating_sub(60_000);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8091-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: a minute-old 429 still moves the fresh session"
+    );
+}
+
+/// A latched 429 on `a` (no target: both capped), the session ends and a new
+/// opus session reuses its id on the SAME member before any empty scan. The
+/// latch's `started_at` key must refuse it once `b` frees.
+#[test]
+fn a_reused_id_on_the_same_member_does_not_fire_the_dead_latch() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut old = session_row("8092-0", "a");
+    old.claude_pid = Some(77_777);
+    let marker = register_live_row(&old);
+    seed_session_record(&home, "conv-a", 77_777);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert!(
+        super::SPEND_CAP_LATCH.with(|l| l.borrow().contains_key("8092-0")),
+        "control: the old session latched"
+    );
+    drop(marker);
+    crate::live_sessions::unregister("8092-0").expect("unregister");
+    let mut fresh = session_row("8092-0", "a");
+    fresh.started_at = crate::usage::now_ms() + 1;
+    fresh.launch_families = Some(vec!["opus".to_string()]);
+    let _m2 = register_live_row(&fresh);
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8092-0"),
+        (None, None),
+        "a new opus session must not fire a dead session's latch"
+    );
+}
+
+/// A second session record naming the conversation under a DEAD pid (a reaped
+/// child) must not make the conversation ambiguous.
+#[cfg(unix)]
+#[test]
+fn a_dead_pid_record_does_not_make_the_429_ambiguous() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut dead = std::process::Command::new("true").spawn().expect("spawn");
+    let dead_pid = dead.id();
+    // A crashed Claude Code's record keeps the start the process had while
+    // alive: on linux the dead-pid term must decide by DEADNESS, not by an
+    // empty start. Read the start before reaping (the zombie's `/proc` entry
+    // keeps it).
+    #[cfg(target_os = "linux")]
+    let dead_start = crate::testutil::proc_start_of(dead_pid)
+        .expect("the zombie's start is still readable before reaping");
+    dead.wait().expect("reap");
+    let mut row = session_row("8094-0", "a");
+    row.claude_pid = Some(77_777);
+    let _marker = register_live_row(&row);
+    seed_session_record(&home, "conv-a", 77_777);
+    #[cfg(target_os = "linux")]
+    {
+        let sessions = home.home().join(".claude/sessions");
+        std::fs::write(
+            sessions.join(format!("{dead_pid}.json")),
+            serde_json::json!({ "sessionId": "conv-a", "pid": dead_pid, "procStart": dead_start })
+                .to_string(),
+        )
+        .unwrap();
+    }
+    #[cfg(not(target_os = "linux"))]
+    seed_session_record(&home, "conv-a", dead_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8094-0"),
+        (Some("b".to_string()), Some(1)),
+        "a dead pid's stale record must not suppress the session's own 429"
+    );
+}
+
+/// A 429 inside the in-flight grace after a swap onto `b` still MARKS the
+/// session (the grace gates the latch only): the model is credit-billed, so the
+/// home pass must not walk the unknown-demand row back onto its capped gate-off
+/// preferred home `a`.
+#[test]
+fn a_429_inside_the_grace_marks_the_session_and_it_stays() {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("8095-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.current_member = Some("b".to_string());
+    row.intended_member = Some("b".to_string());
+    row.chain_cursor = Some(1);
+    row.last_swap_at = Some(crate::usage::now_ms() - 10_000);
+    row.launch_store = Some(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .join("credentials.json"),
+    );
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    seed_session_record(&home, "conv-a", child_pid);
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8095-0"),
+        (Some("b".to_string()), Some(1)),
+        "the in-grace 429 marks the session; it stays on b"
+    );
+}
+
+/// Control: the same row with no 429 is walked home onto `a`.
+#[test]
+fn an_unmarked_swapped_row_returns_home() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("8096-0", "a");
+    row.claude_pid = Some(77_777);
+    row.current_member = Some("b".to_string());
+    row.intended_member = Some("b".to_string());
+    row.chain_cursor = Some(1);
+    row.last_swap_at = Some(crate::usage::now_ms() - 10_000);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[], &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .preferred = true;
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8096-0"),
+        (Some("a".to_string()), Some(0)),
+        "unmarked, the home pass walks it onto a"
+    );
+}
+
+/// A record naming the conversation under a LIVE pid whose `procStart` is
+/// empty is not that process's record: an empty start never counts on linux,
+/// so the conversation is not ambiguous and the session's own 429 moves it.
+/// Linux-only (the start compare is linux-only).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_pid_record_with_an_empty_start_does_not_make_the_429_ambiguous() {
+    let home = crate::testutil::HomeSandbox::new();
+    let other = LiveChild::spawn();
+    let mut row = session_row("8197-0", "a");
+    row.claude_pid = Some(77_777);
+    let _m = register_live_row(&row);
+    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", other.pid());
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8197-0"),
+        (Some("b".to_string()), Some(1)),
+        "a live pid's record with an empty start is not that process's; the 429 stays the session's own"
+    );
+}
+
+/// A crashed Claude Code leaves its record WITH a real `procStart` behind: a
+/// DEAD pid whose record carries the start it had while alive must not count.
+/// Linux-only (the start compare is linux-only).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dead_pid_record_with_its_real_start_does_not_make_the_429_ambiguous() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut gone = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn");
+    let gone_pid = gone.id();
+    let start = crate::testutil::proc_start_of(gone_pid).expect("the child's start");
+    gone.kill().expect("kill");
+    gone.wait().expect("reap");
+    let mut row = session_row("8198-0", "a");
+    row.claude_pid = Some(77_777);
+    let _m = register_live_row(&row);
+    seed_session_record(&home, "conv-a", 77_777);
+    let sessions = home.home().join(".claude/sessions");
+    std::fs::write(
+        sessions.join(format!("{gone_pid}.json")),
+        serde_json::json!({ "sessionId": "conv-a", "pid": gone_pid, "procStart": start })
+            .to_string(),
+    )
+    .unwrap();
+    seed_spend_cap_transcript(&home, "conv-a");
+    tail_transcripts();
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(
+        decision_of("8198-0"),
+        (Some("b".to_string()), Some(1)),
+        "a dead pid's record carrying its real start must not suppress the session's own 429"
     );
 }

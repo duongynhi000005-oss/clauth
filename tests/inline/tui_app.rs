@@ -15889,6 +15889,8 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
         start_profile: "late".to_string(),
         harness: crate::harness::Harness::Claude,
         pid: 4242,
+        claude_pid: None,
+        launch_families: None,
         started_at: 1_700_000_000_000,
         cwd: None,
         isolated: false,

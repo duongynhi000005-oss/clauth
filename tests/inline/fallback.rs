@@ -4464,6 +4464,8 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
             &usage,
             &HashSet::new(),
             ActiveBurnRate::Supplied(Some(1200.0)),
+            false,
+            false,
         ),
         Some(SwitchAction::Off),
         "the in-memory rate must decide, not the disk history"
@@ -4495,6 +4497,8 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
             &usage,
             &HashSet::new(),
             ActiveBurnRate::FromDisk,
+            false,
+            false,
         ),
         None,
         "the disk history's light climb must not project past the cap"
@@ -4550,6 +4554,8 @@ fn a_third_party_active_never_projects_its_burn() {
             &usage,
             &third_party_names,
             ActiveBurnRate::Supplied(Some(1200.0)),
+            false,
+            false,
         ),
         None,
         "a third-party active's provider window must not pair with OAuth burn history"
@@ -6204,6 +6210,8 @@ fn next_auto_switch_target_ignores_store_mutation_after_snapshot() {
         &pre_mutation,
         &HashSet::new(),
         ActiveBurnRate::FromDisk,
+        false,
+        false,
     );
     assert_eq!(
         result_with_pre_snapshot,
@@ -8693,6 +8701,8 @@ fn a_hybrid_active_walks_on_its_provider_windows() {
             &usage,
             &third_party_names,
             ActiveBurnRate::FromDisk,
+            false,
+            false,
         ),
         None,
         "a hybrid active with provider headroom must not switch on its stale OAuth reading"
@@ -8744,7 +8754,9 @@ fn a_monthly_only_active_walks_off_past_the_weekly_line() {
             &snap,
             &usage,
             &HashSet::new(),
-            ActiveBurnRate::FromDisk
+            ActiveBurnRate::FromDisk,
+            false,
+            false,
         ),
         Some(SwitchAction::To("b".to_string())),
         "control: a 7d window past the weekly line walks the active off"
@@ -8789,6 +8801,8 @@ fn a_monthly_only_active_walks_off_past_the_weekly_line() {
                 &usage,
                 &third_party_names,
                 ActiveBurnRate::FromDisk,
+                false,
+                false,
             ),
             expected,
             "{why} (monthly at {pct}%)"
@@ -8868,6 +8882,8 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
             &usage,
             &third_party_names,
             ActiveBurnRate::FromDisk,
+            false,
+            false,
         ),
         None,
         "a hybrid's provider window never pairs its OAuth burn history"

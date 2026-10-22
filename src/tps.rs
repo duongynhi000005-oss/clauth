@@ -166,6 +166,21 @@ pub(crate) struct Producer {
     /// Every response still relevant (the last hour + today + yesterday),
     /// keyed by message id or `(session, user ts)`.
     responses: HashMap<String, Resp>,
+    /// Conversation id → the latest spend-cap 429 row since the last drain,
+    /// carrying its timestamp and the transcript FILE it came from. The file
+    /// matters: a subagent transcript shares the parent's conversation key
+    /// (`session_key` folds `subagents/` into the parent dir), so a success in
+    /// another file must not clear the parent's 429. An error row still folds
+    /// no tokens; this map is its only effect.
+    spend_cap_429: HashMap<String, SpendCap429Fact>,
+    /// Conversation id → per transcript FILE, the latest successful turn since
+    /// the last drain, so the scheduler can clear a latched 429 once a success
+    /// in the SAME file outruns it — even a success read after the 429 was
+    /// already drained (the drain that latched it and the success that clears
+    /// it are different ticks). Keyed by file, never conversation alone: a
+    /// later success in another file (a subagent) must not overwrite the file
+    /// that recovered.
+    spend_cap_recoveries: HashMap<String, HashMap<PathBuf, u64>>,
     /// Accumulated day sums (additive), loaded from the cache on start.
     days: DaySums,
     /// Response key → member, loaded from the previous cache's `frozen` map:
@@ -241,6 +256,8 @@ impl Producer {
         Self {
             files: HashMap::new(),
             responses: HashMap::new(),
+            spend_cap_429: HashMap::new(),
+            spend_cap_recoveries: HashMap::new(),
             days,
             inherited,
             last_user: HashMap::new(),
@@ -257,6 +274,19 @@ impl Producer {
             speed_ledger_sig: (0, 0, 0, 0),
             last_reload_ms: 0,
             last_discover_ms: 0,
+        }
+    }
+
+    /// Conversation id → the latest spend-cap fact since the last scan,
+    /// consumed once by the scheduler's per-session scan. Draining clears both
+    /// halves: a 429 is delivered exactly once, and the scheduler's latch is
+    /// what makes it survive a tick with no moveable target; a recovery is
+    /// delivered exactly once, and the scheduler's latch drop is what makes a
+    /// later successful turn clear a 429 it already consumed.
+    pub(crate) fn drain_spend_cap(&mut self) -> SpendCapDrain {
+        SpendCapDrain {
+            pending: std::mem::take(&mut self.spend_cap_429),
+            recoveries: std::mem::take(&mut self.spend_cap_recoveries),
         }
     }
 
@@ -507,17 +537,40 @@ impl Producer {
             .or_insert_with(|| path.to_path_buf());
         let cutoff = if first { cutoff_ms(now_ms) } else { 0 };
         let mut consumed = 0usize;
+        // The newest successful turn in THIS file, folded here and written once
+        // per file below: a success in a file is that file's recovery candidate
+        // alone, and writing it line by line would allocate the conversation key
+        // and the path for every assistant line of a cold start's hot-set
+        // re-read.
+        let mut max_success_ts: Option<u64> = None;
         for seg in buf
             .split_inclusive(|&b| b == b'\n')
             .filter(|s| s.last() == Some(&b'\n'))
         {
             consumed += seg.len();
             let line = strip_crlf(seg);
-            self.process_line(path, &key, account.as_deref(), line, cutoff);
+            if let Some(ts) = self.process_line(path, &key, account.as_deref(), line, cutoff) {
+                max_success_ts = Some(max_success_ts.map_or(ts, |latest| latest.max(ts)));
+            }
+        }
+        if let Some(ts) = max_success_ts {
+            self.spend_cap_recoveries
+                .entry(key.clone())
+                .or_default()
+                .entry(path.to_path_buf())
+                .and_modify(|latest| {
+                    if ts > *latest {
+                        *latest = ts;
+                    }
+                })
+                .or_insert(ts);
         }
         start + consumed as u64
     }
 
+    /// One line's effect on the producer's per-line maps. Returns the successful
+    /// assistant turn's timestamp (`Some`) so `read_append` can fold the file's
+    /// recovery candidate once, `None` for every other line.
     fn process_line(
         &mut self,
         path: &Path,
@@ -525,13 +578,27 @@ impl Producer {
         attr: Option<&str>,
         line: &str,
         cutoff_ms: u64,
-    ) {
-        let Some(parsed) = parse_line(line) else {
-            return;
-        };
+    ) -> Option<u64> {
+        let parsed = parse_line(line)?;
         match parsed {
+            Parsed::SpendCap429 { ts } => {
+                let file = path.to_path_buf();
+                match self.spend_cap_429.get_mut(key) {
+                    Some(latest) if ts >= latest.ts => {
+                        latest.ts = ts;
+                        latest.file = file;
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.spend_cap_429
+                            .insert(key.to_owned(), SpendCap429Fact { ts, file });
+                    }
+                }
+                None
+            }
             Parsed::User { ts } => {
                 self.last_user.insert(path.to_path_buf(), ts);
+                None
             }
             Parsed::Assistant {
                 ts,
@@ -540,9 +607,10 @@ impl Producer {
                 output,
             } => {
                 // A pre-cutoff user line still updates the span start; a pre-cutoff
-                // response is simply not retained.
+                // response is simply not retained. The successful turn is still a
+                // recovery candidate for its file: `read_append` folds the max.
                 if ts < cutoff_ms {
-                    return;
+                    return Some(ts);
                 }
                 let user_ts = self.last_user.get(path).copied().unwrap_or(0);
                 let msg_key = response_key(key, id.as_deref(), user_ts);
@@ -583,7 +651,7 @@ impl Producer {
                         resp.added_gen_ms = span;
                     }
                     resp.day = day_of_ms(resp.end_ms);
-                    return;
+                    return Some(ts);
                 }
                 resp.added = true;
                 // A response whose end crossed UTC midnight moves its already-added
@@ -619,7 +687,7 @@ impl Producer {
                 // response is out of day sums entirely (a day sum is a speed
                 // basis: output paired with gen_ms).
                 let Some((_, span)) = resp.span() else {
-                    return;
+                    return Some(ts);
                 };
                 let d_out = resp.output.saturating_sub(resp.added_output);
                 let d_gen = span.saturating_sub(resp.added_gen_ms);
@@ -637,6 +705,7 @@ impl Producer {
                     resp.added_output = resp.output;
                     resp.added_gen_ms = span;
                 }
+                Some(ts)
             }
         }
     }
@@ -775,6 +844,7 @@ pub(crate) fn transcript_speed(path: &Path) -> Option<DaySum> {
             continue;
         };
         match parsed {
+            Parsed::SpendCap429 { .. } => {}
             Parsed::User { ts } => last_user = Some(ts),
             Parsed::Assistant {
                 ts,
@@ -864,12 +934,44 @@ enum Parsed {
         model: String,
         output: u64,
     },
+    /// A Claude Code API-error row naming the spend-cap 429: direct evidence
+    /// the session runs a credit-billed model on a spent cap. Carries the
+    /// row's timestamp so the scheduler can age a fact out, and no tokens — it
+    /// never reaches a figure.
+    SpendCap429 {
+        ts: u64,
+    },
+}
+
+/// The `apiError` value the spend-cap 429 branch writes (`error: "rate_limit"`).
+const SPEND_CAP_429_API_ERROR: &str = "model_requires_usage_credits";
+
+/// A spend-cap 429 fact: its row timestamp and the transcript FILE it came
+/// from. The file is what lets a later success in the SAME file clear it while
+/// a subagent's success (a different file, the same conversation key) does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpendCap429Fact {
+    pub(crate) ts: u64,
+    pub(crate) file: PathBuf,
+}
+
+/// One drain of the producer's spend-cap facts: the pending 429s keyed by
+/// conversation id, and the successful turns keyed by conversation id then
+/// transcript FILE, both consumed exactly once.
+#[derive(Debug, Default)]
+pub(crate) struct SpendCapDrain {
+    pub(crate) pending: HashMap<String, SpendCap429Fact>,
+    pub(crate) recoveries: HashMap<String, HashMap<PathBuf, u64>>,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct WireLine {
     timestamp: Option<String>,
+    #[serde(rename = "isApiErrorMessage")]
+    is_api_error_message: Option<bool>,
+    #[serde(rename = "apiError")]
+    api_error: Option<String>,
     message: Option<WireMsg>,
 }
 
@@ -894,6 +996,15 @@ struct WireUsage {
 fn parse_line(line: &str) -> Option<Parsed> {
     let wire: WireLine = serde_json::from_str(line).ok()?;
     let ts = parse_ts(wire.timestamp.as_deref()?)?;
+    // The spend-cap 429 row is recognized off its own fields, before the
+    // usage filters below: it carries no usable usage and must still add no
+    // tokens, so it cannot ride the assistant path. Its timestamp is kept so
+    // the scheduler can ignore a stale fact.
+    if wire.is_api_error_message == Some(true)
+        && wire.api_error.as_deref() == Some(SPEND_CAP_429_API_ERROR)
+    {
+        return Some(Parsed::SpendCap429 { ts });
+    }
     let msg = wire.message.as_ref()?;
     if msg.role.as_deref() == Some("user") {
         return Some(Parsed::User { ts });

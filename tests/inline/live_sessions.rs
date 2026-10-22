@@ -11,6 +11,8 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         start_profile: profile.to_string(),
         harness: crate::harness::Harness::Claude,
         pid: 4242,
+        claude_pid: None,
+        launch_families: None,
         started_at: 1_700_000_000_000,
         cwd: Some(PathBuf::from("/w/proj")),
         isolated: false,
@@ -42,6 +44,36 @@ fn a_row_predating_the_opt_in_key_deserializes_as_not_following_the_chain() {
         row.harness,
         crate::harness::Harness::Claude,
         "a row with no `harness` key predates the axis, so it is a claude row"
+    );
+}
+
+/// A row predating the child-pid and launch-families fields parses as unjoined
+/// and unknown-demand, and a `None` of either serializes ABSENT (not `null`),
+/// so an older clauth's row round-trips byte-identical. The serialized-absence
+/// half is what binds the serde pair: a parse-only pin would pass with
+/// `#[serde(default)]` deleted, since serde implicitly defaults a missing
+/// `Option`.
+#[test]
+fn a_row_predating_the_child_pid_key_reads_unjoined_and_omits_the_key() {
+    let pre_upgrade = br#"{"session_id":"4242-0","start_profile":"work","pid":4242,
+        "started_at":1700000000000,"cwd":"/w/proj","isolated":false}"#;
+
+    let row: LiveSession = serde_json::from_slice(pre_upgrade).expect("parse a pre-upgrade row");
+    assert_eq!(row.claude_pid, None, "no key must read as unjoined");
+    assert_eq!(
+        row.launch_families, None,
+        "no key must read as unknown demand"
+    );
+
+    let written = serde_json::to_value(&row).expect("serialize");
+    let obj = written.as_object().expect("object");
+    assert!(
+        !obj.contains_key("claude_pid"),
+        "a None child pid must serialize absent, not as null"
+    );
+    assert!(
+        !obj.contains_key("launch_families"),
+        "a None launch demand must serialize absent, not as null"
     );
 }
 

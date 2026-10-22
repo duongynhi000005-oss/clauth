@@ -2152,6 +2152,8 @@ fn an_armed_session_silences_the_reader_before_any_read() {
         start_profile: "a".to_string(),
         harness: crate::harness::Harness::Claude,
         pid: std::process::id(),
+        claude_pid: None,
+        launch_families: None,
         started_at: 0,
         cwd: None,
         isolated: false,

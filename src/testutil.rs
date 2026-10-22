@@ -1592,6 +1592,8 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
         start_profile: profile.to_owned(),
         harness: crate::harness::Harness::Claude,
         pid: 4242,
+        claude_pid: None,
+        launch_families: None,
         started_at: 1_700_000_000_000,
         cwd: None,
         isolated: false,
@@ -1964,6 +1966,17 @@ pub(crate) fn live_session_rows_until(
     }
 }
 
+/// Field 22 of `/proc/<pid>/stat` (the process start time in clock ticks since
+/// boot), parsed after the last `)`, or `None` when the file is unreadable or
+/// the field is missing. The one test-side parse, shared by the fixtures that
+/// seed a record with the process's real start.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn proc_start_of(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit_once(')')?.1;
+    Some(rest.split_whitespace().nth(19)?.to_string())
+}
+
 /// A stateful slow `claude` shim: `--version` and `plugin` probes answer
 /// instantly (the start pre-flight's heal calls them), the session spawn
 /// itself sleeps a bounded five seconds so the poll above can observe the
@@ -1992,7 +2005,7 @@ impl<'a> SlowClaude<'a> {
         let shim = tmp.path().join("claude");
         std::fs::write(
             &shim,
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"2.1.220 (Claude Code)\"; exit 0;;\n  plugin) exit 0;;\nesac\nsleep 5\nexit 0\n",
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"2.1.220 (Claude Code)\"; exit 0;;\n  plugin) exit 0;;\nesac\necho $$ > \"$HOME/.slow-claude.pid\"\nsleep 5\nexit 0\n",
         )
         .expect("write shim");
         use std::os::unix::fs::PermissionsExt;

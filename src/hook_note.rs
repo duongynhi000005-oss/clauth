@@ -1408,6 +1408,8 @@ fn chain_would_act(
         &usage,
         &third_party_names,
         crate::fallback::ActiveBurnRate::FromDisk,
+        false,
+        false,
     )
     .is_some()
 }

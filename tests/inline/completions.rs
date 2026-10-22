@@ -233,6 +233,8 @@ fn session_stem_completion_lists_registry_stems_only() {
             start_profile: "work".to_string(),
             harness: crate::harness::Harness::Claude,
             pid: 4242,
+            claude_pid: None,
+            launch_families: None,
             started_at: 0,
             cwd: None,
             isolated: false,

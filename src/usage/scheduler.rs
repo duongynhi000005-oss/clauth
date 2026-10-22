@@ -4502,6 +4502,29 @@ fn catch_up_staged_pairs(config: &crate::profile::ConfigHandle) {
     }
 }
 
+/// One latched spend-cap 429: the member the session was on when it was seen,
+/// the row's `started_at` when it landed (so a reused id never re-fires a dead
+/// session's latch), and the 429 fact itself — its timestamp (so a later
+/// successful turn in the same file can outrun it) and the transcript file it
+/// came from (so only a success in THAT file clears it — a subagent's success
+/// must not).
+struct SpendCapLatchEntry {
+    member: String,
+    started_at: u64,
+    fact: crate::tps::SpendCap429Fact,
+}
+
+/// A request sent on the outgoing member just before a swap hold answers after
+/// the hold; its 429 carries a timestamp at or after the row's swap stamp even
+/// though the outgoing account served it. The latch insert therefore requires
+/// the 429 to postdate the last swap by this much, and only after a swap — a
+/// fresh session's first 429 has no outgoing member, so it latches at once. A
+/// genuine 429 on the incoming member re-latches on the next turn, so the
+/// grace only delays it. A same-member convergence also re-stamps the swap
+/// stamp and re-opens the grace: a 429 inside it is dropped and the next one
+/// latches.
+const SPEND_CAP_IN_FLIGHT_GRACE_MS: u64 = 30_000;
+
 // The tps producer, one per thread. The scheduler tick runs on one
 // dedicated thread for the process lifetime (the TUI's and the daemon's
 // alike), and a test drives `tick` on its own test thread, so thread-local
@@ -4513,6 +4536,33 @@ thread_local! {
     /// (last write ms, last written bytes with `generated_at` blanked).
     static TPS_LAST_WRITE: std::cell::RefCell<(u64, Option<Vec<u8>>)> =
         const { std::cell::RefCell::new((0, None)) };
+    /// live session id -> a joined spend-cap 429 the session latched during its
+    /// life, keyed by the row's `session_id` (stable across `/clear`), never the
+    /// conversation id. The entry carries the row's `started_at` and is read
+    /// only while it equals the current row's, so a reused id never re-fires a
+    /// dead session's latch. Cleared by a scan with no live chain row and
+    /// pruned by the next non-empty scan once the session is gone or on another
+    /// member, so the 429 for the old stint never re-fires; dropped when a
+    /// drained successful turn in the same file outruns it. A 429 read with no
+    /// moveable target survives to the tick a target frees — the fact is never
+    /// dropped with its tick.
+    static SPEND_CAP_LATCH: std::cell::RefCell<HashMap<String, SpendCapLatchEntry>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// live session id -> the row's `started_at`, set when the session had a
+    /// joined spend-cap 429 during its life: the row itself proves the session
+    /// runs a credit-billed model. Read only while the stored `started_at`
+    /// equals the current row's, so a reused id never inherits a dead session's
+    /// mark. Kept across member changes until the session's row is gone, so an
+    /// unknown-demand session moved off a capped member by its own 429 is not
+    /// walked back onto it by a later scan's home pass; also cleared by a scan
+    /// with no live chain row (bounds growth — the `started_at` key already
+    /// makes reuse safe). A same-file recovery clears only the latch, never
+    /// this mark: a successful turn on another member proves nothing about the
+    /// model. Pruned only when the session has no live chain-following row: a
+    /// scan in which its member is briefly out of the chain still finds the
+    /// row live, so the mark survives it.
+    static SPEND_CAP_CREDIT_SEEN: std::cell::RefCell<HashMap<String, u64>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 /// The lease holder's tps leg: one tail pass, then publish the snapshot into
@@ -5921,6 +5971,8 @@ pub(crate) fn scan_auto_switch(
         &usage,
         &third_party_names,
         crate::fallback::ActiveBurnRate::FromDisk,
+        false,
+        false,
     ) {
         Some(crate::fallback::AutoSwitchDecision {
             action: crate::fallback::SwitchAction::To(name),
@@ -5967,6 +6019,66 @@ struct SessionDecision {
     row: crate::live_sessions::LiveSession,
 }
 
+/// The conversation id of the session whose `claude` child is recorded on the
+/// row: its Claude Code session record's `sessionId`, read from the row's
+/// `sessions` dir. `None` when the record is absent or names another pid, or
+/// on an older row with no recorded child pid (which also lacks the launch
+/// demand, so neither trigger moves it).
+///
+/// A `claude` wrapper that spawns the real binary without `exec` writes its
+/// record under the grandchild's pid, which this direct lookup does not reach;
+/// the sessions dir has no descendant index, so a walk would read every record
+/// each tick — the join stays direct.
+fn session_conversation_id(row: &crate::live_sessions::LiveSession) -> Option<String> {
+    let pid = row.claude_pid?;
+    let dir = session_sessions_dir(row)?;
+    crate::session_record::session_record(&dir, pid).map(|r| r.session_id)
+}
+
+/// The sessions dir a row's Claude Code record lives in: the runtime tree the
+/// bridge's [`crate::runtime::session_sessions_tree`] picks (a fake-link box
+/// holds the record off `~/.claude`), else `~/.claude/sessions`. The tree pick
+/// is shared with the bridge so the rule lives once.
+fn session_sessions_dir(row: &crate::live_sessions::LiveSession) -> Option<std::path::PathBuf> {
+    if let Some(tree) =
+        crate::runtime::session_sessions_tree(&row.start_profile, row.isolated, &row.session_id)
+    {
+        return Some(tree.join("sessions"));
+    }
+    crate::profile::claude_dir()
+        .ok()
+        .map(|d| d.join("sessions"))
+}
+
+/// Whether a conversation the row joined is ambiguous: some live process other
+/// than the row's own `claude_pid` holds a session record naming it. With a
+/// second live claimant the 429 cannot be attributed to this session, so it
+/// must neither latch nor mark. `live_claims` is built once per scan by
+/// [`scan_session_switches`], for the conversations this drain names only.
+fn conversation_ambiguous(
+    live_claims: &HashMap<String, HashSet<u32>>,
+    conv: &str,
+    own_claude_pid: Option<u32>,
+) -> bool {
+    live_claims
+        .get(conv)
+        .is_some_and(|pids| pids.iter().any(|&pid| Some(pid) != own_claude_pid))
+}
+
+/// Whether the session reads the current member's credential store: its
+/// `launch_store` names a file under that member's profile dir, or is absent
+/// on a legacy row that never recorded one. A 429 drained while the row still
+/// names the outgoing store is that member's, not the incoming one's, so it
+/// must not latch against the member the session just moved to. Matched by
+/// profile dir, never exact file, so a sidecar appearing or going between
+/// `session-token.json` and `credentials.json` does not suppress trigger b.
+fn reads_member_store(row: &crate::live_sessions::LiveSession, member: &ProfileName) -> bool {
+    match row.launch_store.as_deref() {
+        None => true,
+        Some(store) => crate::profile::profile_dir(member).is_ok_and(|dir| store.starts_with(&dir)),
+    }
+}
+
 /// Per-session fallback: decide which chain member each chain-following live
 /// session should be on, and write it into that session's registry row.
 ///
@@ -5989,6 +6101,21 @@ struct SessionDecision {
 /// `ProfileTtl` ranks outside `State`), and no pending-switch lock is held
 /// anywhere here: those rank OUTSIDE the flock (1500/1700 vs 500), so holding one
 /// across the write inverts the order.
+///
+/// **Backward wall-clock steps.** The latch and mark inserts compare the 429
+/// row's wall-clock `timestamp` against the row's `started_at` and swap stamp,
+/// so a backward step across a swap (a VM resume, a manual date set, an NTP
+/// step) makes a genuine 429 read older than the stamp: trigger b is suppressed
+/// until the wall clock passes the stamp again. It self-heals; trigger a reads
+/// live usage, never a transcript stamp, and is unaffected.
+///
+/// **Unobserved swap-backs.** A latch is pruned only by a scan this process
+/// runs, so a member round trip `X -> Y -> X` it never observes (a lease
+/// handoff while another process holds the scheduler, two swaps inside one
+/// tick) leaves the `X` stint's latch standing on the same id and `started_at`,
+/// and it fires once the row is back on `X`. One spurious move off `X`, onto a
+/// member the walk had already judged worse; the next scan this process runs
+/// prunes it.
 #[allow(clippy::too_many_arguments)]
 fn scan_session_switches(
     config: &crate::profile::ConfigHandle,
@@ -6010,10 +6137,129 @@ fn scan_session_switches(
         // sessions count.
         .filter(row_follows_chain_live)
         .collect();
+    // Every live chain-following row's id, taken before the config hold: the
+    // credit-seen mark's prune below keys on THIS — a row whose member is
+    // briefly out of the chain still counts as live, and dropping its mark
+    // would walk it back onto a capped member on the next scan.
+    let row_ids: HashSet<String> = rows.iter().map(|r| r.session_id.clone()).collect();
+    // The session's own spend-cap facts: conversation ids + 429 timestamps and
+    // files, plus the successful turns, the tps tailer saw since the last scan.
+    // Drained here, before the early return, so a fact for a conversation with
+    // no live chain row is consumed now rather than delivered to a session
+    // that appears later (a resume keeps the conversation id).
+    let drained: crate::tps::SpendCapDrain =
+        TPS_PRODUCER.with(|p| p.borrow_mut().drain_spend_cap());
     if rows.is_empty() {
+        // No live chain row means every latched 429 and credit-seen mark is
+        // stale: a session that ends while its 429 is latched must not hand it
+        // to a later session that reuses its `<pid>-<seq>` id.
+        SPEND_CAP_LATCH.with(|l| l.borrow_mut().clear());
+        SPEND_CAP_CREDIT_SEEN.with(|s| s.borrow_mut().clear());
         return;
     }
 
+    // The conversation id each live row joins, read once before the config hold
+    // (the mark insert below and the per-row loop both need it). Built only
+    // when this drain holds a fact to attribute; the common tick pays no
+    // record reads.
+    let mut conv_of: HashMap<String, String> = HashMap::new();
+    if !drained.pending.is_empty() || !drained.recoveries.is_empty() {
+        for row in &rows {
+            if let Some(conv) = session_conversation_id(row) {
+                conv_of.insert(row.session_id.clone(), conv);
+            }
+        }
+    }
+    // A conversation with a pending 429 in this drain is ambiguous when any
+    // live process other than the row's own `claude_pid` holds a session
+    // record naming it: the 429 row names no process, so it cannot be
+    // attributed. The scan runs only for a pending 429 — a recovery-only
+    // conversation needs no ambiguity verdict (a recovery only drops a latch).
+    // It reads every sessions dir a live row reads (chain or not, isolated or
+    // not) plus the global `~/.claude/sessions`, deduped by canonical path (a
+    // shared runtime's sessions dir is a symlink to the global one, and a
+    // `--bg` session writes its record there even under a runtime tree). A
+    // record counts only while its process is the one the record names — a dead pid
+    // or a recycled pid's stale record does not. Where no start compare or
+    // liveness probe exists the check is always false, so the scan finds
+    // nothing ambiguous: the accepted degraded case.
+    let mut live_claims: HashMap<String, HashSet<u32>> = HashMap::new();
+    if !drained.pending.is_empty() {
+        let mut dirs: HashSet<std::path::PathBuf> = HashSet::new();
+        for row in crate::live_sessions::list() {
+            let Some(dir) = session_sessions_dir(&row) else {
+                continue;
+            };
+            if let Ok(id) = crate::canonical::identity(&dir) {
+                dirs.insert(id);
+            }
+        }
+        if let Ok(dir) = crate::profile::claude_dir()
+            && let Ok(id) = crate::canonical::identity(dir.join("sessions"))
+        {
+            dirs.insert(id);
+        }
+        let drain_convs: HashSet<&str> = drained.pending.keys().map(String::as_str).collect();
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                    continue;
+                };
+                let Ok(pid) = stem.parse::<u32>() else {
+                    continue;
+                };
+                // A record name of 0 or above `i32::MAX` is not a process id
+                // `kill` can probe as one process (0 and negative pids address
+                // a process group): skip it.
+                if pid == 0 || pid > i32::MAX.unsigned_abs() {
+                    continue;
+                }
+                let Some(record) = crate::session_record::session_record(&dir, pid) else {
+                    continue;
+                };
+                if !drain_convs.contains(record.session_id.as_str()) {
+                    continue;
+                }
+                if !crate::session_record::process_matches_record(pid, &record) {
+                    continue;
+                }
+                live_claims
+                    .entry(record.session_id)
+                    .or_default()
+                    .insert(pid);
+            }
+        }
+    }
+    // The credit-seen mark inserts over `rows`, before the config hold, so a
+    // 429 drained in a scan where the row's member is briefly out of the chain
+    // still marks the session — the same reason `row_ids` is taken here. Gated
+    // on the session's own life and not ambiguous, and keyed by the row's
+    // `started_at` so a reused id never inherits it.
+    for row in &rows {
+        let Some(conv) = conv_of.get(&row.session_id) else {
+            continue;
+        };
+        if conversation_ambiguous(&live_claims, conv, row.claude_pid) {
+            continue;
+        }
+        let Some(pending) = drained.pending.get(conv) else {
+            continue;
+        };
+        if pending.ts > row.started_at {
+            SPEND_CAP_CREDIT_SEEN.with(|s| {
+                s.borrow_mut()
+                    .insert(row.session_id.clone(), row.started_at)
+            });
+        }
+    }
+
+    // The credit-billed family set is global, read once for the whole scan —
+    // never per row, and never under the config hold.
+    let billed = crate::claude_json::credit_billed_families();
     // Clone the live broken map first (rank 295 below config 400), then
     // intersect with the SAME config snapshot `snapshot_session_chain` folds
     // into each member's home judgment below.
@@ -6033,7 +6279,20 @@ fn scan_session_switches(
         HashSet<ProfileName>,
         HashSet<ProfileName>,
     ) = {
-        let Ok(cfg) = config.lock() else { return };
+        let Ok(cfg) = config.lock() else {
+            // Rows are non-empty here (the empty-rows arm above returned), so a
+            // dead session's latch and mark must still be pruned: the loop that
+            // builds `live_latch_members` never ran.
+            SPEND_CAP_LATCH.with(|l| {
+                l.borrow_mut()
+                    .retain(|session_id, _| row_ids.contains(session_id));
+            });
+            SPEND_CAP_CREDIT_SEEN.with(|s| {
+                s.borrow_mut()
+                    .retain(|session_id, _| row_ids.contains(session_id));
+            });
+            return;
+        };
         let key_rejected: HashSet<ProfileName> =
             current_key_rejected_names(&broken_snapshot, &cfg.profiles)
                 .into_iter()
@@ -6061,9 +6320,8 @@ fn scan_session_switches(
                         .clone()
                         .unwrap_or_else(|| row.start_profile.clone()),
                 );
-                let launch = crate::runtime::LaunchTransport::of(
-                    cfg.find(&ProfileName::from(row.start_profile.clone()))?,
-                );
+                let start = cfg.find(&ProfileName::from(row.start_profile.clone()))?;
+                let launch = crate::runtime::LaunchTransport::of(start);
                 let snapshot =
                     crate::fallback::snapshot_session_chain(&cfg, &member, &launch, &key_rejected)?;
                 Some(SessionDecision {
@@ -6078,6 +6336,9 @@ fn scan_session_switches(
 
     let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
     let mut writes: Vec<(String, String, usize)> = Vec::new();
+    // Live session id -> member, for every row this scan walks, so the prune
+    // below drops latch entries whose session ended or moved.
+    let mut live_latch_members: HashMap<String, String> = HashMap::new();
     for SessionDecision {
         mut snapshot,
         member,
@@ -6120,6 +6381,72 @@ fn scan_session_switches(
             .map(|m| m.name.clone())
             .collect();
         let member_broken = snapshot.broken.contains(&member);
+        // The session's own spend-cap 429 row (direct evidence), joined through
+        // the row's claude child pid -> its session record's `sessionId`, never
+        // by account. A freshly drained 429 is latched only while its row
+        // timestamp clears the in-flight grace past the session's last swap (no
+        // swap means no grace: a fresh session's first 429 latches at once): a
+        // request in flight across the hold answers after it, and its 429
+        // belongs to the outgoing member, so the grace lets it age out. A
+        // drained successful turn in the same transcript file newer than the
+        // latched 429 drops the latch — the session recovered — so a 429 read
+        // with no moveable target still lands the move once a target frees, but
+        // never outlives a recovery.
+        let reads_store = reads_member_store(&row, &member);
+        if let Some(conv) = conv_of.get(&row.session_id) {
+            let latch_after = row.last_swap_at.map_or(row.started_at, |t| {
+                t.saturating_add(SPEND_CAP_IN_FLIGHT_GRACE_MS)
+            });
+            // The latch lands only when the session reads the current member's
+            // store: a 429 drained while the row still names the outgoing store
+            // is that member's, not the incoming one's, so it must not latch
+            // against the member the session just moved to. The mark rides the
+            // same branch, so latch ⊆ mark holds structurally.
+            if !conversation_ambiguous(&live_claims, conv, row.claude_pid)
+                && reads_store
+                && let Some(pending) = drained.pending.get(conv)
+                && pending.ts > latch_after
+            {
+                SPEND_CAP_LATCH.with(|l| {
+                    l.borrow_mut().insert(
+                        row.session_id.clone(),
+                        SpendCapLatchEntry {
+                            member: member.as_str().to_owned(),
+                            started_at: row.started_at,
+                            fact: pending.clone(),
+                        },
+                    );
+                });
+                SPEND_CAP_CREDIT_SEEN.with(|s| {
+                    s.borrow_mut()
+                        .insert(row.session_id.clone(), row.started_at)
+                });
+            }
+            if let Some(recoveries) = drained.recoveries.get(conv) {
+                SPEND_CAP_LATCH.with(|l| {
+                    let mut latches = l.borrow_mut();
+                    if latches.get(&row.session_id).is_some_and(|latched| {
+                        recoveries
+                            .get(&latched.fact.file)
+                            .is_some_and(|&ts| ts > latched.fact.ts)
+                    }) {
+                        latches.remove(&row.session_id);
+                    }
+                });
+            }
+        }
+        live_latch_members.insert(row.session_id.clone(), member.as_str().to_owned());
+        // The latch fires only for the row's current stint: the entry stores the
+        // `started_at` it landed under and reads only while that equals the
+        // row's now (a reused id never re-fires a dead session's 429), on the
+        // same member it latched against.
+        let trigger_b = SPEND_CAP_LATCH.with(|l| {
+            l.borrow().get(&row.session_id).is_some_and(|latched| {
+                latched.member == member.as_str() && latched.started_at == row.started_at
+            })
+        });
+        let credit_seen = SPEND_CAP_CREDIT_SEEN
+            .with(|s| s.borrow().get(&row.session_id) == Some(&row.started_at));
         // The gate reads OAuth-first with the third-party fallback, the same rule
         // the candidate fill above applies through `decision_fresh_any` — so a
         // pure-third-party session's member is no longer invisible to it. A
@@ -6129,7 +6456,11 @@ fn scan_session_switches(
         // to; nothing changes for such a session. Relaxing that arm
         // (same-provider swapping is the obvious next ask) gives the reading a
         // real target to reach.
-        if !reading_is_actionable(
+        //
+        // Freshness: a credit-billed leave joins this rule (a stale cap reading
+        // may be last month's); the session's own 429 bypasses it (the 429 row
+        // is direct evidence).
+        let reading_actionable = reading_is_actionable(
             member_broken,
             status,
             third_party_status,
@@ -6137,9 +6468,33 @@ fn scan_session_switches(
             third_party_streaks,
             third_party_names.contains(&member),
             &member,
-        ) {
+        );
+        if !reading_actionable && !trigger_b {
             continue;
         }
+        // A credit-billed launch demand leaves a capped member at once —
+        // gate-independent like a known start demand, so it reads the raw cap
+        // verdict, never `check_credit_cap`. The freshness gate above is its
+        // hard requirement: a stale cap reading may be last month's.
+        let credit_billed_launch = row
+            .launch_families
+            .as_deref()
+            .is_some_and(|families| families.iter().any(|f| billed.contains(f)));
+        let trigger_a = credit_billed_launch
+            && usage
+                .get(member.as_str())
+                .is_some_and(crate::usage::UsageInfo::credit_capped);
+        let must_leave = trigger_a || trigger_b;
+        // The credit demand the walk's target passes read the raw cap against:
+        // a credit-billed launch stays credit-billed after the leave lands, so
+        // the home passes must keep skipping the capped member it just left
+        // (whatever that member's gate). `credit_seen` carries that past the
+        // member change — an unknown-demand session moved off a capped member by
+        // its own 429 must not be walked back onto it once the per-member latch
+        // is pruned — and it already covers the current stint: every latch
+        // insert also marks the session, so the latch adds no term here.
+        // `must_leave` above only opens the leave guard.
+        let credit_demand = credit_billed_launch || credit_seen;
         // `Off` means "sign every account out", which has no per-session form: a
         // session cannot be left credential-less mid-flight and there is no member
         // name to write. It, and a stay-put `None`, leave the row as it stands.
@@ -6149,6 +6504,8 @@ fn scan_session_switches(
                 &usage,
                 &third_party_names,
                 crate::fallback::ActiveBurnRate::FromDisk,
+                must_leave,
+                credit_demand,
             )
         else {
             continue;
@@ -6169,6 +6526,21 @@ fn scan_session_switches(
         }
         writes.push((row.session_id, target, cursor));
     }
+    // Prune the latch: an entry whose session ended (no live row) or whose
+    // member changed is stale — the 429 was for the old stint, and must not
+    // re-fire after a swap-back.
+    SPEND_CAP_LATCH.with(|l| {
+        l.borrow_mut().retain(|session_id, latched| {
+            live_latch_members.get(session_id) == Some(&latched.member)
+        });
+    });
+    // Prune the credit-seen mark only for a session that is gone: it survives a
+    // member change (the model it runs did not), so the home passes keep
+    // reading the raw cap against the member it just left.
+    SPEND_CAP_CREDIT_SEEN.with(|s| {
+        s.borrow_mut()
+            .retain(|session_id, _| row_ids.contains(session_id));
+    });
     if writes.is_empty() {
         return;
     }

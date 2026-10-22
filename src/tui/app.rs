@@ -6049,6 +6049,8 @@ impl App {
             &projected,
             &third_party_names,
             crate::fallback::ActiveBurnRate::Supplied(active_rate),
+            false,
+            false,
         );
         AutoSwitchProjection {
             action,

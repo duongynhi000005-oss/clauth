@@ -207,16 +207,7 @@ fn a_transient_unreadable_record_keeps_the_instance() {
     // The macOS branch compares nothing (`procStart` there is unmeasured).
     let me = std::process::id();
     #[cfg(target_os = "linux")]
-    let start = {
-        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-        stat.rsplit_once(')')
-            .unwrap()
-            .1
-            .split_whitespace()
-            .nth(19)
-            .unwrap()
-            .to_string()
-    };
+    let start = crate::testutil::proc_start_of(me).unwrap();
     #[cfg(target_os = "macos")]
     let start = "1".to_string();
     let (t, r) = table(&[(me, instance("s1", &start))]);
@@ -631,11 +622,15 @@ fn chunked_transfer_is_refused() {
 #[cfg(target_os = "linux")]
 #[test]
 fn proc_start_matches_reads_the_tests_own_start_time() {
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-    let rest = stat.rsplit_once(')').unwrap().1;
-    let mine = rest.split_whitespace().nth(19).unwrap();
-    assert!(proc_start_matches(std::process::id(), mine));
-    assert!(!proc_start_matches(std::process::id(), "not-a-start"));
+    let mine = crate::testutil::proc_start_of(std::process::id()).unwrap();
+    assert!(crate::session_record::proc_start_matches(
+        std::process::id(),
+        &mine
+    ));
+    assert!(!crate::session_record::proc_start_matches(
+        std::process::id(),
+        "not-a-start"
+    ));
 }
 
 /// MB-1: the hold flag reads the device store fresh per call — pairing a

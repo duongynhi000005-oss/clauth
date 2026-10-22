@@ -16,13 +16,14 @@ pub(crate) struct SessionRecord {
     #[serde(rename = "sessionId")]
     pub(crate) session_id: String,
     pub(crate) pid: u32,
-    /// The process start time the record carries, as the record spells it. Only
-    /// the bridge's linux resolver compares it (against `/proc/<pid>/stat` field
-    /// 22, measured equal); the macOS form is unmeasured, so nothing there
-    /// compares it. `default` is the upgrade gate: a record written before the
-    /// field existed reads empty and fails the linux compare rather than being
-    /// trusted. The bridge is unix-only, so Windows reads no field beyond
-    /// `session_id` and `pid`.
+    /// The process start time the record carries, as the record spells it. Both
+    /// callers that compare it — the bridge's linux resolver and the scheduler's
+    /// ambiguity scan, the latter through [`process_matches_record`] — read it
+    /// against `/proc/<pid>/stat` field 22 (measured equal); the macOS form is
+    /// unmeasured, so nothing there compares it. `default` is the upgrade gate:
+    /// a record written before the field existed reads empty and fails the
+    /// linux compare rather than being trusted. The bridge is unix-only, so
+    /// Windows reads no field beyond `session_id` and `pid`.
     ///
     /// Read leniently: every other caller parses this struct for `session_id`/
     /// `pid`, and a future Claude Code version writing `procStart` as a
@@ -129,4 +130,47 @@ pub(crate) fn session_record(dir: &Path, pid: u32) -> Option<SessionRecord> {
     let record = (0..2)
         .find_map(|_| serde_json::from_slice::<SessionRecord>(&std::fs::read(&path).ok()?).ok())?;
     (record.pid == pid && !record.session_id.is_empty()).then_some(record)
+}
+
+/// Whether `/proc/<pid>/stat` field 22 (the start time in clock ticks since
+/// boot) equals `proc_start` (measured 2.1.301). The one field-22 compare,
+/// shared by [`process_matches_record`] and the bridge's gone-or-moved check.
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_start_matches(pid: u32, proc_start: &str) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(rest) = stat.rsplit_once(')') else {
+        return false;
+    };
+    let Some(field) = rest.1.split_whitespace().nth(19) else {
+        return false;
+    };
+    field == proc_start
+}
+
+/// Whether the process holding `pid` is the one `record` names: on linux the
+/// record's `proc_start` equals `/proc/<pid>/stat` field 22 (a record with an
+/// empty start field fails the compare — it predates the field); on macOS only
+/// liveness is compared (the `procStart` form there is unmeasured); elsewhere
+/// false — the accepted degraded case, where a record's process can never be
+/// matched.
+pub(crate) fn process_matches_record(pid: u32, record: &SessionRecord) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // A Claude Code that stops writing `procStart` makes no conversation
+        // ambiguous on linux — the accepted cost of never counting an empty
+        // start, which a crashed session's recycled-pid record would exploit.
+        !record.proc_start.is_empty() && proc_start_matches(pid, &record.proc_start)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = record;
+        crate::runtime::namespaced_keychain_ledger::pid_alive(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (pid, record);
+        false
+    }
 }
