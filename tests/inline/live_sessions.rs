@@ -19,6 +19,8 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         follows_chain: false,
         intended_member: None,
         chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
         current_member: None,
         last_swap_at: None,
         launch_store: None,
@@ -74,6 +76,33 @@ fn a_row_predating_the_child_pid_key_reads_unjoined_and_omits_the_key() {
     assert!(
         !obj.contains_key("launch_families"),
         "a None launch demand must serialize absent, not as null"
+    );
+}
+
+/// A row predating the credit-leave keys reads both as false, and a false of
+/// either serializes ABSENT (not `false`), so an older clauth's row
+/// round-trips byte-identical — the serde pair's serialized-absence half.
+#[test]
+fn a_row_predating_the_credit_leave_keys_omits_them() {
+    let pre_upgrade = br#"{"session_id":"4242-0","start_profile":"work","pid":4242,
+        "started_at":1700000000000,"cwd":"/w/proj","isolated":false}"#;
+
+    let row: LiveSession = serde_json::from_slice(pre_upgrade).expect("parse a pre-upgrade row");
+    assert!(!row.credit_leave, "no key must read as not a credit leave");
+    assert!(
+        !row.credit_leave_aware,
+        "no key must read as not credit-leave-aware"
+    );
+
+    let written = serde_json::to_value(&row).expect("serialize");
+    let obj = written.as_object().expect("object");
+    assert!(
+        !obj.contains_key("credit_leave"),
+        "a false credit_leave must serialize absent, not as false"
+    );
+    assert!(
+        !obj.contains_key("credit_leave_aware"),
+        "a false credit_leave_aware must serialize absent, not as false"
     );
 }
 

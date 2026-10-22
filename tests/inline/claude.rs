@@ -4696,12 +4696,12 @@ fn the_sign_out_skips_its_destructive_read_degrade_only_over_a_locked_keychain()
 
 /// The model read the start walk's per-member demand draws from: the runtime
 /// overlay's top-level `model`, the `fallbackModel` array (non-string entries
-/// skipped), then the subagent env key, in that order. A profile with no
+/// skipped), then the subagent env key, each in its own slot. A profile with no
 /// `[models] default` (and no subagent) drops the base model knobs — the
 /// overlay removes them — so no model comes from that source: the demand
 /// follows the session, not the global live settings.
 #[test]
-fn runtime_models_reads_the_runtime_models_and_drops_a_missing_default() {
+fn runtime_model_sources_read_the_runtime_models_and_drop_a_missing_default() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("settings.json");
     fs::write(
@@ -4713,19 +4713,23 @@ fn runtime_models_reads_the_runtime_models_and_drops_a_missing_default() {
     let mut profile = crate::profile::Profile::new("p".to_string(), None, None);
     profile.models.default = Some("opus".to_string());
     profile.models.subagent = Some("claude-haiku-4-5".to_string());
-    assert_eq!(
-        runtime_models(Some(base.as_path()), &profile, &[]).0,
-        ["opus", "claude-sonnet-5", "haiku", "claude-haiku-4-5"]
-    );
+    let src = runtime_model_sources(Some(base.as_path()), &profile, &[]);
+    assert_eq!(src.model.as_deref(), Some("opus"));
+    assert_eq!(src.fallbacks, ["claude-sonnet-5", "haiku"]);
+    assert_eq!(src.env_subagent.as_deref(), Some("claude-haiku-4-5"));
+    assert_eq!(src.env_anthropic, None);
 
     let no_default = crate::profile::Profile::new("p".to_string(), None, None);
+    let src = runtime_model_sources(Some(base.as_path()), &no_default, &[]);
     assert_eq!(
-        runtime_models(Some(base.as_path()), &no_default, &[]).0,
-        ["claude-sonnet-5", "haiku"],
-        "no [models] default (or subagent) drops the base model knobs the session drops"
+        src.model, None,
+        "no [models] default drops the base model knob"
     );
+    assert_eq!(src.fallbacks, ["claude-sonnet-5", "haiku"]);
+    assert_eq!(src.env_subagent, None);
 
-    assert!(runtime_models(None, &no_default, &[]).0.is_empty());
+    let empty = runtime_model_sources(None, &no_default, &[]);
+    assert!(empty.model.is_none() && empty.fallbacks.is_empty());
 }
 
 // ── preserve_non_login_keys: every non-login key stays with its account ─────

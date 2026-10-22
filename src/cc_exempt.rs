@@ -407,7 +407,9 @@ fn resolve_projects(config_dir: &Path) -> Option<PathBuf> {
 /// Split `passthrough` into the last user `--settings` value (folded in) and
 /// the args with every `--settings` before the first `--` removed. A bare
 /// `--settings` with no value before `--` or the end is `Err`.
-fn fold_settings_args(passthrough: &[String]) -> Result<(Option<String>, Vec<String>), ()> {
+pub(crate) fn fold_settings_args(
+    passthrough: &[String],
+) -> Result<(Option<String>, Vec<String>), ()> {
     let end = passthrough
         .iter()
         .position(|arg| arg == "--")
@@ -450,7 +452,7 @@ pub(crate) fn is_inline_settings(value: &str) -> bool {
 /// The user's `--settings` value as a JSON object, inline JSON or a settings
 /// file path resolved against `cwd` ([`is_inline_settings`] picks). The `Err`
 /// is the full, already-rendered warning.
-fn parse_settings_value(
+pub(crate) fn parse_settings_value(
     value: &str,
     cwd: &Path,
     inline: bool,

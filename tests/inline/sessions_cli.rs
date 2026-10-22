@@ -1168,6 +1168,8 @@ fn registry_row(sid: &str, profile: &str, harness: crate::harness::Harness) {
         follows_chain: false,
         intended_member: None,
         chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
         current_member: None,
         last_swap_at: None,
         launch_store: None,
@@ -1346,6 +1348,33 @@ fn switch_points_the_row_at_the_named_profile_through_the_registry_seam() {
     );
 }
 
+/// A manual move is never a credit-cap leave: it clears a stale daemon reason,
+/// so the executor keeps the models-equal rule whatever the last daemon write
+/// recorded.
+#[test]
+fn switch_clears_a_stale_credit_leave_reason() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work", "spare"], &[]);
+    let _marker = live_claude_row("4242-0", "work");
+    crate::live_sessions::update_as_daemon("4242-0", |d| d.set_credit_leave(true))
+        .expect("seed the daemon's credit-leave reason");
+    assert!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .credit_leave,
+        "fixture control: the row carries the reason"
+    );
+
+    run_switch("4242-0", "spare").expect("the switch records the intent");
+
+    let row = crate::live_sessions::get("4242-0").expect("row");
+    assert_eq!(row.intended_member.as_deref(), Some("spare"));
+    assert!(
+        !row.credit_leave,
+        "a manual switch is never a credit leave, so the models-equal rule stands"
+    );
+}
+
 #[test]
 fn switch_receipt_names_when_the_move_lands() {
     assert_eq!(
@@ -1405,7 +1434,11 @@ fn switch_leaves_the_go_no_go_with_the_sessions_executor() {
         "nothing executed: this process never swaps"
     );
     assert_eq!(
-        crate::runtime::swap_eligible(&keyed, &crate::runtime::LaunchTransport::of(&launch)),
+        crate::runtime::swap_eligible(
+            &keyed,
+            &crate::runtime::LaunchTransport::of(&launch),
+            crate::runtime::ModelsRule::Equal,
+        ),
         Err(crate::runtime::SwapRefused::NotOauth),
         "the executor's own grounds still refuse this member, so the intent \
          stays an intent"

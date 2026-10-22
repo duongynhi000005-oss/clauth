@@ -1683,6 +1683,8 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
         follows_chain: true,
         intended_member: None,
         chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
         current_member: None,
         last_swap_at: None,
         launch_store: None,

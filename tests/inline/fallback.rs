@@ -1191,6 +1191,7 @@ fn walk_order_soonest_recovery_orders_both_passes_unless_preferred_wins() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let recovered_usage = |seven_reset: String| {
         usage_both(
@@ -1241,6 +1242,7 @@ fn walk_order_snapshot_walk_matches_the_config_walk_in_both_directions() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "gamma".into(),
@@ -1257,6 +1259,7 @@ fn walk_order_snapshot_walk_matches_the_config_walk_in_both_directions() {
         kick_rejected: vec![],
         reading_dead: vec![],
         fresh: vec![],
+        models_differ: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1301,6 +1304,7 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let snap = |order: WalkOrder, burn_aware: bool| ChainSnapshot {
         active: "gamma".into(),
@@ -1322,6 +1326,7 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         kick_rejected: vec![],
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
+        models_differ: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1488,6 +1493,7 @@ fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "gamma".into(),
@@ -1504,6 +1510,7 @@ fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put
         kick_rejected: vec![],
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
+        models_differ: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1543,6 +1550,7 @@ fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "gamma".into(),
@@ -1566,6 +1574,7 @@ fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
         kick_rejected: vec![],
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
+        models_differ: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1604,6 +1613,7 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let snap = |order: WalkOrder, fresh: Vec<ProfileName>| ChainSnapshot {
         active: "gamma".into(),
@@ -1620,6 +1630,7 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
         kick_rejected: vec![],
         reading_dead: vec![],
         fresh,
+        models_differ: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1684,6 +1695,7 @@ fn walk_order_soonest_recomputed_home_parks_once_landed_on_the_soonest_member() 
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "beta".into(),
@@ -1700,6 +1712,7 @@ fn walk_order_soonest_recomputed_home_parks_once_landed_on_the_soonest_member() 
         kick_rejected: vec![],
         reading_dead: vec![],
         fresh: vec!["beta".into(), "alpha".into()],
+        models_differ: Vec::new(),
     };
     let clear = |seven_reset: String| {
         usage_both(
@@ -1758,14 +1771,14 @@ fn start_walk_soonest_reset_picks_by_weekly_reset_with_the_freshness_pass_intact
         vec![start_walk_profile("beta"), start_walk_profile("alpha")],
         "beta",
     );
-    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         pick,
         Some(0),
         "default: chain order takes beta, the first clear"
     );
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, Some(1), "soonest-reset: alpha (+2h) beats beta (+3d)");
     assert_eq!(rows[0].block, None);
     assert_eq!(rows[1].block, None);
@@ -1780,7 +1793,7 @@ fn start_walk_soonest_reset_picks_by_weekly_reset_with_the_freshness_pass_intact
             ..Default::default()
         },
     );
-    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         pick,
         Some(0),
@@ -1829,6 +1842,7 @@ fn headroom_member(name: &str, preferred: bool) -> ChainMember {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     }
 }
 
@@ -1848,6 +1862,7 @@ fn headroom_snapshot(order: WalkOrder, chain: &[&str], fresh: &[&str]) -> ChainS
         kick_rejected: vec![],
         reading_dead: vec![],
         fresh: fresh.iter().map(|n| ProfileName::from(*n)).collect(),
+        models_differ: Vec::new(),
     }
 }
 
@@ -2156,14 +2171,14 @@ fn start_walk_most_headroom_picks_the_least_used_week_with_the_freshness_pass_in
         vec![start_walk_profile("beta"), start_walk_profile("alpha")],
         "beta",
     );
-    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         pick,
         Some(0),
         "default: chain order takes beta, the first clear"
     );
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         pick,
         Some(1),
@@ -2181,7 +2196,7 @@ fn start_walk_most_headroom_picks_the_least_used_week_with_the_freshness_pass_in
             ..Default::default()
         },
     );
-    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         pick,
         Some(0),
@@ -2207,6 +2222,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             scoped_line: 98.0,
             check_scoped: true,
             check_credit_cap: true,
+            own_inference: false,
         },
         ChainMember {
             name: "b".into(),
@@ -2218,6 +2234,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             scoped_line: 98.0,
             check_scoped: true,
             check_credit_cap: true,
+            own_inference: false,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
@@ -2251,6 +2268,7 @@ fn find_recovered_skips_exhausted_members() {
             scoped_line: 98.0,
             check_scoped: true,
             check_credit_cap: true,
+            own_inference: false,
         },
         ChainMember {
             name: "b".into(),
@@ -2262,6 +2280,7 @@ fn find_recovered_skips_exhausted_members() {
             scoped_line: 98.0,
             check_scoped: true,
             check_credit_cap: true,
+            own_inference: false,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
@@ -2284,6 +2303,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             scoped_line: 98.0,
             check_scoped: true,
             check_credit_cap: true,
+            own_inference: false,
         },
         ChainMember {
             name: "b".into(),
@@ -2295,6 +2315,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             scoped_line: 98.0,
             check_scoped: true,
             check_credit_cap: true,
+            own_inference: false,
         },
     ];
     let store = store_with_utils(&[]); // no usage data for any member
@@ -2317,6 +2338,7 @@ fn find_recovered_uses_threshold_per_member() {
             scoped_line: 98.0,
             check_scoped: true,
             check_credit_cap: true,
+            own_inference: false,
         }, // 95% util ≥ 90 → exhausted
         ChainMember {
             name: "b".into(),
@@ -2328,6 +2350,7 @@ fn find_recovered_uses_threshold_per_member() {
             scoped_line: 98.0,
             check_scoped: true,
             check_credit_cap: true,
+            own_inference: false,
         }, // 94% util < 95 → recovered
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
@@ -2352,6 +2375,7 @@ fn find_recovered_recovers_when_window_expired() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     }];
     let store = store_with_infos(vec![(
         "a",
@@ -2377,6 +2401,7 @@ fn find_recovered_recovers_when_windowless() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
@@ -2399,6 +2424,7 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(
@@ -4430,6 +4456,7 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let snap = ChainSnapshot {
         active: "a".into(),
@@ -4446,6 +4473,7 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
         kick_rejected: vec![],
         reading_dead: vec![],
         fresh: vec![],
+        models_differ: Vec::new(),
     };
     let usage = HashMap::from([
         (
@@ -4520,6 +4548,7 @@ fn a_third_party_active_never_projects_its_burn() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let snap = ChainSnapshot {
         active: "a".into(),
@@ -4536,6 +4565,7 @@ fn a_third_party_active_never_projects_its_burn() {
         kick_rejected: vec![],
         reading_dead: vec![],
         fresh: vec![],
+        models_differ: Vec::new(),
     };
     let usage = HashMap::from([
         (
@@ -4703,6 +4733,7 @@ fn weekly_dead_member_never_recovers() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     }];
     let dead = store_with_infos(vec![(
         "b",
@@ -5978,6 +6009,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 scoped_line: 98.0,
                 check_scoped: true,
                 check_credit_cap: true,
+                own_inference: false,
             },
             ChainMember {
                 name: "b".into(),
@@ -5989,6 +6021,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 scoped_line: 98.0,
                 check_scoped: true,
                 check_credit_cap: true,
+                own_inference: false,
             },
             ChainMember {
                 name: "c".into(),
@@ -6000,6 +6033,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 scoped_line: 98.0,
                 check_scoped: true,
                 check_credit_cap: true,
+                own_inference: false,
             },
         ],
         switch_off_when_spent: true,
@@ -6014,6 +6048,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
         kick_rejected: vec![],
         reading_dead: vec![],
         fresh: vec![],
+        models_differ: Vec::new(),
     }
 }
 
@@ -6071,6 +6106,7 @@ fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
 
     // Per-predicate-lock simulation (the pre-snapshot shape): each call
@@ -6766,6 +6802,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             scoped_line: 98.0,
             check_scoped: true,
             check_credit_cap: true,
+            own_inference: false,
         },
         ChainMember {
             name: "c".into(),
@@ -6777,6 +6814,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             scoped_line: 98.0,
             check_scoped: true,
             check_credit_cap: true,
+            own_inference: false,
         },
     ];
     let store = store_with_infos(vec![
@@ -6814,6 +6852,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     }];
     assert_eq!(
         find_recovered_member_for_test(&chain_b, &store, &[], WalkOrder::Chain),
@@ -6840,6 +6879,7 @@ fn find_recovered_prefers_the_preferred_member_over_a_scoped_clear_one() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let chain = vec![
         mkmember("a", false),
@@ -6896,6 +6936,7 @@ fn recovery_respects_each_members_gates() {
         scoped_line: 98.0,
         check_scoped,
         check_credit_cap: true,
+        own_inference: false,
     };
     let chain = vec![member("b", true, false), member("c", false, true)];
     let store = store_with_infos(vec![
@@ -7503,7 +7544,7 @@ fn start_walk_takes_chain_order_over_headroom() {
     start_walk_write_usage("b", &start_walk_usage(240, 5.0, 10.0));
     let (config, _readings) =
         config_with_chain(vec![start_walk_profile("a"), start_walk_profile("b")], "a");
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, Some(0), "chain order, not headroom, is the pick");
     assert_eq!(rows[0].block, None);
     assert_eq!(rows[1].block, None);
@@ -7521,7 +7562,7 @@ fn start_walk_skips_a_member_capped_on_a_demanded_family() {
     let mut capped = start_walk_profile("capped");
     capped.profile.models.default = Some("opus".to_owned());
     let (config, _readings) = config_with_chain(vec![capped], "capped");
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, None);
     assert_eq!(
         rows[0].block,
@@ -7544,9 +7585,312 @@ fn start_walk_keeps_a_member_capped_on_another_family() {
     let mut capped = start_walk_profile("capped");
     capped.profile.models.default = Some("sonnet".to_owned());
     let (config, _readings) = config_with_chain(vec![capped], "capped");
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, Some(0));
     assert_eq!(rows[0].block, None);
+}
+
+/// A project `<cwd>/.claude/settings.json` `model` is the headline the spawn
+/// runs, so it demands a family the capped member's spent cap refuses. The same
+/// file at the real `$HOME` is the user-tier base the runtime overlay drops
+/// (the member has no `[models] default`) and the project tier never reads it
+/// there (`--setting-sources user`), so with the gate off it blocks nothing.
+#[test]
+fn start_walk_reads_a_project_settings_model_and_skips_a_capped_member() {
+    let sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let mut capped = start_walk_profile("capped");
+    capped.profile.check_credit_cap = false;
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+
+    let cwd = sb.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick, None,
+        "the project model is fable, which the cap refuses"
+    );
+    assert_eq!(rows[0].block, Some(StartBlock::CreditCap));
+
+    // The same file at the real `$HOME` is not a project source.
+    std::fs::create_dir_all(sb.home().join(".claude")).unwrap();
+    std::fs::write(
+        sb.home().join(".claude").join("settings.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        Some(sb.home()),
+    );
+    assert_eq!(pick, Some(0), "the home settings are not project settings");
+    assert_eq!(rows[0].block, None);
+}
+
+/// An unplaceable named model is an unknown demand, judged credit-billed only
+/// while the gate is on: with the gate off, `start --auto` admits the same
+/// member the delegate pre-flight admits.
+#[test]
+fn start_takes_an_unplaceable_model_with_the_gate_off() {
+    let _sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let mut capped = start_walk_profile("capped");
+    capped.profile.check_credit_cap = false;
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+    let args = vec!["--model".to_owned(), "glm-4.6".to_owned()];
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &args, [None, None], false, None);
+    assert_eq!(pick, Some(0), "the gate-off unknown demand is admitted");
+    assert_eq!(rows[0].block, None);
+}
+
+/// A `--setting-sources` passthrough naming neither `project` nor `local`
+/// makes Claude Code skip the project tiers, so a project `model: fable` is
+/// ignored: the gate-off capped member is picked.
+#[test]
+fn start_ignores_a_project_model_under_a_setting_sources_user_flag() {
+    let sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let mut capped = start_walk_profile("capped");
+    capped.profile.check_credit_cap = false;
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+    let cwd = sb.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+
+    let args = vec!["--setting-sources".to_owned(), "user".to_owned()];
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &args,
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick,
+        Some(0),
+        "the project tier is skipped, so the gate-off member is clear"
+    );
+    assert_eq!(rows[0].block, None);
+}
+
+/// A `--setting-sources` list names each project tier alone: `project` reads
+/// `.claude/settings.json` (opus, headroom) and skips `settings.local.json`
+/// (fable), `local` reads the local file alone and skips the project one.
+#[test]
+fn start_setting_sources_reads_only_the_named_project_tier() {
+    let sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let mut capped = start_walk_profile("capped");
+    capped.profile.check_credit_cap = false;
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+    let cwd = sb.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"opus"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.local.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+
+    let project_args = vec!["--setting-sources".to_owned(), "user,project".to_owned()];
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &project_args,
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick,
+        Some(0),
+        "`user,project` reads only settings.json, whose opus has headroom"
+    );
+    assert_eq!(rows[0].block, None);
+
+    let local_args = vec!["--setting-sources".to_owned(), "user,local".to_owned()];
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &local_args,
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick, None,
+        "`user,local` reads only settings.local.json, whose fable is refused"
+    );
+    assert_eq!(rows[0].block, Some(StartBlock::CreditCap));
+}
+
+/// The LAST `--setting-sources` flag governs, whatever an earlier one named.
+#[test]
+fn start_the_last_setting_sources_flag_governs() {
+    let sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let mut capped = start_walk_profile("capped");
+    capped.profile.check_credit_cap = false;
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+    let cwd = sb.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"opus"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.local.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "--setting-sources".to_owned(),
+        "user,local".to_owned(),
+        "--setting-sources".to_owned(),
+        "user,project".to_owned(),
+    ];
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &args,
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick,
+        Some(0),
+        "the last flag names project, so opus governs and the member is picked"
+    );
+    assert_eq!(rows[0].block, None);
+}
+
+/// A test build's only home is the sandbox: a project dir NOT under it is
+/// never read (the test process cwd is the real checkout root on a dev box,
+/// whose `.claude/settings*.json` must not steer the demand). The same file
+/// under the sandbox home IS the project tier.
+#[test]
+fn start_walk_ignores_a_project_dir_outside_the_sandbox_home() {
+    let sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let mut capped = start_walk_profile("capped");
+    capped.profile.check_credit_cap = false;
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(outside.path().join(".claude")).unwrap();
+    std::fs::write(
+        outside.path().join(".claude").join("settings.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        Some(outside.path()),
+    );
+    assert_eq!(
+        pick,
+        Some(0),
+        "a project dir outside the sandbox home is never read in a test build"
+    );
+    assert_eq!(rows[0].block, None);
+
+    let cwd = sb.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(pick, None, "the sandbox project model is fable, refused");
+    assert_eq!(rows[0].block, Some(StartBlock::CreditCap));
+}
+#[test]
+fn start_walk_reads_a_project_local_settings_model_over_the_project_one() {
+    let sb = start_walk_sandbox(&["capped"]);
+    start_walk_write_usage("capped", &usage_credit_capped());
+    let capped = start_walk_profile("capped");
+    let (config, _readings) = config_with_chain(vec![capped], "capped");
+
+    let cwd = sb.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"opus"}"#,
+    )
+    .unwrap();
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick,
+        Some(0),
+        "the project model is opus, which has headroom"
+    );
+    assert_eq!(rows[0].block, None);
+
+    std::fs::write(
+        cwd.join(".claude").join("settings.local.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        Some(&cwd),
+    );
+    assert_eq!(
+        pick, None,
+        "the local model is fable, which the cap refuses"
+    );
+    assert_eq!(rows[0].block, Some(StartBlock::CreditCap));
 }
 
 #[test]
@@ -7562,7 +7906,14 @@ fn start_walk_with_no_demand_keeps_the_blanket_check_scoped_gate() {
     let mut gated = start_walk_profile("capped");
     gated.profile.check_scoped = true;
     let (gated_config, _readings) = config_with_chain(vec![gated], "capped");
-    let (rows, pick) = start_walk(&gated_config, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(
+        &gated_config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, None, "no demand keeps the blanket check_scoped gate");
     assert!(matches!(
         rows[0].block,
@@ -7572,7 +7923,14 @@ fn start_walk_with_no_demand_keeps_the_blanket_check_scoped_gate() {
     let mut ungated = start_walk_profile("capped");
     ungated.profile.check_scoped = false;
     let (ungated_config, _readings) = config_with_chain(vec![ungated], "capped");
-    let (rows, pick) = start_walk(&ungated_config, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(
+        &ungated_config,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, Some(0));
     assert_eq!(rows[0].block, None);
 }
@@ -7590,7 +7948,7 @@ fn start_walk_a_known_demand_overrides_check_scoped_off() {
     profile.profile.check_scoped = false;
     profile.profile.models.default = Some("opus".to_owned());
     let (config, _readings) = config_with_chain(vec![profile], "capped");
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, None, "a known demand supersedes the blanket gate");
     assert!(matches!(
         rows[0].block,
@@ -7644,7 +8002,7 @@ fn start_walk_skips_what_the_switch_walk_skips() {
     );
     config.state.auth_broken.push("authbroken".into());
 
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, None);
     assert_eq!(rows[0].block, Some(StartBlock::Disabled));
     assert_eq!(rows[1].block, Some(StartBlock::AuthBroken));
@@ -7671,11 +8029,11 @@ fn start_walk_refuses_a_non_oauth_member_only_under_with_fallback() {
     third_party.profile.base_url = Some("https://api.example.com".to_owned());
     let (config, _readings) = config_with_chain(vec![third_party], "thirdparty");
 
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], true);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], true, None);
     assert_eq!(pick, None, "--with-fallback refuses a non-OAuth member");
     assert_eq!(rows[0].block, Some(StartBlock::NotOauth));
 
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, Some(0));
     assert_eq!(rows[0].block, None);
 }
@@ -7689,7 +8047,7 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
 
     let (two, _readings) =
         config_with_chain(vec![start_walk_profile("a"), start_walk_profile("b")], "a");
-    let (rows, pick) = start_walk(&two, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(&two, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         pick,
         Some(1),
@@ -7698,7 +8056,7 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
     assert!(rows[0].stale && !rows[1].stale);
 
     let (one, _readings) = config_with_chain(vec![start_walk_profile("c")], "c");
-    let (rows, pick) = start_walk(&one, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(&one, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, Some(0), "the only clear member still launches stale");
     assert!(rows[0].stale);
 
@@ -7712,6 +8070,7 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
         &[],
         [None, None],
         false,
+        None,
     );
     assert_eq!(
         pick,
@@ -7721,7 +8080,14 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
     assert!(rows[0].stale && !rows[0].fresh && !rows[1].fresh);
 
     let (only_unread, _readings) = config_with_chain(vec![start_walk_profile("d")], "d");
-    let (rows, pick) = start_walk(&only_unread, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(
+        &only_unread,
+        Isolation::Shared,
+        &[],
+        [None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, Some(0), "the only member still launches unread");
     assert!(!rows[0].fresh);
 }
@@ -7737,7 +8103,7 @@ fn start_walk_with_nothing_startable_returns_no_pick_and_every_verdict() {
         vec![a, start_walk_profile("b"), start_walk_profile("c")],
         "a",
     );
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false);
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(pick, None);
     assert_eq!(rows.len(), 3);
     assert!(
@@ -7775,7 +8141,7 @@ fn start_pick_returns_the_picked_member_and_its_demand() {
 
     let (config, _readings) = config_with_chain(vec![a, b], "a");
     let (name, rows, pick, demand) =
-        start_pick(&config, Isolation::Shared, &[], [None, None], false)
+        start_pick(&config, Isolation::Shared, &[], [None, None], false, None)
             .expect("`b` is clear and is the walk's pick");
 
     assert_eq!(name, ProfileName::from("b"));
@@ -8277,6 +8643,7 @@ fn start_block_treats_a_key_rejected_third_party_member_as_auth_broken() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let config = AppConfig {
         state: AppState::default(),
@@ -8384,6 +8751,7 @@ fn start_block_leaves_a_console_lapsed_alibaba_member_pickable() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let config = AppConfig {
         state: AppState::default(),
@@ -8516,6 +8884,7 @@ fn an_alibaba_member_without_a_console_is_not_key_rejected() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let profile = config.find(&ProfileName::from("ali")).unwrap();
     assert_eq!(
@@ -8827,6 +9196,7 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let snap = ChainSnapshot {
         active: "gamma".into(),
@@ -8843,6 +9213,7 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
         kick_rejected: vec![],
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
+        models_differ: Vec::new(),
     };
     // The OAuth leg's burn history: 32 → 92 over 6 minutes = 600 %/h.
     let now = crate::usage::now_ms();
@@ -8946,6 +9317,123 @@ fn auto_switch_skips_a_credit_capped_member_while_its_gate_is_on() {
     );
 }
 
+/// An account serving inference from its own endpoint + token never spends
+/// its OAuth usage credits, so its spent cap keeps it out of no pass, gate on.
+#[test]
+fn auto_switch_takes_a_credit_capped_member_on_its_own_endpoint() {
+    let (mut config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let b = &mut config.profiles[1];
+    assert!(b.check_credit_cap, "fixture control: the gate is on");
+    b.env.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "http://127.0.0.1:9".to_owned(),
+    );
+    b.env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_owned(), "test-token".to_owned());
+    assert!(
+        crate::claude::has_own_inference_endpoint(b),
+        "fixture control: b serves from its own endpoint"
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_credit_capped()),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+/// A credit-demand leave reads a target's cap off the RAW verdict (its gate
+/// ignored), but an own-endpoint member never spends OAuth credits: it is clear
+/// even while its cached cap reads spent, so the leave lands on it.
+#[test]
+fn a_credit_demand_leave_lands_on_an_own_endpoint_capped_member() {
+    let member = |name: &str, own_inference: bool| ChainMember {
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        preferred: false,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+        check_credit_cap: true,
+        own_inference,
+    };
+    let snap = ChainSnapshot {
+        active: "a".into(),
+        chain: vec![member("a", false), member("b", true)],
+        switch_off_when_spent: false,
+        broken: vec![],
+        burn_aware: false,
+        walk_order: WalkOrder::Chain,
+        interval_ms: 60_000,
+        burn_floor_pct: 98.0,
+        burn_horizon_cap_ms: 60_000,
+        spend_budget: false,
+        switch_off_when_budget_spent: false,
+        kick_rejected: vec![],
+        reading_dead: vec![],
+        fresh: vec![],
+        models_differ: Vec::new(),
+    };
+    let usage = HashMap::from([
+        ("a".to_string(), usage_credit_capped()),
+        ("b".to_string(), usage_credit_capped()),
+    ]);
+    assert_eq!(
+        next_auto_switch_target_with_usage(
+            &snap,
+            &usage,
+            &HashSet::new(),
+            ActiveBurnRate::FromDisk,
+            true,
+            true,
+        ),
+        Some(SwitchAction::To("b".to_string())),
+        "a capped own-endpoint member is a valid credit-leave target"
+    );
+}
+
+/// Recovery (switch-off-all) reads a target's cap off the raw verdict in its
+/// scoped-clear pass: an own-endpoint member's spent OAuth cap does not block
+/// it, so it wins that pass over a plain capped member the pass skips. The
+/// aggregate fallback picks the FIRST member, so the two-pick fixture is what
+/// pins the own-endpoint exemption rather than the fallback.
+#[test]
+fn a_capped_own_endpoint_member_recovers() {
+    let member = |name: &str, own_inference: bool| ChainMember {
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        preferred: false,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+        check_credit_cap: true,
+        own_inference,
+    };
+    let chain = vec![member("a", false), member("b", true)];
+    let store = store_with_infos(vec![
+        ("a", usage_credit_capped()),
+        ("b", usage_credit_capped()),
+    ]);
+    assert_eq!(
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::Chain),
+        Some("b".to_string()),
+        "the own-endpoint member recovers in the scoped-clear pass; the plain capped one does not"
+    );
+}
+
 #[test]
 fn auto_switch_takes_a_credit_capped_member_once_its_gate_is_off() {
     let (mut config, _readings) = config_with_chain(
@@ -9023,6 +9511,7 @@ fn find_recovered_prefers_a_member_whose_credit_cap_is_not_spent() {
         scoped_line: 98.0,
         check_scoped: true,
         check_credit_cap: true,
+        own_inference: false,
     };
     let chain = vec![member("b"), member("c")];
     let store = store_with_infos(vec![

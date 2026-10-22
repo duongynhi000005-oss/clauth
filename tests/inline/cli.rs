@@ -4819,6 +4819,76 @@ fn cmd_start_auto_takes_a_credit_capped_member_with_no_known_model_while_its_gat
         .expect("the gate off keeps a capped member in rotation for an unknown model");
 }
 
+fn cmd_start_auto_with(args: &[&str]) -> anyhow::Result<()> {
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    cmd_start(
+        &crate::cli::StartTarget::Auto,
+        &args,
+        Isolation::Shared,
+        false,
+        true,
+    )
+}
+
+/// A `--model` passthrough replaces the member's `[models] default` as the
+/// headline: Claude Code runs the flag over the settings `model`, so a fable
+/// default never runs (cloudy, 2026-10-22).
+#[test]
+fn cmd_start_auto_takes_a_credit_capped_fable_default_member_when_the_launch_names_opus() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, true);
+
+    cmd_start_auto_with(&["--model", "opus"])
+        .expect("the launch runs opus, which bills the subscription");
+}
+
+/// A `[models]` alias remap is what the alias runs: `opus` remapped onto a
+/// fable id demands fable.
+#[test]
+fn cmd_start_auto_follows_a_models_alias_remap() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(None, true, true);
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&name).unwrap();
+    profile.models.opus = Some("claude-fable-5".to_owned());
+    crate::profile::save_profile(&profile).unwrap();
+
+    let err =
+        cmd_start_auto_with(&["--model", "opus"]).expect_err("opus is remapped onto a fable id");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// An account serving inference from its own endpoint + token never spends
+/// its OAuth usage credits, so its spent cap blocks no launch.
+#[test]
+fn cmd_start_auto_takes_a_credit_capped_member_on_its_own_endpoint() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, true);
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&name).unwrap();
+    profile.env.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "http://127.0.0.1:9".to_owned(),
+    );
+    profile
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_owned(), "test-token".to_owned());
+    crate::profile::save_profile(&profile).unwrap();
+    let profile = crate::profile::load_profile(&name).unwrap();
+    assert!(
+        crate::claude::has_own_inference_endpoint(&profile),
+        "fixture control: the account serves from its own endpoint"
+    );
+
+    cmd_start_auto(Isolation::Shared).expect("its own endpoint serves fable");
+}
+
 #[test]
 fn cmd_start_auto_never_judges_a_member_by_a_global_model_its_session_drops() {
     let sb = crate::testutil::HomeSandbox::new();
@@ -4920,8 +4990,8 @@ fn cmd_start_auto_refusal_names_no_family_when_the_members_demands_differ() {
 fn cmd_start_auto_judges_a_member_by_the_model_its_passthrough_names() {
     let sb = crate::testutil::HomeSandbox::new();
     let _env = no_model_env(&sb);
-    // The member runs opus by default; `--model fable` adds fable to what the
-    // session may run, and its fable week is spent.
+    // The member runs opus by default; `--model fable` replaces that default as
+    // the headline, and its fable week is spent.
     seed_start_members(
         serde_json::json!({}),
         &[StartMember {
@@ -4942,7 +5012,7 @@ fn cmd_start_auto_judges_a_member_by_the_model_its_passthrough_names() {
     .expect_err("the passthrough model's week is spent");
     assert_eq!(
         err.to_string(),
-        "--auto found no chain member with headroom for opus + fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
     );
 }
 
@@ -5021,6 +5091,40 @@ fn cmd_start_auto_never_judges_a_member_by_an_inherited_model_the_outgoing_profi
     crate::profile::save_profile(&profile).unwrap();
 
     cmd_start_auto(Isolation::Shared).expect("a scrubbed variable is no demand");
+}
+
+/// The positive side of the two pins above: a shell `ANTHROPIC_MODEL` the
+/// child keeps (no profile owns it, no runtime `env` overrides it) is the
+/// session's headline, so it is demand.
+#[test]
+fn cmd_start_auto_judges_a_member_by_an_inherited_model_the_child_keeps() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &sb,
+        &[
+            (
+                "ANTHROPIC_MODEL",
+                Some(std::ffi::OsStr::new("claude-fable-5")),
+            ),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", None),
+        ],
+    );
+    seed_start_members(
+        serde_json::json!({}),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+    activate_outside_chain(&[]);
+
+    let err = cmd_start_auto(Isolation::Shared).expect_err("the session runs the shell's fable");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
 }
 
 #[test]

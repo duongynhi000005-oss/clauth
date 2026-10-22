@@ -2960,32 +2960,86 @@ pub(crate) fn claude_settings_env_keys() -> Result<Vec<String>> {
 /// exactly as its session would; a member `[env] ANTHROPIC_MODEL` lands in the
 /// built `env` and is read here, as Claude Code runs it. Best-effort: a base the
 /// overlay also refuses degrades to an empty hint, never a failed start.
-pub(crate) fn runtime_models(
+/// The runtime overlay's model sources, split by SLOT rather than flattened:
+/// the top-level `model` and `env.ANTHROPIC_MODEL` are headline candidates a
+/// `--model` flag or an explicit `model` argument replaces, while the
+/// `fallbackModel` entries and `env.CLAUDE_CODE_SUBAGENT_MODEL` are unioned into
+/// the demand whatever the headline. The four `ANTHROPIC_DEFAULT_*_MODEL` keys
+/// carry the `[models]` alias remap, read here so the remap resolves what the
+/// child actually sees. Read off the SAME overlay `build_claude_settings_json`
+/// writes, so the two cannot drift on the builder or base choice.
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeModelSources {
+    pub(crate) model: Option<String>,
+    pub(crate) fallbacks: Vec<String>,
+    pub(crate) env_anthropic: Option<String>,
+    pub(crate) env_subagent: Option<String>,
+    pub(crate) env_opus: Option<String>,
+    pub(crate) env_sonnet: Option<String>,
+    pub(crate) env_haiku: Option<String>,
+    pub(crate) env_fable: Option<String>,
+}
+
+impl RuntimeModelSources {
+    /// The `env` value this source set carries for `key`, across the model env
+    /// keys the demand resolver reads. `None` for a key the struct does not
+    /// hold, so a caller folding several sources fills each key from the first
+    /// source that set it.
+    pub(crate) fn env_value(&self, key: &str) -> Option<String> {
+        match key {
+            "ANTHROPIC_MODEL" => self.env_anthropic.clone(),
+            "CLAUDE_CODE_SUBAGENT_MODEL" => self.env_subagent.clone(),
+            "ANTHROPIC_DEFAULT_OPUS_MODEL" => self.env_opus.clone(),
+            "ANTHROPIC_DEFAULT_SONNET_MODEL" => self.env_sonnet.clone(),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL" => self.env_haiku.clone(),
+            "ANTHROPIC_DEFAULT_FABLE_MODEL" => self.env_fable.clone(),
+            _ => None,
+        }
+    }
+}
+
+/// The model slots a settings object carries, read off the keys Claude Code
+/// itself reads: top-level `model`, `fallbackModel`, and the model `env` keys.
+/// Shared by the overlay reader, the project settings tiers and the
+/// `--settings` passthrough tier, so the three fold the same keys.
+pub(crate) fn model_sources_from_json(settings: &serde_json::Value) -> RuntimeModelSources {
+    let env = |key: &str| settings["env"][key].as_str().map(str::to_owned);
+    RuntimeModelSources {
+        model: settings["model"].as_str().map(str::to_owned),
+        fallbacks: settings["fallbackModel"]
+            .as_array()
+            .map(|fb| {
+                fb.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        env_anthropic: env("ANTHROPIC_MODEL"),
+        env_subagent: env("CLAUDE_CODE_SUBAGENT_MODEL"),
+        env_opus: env("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+        env_sonnet: env("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+        env_haiku: env("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+        env_fable: env("ANTHROPIC_DEFAULT_FABLE_MODEL"),
+    }
+}
+
+/// The split-source form of the runtime overlay's model slots — same build,
+/// same overlay, structured so a caller judging the headline alone does not
+/// have to pick it out of a flattened list.
+pub(crate) fn runtime_model_sources(
     base: Option<&Path>,
     profile: &Profile,
     stale_env_keys: &[String],
-) -> (Vec<String>, bool) {
+) -> RuntimeModelSources {
+    let empty = RuntimeModelSources::default();
     let Ok(json) = build_claude_settings_json(base, profile, stale_env_keys) else {
-        return (Vec::new(), false);
+        return empty;
     };
     let Ok(settings) = serde_json::from_str::<serde_json::Value>(&json) else {
-        return (Vec::new(), false);
+        return empty;
     };
-    let mut out = Vec::new();
-    if let Some(m) = settings["model"].as_str() {
-        out.push(m.to_owned());
-    }
-    if let Some(fb) = settings["fallbackModel"].as_array() {
-        out.extend(fb.iter().filter_map(|v| v.as_str()).map(str::to_owned));
-    }
-    let env_anthropic_model = settings["env"]["ANTHROPIC_MODEL"].as_str();
-    if let Some(m) = env_anthropic_model {
-        out.push(m.to_owned());
-    }
-    if let Some(m) = settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"].as_str() {
-        out.push(m.to_owned());
-    }
-    (out, env_anthropic_model.is_some())
+    model_sources_from_json(&settings)
 }
 
 /// Patch `settings.json` `env` with profile's endpoint keys and env map;

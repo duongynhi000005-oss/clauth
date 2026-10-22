@@ -95,6 +95,23 @@ pub(crate) struct LiveSession {
     /// Daemon-owned: the member the decision leg wants this session on.
     #[serde(default)]
     pub(crate) intended_member: Option<String>,
+    /// Daemon-owned: whether `intended_member` was chosen for a credit-cap leave
+    /// (a credit-billed launch on a capped account, or the session's own
+    /// spend-cap 429) — the one leave that may land on a member whose `[models]`
+    /// differ. `serde(default)` keeps a row written by an older clauth or a
+    /// manual `clauth switch` reading false, so every such move keeps the
+    /// models-equal rule. Serialized absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) credit_leave: bool,
+    /// Session-owned: whether the `clauth start` that launched this session
+    /// understands the credit-leave reason (a same-binary capability written in
+    /// the same update as `launch_families`). The daemon merges members whose
+    /// `[models]` differ only for rows carrying this flag: a session still
+    /// running an older binary reads `false` and keeps the strict chain, so a
+    /// relaxed intent is never written where its executor would refuse it.
+    /// `serde(default)` is the upgrade gate; serialized absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) credit_leave_aware: bool,
     /// Daemon-owned: this session's position in the shared `fallback_chain`.
     #[serde(default)]
     pub(crate) chain_cursor: Option<usize>,
@@ -161,6 +178,8 @@ impl LiveSession {
             follows_chain,
             intended_member: None,
             chain_cursor: None,
+            credit_leave: false,
+            credit_leave_aware: false,
             current_member: None,
             last_swap_at: None,
             launch_store,
@@ -181,6 +200,10 @@ impl DaemonFields<'_> {
     pub(crate) fn set_chain_cursor(&mut self, cursor: usize) {
         self.0.chain_cursor = Some(cursor);
     }
+
+    pub(crate) fn set_credit_leave(&mut self, on: bool) {
+        self.0.credit_leave = on;
+    }
 }
 
 /// The session's view of a row under [`update_as_session`]: the execution fields
@@ -190,6 +213,14 @@ pub(crate) struct SessionFields<'a>(&'a mut LiveSession);
 impl SessionFields<'_> {
     pub(crate) fn set_current_member(&mut self, member: impl Into<String>) {
         self.0.current_member = Some(member.into());
+    }
+
+    /// Record that this session's launcher understands the credit-leave reason.
+    /// Written by `clauth start` in the same update as `launch_families`; an
+    /// older launcher leaves the field absent, and the daemon reads that as
+    /// false.
+    pub(crate) fn set_credit_leave_aware(&mut self) {
+        self.0.credit_leave_aware = true;
     }
 
     pub(crate) fn set_last_swap_at(&mut self, at: u64) {

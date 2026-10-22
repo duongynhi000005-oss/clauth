@@ -770,6 +770,7 @@ fn cmd_start(
             rest,
             start::process_model_env(),
             follows_chain,
+            std::env::current_dir().ok().as_deref(),
         )?,
     };
 

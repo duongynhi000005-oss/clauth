@@ -237,6 +237,9 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
 
     crate::live_sessions::update_as_daemon(sid, |fields| {
         fields.set_intended_member(canonical.as_str());
+        // A manual move is never a credit-cap leave, so it keeps the
+        // models-equal rule whatever the last daemon write recorded.
+        fields.set_credit_leave(false);
     })?;
     outln!("{}", switch_receipt(sid, canonical.as_str()));
     Ok(())

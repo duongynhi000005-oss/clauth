@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use anyhow::Result;
 
@@ -473,6 +474,7 @@ fn scoped_blocked_from_usage(member: &ChainMember, usage: &HashMap<String, Usage
 /// blocked" (the member is then judged by the aggregate gates alone).
 fn credit_capped_from_usage(member: &ChainMember, usage: &HashMap<String, UsageInfo>) -> bool {
     member.check_credit_cap
+        && !member.own_inference
         && usage
             .get(member.name.as_str())
             .is_some_and(UsageInfo::credit_capped)
@@ -1105,6 +1107,12 @@ pub(crate) struct ChainMember {
     /// Mirrors `Profile::check_credit_cap` — whether a spent usage-credit cap
     /// keeps this member out of the walk's target passes.
     pub(crate) check_credit_cap: bool,
+    /// Whether this account serves inference from its own endpoint + credential
+    /// ([`crate::claude::has_own_inference_endpoint`]), so its usage credits are
+    /// never spent by the launch — the credit-cap gate skips it everywhere it
+    /// gates. Folded so the lock-free walk sites that hold only a `ChainMember`
+    /// still judge it the same way the profile-holding sites do.
+    pub(crate) own_inference: bool,
 }
 
 /// In-memory snapshot of the fields `next_auto_switch_target` needs: active
@@ -1182,6 +1190,11 @@ pub(crate) struct ChainSnapshot {
     /// so an exhausted active never loses its escape (2026-06-28 target
     /// asymmetry: the walk gates only the ACTIVE, never the target).
     pub(crate) fresh: Vec<ProfileName>,
+    /// Members the per-session walk's strict swap-eligibility skip dropped ONLY
+    /// because their `[models]` differ from the launch — re-admissible on a
+    /// credit-cap leave (trigger a or b), in on-disk chain order. [`snapshot_chain`]
+    /// leaves it empty; only [`snapshot_session_chain`] fills it.
+    pub(crate) models_differ: Vec<ChainMember>,
 }
 
 /// Snapshot active profile + chain + per-member thresholds out of `AppConfig`.
@@ -1252,6 +1265,7 @@ pub(crate) fn snapshot_codex_chain(
                 scoped_line: weekly_pct,
                 check_scoped: false,
                 check_credit_cap: false,
+                own_inference: false,
             })
             .collect(),
         switch_off_when_spent: state.switch_off_when_spent(),
@@ -1269,6 +1283,7 @@ pub(crate) fn snapshot_codex_chain(
         kick_rejected,
         reading_dead: Vec::new(),
         fresh: Vec::new(),
+        models_differ: Vec::new(),
     })
 }
 
@@ -1325,12 +1340,43 @@ pub(crate) fn snapshot_session_chain(
     if !config.state.fallback_chain.iter().any(|n| n == member) {
         return None;
     }
-    Some(build_chain_snapshot(
+    let mut snapshot = build_chain_snapshot(
         config,
         member.clone(),
-        &|profile| profile.is_none_or(|p| crate::runtime::swap_eligible(p, launch).is_err()),
+        &|profile| {
+            profile.is_none_or(|p| {
+                crate::runtime::swap_eligible(p, launch, crate::runtime::ModelsRule::Equal).is_err()
+            })
+        },
         key_rejected,
-    ))
+    );
+    // The members the strict skip above dropped ONLY for a `[models]` mismatch:
+    // a credit-cap leave may still land on them. Computed in the same config
+    // hold, never a second one — the merge back in happens after the hold, only
+    // when the leave is for a credit reason.
+    snapshot.models_differ = config
+        .state
+        .fallback_chain
+        .iter()
+        .filter(|name| {
+            *name != member
+                && config.find(name).is_some_and(|p| {
+                    crate::runtime::swap_eligible(p, launch, crate::runtime::ModelsRule::Equal)
+                        .is_err()
+                        && crate::runtime::swap_eligible(p, launch, crate::runtime::ModelsRule::Any)
+                            .is_ok()
+                })
+        })
+        .map(|name| {
+            chain_member(
+                config,
+                name,
+                config.state.weekly_switch_threshold_pct(),
+                key_rejected,
+            )
+        })
+        .collect();
+    Some(snapshot)
 }
 
 /// One chain member resolved out of `config` for `name` — the fields
@@ -1357,6 +1403,7 @@ fn chain_member(
             .unwrap_or(weekly_pct),
         check_scoped: profile.is_none_or(|p| p.check_scoped),
         check_credit_cap: profile.is_none_or(|p| p.check_credit_cap),
+        own_inference: profile.is_some_and(crate::claude::has_own_inference_endpoint),
     }
 }
 
@@ -1415,6 +1462,7 @@ fn build_chain_snapshot(
         kick_rejected: Vec::new(),
         reading_dead: Vec::new(),
         fresh: Vec::new(),
+        models_differ: Vec::new(),
     }
 }
 
@@ -1724,7 +1772,11 @@ pub(crate) fn start_block(
     // credit gate says; an unknown demand (no model resolved) is judged
     // credit-billed only while the gate is on — the scoped gate's blanket rule.
     // Keyed on `credit_capped()`, never a stale percent or a billing-off limit.
-    if usage.is_some_and(UsageInfo::credit_capped) {
+    // An account serving inference from its own endpoint + token never spends
+    // its OAuth usage credits, so its spent cap blocks no launch.
+    if !crate::claude::has_own_inference_endpoint(profile)
+        && usage.is_some_and(UsageInfo::credit_capped)
+    {
         let billed = match families {
             Some(fams) => fams.iter().any(|f| credit_billed.contains(f)),
             None => member.check_credit_cap,
@@ -1783,6 +1835,7 @@ pub(crate) fn start_walk(
     claude_args: &[String],
     env_models: [Option<String>; 2],
     needs_oauth: bool,
+    cwd: Option<&Path>,
 ) -> (Vec<StartCandidate>, Option<usize>) {
     let weekly_pct = config.state.weekly_switch_threshold_pct();
     let now = now_epoch_secs();
@@ -1839,7 +1892,10 @@ pub(crate) fn start_walk(
             isolation,
             &stale_env_keys,
             claude_args,
-            &env_models,
+            None,
+            crate::start::EnvLeg::Process,
+            cwd,
+            crate::start::process_model_env_of(&env_models),
         ));
         let families = (!demand.is_empty()).then_some(demand.as_slice());
         let block = start_block(
@@ -1918,13 +1974,21 @@ pub(crate) fn start_pick(
     claude_args: &[String],
     env_models: [Option<String>; 2],
     follows_chain: bool,
+    cwd: Option<&Path>,
 ) -> Result<StartPick> {
     anyhow::ensure!(
         !config.state.fallback_chain.is_empty(),
         "--auto picks from the fallback chain and it is empty; add accounts on the \
          fallback tab, or name one"
     );
-    let (rows, pick) = start_walk(config, isolation, claude_args, env_models, follows_chain);
+    let (rows, pick) = start_walk(
+        config,
+        isolation,
+        claude_args,
+        env_models,
+        follows_chain,
+        cwd,
+    );
     let Some(pick) = pick else {
         let demand = shared_demand(&rows);
         anyhow::bail!(
@@ -2358,9 +2422,10 @@ fn next_auto_switch_target_core(
     // back. Every other caller passes `false` for both and keeps the
     // gate-honouring check.
     let raw_capped = |m: &ChainMember| {
-        usage
-            .get(m.name.as_str())
-            .is_some_and(UsageInfo::credit_capped)
+        !m.own_inference
+            && usage
+                .get(m.name.as_str())
+                .is_some_and(UsageInfo::credit_capped)
     };
     let credit_blocked = |m: &ChainMember| {
         if credit_demand {
@@ -2654,7 +2719,10 @@ pub(crate) fn find_recovered_member(
                 && (!require_scoped_clear
                     || !member.check_scoped
                     || !scoped_weekly_blocked_info(info, now, member.scoped_line))
-                && (!require_scoped_clear || !member.check_credit_cap || !info.credit_capped())
+                && (!require_scoped_clear
+                    || member.own_inference
+                    || !member.check_credit_cap
+                    || !info.credit_capped())
                 && (!five_hour_live(info, now)
                     || info
                         .five_hour

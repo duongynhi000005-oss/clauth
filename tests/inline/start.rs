@@ -1243,7 +1243,8 @@ fn a_clauth_start_row_is_seen_and_reads_own() {
 /// the recorded `launch_families` must name what THIS launch ran — the outgoing
 /// profile's `[env] ANTHROPIC_MODEL` must not leak into an opus launch, and a
 /// `--model fable` passthrough on a member with no default must record fable —
-/// and the recorded `claude_pid` must be the spawned child.
+/// and the recorded `claude_pid` must be the spawned child, and the row must
+/// record the credit-leave capability its relax leg gates on.
 #[cfg(unix)]
 #[test]
 fn a_start_run_records_the_launch_demand_and_the_child_pid() {
@@ -1253,7 +1254,8 @@ fn a_start_run_records_the_launch_demand_and_the_child_pid() {
     // after the spawn), then hand back the recorded demand and pid. Bounded so
     // a run that never records fails the test instead of hanging the suite.
     let observe =
-        |target: &'static str| -> std::thread::JoinHandle<(Option<Vec<String>>, Option<u32>)> {
+        |target: &'static str| -> std::thread::JoinHandle<(Option<Vec<String>>, Option<u32>, bool)>
+        {
             std::thread::spawn(move || {
                 let dir = crate::profile::clauth_dir()
                     .expect("clauth dir")
@@ -1265,8 +1267,8 @@ fn a_start_run_records_the_launch_demand_and_the_child_pid() {
                 );
                 seen.into_iter()
                     .find(|r| r.start_profile == target && r.claude_pid.is_some())
-                    .map(|r| (r.launch_families, r.claude_pid))
-                    .unwrap_or((None, None))
+                    .map(|r| (r.launch_families, r.claude_pid, r.credit_leave_aware))
+                    .unwrap_or((None, None, false))
             })
         };
 
@@ -1311,7 +1313,7 @@ fn a_start_run_records_the_launch_demand_and_the_child_pid() {
             None,
         )
         .expect("start");
-        let (families, pid) = observer.join().expect("observer");
+        let (families, pid, aware) = observer.join().expect("observer");
         let shim_pid = std::fs::read_to_string(sb.home().join(".slow-claude.pid"))
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
@@ -1324,6 +1326,10 @@ fn a_start_run_records_the_launch_demand_and_the_child_pid() {
             families,
             Some(vec!["opus".to_string()]),
             "an opus launch must not be credit-billed off the outgoing profile's env model"
+        );
+        assert!(
+            aware,
+            "the row records that this session understands the credit-leave reason"
         );
         drop(shim);
     }
@@ -1344,7 +1350,7 @@ fn a_start_run_records_the_launch_demand_and_the_child_pid() {
             None,
         )
         .expect("start");
-        let (families, pid) = observer.join().expect("observer");
+        let (families, pid, aware) = observer.join().expect("observer");
         let shim_pid = std::fs::read_to_string(sb.home().join(".slow-claude.pid"))
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
@@ -1358,6 +1364,10 @@ fn a_start_run_records_the_launch_demand_and_the_child_pid() {
             Some(vec!["fable".to_string()]),
             "a --model fable passthrough must record fable as the launch demand"
         );
+        assert!(
+            aware,
+            "the row records that this session understands the credit-leave reason"
+        );
         drop(shim);
     }
 }
@@ -1365,47 +1375,68 @@ fn a_start_run_records_the_launch_demand_and_the_child_pid() {
 // ── start-time model demand + the extracted admit ───────────────────────────
 
 #[test]
-fn models_from_args_reads_both_spellings() {
+fn parsed_model_args_reads_both_spellings() {
     let split = vec!["--model".to_owned(), "claude-fable-5-1".to_owned()];
-    assert_eq!(models_from_args(&split), ["claude-fable-5-1"]);
+    assert_eq!(
+        parsed_model_args(&split),
+        (Some("claude-fable-5-1".into()), vec![])
+    );
     let joined = vec!["--model=opus".to_owned()];
-    assert_eq!(models_from_args(&joined), ["opus"]);
+    assert_eq!(parsed_model_args(&joined), (Some("opus".into()), vec![]));
     let none = vec!["-p".to_owned(), "hi".to_owned()];
-    assert!(models_from_args(&none).is_empty());
+    assert_eq!(parsed_model_args(&none), (None, vec![]));
     let fb_split = vec!["--fallback-model".to_owned(), "sonnet,haiku".to_owned()];
-    assert_eq!(models_from_args(&fb_split), ["sonnet", "haiku"]);
+    assert_eq!(
+        parsed_model_args(&fb_split),
+        (None, vec!["sonnet".into(), "haiku".into()])
+    );
     let fb_joined = vec!["--fallback-model=opus, sonnet".to_owned()];
-    assert_eq!(models_from_args(&fb_joined), ["opus", "sonnet"]);
-    assert!(models_from_args(&["--fallback-model".to_owned()]).is_empty());
+    assert_eq!(
+        parsed_model_args(&fb_joined),
+        (None, vec!["opus".into(), "sonnet".into()])
+    );
+    assert_eq!(
+        parsed_model_args(&["--fallback-model".to_owned()]),
+        (None, vec![])
+    );
 }
 
 #[test]
 fn a_dangling_model_flag_yields_nothing() {
-    assert!(models_from_args(&["--model".to_owned()]).is_empty());
+    assert_eq!(parsed_model_args(&["--model".to_owned()]), (None, vec![]));
+}
+
+/// A blank `--model` value is absent, never a headline: the overlay default
+/// stays and the unplaceable refusal never prints an empty model.
+#[test]
+fn a_blank_model_value_is_absent() {
+    assert_eq!(parsed_model_args(&["--model=".to_owned()]), (None, vec![]));
+    assert_eq!(
+        parsed_model_args(&["--model".to_owned(), String::new()]),
+        (None, vec![])
+    );
 }
 
 #[test]
-fn launch_models_unions_the_settings_models_and_the_model_args() {
+fn launch_models_unions_the_settings_models_and_the_env_models() {
     let settings = vec![
         "opus".to_owned(),
         "claude-sonnet-5".to_owned(),
         "claude-haiku-4-5".to_owned(),
         "haiku".to_owned(),
     ];
-    let args = vec!["--model".to_owned(), "claude-fable-5-1".to_owned()];
     assert_eq!(
-        launch_models_from(settings, [Some("gemini".to_owned()), None], &args),
+        launch_models_from(settings, [Some("gemini".to_owned()), None]),
         [
             "opus",
             "claude-sonnet-5",
             "claude-haiku-4-5",
             "haiku",
             "gemini",
-            "claude-fable-5-1",
         ]
     );
     assert!(
-        launch_models_from(Vec::new(), [None, Some("".to_owned())], &[]).is_empty(),
+        launch_models_from(Vec::new(), [None, Some("".to_owned())]).is_empty(),
         "an empty env value is dropped, never a family"
     );
 }

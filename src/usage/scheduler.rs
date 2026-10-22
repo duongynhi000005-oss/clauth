@@ -6016,6 +6016,9 @@ struct SessionDecision {
     snapshot: crate::fallback::ChainSnapshot,
     /// The member this session's link resolves to — what the walk starts from.
     member: ProfileName,
+    /// Whether `member` serves inference from its own endpoint + token, so its
+    /// usage credits are never spent by this session: trigger a skips it.
+    own_inference: bool,
     row: crate::live_sessions::LiveSession,
 }
 
@@ -6324,9 +6327,13 @@ fn scan_session_switches(
                 let launch = crate::runtime::LaunchTransport::of(start);
                 let snapshot =
                     crate::fallback::snapshot_session_chain(&cfg, &member, &launch, &key_rejected)?;
+                let own_inference = cfg
+                    .find(&member)
+                    .is_some_and(crate::claude::has_own_inference_endpoint);
                 Some(SessionDecision {
                     snapshot,
                     member,
+                    own_inference,
                     row,
                 })
             })
@@ -6335,31 +6342,42 @@ fn scan_session_switches(
     };
 
     let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
-    let mut writes: Vec<(String, String, usize)> = Vec::new();
+    let mut writes: Vec<(String, String, usize, bool)> = Vec::new();
     // Live session id -> member, for every row this scan walks, so the prune
     // below drops latch entries whose session ended or moved.
     let mut live_latch_members: HashMap<String, String> = HashMap::new();
     for SessionDecision {
         mut snapshot,
         member,
+        own_inference,
         row,
     } in pending
     {
         // Neither of these is config state, so `snapshot_session_chain` cannot fill
         // them — same split `scan_auto_switch` works to. `reading_dead` follows the
         // same split again (issue #83's dead-reading bypass). The picker snapshot
-        // is built once and shared with the walk below.
+        // is built once and shared with the walk below. The three store/status
+        // reads run over the strict chain PLUS the members dropped ONLY on
+        // `ModelsDiffers`: a relaxed (credit-leave) member merged back in below
+        // is then judged fresh and clear like any other member, instead of being
+        // skipped for never appearing in the strict chain's fresh set. Extra
+        // entries for members never merged are inert — the walk reads only the
+        // names in `snapshot.chain`.
         snapshot.kick_rejected = kick_rejected.clone();
         snapshot.broken.extend(key_rejected.iter().cloned());
+        let mut walk_members: Vec<crate::fallback::ChainMember> =
+            Vec::with_capacity(snapshot.chain.len() + snapshot.models_differ.len());
+        walk_members.extend(snapshot.chain.iter().cloned());
+        walk_members.extend(snapshot.models_differ.iter().cloned());
         let usage = crate::fallback::usage_snapshot_for_chain(
             store,
             third_party_usage_store,
             &third_party_names,
             &polled,
-            &snapshot.chain,
+            &walk_members,
         );
         snapshot.reading_dead = reading_dead_names(
-            &snapshot.chain,
+            &walk_members,
             status,
             third_party_status,
             streaks,
@@ -6367,8 +6385,7 @@ fn scan_session_switches(
             &third_party_names,
             &usage,
         );
-        snapshot.fresh = snapshot
-            .chain
+        snapshot.fresh = walk_members
             .iter()
             .filter(|m| {
                 decision_fresh_any(
@@ -6480,11 +6497,39 @@ fn scan_session_switches(
             .launch_families
             .as_deref()
             .is_some_and(|families| families.iter().any(|f| billed.contains(f)));
-        let trigger_a = credit_billed_launch
+        let trigger_a = !own_inference
+            && credit_billed_launch
             && usage
                 .get(member.as_str())
                 .is_some_and(crate::usage::UsageInfo::credit_capped);
         let must_leave = trigger_a || trigger_b;
+        // A credit-cap leave may land on a member whose `[models]` differ, so
+        // the members the strict swap-eligibility skip dropped ONLY on that
+        // ground merge back in — on-disk order, once, under no config hold.
+        // Gated on the row's `credit_leave_aware`: a session still running an
+        // older binary reads false and keeps the strict chain, so a relaxed
+        // intent is never written where its executor would refuse it.
+        if must_leave && row.credit_leave_aware && !snapshot.models_differ.is_empty() {
+            let mut merged: Vec<crate::fallback::ChainMember> =
+                Vec::with_capacity(snapshot.chain.len() + snapshot.models_differ.len());
+            for name in &chain {
+                if let Some(m) = snapshot
+                    .chain
+                    .iter()
+                    .find(|m| m.name.as_str() == name.as_str())
+                {
+                    merged.push(m.clone());
+                } else if let Some(m) = snapshot
+                    .models_differ
+                    .iter()
+                    .find(|m| m.name.as_str() == name.as_str())
+                {
+                    merged.push(m.clone());
+                }
+            }
+            snapshot.chain = merged;
+            snapshot.models_differ.clear();
+        }
         // The credit demand the walk's target passes read the raw cap against:
         // a credit-billed launch stays credit-billed after the leave lands, so
         // the home passes must keep skipping the capped member it just left
@@ -6519,12 +6564,15 @@ fn scan_session_switches(
         // Already what the row says: rewriting it every tick would take the
         // cross-process flock for nothing. A dropped write still self-heals, since
         // the row then differs from the decision this comparison is made against.
+        // The leave reason rides the same comparison, so a reason change on an
+        // unchanged intent still rewrites the flag.
         if row.intended_member.as_deref() == Some(target.as_str())
             && row.chain_cursor == Some(cursor)
+            && row.credit_leave == must_leave
         {
             continue;
         }
-        writes.push((row.session_id, target, cursor));
+        writes.push((row.session_id, target, cursor, must_leave));
     }
     // Prune the latch: an entry whose session ended (no live row) or whose
     // member changed is stale — the 429 was for the old stint, and must not
@@ -6546,7 +6594,7 @@ fn scan_session_switches(
     }
 
     let batch = crate::lock::with_state_lock(|_held| {
-        for (session_id, target, cursor) in &writes {
+        for (session_id, target, cursor, credit_leave) in &writes {
             // A session that died between `list()` and this hold is skipped
             // silently — that is what keeps "no row for this id" from being this
             // leg's ordinary outcome rather than a real failure.
@@ -6556,6 +6604,7 @@ fn scan_session_switches(
             if let Err(e) = crate::live_sessions::update_as_daemon(session_id, |fields| {
                 fields.set_intended_member(target.as_str());
                 fields.set_chain_cursor(*cursor);
+                fields.set_credit_leave(*credit_leave);
             }) {
                 logline!("clauth: session {session_id} could not be pointed at {target}: {e:#}");
             }
@@ -6663,6 +6712,8 @@ fn scan_recovery(
                             .unwrap_or(weekly_pct),
                         check_scoped: profile.is_none_or(|p| p.check_scoped),
                         check_credit_cap: profile.is_none_or(|p| p.check_credit_cap),
+                        own_inference: profile
+                            .is_some_and(crate::claude::has_own_inference_endpoint),
                     }
                 })
                 .collect(),

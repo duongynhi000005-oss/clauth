@@ -7129,6 +7129,8 @@ fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
             follows_chain: false,
             intended_member: None,
             chain_cursor: None,
+            credit_leave: false,
+            credit_leave_aware: false,
             current_member: None,
             last_swap_at: None,
             launch_store: None,
@@ -7917,40 +7919,40 @@ fn swap_eligible_refuses_exactly_the_config_grounds_the_precondition_does() {
     let mut twin = make_profile("elig-twin");
     twin.env = launch.env.clone();
     twin.models = launch.models.clone();
-    assert_eq!(swap_eligible(&twin, &transport), Ok(()));
+    assert_eq!(swap_eligible(&twin, &transport, ModelsRule::Equal), Ok(()));
 
     let mut endpoint = twin.clone();
     endpoint.base_url = Some("https://api.example/anthropic".into());
     assert_eq!(
-        swap_eligible(&endpoint, &transport),
+        swap_eligible(&endpoint, &transport, ModelsRule::Equal),
         Err(SwapRefused::NotOauth)
     );
 
     let mut disabled = twin.clone();
     disabled.disabled = true;
     assert_eq!(
-        swap_eligible(&disabled, &transport),
+        swap_eligible(&disabled, &transport, ModelsRule::Equal),
         Err(SwapRefused::Disabled)
     );
 
     let mut env = twin.clone();
     env.env.insert("EXTRA".into(), "2".into());
     assert_eq!(
-        swap_eligible(&env, &transport),
+        swap_eligible(&env, &transport, ModelsRule::Equal),
         Err(SwapRefused::EnvDiffers)
     );
 
     let mut models = twin.clone();
     models.models.default = Some("opus".into());
     assert_eq!(
-        swap_eligible(&models, &transport),
+        swap_eligible(&models, &transport, ModelsRule::Equal),
         Err(SwapRefused::ModelsDiffers)
     );
 
     let mut keyed = twin.clone();
     keyed.api_key = Some("k".into());
     assert_eq!(
-        swap_eligible(&keyed, &transport),
+        swap_eligible(&keyed, &transport, ModelsRule::Equal),
         Err(SwapRefused::ApiKeyDiffers)
     );
 
@@ -7962,7 +7964,7 @@ fn swap_eligible_refuses_exactly_the_config_grounds_the_precondition_does() {
     let mut endpoint_and_disabled = endpoint.clone();
     endpoint_and_disabled.disabled = true;
     assert_eq!(
-        swap_eligible(&endpoint_and_disabled, &transport),
+        swap_eligible(&endpoint_and_disabled, &transport, ModelsRule::Equal),
         Err(SwapRefused::NotOauth),
         "the endpoint must be reported ahead of the disabled bit"
     );
@@ -7973,9 +7975,12 @@ fn swap_eligible_refuses_exactly_the_config_grounds_the_precondition_does() {
     let mut keyed_launch = launch.clone();
     keyed_launch.api_key = Some("k".into());
     let keyed_transport = LaunchTransport::of(&keyed_launch);
-    assert_eq!(swap_eligible(&keyed, &keyed_transport), Ok(()));
     assert_eq!(
-        swap_eligible(&twin, &keyed_transport),
+        swap_eligible(&keyed, &keyed_transport, ModelsRule::Equal),
+        Ok(())
+    );
+    assert_eq!(
+        swap_eligible(&twin, &keyed_transport, ModelsRule::Equal),
         Err(SwapRefused::ApiKeyDiffers)
     );
 }
@@ -9446,6 +9451,67 @@ fn poll_executes_the_member_the_daemon_named() {
     });
 }
 
+/// A credit-cap leave is the ONE move that may land on a member whose
+/// `[models]` differ: the daemon's `credit_leave` flag on the row relaxes the
+/// models-equal rule, and its absence keeps it. Driven through `poll`, which
+/// reads the row the executor reads.
+#[test]
+fn poll_relaxes_models_for_a_credit_leave_and_only_then() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
+        let launch = member("credit-a");
+        let mut intended = member("credit-b");
+        intended.models.default = Some("opus".to_owned());
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+        crate::live_sessions::update_as_session(&sid, |s| {
+            s.set_launch_families(vec!["fable".to_owned()]);
+        })
+        .expect("session write");
+
+        // No credit reason: the models-equal rule refuses.
+        crate::live_sessions::update_as_daemon(&sid, |d| {
+            d.set_intended_member("credit-b");
+            d.set_credit_leave(false);
+        })
+        .expect("daemon write");
+        swap.poll();
+        assert_eq!(swap.member(), "credit-a", "models differ, no credit leave");
+        assert_eq!(
+            swap.cell().last_refusal,
+            Some(("credit-b".to_string(), SwapRefused::ModelsDiffers))
+        );
+
+        // A credit-cap leave: the relaxed rule admits.
+        crate::live_sessions::update_as_daemon(&sid, |d| {
+            d.set_intended_member("credit-b");
+            d.set_credit_leave(true);
+        })
+        .expect("daemon write");
+        swap.poll();
+        assert_eq!(
+            swap.member(),
+            "credit-b",
+            "a credit leave may land on differing models"
+        );
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            intended_store
+        );
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(
+            row.launch_families,
+            Some(vec!["fable".to_owned()]),
+            "a swap moves credentials only, never the launch demand"
+        );
+    });
+}
+
 /// A standing intent the executor refuses re-fires every tick, so announcing
 /// unconditionally writes one line per second for as long as it stands — but a
 /// refusal nothing ever says leaves the session on its launch account invisibly.
@@ -10470,6 +10536,8 @@ fn register_row(profile: &str, sid: &str, launch_store: Option<std::path::PathBu
         follows_chain: false,
         intended_member: None,
         chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
         current_member: None,
         last_swap_at: None,
         launch_store,

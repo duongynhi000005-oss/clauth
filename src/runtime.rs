@@ -3050,9 +3050,22 @@ impl LaunchTransport {
 /// store-exists check (disk IO the daemon would repeat per candidate per tick)
 /// and the transport/platform + isolated refusals ([`swap_support`], which the
 /// decision leg has no business re-deriving).
+///
+/// `models` relaxes ONLY the `[models]`-equality arm: a credit-cap leave (the
+/// session's own 429, or a credit-billed launch on a capped account) may land
+/// on a member whose `[models]` differ, since a swap moves credentials only and
+/// the session keeps running its launch model on the new member. Every other
+/// leave keeps the models-equal rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelsRule {
+    Equal,
+    Any,
+}
+
 pub(crate) fn swap_eligible(
     candidate: &Profile,
     launch: &LaunchTransport,
+    models: ModelsRule,
 ) -> Result<(), SwapRefused> {
     if !candidate.is_oauth() {
         return Err(SwapRefused::NotOauth);
@@ -3063,7 +3076,7 @@ pub(crate) fn swap_eligible(
     if candidate.env != launch.env {
         return Err(SwapRefused::EnvDiffers);
     }
-    if candidate.models != launch.models {
+    if matches!(models, ModelsRule::Equal) && candidate.models != launch.models {
         return Err(SwapRefused::ModelsDiffers);
     }
     if candidate.api_key.is_some() != launch.has_api_key {
@@ -3425,15 +3438,27 @@ impl SessionSwap {
     /// switch <sid> <profile>` writes one for any live claude row, so a plain
     /// `start` session no writer has targeted polls and finds nothing to do.
     fn poll(&self) {
-        let Some(intended) = crate::live_sessions::get(self.session.as_str())
-            .and_then(|row| row.intended_member)
+        let Some(row) = crate::live_sessions::get(self.session.as_str()) else {
+            self.poll_converge();
+            return;
+        };
+        let Some(intended) = row
+            .intended_member
             .filter(|intended| *intended != self.member())
         else {
             self.poll_converge();
             return;
         };
+        // A credit-cap leave may land on a member whose `[models]` differ; the
+        // daemon records that leave reason on the row beside the intent. Every
+        // other move keeps the models-equal rule.
+        let models = if row.credit_leave {
+            ModelsRule::Any
+        } else {
+            ModelsRule::Equal
+        };
         let sid = self.session.as_str();
-        match self.swap_to(&intended) {
+        match self.swap_to_with(&intended, models) {
             Ok(SwapOutcome::Swapped) => {
                 logline!("clauth: session {sid} swapped onto {intended}");
             }
@@ -3491,7 +3516,18 @@ impl SessionSwap {
     /// source now selecting a distinct refreshless sidecar), which the
     /// in-place convergence executes. Every other same-member state stays a
     /// no-op.
+    #[cfg(test)]
     fn precondition(&self, intended: &str) -> Result<SwapPlan, SwapRefused> {
+        self.precondition_with(intended, ModelsRule::Equal)
+    }
+
+    /// [`precondition`] with the models rule a credit-cap leave relaxes (see
+    /// [`swap_eligible`]); every other caller keeps the models-equal rule.
+    fn precondition_with(
+        &self,
+        intended: &str,
+        models: ModelsRule,
+    ) -> Result<SwapPlan, SwapRefused> {
         let intended = ProfileName::from(intended);
         if self.shutdown.is_begun() {
             return Err(SwapRefused::ShuttingDown);
@@ -3517,7 +3553,7 @@ impl SessionSwap {
         }
         let profile = crate::profile::load_profile(&intended)
             .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
-        swap_eligible(&profile, &self.launch)?;
+        swap_eligible(&profile, &self.launch, models)?;
         let store = crate::claude::install_source_path(&intended)
             .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
         if !store.exists() {
@@ -3583,7 +3619,13 @@ impl SessionSwap {
     /// the other and never between them. Everything that can fail runs BEFORE the
     /// link moves; [`publish_swap`](Self::publish_swap) runs only once it has.
     fn swap_to(&self, intended: &str) -> Result<SwapOutcome> {
-        let plan = match self.precondition(intended) {
+        self.swap_to_with(intended, ModelsRule::Equal)
+    }
+
+    /// [`swap_to`] with the models rule a credit-cap leave relaxes (see
+    /// [`swap_eligible`]); every other caller keeps the models-equal rule.
+    fn swap_to_with(&self, intended: &str, models: ModelsRule) -> Result<SwapOutcome> {
+        let plan = match self.precondition_with(intended, models) {
             Ok(plan) => plan,
             Err(refused) => return Ok(SwapOutcome::Refused(refused)),
         };

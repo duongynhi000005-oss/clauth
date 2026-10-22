@@ -390,11 +390,305 @@ fn a_credit_capped_target_admits_a_run_naming_no_model_while_its_gate_is_off() {
     assert_admitted(delegate_to_capped(None, &cwd));
 }
 
+/// [`delegate_to_capped`] with the call's own `args` and `env`.
+fn delegate_to_capped_with(
+    model: Option<&str>,
+    args: &[&str],
+    env: &[(&str, &str)],
+    cwd: &std::path::Path,
+) -> std::result::Result<serde_json::Value, String> {
+    run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "hello",
+        model,
+        cwd: cwd.to_str(),
+        env: env
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+        extra_args: args.iter().map(|a| (*a).to_owned()).collect(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+}
+
+const REFUSES_FABLE: &str = "credit cap spent: capped cannot run fable, which Claude Code bills against usage credits; name another account or another model";
+
+/// A `--model` in the call's `args` is what the spawned `claude` runs (args
+/// come last, so they win), and the gate judges it: the gate is off here, so
+/// only the args' own family can refuse.
+#[test]
+fn a_credit_capped_target_refuses_a_credit_billed_model_named_in_args() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+
+    let err = delegate_to_capped_with(None, &["--model", "fable"], &[], &cwd)
+        .expect_err("args name fable");
+    assert_eq!(err, REFUSES_FABLE);
+}
+
+/// The last `--model` in `args` beats the `model` argument, since `args` go
+/// after the `--model` clauth passes for it.
+#[test]
+fn a_model_in_args_outranks_the_model_argument() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+
+    let err = delegate_to_capped_with(Some("opus"), &["--model", "fable"], &[], &cwd)
+        .expect_err("args win over model");
+    assert_eq!(err, REFUSES_FABLE);
+}
+
+/// The call's `env` reaches the child after the profile scrub, so its model
+/// keys are demand like any other source.
+#[test]
+fn a_credit_capped_target_refuses_a_credit_billed_model_named_in_env() {
+    for key in ["ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"] {
+        let home = HomeSandbox::new();
+        let cwd = seed_credit_spend_target(&home, None, false, true);
+
+        let err = delegate_to_capped_with(None, &[], &[(key, "fable")], &cwd)
+            .expect_err("env names fable");
+        assert_eq!(err, REFUSES_FABLE, "{key}");
+        drop(home);
+    }
+}
+
+/// A named model replaces only the headline: the overlay's subagent model
+/// still runs (a `Task` subagent spends the same account), so it is demand.
+#[test]
+fn a_named_model_keeps_the_overlays_subagent_model_in_the_demand() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let name = crate::profile::ProfileName::from("capped");
+    let mut profile = crate::profile::load_profile(&name).expect("load profile");
+    profile.models.subagent = Some("fable".to_owned());
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    let err = delegate_to_capped(Some("opus"), &cwd).expect_err("the subagent runs fable");
+    assert_eq!(err, REFUSES_FABLE);
+}
+
+/// A named model replaces the overlay headline (`[models] default`): Claude
+/// Code runs `--model` over the settings `model`, so a fable default never
+/// runs (cloudy, 2026-10-22).
+#[test]
+fn a_named_model_replaces_the_overlays_default_in_the_demand() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("fable"), true, true);
+    assert_admitted(delegate_to_capped(Some("opus"), &cwd));
+    assert_admitted(delegate_to_capped_with(
+        None,
+        &["--model", "opus"],
+        &[],
+        &cwd,
+    ));
+}
+
+/// A named model clauth cannot place in a family gets its own arm, never the
+/// "names no model" one (cloudy's copy, 2026-10-20).
+#[test]
+fn a_credit_capped_target_refuses_a_model_it_cannot_place() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, true, true);
+
+    let err = delegate_to_capped(Some("glm-4.6"), &cwd).expect_err("an unplaceable model");
+    assert_eq!(
+        err,
+        "credit cap spent: capped runs glm-4.6, which clauth cannot tell is billed against usage credits; name another account or a known model"
+    );
+}
+
+/// An unknown demand is judged credit-billed only while the gate is on: with
+/// the gate off, an unplaceable model is admitted, exactly like a run naming
+/// no model at all.
+#[test]
+fn a_credit_capped_target_admits_an_unplaceable_model_with_its_gate_off() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    // Control: no model at all, gate off, is admitted.
+    assert_admitted(delegate_to_capped(None, &cwd));
+    assert_admitted(delegate_to_capped(Some("glm-4.6"), &cwd));
+}
+
+/// The alias remap must not slice the original by a length measured on a
+/// lowercased copy: a Kelvin-sign alias lowercases to a different byte width.
+/// It is also NOT the `haiku` alias (ASCII-case-insensitive matching only),
+/// and a mixed-case `[1M]` suffix does not panic.
+#[test]
+fn the_alias_remap_does_not_panic_on_a_non_ascii_alias_or_mixed_case_suffix() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, true, true);
+    let name = crate::profile::ProfileName::from("capped");
+    let mut p = crate::profile::load_profile(&name).expect("load");
+    p.models.haiku = Some("claude-haiku-x".to_owned());
+    crate::profile::save_profile(&p).expect("save");
+    let p = crate::profile::load_profile(&name).expect("reload");
+
+    // The Kelvin sign is not the ASCII `haiku` alias, so the remap leaves the
+    // string alone (a Unicode-lowercase match would remap it wrongly).
+    let models = crate::start::member_launch_models(
+        &p,
+        Isolation::Shared,
+        &[],
+        &[],
+        Some("hai\u{212A}u"),
+        crate::start::EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(
+        models,
+        ["hai\u{212A}u".to_string()],
+        "the Kelvin-sign spelling is not the haiku alias"
+    );
+
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        delegate_to_capped(Some("hai\u{212A}u"), &cwd)
+    }));
+    assert!(
+        r.is_ok(),
+        "the alias remap must not panic on a non-ASCII model string"
+    );
+
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        delegate_to_capped(Some("haiku[1M]"), &cwd)
+    }));
+    assert!(r.is_ok(), "a mixed-case context suffix must not panic");
+}
+
+/// The caller env's alias key routes the alias the child runs: `model: "opus"`
+/// with `ANTHROPIC_DEFAULT_OPUS_MODEL` naming a fable id refuses on a capped
+/// target with the gate off.
+#[test]
+fn a_caller_env_alias_target_is_demand() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let r = delegate_to_capped_with(
+        Some("opus"),
+        &[],
+        &[("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-fable-5")],
+        &cwd,
+    );
+    assert_eq!(r.expect_err("refused"), REFUSES_FABLE);
+}
+
+/// A composite expands before the remap: `--model opusplan` with the member's
+/// `[models] opus` on a fable id demands fable.
+#[test]
+fn a_composite_alias_remaps_through_the_member_opus_alias() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let name = crate::profile::ProfileName::from("capped");
+    let mut p = crate::profile::load_profile(&name).expect("load");
+    p.models.opus = Some("claude-fable-5".to_owned());
+    crate::profile::save_profile(&p).expect("save");
+    let r = delegate_to_capped_with(None, &["--model", "opusplan"], &[], &cwd);
+    assert_eq!(r.expect_err("refused"), REFUSES_FABLE);
+}
+
+/// A `--settings` passthrough is the top settings tier: its `model` names the
+/// demand, so a fable inline settings refuses on a capped target with the gate
+/// off.
+#[test]
+fn a_settings_flag_model_is_demand() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let r = delegate_to_capped_with(None, &["--settings", r#"{"model":"fable"}"#], &[], &cwd);
+    assert_eq!(r.expect_err("refused"), REFUSES_FABLE);
+}
+
+/// An inline-JSON `--settings` value is self-contained and reads with no cwd
+/// (production passes `None` only when `current_dir()` fails): the inline
+/// model is still the demand.
+#[test]
+fn an_inline_settings_flag_model_is_demand_without_a_cwd() {
+    let _home = HomeSandbox::new();
+    let p = crate::profile::Profile::new("blank".to_string(), None, None);
+    let models = crate::start::member_launch_models(
+        &p,
+        Isolation::Shared,
+        &[],
+        &["--settings".to_owned(), r#"{"model":"fable"}"#.to_owned()],
+        None,
+        crate::start::EnvLeg::Process,
+        None,
+        |_| None,
+    );
+    assert_eq!(
+        models,
+        ["fable".to_string()],
+        "the inline settings model is demand even with no cwd"
+    );
+}
+
+/// A blank `--model` value is absent: the fable-default capped target refuses
+/// with the fable message, never an empty interpolation.
+#[test]
+fn a_blank_model_value_keeps_the_default_headline() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("fable"), false, true);
+    let r = delegate_to_capped_with(None, &["--model="], &[], &cwd);
+    let err = r.expect_err("the fable default refuses");
+    assert!(!err.contains("runs , which"), "empty interpolation: {err}");
+    assert_eq!(err, REFUSES_FABLE);
+}
+
+/// An account serving inference from its own endpoint + token never spends
+/// its OAuth usage credits, so its cap refuses nothing.
+#[test]
+fn a_credit_capped_target_on_its_own_endpoint_admits_a_credit_billed_model() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, true, true);
+    let name = crate::profile::ProfileName::from("capped");
+    let mut profile = crate::profile::load_profile(&name).expect("load profile");
+    profile.env.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "http://127.0.0.1:9".to_owned(),
+    );
+    profile
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_owned(), "test-token".to_owned());
+    crate::profile::save_profile(&profile).expect("save profile");
+    let profile = crate::profile::load_profile(&name).expect("reload profile");
+    assert!(
+        crate::claude::has_own_inference_endpoint(&profile),
+        "fixture control: the account serves from its own endpoint"
+    );
+
+    assert_admitted(delegate_to_capped(Some("fable"), &cwd));
+    assert_admitted(delegate_to_capped(None, &cwd));
+}
+
 #[test]
 fn a_credit_capped_target_admits_a_subscription_model() {
     let home = HomeSandbox::new();
     let cwd = seed_credit_spend_target(&home, Some("fable"), true, true);
     assert_admitted(delegate_to_capped(Some("opus"), &cwd));
+}
+
+/// A delegate whose spawn cwd holds a project `.claude/settings.json` `model`
+/// is judged by it like a start's cwd is: fable bills the capped target's
+/// usage credits and refuses before any spawn.
+#[test]
+fn a_delegate_reads_a_project_settings_model_from_its_spawn_cwd() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, None, true, true);
+    let cwd = home.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .unwrap();
+
+    let err = delegate_to_capped(None, &cwd).expect_err("the project model is fable");
+    assert_eq!(err, REFUSES_FABLE);
 }
 
 /// A billing-off account carrying a stale full limit is never capped: the
@@ -479,6 +773,7 @@ fn a_quarantined_and_capped_oauth_target_refuses_with_the_login_expired_sentence
             &name,
             &["fable".to_string()],
             &["fable".to_string()],
+            &["fable".to_string()],
         ),
         Err(crate::format::login_expired(&name).line()),
         "the quarantine arm sits above the credit arm, so the login fix keeps its answer",
@@ -550,6 +845,123 @@ fn the_roster_ranks_a_credit_capped_account_last_while_its_gate_is_on() {
             );
         }
     }
+}
+
+/// An own-endpoint account never spends its usage credits, so its spent cap
+/// must not demote it to `Capped` — the RANK is what the credit gate governs.
+/// The in-test control first pins the same fixture WITHOUT the endpoint as
+/// `Capped`, so the negative assertion cannot pass on any other rank.
+#[test]
+fn an_own_endpoint_account_is_not_demoted_to_a_capped_rank() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("own-capped");
+    let mut p = crate::testutil::blank_profile(&name);
+    crate::profile::save_profile(&p).unwrap();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.clone()],
+        ..Default::default()
+    })
+    .unwrap();
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            spend: Some(crate::usage::SpendInfo {
+                enabled: true,
+                used: Some(50.0),
+                limit: Some(50.0),
+                percent: Some(100.0),
+                currency: Some("USD".to_owned()),
+            }),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        roster_rank_for(&p),
+        RosterRank::Capped,
+        "fixture control: a plain capped account ranks Capped"
+    );
+
+    p.env.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "http://127.0.0.1:9".to_owned(),
+    );
+    p.env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_owned(), "test-token".to_owned());
+    crate::profile::save_profile(&p).unwrap();
+    let p = crate::profile::load_profile(&name).unwrap();
+    assert!(
+        crate::claude::has_own_inference_endpoint(&p),
+        "fixture control: the account serves from its own endpoint"
+    );
+    assert_eq!(
+        roster_rank_for(&p),
+        RosterRank::Unknown,
+        "the own-endpoint account's spent cap must not demote its rank"
+    );
+}
+
+/// The roster row's `credit cap spent` flag describes a refusal the pre-flight
+/// can make: an own-endpoint account refuses nothing, so its row carries no
+/// flag, while a plain capped account's does.
+#[test]
+fn an_own_endpoint_capped_accounts_row_carries_no_credit_cap_flag() {
+    let _home = HomeSandbox::new();
+    let plain = crate::profile::ProfileName::from("plain-capped");
+    let own = crate::profile::ProfileName::from("own-capped");
+    for (n, endpoint) in [(&plain, false), (&own, true)] {
+        let mut p = crate::testutil::blank_profile(n);
+        if endpoint {
+            p.env.insert(
+                "ANTHROPIC_BASE_URL".to_owned(),
+                "http://127.0.0.1:9".to_owned(),
+            );
+            p.env
+                .insert("ANTHROPIC_AUTH_TOKEN".to_owned(), "test-token".to_owned());
+        }
+        crate::profile::save_profile(&p).expect("save profile");
+    }
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![plain.clone(), own.clone()],
+        ..Default::default()
+    })
+    .expect("save state");
+    for (n, _) in [(&plain, false), (&own, true)] {
+        crate::profile_cache::write_profile_cache(
+            n,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                spend: Some(crate::usage::SpendInfo {
+                    enabled: true,
+                    used: Some(50.0),
+                    limit: Some(50.0),
+                    percent: Some(100.0),
+                    currency: Some("USD".to_owned()),
+                }),
+                ..Default::default()
+            },
+        );
+    }
+    let config = crate::profile::load_config().expect("load config");
+    let jobs = crate::claude_jobs::job_trees();
+    let now = 1_700_000_000_000;
+    let row = |n: &crate::profile::ProfileName| {
+        profile_row(
+            config.find(n).expect("profile in the config"),
+            &config,
+            now,
+            &jobs,
+        )
+    };
+    assert_eq!(
+        row(&plain).get("credit_capped"),
+        Some(&serde_json::json!(true)),
+        "a plain capped row carries the flag"
+    );
+    assert!(
+        row(&own).get("credit_capped").is_none(),
+        "an own-endpoint capped row carries no flag"
+    );
 }
 
 // ── third-party auth guard ──────────────────────────────────────────────────
@@ -986,8 +1398,18 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
         .iter()
         .map(|n| (*n).to_string())
         .collect();
-    let err = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
-        .expect_err("a keyless member refuses the whole fan-out");
+    let err = resolve_fanout(
+        &config,
+        &raw,
+        None,
+        Isolation::Shared,
+        &[],
+        &[],
+        &[],
+        &HashMap::new(),
+        None,
+    )
+    .expect_err("a keyless member refuses the whole fan-out");
     assert_eq!(
         err,
         "profile has no api key: qwen (run `clauth login qwen --api-key <key>`)"
@@ -1044,8 +1466,18 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
         .iter()
         .map(|n| (*n).to_string())
         .collect();
-    let err = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
-        .expect_err("an empty-key member refuses the whole fan-out");
+    let err = resolve_fanout(
+        &config,
+        &raw,
+        None,
+        Isolation::Shared,
+        &[],
+        &[],
+        &[],
+        &HashMap::new(),
+        None,
+    )
+    .expect_err("an empty-key member refuses the whole fan-out");
     assert_eq!(
         err,
         "profile has no api key: ds-empty (run `clauth login ds-empty --api-key <key>`)"
@@ -1098,8 +1530,18 @@ fn resolve_fanout_refuses_an_auth_broken_member_by_name() {
         .iter()
         .map(|n| (*n).to_string())
         .collect();
-    let err = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
-        .expect_err("a quarantined member refuses the whole fan-out");
+    let err = resolve_fanout(
+        &config,
+        &raw,
+        None,
+        Isolation::Shared,
+        &[],
+        &[],
+        &[],
+        &HashMap::new(),
+        None,
+    )
+    .expect_err("a quarantined member refuses the whole fan-out");
     assert_eq!(
         err,
         crate::format::login_expired(&crate::profile::ProfileName::from("dead")).line()
@@ -1134,8 +1576,18 @@ fn a_disabled_and_quarantined_target_refuses_as_disabled() {
     );
 
     let raw = vec!["both".to_string()];
-    let err = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
-        .expect_err("a disabled member refuses the fan-out");
+    let err = resolve_fanout(
+        &config,
+        &raw,
+        None,
+        Isolation::Shared,
+        &[],
+        &[],
+        &[],
+        &HashMap::new(),
+        None,
+    )
+    .expect_err("a disabled member refuses the fan-out");
     assert_eq!(err, "profile is disabled: both (run `clauth enable both`)");
 }
 
@@ -1166,8 +1618,18 @@ fn a_quarantined_and_keyless_third_party_target_refuses_as_keyless() {
     );
 
     let raw = vec!["ds-both".to_string()];
-    let err = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
-        .expect_err("a keyless third-party member refuses the whole fan-out");
+    let err = resolve_fanout(
+        &config,
+        &raw,
+        None,
+        Isolation::Shared,
+        &[],
+        &[],
+        &[],
+        &HashMap::new(),
+        None,
+    )
+    .expect_err("a keyless third-party member refuses the whole fan-out");
     assert_eq!(
         err,
         "profile has no api key: ds-both (run `clauth login ds-both --api-key <key>`)"
@@ -1209,7 +1671,17 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
 
     let raw = vec!["ds-keyq".to_string()];
     assert_eq!(
-        resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[]),
+        resolve_fanout(
+            &config,
+            &raw,
+            None,
+            Isolation::Shared,
+            &[],
+            &[],
+            &[],
+            &HashMap::new(),
+            None
+        ),
         Ok(vec!["ds-keyq".to_string()]),
         "a quarantined third-party member with a working key still delegates",
     );
@@ -1222,6 +1694,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
             profile,
             &config,
             &crate::profile::ProfileName::from("ds-keyq"),
+            &[],
             &[],
             &[],
         ),
@@ -1259,6 +1732,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
             &crate::profile::ProfileName::from("generic-q"),
             &[],
             &[],
+            &[],
         ),
         Ok(()),
         "provider recognition is not the discriminator: an unrecognised endpoint \
@@ -1287,6 +1761,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
             oauth,
             &config,
             &crate::profile::ProfileName::from("oauth-q"),
+            &[],
             &[],
             &[],
         ),
@@ -1333,8 +1808,18 @@ fn resolve_fanout_passes_when_every_member_is_delegable() {
         .iter()
         .map(|n| (*n).to_string())
         .collect();
-    let names = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
-        .expect("every member has a credential");
+    let names = resolve_fanout(
+        &config,
+        &raw,
+        None,
+        Isolation::Shared,
+        &[],
+        &[],
+        &[],
+        &HashMap::new(),
+        None,
+    )
+    .expect("every member has a credential");
     assert_eq!(names, vec!["ds-key", "oauth1", "qwen"]);
 }
 
@@ -1655,6 +2140,353 @@ fn background_refuses_a_credit_capped_target_before_writing_job() {
     assert_eq!(
         job_count, 0,
         "a refused background delegate writes no job file"
+    );
+}
+
+/// The fan-out pre-flight reads the call's `args` too: a `--model fable` in
+/// `args` (not the `model` field) refuses a capped member before any job file.
+#[test]
+fn fanout_refuses_a_credit_billed_model_named_in_args() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "solo".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-test".to_string()),
+        Default::default(),
+    )
+    .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "capped".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let capped_name = crate::profile::ProfileName::from("capped");
+    let mut capped = crate::profile::load_profile(&capped_name).expect("load capped");
+    capped.check_credit_cap = true;
+    crate::profile::save_profile(&capped).expect("save capped");
+    crate::profile_cache::write_profile_cache(
+        &capped_name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            spend: Some(crate::usage::SpendInfo {
+                enabled: true,
+                used: Some(50.0),
+                limit: Some(50.0),
+                percent: Some(100.0),
+                currency: Some("USD".to_owned()),
+            }),
+            ..Default::default()
+        },
+    );
+
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the sandbox),
+    // restored unconditionally below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
+
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let result = rt
+        .block_on(async {
+            server
+                .delegate_with(
+                    DelegateArgs {
+                        profiles: Some(vec!["solo".to_string(), "capped".to_string()]),
+                        prompt: Some("hello".to_string()),
+                        model: None,
+                        cwd: None,
+                        env: None,
+                        args: Some(vec!["--model".to_string(), "fable".to_string()]),
+                        session_id: None,
+                        subagent_type: None,
+                        allowed_tools: None,
+                        permission_mode: None,
+                        result: None,
+                        isolated: None,
+                        background: Some(true),
+                    },
+                    ProgressSink::none(),
+                )
+                .await
+        })
+        .expect("delegate returns a tool result, never a transport error");
+
+    // SAFETY: restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a capped member refuses the fan-out"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("refusal text");
+    assert_eq!(
+        text,
+        "delegate failed: credit cap spent: capped cannot run fable, which Claude Code \
+         bills against usage credits; name another account or another model"
+    );
+    let job_count = jobs::jobs_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(job_count, 0, "a refused fan-out writes no job file");
+}
+
+/// The single-background pre-flight reads the call's `args` too: a `--model
+/// fable` in `args` refuses a capped target before its job file is reserved.
+#[test]
+fn background_refuses_a_credit_billed_model_named_in_args() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "capped".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let capped_name = crate::profile::ProfileName::from("capped");
+    let mut capped = crate::profile::load_profile(&capped_name).expect("load capped");
+    capped.check_credit_cap = true;
+    crate::profile::save_profile(&capped).expect("save capped");
+    crate::profile_cache::write_profile_cache(
+        &capped_name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            spend: Some(crate::usage::SpendInfo {
+                enabled: true,
+                used: Some(50.0),
+                limit: Some(50.0),
+                percent: Some(100.0),
+                currency: Some("USD".to_owned()),
+            }),
+            ..Default::default()
+        },
+    );
+
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the sandbox),
+    // restored unconditionally below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
+
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let result = rt
+        .block_on(async {
+            server
+                .delegate_with(
+                    DelegateArgs {
+                        profiles: Some(vec!["capped".to_string()]),
+                        prompt: Some("hello".to_string()),
+                        model: None,
+                        cwd: None,
+                        env: None,
+                        args: Some(vec!["--model".to_string(), "fable".to_string()]),
+                        session_id: None,
+                        subagent_type: None,
+                        allowed_tools: None,
+                        permission_mode: None,
+                        result: None,
+                        isolated: None,
+                        background: Some(true),
+                    },
+                    ProgressSink::none(),
+                )
+                .await
+        })
+        .expect("delegate returns a tool result, never a transport error");
+
+    // SAFETY: restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a capped background delegate refuses"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("refusal text");
+    assert_eq!(
+        text,
+        "delegate failed: credit cap spent: capped cannot run fable, which Claude Code \
+         bills against usage credits; name another account or another model"
+    );
+    let job_count = jobs::jobs_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(
+        job_count, 0,
+        "a refused background delegate writes no job file"
+    );
+}
+
+/// A background resume spawns in the transcript's workspace, so the pre-flight
+/// reads THAT workspace's project settings: a workspace `.claude/settings.json`
+/// naming fable refuses synchronously, before any job file is reserved.
+#[test]
+fn a_background_resume_reads_its_workspaces_project_model() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "capped".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let capped_name = crate::profile::ProfileName::from("capped");
+    let mut capped = crate::profile::load_profile(&capped_name).expect("load capped");
+    capped.check_credit_cap = true;
+    crate::profile::save_profile(&capped).expect("save capped");
+    crate::profile_cache::write_profile_cache(
+        &capped_name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            spend: Some(crate::usage::SpendInfo {
+                enabled: true,
+                used: Some(50.0),
+                limit: Some(50.0),
+                percent: Some(100.0),
+                currency: Some("USD".to_owned()),
+            }),
+            ..Default::default()
+        },
+    );
+
+    // A transcript whose recorded workspace carries the fable project model.
+    let id = "sess-bg-1";
+    let slug = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("projects")
+        .join("-w-bg");
+    std::fs::create_dir_all(&slug).expect("projects dir");
+    let workspace = _home.home().join("w-bg");
+    std::fs::create_dir_all(workspace.join(".claude")).expect("workspace dir");
+    std::fs::write(
+        workspace.join(".claude").join("settings.json"),
+        r#"{"model":"fable"}"#,
+    )
+    .expect("workspace settings");
+    std::fs::write(
+        slug.join(format!("{id}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"cwd\":{},\"message\":{{\"content\":\"hi\"}}}}\n",
+            serde_json::Value::String(workspace.to_string_lossy().into_owned())
+        ),
+    )
+    .expect("transcript fixture");
+
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the sandbox),
+    // restored unconditionally below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
+
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let result = rt
+        .block_on(async {
+            server
+                .delegate_with(
+                    DelegateArgs {
+                        profiles: Some(vec!["capped".to_string()]),
+                        prompt: Some("hello".to_string()),
+                        model: None,
+                        cwd: None,
+                        env: None,
+                        args: None,
+                        session_id: Some(id.to_string()),
+                        subagent_type: None,
+                        allowed_tools: None,
+                        permission_mode: None,
+                        result: None,
+                        isolated: None,
+                        background: Some(true),
+                    },
+                    ProgressSink::none(),
+                )
+                .await
+        })
+        .expect("delegate returns a tool result, never a transport error");
+
+    // SAFETY: restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "the workspace's fable model refuses"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("refusal text");
+    assert_eq!(
+        text,
+        "delegate failed: credit cap spent: capped cannot run fable, which Claude Code \
+         bills against usage credits; name another account or another model"
+    );
+    let job_count = jobs::jobs_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(
+        job_count, 0,
+        "a refused background resume writes no job file"
     );
 }
 
@@ -5668,7 +6500,7 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         // needle; the non-blanket direction, for the reason the canceled
         // clause above states.
         "`no api key`, `credit cap spent` or",
-        "`credit cap spent` refuses only a delegate whose model bills usage credits",
+        "`credit cap spent` refuses a delegate whose model bills usage credits, and one naming no model while the account's credit gate is on",
         // The direction of the percentage. A caller reading it backwards picks
         // the most-spent account. Relaxed 2026-08-20 from `less headroom` to the
         // clause the owner's copy states it with: the direction is what matters,
@@ -5680,6 +6512,25 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
             "`profiles` entry dropped {phrase:?}: {text}",
         );
     }
+}
+
+/// C1: the `profiles` description's credit-cap clause carries the owner's
+/// sentence verbatim — the unplaceable-model arm changed what the clause must
+/// say, and the old "refuses only" wording is gone.
+#[test]
+fn the_profiles_description_carries_the_credit_cap_sentence_verbatim() {
+    let text = tool_entry_text("profiles");
+    assert!(
+        text.contains(
+            "`credit cap spent` refuses a delegate whose model bills usage credits, \
+             and one naming no model while the account's credit gate is on."
+        ),
+        "the C1 sentence must appear verbatim: {text}"
+    );
+    assert!(
+        !text.contains("refuses only a delegate whose model bills usage credits"),
+        "the old wording is gone: {text}"
+    );
 }
 
 /// The roster's sort key. `roster_lines` is pinned on the value, so nothing else
@@ -9957,8 +10808,18 @@ fn resolve_fanout_refuses_a_codex_member_as_a_codex_account() {
     .expect("create profile");
 
     let raw: Vec<String> = ["cl1", "cx"].iter().map(|n| (*n).to_string()).collect();
-    let err = resolve_fanout(&config, &raw, None, Isolation::Shared, &[], &[])
-        .expect_err("a codex member refuses the fan-out");
+    let err = resolve_fanout(
+        &config,
+        &raw,
+        None,
+        Isolation::Shared,
+        &[],
+        &[],
+        &[],
+        &HashMap::new(),
+        None,
+    )
+    .expect_err("a codex member refuses the fan-out");
     assert_eq!(
         err,
         "profile not found: cx; cx names a CODEX account, which these tools do not manage — \

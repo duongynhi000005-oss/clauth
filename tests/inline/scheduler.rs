@@ -4188,6 +4188,8 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
         follows_chain: true,
         intended_member: None,
         chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
         current_member: None,
         last_swap_at: None,
         launch_store: None,
@@ -4570,6 +4572,122 @@ fn an_opus_session_stays_on_an_account_whose_credit_cap_is_spent() {
         (None, None),
         "opus bills the subscription; a spent credit cap never stops it"
     );
+}
+
+/// A credit-cap leave may land on a member whose `[models]` differ (cloudy,
+/// 2026-10-20, F7): a swap moves credentials only, so the session keeps running
+/// fable on `b`, whose cap is clear.
+#[test]
+fn a_credit_cap_leave_lands_on_a_member_whose_models_differ() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    row.credit_leave_aware = true;
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "fable"), ("b", "opus")], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (Some("b".to_string()), Some(1)));
+}
+
+/// A credit leave's relaxed member is judged fresh like any other: with a, b, c
+/// all fresh and clear and b differing only on `[models]`, the leave takes the
+/// FIRST eligible member in chain order — b, not the later models-equal c.
+#[test]
+fn a_credit_leave_takes_the_first_relaxed_member_in_chain_order() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    row.credit_leave_aware = true;
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[("a", "fable"), ("b", "opus")], &[]),
+        &credit_store(&["a", "b", "c"], &["a"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (Some("b".to_string()), Some(1)));
+}
+
+/// A row the launcher did not mark credit-leave-aware keeps the strict chain:
+/// the daemon never writes a relaxed intent for a session whose older binary
+/// would refuse it, so the models-equal `c` is the target, not the differing
+/// `b`.
+#[test]
+fn a_row_without_the_credit_leave_flag_keeps_the_strict_chain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    // `credit_leave_aware` stays false: an older launcher's row.
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b", "c"], &[("a", "fable"), ("b", "opus")], &[]),
+        &credit_store(&["a", "b", "c"], &["a"]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (Some("c".to_string()), Some(2)));
+}
+
+/// Every other leave keeps the models-equal rule: an exhausted window moves a
+/// session only onto a member whose `[models]` match its launch.
+#[test]
+fn an_exhaustion_leave_never_lands_on_a_member_whose_models_differ() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[("a", "fable"), ("b", "opus")], &[]),
+        &session_store(&[("a", 100.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (None, None));
+}
+
+/// An account serving inference from its own endpoint + token never spends
+/// its OAuth usage credits: a fable session there stays put on a spent cap.
+#[test]
+fn a_fable_session_stays_on_a_capped_account_serving_its_own_endpoint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.launch_families = Some(vec!["fable".to_string()]);
+    let _marker = register_live_row(&row);
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
+    {
+        // Both members share the endpoint, so `b` stays a swap-eligible
+        // target: only the exemption keeps the session on `a`.
+        let mut cfg = config.lock().unwrap();
+        for p in &mut cfg.profiles {
+            p.env.insert(
+                "ANTHROPIC_BASE_URL".to_owned(),
+                "http://127.0.0.1:9".to_owned(),
+            );
+            p.env
+                .insert("ANTHROPIC_AUTH_TOKEN".to_owned(), "test-token".to_owned());
+            assert!(
+                crate::claude::has_own_inference_endpoint(p),
+                "fixture control: {} serves from its own endpoint",
+                p.name
+            );
+        }
+    }
+
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (None, None));
 }
 
 /// No `[models] default`: clauth cannot tell the session's model, so the cap
@@ -5090,7 +5208,10 @@ fn an_outgoing_profiles_env_model_does_not_make_an_opus_session_credit_billed() 
         crate::runtime::Isolation::Shared,
         &stale,
         &[],
-        &[None, None],
+        None,
+        crate::start::EnvLeg::Process,
+        None,
+        |_| None,
     ));
     assert_eq!(
         launch,

@@ -174,68 +174,39 @@ pub(crate) fn process_model_env() -> [Option<String>; 2] {
     PROCESS_MODEL_ENV_KEYS.map(|key| std::env::var(key).ok())
 }
 
-/// The model strings one chain member's session may run, from every source a
-/// launcher can see before the session exists: the member's RUNTIME
-/// `settings.json` overlay (built through the same builder and base choice the
-/// runtime write applies, so the two cannot drift), the process environment
-/// pair (only the keys the spawned child keeps after the scrub, and an
-/// inherited `ANTHROPIC_MODEL` only while the built `env` carries none — Claude
-/// Code applies settings `env` over the inherited value), and an explicit
-/// `--model` passthrough. Per-member form of the launch union — the GLOBAL live
-/// settings do not name what a member's session runs, because the overlay drops
-/// a global `model` the member's `[models] default` does not carry. A UNION,
-/// not a resolution — a `Task` subagent shares the parent's process-wide
-/// credential memo, so it spends the same account on whatever model it runs,
-/// and selecting for the headline model alone strands it (see
-/// [`crate::fallback::start_walk`]).
-pub(crate) fn member_launch_models(
-    profile: &Profile,
-    isolation: Isolation,
-    stale_env_keys: &[String],
-    claude_args: &[String],
+/// The `env_of` reader for [`member_launch_models`]: maps a model env key to
+/// its slot in the process-env pair, so the start and fallback paths pass one
+/// closure instead of each writing the match.
+pub(crate) fn process_model_env_of(
     env_models: &[Option<String>; 2],
-) -> Vec<String> {
-    let base = crate::profile::claude_dir()
-        .ok()
-        .and_then(|home| crate::runtime::settings_base(&home, isolation));
-    let (settings, env_sets_anthropic_model) =
-        crate::claude::runtime_models(base.as_deref(), profile, stale_env_keys);
-    launch_models_from(
-        settings,
-        [
-            (crate::runtime::env_survives_scrub(PROCESS_MODEL_ENV_KEYS[0], stale_env_keys)
-                && !env_sets_anthropic_model)
-                .then(|| env_models[0].clone())
-                .flatten(),
-            crate::runtime::env_survives_scrub(PROCESS_MODEL_ENV_KEYS[1], stale_env_keys)
-                .then(|| env_models[1].clone())
-                .flatten(),
-        ],
-        claude_args,
-    )
+) -> impl Fn(&str) -> Option<String> + '_ {
+    move |key| match key {
+        "ANTHROPIC_MODEL" => env_models[0].clone(),
+        "CLAUDE_CODE_SUBAGENT_MODEL" => env_models[1].clone(),
+        _ => None,
+    }
 }
 
-/// The union of the three model sources a launcher can see, held here so the
-/// union is testable without a home or a process environment: the runtime
-/// overlay's model strings, the two process-env strings (in order), and the
-/// passthrough args. An empty env value is dropped, never a family.
-pub(crate) fn launch_models_from(
-    settings: Vec<String>,
-    env: [Option<String>; 2],
-    args: &[String],
-) -> Vec<String> {
-    let mut out = settings;
-    out.extend(env.into_iter().flatten().filter(|v| !v.trim().is_empty()));
-    out.extend(models_from_args(args));
-    out
+/// Where the `env_models` pair came from. The start path's inherited process
+/// env is scrubbed before the child sees it, so a key reaches the child only
+/// where [`crate::runtime::env_survives_scrub`] keeps it; the delegate's caller
+/// env is layered AFTER the scrub ([`crate::mcp::apply_delegate_env`]), so it
+/// always reaches the child. Both still lose to a settings `env` value for the
+/// same key (Claude Code applies settings env at startup).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvLeg {
+    Process,
+    Caller,
 }
 
-/// The `--model` and `--fallback-model` values in a passthrough arg list, in
-/// both spellings. A `--fallback-model` value is a comma-separated list of
-/// models, split and trimmed here. Split out of the launch-union helpers so the
-/// parsing is testable without a home (its siblings read `settings.json` and
-/// the environment, which resolve the operator's real home outside a sandbox).
-pub(crate) fn models_from_args(claude_args: &[String]) -> Vec<String> {
+/// The last `--model` value and every `--fallback-model` value in a passthrough
+/// arg list, in both spellings. Split because the headline slot holds exactly
+/// one model — the LAST `--model` wins — while fallback models are unioned. A
+/// blank `--model` value (`--model=`, `--model ""`) is absent, never a
+/// headline: a blank value names no model, and an empty string would both
+/// erase the overlay default and print an empty interpolation in the
+/// unplaceable-model refusal.
+pub(crate) fn parsed_model_args(claude_args: &[String]) -> (Option<String>, Vec<String>) {
     fn comma_list(out: &mut Vec<String>, v: &str) {
         out.extend(
             v.split(',')
@@ -245,23 +216,300 @@ pub(crate) fn models_from_args(claude_args: &[String]) -> Vec<String> {
         );
     }
 
-    let mut out = Vec::new();
+    let mut headline = None;
+    let mut fallbacks = Vec::new();
     let mut args = claude_args.iter();
     while let Some(a) = args.next() {
         if let Some(v) = a.strip_prefix("--model=") {
-            out.push(v.to_owned());
+            if !v.trim().is_empty() {
+                headline = Some(v.to_owned());
+            }
         } else if let Some(v) = a.strip_prefix("--fallback-model=") {
-            comma_list(&mut out, v);
+            comma_list(&mut fallbacks, v);
         } else if a == "--model"
             && let Some(v) = args.next()
         {
-            out.push(v.clone());
+            if !v.trim().is_empty() {
+                headline = Some(v.clone());
+            }
         } else if a == "--fallback-model"
             && let Some(v) = args.next()
         {
-            comma_list(&mut out, v);
+            comma_list(&mut fallbacks, v);
         }
     }
+    (headline, fallbacks)
+}
+
+/// The model strings one chain member's session may run, by Claude Code's own
+/// precedence:
+///
+/// - the HEADLINE is exactly one model: the last `--model` in `claude_args`,
+///   else the delegate's `model`, else `ANTHROPIC_MODEL` as the child sees it
+///   (settings `env` applied over an inherited/caller value), else the settings
+///   `model` by source precedence (a `--settings <file|json>` passthrough, then
+///   project-local `.claude/settings.local.json`, then project
+///   `.claude/settings.json`, then the runtime overlay; the project sources are
+///   skipped where `cwd` is the real `$HOME`, and each is read only when a
+///   `--setting-sources` list names its tier);
+/// - UNIONED beside it: the overlay's `fallbackModel` entries, every
+///   `--fallback-model` value, and `CLAUDE_CODE_SUBAGENT_MODEL` as the child
+///   sees it (passthrough env, else project env, else overlay env, else
+///   inherited/caller where it survives);
+/// - then a `[models]` alias (`opus`/`sonnet`/`haiku`/`fable`, bare or with a
+///   `[1m]`-style context suffix) remaps onto the `ANTHROPIC_DEFAULT_*_MODEL`
+///   env value the child sees; a composite (`opusplan`/`best`) expands to its
+///   member aliases before that remap.
+///
+/// A UNION of the headline plus those side sources — a `Task` subagent shares
+/// the parent's process-wide credential memo, so it spends the same account on
+/// whatever model it runs, and selecting for the headline model alone strands
+/// it (see [`crate::fallback::start_walk`]).
+///
+/// `env_of` answers the inherited (start) or caller (delegate) env value for a
+/// model env key; the `env_leg` decides whether that value survives the scrub
+/// into the child.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn member_launch_models(
+    profile: &Profile,
+    isolation: Isolation,
+    stale_env_keys: &[String],
+    claude_args: &[String],
+    delegate_model: Option<&str>,
+    env_leg: EnvLeg,
+    cwd: Option<&Path>,
+    env_of: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let base = crate::profile::claude_dir()
+        .ok()
+        .and_then(|home| crate::runtime::settings_base(&home, isolation));
+    let overlay = crate::claude::runtime_model_sources(base.as_deref(), profile, stale_env_keys);
+    let passthrough = passthrough_settings_sources(claude_args, cwd);
+    let project = project_model_sources(cwd, claude_args);
+
+    let (arg_model, arg_fallbacks) = parsed_model_args(claude_args);
+    let mut union = overlay.fallbacks.clone();
+    union.extend(arg_fallbacks);
+    let survives = |key: &str| match env_leg {
+        EnvLeg::Process => crate::runtime::env_survives_scrub(key, stale_env_keys),
+        EnvLeg::Caller => true,
+    };
+    // The child's value for one model env key, by the same tier precedence for
+    // every key: passthrough settings env, project settings env, overlay env,
+    // then the inherited/caller env where it survives the scrub.
+    let child_env = |key: &str| -> Option<String> {
+        passthrough
+            .env_value(key)
+            .or_else(|| project.env_value(key))
+            .or_else(|| overlay.env_value(key))
+            .or_else(|| survives(key).then(|| env_of(key)).flatten())
+    };
+    let settings_model = passthrough
+        .model
+        .clone()
+        .or_else(|| project.model.clone())
+        .or_else(|| overlay.model.clone());
+    let headline = arg_model
+        .or_else(|| {
+            delegate_model
+                .filter(|m| !m.trim().is_empty())
+                .map(|m| m.to_owned())
+        })
+        .or_else(|| child_env(PROCESS_MODEL_ENV_KEYS[0]))
+        .or(settings_model);
+
+    let mut out = launch_models_from(union, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+    if let Some(m) = headline {
+        out.insert(0, m);
+    }
+    remap_model_aliases(&mut out, &child_env);
+    out
+}
+
+/// Substitute a member's `[models]` alias remap for any demand string that
+/// names one of the four bare aliases (a `[1m]`-style context suffix is kept):
+/// what the alias actually runs is the `ANTHROPIC_DEFAULT_*_MODEL` env value
+/// the child sees, resolved through `child_env` by the same precedence as
+/// `ANTHROPIC_MODEL`. A composite (`opusplan`/`best`) expands to its member
+/// aliases BEFORE the remap, so each member alias routes through the same
+/// remap a bare spelling would. `strip_bracket_suffix` runs on the trimmed
+/// ORIGINAL (it returns a prefix, so its length is a char boundary), and the
+/// alias match is ASCII-case-insensitive.
+fn remap_model_aliases(models: &mut Vec<String>, child_env: &impl Fn(&str) -> Option<String>) {
+    const ALIAS_KEYS: [(&str, &str); 4] = [
+        ("opus", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+        ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+        ("haiku", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+        ("fable", "ANTHROPIC_DEFAULT_FABLE_MODEL"),
+    ];
+    let mut expanded: Vec<String> = Vec::with_capacity(models.len());
+    for m in models.iter() {
+        let trimmed = m.trim();
+        let base = crate::pricing::strip_bracket_suffix(trimmed);
+        let suffix = &trimmed[base.len()..];
+        let members: Option<&[&str]> = if base.eq_ignore_ascii_case("opusplan") {
+            Some(&["opus", "sonnet"])
+        } else if base.eq_ignore_ascii_case("best") {
+            Some(&["fable", "opus"])
+        } else {
+            None
+        };
+        match members {
+            Some(members) => {
+                for alias in members {
+                    expanded.push(format!("{alias}{suffix}"));
+                }
+            }
+            None => expanded.push(m.clone()),
+        }
+    }
+
+    for m in &mut expanded {
+        let trimmed = m.trim();
+        let base = crate::pricing::strip_bracket_suffix(trimmed);
+        let suffix = &trimmed[base.len()..];
+        let env_key = ALIAS_KEYS
+            .iter()
+            .find(|(alias, _)| base.eq_ignore_ascii_case(alias))
+            .map(|(_, key)| *key);
+        let Some(env_key) = env_key else {
+            continue;
+        };
+        if let Some(id) = child_env(env_key) {
+            *m = format!("{id}{suffix}");
+        }
+    }
+    *models = expanded;
+}
+
+/// The model slots a passthrough `--settings <file|json>` sets, the top
+/// settings tier: above project-local. Parsed through the same helpers the
+/// spawn-side settings fold uses, so one value is read one way. Empty when the
+/// args carry no `--settings` or the value fails to parse (the spawn path warns;
+/// the demand just reads nothing from it). Inline JSON is self-contained and
+/// reads with no cwd; only the relative file form resolves against the cwd.
+fn passthrough_settings_sources(
+    claude_args: &[String],
+    cwd: Option<&Path>,
+) -> crate::claude::RuntimeModelSources {
+    let Ok((Some(value), _)) = crate::cc_exempt::fold_settings_args(claude_args) else {
+        return crate::claude::RuntimeModelSources::default();
+    };
+    let inline = crate::cc_exempt::is_inline_settings(&value);
+    let parsed = if inline {
+        crate::cc_exempt::parse_settings_value(&value, std::path::Path::new("."), true)
+    } else {
+        let Some(dir) = cwd else {
+            return crate::claude::RuntimeModelSources::default();
+        };
+        crate::cc_exempt::parse_settings_value(&value, dir, false)
+    };
+    let Ok(map) = parsed else {
+        return crate::claude::RuntimeModelSources::default();
+    };
+    crate::claude::model_sources_from_json(&serde_json::Value::Object(map))
+}
+
+/// The project-tier sources a `--setting-sources` list enables, as
+/// `(project, local)`. The LAST flag governs; no flag enables both (Claude
+/// Code reads both project files by default). A list naming neither still
+/// reads neither project file: the runtime injects `--setting-sources user`
+/// only at the real `$HOME`, which [`project_model_sources`]' own home check
+/// already skips, so the `user` tier is not judged here.
+fn project_setting_sources(claude_args: &[String]) -> (bool, bool) {
+    let mut enabled = (true, true);
+    let mut args = claude_args.iter();
+    while let Some(a) = args.next() {
+        let value = if let Some(v) = a.strip_prefix("--setting-sources=") {
+            Some(v)
+        } else if a == "--setting-sources" {
+            args.next().map(String::as_str)
+        } else {
+            None
+        };
+        let Some(value) = value else {
+            continue;
+        };
+        let list: Vec<&str> = value.split(',').map(str::trim).collect();
+        enabled = (list.contains(&"project"), list.contains(&"local"));
+    }
+    enabled
+}
+
+/// The model strings a project's committed settings put in effect for a spawn
+/// in `cwd`, by Claude Code's own tier precedence (`.claude/settings.local.json`
+/// over `.claude/settings.json`), per key. Empty when `cwd` is `None`, the
+/// real `$HOME` (the runtime passes `--setting-sources user` there, so the
+/// project tiers never apply), or the passthrough's `--setting-sources` list
+/// disables a tier. A test build reads no project dir outside its sandbox
+/// home, so a real checkout-root `.claude/settings*.json` never steers the
+/// demand.
+fn project_model_sources(
+    cwd: Option<&Path>,
+    claude_args: &[String],
+) -> crate::claude::RuntimeModelSources {
+    let mut out = crate::claude::RuntimeModelSources::default();
+    let Some(dir) = cwd.filter(|dir| !crate::runtime::cwd_is_real_home(dir)) else {
+        return out;
+    };
+    // A test build's only home is the sandbox: skip a project dir not under
+    // it (mirrors `plugin_probe::on_path`). `home_dir()` panics when no
+    // sandbox is held, so the `else` arm only satisfies the `Result` type.
+    #[cfg(test)]
+    {
+        let Ok(home) = crate::profile::home_dir() else {
+            return out;
+        };
+        if !dir.starts_with(&home) {
+            return out;
+        }
+    }
+    let (project, local) = project_setting_sources(claude_args);
+    // Local outranks project, so it is read FIRST and the project tier only
+    // fills keys the local tier left unset.
+    for file in [
+        local.then(|| dir.join(".claude").join("settings.local.json")),
+        project.then(|| dir.join(".claude").join("settings.json")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Ok(settings) = crate::profile::read_json_file::<serde_json::Value>(&file) else {
+            continue;
+        };
+        let src = crate::claude::model_sources_from_json(&settings);
+        if out.model.is_none() {
+            out.model = src.model;
+        }
+        if out.env_anthropic.is_none() {
+            out.env_anthropic = src.env_anthropic;
+        }
+        if out.env_subagent.is_none() {
+            out.env_subagent = src.env_subagent;
+        }
+        if out.env_opus.is_none() {
+            out.env_opus = src.env_opus;
+        }
+        if out.env_sonnet.is_none() {
+            out.env_sonnet = src.env_sonnet;
+        }
+        if out.env_haiku.is_none() {
+            out.env_haiku = src.env_haiku;
+        }
+        if out.env_fable.is_none() {
+            out.env_fable = src.env_fable;
+        }
+    }
+    out
+}
+
+/// The union of the two model sources a launcher can see, held here so the
+/// union is testable without a home or a process environment: the runtime
+/// overlay's model strings and the subagent env string. An empty env value is
+/// dropped, never a family.
+pub(crate) fn launch_models_from(settings: Vec<String>, env: [Option<String>; 2]) -> Vec<String> {
+    let mut out = settings;
+    out.extend(env.into_iter().flatten().filter(|v| !v.trim().is_empty()));
     out
 }
 
@@ -373,12 +621,16 @@ pub(crate) fn run(
     // post-spawn flock hold covers only the field writes: the row's update
     // below takes the state flock, and the demand must name what this launch
     // actually ran.
+    let env_models = process_model_env();
     let launch_families = crate::fallback::demand_from(member_launch_models(
         profile,
         isolation,
         &stale_env_keys,
         claude_args,
-        &process_model_env(),
+        None,
+        EnvLeg::Process,
+        spawn_cwd.as_deref(),
+        process_model_env_of(&env_models),
     ));
     let mut child = command.spawn().context("failed to spawn claude")?;
     // Record the child's pid and the launch demand's resolved families on the
@@ -390,6 +642,7 @@ pub(crate) fn run(
     let _ = crate::live_sessions::update_as_session(runtime.session_id(), |fields| {
         fields.set_claude_pid(child.id());
         fields.set_launch_families(launch_families);
+        fields.set_credit_leave_aware();
     });
 
     #[cfg(unix)]

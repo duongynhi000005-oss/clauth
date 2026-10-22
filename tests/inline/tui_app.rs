@@ -15909,6 +15909,8 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
         follows_chain: false,
         intended_member: None,
         chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
         current_member: None,
         last_swap_at: None,
         launch_store: None,
