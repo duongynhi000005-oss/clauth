@@ -107,6 +107,10 @@ pub(crate) fn emit(args: Arguments<'_>, newline: bool) {
 /// silently. Neither had anywhere left to report the failure, so there is
 /// nothing to trade for the line.
 pub(crate) fn emit_err(args: Arguments<'_>) {
+    #[cfg(test)]
+    if captured_err(&args) {
+        return;
+    }
     let _ = write_chunk(&mut std::io::stderr().lock(), args, true, "stderr");
 }
 
@@ -218,6 +222,88 @@ fn captured(args: &Arguments<'_>, newline: bool) -> bool {
                     if newline {
                         line.push('\n');
                     }
+                    buf.0
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .extend_from_slice(line.as_bytes());
+                })
+                .is_some()
+        })
+        .unwrap_or(false)
+}
+
+// ── test-only stderr capture ────────────────────────────────────────────────
+//
+// The [`emit_err`] half of the stdout capture above: diverts the stderr bytes
+// one thread writes into a buffer, so a test can pin exactly what a foreground
+// run printed to stderr. The same per-thread shape as [`OutCapture`] and for
+// the same reason — under a plain `cargo test` run every `tests/inline/*.rs`
+// compiles into one binary whose tests are THREADS.
+
+#[cfg(test)]
+thread_local! {
+    static ERR_CAPTURE: std::cell::RefCell<Option<ErrCapture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A capture buffer for stderr. Clone it into the thread whose writes are
+/// wanted, keep the original to read them back.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ErrCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl ErrCapture {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take every stderr byte the CALLING thread writes until the returned
+    /// guard drops. Panics when one is already installed, like
+    /// [`OutCapture::capture_here`].
+    #[must_use]
+    pub(crate) fn capture_here(&self) -> ErrCaptureGuard {
+        ERR_CAPTURE.with(|c| {
+            let mut c = c.borrow_mut();
+            assert!(
+                c.is_none(),
+                "an err capture is already installed on this thread"
+            );
+            *c = Some(self.clone());
+        });
+        ErrCaptureGuard(std::marker::PhantomData)
+    }
+
+    /// The bytes taken so far, in write order.
+    pub(crate) fn snapshot(&self) -> Vec<u8> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+/// RAII half of [`ErrCapture::capture_here`]: restores the thread's real sink
+/// on drop, panic included. `!Send` by construction, for the same reason as
+/// [`OutCaptureGuard`].
+#[cfg(test)]
+pub(crate) struct ErrCaptureGuard(std::marker::PhantomData<*const ()>);
+
+#[cfg(test)]
+impl Drop for ErrCaptureGuard {
+    fn drop(&mut self) {
+        let _ = ERR_CAPTURE.try_with(|c| c.borrow_mut().take());
+    }
+}
+
+/// Whether this thread's capture took the line [`emit_err`] would have
+/// printed (the trailing newline included).
+#[cfg(test)]
+fn captured_err(args: &Arguments<'_>) -> bool {
+    ERR_CAPTURE
+        .try_with(|c| {
+            c.borrow()
+                .as_ref()
+                .map(|buf| {
+                    let mut line = args.to_string();
+                    line.push('\n');
                     buf.0
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())

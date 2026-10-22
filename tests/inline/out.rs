@@ -193,6 +193,78 @@ fn a_capture_takes_the_writes_until_its_guard_drops() {
     );
 }
 
+/// The stderr half captures through its own buffer: `emit_err` checks it the
+/// way `emit` checks the stdout capture, so a foreground run's stderr is
+/// pinnable without writing to the terminal running the suite.
+#[test]
+fn an_err_capture_takes_the_stderr_writes_until_its_guard_drops() {
+    let first = ErrCapture::new();
+    let guard = first.capture_here();
+    errln!("err line {}", 2);
+    assert_eq!(
+        first.snapshot(),
+        b"err line 2\n".to_vec(),
+        "the capture must carry stderr bytes exactly as written, newline included"
+    );
+    drop(guard);
+
+    let second = ErrCapture::new();
+    let _guard = second.capture_here();
+    errln!("after the first guard");
+    assert_eq!(
+        second.snapshot(),
+        b"after the first guard\n".to_vec(),
+        "the write went somewhere other than the capture standing when it was raised"
+    );
+}
+
+/// The stderr capture's per-thread scope, asked the same way as the stdout
+/// one's below: a thread that installed nothing is never handed another
+/// thread's capture, and a sibling's install and drop leave this thread's own.
+#[test]
+fn an_err_capture_takes_only_the_writes_raised_on_its_own_thread() {
+    let mine = ErrCapture::new();
+    let _guard = mine.capture_here();
+    errln!("raised before the sibling");
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(
+                !captured_err(&format_args!("probed from the sibling thread")),
+                "a thread that installed nothing was handed another thread's err capture"
+            );
+            let theirs = ErrCapture::new();
+            let _guard = theirs.capture_here();
+            errln!("raised on the sibling thread");
+            assert_eq!(
+                theirs.snapshot(),
+                b"raised on the sibling thread\n".to_vec(),
+                "the sibling's own err capture must take its write"
+            );
+        });
+    });
+
+    errln!("raised after the sibling");
+    assert_eq!(
+        mine.snapshot(),
+        b"raised before the sibling\nraised after the sibling\n".to_vec(),
+        "the sibling's install and its drop both reached across threads"
+    );
+}
+
+/// An err guard is a claim on the thread that installed it, like the stdout
+/// guard below.
+#[test]
+fn an_err_capture_guard_cannot_be_carried_to_another_thread() {
+    use crate::testutil::{NotSend as _, Probe};
+
+    assert!(Probe::<ErrCapture>::is_send(), "positive control");
+    assert!(
+        !Probe::<ErrCaptureGuard>::is_send(),
+        "a guard that can cross threads restores the wrong thread's sink"
+    );
+}
+
 /// The per-thread scope IS what keeps one test's capture off another's bytes
 /// under the `cargo test` fallback, where every inline test is a thread of one
 /// binary. A process-global sink passes every other test in this file, so the

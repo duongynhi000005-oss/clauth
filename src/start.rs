@@ -311,6 +311,12 @@ pub(crate) fn run(
             crate::live_sessions::Launcher::Own,
         )?
     };
+    // A shared store `~/.claude` refused to create would otherwise fail
+    // silently: surface the consequence once the spinner is off, the same
+    // `errln!` shape the `cc_exempt` warning below uses.
+    for note in runtime.store_notes() {
+        errln!("{note}");
+    }
 
     #[cfg(unix)]
     let signal_watcher = SignalWatcher::new()?;

@@ -723,6 +723,133 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
     );
 }
 
+// ── the shared-store skip line ─────────────────────────────────────────────
+
+/// A `clauth start` of a shared profile under a `~/.claude` that refuses new
+/// dirs still succeeds, and tells the terminal once per store it could not
+/// create, naming only that store's own consequence. The build hands the
+/// lines back and `start::run` prints them through `errln!`, captured here.
+/// Linked trees only: a host that cannot symlink copies `~/.claude` instead
+/// and creates no store, so it cannot pose the failure.
+#[cfg(unix)]
+#[test]
+fn start_prints_one_line_per_store_it_cannot_create() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let probe = tempfile::tempdir().expect("probe dir");
+    if std::os::unix::fs::symlink(probe.path(), probe.path().join("link")).is_err() {
+        return;
+    }
+
+    // Both stores fail.
+    {
+        let sb = HomeSandbox::new();
+        let claude = sb.home().join(".claude");
+        std::fs::create_dir_all(&claude).expect("~/.claude");
+        let _config = ConfigDirSandbox::new(&sb, &claude);
+        let fake = FakeClaude::new(&sb);
+        // `acquire` re-reads the account record from disk under the state
+        // flock, so the sandbox needs the profile the run starts under.
+        let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+        std::fs::create_dir_all(&clauth_dir).expect("clauth dir");
+        std::fs::write(
+            clauth_dir.join("profiles.toml"),
+            "profiles = [\"wired\", \"spare\"]\n",
+        )
+        .expect("profiles.toml");
+        let config = chain_ready_config("wired");
+
+        let unwritable = crate::testutil::UnwritableDir::new(&claude);
+        let refused = std::fs::create_dir(claude.join("probe"))
+            .expect_err("the unwritable dir refuses a new dir")
+            .to_string();
+        let capture = crate::out::ErrCapture::new();
+        let guard = capture.capture_here();
+
+        run(
+            &config,
+            &crate::profile::ProfileName::from("wired"),
+            &[],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect("a shared start succeeds when stores cannot be created");
+        drop(guard);
+        drop(unwritable);
+        drop(fake);
+
+        let expected = [
+            format!(
+                "clauth: could not create {}: {refused}; this session's background jobs \
+                 stay in its own tree and are lost when it ends\n",
+                claude.join("jobs").display()
+            ),
+            format!(
+                "clauth: could not create {}: {refused}; this session's transcripts \
+                 stay in its own tree and are lost when it ends\n",
+                claude.join("projects").display()
+            ),
+        ];
+        assert_eq!(
+            String::from_utf8(capture.snapshot()).expect("captured stderr is utf-8"),
+            expected.join(""),
+            "stderr carries exactly one line per uncreatable store, nothing else"
+        );
+    }
+
+    // Only `jobs` fails: `projects` pre-exists as a real dir before arming, so
+    // the run names only the store whose records stay in the tree.
+    {
+        let sb = HomeSandbox::new();
+        let claude = sb.home().join(".claude");
+        std::fs::create_dir_all(claude.join("projects")).expect("~/.claude/projects");
+        let _config = ConfigDirSandbox::new(&sb, &claude);
+        let fake = FakeClaude::new(&sb);
+        let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+        std::fs::create_dir_all(&clauth_dir).expect("clauth dir");
+        std::fs::write(
+            clauth_dir.join("profiles.toml"),
+            "profiles = [\"wired\", \"spare\"]\n",
+        )
+        .expect("profiles.toml");
+        let config = chain_ready_config("wired");
+
+        let unwritable = crate::testutil::UnwritableDir::new(&claude);
+        let refused = std::fs::create_dir(claude.join("probe"))
+            .expect_err("the unwritable dir refuses a new dir")
+            .to_string();
+        let capture = crate::out::ErrCapture::new();
+        let guard = capture.capture_here();
+
+        run(
+            &config,
+            &crate::profile::ProfileName::from("wired"),
+            &[],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect("a shared start succeeds when the jobs store cannot be created");
+        drop(guard);
+        drop(unwritable);
+        drop(fake);
+
+        let expected = format!(
+            "clauth: could not create {}: {refused}; this session's background jobs \
+             stay in its own tree and are lost when it ends\n",
+            claude.join("jobs").display()
+        );
+        assert_eq!(
+            String::from_utf8(capture.snapshot()).expect("captured stderr is utf-8"),
+            expected,
+            "stderr carries exactly the jobs line, nothing else"
+        );
+    }
+}
+
 /// The codex spawn's wire facts, pinned without spawning: the CODEX_HOME pin,
 /// the forced file store as the FIRST -c (a caller's later -c wins in codex's
 /// layering, which is their own foot-gun to aim), and the passthrough args

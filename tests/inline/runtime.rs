@@ -2578,7 +2578,7 @@ fn a_shared_tree_links_projects_on_a_box_without_the_store() {
         let profile = make_profile("projectslink");
         let canonical = tmp.path().join("creds.json");
 
-        build_runtime_dir(
+        let notes = build_runtime_dir(
             &runtime,
             &claude_home,
             &profile,
@@ -2587,6 +2587,11 @@ fn a_shared_tree_links_projects_on_a_box_without_the_store() {
             Isolation::Shared,
         )
         .expect("build");
+
+        assert!(
+            notes.is_empty(),
+            "a store created successfully raises no note, got: {notes:?}"
+        );
 
         let store = claude_home.join("projects");
         assert!(store.is_dir(), "the store is created before the walk");
@@ -2687,7 +2692,7 @@ fn a_shared_build_skips_a_store_that_is_not_a_usable_dir() {
         let profile = make_profile("badstores");
         let canonical = tmp.path().join("creds.json");
 
-        build_runtime_dir(
+        let notes = build_runtime_dir(
             &runtime,
             &claude_home,
             &profile,
@@ -2696,6 +2701,11 @@ fn a_shared_build_skips_a_store_that_is_not_a_usable_dir() {
             Isolation::Shared,
         )
         .expect("a store that is not a usable dir skips, never fails the build");
+
+        assert!(
+            notes.is_empty(),
+            "an unusable store skip raises no note, got: {notes:?}"
+        );
 
         assert!(
             claude_home
@@ -2725,7 +2735,8 @@ fn a_shared_build_skips_a_store_that_is_not_a_usable_dir() {
 /// not refuse a shared start: the store is skipped, as an unusable one is, and
 /// the tree gets no link for it. The base started there — the walk only links
 /// what `~/.claude` already holds — and this fix must not be stricter than the
-/// base it corrects.
+/// base it corrects. Each store it cannot create is returned as a note the
+/// start path prints, one line naming only that store's own consequence.
 ///
 /// Unix only: [`crate::testutil::UnwritableDir`]'s Windows deny ACE still lets
 /// a new SUBDIRECTORY through, so it cannot pose a refused `mkdir` here.
@@ -2751,8 +2762,15 @@ fn a_shared_build_skips_a_store_it_cannot_create() {
         let profile = make_profile("uncreatablestores");
         let canonical = tmp.path().join("creds.json");
         let unwritable = crate::testutil::UnwritableDir::new(&claude_home);
+        // The refusal's text as this platform's std renders it, read off an
+        // independent create under the same unwritable dir.
+        let refused = fs::create_dir(claude_home.join("probe"))
+            .expect_err("the unwritable dir refuses a new dir")
+            .to_string();
+        let lines = crate::logline::LogLines::new();
+        let capture = lines.capture_here();
 
-        build_runtime_dir(
+        let notes = build_runtime_dir(
             &runtime,
             &claude_home,
             &profile,
@@ -2761,7 +2779,29 @@ fn a_shared_build_skips_a_store_it_cannot_create() {
             Isolation::Shared,
         )
         .expect("a store that cannot be created skips, never fails the build");
+        drop(capture);
         drop(unwritable);
+
+        // The build raises no log line for a failed create: the notes travel
+        // back to the acquire seam, and the start path prints them.
+        assert!(
+            lines.snapshot().is_empty(),
+            "the build must raise no logline line, got: {:?}",
+            lines.snapshot()
+        );
+        // cloudy 2026-10-22: one note per store the build could not create,
+        // each naming only its own consequence.
+        assert_eq!(
+            notes,
+            [("jobs", "background jobs"), ("projects", "transcripts")].map(
+                |(store, consequence)| format!(
+                    "clauth: could not create {}: {refused}; this session's {consequence} \
+                     stay in its own tree and are lost when it ends",
+                    claude_home.join(store).display()
+                )
+            ),
+            "one note per store the build could not create"
+        );
 
         assert!(
             claude_home.join("jobs").symlink_metadata().is_err(),

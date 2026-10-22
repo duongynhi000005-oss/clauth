@@ -4164,6 +4164,10 @@ pub(crate) struct ProfileRuntime {
     pid_file: PathBuf,
     claude_home: PathBuf,
     sessions: PathBuf,
+    /// Notes raised while building the runtime dir — one per shared store the
+    /// build could not create — held so the caller surfaces them once. The
+    /// foreground start prints them; the MCP delegate path stays silent.
+    store_notes: Vec<String>,
     /// Held for the lifetime of the session so a sibling process's
     /// `try_lock` reveals we're still alive.
     _pid_lock: File,
@@ -4362,7 +4366,7 @@ impl ProfileRuntime {
             .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
         pre_lock_done();
 
-        let (session, paths, pid_lock, mode, fresh) = with_state_lock(|_held| {
+        let (session, paths, pid_lock, mode, fresh, store_notes) = with_state_lock(|_held| {
             // Inside the hold, and ahead of every write this closure does — see
             // `refuse_if_unconfigured` for which mechanism each half buys.
             refuse_if_unconfigured(name)?;
@@ -4447,7 +4451,7 @@ impl ProfileRuntime {
             }
             crate::profile::mkdir_700(runtime)
                 .with_context(|| format!("failed to create {}", runtime.display()))?;
-            build_runtime_dir_with_active_env(
+            let store_notes = build_runtime_dir_with_active_env(
                 runtime,
                 &claude_home,
                 &fresh,
@@ -4508,7 +4512,7 @@ impl ProfileRuntime {
                 logline!("clauth: registering the live session failed: {e}");
             }
             stamp_window_closing(&paths, &session);
-            Ok::<_, anyhow::Error>((session, paths, file, mode, fresh))
+            Ok::<_, anyhow::Error>((session, paths, file, mode, fresh, store_notes))
         })?;
         // macOS: the Keychain half of the tree build. Before the guard drops,
         // so a rotation queued behind it cannot land between the build and the
@@ -4670,6 +4674,7 @@ impl ProfileRuntime {
             pid_file,
             claude_home,
             sessions,
+            store_notes,
             _pid_lock: pid_lock,
             watchdog_signal: Some(watchdog_tx),
             watchdog_handle: Some(watchdog_handle),
@@ -4678,6 +4683,12 @@ impl ProfileRuntime {
 
     pub(crate) fn config_dir(&self) -> &Path {
         &self.swap.runtime
+    }
+
+    /// The notes [`build_runtime_dir_with_active_env`] raised for this build —
+    /// one per shared store it could not create — for the caller to surface.
+    pub(crate) fn store_notes(&self) -> &[String] {
+        &self.store_notes
     }
 
     /// This session's registry id, for a caller that needs to edit its row after
@@ -5178,7 +5189,7 @@ fn build_runtime_dir_with_active_env(
     mode: LinkMode,
     isolation: Isolation,
     stale_env_keys: &[String],
-) -> Result<()> {
+) -> Result<Vec<String>> {
     // Drop any top-level symlink whose `~/.claude/` target has vanished before
     // the re-walk. A prior session's link can dangle once the operator moves the
     // source aside (the reported `runtime/CLAUDE.md` → moved memory case); the
@@ -5186,8 +5197,9 @@ fn build_runtime_dir_with_active_env(
     // revisit — and skip — that stale link. Live entries stay; a still-present
     // source gets re-linked by the walk.
     prune_dangling_links(runtime)?;
+    let mut store_notes = Vec::new();
     if isolation == Isolation::Shared {
-        ensure_store_links(claude_home, runtime, mode)?;
+        store_notes = ensure_store_links(claude_home, runtime, mode)?;
     }
 
     let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -5235,12 +5247,12 @@ fn build_runtime_dir_with_active_env(
 
     seed_claude_json(runtime, claude_home)?;
 
-    Ok(())
+    Ok(store_notes)
 }
 
 /// Stores Claude Code writes through its config dir and clauth reads from
 /// `~/.claude`.
-const SHARED_STORES: &[&str] = &["jobs", "projects"];
+const SHARED_STORES: &[(&str, &str)] = &[("jobs", "background jobs"), ("projects", "transcripts")];
 
 /// Link the stores a shared tree must reach: Claude Code writes `jobs`
 /// (background job records) and `projects` (transcripts) through its config
@@ -5255,37 +5267,52 @@ const SHARED_STORES: &[&str] = &["jobs", "projects"];
 /// absent store is created 0700, the owner-only shape every clauth write
 /// takes; an existing tree entry is left as it is; a store that is unusable or
 /// cannot be created is skipped, so a start the base allowed is never refused
-/// by this fix.
-fn ensure_store_links(claude_home: &Path, runtime: &Path, mode: LinkMode) -> Result<()> {
+/// by this fix. Each store it cannot create is returned as a note the caller
+/// surfaces (the foreground start prints it; the MCP delegate path stays
+/// silent).
+fn ensure_store_links(claude_home: &Path, runtime: &Path, mode: LinkMode) -> Result<Vec<String>> {
+    let mut notes = Vec::new();
     if mode == LinkMode::Fake {
-        return Ok(());
+        return Ok(notes);
     }
-    for name in SHARED_STORES {
-        ensure_store_link(claude_home, runtime, name)?;
+    for (name, consequence) in SHARED_STORES {
+        if let Some(note) = ensure_store_link(claude_home, runtime, name, consequence)? {
+            notes.push(note);
+        }
     }
-    Ok(())
+    Ok(notes)
 }
 
-fn ensure_store_link(claude_home: &Path, runtime: &Path, name: &str) -> Result<()> {
+fn ensure_store_link(
+    claude_home: &Path,
+    runtime: &Path,
+    name: &str,
+    consequence: &str,
+) -> Result<Option<String>> {
     let global = claude_home.join(name);
     // A regular file, a dangling link or an `ELOOP` loop (`is_dir` swallows
     // the error) is no store: the walk links the tree entry to it as it
     // stands, exactly as the base does.
     if global.symlink_metadata().is_ok() && !global.is_dir() {
-        return Ok(());
+        return Ok(None);
     }
     // A start the base allowed must never be refused by this fix: a read-only
     // or full `~/.claude` skips this store and the build goes on.
-    if crate::profile::mkdir_700(&global).is_err() {
-        return Ok(());
+    if let Err(e) = crate::profile::mkdir_700(&global) {
+        return Ok(Some(format!(
+            "clauth: could not create {}: {e}; this session's {consequence} \
+             stay in its own tree and are lost when it ends",
+            global.display()
+        )));
     }
     let dst = runtime.join(name);
     if dst.symlink_metadata().is_ok() {
         // A tree entry already in place (a link or a real dir) is left as-is,
         // the walk's existing skip.
-        return Ok(());
+        return Ok(None);
     }
-    link_entry(&global, &dst)
+    link_entry(&global, &dst)?;
+    Ok(None)
 }
 
 /// Test-only convenience over [`build_runtime_dir_with_active_env`]: passes
@@ -5301,7 +5328,7 @@ fn build_runtime_dir(
     canonical: &Path,
     mode: LinkMode,
     isolation: Isolation,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     build_runtime_dir_with_active_env(
         runtime,
         claude_home,
