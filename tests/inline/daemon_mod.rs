@@ -3308,6 +3308,386 @@ fn the_daemon_logs_a_day_collision_once_per_change() {
     );
 }
 
+/// A spent usage-credit cap is said on the log at its edge: once when the
+/// cached cap turns spent, once when it clears, and once more from a fresh
+/// daemon over a cap still standing (the in-memory latch, like the bell's).
+///
+/// `write_status` is the seam: it is the per-tick work both daemon modes run,
+/// so the line lands with no API listener beside it.
+#[test]
+fn the_daemon_says_a_spent_credit_cap_once_per_edge() {
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::usage::{SpendInfo, UsageInfo};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    // Two credit-billed families, so the ruled line's `, ` join shows.
+    std::fs::write(
+        crate::profile::home_dir()
+            .expect("home")
+            .join(".claude.json"),
+        r#"{"cachedGrowthBookFeatures":{"tengu_calm_seal":["opus"]}}"#,
+    )
+    .expect("write the credit-billed flag");
+
+    let name = crate::profile::ProfileName::from("work");
+    let config = persist(vec![blank_profile(&name)], Some("work"), 60_000);
+    let mut daemon = daemon_for(config.clone());
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let capped = || UsageInfo {
+        spend: Some(SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..UsageInfo::default()
+    };
+    let spent = "work: credit cap spent; Claude Code refuses fable, opus on it until its \
+                 monthly spend limit resets or is raised";
+    let clear = "work: credit cap clear, fable, opus run again";
+
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &capped());
+    daemon.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        [spent],
+        "the cap edge reaches the log, stamped families and all"
+    );
+
+    daemon.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        [spent],
+        "an unchanged tick writes nothing"
+    );
+
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &UsageInfo::default());
+    daemon.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        [spent, clear],
+        "the clear edge says so once"
+    );
+
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &capped());
+    daemon.write_status();
+    let mut expected = vec![spent.to_string(), clear.to_string(), spent.to_string()];
+    assert_eq!(
+        lines.snapshot(),
+        expected,
+        "a cleared cap that fills again is a new edge"
+    );
+
+    let mut fresh = daemon_for(config);
+    fresh.write_status();
+    expected.push(spent.to_string());
+    assert_eq!(
+        lines.snapshot(),
+        expected,
+        "a fresh daemon over a standing cap says it once more"
+    );
+
+    fresh.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        expected,
+        "and then holds, like any other unchanged tick"
+    );
+
+    // A deleted account forgets its latch, so a re-created name announces the
+    // cap it still stands under (the push latch's own rule).
+    daemon.config.lock().expect("config").profiles.clear();
+    daemon.write_status();
+    daemon
+        .config
+        .lock()
+        .expect("config")
+        .profiles
+        .push(blank_profile(&name));
+    daemon.write_status();
+    expected.push(spent.to_string());
+    assert_eq!(
+        lines.snapshot(),
+        expected,
+        "a deleted-and-re-created account says its standing cap once more"
+    );
+}
+
+/// A cache whose usage-credit cap reads spent with every window under its line
+/// — the shape the credit-cap surfaces judge.
+fn write_credit_capped(name: &str) {
+    let usage = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 10.0,
+            resets_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+        }),
+        spend: Some(crate::usage::SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        fetched_at: Some(now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+}
+
+/// The production path from the published body to the `credit` push: a capped
+/// fresh cache under a live push daemon queues exactly one trigger across
+/// ticks, off the `credit_capped` projection [`Daemon::queue_pushes`] builds.
+#[test]
+fn a_spent_credit_cap_queues_one_credit_push_across_ticks() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon("alpha", 10.0, crate::usage::FetchStatus::Fresh, |_, _| {});
+    write_credit_capped("alpha");
+
+    d.write_status();
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Credit {
+            profile: "alpha".to_string()
+        }]
+    );
+}
+
+/// An account serving inference from its own endpoint is under no credit gate,
+/// so a spent cap is neither logged nor pushed for it — while the same cap on
+/// an account without the endpoint says both.
+#[test]
+fn an_own_endpoint_credit_cap_logs_nothing_and_queues_no_push() {
+    let _home = HomeSandbox::new();
+    std::fs::write(
+        crate::profile::home_dir()
+            .expect("home")
+            .join(".claude.json"),
+        r#"{"cachedGrowthBookFeatures":{"tengu_calm_seal":["opus"]}}"#,
+    )
+    .expect("write the credit-billed flag");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let spent = "plain: credit cap spent; Claude Code refuses fable, opus on it until its \
+                 monthly spend limit resets or is raised";
+
+    let (mut plain, plain_inbox) =
+        push_daemon("plain", 10.0, crate::usage::FetchStatus::Fresh, |_, _| {});
+    write_credit_capped("plain");
+    plain.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        [spent],
+        "the control account without the endpoint says the cap"
+    );
+    assert_eq!(
+        plain_inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Credit {
+            profile: "plain".to_string()
+        }],
+        "and queues the push"
+    );
+
+    let (mut own, own_inbox) = push_daemon(
+        "own",
+        10.0,
+        crate::usage::FetchStatus::Fresh,
+        |profile, _| {
+            profile.env.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://api.example.test".to_string(),
+            );
+            profile
+                .env
+                .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "tok-test".to_string());
+        },
+    );
+    assert!(
+        own.config
+            .lock()
+            .expect("config")
+            .find(&crate::profile::ProfileName::from("own"))
+            .is_some_and(crate::claude::has_own_inference_endpoint),
+        "fixture control: the account serves inference on its own endpoint"
+    );
+    write_credit_capped("own");
+    own.write_status();
+    let body = std::fs::read_to_string(clauth_dir().expect("clauth dir").join("status.json"))
+        .expect("read the published body");
+    assert!(
+        body.contains("\"credit_capped\": true"),
+        "fixture control: the own-endpoint account's body still reads capped"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        [spent],
+        "the own-endpoint account adds no line"
+    );
+    assert_eq!(
+        own_inbox.try_iter().collect::<Vec<_>>(),
+        [],
+        "and queues no push"
+    );
+}
+
+/// A capped account that starts serving inference on its own endpoint is under
+/// no credit gate, so both surfaces forget the announced cap; when it leaves
+/// that endpoint the cap still standing is a new edge on both, not only on the
+/// push.
+#[test]
+fn an_account_leaving_its_own_endpoint_announces_a_standing_cap_again() {
+    let _home = HomeSandbox::new();
+    std::fs::write(
+        crate::profile::home_dir()
+            .expect("home")
+            .join(".claude.json"),
+        r#"{"cachedGrowthBookFeatures":{"tengu_calm_seal":["opus"]}}"#,
+    )
+    .expect("write the credit-billed flag");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let spent = "alpha: credit cap spent; Claude Code refuses fable, opus on it until its \
+                 monthly spend limit resets or is raised";
+
+    let (mut d, inbox) = push_daemon("alpha", 10.0, crate::usage::FetchStatus::Fresh, |_, _| {});
+    write_credit_capped("alpha");
+    d.write_status();
+    assert_eq!(lines.snapshot(), [spent], "the cap is announced first");
+
+    {
+        let mut config = d.config.lock().expect("config");
+        let profile = config.profiles.first_mut().expect("the one account");
+        profile.env.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://api.example.test".to_string(),
+        );
+        profile
+            .env
+            .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "tok-test".to_string());
+    }
+    assert!(
+        d.config
+            .lock()
+            .expect("config")
+            .profiles
+            .first()
+            .is_some_and(crate::claude::has_own_inference_endpoint),
+        "fixture control: the account serves inference on its own endpoint"
+    );
+    d.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        [spent],
+        "no line while the account is off the credit gate"
+    );
+
+    {
+        let mut config = d.config.lock().expect("config");
+        let profile = config.profiles.first_mut().expect("the one account");
+        profile.env.remove("ANTHROPIC_BASE_URL");
+        profile.env.remove("ANTHROPIC_AUTH_TOKEN");
+    }
+    d.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        [spent, spent],
+        "leaving the endpoint announces the cap still standing"
+    );
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [
+            crate::push::Trigger::Credit {
+                profile: "alpha".to_string()
+            },
+            crate::push::Trigger::Credit {
+                profile: "alpha".to_string()
+            },
+        ],
+        "and the push agrees with the log"
+    );
+}
+
+/// A reading clauth distrusts is no cap edge on either surface: neither the
+/// log line nor the push moves until a fresh reading lands, which then says the
+/// edge exactly once — in both directions.
+#[test]
+fn a_stale_credit_cap_reading_logs_nothing_and_queues_no_push() {
+    let _home = HomeSandbox::new();
+    std::fs::write(
+        crate::profile::home_dir()
+            .expect("home")
+            .join(".claude.json"),
+        r#"{"cachedGrowthBookFeatures":{"tengu_calm_seal":["opus"]}}"#,
+    )
+    .expect("write the credit-billed flag");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let spent = "alpha: credit cap spent; Claude Code refuses fable, opus on it until its \
+                 monthly spend limit resets or is raised";
+    let clear = "alpha: credit cap clear, fable, opus run again";
+
+    let (mut d, inbox) = push_daemon("alpha", 10.0, crate::usage::FetchStatus::Cached, |_, _| {});
+    let status = |d: &mut Daemon, status: crate::usage::FetchStatus| {
+        d.usage_status
+            .lock()
+            .expect("usage_status")
+            .insert("alpha".to_string(), status);
+    };
+    write_credit_capped("alpha");
+
+    d.write_status();
+    assert!(
+        lines.snapshot().is_empty(),
+        "a stale capped reading logs nothing: {:?}",
+        lines.snapshot()
+    );
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [],
+        "and queues no push"
+    );
+
+    status(&mut d, crate::usage::FetchStatus::Fresh);
+    d.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        [spent],
+        "the same standing cap on a fresh reading is the edge"
+    );
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Credit {
+            profile: "alpha".to_string()
+        }],
+        "and queues the push"
+    );
+
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("alpha"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo::default(),
+    );
+    status(&mut d, crate::usage::FetchStatus::Cached);
+    d.write_status();
+    assert_eq!(lines.snapshot(), [spent], "a stale clear logs nothing");
+
+    status(&mut d, crate::usage::FetchStatus::Fresh);
+    d.write_status();
+    assert_eq!(
+        lines.snapshot(),
+        [spent, clear],
+        "a fresh clear says so once"
+    );
+}
+
 /// N2 (D-arc): the status writer reads the SAME `third_party_streaks` Arc the
 /// scheduler leg writes — `live_stores()` clones that Arc, never a fresh empty
 /// store — so a deep streak the scheduler recorded moves the published `stale`.

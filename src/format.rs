@@ -710,6 +710,16 @@ pub(crate) const DIAG_CANCELED: &str = "canceled";
 pub(crate) const DIAG_AUTH_BROKEN: &str = "auth broken";
 pub(crate) const DIAG_KEY_REJECTED: &str = "key rejected";
 pub(crate) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
+pub(crate) const DIAG_CREDIT_CAP: &str = "credit cap spent";
+/// The legend names the whole state in one row, where the card's pill and its
+/// faint suffix carry the two halves.
+pub(crate) const DIAG_CREDIT_CAP_LEGEND: &str = "credit cap spent, other models ok";
+/// The qualifier a still-serving rung trails outside its brackets: a model's
+/// spent week and a spent credit cap both leave the rest of the account usable.
+pub(crate) const DIAG_OTHER_MODELS_OK: &str = "other models ok";
+/// The `⊘` legend row's scoped-week sense: each legend row's full text lives in
+/// one constant.
+pub(crate) const DIAG_SCOPED_SPENT_LEGEND: &str = "one model's week spent, other models ok";
 pub(crate) const DIAG_KICK: &str = "claude code blocked";
 pub(crate) const DIAG_WEEKLY_SPENT: &str = "weekly spent";
 pub(crate) const DIAG_WEEKLY_SOFT: &str = "past the weekly switch line, still serving";
@@ -796,9 +806,9 @@ pub(crate) fn start_block_label(block: &StartBlock) -> String {
         ),
         StartBlock::FiveHour { pct } => format!("5h {}", format_pct(*pct)),
         StartBlock::ScopedSpent { label, pct } => {
-            format!("{label} {}, other models ok", format_pct(*pct))
+            format!("{label} {}, {DIAG_OTHER_MODELS_OK}", format_pct(*pct))
         }
-        StartBlock::CreditCap => "credit cap spent, other models ok".to_string(),
+        StartBlock::CreditCap => DIAG_CREDIT_CAP_LEGEND.to_string(),
     }
 }
 

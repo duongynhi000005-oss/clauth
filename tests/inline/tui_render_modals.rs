@@ -1032,7 +1032,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         .unwrap_or_else(|| panic!("the legend renders:\n{}", rows.join("\n")));
     // The section header, its blank, and one row per mark.
     assert_eq!(
-        rows[head..head + 18].iter().map(slice).collect::<Vec<_>>(),
+        rows[head..head + 19].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "│  GLYPHS                                                                 │"
                 .to_string(),
@@ -1062,6 +1062,8 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
                 .to_string(),
             "│    ⊘                   one model's week spent, other models ok          │"
                 .to_string(),
+            "│    ¢                   credit cap spent, other models ok                │"
+                .to_string(),
             "│    ~                   past the weekly switch line, still serving       │"
                 .to_string(),
             "│    ⋯                   stale data                                       │"
@@ -1076,7 +1078,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
     // Every mark's own hue, read off the rendered cell. `⊖` and `⊘` are the
     // whole point: same shape, different color, different meaning. `×` keeps
     // one color for both its meanings.
-    let expected: [Color; 16] = [
+    let expected: [Color; 17] = [
         crate::tui::theme::accent_2_color(),
         crate::tui::theme::text_dim_color(),
         crate::tui::theme::text_faint_color(),
@@ -1090,6 +1092,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         crate::tui::theme::warning_color(),
         crate::tui::theme::warning_color(),
         crate::tui::theme::warning_color(),
+        crate::tui::theme::warning_color(),
         crate::tui::theme::text_faint_color(),
         crate::tui::theme::warning_color(),
         crate::tui::theme::accent_color(),
@@ -1098,7 +1101,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
     // 2-space gutter all sit ahead of the mark.
     let glyph_x = left + 5;
     let stride = buf.area.width as usize;
-    let got: Vec<Color> = (0..16)
+    let got: Vec<Color> = (0..17)
         .map(|i| buf.content[(head + 2 + i) * stride + glyph_x].fg)
         .collect();
     assert_eq!(got, expected.to_vec());
@@ -4297,8 +4300,8 @@ fn the_check_output_modal_drops_trailing_whitespace_that_overflows() {
 /// One exact pin here, beside the widened (content-fit) help pins above.
 ///
 /// The thumb's extent is part of that shape, so it moves when the legend does:
-/// the `◆ can't read usage` row is one row more of content, and the thumb is
-/// one row shorter for it. The wrapped rows above are what this test is for and
+/// the `¢ credit cap spent` row wraps to two rows of content, and the thumb is
+/// shorter for it. The wrapped rows above are what this test is for and
 /// none of them changed.
 #[test]
 fn the_help_modal_wraps_long_rows_at_the_common_width() {
@@ -4360,12 +4363,12 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│    ×                   auth broken         ┃ │",
         "│    ×                   key rejected        ┃ │",
         "│    ⊘                   weekly spent        ┃ │",
-        "│    ⧗                   claude code blocked ┃ │",
-        "│    $                   extra usage spent   ┃ │",
+        "│    ⧗                   claude code blocked ┊ │",
+        "│    $                   extra usage spent   ┊ │",
         "│    ◔                   5h window spent     ┊ │",
         "│    ⊘                   one model's week    ┊ │",
         "│  spent, other models ok                    ┊ │",
-        "│    ~                   past the weekly     ┊ │",
+        "│    ¢                   credit cap spent,   ┊ │",
         "│                                              │",
         "╰──────────────────────────────────────────────╯",
     ]

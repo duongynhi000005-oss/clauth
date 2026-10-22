@@ -5282,6 +5282,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
             BlockedReason::WeeklySpent { .. }
             | BlockedReason::KickRejected { .. }
             | BlockedReason::BudgetSpent
+            | BlockedReason::CreditCap
             | BlockedReason::FiveHour { .. }
             | BlockedReason::ScopedSpent { .. }
             | BlockedReason::WeeklySoft { .. }
@@ -5474,6 +5475,24 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
         NO_TOKEN,
         &|r| matches!(r, BlockedReason::ScopedSpent { .. }),
         "ScopedSpent",
+        &readings,
+    );
+
+    // CreditCap — the gate on over a spent cap, every window clear: a
+    // target-side skip, so the member stays a walk candidate.
+    let (config, readings) = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage("cand", Some(90.0), Some(usage_credit_capped())),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        NO_TOKEN,
+        &|r| matches!(r, BlockedReason::CreditCap),
+        "CreditCap",
         &readings,
     );
 
@@ -9972,5 +9991,141 @@ fn the_walk_treats_an_unmeasured_member_like_any_member_without_a_fresh_reading(
         next_auto_switch_target_for_test(&snap, &readings.usage),
         Some(SwitchAction::To("c".into())),
         "a freshly read member with room comes first"
+    );
+}
+
+/// #93: the credit-cap rung describes exactly the member the walk skips as a
+/// target — its `check_credit_cap` gate on over a spent cached cap — and never
+/// one the gate is off for or one serving inference from its own endpoint.
+/// `BudgetSpent`, the spent 5h window and a spent per-model week still outrank
+/// it, and it sits above the merely-dispreferred weekly soft band.
+#[test]
+fn blocked_reason_says_credit_cap_only_where_the_walk_skips() {
+    let capped = || UsageInfo {
+        five_hour: Some(window(10.0, Some(live_reset()))),
+        spend: Some(SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..UsageInfo::default()
+    };
+    assert!(
+        capped().credit_capped(),
+        "fixture control: the cap reads spent"
+    );
+    let reason = |mut f: Fixture, usage: UsageInfo, budget_on: bool| {
+        f.usage = Some(usage);
+        let (mut cfg, readings) = config_with_chain(vec![f], "a");
+        cfg.state.spend_budget_switching = budget_on;
+        blocked_reason(
+            &cfg,
+            &cfg.profiles[0],
+            None,
+            &HashSet::new(),
+            readings.usage.get(cfg.profiles[0].name.as_str()),
+            None,
+            false,
+        )
+    };
+
+    // The walk's own target-side credit skip for the same member, so each
+    // chip verdict below is checked against the decision it describes.
+    let walk_skips = |mut f: Fixture, usage: UsageInfo| {
+        f.usage = Some(usage);
+        let (cfg, readings) = config_with_chain(vec![f], "a");
+        let snap = snapshot_chain(&cfg, &HashSet::new()).expect("snapshot");
+        let member = snap
+            .chain
+            .iter()
+            .find(|m| m.name.as_str() == "a")
+            .expect("a is a chain member");
+        credit_capped_from_usage(member, &readings.usage)
+    };
+
+    assert_eq!(
+        reason(profile_with_usage("a", Some(95.0), None), capped(), false),
+        Some(BlockedReason::CreditCap),
+        "gate on and cap spent: the walk skips it, so the card says why"
+    );
+    assert!(
+        walk_skips(profile_with_usage("a", Some(95.0), None), capped()),
+        "the walk skips the member the chip names"
+    );
+
+    let off = || {
+        let mut f = profile_with_usage("a", Some(95.0), None);
+        f.profile.check_credit_cap = false;
+        f
+    };
+    assert_eq!(
+        reason(off(), capped(), false),
+        None,
+        "gate off: the walk takes it, so no chip claims a block"
+    );
+    assert!(!walk_skips(off(), capped()), "gate off: the walk takes it");
+
+    let own = || {
+        let mut f = profile_with_usage("a", Some(95.0), None);
+        f.profile.base_url = Some("https://api.z.ai/api/anthropic".to_owned());
+        f.profile.api_key = Some("k".to_owned());
+        f
+    };
+    assert_eq!(
+        reason(own(), capped(), false),
+        None,
+        "an own-endpoint account serves elsewhere: the credit gates do not apply"
+    );
+    assert!(
+        !walk_skips(own(), capped()),
+        "the walk takes an own-endpoint member too, so the chip hides no block"
+    );
+
+    // A spent billing budget keeps the rung it owns when both hold.
+    let mut spent = profile_with_usage("a", Some(95.0), None);
+    spent.profile.max_auto_spend = Some(10.0);
+    let over_budget = UsageInfo {
+        five_hour: Some(window(100.0, Some(live_reset()))),
+        spend: Some(SpendInfo {
+            enabled: true,
+            used: Some(60.0),
+            limit: Some(50.0),
+            percent: Some(120.0),
+            currency: Some("USD".to_owned()),
+        }),
+        ..UsageInfo::default()
+    };
+    assert_eq!(
+        reason(spent, over_budget.clone(), true),
+        Some(BlockedReason::BudgetSpent),
+        "BudgetSpent outranks the credit cap when both hold"
+    );
+
+    // A spent per-model week outranks the whole-account cap, the order
+    // `start_block` names in.
+    let capped_and_scoped = UsageInfo {
+        weekly_scoped: vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
+        ..capped()
+    };
+    let scoped = reason(
+        profile_with_usage("a", Some(95.0), None),
+        capped_and_scoped,
+        false,
+    );
+    assert!(
+        matches!(scoped, Some(BlockedReason::ScopedSpent { .. })),
+        "the spent model's week outranks the credit cap: {scoped:?}"
+    );
+
+    let five_hour = reason(
+        profile_with_usage("a", Some(95.0), None),
+        over_budget,
+        false,
+    );
+    assert!(
+        matches!(five_hour, Some(BlockedReason::FiveHour { .. })),
+        "the spent 5h window outranks the credit cap: {five_hour:?}"
     );
 }

@@ -66,6 +66,8 @@ pub(crate) enum PushEvent {
     Account,
     /// A usage window crossed its line.
     Window,
+    /// An account's usage-credit cap filled.
+    Credit,
 }
 
 impl PushEvent {
@@ -77,6 +79,7 @@ impl PushEvent {
             "blocked" => Some(Self::Blocked),
             "account" => Some(Self::Account),
             "window" => Some(Self::Window),
+            "credit" => Some(Self::Credit),
             _ => None,
         }
     }
@@ -86,12 +89,13 @@ impl PushEvent {
             Self::Blocked => "blocked",
             Self::Account => "account",
             Self::Window => "window",
+            Self::Credit => "credit",
         }
     }
 }
 
 /// `events` in the order every answer lists them (`blocked`, `account`,
-/// `window`), each once.
+/// `window`, `credit`), each once.
 fn canonical(mut events: Vec<PushEvent>) -> Vec<PushEvent> {
     events.sort_unstable();
     events.dedup();

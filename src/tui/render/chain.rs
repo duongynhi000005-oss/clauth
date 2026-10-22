@@ -28,12 +28,12 @@ use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resum
 use super::global_config::reminder_text;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
-    DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_MONTHLY_SOFT, DIAG_MONTHLY_SPENT,
-    DIAG_NO_USAGE, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when,
-    cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list, head_cols,
-    help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
-    name_color, pill, place_caret, rail_hint_lines, section_box, section_box_verbatim, select_line,
-    value_caret, wrap_words,
+    DIAG_CREDIT_CAP, DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_MONTHLY_SOFT,
+    DIAG_MONTHLY_SPENT, DIAG_NO_USAGE, DIAG_OTHER_MODELS_OK, DIAG_STALE, DIAG_WEEKLY_SOFT,
+    DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when, cycle_row_lines, draw_scrolled_lines_with_footnote,
+    draw_selector_list, head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines,
+    key_cell, label_style, master_detail, name_color, pill, place_caret, rail_hint_lines,
+    section_box, section_box_verbatim, select_line, value_caret, wrap_words,
 };
 use super::prose::{cmd, key, mark_commands};
 use crate::fallback::{
@@ -484,6 +484,7 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
         // splits disabled/canceled: danger = the aggregate week (dead for
         // days), warning = one model's week (still serves the rest).
         BlockedReason::ScopedSpent { .. } => ("⊘", theme::warning()),
+        BlockedReason::CreditCap => ("¢", theme::warning()),
         BlockedReason::WeeklySoft { .. } => ("~", theme::warning()),
         BlockedReason::Stale => ("⋯", theme::faint()),
         BlockedReason::NoUsage => ("◆", theme::warning()),
@@ -532,7 +533,12 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
         BlockedReason::ScopedSpent { label, pct } => (
             format!("{label} {}", format_pct(*pct)),
             theme::warning().bold(),
-            Some("other models ok".to_string()),
+            Some(DIAG_OTHER_MODELS_OK.to_string()),
+        ),
+        BlockedReason::CreditCap => (
+            DIAG_CREDIT_CAP.to_string(),
+            theme::warning().bold(),
+            Some(DIAG_OTHER_MODELS_OK.to_string()),
         ),
         BlockedReason::WeeklySoft { pct, monthly } => (
             format!(
@@ -584,6 +590,11 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName, active
         BlockedReason::FiveHour { .. } => "5h quota is spent, it resets on its own".to_string(),
         BlockedReason::ScopedSpent { .. } => {
             "that model's weekly window is spent, other models still serve".to_string()
+        }
+        BlockedReason::CreditCap => {
+            "raise its spend limit on claude.ai, or turn credit gate off below to keep it for \
+             other models"
+                .to_string()
         }
         BlockedReason::WeeklySoft { monthly, .. } => {
             if *monthly {

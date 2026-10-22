@@ -21,11 +21,11 @@ use super::chain::reason_marker;
 use super::format::{spinner_frame, truncate};
 use super::overview::switch_mark;
 use super::panes::{
-    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
-    DIAG_KICK, DIAG_NO_USAGE, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, META_RULE_MIN,
-    bold_when, draw_scrollbar, draw_scrolled_lines, field_window, follow_scroll_offset,
-    follow_scroll_offset_tail, head_cols, key_cell, meta_line, place_caret, right_meta_fits,
-    title_label,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_CREDIT_CAP_LEGEND, DIAG_DISABLED,
+    DIAG_KEY_REJECTED, DIAG_KICK, DIAG_NO_USAGE, DIAG_SCOPED_SPENT_LEGEND, DIAG_STALE,
+    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, META_RULE_MIN, bold_when, draw_scrollbar,
+    draw_scrolled_lines, field_window, follow_scroll_offset, follow_scroll_offset_tail, head_cols,
+    key_cell, meta_line, place_caret, right_meta_fits, title_label,
 };
 use super::prose::{self, cmd_lit, key_lit};
 use crate::fallback::BlockedReason;
@@ -2105,8 +2105,9 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
                 label: String::new(),
                 pct: 0.0,
             },
-            "one model's week spent, other models ok",
+            DIAG_SCOPED_SPENT_LEGEND,
         ),
+        reason(BlockedReason::CreditCap, DIAG_CREDIT_CAP_LEGEND),
         reason(
             BlockedReason::WeeklySoft {
                 pct: 0.0,

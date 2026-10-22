@@ -2,12 +2,13 @@
 //! encryption, the RFC 8292 VAPID JWT, and the POST to the device's push
 //! service.
 //!
-//! Three triggers, each fired on a transition and never on a re-read of the
-//! same state: a herdr pane moving INTO `blocked`, an account entering a failed
-//! login or key state, and a chain member's 5h or 7d window reaching the line
-//! the fallback chain switches it at. The latches are in-process like the 5h bell's,
-//! so a daemon restart can announce a standing state once more, where a
-//! persisted latch would swallow one after a crash.
+//! Four triggers, each fired on a transition and never on a re-read of the
+//! same state: a herdr pane moving INTO `blocked`, an account entering a
+//! failed login or key state, a chain member's 5h or 7d window reaching the
+//! line the fallback chain switches it at, and an account's usage-credit cap
+//! filling. The latches are in-process like the 5h bell's, so a daemon restart
+//! can announce a standing state once more, where a persisted latch would
+//! swallow one after a crash.
 //!
 //! Delivery runs on its own thread off a bounded queue, so neither the
 //! daemon's tick nor the herdr follower ever waits on a push service. A push
@@ -71,6 +72,8 @@ pub(crate) enum Trigger {
     Account { profile: String },
     /// A chain member's 5h or 7d window reached its chain line.
     Window { profile: String },
+    /// An account's usage-credit cap filled.
+    Credit { profile: String },
 }
 
 impl Trigger {
@@ -79,6 +82,7 @@ impl Trigger {
             Self::Blocked { .. } | Self::SessionBlocked { .. } => PushEvent::Blocked,
             Self::Account { .. } => PushEvent::Account,
             Self::Window { .. } => PushEvent::Window,
+            Self::Credit { .. } => PushEvent::Credit,
         }
     }
 
@@ -88,7 +92,7 @@ impl Trigger {
     fn ttl_and_urgency(&self) -> (u32, &'static str) {
         match self {
             Self::Blocked { .. } | Self::SessionBlocked { .. } => (60 * 60, "high"),
-            Self::Account { .. } => (24 * 60 * 60, "normal"),
+            Self::Account { .. } | Self::Credit { .. } => (24 * 60 * 60, "normal"),
             Self::Window { .. } => (60 * 60, "normal"),
         }
     }
@@ -120,6 +124,9 @@ pub(crate) struct Reading<'a> {
     /// rejected as revoked or invalid, or a provider rejected the usage
     /// credential.
     pub(crate) failing: bool,
+    /// The account's usage-credit cap is spent, off the published body, under
+    /// no credit gate — an own-endpoint account reads `false`, like its chip.
+    pub(crate) credit_capped: bool,
     /// The 5h window: the chain's switch line for this account (`None` off
     /// the chain) and the utilization read (`None` when the reading has none).
     pub(crate) five_hour: WindowReading,
@@ -143,6 +150,9 @@ pub(crate) struct WindowReading {
 pub(crate) struct StatusLatches {
     /// Accounts already announced as failing, until they read healthy again.
     failing: HashSet<String>,
+    /// Accounts already announced with a spent usage-credit cap, until the cap
+    /// clears.
+    credit_capped: HashSet<String>,
     /// Accounts already announced past each window's chain line: the 5h
     /// bell's own latch, judged on the chain's lines instead of the bell's.
     five_hour: crate::bell::BellLatch,
@@ -164,6 +174,18 @@ impl StatusLatches {
                 fired.push(Trigger::Account {
                     profile: reading.name.to_string(),
                 });
+            }
+            // The cap is a level, not a sample: only a fresh reading moves its
+            // latch, in either direction, so a reading clauth distrusts cannot
+            // announce a cap that may have reset (the window latches' rule).
+            if reading.fresh {
+                if !reading.credit_capped {
+                    self.credit_capped.remove(reading.name);
+                } else if self.credit_capped.insert(reading.name.to_string()) {
+                    fired.push(Trigger::Credit {
+                        profile: reading.name.to_string(),
+                    });
+                }
             }
             let five_hour = self.five_hour.observe(
                 reading.name,
@@ -188,14 +210,17 @@ impl StatusLatches {
         fired
     }
 
-    /// Forget every latch entry — `failing` plus both window latches — whose
-    /// account is not in `roster`, so an account deleted and re-created under
-    /// the same name announces again. Callers pass the ROSTER (the full account
-    /// set), never the published body: a disabled account is hidden from the
-    /// body but is still an account, so its latches must survive the hide.
+    /// Forget every latch entry — `failing`, `credit_capped` plus both window
+    /// latches — whose account is not in `roster`, so an account deleted and
+    /// re-created under the same name announces again. Callers pass the ROSTER
+    /// (the full account set), never the published body: a disabled account is
+    /// hidden from the body but is still an account, so its latches must
+    /// survive the hide.
     pub(crate) fn forget_absent<'a>(&mut self, roster: impl IntoIterator<Item = &'a str>) {
         let roster: HashSet<&str> = roster.into_iter().collect();
         self.failing.retain(|name| roster.contains(name.as_str()));
+        self.credit_capped
+            .retain(|name| roster.contains(name.as_str()));
         self.five_hour.forget_absent(&roster);
         self.seven_day.forget_absent(&roster);
     }
@@ -474,6 +499,7 @@ pub(crate) struct Sender {
     blocked: RateCap,
     account: RateCap,
     window: RateCap,
+    credit: RateCap,
 }
 
 impl Sender {
@@ -489,6 +515,7 @@ impl Sender {
             blocked: RateCap::new(PushEvent::Blocked, posts, window),
             account: RateCap::new(PushEvent::Account, posts, window),
             window: RateCap::new(PushEvent::Window, posts, window),
+            credit: RateCap::new(PushEvent::Credit, posts, window),
         }
     }
 
@@ -498,6 +525,7 @@ impl Sender {
             PushEvent::Blocked => &mut self.blocked,
             PushEvent::Account => &mut self.account,
             PushEvent::Window => &mut self.window,
+            PushEvent::Credit => &mut self.credit,
         }
     }
 
@@ -534,7 +562,9 @@ impl Sender {
                 crate::daemon::api::panes::pane_profile(&self.herdr_probe, pane_id)
             }
             Trigger::SessionBlocked { account } => account.clone(),
-            Trigger::Account { profile } | Trigger::Window { profile } => Some(profile.clone()),
+            Trigger::Account { profile }
+            | Trigger::Window { profile }
+            | Trigger::Credit { profile } => Some(profile.clone()),
         };
         let body = payload(event, account.as_deref());
         for row in &rows {

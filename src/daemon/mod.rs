@@ -1107,6 +1107,13 @@ impl LiveSnapshot {
     }
 }
 
+/// The one freshness test the daemon's per-tick latches share: a `Fresh` fetch
+/// status on a reading the feed does not call stale.
+fn entry_fresh(entry: &status_json::ProfileEntry) -> bool {
+    let fresh = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
+    !entry.stale && entry.fetch_status.as_deref() == Some(fresh)
+}
+
 /// Owns the shared `Arc` stores (cloned into the scheduler) plus main-loop-only
 /// state. Only the main thread touches `self`; the scheduler holds `Arc` clones
 /// of the individual stores.
@@ -1164,6 +1171,10 @@ struct Daemon {
     /// Count of ACTUAL failure-log emissions (post-dedup) — the observable proof a
     /// stuck switch isn't logging 1/tick. Read by tests.
     switch_failure_logs: u64,
+    /// The accounts whose spent usage-credit cap has already been logged,
+    /// until it clears or the account leaves the credit gate (its own
+    /// endpoint).
+    credit_capped: HashSet<String>,
     /// The day-list notices last logged, empty while the lists are ordinary.
     /// Same dedup shape as `switch_backoff` above and for the same reason: the
     /// condition is re-derived every tick, so each message is its own key — it
@@ -1248,6 +1259,7 @@ impl Daemon {
             switch_backoff: None,
             switch_failure_logs: 0,
             day_claim_notices: Vec::new(),
+            credit_capped: HashSet::new(),
             bells: crate::bell::BellLatch::default(),
             push: None,
             push_latches: crate::push::StatusLatches::default(),
@@ -1542,12 +1554,64 @@ impl Daemon {
             }
             Err(e) => logline!("clauth daemon: failed to serialize status.json: {e}"),
         }
+        self.log_credit_caps(&cfg_snap, &body.profiles);
         self.ring_bells(
             &cfg_snap.profiles,
             &body.profiles,
             cfg_snap.state.bell_command.as_deref(),
         );
         self.queue_pushes(&cfg_snap, &body.profiles, codex.as_ref());
+    }
+
+    /// Say a spent usage-credit cap out loud, once per account per edge, on
+    /// fresh readings only: the cap turns spent and it clears, and each edge
+    /// gets exactly one line while the account bills its own usage credits
+    /// (an own-endpoint account is forgotten silently). Driven by the
+    /// published body, so every daemon ticks it, API listener or not.
+    /// The latch is in process, so a restart over a standing cap says it once
+    /// more rather than swallowing the line after a crash (the bell's rule) —
+    /// and an unchanged tick writes nothing.
+    fn log_credit_caps(&mut self, config: &AppConfig, entries: &[status_json::ProfileEntry]) {
+        // A deleted account's entry goes with it; one merely hidden from the
+        // body (disabled) keeps its latch, so a re-enable does not re-log.
+        self.credit_capped.retain(|name| {
+            config
+                .profiles
+                .iter()
+                .any(|p| p.name.as_str() == name.as_str())
+        });
+        // Read only on an edge: the flag lives in `~/.claude.json`.
+        let families = || crate::claude_json::credit_billed_families().join(", ");
+        for entry in entries {
+            let name = entry.name.as_str();
+            // A stale reading is no edge in either direction (the window
+            // latches' rule).
+            if !entry_fresh(entry) {
+                continue;
+            }
+            // An account serving inference on its own endpoint is under no
+            // credit gate. The push reads it as not capped, so the log forgets
+            // its latch the same way — silently, since the clear copy would be
+            // false here.
+            if config
+                .find(&entry.name)
+                .is_some_and(crate::claude::has_own_inference_endpoint)
+            {
+                self.credit_capped.remove(name);
+                continue;
+            }
+            if !entry.credit_capped {
+                if self.credit_capped.remove(name) {
+                    logline!("{name}: credit cap clear, {} run again", families());
+                }
+            } else if self.credit_capped.insert(name.to_string()) {
+                logline!(
+                    "{name}: credit cap spent; Claude Code refuses {} on it until its monthly \
+                     spend limit resets or is raised",
+                    families()
+                );
+            }
+        }
     }
 
     /// Hand the push sender what this body changed: an account entering a
@@ -1559,8 +1623,8 @@ impl Daemon {
     /// window (7d, else the provider-marked monthly quota) at its weekly line;
     /// a codex chain member at the lines the codex chain
     /// switches it at (`fallback::snapshot_codex_chain`: the default 5h
-    /// threshold, the codex weekly line). Nothing is queued while the API is
-    /// off.
+    /// threshold, the codex weekly line), and an account's usage-credit cap
+    /// filling on a fresh reading. Nothing is queued while the API is off.
     fn queue_pushes(
         &mut self,
         config: &AppConfig,
@@ -1568,7 +1632,6 @@ impl Daemon {
         codex: Option<&crate::codex_profiles::CodexState>,
     ) {
         let Some(queue) = &self.push else { return };
-        let fresh_status = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
         let auth_expired = status_json::fetch_status_str(crate::usage::FetchStatus::AuthExpired);
         let chain_weekly = config.state.weekly_switch_threshold_pct();
         let codex_member = |entry: &status_json::ProfileEntry| {
@@ -1596,10 +1659,16 @@ impl Daemon {
             }
             entry.long_window_label.and_then(|label| util(entry, label))
         };
+        let own_endpoint = |entry: &status_json::ProfileEntry| {
+            config
+                .find(&entry.name)
+                .is_some_and(crate::claude::has_own_inference_endpoint)
+        };
         let readings = entries.iter().map(|entry| crate::push::Reading {
             name: entry.name.as_str(),
             failing: entry.auth_status == "broken"
                 || entry.fetch_status.as_deref() == Some(auth_expired),
+            credit_capped: entry.credit_capped && !own_endpoint(entry),
             five_hour: crate::push::WindowReading {
                 line: entry
                     .fallback
@@ -1623,7 +1692,7 @@ impl Daemon {
                 // follows that line too").
                 util: long_util(entry),
             },
-            fresh: !entry.stale && entry.fetch_status.as_deref() == Some(fresh_status),
+            fresh: entry_fresh(entry),
         });
         // Forget against the ROSTER, not the published body: a disabled account
         // is hidden from the body but is still an account, so its latches must
@@ -1656,7 +1725,6 @@ impl Daemon {
         command: Option<&str>,
     ) {
         let Some(command) = command else { return };
-        let fresh_status = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
         // Forget against the ROSTER, not the published body: a disabled account
         // is hidden from the body but is still an account, so its standing bell
         // must not re-arm when it comes back into view. Only a deleted account
@@ -1665,7 +1733,7 @@ impl Daemon {
         let present: HashSet<&str> = roster.iter().map(|profile| profile.name.as_str()).collect();
         self.bells.forget_absent(&present);
         for entry in entries {
-            let fresh = !entry.stale && entry.fetch_status.as_deref() == Some(fresh_status);
+            let fresh = entry_fresh(entry);
             let util = entry
                 .windows
                 .iter()

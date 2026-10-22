@@ -1144,6 +1144,95 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
     );
 }
 
+/// #93: a member whose usage-credit cap is spent opens its card on the
+/// `credit cap spent` pill while its credit gate is on (the walk skips it as a
+/// target then), with the fix under it; with the gate off the walk takes it,
+/// so the card claims no block (cloudy's copy, 2026-10-22).
+#[test]
+fn a_credit_capped_member_opens_its_card_on_the_credit_cap_pill_while_its_gate_is_on() {
+    let card = |gate: bool| {
+        let (mut capped, mut capped_readings) = profile("capped", 95.0, 10.0, 7200);
+        capped.check_credit_cap = gate;
+        capped_readings
+            .usage
+            .get_mut("capped")
+            .expect("the fixture reading")
+            .spend = Some(crate::usage::SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        });
+        assert!(
+            capped_readings.usage["capped"].credit_capped(),
+            "fixture control: the cap reads spent"
+        );
+        let (cfg, readings) = config_with(
+            vec![profile("ok", 95.0, 10.0, 7200), (capped, capped_readings)],
+            Some("ok"),
+            vec!["ok", "capped"],
+        );
+        member_detail(
+            &cfg,
+            &crate::profile::ProfileName::from("capped"),
+            MemberCard {
+                width: 160,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        )
+        .0
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+    };
+    let on = card(true);
+    assert_eq!(
+        on,
+        [
+            "status          [ credit cap spent ]  other models ok".to_owned(),
+            "└ raise its spend limit on claude.ai, or turn credit gate off below to keep it for other models".to_owned(),
+            "".to_owned(),
+            "5h usage        ██░░░░░░░░░░░░░░░░░░░│  10% used".to_owned(),
+            "                85% until rotate".to_owned(),
+            "".to_owned(),
+            "  rotate at       95%".to_owned(),
+            "  weekly at       98%".to_owned(),
+            "  weekly gate     ─●".to_owned(),
+            "  scoped gate     ─●".to_owned(),
+            "  credit gate     ─●".to_owned(),
+            "  last resort     ○─".to_owned(),
+            "  preferred       ○─".to_owned(),
+            "  preferred days  never  weekdays  weekends  every day".to_owned(),
+            "  max spend       off".to_owned(),
+            "  remove          remove from chain".to_owned(),
+        ],
+        "the gate-on card, whole: {on:?}"
+    );
+    let off = card(false);
+    assert_eq!(
+        off,
+        [
+            "5h usage        ██░░░░░░░░░░░░░░░░░░░│  10% used".to_owned(),
+            "                85% until rotate".to_owned(),
+            "".to_owned(),
+            "  rotate at       95%".to_owned(),
+            "  weekly at       98%".to_owned(),
+            "  weekly gate     ─●".to_owned(),
+            "  scoped gate     ─●".to_owned(),
+            "  credit gate     ○─".to_owned(),
+            "  last resort     ○─".to_owned(),
+            "  preferred       ○─".to_owned(),
+            "  preferred days  never  weekdays  weekends  every day".to_owned(),
+            "  max spend       off".to_owned(),
+            "  remove          remove from chain".to_owned(),
+        ],
+        "the gate-off card, whole: {off:?}"
+    );
+}
+
 /// A member the operator disabled is not a member clauth cannot measure. The
 /// card stacks the health ladder under `[ disabled ]`
 /// (`member_detail_stacks_the_health_pill_under_disabled`), so a marker whose
@@ -4109,5 +4198,70 @@ fn the_credit_gate_row_hints_the_current_state() {
     assert_eq!(
         hint(false).as_deref(),
         Some("auto-switch can move onto this account even with its usage-credit cap spent")
+    );
+}
+
+/// The credit-cap rung's mark is its own shape, in the warning hue the other
+/// charged-but-still-serving rungs wear, so a legend reader can tell it from
+/// every mark already on the card.
+#[test]
+fn the_credit_cap_mark_is_its_own_warning_shape() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let credit = reason_marker(&BlockedReason::CreditCap);
+    assert_eq!(credit.content, "¢", "the ruled mark");
+    assert_eq!(
+        credit.style.fg,
+        theme::warning().fg,
+        "warning, the hue every charged-but-serving rung wears"
+    );
+    let taken = [
+        BlockedReason::Disabled,
+        BlockedReason::Canceled,
+        BlockedReason::AuthBroken,
+        BlockedReason::KeyRejected,
+        BlockedReason::WeeklySpent {
+            resets_in: None,
+            monthly: false,
+        },
+        BlockedReason::KickRejected { lifts_in: 0 },
+        BlockedReason::BudgetSpent,
+        BlockedReason::FiveHour {
+            pct: 0.0,
+            resets_in: None,
+        },
+        BlockedReason::ScopedSpent {
+            label: String::new(),
+            pct: 0.0,
+        },
+        BlockedReason::WeeklySoft {
+            pct: 0.0,
+            monthly: false,
+        },
+        BlockedReason::Stale,
+        BlockedReason::NoUsage,
+    ];
+    for other in &taken {
+        assert_ne!(
+            credit.content,
+            reason_marker(other).content,
+            "a shape of its own, distinct from {other:?}"
+        );
+    }
+}
+
+/// The credit-cap pill: the label inside the brackets, the "other models ok"
+/// qualifier outside them, and the label in the warning hue.
+#[test]
+fn the_credit_cap_pill_reads_spent_with_the_other_models_suffix() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let spans = reason_pill_spans(&BlockedReason::CreditCap, ResetFmt::default());
+    assert_eq!(
+        spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+        "[ credit cap spent ]  other models ok"
+    );
+    assert_eq!(
+        spans[1].style,
+        theme::warning().bold(),
+        "the label itself is charged, like the other spent rungs"
     );
 }

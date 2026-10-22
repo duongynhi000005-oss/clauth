@@ -880,6 +880,12 @@ pub(crate) enum BlockedReason {
     /// this member's `check_scoped` gate is on: out of rotation, though it
     /// still serves other models. `label`/`pct` name the worst such window.
     ScopedSpent { label: String, pct: f64 },
+    /// A spend-billed member whose usage-credit cap is spent while its
+    /// `check_credit_cap` gate is on: the walk skips it as a target, though its
+    /// other models still serve. Render-only, and never on an account serving
+    /// inference from its own endpoint — no credit gate covers that account, so
+    /// the chip would claim a block the walk never applies.
+    CreditCap,
     /// Long window (7d, else the provider-marked monthly quota) over the soft
     /// switch line but under the hard cap: still serves
     /// every request, just won't be picked. `pct` is the current utilization;
@@ -1036,6 +1042,20 @@ pub(crate) fn health_blocked_reason(
             label: worst.label.clone(),
             pct: worst.window.utilization,
         });
+    }
+    // The same target-side skip [`credit_capped_from_usage`] applies, so the
+    // chip names a block the walk acts on. An own-endpoint account serves
+    // inference elsewhere, where no usage-credit gate covers it.
+    //
+    // Below `FiveHour`, whose account-wide block would make the chip's "other
+    // models ok" false, and below `ScopedSpent`, in the same order as
+    // [`start_block`]'s rungs (a spent per-model week is refused before the
+    // credit cap).
+    if profile.check_credit_cap
+        && usage.is_some_and(UsageInfo::credit_capped)
+        && !crate::claude::has_own_inference_endpoint(profile)
+    {
+        return Some(BlockedReason::CreditCap);
     }
     if weekly_blocked(profile, soft, usage) {
         let pct = usage
