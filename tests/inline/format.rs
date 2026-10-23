@@ -670,6 +670,7 @@ fn the_split_state_sentences_render_their_ruled_bytes() {
 fn start_block_labels_are_the_tui_chip_words() {
     assert_eq!(start_block_label(&StartBlock::Disabled), "disabled");
     assert_eq!(start_block_label(&StartBlock::AuthBroken), "auth broken");
+    assert_eq!(start_block_label(&StartBlock::LoggedOut), "logged out");
     assert_eq!(start_block_label(&StartBlock::Canceled), "canceled");
     assert_eq!(
         start_block_label(&StartBlock::KickRejected),

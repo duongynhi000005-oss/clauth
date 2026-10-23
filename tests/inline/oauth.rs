@@ -69,6 +69,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
+        has_long_lived_sidecar: false,
         provider: None,
     };
     let mut config = AppConfig {
@@ -190,6 +191,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
+        has_long_lived_sidecar: false,
         provider: None,
     };
     let mut config = AppConfig {
@@ -255,6 +257,7 @@ fn profile_without_refresh_token_excluded() {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
+        has_long_lived_sidecar: false,
         provider: None,
     };
     let mut config = AppConfig {
@@ -349,6 +352,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
+        has_long_lived_sidecar: false,
         provider: None,
     };
     let mut config = AppConfig {
@@ -383,6 +387,7 @@ fn third_party_config(name: &str) -> AppConfig {
         disabled: false,
         console: None,
         credentials: None,
+        has_long_lived_sidecar: false,
         provider: None,
     };
     let mut config = AppConfig {

@@ -1383,8 +1383,41 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         disabled: false,
         console: None,
         credentials: None,
+        has_long_lived_sidecar: false,
         provider: None,
     }
+}
+
+/// A stored rotating OAuth pair (`credentials.json`'s shape) whose access
+/// token is `access` — a profile holding one holds a login.
+pub(crate) fn oauth_pair(access: &str) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// Write a long-lived `session-token.json` sidecar (no refresh token, so
+/// `claude::has_session_token` reads it as a login) into `name`'s profile dir
+/// under the process HOME, which the caller's `HomeSandbox` pins.
+pub(crate) fn write_long_lived_sidecar(name: &crate::profile::ProfileName) {
+    let mut sidecar = oauth_pair(&format!("sk-ant-oat-{name}"));
+    if let Some(token) = sidecar.claude_ai_oauth.as_mut() {
+        token.refresh_token = None;
+    }
+    let dir = crate::profile::profile_dir(name).expect("profile dir");
+    std::fs::create_dir_all(&dir).expect("mkdir profile dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("serialize sidecar"),
+    )
+    .expect("write session-token sidecar");
 }
 
 /// Write `entries` as a profile's `usage_history.jsonl` — the on-disk shape
@@ -2198,11 +2231,13 @@ pub(crate) fn bar_reset_in(
 
 /// The walk fixture reviewer A's r3 probe used: `act` and `ok` are OAuth
 /// accounts (`act` exhausted at 99%, `ok` at 10% fresh or aged), `kl` is a
-/// KEYLESS DeepSeek chain member with a `third_party_cache.json` reading
-/// `kl_five`% — a display-only name (third-party-classified, no api key), the
-/// exact shape whose cached reading commit 2b's display superset lets reach the
-/// walk. The active's credentials are linked so startup reconcile is Clean.
-/// Runs under the caller's `HomeSandbox`.
+/// KEYLESS DeepSeek chain member — an `[env]` inference token (so the walk
+/// keeps it eligible, and `load_profile` keeps its endpoint) but NO api key,
+/// with a `third_party_cache.json` reading `kl_five`% — a display-only name
+/// (third-party-classified, no api key), the exact shape whose cached reading
+/// commit 2b's display superset lets reach the walk. The active's credentials
+/// are linked so startup reconcile is Clean. Runs under the caller's
+/// `HomeSandbox`.
 pub(crate) fn keyless_walk_fixture(chain: &[&str], active: &str, ok_age_secs: u64, kl_five: f64) {
     use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
     let oauth = |n: &str| {
@@ -2224,6 +2259,8 @@ pub(crate) fn keyless_walk_fixture(chain: &[&str], active: &str, ok_age_secs: u6
     let mut kl = blank_profile(&ProfileName::from("kl"));
     kl.base_url = Some("https://api.deepseek.com/anthropic".into());
     kl.provider = Some(crate::providers::Provider::DeepSeek);
+    kl.env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "tok-kl".to_string());
     for p in [&act, &kl, &ok] {
         save_profile(p).expect("save profile");
     }

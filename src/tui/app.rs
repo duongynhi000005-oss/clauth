@@ -67,10 +67,10 @@ use crate::usage::{
     ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, MemoryStores,
     NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
     PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue,
-    StartupReceiver, StartupSender, StartupSignal, StatusStore, SuppressedAuthExpiredStore,
-    ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyStreaks,
-    ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, WeeklyResetKicks, any_busy,
-    apply_pending_forgets, bootstrap_fetch, bootstrap_third_party, clear_activity,
+    SkippedUnreadable, StartupReceiver, StartupSender, StartupSignal, StatusStore,
+    SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
+    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, WeeklyResetKicks,
+    any_busy, apply_pending_forgets, bootstrap_fetch, bootstrap_third_party, clear_activity,
     collect_oauth_seed_names, collect_third_party_entries, collect_third_party_seed_names,
     collect_tokens, is_idle, mark_activity, now_ms, spawn_refresher, switch_gate_in_flight,
     windows_maxed,
@@ -4636,6 +4636,7 @@ pub(crate) struct App {
     pub(crate) third_party_status: ThirdPartyStatusStore,
     pub(crate) third_party_streaks: ThirdPartyStreaks,
     pub(crate) third_party_broken: ThirdPartyBroken,
+    pub(crate) skipped_unreadable: SkippedUnreadable,
     /// Scheduler-only stores held here so `forget_memory` can reach the whole
     /// process's name-keyed state.
     pub(crate) weekly_reset_kicks: WeeklyResetKicks,
@@ -5272,6 +5273,7 @@ struct WorkerHandles {
     third_party_status: ThirdPartyStatusStore,
     third_party_streaks: ThirdPartyStreaks,
     third_party_broken: ThirdPartyBroken,
+    skipped_unreadable: SkippedUnreadable,
     weekly_reset_kicks: WeeklyResetKicks,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
@@ -5307,6 +5309,7 @@ impl WorkerHandles {
             third_party_status: Arc::clone(&app.third_party_status),
             third_party_streaks: Arc::clone(&app.third_party_streaks),
             third_party_broken: Arc::clone(&app.third_party_broken),
+            skipped_unreadable: Arc::clone(&app.skipped_unreadable),
             weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
             suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
             shutting_down: Arc::clone(&app.shutting_down),
@@ -5420,6 +5423,7 @@ impl App {
         let third_party_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_streaks: ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_broken: ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::new()));
+        let skipped_unreadable: SkippedUnreadable = Arc::new(RankedMutex::new(HashSet::new()));
         let weekly_reset_kicks: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
         let suppressed_auth_expired: SuppressedAuthExpiredStore =
             Arc::new(RankedMutex::new(HashMap::new()));
@@ -5571,6 +5575,7 @@ impl App {
             third_party_status,
             third_party_streaks,
             third_party_broken,
+            skipped_unreadable,
             weekly_reset_kicks,
             suppressed_auth_expired,
             stale_cues: HashMap::new(),
@@ -6217,6 +6222,15 @@ impl App {
             &third_party_names,
             &polled,
         );
+        // The caption names where the walk lands, so it honours the live skip
+        // set — but it runs every frame, so it READS the set as the last scan
+        // left it (no `stored_login` read, no write): the scan already heals
+        // each cadence, and a per-frame disk read on the render path is what
+        // `docs/tui-design.md`'s "never per frame" bars.
+        snapshot.skipped_unreadable =
+            crate::usage::read_skipped_unreadable(&self.skipped_unreadable)
+                .into_iter()
+                .collect();
         snapshot.broken.extend(key_rejected.iter().cloned());
         let active_usage = usage.get(active.as_str()).cloned();
         let active_threshold = snapshot
@@ -6389,6 +6403,7 @@ impl App {
             h.third_party_status,
             h.third_party_streaks,
             h.third_party_broken,
+            h.skipped_unreadable,
             h.suppressed_auth_expired,
             h.shutting_down,
             // Single-fetcher lease (#27): the TUI competes for `usage-fetch.lock`
@@ -26263,6 +26278,26 @@ pub(crate) fn on_tick(app: &mut App) {
             ) {
                 continue;
             }
+        }
+        // The daemon drain's twin: the queued target's login is re-read ON DISK
+        // right before dispatch, because the in-memory `Profile` is stale until
+        // the next reload and a login deleted out-of-process after the scan's
+        // enqueue must still stop the link. The proven-none outcome drops
+        // (silent, like the stale-cause neighbour above — no toast: the ruled
+        // "it has no login or api key" line lives in the daemon-log register,
+        // and a fresh visible string would be out of scope); an unreadable store
+        // is skipped for this drain, like the not-idle skip above, and its
+        // FIRST skip marks the member skipped so the next scan passes over it —
+        // never linked on a guess.
+        match crate::profile::stored_login(&name) {
+            crate::profile::StoredLogin::HoldsNone => continue,
+            crate::profile::StoredLogin::Unknown => {
+                if let Ok(mut s) = app.skipped_unreadable.lock() {
+                    s.insert(name.as_str().to_string());
+                }
+                continue;
+            }
+            crate::profile::StoredLogin::HoldsLogin => {}
         }
         let returning = app.config().is_home_today(&name, &key_rejected);
         let msg = if returning {

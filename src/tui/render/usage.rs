@@ -2014,7 +2014,18 @@ fn oauth_empty_msg(profile: &Profile, status: Option<FetchStatus>) -> &'static s
         .as_ref()
         .is_some_and(|c| c.claude_ai_oauth.is_some());
     if !has_oauth {
-        "not logged in, use + login on the setup tab"
+        // A long-lived session-token sidecar is a login the OAuth leg cannot
+        // read usage through: never call it "not logged in", tell the operator
+        // to log the same account in. An api key / `[env]` inference token has
+        // no usage windows at all — nothing to fix, so no fix line. Only a
+        // member holding nothing is "not logged in".
+        if profile.has_long_lived_sidecar {
+            "can't read usage, log in the same account with + login on the setup tab"
+        } else if crate::claude::has_inference_auth(profile) {
+            "can't read usage, an api key has no usage windows"
+        } else {
+            "not logged in, use + login on the setup tab"
+        }
     } else if profile.is_disabled() || status == Some(FetchStatus::Failed) {
         // Disabled: never scheduled, so with no seeded cache no fetch will land.
         "no usage available"

@@ -3710,7 +3710,7 @@ fn only_a_fresh_read_drives_a_switch_decision() {
 #[test]
 fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
     use super::{FetchStatus, PendingSwitch, PendingSwitchOff, StatusStore, scan_auto_switch};
-    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::profile::{AppConfig, AppState};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
 
     let frozen_state = || {
@@ -3757,10 +3757,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
                 fallback_chain: vec!["a".into(), "b".into()],
                 ..AppState::default()
             },
-            profiles: vec![
-                Profile::new("a".to_string(), None, None),
-                Profile::new("b".to_string(), None, None),
-            ],
+            profiles: vec![logged_in("a"), logged_in("b")],
         };
         cfg.set_auth_broken(&crate::profile::ProfileName::from("a"), broken);
         Arc::new(RankedMutex::new(cfg))
@@ -3776,6 +3773,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -3798,6 +3796,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -3819,13 +3818,14 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
 /// runs it has been handed a snapshot that already passed this gate, so a change
 /// to the gate would leave a walk-core test green while the copy went false.
 ///
-/// The sidecar is not part of this gate and the fixture needs none: what decides
-/// is the ABSENCE of an actionable reading, which is the same absence whether a
-/// long-lived token or nothing at all is serving the member's sessions.
+/// The sidecar is not part of this gate: what decides is the ABSENCE of an
+/// actionable reading, the same absence whether a long-lived token or nothing
+/// at all serves the member's sessions. The fixture installs one only so
+/// `blind` is the member the copy names.
 #[test]
 fn an_unmeasured_active_is_never_switched_away_from() {
     use super::{FetchStatus, PendingSwitch, PendingSwitchOff, StatusStore, scan_auto_switch};
-    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::profile::{AppConfig, AppState};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
 
     let live = |utilization: f64| UsageInfo {
@@ -3844,8 +3844,13 @@ fn an_unmeasured_active_is_never_switched_away_from() {
                 ..AppState::default()
             },
             profiles: vec![
-                Profile::new("blind".to_string(), None, None),
-                Profile::new("c".to_string(), None, None),
+                {
+                    let mut p = logged_in("blind");
+                    p.credentials = None;
+                    p.has_long_lived_sidecar = true;
+                    p
+                },
+                logged_in("c"),
             ],
         }))
     };
@@ -3870,6 +3875,7 @@ fn an_unmeasured_active_is_never_switched_away_from() {
             &Arc::new(RankedMutex::new(HashMap::new())),
             &Arc::new(RankedMutex::new(HashMap::new())),
             &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
             &Arc::new(RankedMutex::new(HashMap::new())),
             &Arc::new(RankedMutex::new(HashMap::new())),
             &Arc::new(RankedMutex::new(HashMap::new())),
@@ -3915,7 +3921,7 @@ fn an_unmeasured_active_is_never_switched_away_from() {
 #[test]
 fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
     use super::{FetchStatus, PendingSwitch, StatusStore, scan_auto_switch};
-    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::profile::{AppConfig, AppState};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
 
     let live = |utilization: f64| UsageInfo {
@@ -3943,11 +3949,7 @@ fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
             fallback_chain: vec!["a".into(), "b".into(), "c".into()],
             ..AppState::default()
         },
-        profiles: vec![
-            Profile::new("a".to_string(), None, None),
-            Profile::new("b".to_string(), None, None),
-            Profile::new("c".to_string(), None, None),
-        ],
+        profiles: vec![logged_in("a"), logged_in("b"), logged_in("c")],
     }));
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
     scan_auto_switch(
@@ -3958,6 +3960,7 @@ fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
@@ -4052,7 +4055,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
         ACTIVE_CAP_MAX_STREAK, FetchStatus, PendingSwitch, PendingSwitchOff, PollStreaks,
         StatusStore, scan_auto_switch,
     };
-    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::profile::{AppConfig, AppState};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
 
     // `a` is active and RateLimited; `active_util` on a 5h window whose reset is
@@ -4106,10 +4109,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
                 fallback_chain: vec!["a".into(), "b".into()],
                 ..AppState::default()
             },
-            profiles: vec![
-                Profile::new("a".to_string(), None, None),
-                Profile::new("b".to_string(), None, None),
-            ],
+            profiles: vec![logged_in("a"), logged_in("b")],
         }))
     };
     let deep = ACTIVE_CAP_MAX_STREAK + 1;
@@ -4125,6 +4125,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
             &Arc::new(RankedMutex::new(HashMap::new())),
             &Arc::new(RankedMutex::new(HashMap::new())),
             &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
             &streaks,
             &Arc::new(RankedMutex::new(HashMap::new())),
             &activity,
@@ -4213,67 +4214,87 @@ fn register_live_row(row: &crate::live_sessions::LiveSession) -> std::fs::File {
 }
 
 /// A chain of plain OAuth members, every one `swap_eligible`, with `active` as the
-/// global active profile.
+/// global active profile. Written to disk so the decision leg's `stored_login`
+/// re-read answers `HoldsLogin` — the leg reads the committed store, not the
+/// in-memory profile.
 fn session_config(names: &[&str], active: Option<&str>) -> crate::profile::ConfigHandle {
-    use crate::profile::{AppConfig, AppState, Profile};
-    Arc::new(RankedMutex::new(AppConfig {
-        state: AppState {
-            active_profile: active.map(Into::into),
-            profiles: names.iter().map(|n| (*n).into()).collect(),
-            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
-            ..AppState::default()
-        },
-        profiles: names
-            .iter()
-            .map(|n| Profile::new((*n).to_string(), None, None))
-            .collect(),
-    }))
+    use crate::profile::{AppConfig, AppState};
+
+    crate::testutil::register_names(names);
+    let profiles: Vec<crate::profile::Profile> = names
+        .iter()
+        .map(|n| {
+            let p = logged_in(n);
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: active.map(Into::into),
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    Arc::new(RankedMutex::new(AppConfig { state, profiles }))
+}
+
+/// A blank profile holding a stored OAuth pair — the walk-driving fixtures use
+/// it so a login-less member stays the exception, not the default.
+fn logged_in(name: &str) -> crate::profile::Profile {
+    let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+    p.credentials = Some(crate::testutil::oauth_pair(name));
+    p
 }
 
 /// `session_config` plus a third-party credential (the same generic endpoint +
 /// key `tp_entry` uses) on the named profiles, so a key-rejected mark recorded
 /// against that credential's fingerprint intersects with the REAL config
-/// fingerprint the scan now reads.
+/// fingerprint the scan now reads. Written to disk like `session_config`.
 fn session_config_tp(
     names: &[&str],
     active: Option<&str>,
     third_party: &[&str],
 ) -> crate::profile::ConfigHandle {
     use crate::profile::{AppConfig, AppState, Profile};
-    Arc::new(RankedMutex::new(AppConfig {
-        state: AppState {
-            active_profile: active.map(Into::into),
-            profiles: names.iter().map(|n| (*n).into()).collect(),
-            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
-            ..AppState::default()
-        },
-        profiles: names
-            .iter()
-            .map(|n| {
-                if third_party.contains(n) {
-                    let mut p = Profile::new(
-                        (*n).to_string(),
-                        Some("https://example.com".to_string()),
-                        Some("key".to_string()),
-                    );
-                    // A real hybrid: an OAuth pair behind the base_url + key.
-                    p.credentials = Some(crate::profile::ClaudeCredentials {
-                        claude_ai_oauth: Some(crate::profile::OAuthToken {
-                            access_token: "at".into(),
-                            refresh_token: Some("rt".into()),
-                            expires_at: None,
-                            scopes: None,
-                            subscription_type: None,
-                            ..crate::profile::OAuthToken::default_extra()
-                        }),
-                    });
-                    p
-                } else {
-                    Profile::new((*n).to_string(), None, None)
-                }
-            })
-            .collect(),
-    }))
+
+    crate::testutil::register_names(names);
+    let profiles: Vec<Profile> = names
+        .iter()
+        .map(|n| {
+            let p = if third_party.contains(n) {
+                let mut p = Profile::new(
+                    (*n).to_string(),
+                    Some("https://example.com".to_string()),
+                    Some("key".to_string()),
+                );
+                // A real hybrid: an OAuth pair behind the base_url + key.
+                p.credentials = Some(crate::profile::ClaudeCredentials {
+                    claude_ai_oauth: Some(crate::profile::OAuthToken {
+                        access_token: "at".into(),
+                        refresh_token: Some("rt".into()),
+                        expires_at: None,
+                        scopes: None,
+                        subscription_type: None,
+                        ..crate::profile::OAuthToken::default_extra()
+                    }),
+                });
+                p
+            } else {
+                logged_in(n)
+            };
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: active.map(Into::into),
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    Arc::new(RankedMutex::new(AppConfig { state, profiles }))
 }
 
 /// Live 5h windows at the given utilizations — a member at 100 is spent, one at 10
@@ -4341,6 +4362,29 @@ fn scan_sessions_with_streaks(
         &Arc::new(RankedMutex::new(HashMap::new())),
         streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+    );
+}
+
+/// [`scan_sessions`] with the skip store the session walk reads — the one input
+/// the skip-set tests set.
+fn scan_sessions_skipped(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+    skipped: &super::SkippedUnreadable,
+) {
+    super::scan_session_switches(
+        config,
+        store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        skipped,
     );
 }
 
@@ -4363,6 +4407,7 @@ fn scan_sessions_tp(
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 }
 
@@ -4445,7 +4490,9 @@ fn two_opted_in_sessions_on_different_members_get_different_intended_members() {
 /// carries the launch profile's default: a live session's model is a property
 /// of the whole chain, and `swap_eligible` drops a target whose `[models]`
 /// differs from the launch — so a heterogeneous chain would leave the walk with
-/// no target before trigger a ever runs.
+/// no target before trigger a ever runs. Like [`session_config`], each member
+/// holds a stored OAuth pair and is written to disk, so the decision leg's
+/// `stored_login` re-read and `swap_target_precondition` answer `HoldsLogin`.
 fn session_config_models(
     names: &[&str],
     defaults: &[(&str, &str)],
@@ -4453,27 +4500,30 @@ fn session_config_models(
 ) -> crate::profile::ConfigHandle {
     use crate::profile::{AppConfig, AppState, Profile};
     let launch_default = defaults.first().map(|(_, model)| *model);
-    Arc::new(RankedMutex::new(AppConfig {
-        state: AppState {
-            active_profile: names.first().map(|n| (*n).into()),
-            profiles: names.iter().map(|n| (*n).into()).collect(),
-            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
-            ..AppState::default()
-        },
-        profiles: names
-            .iter()
-            .map(|n| {
-                let mut p = Profile::new((*n).to_string(), None, None);
-                p.models.default = defaults
-                    .iter()
-                    .find(|(name, _)| name == n)
-                    .map(|(_, model)| (*model).to_string())
-                    .or_else(|| launch_default.map(str::to_string));
-                p.check_credit_cap = !gate_off.contains(n);
-                p
-            })
-            .collect(),
-    }))
+    crate::testutil::register_names(names);
+    let profiles: Vec<Profile> = names
+        .iter()
+        .map(|n| {
+            let mut p = Profile::new((*n).to_string(), None, None);
+            p.credentials = Some(crate::testutil::oauth_pair(n));
+            p.models.default = defaults
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, model)| (*model).to_string())
+                .or_else(|| launch_default.map(str::to_string));
+            p.check_credit_cap = !gate_off.contains(n);
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: names.first().map(|n| (*n).into()),
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    Arc::new(RankedMutex::new(AppConfig { state, profiles }))
 }
 
 /// [`session_store`] at 10% on every member, the named ones with their
@@ -5186,7 +5236,9 @@ fn an_outgoing_profiles_env_model_does_not_make_an_opus_session_credit_billed() 
     .unwrap();
     let mk = |n: &str| {
         let mut p = Profile::new(n.to_string(), None, None);
+        p.credentials = Some(crate::testutil::oauth_pair(n));
         p.models.default = Some("opus".to_string());
+        crate::profile::save_profile(&p).expect("save profile");
         p
     };
     let mut x = Profile::new("x".to_string(), None, None);
@@ -6518,12 +6570,15 @@ fn a_batch_of_session_decisions_takes_the_state_flock_once() {
     let _b_marker = register_live_row(&on_b);
     let _d_marker = register_live_row(&on_d);
 
+    // Build the on-disk fixtures OUTSIDE the measured window: `session_config`
+    // writes each profile to disk, which takes the state flock, and the pin
+    // below measures the decision leg's flock cost alone.
+    let config = session_config(&["a", "b", "c", "d"], Some("a"));
+    let store = session_store(&[("a", 10.0), ("b", 100.0), ("c", 10.0), ("d", 100.0)]);
+    let status = all_fresh(&["a", "b", "c", "d"]);
+
     crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
-    scan_sessions(
-        &session_config(&["a", "b", "c", "d"], Some("a")),
-        &session_store(&[("a", 10.0), ("b", 100.0), ("c", 10.0), ("d", 100.0)]),
-        &all_fresh(&["a", "b", "c", "d"]),
-    );
+    scan_sessions(&config, &store, &status);
     let flocks = crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.get());
 
     assert_eq!(
@@ -6682,6 +6737,328 @@ fn an_isolated_session_gets_no_decision() {
         decision_of("4242-0"),
         (None, None),
         "an isolated session follows no chain"
+    );
+}
+
+// ── per-session decision leg: the unreadable-member re-read ───────────────────
+//
+// The second half of P1: the leg re-reads its CHOSEN candidate's `stored_login`
+// before writing `intended_member`, exactly like the drains. A member whose
+// in-memory profile still holds a login while its committed store is torn or
+// empty is refused by the executor every poll, so the leg must step past it —
+// otherwise the intent never changes and the session wedges.
+
+#[test]
+fn a_session_decision_passes_over_a_torn_credentials_store() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["alpha", "gamma", "delta"], Some("alpha"));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    let gamma_store = crate::profile::profile_dir(&crate::profile::ProfileName::from("gamma"))
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::write(&gamma_store, "{\"claudeAiOauth\": {\"accessToken\": ")
+        .expect("tear gamma's credentials.json");
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the decision leg passes over the member whose credentials store it cannot \
+         read and names the one after it"
+    );
+}
+
+/// `gamma` is a key-only member whose `config.toml` is torn, so its stored
+/// login reads `Unknown`; `delta` holds the same api key beside a stored pair,
+/// so the swap can install it. A key-only `delta` would be refused by the
+/// swap (`NoCredentialStore`: no store to install), and naming it every tick is
+/// the wedge the leg's shared target check exists to prevent.
+#[test]
+fn a_session_decision_passes_over_a_torn_config_store() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alpha", "gamma", "delta"]);
+    let profiles: Vec<Profile> = ["alpha", "gamma", "delta"]
+        .iter()
+        .map(|name| {
+            let mut p = Profile::new((*name).to_string(), None, Some("k".to_string()));
+            if *name != "gamma" {
+                p.credentials = Some(crate::testutil::oauth_pair(name));
+            }
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        fallback_chain: ["alpha", "gamma", "delta"].map(ProfileName::from).to_vec(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(AppConfig { state, profiles }));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    let gamma_config = crate::profile::profile_dir(&ProfileName::from("gamma"))
+        .expect("profile dir")
+        .join("config.toml");
+    std::fs::write(&gamma_config, "base_url = \"").expect("tear gamma's config.toml");
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the decision leg passes over the member whose config it cannot read and \
+         names the one after it"
+    );
+}
+
+/// A key-only member reads `HoldsLogin` (its api key is inference auth), yet the
+/// swap refuses it `NoCredentialStore`: there is no store to install. The leg
+/// asks the swap's own target check, so a chain whose only members past the
+/// current one are key-only yields no decision at all, rather than one naming a
+/// member the executor refuses every tick.
+#[test]
+fn a_session_decision_names_no_key_only_member_the_swap_cannot_install() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alpha", "gamma", "delta"]);
+    let profiles: Vec<Profile> = ["alpha", "gamma", "delta"]
+        .iter()
+        .map(|name| {
+            let mut p = Profile::new((*name).to_string(), None, Some("k".to_string()));
+            if *name == "alpha" {
+                p.credentials = Some(crate::testutil::oauth_pair(name));
+            }
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        fallback_chain: ["alpha", "gamma", "delta"].map(ProfileName::from).to_vec(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(AppConfig { state, profiles }));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    assert_eq!(
+        crate::profile::stored_login(&ProfileName::from("delta")),
+        crate::profile::StoredLogin::HoldsLogin,
+        "precondition: a key-only member reads as holding a login"
+    );
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (None, None),
+        "the decision leg names no member the swap would refuse for want of a store"
+    );
+}
+
+/// `gamma` is an INTACT key-only member (readable config, an api key, no pair):
+/// the swap refuses it `NoCredentialStore` (no store to install), but the leg
+/// must step PAST that refusal — not stop at its first one — and name the pair
+/// member `delta` after it, whose api-key presence matches the launch's. The
+/// sibling `a_session_decision_names_no_key_only_member_the_swap_cannot_install`
+/// pins the all-key-only floor; this pins the re-walk over one intact key-only
+/// member.
+#[test]
+fn a_session_decision_steps_past_an_intact_key_only_member_to_a_pair_member() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alpha", "gamma", "delta"]);
+    let profiles: Vec<Profile> = ["alpha", "gamma", "delta"]
+        .iter()
+        .map(|name| {
+            let mut p = Profile::new((*name).to_string(), None, Some("k".to_string()));
+            if *name != "gamma" {
+                p.credentials = Some(crate::testutil::oauth_pair(name));
+            }
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        fallback_chain: ["alpha", "gamma", "delta"].map(ProfileName::from).to_vec(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(AppConfig { state, profiles }));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the decision leg steps past an intact key-only member the swap refuses \
+         for want of a store and names the pair member after it"
+    );
+}
+
+#[test]
+fn a_session_decision_passes_over_a_torn_sidecar_store() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alpha", "gamma", "delta"]);
+    let profiles: Vec<crate::profile::Profile> = ["alpha", "gamma", "delta"]
+        .iter()
+        .map(|name| {
+            let mut p = crate::testutil::blank_profile(&ProfileName::from(*name));
+            if *name == "gamma" {
+                p.has_long_lived_sidecar = true;
+            } else {
+                p.credentials = Some(crate::testutil::oauth_pair(name));
+            }
+            crate::profile::save_profile(&p).expect("save profile");
+            if *name == "gamma" {
+                crate::testutil::write_long_lived_sidecar(&ProfileName::from(*name));
+            }
+            p
+        })
+        .collect();
+    let state = AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        fallback_chain: ["alpha", "gamma", "delta"].map(ProfileName::from).to_vec(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(AppConfig { state, profiles }));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    let gamma_sidecar = crate::profile::profile_dir(&ProfileName::from("gamma"))
+        .expect("profile dir")
+        .join("session-token.json");
+    std::fs::write(&gamma_sidecar, "{\"claudeAiOauth\": {\"accessToken\": ")
+        .expect("tear gamma's session-token.json");
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the decision leg passes over the member whose sidecar it cannot read and \
+         names the one after it"
+    );
+}
+
+/// The first half of P1: the session walk reads the skip set and never names a
+/// skipped member as the intent, even while that member's store reads fine on
+/// disk — the set is read-only here, so the member stays passed over until the
+/// next healing scan drops it.
+#[test]
+fn a_session_decision_never_points_at_a_skipped_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["alpha", "gamma", "delta"], Some("alpha"));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    let skipped: super::SkippedUnreadable =
+        Arc::new(RankedMutex::new(HashSet::from(["gamma".to_string()])));
+
+    scan_sessions_skipped(&config, &store, &status, &skipped);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the session walk honours the skip set and never names a skipped member as the intent"
+    );
+}
+
+/// The leg steps past an `Unknown` pick WITHOUT marking the shared skip store
+/// (round-7 Q2): it re-reads the pick's store every tick, so it needs no memory
+/// of the rejection, and the daemon keeps its own ruled defer/give-up lines for
+/// a member whose store stays unreadable. The skip set the walk honours stays
+/// read-only.
+#[test]
+fn a_session_decision_leaves_the_skip_store_unmarked_after_an_unreadable_pick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["alpha", "gamma", "delta"], Some("alpha"));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    let gamma_store = crate::profile::profile_dir(&crate::profile::ProfileName::from("gamma"))
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::write(&gamma_store, "{\"claudeAiOauth\": {\"accessToken\": ")
+        .expect("tear gamma's credentials.json");
+    let skipped: super::SkippedUnreadable = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_sessions_skipped(&config, &store, &status, &skipped);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the decision leg passes over the member whose store it cannot read and names the one after it"
+    );
+    assert!(
+        skipped.lock().expect("skip store lock").is_empty(),
+        "the session leg writes nothing into the shared skip store"
+    );
+}
+
+/// A pick the executor refuses for a load failure past a readable login (a pair
+/// member whose `credentials.json` reads fine but whose `config.toml` is torn)
+/// is stepped past by the leg through the SAME gate the executor's install
+/// branch runs — the leg's `stored_login` re-read alone reads `HoldsLogin` and
+/// would accept it, writing the intent every tick and wedging the session.
+/// Neither rejection marks the shared skip store.
+#[test]
+fn a_session_decision_steps_past_a_pick_the_executor_refuses_for_a_load_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["alpha", "gamma", "delta"], Some("alpha"));
+    let store = session_store(&[("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)]);
+    let status = all_fresh(&["alpha", "gamma", "delta"]);
+    let row = session_row("4242-1", "alpha");
+    let _marker = register_live_row(&row);
+    let gamma_config = crate::profile::profile_dir(&crate::profile::ProfileName::from("gamma"))
+        .expect("profile dir")
+        .join("config.toml");
+    std::fs::write(&gamma_config, "base_url = \"").expect("tear gamma's config.toml");
+    let skipped: super::SkippedUnreadable = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_sessions_skipped(&config, &store, &status, &skipped);
+
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("delta".to_string()), Some(2)),
+        "the decision leg steps past a member the executor refuses for a load \
+         failure and names the one after it"
+    );
+    assert!(
+        skipped.lock().expect("skip store lock").is_empty(),
+        "the session leg writes nothing into the shared skip store"
     );
 }
 
@@ -7741,6 +8118,7 @@ fn third_party_state_at_interval(
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -9170,6 +9548,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -9267,6 +9646,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -9493,6 +9873,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // A DIFFERENT lease over the same file → its acquire() is denied while
@@ -9606,6 +9987,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // Nothing else holds the flock, so this tick is the fetcher.
@@ -9727,6 +10109,7 @@ fn a_rebuilt_entry_partitioned_after_a_bump_still_lands() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -9826,6 +10209,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -9945,6 +10329,7 @@ fn auto_start_queue_election_is_wired_into_tick() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -10557,6 +10942,7 @@ fn completion_order_state() -> super::SchedulerState {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -10822,7 +11208,7 @@ fn recovery_config(
     active_profile: Option<&str>,
     fallback_chain: &[&str],
 ) -> crate::profile::ConfigHandle {
-    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::profile::{AppConfig, AppState};
 
     Arc::new(RankedMutex::new(AppConfig {
         state: AppState {
@@ -10830,7 +11216,7 @@ fn recovery_config(
             fallback_chain: fallback_chain.iter().map(|s| (*s).into()).collect(),
             ..AppState::default()
         },
-        profiles: vec![Profile::new("b".to_string(), None, None)],
+        profiles: vec![logged_in("b")],
     }))
 }
 
@@ -10863,6 +11249,7 @@ fn scan_recovery_is_a_no_op_while_a_switch_is_pending() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert_eq!(
@@ -10897,6 +11284,7 @@ fn scan_recovery_is_a_no_op_with_an_active_profile_set() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -10932,6 +11320,7 @@ fn scan_recovery_ignores_a_stale_or_synthetic_read() {
             &kick_blocks,
             &pending,
             &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
         );
         assert!(
             pending.lock().unwrap().is_empty(),
@@ -10951,6 +11340,7 @@ fn scan_recovery_ignores_a_stale_or_synthetic_read() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     assert!(
         pending.lock().unwrap().is_empty(),
@@ -10991,6 +11381,7 @@ fn scan_recovery_never_relinks_to_a_switch_grade_kick_rejected_member() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -11021,6 +11412,7 @@ fn scan_recovery_queues_a_recovered_chain_member() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert_eq!(
@@ -11030,6 +11422,125 @@ fn scan_recovery_queues_a_recovered_chain_member() {
             key_rejected_cause: None,
         }]),
         "a recovered chain member must be queued for switch"
+    );
+}
+
+/// The switch-off recovery walk never queues a relink onto a recovered-looking
+/// member that holds no login (no stored pair, no session-token sidecar, no api
+/// key): the relink would install an empty login into the global slot.
+#[test]
+fn scan_recovery_never_queues_a_member_holding_no_login() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            fallback_chain: vec!["b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("b".to_string(), None, None)],
+    }));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_recovery(
+        &config,
+        &recoverable_store(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+    );
+
+    assert_eq!(
+        pending.lock().unwrap().clone(),
+        HashSet::new(),
+        "a member holding no login must never be queued"
+    );
+}
+
+/// The recovery walk's skip filter (P3): a skipped member whose store still
+/// reads unreadable sits ahead of a clear member; recovery must pass over it and
+/// queue the clear one, or the relink re-picks the skipped member off the stale
+/// config and wedges recovery on it forever.
+#[test]
+fn scan_recovery_passes_over_a_skipped_member_to_the_next_clear_one() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let profiles: Vec<crate::profile::Profile> = ["a", "b"]
+        .iter()
+        .map(|name| {
+            let mut p = crate::testutil::blank_profile(&ProfileName::from(*name));
+            p.credentials = Some(crate::testutil::oauth_pair(name));
+            crate::profile::save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles,
+    }));
+    let now = crate::usage::now_epoch_secs();
+    let recoverable = |util: f64| crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: util,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let store = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), recoverable(10.0)),
+        ("b".to_string(), recoverable(10.0)),
+    ])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), FetchStatus::Fresh),
+        ("b".to_string(), FetchStatus::Fresh),
+    ])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let skipped: super::SkippedUnreadable =
+        Arc::new(RankedMutex::new(HashSet::from(["a".to_string()])));
+    // Tear "a"'s committed store so the healing re-read keeps it skipped.
+    let a_store = crate::profile::profile_dir(&ProfileName::from("a"))
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::write(&a_store, "{\"claudeAiOauth\": {\"accessToken\": ").expect("tear a's store");
+
+    scan_recovery(
+        &config,
+        &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &skipped,
+    );
+
+    assert_eq!(
+        pending.lock().unwrap().clone(),
+        HashSet::from([super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: None,
+        }]),
+        "a skipped clear member ahead of a clear one must be passed over"
     );
 }
 
@@ -11068,6 +11579,7 @@ fn scan_recovery_ignores_a_keyless_provider_members_cached_reading() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -11111,6 +11623,7 @@ fn scan_recovery_never_relinks_to_a_disabled_member() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -11166,6 +11679,7 @@ fn scan_recovery_never_relinks_to_a_chain_member_with_no_profile() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -11215,6 +11729,7 @@ fn scan_recovery_never_relinks_to_a_canceled_member() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -11258,6 +11773,7 @@ fn scan_recovery_never_relinks_to_an_auth_broken_member() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -11324,6 +11840,7 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         // Pre-armed shutdown: if the `cfg!(test)` spawn-skip is ever removed
         // while the seed hoist stays, the tick thread this would spawn breaks
@@ -11892,6 +12409,7 @@ fn spawn_refresher_prunes_stale_history_before_returning() {
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         // Same pre-armed shutdown as the kick-block seed test: if the
         // `cfg!(test)` spawn-skip ever goes while this hoist stays, the tick
@@ -14245,6 +14763,7 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -14500,6 +15019,7 @@ fn auto_start_queue_election_drops_a_canceled_account_from_the_store_only() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -14620,6 +15140,7 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -15188,6 +15709,7 @@ fn scan_auto_switch_leaves_a_reading_dead_global_active() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -15276,6 +15798,7 @@ fn run_third_party_scan(
         tp_status,
         tp_streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -15495,6 +16018,7 @@ fn scan_auto_switch_walks_a_hybrid_on_its_provider_windows() {
         &tp_status,
         &tp_streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -15534,6 +16058,7 @@ fn a_hybrid_with_a_failed_provider_leg_does_not_act_on_its_fresh_oauth_leg() {
         &tp_status,
         &tp_streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -15570,6 +16095,7 @@ fn recovery_relinks_onto_a_third_party_member_with_provider_headroom() {
         &kick_blocks,
         &pending,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     assert_eq!(
         pending.lock().unwrap().clone(),
@@ -15609,7 +16135,7 @@ fn an_env_token_oauth_account_with_a_base_url_is_walked_off_its_merged_store_rea
         !a.usage_cache_is_third_party() && a.base_url.is_some(),
         "fixture: the two predicates disagree"
     );
-    let b = crate::profile::Profile::new("b".to_string(), None, None);
+    let b = logged_in("b");
     let config = Arc::new(RankedMutex::new(crate::profile::AppConfig {
         state: crate::profile::AppState {
             active_profile: Some("a".into()),
@@ -15633,6 +16159,7 @@ fn an_env_token_oauth_account_with_a_base_url_is_walked_off_its_merged_store_rea
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -15776,6 +16303,7 @@ fn a_windowless_provider_hybrid_with_a_fresh_provider_leg_is_not_reading_dead() 
         &tp_status,
         &tp_streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -16177,6 +16705,7 @@ fn scan_auto_switch_leaves_a_key_rejected_third_party_active() {
         &tp_status,
         &tp_streaks,
         &broken,
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -16218,6 +16747,7 @@ fn scan_records_key_rejected(
         tp_status,
         tp_streaks,
         broken,
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -16561,6 +17091,7 @@ fn scan_auto_switch_keeps_a_console_lapse_active() {
         &tp_status,
         &tp_streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -16624,6 +17155,7 @@ fn scan_auto_switch_never_picks_a_key_rejected_member_as_target() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &broken,
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -17848,6 +18380,7 @@ fn tps_state(lease: Arc<crate::daemon::FetchLease>) -> super::SchedulerState {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: lease,
@@ -19558,6 +20091,7 @@ fn a_tick_with_all_legs_due_under_a_wedge_takes_one_wait() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -19716,6 +20250,7 @@ fn a_tick_with_no_codex_due_under_a_wedge_takes_one_wait() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),

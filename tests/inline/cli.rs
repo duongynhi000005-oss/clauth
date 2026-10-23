@@ -4478,6 +4478,11 @@ fn cmd_start_explain_launches_nothing() {
     })
     .unwrap();
     for name in ["a", "b"] {
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+        p.credentials = Some(crate::testutil::oauth_pair(name));
+        crate::profile::save_profile(&p).unwrap();
+    }
+    for name in ["a", "b"] {
         crate::profile_cache::write_profile_cache(
             &crate::profile::ProfileName::from(name),
             crate::profile_cache::USAGE_CACHE_FILE,
@@ -4536,6 +4541,9 @@ fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
         ..crate::profile::AppState::default()
     })
     .unwrap();
+    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    p.credentials = Some(crate::testutil::oauth_pair("a"));
+    crate::profile::save_profile(&p).unwrap();
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from("a"),
         crate::profile_cache::USAGE_CACHE_FILE,
@@ -4587,6 +4595,7 @@ fn seed_start_members(global: serde_json::Value, members: &[StartMember]) {
     for m in members {
         let name = crate::profile::ProfileName::from(m.name);
         let mut profile = crate::testutil::blank_profile(&name);
+        profile.credentials = Some(crate::testutil::oauth_pair(m.name));
         profile.models.default = m.default.map(str::to_owned);
         for (k, v) in m.env {
             profile.env.insert((*k).to_owned(), (*v).to_owned());
@@ -4692,6 +4701,7 @@ fn seed_credit_spend_member(
     })
     .unwrap();
     let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::testutil::oauth_pair("a"));
     profile.models.default = member_default.map(str::to_owned);
     profile.check_credit_cap = check_credit_cap;
     crate::profile::save_profile(&profile).unwrap();

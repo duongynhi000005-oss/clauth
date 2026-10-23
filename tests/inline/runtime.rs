@@ -8039,6 +8039,361 @@ fn the_precondition_refuses_a_member_whose_transport_differs() {
     });
 }
 
+/// A `credentials.json` that parses but holds no login installs an empty login
+/// into the session, signing it out. The swap's precondition re-reads the
+/// intended member's stored login lock-free and refuses the proven-none state.
+#[test]
+fn the_precondition_refuses_a_credentials_store_holding_no_login() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("pc-launch");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        for body in ["{}", "{\"mcpOauth\": {\"accessToken\": \"x\"}}"] {
+            let gamma = member("pc-empty");
+            let store = member_store(&gamma);
+            std::fs::write(&store, body).expect("write a login-less credentials store");
+
+            assert_eq!(
+                swap.precondition("pc-empty").map(|plan| plan.member),
+                Err(SwapRefused::NoCredentialStore),
+                "a store that parses with no login is refused, never installed"
+            );
+        }
+    });
+}
+
+/// A torn `credentials.json` reads [`crate::profile::StoredLogin::Unknown`],
+/// so the re-read — which runs BEFORE the profile load — refuses it as
+/// [`SwapRefused::LoginUnreadable`] and no parse-error text reaches the line.
+/// A readable login beside a torn `config.toml` still fails the load: see
+/// `the_precondition_refuses_a_pair_member_whose_config_is_torn_as_unreadable_profile`.
+#[test]
+fn the_precondition_refuses_a_torn_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("pt-launch");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let gamma = member("pt-torn");
+        let store = member_store(&gamma);
+        std::fs::write(&store, "{\"claudeAiOauth\": {\"accessToken\": ")
+            .expect("tear the intended member's store");
+
+        assert_eq!(
+            swap.precondition("pt-torn").map(|plan| plan.member),
+            Err(SwapRefused::LoginUnreadable),
+            "a torn credentials store is refused as an unreadable login"
+        );
+    });
+}
+
+/// A key member (api key in `config.toml`, no OAuth pair, no sidecar) whose
+/// `config.toml` is torn reads [`crate::profile::StoredLogin::Unknown`], so the
+/// re-read refuses it as [`SwapRefused::LoginUnreadable`] before `load_profile`
+/// can put the parse error's bytes on the line.
+#[test]
+fn the_precondition_refuses_a_key_member_whose_config_is_torn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("pk-launch");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let mut keyed = make_profile("pk-key");
+        keyed.api_key = Some("k".into());
+        member_store(&keyed);
+        let config = crate::profile::profile_dir(&crate::profile::ProfileName::from("pk-key"))
+            .expect("profile dir")
+            .join("config.toml");
+        std::fs::write(&config, "api_key = \"sk-").expect("tear the key member's config.toml");
+
+        assert_eq!(
+            swap.precondition("pk-key").map(|plan| plan.member),
+            Err(SwapRefused::LoginUnreadable),
+            "a key member whose config.toml is torn is refused as an unreadable login"
+        );
+    });
+}
+
+/// A pair member whose `credentials.json` reads fine but whose `config.toml` is
+/// torn reads [`crate::profile::StoredLogin::HoldsLogin`], so the re-read passes
+/// it through to `load_profile`, which refuses it as
+/// [`SwapRefused::ProfileUnreadable`] — the re-read must not swallow a genuine
+/// load failure past a readable login.
+#[test]
+fn the_precondition_refuses_a_pair_member_whose_config_is_torn_as_unreadable_profile() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("pp-launch");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let gamma = member("pp-torn-config");
+        member_store(&gamma);
+        let config =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("pp-torn-config"))
+                .expect("profile dir")
+                .join("config.toml");
+        std::fs::write(&config, "base_url = \"").expect("tear the pair member's config.toml");
+
+        assert!(
+            matches!(
+                swap.precondition("pp-torn-config"),
+                Err(SwapRefused::ProfileUnreadable(_))
+            ),
+            "a readable login beside a torn config.toml is refused as an unreadable profile"
+        );
+    });
+}
+
+/// The shared target check is a read-only question: a member holding a legacy
+/// `credentials.json.pending` sidecar is checked, and neither `credentials.json`
+/// nor the sidecar changes — the check must not adopt the sidecar the way
+/// `load_profile`'s recovery does. Modelled on
+/// `pending_sidecar_newer_than_the_commit_is_adopted_and_written_through`.
+#[test]
+fn the_shared_target_check_does_not_adopt_a_legacy_pending_sidecar() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("scp-launch");
+        member_store(&launch);
+        let launch = crate::runtime::LaunchTransport::of(&launch);
+
+        let gamma = member("scp-pending");
+        let store = member_store(&gamma);
+        let pending =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("scp-pending"))
+                .expect("profile dir")
+                .join("credentials.json.pending");
+        std::fs::write(
+            &pending,
+            "{\"claudeAiOauth\":{\"accessToken\":\"at-pending\",\"refreshToken\":\"rt-pending\"}}",
+        )
+        .expect("write a legacy pending sidecar");
+        // Newer than the committed store, so a full load would adopt it.
+        let now = std::time::SystemTime::now();
+        crate::testutil::set_mtime(&store, now - std::time::Duration::from_secs(60));
+        crate::testutil::set_mtime(&pending, now);
+        let before_store = std::fs::read(&store).expect("read store before");
+        let before_pending = std::fs::read(&pending).expect("read pending before");
+
+        assert!(
+            crate::runtime::swap_target_precondition(
+                &crate::profile::ProfileName::from("scp-pending"),
+                &launch,
+                crate::runtime::ModelsRule::Equal,
+            )
+            .is_ok(),
+            "a pair member with a legacy sidecar passes the shared check"
+        );
+        assert_eq!(
+            std::fs::read(&store).expect("read store after"),
+            before_store,
+            "the shared check must not write credentials.json"
+        );
+        assert_eq!(
+            std::fs::read(&pending).expect("read pending after"),
+            before_pending,
+            "the shared check must not consume or rewrite the pending sidecar"
+        );
+    });
+}
+
+/// The shared target check resolves an adoptable legacy `.pending` exactly as a
+/// full load would: a member with NO committed `credentials.json`, a long-lived
+/// sidecar login, a leftover `base_url` and an adoptable `.pending` passes the
+/// check — `read_profile` adopts the sidecar in memory, so the pair wins over
+/// the leftover endpoint — while nothing on disk changes. Modelled on
+/// `pending_sidecar_is_adopted_when_no_commit_exists_at_all`.
+#[test]
+fn the_shared_target_check_resolves_an_adoptable_pending_sidecar_like_a_full_load() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("r10p-launch");
+        member_store(&launch);
+        let launch = crate::runtime::LaunchTransport::of(&launch);
+
+        let name = crate::profile::ProfileName::from("r10p-pend-baseurl");
+        // No committed credentials: `save_profile` with `credentials: None`
+        // writes config.toml only, so the sidecar below is the only pair.
+        let mut gamma = make_profile("r10p-pend-baseurl");
+        gamma.base_url = Some("https://api.example/anthropic".into());
+        crate::profile::save_profile(&gamma).expect("save profile");
+        crate::testutil::write_long_lived_sidecar(&name);
+        let pending = crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join("credentials.json.pending");
+        std::fs::write(
+            &pending,
+            "{\"claudeAiOauth\":{\"accessToken\":\"at-pending\",\"refreshToken\":\"rt-pending\"}}",
+        )
+        .expect("write a legacy pending sidecar");
+        let before_pending = std::fs::read(&pending).expect("read pending before");
+        let store = crate::claude::install_source_path(&name).expect("install source");
+        let before_store = std::fs::read(&store).expect("read store before");
+        let cred_path = crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join("credentials.json");
+
+        assert!(
+            crate::runtime::swap_target_precondition(
+                &name,
+                &launch,
+                crate::runtime::ModelsRule::Equal
+            )
+            .is_ok(),
+            "the shared check resolves the adoptable sidecar exactly as a full load would"
+        );
+        assert_eq!(
+            std::fs::read(&pending).expect("read pending after"),
+            before_pending,
+            "the shared check must not consume or rewrite the pending sidecar"
+        );
+        assert_eq!(
+            std::fs::read(&store).expect("read store after"),
+            before_store,
+            "the shared check must not write the install source"
+        );
+        assert!(
+            !cred_path.exists(),
+            "the resolve is in memory only: no credentials.json is written through"
+        );
+    });
+}
+
+/// The shared target check must not rewrite `config.toml` either. A config whose
+/// canonical render does not round-trip — an `[env]` key that needs quoting,
+/// which `render_config_toml` emits bare — makes `load_profile`'s rewrite leg
+/// fire; the side-effect-free read must leave it byte-identical. The fixture is
+/// asserted LIVE (a full load on a sibling copy of the same bytes changes them),
+/// so the pin stays armed once the renderer learns to quote keys, and the check
+/// runs on its `Ok` path (a launch carrying the same env) so the read reaches
+/// past the transport gate.
+#[test]
+fn the_shared_target_check_does_not_rewrite_config_toml() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let mut launch = member("scc-launch");
+        launch.env.insert("A.B".into(), "x".into());
+        member_store(&launch);
+        let launch = crate::runtime::LaunchTransport::of(&launch);
+
+        let seed = |name: &str| {
+            crate::profile::save_profile(&member(name)).expect("save member");
+            let config = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+                .expect("profile dir")
+                .join("config.toml");
+            std::fs::write(&config, "[env]\n\"A.B\" = \"x\"\n")
+                .expect("write a config whose render does not round-trip");
+            config
+        };
+
+        // The fixture is live: a full load rewrites these exact bytes.
+        let live_config = seed("scc-rewrite-live");
+        let live_before = std::fs::read(&live_config).expect("read live config before");
+        crate::profile::load_profile(&crate::profile::ProfileName::from("scc-rewrite-live"))
+            .expect("load live profile");
+        assert_ne!(
+            std::fs::read(&live_config).expect("read live config after"),
+            live_before,
+            "fixture liveness: a full load must rewrite this config"
+        );
+
+        let config = seed("scc-rewrite");
+        let before = std::fs::read(&config).expect("read config before");
+        assert!(
+            crate::runtime::swap_target_precondition(
+                &crate::profile::ProfileName::from("scc-rewrite"),
+                &launch,
+                crate::runtime::ModelsRule::Equal,
+            )
+            .is_ok(),
+            "the check runs on its Ok path: the launch carries the same env"
+        );
+        assert_eq!(
+            std::fs::read(&config).expect("read config after"),
+            before,
+            "the shared check must not rewrite config.toml"
+        );
+    });
+}
+
+/// The `LoginUnreadable` refusal renders the approved copy and composes into the
+/// session's stay line exactly: the intended member is blamed, and the reason is
+/// the store's unreadability rather than a profile load failure.
+#[test]
+fn the_login_unreadable_refusal_composes_the_approved_line() {
+    assert_eq!(
+        refusal_line("3f2a", "alpha", "gamma", &SwapRefused::LoginUnreadable),
+        "clauth: session 3f2a stays on alpha: gamma is not swappable (its stored login could not be read)",
+        "the exact approved copy: an unreadable stored login, not a profile load failure"
+    );
+}
+
+/// A sidecar-only member whose `session-token.json` is torn is an UNREADABLE
+/// login, never a proven absence: `install_source_path` falls back to the absent
+/// `credentials.json`, so the existence check alone would read `NoCredentialStore`.
+/// The re-read runs BEFORE that check and refuses `LoginUnreadable`.
+#[test]
+fn the_precondition_refuses_a_sidecar_only_member_whose_sidecar_is_torn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("pst-launch");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let gamma = make_profile("pst-side");
+        register_profile(&gamma);
+        crate::testutil::write_long_lived_sidecar(&crate::profile::ProfileName::from("pst-side"));
+        let sidecar = crate::profile::profile_dir(&crate::profile::ProfileName::from("pst-side"))
+            .expect("profile dir")
+            .join("session-token.json");
+        std::fs::write(&sidecar, "{\"claudeAiOauth\": {\"accessToken\": ")
+            .expect("tear the sidecar-only member's sidecar");
+
+        assert_eq!(
+            swap.precondition("pst-side").map(|plan| plan.member),
+            Err(SwapRefused::LoginUnreadable),
+            "a torn sidecar is an unreadable login, not a proven absence"
+        );
+    });
+}
+
+/// The pin the round-6 review asked for (Q1): `credentials.json` = `{}` beside a
+/// torn `session-token.json` loads fine, so `load_profile` cannot refuse it, and
+/// only the login re-read stands between it and installing an empty login.
+#[test]
+fn the_precondition_refuses_an_empty_store_beside_a_torn_sidecar() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("pes-launch");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let gamma = member("pes-empty-side");
+        let store = member_store(&gamma);
+        std::fs::write(&store, "{}").expect("write an empty credentials store");
+        crate::testutil::write_long_lived_sidecar(&crate::profile::ProfileName::from(
+            "pes-empty-side",
+        ));
+        let sidecar =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("pes-empty-side"))
+                .expect("profile dir")
+                .join("session-token.json");
+        std::fs::write(&sidecar, "{\"claudeAiOauth\": {\"accessToken\": ")
+            .expect("tear the sidecar");
+
+        assert_eq!(
+            swap.precondition("pes-empty-side").map(|plan| plan.member),
+            Err(SwapRefused::LoginUnreadable),
+            "an empty store beside a torn sidecar is refused as an unreadable login"
+        );
+    });
+}
+
 /// A swap stamps and holds ONE marker on the swapped-onto member, its per-session
 /// `sessions-<sid>/<sid>`, so `has_live_session` sees that member live for the
 /// session's life and nothing lands at the bare-stem `sessions/<sid>`.

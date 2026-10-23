@@ -854,6 +854,12 @@ pub(crate) enum BlockedReason {
     /// wrong fix — the key must be re-entered. A lapsed Alibaba console session
     /// is NOT this (its key still serves).
     KeyRejected,
+    /// The member holds no login at all — no stored OAuth pair, no long-lived
+    /// session-token sidecar, no usable api key / env inference token. Dead
+    /// credential family, beside [`BlockedReason::AuthBroken`]: linking it
+    /// would install an empty login into the global slot and sign every
+    /// session out.
+    LoggedOut,
     /// Long window (7d, else the provider-marked monthly quota) at/over the
     /// hard cap ([`WEEKLY_HARD_BLOCK_PCT`]) — dead until the
     /// window's reset. `resets_in` is seconds to that reset when the window
@@ -985,6 +991,12 @@ pub(crate) fn health_blocked_reason(
     // `AuthBroken` — a re-login does not fix a rejected key.
     if key_rejected.contains(&profile.name) {
         return Some(BlockedReason::KeyRejected);
+    }
+    // No login at all — the dead-credential family's last rung: a member with
+    // nothing to install is dead on every axis, and naming a quota window for
+    // it would describe an account nothing is going to pick anyway.
+    if !profile.holds_login() {
+        return Some(BlockedReason::LoggedOut);
     }
     let now = now_epoch_secs();
     // Weekly HARD cap first: dead for days regardless of the 5h window.
@@ -1186,6 +1198,21 @@ pub(crate) struct ChainSnapshot {
     /// even with idle-looking usage, so it is walked around like `broken`, and
     /// a rejected ACTIVE bypasses the exhaustion gate the same way.
     pub(crate) kick_rejected: Vec<ProfileName>,
+    /// Members the walk passes over. The shared skip store holds only names a
+    /// drain marked for a store that read
+    /// [`crate::profile::StoredLogin::Unknown`]: the daemon marks at give-up (its
+    /// backoff window closed), the TUI marks at its first skip of an `Unknown`
+    /// store, and the healing scan keeps only `Unknown` — a name `stored_login`
+    /// reads as anything else is dropped, so a `HoldsNone` name never survives a
+    /// scan. Only the session decision leg's snapshot-local push adds other
+    /// refusal reasons, and it never writes the shared store. Not config
+    /// state — [`snapshot_chain`] leaves it empty and the scheduler's scan fills
+    /// it from the live [`crate::usage::SkippedUnreadable`] store after
+    /// re-reading each name's `stored_login` lock-free and dropping the healed
+    /// ones; the session leg appends its own refused picks per walk. A skipped
+    /// member can never be linked, so it is walked around like `broken`; unlike
+    /// `broken` it is transient, cleared the scan its store reads again.
+    pub(crate) skipped_unreadable: Vec<ProfileName>,
     /// Members whose usage-reading channel is DEAD: deep-slot stuck
     /// `RateLimited` (the streak that already opens the scan bypass
     /// `reading_is_actionable`) with a windowless or absent store entry, so
@@ -1301,6 +1328,7 @@ pub(crate) fn snapshot_codex_chain(
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected,
+        skipped_unreadable: Vec::new(),
         reading_dead: Vec::new(),
         fresh: Vec::new(),
         models_differ: Vec::new(),
@@ -1381,7 +1409,12 @@ pub(crate) fn snapshot_session_chain(
         .filter(|name| {
             *name != member
                 && config.find(name).is_some_and(|p| {
-                    crate::runtime::swap_eligible(p, launch, crate::runtime::ModelsRule::Equal)
+                    p.holds_login()
+                        && crate::runtime::swap_eligible(
+                            p,
+                            launch,
+                            crate::runtime::ModelsRule::Equal,
+                        )
                         .is_err()
                         && crate::runtime::swap_eligible(p, launch, crate::runtime::ModelsRule::Any)
                             .is_ok()
@@ -1444,17 +1477,17 @@ fn build_chain_snapshot(
         .state
         .fallback_chain
         .iter()
-        // A disabled or unresolvable NON-active member is invisible to both
-        // chain walks — dropped here rather than carried as a `ChainMember`
-        // flag, so the freshness pass built from `.chain` below never considers
-        // it either. The active slot must stay RESOLVABLE regardless of its own
-        // `disabled` bit — `next_auto_switch_target` indexes into this vec by
-        // `position(|m| m.name == snapshot.active)`, so dropping a disabled
-        // active here would make that `?` return `None` every tick, wedging
-        // auto-switch permanently instead of just skipping it as a candidate
-        // (the walk's own skip closure never skips `chain[i] == active` either
-        // — `disabled` and unresolvable are candidate-only exclusions, same as
-        // `broken`/`canceled`).
+        // A disabled, logged-out, or unresolvable NON-active member is
+        // invisible to both chain walks — dropped here rather than carried as a
+        // `ChainMember` flag, so the freshness pass built from `.chain` below
+        // never considers it either. The active slot must stay RESOLVABLE
+        // regardless of its own `disabled` bit — `next_auto_switch_target`
+        // indexes into this vec by `position(|m| m.name == snapshot.active)`, so
+        // dropping a disabled active here would make that `?` return `None`
+        // every tick, wedging auto-switch permanently instead of just skipping
+        // it as a candidate (the walk's own skip closure never skips
+        // `chain[i] == active` either — `disabled`, logged-out, and unresolvable
+        // are candidate-only exclusions, same as `broken`/`canceled`).
         .filter(|name| {
             // Bound once: `find` is a linear scan and `skip_candidate`'s argument is
             // evaluated eagerly, so spelling it twice here charged the GLOBAL path a
@@ -1463,6 +1496,7 @@ fn build_chain_snapshot(
             *name == active.as_str()
                 || (profile.is_some()
                     && !profile.is_some_and(Profile::is_disabled)
+                    && profile.is_some_and(|p| p.holds_login())
                     && !skip_candidate(profile))
         })
         .map(|name| chain_member(config, name, weekly_pct, key_rejected))
@@ -1480,6 +1514,7 @@ fn build_chain_snapshot(
         spend_budget: config.state.spend_budget_switching,
         switch_off_when_budget_spent: config.state.switch_off_when_budget_spent,
         kick_rejected: Vec::new(),
+        skipped_unreadable: Vec::new(),
         reading_dead: Vec::new(),
         fresh: Vec::new(),
         models_differ: Vec::new(),
@@ -1691,13 +1726,27 @@ fn ordered_walk<'u>(
 pub(crate) enum StartBlock {
     Disabled,
     AuthBroken,
+    /// The member holds no login at all (no stored pair, sidecar, api key or
+    /// env token): a start would install an empty login. Dead-credential
+    /// family, beside [`StartBlock::AuthBroken`].
+    LoggedOut,
     Canceled,
     KickRejected,
     NotOauth,
-    WeeklySpent { monthly: bool },
-    WeeklySoft { pct: f64, monthly: bool },
-    FiveHour { pct: f64 },
-    ScopedSpent { label: String, pct: f64 },
+    WeeklySpent {
+        monthly: bool,
+    },
+    WeeklySoft {
+        pct: f64,
+        monthly: bool,
+    },
+    FiveHour {
+        pct: f64,
+    },
+    ScopedSpent {
+        label: String,
+        pct: f64,
+    },
     CreditCap,
 }
 
@@ -1719,7 +1768,7 @@ pub(crate) enum StartBlock {
 /// walk's own predicate); the `WeeklySpent`/`FiveHour`/`WeeklySoft` rungs only
 /// NAME which of its clauses fired, so none can fire while the predicate is
 /// clear. `None` means the member is not excluded (disabled, canceled,
-/// auth-broken, kick-rejected, non-OAuth under `--with-fallback`) AND not
+/// auth-broken, logged-out, kick-rejected, non-OAuth under `--with-fallback`) AND not
 /// exhausted AND scoped-clear AND credit-clear. Every rung but `NotOauth` is
 /// one the switch walk also skips or refuses on, except the demand-narrowed
 /// rungs (`ScopedSpent`, `CreditCap`) under a known demand; the active-slot
@@ -1746,6 +1795,12 @@ pub(crate) fn start_block(
     }
     if config.is_auth_broken(&member.name) || third_party_key_rejected(profile, &member.name) {
         return Some(StartBlock::AuthBroken);
+    }
+    // Dead-credential family: a member holding no login at all can never be
+    // started on (the launch would install an empty login), so it outranks the
+    // `--with-fallback` non-OAuth refusal and every usage rung below.
+    if !profile.holds_login() {
+        return Some(StartBlock::LoggedOut);
     }
     if needs_oauth && !profile.is_oauth() {
         return Some(StartBlock::NotOauth);
@@ -2057,12 +2112,12 @@ pub(crate) fn durable_key_rejected(config: &AppConfig) -> HashSet<ProfileName> {
 }
 
 /// Config-side exclusions every fallback-chain walk applies before it weighs
-/// usage headroom: an unresolvable, auth-broken, key-rejected, or user-disabled
-/// member is never a candidate. Pure state (no usage read, no disk read) —
-/// `key_rejected` is the key-rejected set the caller computed once outside the
-/// config guard, so it holds in both the UI and daemon contexts. Shared by
-/// `scan_recovery` and the render-side walks so their skip lists can't drift
-/// apart. The `== active` guard is walk-structural and stays at the
+/// usage headroom: an unresolvable, auth-broken, key-rejected, user-disabled,
+/// or logged-out member is never a candidate. Pure state (no usage read, no
+/// disk read) — `key_rejected` is the key-rejected set the caller computed once
+/// outside the config guard, so it holds in both the UI and daemon contexts.
+/// Shared by `scan_recovery` and the render-side walks so their skip lists can't
+/// drift apart. The `== active` guard is walk-structural and stays at the
 /// call site; canceled is usage-derived and split by data source (see
 /// `candidate_excluded`).
 pub(crate) fn walk_excluded(
@@ -2075,6 +2130,7 @@ pub(crate) fn walk_excluded(
         || config.is_auth_broken(name)
         || p.is_some_and(Profile::is_disabled)
         || key_rejected.contains(name)
+        || p.is_some_and(|profile| !profile.holds_login())
 }
 
 /// Whether the chain walk would ever visit `name`: a member of the chain, and
@@ -2132,6 +2188,9 @@ pub(crate) fn walk_blocker(
     }
     if key_rejected.contains(name) {
         return Some("its api key was rejected");
+    }
+    if !profile.holds_login() {
+        return Some("it has no login or api key");
     }
     None
 }
@@ -2420,6 +2479,10 @@ fn next_auto_switch_target_core(
                 .kick_rejected
                 .iter()
                 .any(|k| k == &snapshot.chain[i].name)
+            || snapshot
+                .skipped_unreadable
+                .iter()
+                .any(|s| s == &snapshot.chain[i].name)
             || is_canceled_from_usage(&snapshot.chain[i].name, usage)
     };
     let reading = |i: usize| usage.get(snapshot.chain[i].name.as_str());
@@ -3061,7 +3124,22 @@ pub(crate) fn auto_switch_if_needed(
         auto_decision_rendezvous(&action);
         let changed = match &action {
             SwitchAction::To(target) => {
-                switch_profile_locked(config, &ProfileName::from(target.clone()))?
+                // The drains' twin at the one-shot's dispatch: re-read the
+                // target's stored login on disk before linking. A store that
+                // proves no login, or one that exists but cannot be read or
+                // parsed, never links at startup (no log line, no toast) — the
+                // next scan handles it. Lock-free; the state flock above is
+                // already held for the dispatch, and `stored_login` takes no
+                // lock of its own.
+                match crate::profile::stored_login(&ProfileName::from(target.clone())) {
+                    crate::profile::StoredLogin::HoldsLogin => {
+                        switch_profile_locked(config, &ProfileName::from(target.clone()))?
+                    }
+                    crate::profile::StoredLogin::HoldsNone
+                    | crate::profile::StoredLogin::Unknown => {
+                        return Ok((None, false));
+                    }
+                }
             }
             SwitchAction::Off => switch_off_locked(config)?,
         };

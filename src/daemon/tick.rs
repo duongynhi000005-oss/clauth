@@ -264,6 +264,35 @@ impl super::Daemon {
             return;
         }
 
+        // The drain re-reads the target's login ON DISK, lock-free — the
+        // in-memory `Profile` is stale until the next reload, and a login
+        // deleted out-of-process after the enqueue must still stop the link.
+        // `stored_login` answers through the same three facts as
+        // `Profile::holds_login`, off the committed store, never the state
+        // flock. Only the PROVEN-none outcome drops (linking it would install
+        // an empty login into the global slot); an unreadable store — one that
+        // exists but cannot be read or parsed — defers through the backoff
+        // below, and the give-up marks the member skipped until its store reads
+        // again, never linking on a guess.
+        let stored = crate::profile::stored_login(&target);
+        let unreadable = match stored {
+            crate::profile::StoredLogin::HoldsNone => {
+                logline!(
+                    "clauth daemon: dropping queued switch to '{target}': it has no login or api key"
+                );
+                if self
+                    .switch_backoff
+                    .as_ref()
+                    .is_some_and(|b| b.target == target.as_str())
+                {
+                    self.switch_backoff = None;
+                }
+                return;
+            }
+            crate::profile::StoredLogin::HoldsLogin => false,
+            crate::profile::StoredLogin::Unknown => true,
+        };
+
         // Backoff gate: if this target is inside its backoff window from a prior
         // failure, re-queue without attempting or logging — this is what turns a
         // stuck switch's 1/tick retry+log storm into a spaced, deduped one. The
@@ -279,12 +308,28 @@ impl super::Daemon {
                     b.reason
                 );
                 self.switch_backoff = None;
+                // The give-up ends the retry window. A member whose store is
+                // still unreadable must not be re-picked off the stale config
+                // next scan, so mark it skipped until `stored_login` reads again.
+                if unreadable {
+                    self.mark_skipped_unreadable(&target);
+                }
                 return;
             }
             if now < b.not_before {
                 self.requeue_quiet(&decision);
                 return;
             }
+        }
+
+        // AFTER the backoff gate: a pass inside `not_before` re-queues quietly
+        // above. The first two retries are immediate (`switch_backoff_ms(1..=2)`
+        // is 0, so three consecutive drains each reach this defer), and only past
+        // that does the widening gap make it fire once per fresh retry, never once
+        // per tick.
+        if unreadable {
+            self.fail_switch(&decision, now, "its stored login could not be read");
+            return;
         }
 
         // Still mid-fetch/rotation — switching now would race the worker on the
@@ -479,6 +524,15 @@ impl super::Daemon {
             && q.is_empty()
         {
             q.insert(decision.clone());
+        }
+    }
+
+    /// Mark a member whose stored login stays unreadable as skipped, so the
+    /// auto-switch walk passes over it until the scan's lock-free re-read drops
+    /// the name. In-memory only, never persisted.
+    fn mark_skipped_unreadable(&self, target: &crate::profile::ProfileName) {
+        if let Ok(mut s) = self.skipped_unreadable.lock() {
+            s.insert(target.as_str().to_string());
         }
     }
 

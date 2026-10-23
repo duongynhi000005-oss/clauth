@@ -29,7 +29,8 @@ fn oauth(name: &str, auto: bool) -> Profile {
         bell_threshold: None,
         disabled: false,
         console: None,
-        credentials: None,
+        credentials: Some(crate::testutil::oauth_pair(name)),
+        has_long_lived_sidecar: false,
         provider: None,
     }
 }
@@ -1678,6 +1679,7 @@ fn setup_api_account_shows_relogin_and_logout_rows() {
     let mut api = oauth("acme", false);
     api.base_url = Some("https://api.example.com".to_string());
     api.api_key = Some("sk-secret".to_string());
+    api.credentials = None;
     let config = AppConfig {
         state: AppState {
             profiles: vec!["acme".into()],
@@ -2718,7 +2720,8 @@ fn bare(name: &str) -> Profile {
         bell_threshold: None,
         disabled: false,
         console: None,
-        credentials: None,
+        credentials: Some(crate::testutil::oauth_pair(name)),
+        has_long_lived_sidecar: false,
         provider: None,
     }
 }
@@ -5884,6 +5887,7 @@ fn page_never_skips_content() {
             .map(|i| {
                 let mut p =
                     crate::testutil::blank_profile(&ProfileName::from(format!("acct-{i:02}")));
+                p.credentials = Some(crate::testutil::oauth_pair(&format!("acct-{i:02}")));
                 if i % 2 == 0 {
                     p.preferred_days = vec![chrono::Weekday::Mon, chrono::Weekday::Tue];
                 }
@@ -6965,13 +6969,17 @@ fn save_startup_state(profiles: &[&Profile], state: AppState) {
 }
 
 /// A DeepSeek account: `keyed` gives it the api key the fetch leg needs,
-/// `disabled` takes it off the work list.
+/// `disabled` takes it off the work list. A keyless member still holds a login
+/// through an `[env]` inference token, so the chain keeps it eligible.
 fn deepseek(name: &str, keyed: bool, disabled: bool) -> Profile {
     let name = crate::profile::ProfileName::from(name);
     let mut p = crate::testutil::blank_profile(&name);
     p.base_url = Some("https://api.deepseek.com/anthropic".into());
     if keyed {
         p.api_key = Some("k".into());
+    } else {
+        p.env
+            .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "tok".to_string());
     }
     p.provider = Some(crate::providers::Provider::DeepSeek);
     p.disabled = disabled;

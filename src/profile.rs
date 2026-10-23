@@ -425,8 +425,22 @@ pub(crate) struct Profile {
     /// on; `None` means the account renders no usage until a console login.
     pub(crate) console: Option<ConsoleCredential>,
     pub(crate) credentials: LockedSlot<Option<ClaudeCredentials>>,
+    /// Recorded at load: the profile's `session-token.json` sidecar holds a
+    /// genuine long-lived login ([`crate::claude::has_session_token`]). Loaded
+    /// state like `credentials`, never serialized — only the loader reads the
+    /// sidecar, so every walk site reads the fact off this field instead of a
+    /// second per-member disk read. A struct literal / [`Profile::new`] leaves
+    /// it `false` ("no sidecar").
+    pub(crate) has_long_lived_sidecar: bool,
     /// Recognised third-party provider (derived from base_url).
     pub(crate) provider: Option<Provider>,
+}
+
+/// The one judgment behind both login reads — [`Profile::holds_login`] over
+/// loaded state and [`stored_login`] over the committed store — so the
+/// two cannot drift apart. Any one of the three facts is a login.
+fn holds_login_facts(stored_pair: bool, long_lived_sidecar: bool, inference_auth: bool) -> bool {
+    stored_pair || long_lived_sidecar || inference_auth
 }
 
 impl Profile {
@@ -453,6 +467,7 @@ impl Profile {
             disabled: false,
             console: None,
             credentials: slot(None),
+            has_long_lived_sidecar: false,
             provider,
         }
     }
@@ -474,6 +489,24 @@ impl Profile {
     /// [`Profile::routing_endpoint`] for a profile already in hand.
     pub(crate) fn login_is_oauth(&self) -> bool {
         self.credentials.is_some() || self.is_oauth()
+    }
+
+    /// "Holds a login" — the ONE predicate every automatic walk reads to keep
+    /// a login-less member from being linked. A stored OAuth pair (a
+    /// `claude_ai_oauth` block in `credentials`, the shape [`load_profile`]
+    /// puts there), a long-lived `session-token.json` sidecar (recorded on
+    /// [`Profile::has_long_lived_sidecar`] at load), or a usable inference
+    /// credential ([`crate::claude::has_inference_auth`]: an api key or an
+    /// `[env]` inference token). Loaded-state only — no disk read — so a walk
+    /// never re-reads `session-token.json` per member.
+    pub(crate) fn holds_login(&self) -> bool {
+        holds_login_facts(
+            self.credentials
+                .as_ref()
+                .is_some_and(|c| c.claude_ai_oauth.is_some()),
+            self.has_long_lived_sidecar,
+            crate::claude::has_inference_auth(self),
+        )
     }
 
     /// The endpoint a LOADED profile routes its requests to, env half first:
@@ -3603,17 +3636,125 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
     load_profile_with(name, true)
 }
 
-/// [`load_profile`] for a caller that must answer without waiting on the state
-/// flock: the same read, but never through [`maybe_rewrite_config_toml`] and
-/// never through a legacy `.pending` sidecar's write-through, both of which take
-/// the flock: a `config.toml` that does not round-trip (a hand-quoted `[env]`
-/// key the renderer writes unquoted) is left as it is, and an adoptable sidecar
-/// is answered from memory and left for the next ordinary load to land.
-pub(crate) fn load_profile_without_rewrite(name: &ProfileName) -> Result<Profile> {
+/// [`load_profile`]'s read-only form, used by the shared swap-target check and
+/// the `clauth mcp` handshake: the same read, but never through
+/// [`maybe_rewrite_config_toml`] and never through a legacy `.pending` sidecar's
+/// write-through, both of which take the state flock — a `config.toml` that does
+/// not round-trip (a hand-quoted `[env]` key the renderer writes unquoted) is
+/// left as it is, and an adoptable sidecar is answered from memory and left for
+/// the next ordinary load to land.
+pub(crate) fn read_profile(name: &ProfileName) -> Result<Profile> {
     load_profile_with(name, false)
 }
 
 fn load_profile_with(name: &ProfileName, rewrite: bool) -> Result<Profile> {
+    let mut source = read_profile_source(name)?;
+    // A live `.staged` pair loads in place of the store; a legacy `.pending` that
+    // never committed is adopted.
+    source.credentials = recover_pending_credentials(name, source.credentials, rewrite);
+    let (profile, config_path, raw_config) = build_profile(name, source);
+    if rewrite {
+        maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
+    }
+    Ok(profile)
+}
+
+/// What a lock-free on-disk login read proves: the store holds a login, holds
+/// none, or the read could not tell (a store that exists but cannot be read or
+/// parsed). The drains drop a target only on [`StoredLogin::HoldsNone`] and
+/// never link on [`StoredLogin::Unknown`]: a store that exists but cannot be
+/// read or parsed proves nothing about absence, so it is never read as "no
+/// credential" (the repo precedent: `src/usage/forget.rs` `SnapshotIdentities`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoredLogin {
+    /// A readable fact proves a login: a parsed stored pair, a parsed long-lived
+    /// sidecar, or a parsed `config.toml` whose api key / `[env]` token passes
+    /// [`crate::claude::has_inference_auth`].
+    HoldsLogin,
+    /// Every store that exists is readable and holds none of the three facts.
+    HoldsNone,
+    /// At least one store exists but cannot be read or parsed, and nothing
+    /// readable proves a login. The disk proves nothing, so a caller must not
+    /// read this as "no login".
+    Unknown,
+}
+
+/// The long-lived sidecar fact plus its unreadable flag, off ONE read of
+/// `session-token.json`: `(holds, unreadable)`. A parsed sidecar classifies the
+/// same way [`crate::claude::session_token_status`] does (a refresh-token
+/// sidecar is a mis-fill, not a login); an existing-but-unparseable sidecar is
+/// `(false, true)` — unknown, not "no sidecar" — because a sidecar that exists
+/// but cannot be parsed proves nothing about absence. An absent sidecar is
+/// `(false, false)`.
+fn stored_sidecar_login(name: &ProfileName) -> (bool, bool) {
+    let Ok(path) = profile_subpath(name, "session-token.json") else {
+        return (false, false);
+    };
+    if !path.exists() {
+        return (false, false);
+    }
+    let Ok(creds) = read_json_file::<ClaudeCredentials>(&path) else {
+        return (false, true);
+    };
+    let Some(oauth) = creds.claude_ai_oauth else {
+        return (false, false);
+    };
+    (oauth.refresh_token.is_none(), false)
+}
+
+/// [`Profile::holds_login`] for a caller holding only a name, read lock-free
+/// from the committed store — the SAME three facts the loaded-state read
+/// answers, each off its existing lock-free reader: the stored OAuth pair
+/// ([`crate::usage::read_oauth_for_compare`], which also reports an
+/// unreadable `credentials.json`), a long-lived sidecar ([`stored_sidecar_login`]),
+/// and `config.toml`'s api key + env fed to [`crate::claude::has_inference_auth`]
+/// ([`stored_endpoint_identity`] `None` while the file exists is the unreadable
+/// flag, the same check [`crate::usage::read_third_party_for_compare`] makes).
+/// The holds judgment is [`holds_login_facts`], shared so the loaded read and
+/// this read cannot drift.
+///
+/// Deliberately NOT `load_profile(name)`: that path recovers a legacy `.pending`
+/// rotation sidecar, which takes the cross-process state flock and rewrites
+/// `credentials.json`, and `maybe_rewrite_config_toml` may rewrite
+/// `config.toml` — no caller asking a read-only question should mutate a
+/// credential store. The TUI's own drain runs it on the UI thread, so it takes
+/// no lock and does bounded single-file reads only.
+pub(crate) fn stored_login(name: &ProfileName) -> StoredLogin {
+    let (oauth, oauth_unreadable) = crate::usage::read_oauth_for_compare(name);
+    let stored_pair = oauth.stored.is_some();
+    let (long_lived_sidecar, sidecar_unreadable) = stored_sidecar_login(name);
+    let endpoint = stored_endpoint_identity(name);
+    let (inference_auth, config_unreadable) = match endpoint {
+        Some(e) => {
+            let mut profile = Profile::new(name.as_str().to_string(), None, e.api_key);
+            profile.env = e.env;
+            (crate::claude::has_inference_auth(&profile), false)
+        }
+        None => (false, profile_config_path(name).is_ok_and(|p| p.exists())),
+    };
+
+    if holds_login_facts(stored_pair, long_lived_sidecar, inference_auth) {
+        StoredLogin::HoldsLogin
+    } else if oauth_unreadable || sidecar_unreadable || config_unreadable {
+        StoredLogin::Unknown
+    } else {
+        StoredLogin::HoldsNone
+    }
+}
+
+/// The parsed source of a profile: one `config.toml` read and one committed
+/// `credentials.json` read, both parsed exactly as the load path parses them, so
+/// a parse failure a full load would hit is still a failure here. NO state
+/// flock, NO legacy `.pending` adoption, NO `config.toml` rewrite — those are
+/// the legs [`load_profile`] adds on top.
+struct ProfileSource {
+    config_path: PathBuf,
+    raw_config: String,
+    config: ProfileConfig,
+    credentials: Option<ClaudeCredentials>,
+}
+
+fn read_profile_source(name: &ProfileName) -> Result<ProfileSource> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,
@@ -3633,9 +3774,25 @@ fn load_profile_with(name: &ProfileName, rewrite: bool) -> Result<Profile> {
     } else {
         None
     };
-    // A live `.staged` pair loads in place of the store; a legacy `.pending` that
-    // never committed is adopted.
-    let credentials = recover_pending_credentials(name, credentials, rewrite);
+    Ok(ProfileSource {
+        config_path,
+        raw_config,
+        config,
+        credentials,
+    })
+}
+
+/// Build the loaded [`Profile`] from parsed [`ProfileSource`], consuming the
+/// source. Returns the profile plus the source's rewrite inputs (the config path
+/// and raw text), since the caller still owes the [`maybe_rewrite_config_toml`]
+/// leg.
+fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf, String) {
+    let ProfileSource {
+        config_path,
+        raw_config,
+        config,
+        credentials,
+    } = source;
 
     let base_url = effective_base_url(
         config.base_url,
@@ -3682,14 +3839,11 @@ fn load_profile_with(name: &ProfileName, rewrite: bool) -> Result<Profile> {
         disabled: config.disabled,
         console: console_credential(&config.console),
         credentials: slot(credentials),
+        has_long_lived_sidecar: crate::claude::has_session_token(name),
         provider,
     };
 
-    if rewrite {
-        maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
-    }
-
-    Ok(profile)
+    (profile, config_path, raw_config)
 }
 
 /// Refresh config.toml when its semantic content drifts from what we'd render
@@ -4068,50 +4222,56 @@ pub(crate) fn clear_staged_credentials(name: &ProfileName) {
     }
 }
 
-/// What `load_profile` reads as the profile's credentials, given the store's
-/// raw `loaded` value. A live `credentials.json.staged` (a rotation whose
-/// persist never landed, `oauth::live_stage_credentials`) is the chain head
-/// and loads into memory only: read lock-free, never written through, never
-/// deleted, since a loader deciding outside the rotation guard raced installs
-/// and refused the rotation's own persist. A legacy `credentials.json.pending`
-/// from an older binary keeps its mtime rule.
-///
-/// `rewrite == false` is the no-rewrite read (the MCP handshake): the legacy
-/// `.pending` sidecar's live pair is answered read lock-free and the sidecar is
-/// left for the next ordinary load to land under the flock, so this path never
-/// takes the state lock and never writes `credentials.json`.
-fn recover_pending_credentials(
+/// The RESOLVE half of [`recover_pending_credentials`]: what a full load would
+/// end with, read-only. Returns the resolved credentials and whether the LAND
+/// leg is owed (a `.pending` sidecar exists to adopt or discard). A live
+/// `credentials.json.staged` resolves in place of the store; an adoptable
+/// legacy `credentials.json.pending` resolves as the login; a stale one
+/// resolves as the store's raw login and is still owed a removal. No state
+/// flock, no write, no removal.
+fn resolve_pending_credentials(
+    name: &ProfileName,
+    loaded: Option<&ClaudeCredentials>,
+) -> (Option<ClaudeCredentials>, bool) {
+    if let Some(staged) = crate::oauth::live_stage_credentials(name, loaded) {
+        return (Some(staged), false);
+    }
+    let (Ok(pending_path), Ok(cred_path)) = (
+        profile_credentials_pending_path(name),
+        profile_credentials_path(name),
+    ) else {
+        return (loaded.cloned(), false);
+    };
+    if pending_path.symlink_metadata().is_err() {
+        return (loaded.cloned(), false); // no sidecar — the common case
+    }
+    (
+        adoptable_pending(&pending_path, &cred_path).or_else(|| loaded.cloned()),
+        true,
+    )
+}
+
+/// The LAND half of [`recover_pending_credentials`]: make the disk match what
+/// [`resolve_pending_credentials`] judged. Called only when that resolve said a
+/// land is due. A sidecar the rule already discards goes lock-free, as it
+/// always did: a stale one must not make every load of this profile wait on the
+/// flock. An adoptable one is re-decided inside the flock and the sidecar goes
+/// only once the write-through it justified has landed in that same hold: a
+/// sidecar deleted beside a write that never happened loses the only live pair.
+fn land_pending_credentials(
     name: &ProfileName,
     loaded: Option<ClaudeCredentials>,
-    rewrite: bool,
 ) -> Option<ClaudeCredentials> {
-    if let Some(staged) = crate::oauth::live_stage_credentials(name, loaded.as_ref()) {
-        return Some(staged);
-    }
     let (Ok(pending_path), Ok(cred_path)) = (
         profile_credentials_pending_path(name),
         profile_credentials_path(name),
     ) else {
         return loaded;
     };
-    if pending_path.symlink_metadata().is_err() {
-        return loaded; // no sidecar — the common case
-    }
-    // The no-rewrite read answers with the pair the rule judges live, read
-    // lock-free and never written: the sidecar stays for the next ordinary load
-    // to land under the flock.
-    if !rewrite {
-        return adoptable_pending(&pending_path, &cred_path).or(loaded);
-    }
-    // A sidecar the rule already discards goes lock-free, as it always did: a
-    // stale one must not make every load of this profile wait on the flock.
     if adoptable_pending(&pending_path, &cred_path).is_none() {
         let _ = std::fs::remove_file(&pending_path);
         return loaded;
     }
-    // The rule is re-decided inside the flock, and the sidecar goes only once
-    // the write-through it justified has landed in that same hold: a sidecar
-    // deleted beside a write that never happened loses the only live pair.
     let landed = with_state_lock(|_held| {
         let adopted = adoptable_pending(&pending_path, &cred_path);
         if let Some(pending) = &adopted {
@@ -4130,6 +4290,38 @@ fn recover_pending_credentials(
         // later load to land, and this load still answers with the pair the
         // rule judges live.
         Err(_) => adoptable_pending(&pending_path, &cred_path).or(loaded),
+    }
+}
+
+/// What `load_profile` reads as the profile's credentials, given the store's
+/// raw `loaded` value: the read-only [`resolve_pending_credentials`] verdict,
+/// then the [`land_pending_credentials`] write-through + `.pending` removal
+/// whenever a land is due and `rewrite` allows it. A live
+/// `credentials.json.staged` (a rotation whose persist never landed,
+/// `oauth::live_stage_credentials`) is the chain head and loads into memory
+/// only: read lock-free, never written through, never deleted, since a loader
+/// deciding outside the rotation guard raced installs and refused the
+/// rotation's own persist. A legacy `credentials.json.pending` from an older
+/// binary keeps its mtime rule.
+///
+/// `rewrite == false` is the no-rewrite read (the MCP handshake and the shared
+/// swap-target check): the resolve verdict is answered read lock-free and the
+/// `.pending` sidecar is left for the next ordinary load to land under the
+/// flock, so this path never takes the state lock and never writes
+/// `credentials.json`.
+fn recover_pending_credentials(
+    name: &ProfileName,
+    loaded: Option<ClaudeCredentials>,
+    rewrite: bool,
+) -> Option<ClaudeCredentials> {
+    let (resolved, land_due) = resolve_pending_credentials(name, loaded.as_ref());
+    if !rewrite {
+        return resolved;
+    }
+    if land_due {
+        land_pending_credentials(name, loaded)
+    } else {
+        resolved
     }
 }
 
@@ -4166,7 +4358,7 @@ pub(crate) fn load_config() -> Result<AppConfig> {
 /// [`load_config`] for a caller that answers before it serves and must never
 /// wait on the state flock — the `clauth mcp` handshake's `instructions` block.
 /// Same reads, but each profile loads through
-/// [`load_profile_without_rewrite`], so neither a `config.toml` rewrite nor a
+/// [`read_profile`], so neither a `config.toml` rewrite nor a
 /// legacy `.pending` sidecar's write-through blocks the handshake on the flock.
 pub(crate) fn load_config_without_rewrite() -> Result<AppConfig> {
     load_config_with(false)
@@ -4187,7 +4379,7 @@ fn load_config_with(rewrite: bool) -> Result<AppConfig> {
             if rewrite {
                 load_profile(name)
             } else {
-                load_profile_without_rewrite(name)
+                read_profile(name)
             }
         })
         .collect::<Result<Vec<_>>>()?;

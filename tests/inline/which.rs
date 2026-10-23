@@ -41,6 +41,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
+        has_long_lived_sidecar: false,
         provider: None,
     }
 }
@@ -67,6 +68,7 @@ fn endpoint_profile(name: &str) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
+        has_long_lived_sidecar: false,
         provider: None,
     }
 }
@@ -93,6 +95,7 @@ fn blank_profile(name: &str) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
+        has_long_lived_sidecar: false,
         provider: None,
     }
 }

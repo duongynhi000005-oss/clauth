@@ -2937,8 +2937,15 @@ pub(crate) enum SwapRefused {
     EnvDiffers,
     ModelsDiffers,
     ApiKeyDiffers,
-    /// Nothing at `install_source_path` — there is no login to swap onto.
+    /// No login to swap onto: nothing at `install_source_path`, or a store the
+    /// re-read proves holds none ([`crate::profile::StoredLogin::HoldsNone`]).
     NoCredentialStore,
+    /// The intended member's stored login exists but cannot be read or parsed
+    /// ([`crate::profile::StoredLogin::Unknown`]): the swap refuses rather than
+    /// link a guess. Distinct from [`Self::NoCredentialStore`], which names
+    /// nothing at `install_source_path` or a store the re-read proves holds none
+    /// — a torn sidecar is unreadable, not absent.
+    LoginUnreadable,
     /// A live process holds the marker this session would need on the intended
     /// member — a colliding session id. Claiming it anyway would leave two
     /// sessions sharing one marker identity, and teardown unlinks only what it
@@ -2992,6 +2999,7 @@ impl std::fmt::Display for SwapRefused {
                 f.write_str("its api-key state differs from the launch snapshot")
             }
             Self::NoCredentialStore => f.write_str("it has no stored login"),
+            Self::LoginUnreadable => f.write_str("its stored login could not be read"),
             Self::MarkerNotLockable => {
                 f.write_str("its liveness marker is held by another process")
             }
@@ -3085,15 +3093,66 @@ pub(crate) fn swap_eligible(
     Ok(())
 }
 
+/// The target-member half of [`SessionSwap::precondition`]'s install branch:
+/// whether a member the session is NOT already on can be swapped onto, judged on
+/// the SAME checks the executor runs, in the SAME order — the `stored_login`
+/// re-read BEFORE the profile read, then the side-effect-free
+/// [`crate::profile::read_profile`], [`swap_eligible`],
+/// [`crate::claude::install_source_path`] and the store-exists check.
+///
+/// The profile read is deliberately NOT [`crate::profile::load_profile`]: this
+/// answers a read-only question, so it takes no state flock and writes nothing.
+/// The load's recovery/rewrite legs (a legacy `.pending` adoption, a
+/// `config.toml` canonical rewrite) are the executor's own cleanup, run by
+/// [`SessionSwap::precondition`] after this verdict passes.
+///
+/// Shared with the daemon's per-session decision leg so it steps past EXACTLY
+/// what the executor refuses, rather than a second copy of the gate that drifts
+/// the next time the executor gains a check. Returns the install source path the
+/// caller's [`SwapPlan`] repoints the link at.
+pub(crate) fn swap_target_precondition(
+    intended: &ProfileName,
+    launch: &LaunchTransport,
+    models: ModelsRule,
+) -> Result<PathBuf, SwapRefused> {
+    // The login re-read runs BEFORE the read: a member whose store reads
+    // `Unknown` (a torn `credentials.json`, a torn sidecar, a key member's torn
+    // `config.toml`) refuses `LoginUnreadable` and no parse-error text reaches
+    // the line; a proven-none store refuses `NoCredentialStore`. Only a login
+    // that read fine reaches the profile read, so `ProfileUnreadable` keeps its
+    // real cause: a profile-read or install-source failure past a readable
+    // login.
+    match crate::profile::stored_login(intended) {
+        crate::profile::StoredLogin::HoldsLogin => {}
+        crate::profile::StoredLogin::HoldsNone => {
+            return Err(SwapRefused::NoCredentialStore);
+        }
+        crate::profile::StoredLogin::Unknown => {
+            return Err(SwapRefused::LoginUnreadable);
+        }
+    }
+    let profile = crate::profile::read_profile(intended)
+        .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
+    swap_eligible(&profile, launch, models)?;
+    let store = crate::claude::install_source_path(intended)
+        .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
+    if !store.exists() {
+        return Err(SwapRefused::NoCredentialStore);
+    }
+    Ok(store)
+}
+
 /// A precondition-cleared swap target, minted ONLY by
-/// [`SessionSwap::precondition`] — which gets here by way of
-/// `profile::load_profile`, and THAT load is what adopts-or-discards a legacy
-/// `credentials.json.pending` sidecar and then removes it.
+/// [`SessionSwap::precondition`]. The install branch runs `profile::load_profile`
+/// past the shared check, and THAT load is what adopts-or-discards a legacy
+/// `credentials.json.pending` sidecar and then removes it; the converge branch
+/// (a same-member move) mints its plan with no load, because its store is the
+/// refreshless sidecar ([`crate::claude::install_source_path`]) and no
+/// `.pending` is at risk there.
 ///
 /// [`touch_store`] takes one of these as its argument for exactly that reason:
 /// the stamp it leaves is only readable as a non-write for as long as its receipt
-/// stands, so the sidecar is still resolved against real bytes first. There is no
-/// other constructor, so the touch cannot be reached without the load.
+/// stands, so the sidecar is still resolved against real bytes first.
 struct SwapPlan {
     member: ProfileName,
     store: PathBuf,
@@ -3505,10 +3564,21 @@ impl SessionSwap {
         }
     }
 
+    /// The test seam: [`precondition_with`] with the models-equal rule.
+    #[cfg(test)]
+    fn precondition(&self, intended: &str) -> Result<SwapPlan, SwapRefused> {
+        self.precondition_with(intended, ModelsRule::Equal)
+    }
+
+    /// The swap precondition under the models rule `models` names: a credit-cap
+    /// leave relaxes it to [`ModelsRule::Any`] (see [`swap_eligible`]); every
+    /// other caller passes [`ModelsRule::Equal`].
+    ///
     /// Every arm refuses distinctly, so the log names the cause. The [`SwapPlan`]
-    /// it returns is the touch step's only key: `load_profile` below is what
-    /// clears a legacy `.pending` credential sidecar, and moving the store's mtime
-    /// before that clearing would discard the sidecar for good.
+    /// it returns is the touch step's only key: the install branch's
+    /// `load_profile` (below, past the shared check) is what clears a legacy
+    /// `.pending` credential sidecar, and moving the store's mtime before that
+    /// clearing would discard the sidecar for good.
     ///
     /// A same-member call compares SOURCE identity before the `AlreadyCurrent`
     /// verdict: the one same-member shape admitted is the armed transition
@@ -3516,13 +3586,22 @@ impl SessionSwap {
     /// source now selecting a distinct refreshless sidecar), which the
     /// in-place convergence executes. Every other same-member state stays a
     /// no-op.
-    #[cfg(test)]
-    fn precondition(&self, intended: &str) -> Result<SwapPlan, SwapRefused> {
-        self.precondition_with(intended, ModelsRule::Equal)
-    }
-
-    /// [`precondition`] with the models rule a credit-cap leave relaxes (see
-    /// [`swap_eligible`]); every other caller keeps the models-equal rule.
+    ///
+    /// Every branch that installs a store re-reads the intended member's
+    /// `stored_login` lock-free, like the drains: the converge branch after
+    /// `install_source_path` + `converge_transition_holds` (it has no profile
+    /// load), the install branch inside [`swap_target_precondition`] BEFORE the
+    /// side-effect-free profile read. A store that parses with no login
+    /// (`HoldsNone`) would install an empty login and sign the session out
+    /// ([`SwapRefused::NoCredentialStore`]), and a store that exists but cannot
+    /// be read (`Unknown` — a torn `credentials.json`, a torn sidecar, a key
+    /// member's torn `config.toml`) is refused as
+    /// [`SwapRefused::LoginUnreadable`] rather than linked on a guess, so no
+    /// parse-error text reaches the line for those shapes.
+    /// [`SwapRefused::ProfileUnreadable`] names a profile-read or
+    /// `install_source_path` failure, plus the install branch's post-check
+    /// `load_profile` (a tear between the check's read and the load). The
+    /// converge branch fails `install_source_path` BEFORE its login re-read.
     fn precondition_with(
         &self,
         intended: &str,
@@ -3546,19 +3625,28 @@ impl SessionSwap {
             if !converge_transition_holds(&self.canonical(), &store) {
                 return Err(SwapRefused::AlreadyCurrent);
             }
+            match crate::profile::stored_login(&intended) {
+                crate::profile::StoredLogin::HoldsLogin => {}
+                crate::profile::StoredLogin::HoldsNone => {
+                    return Err(SwapRefused::NoCredentialStore);
+                }
+                crate::profile::StoredLogin::Unknown => {
+                    return Err(SwapRefused::LoginUnreadable);
+                }
+            }
             return Ok(SwapPlan {
                 member: intended,
                 store,
             });
         }
-        let profile = crate::profile::load_profile(&intended)
+        let store = swap_target_precondition(&intended, &self.launch, models)?;
+        // The shared check read the profile side-effect-free; the load below is
+        // the executor's own cleanup — it clears a legacy `.pending` before the
+        // swap's mtime stamp. It runs only past a passed check, so no refusal
+        // the check would give is skipped; a tear between the check's read and
+        // this load can still refuse `ProfileUnreadable`.
+        crate::profile::load_profile(&intended)
             .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
-        swap_eligible(&profile, &self.launch, models)?;
-        let store = crate::claude::install_source_path(&intended)
-            .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
-        if !store.exists() {
-            return Err(SwapRefused::NoCredentialStore);
-        }
         Ok(SwapPlan {
             member: intended,
             store,

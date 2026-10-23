@@ -59,6 +59,7 @@ fn the_usage_hints_advertise_the_note_key() {
         disabled: false,
         console: None,
         credentials: None,
+        has_long_lived_sidecar: false,
         provider: None,
     };
     let with_account = App::new(crate::profile::AppConfig {

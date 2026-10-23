@@ -47,7 +47,8 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             bell_threshold: None,
             disabled: false,
             console: None,
-            credentials: None,
+            credentials: Some(crate::testutil::oauth_pair(name)),
+            has_long_lived_sidecar: false,
             provider: None,
         },
         snap_with_usage(ReadingsSnapshot::default(), name, usage),
@@ -1073,7 +1074,13 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
     // the card itself, the way the render path hands it over from
     // `App::session_tokens`.
     let card = |session_token: bool, active: &str| {
-        let (blind, _unpolled) = profile("blind", 95.0, 0.0, 7200);
+        let (mut blind, _unpolled) = profile("blind", 95.0, 0.0, 7200);
+        // The sidecar fact arrives on the card itself (`MemberCard::session_token`),
+        // and the profile records the loaded sidecar from that same fact: the
+        // arm names a long-lived token and the member is the sidecar-only
+        // shape, or it names none and the member is the logged-out shape.
+        blind.credentials = None;
+        blind.has_long_lived_sidecar = session_token;
         let (cfg, readings) = config_with(
             vec![
                 profile("ok", 95.0, 10.0, 7200),
@@ -1129,12 +1136,12 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
     );
 
     // The same fixture without the sidecar: nothing serves from it, so this is
-    // the logged-out shape and the card opens on its gauge instead of the pill.
+    // the logged-out shape and the card opens on its pill instead of the gauge.
     let plain: Vec<String> = card(false, "ok").iter().map(line_text).collect();
     assert_eq!(
-        plain.first(),
-        Some(&gauge),
-        "without a session token the card opens on the gauge row"
+        plain.first().map(String::as_str),
+        Some("status          [ logged out ]"),
+        "without a session token the card opens on the logged-out pill"
     );
     assert!(
         !plain
@@ -2130,6 +2137,7 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
         BlockedReason::Canceled,
         BlockedReason::AuthBroken,
         BlockedReason::KeyRejected,
+        BlockedReason::LoggedOut,
         BlockedReason::WeeklySpent {
             resets_in: None,
             monthly: false,
@@ -2140,6 +2148,11 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
             pct: 99.0,
             resets_in: None,
         },
+        BlockedReason::ScopedSpent {
+            label: "7d fable".to_string(),
+            pct: 99.0,
+        },
+        BlockedReason::CreditCap,
         BlockedReason::WeeklySoft {
             pct: 85.0,
             monthly: false,
@@ -2147,6 +2160,27 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
         BlockedReason::Stale,
         BlockedReason::NoUsage,
     ];
+    // A wildcard-free match over every `BlockedReason` variant, beside `all`:
+    // a 15th variant fails to COMPILE here, so whoever adds it extends `all`
+    // above rather than shipping without fix copy.
+    fn _covers(reason: &BlockedReason) {
+        match reason {
+            BlockedReason::Disabled
+            | BlockedReason::Canceled
+            | BlockedReason::AuthBroken
+            | BlockedReason::KeyRejected
+            | BlockedReason::LoggedOut => {}
+            BlockedReason::WeeklySpent { .. }
+            | BlockedReason::KickRejected { .. }
+            | BlockedReason::BudgetSpent
+            | BlockedReason::FiveHour { .. }
+            | BlockedReason::ScopedSpent { .. }
+            | BlockedReason::CreditCap
+            | BlockedReason::WeeklySoft { .. }
+            | BlockedReason::Stale
+            | BlockedReason::NoUsage => {}
+        }
+    }
     let mut seen: Vec<String> = Vec::new();
     for reason in all {
         let fix = reason_fix(&reason, &crate::profile::ProfileName::from("acct"), false);
@@ -2162,7 +2196,6 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
         );
         seen.push(fix);
     }
-    assert_eq!(seen.len(), 11, "every variant contributed a distinct fix");
 }
 
 /// F2: the key-rejected copy is cloudy's verbatim, pinned by equality — the
@@ -2189,6 +2222,36 @@ fn key_rejected_copy_is_pinned_by_equality() {
         .map(|s| s.content.as_ref())
         .collect();
     assert_eq!(pill, "[ key rejected ]", "the rendered pill is {pill:?}");
+}
+
+/// F3b: the LoggedOut fix line is cloudy's verbatim, pinned by equality — the
+/// `reason_fix` line, the `logged out` pill label, and the rendered `[ … ]`
+/// pill, the key-rejected pin's shape for the new rung.
+#[test]
+fn logged_out_fix_line_is_pinned_by_equality() {
+    let fix = reason_fix(
+        &BlockedReason::LoggedOut,
+        &crate::profile::ProfileName::from("acct"),
+        false,
+    );
+    assert_eq!(
+        fix,
+        format!(
+            "log in with {}, or add an api key on the setup tab",
+            crate::tui::render::prose::cmd("clauth login acct")
+        ),
+        "the LoggedOut fix line is cloudy's verbatim"
+    );
+    assert_eq!(
+        super::DIAG_LOGGED_OUT,
+        "logged out",
+        "the pill label is cloudy's verbatim"
+    );
+    let pill: String = reason_pill_spans(&BlockedReason::LoggedOut, ResetFmt::default())
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert_eq!(pill, "[ logged out ]", "the rendered pill is {pill:?}");
 }
 
 // ── `max spend` dims while inert (spend budget off) ──────────────────────────
@@ -2869,7 +2932,17 @@ fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
 fn the_selector_marks_a_member_clauth_cannot_measure() {
     let _home = crate::testutil::HomeSandbox::new();
     let pane = |status: Option<crate::claude::SessionTokenStatus>| {
-        let (blind, _unpolled) = profile("blind", 95.0, 0.0, 7200);
+        let (mut blind, _unpolled) = profile("blind", 95.0, 0.0, 7200);
+        // The member the scenario describes holds a long-lived token with no
+        // OAuth pair behind it: the app cache carries the sidecar fact the
+        // render path reads, while the profile records the loaded sidecar so
+        // `holds_login` reads it as a login. A `NotLongLived` mis-fill and a
+        // missing sidecar are both the logged-out shape instead.
+        blind.credentials = None;
+        blind.has_long_lived_sidecar = matches!(
+            status,
+            Some(crate::claude::SessionTokenStatus::LongLived(_))
+        );
         let (cfg, readings) = config_with(
             vec![
                 profile("ok", 95.0, 10.0, 7200),
@@ -2894,18 +2967,22 @@ fn the_selector_marks_a_member_clauth_cannot_measure() {
             "╰────────────────────────────╯".to_string(),
         ],
     );
-    let unmarked = vec![
+    let logged_out = vec![
         "╭─ CHAIN ────────────────────╮".to_string(),
         "│ ❯  #1 ok                   │".to_string(),
-        "│    #2 blind                │".to_string(),
+        "│    #2 blind              × │".to_string(),
         "│                            │".to_string(),
         "╰────────────────────────────╯".to_string(),
     ];
-    assert_eq!(pane(None), unmarked, "no sidecar, no mark");
+    assert_eq!(
+        pane(None),
+        logged_out,
+        "no sidecar: the logged-out shape carries the mark"
+    );
     assert_eq!(
         pane(Some(crate::claude::SessionTokenStatus::NotLongLived)),
-        unmarked,
-        "a mis-fill installs nothing, so it is not this shape either"
+        logged_out,
+        "a mis-fill installs nothing, so it is the logged-out shape too"
     );
 }
 

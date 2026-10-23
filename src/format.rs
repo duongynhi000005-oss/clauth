@@ -709,6 +709,7 @@ pub(crate) const DIAG_DISABLED: &str = "disabled";
 pub(crate) const DIAG_CANCELED: &str = "canceled";
 pub(crate) const DIAG_AUTH_BROKEN: &str = "auth broken";
 pub(crate) const DIAG_KEY_REJECTED: &str = "key rejected";
+pub(crate) const DIAG_LOGGED_OUT: &str = "logged out";
 pub(crate) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
 pub(crate) const DIAG_CREDIT_CAP: &str = "credit cap spent";
 /// The legend names the whole state in one row, where the card's pill and its
@@ -789,6 +790,7 @@ pub(crate) fn start_block_label(block: &StartBlock) -> String {
     match block {
         StartBlock::Disabled => DIAG_DISABLED.to_string(),
         StartBlock::AuthBroken => DIAG_AUTH_BROKEN.to_string(),
+        StartBlock::LoggedOut => DIAG_LOGGED_OUT.to_string(),
         StartBlock::Canceled => DIAG_CANCELED.to_string(),
         StartBlock::KickRejected => DIAG_KICK.to_string(),
         StartBlock::NotOauth => "not an oauth account".to_string(),

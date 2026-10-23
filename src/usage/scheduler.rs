@@ -491,6 +491,26 @@ pub(crate) type ThirdPartyStreaks = Arc<RankedMutex<HashMap<String, u32>, rank::
 /// the scans, the TUI/daemon key-rejected helpers (chain walks and day
 /// notices), and both switch drains.
 pub(crate) type ThirdPartyBroken = Arc<RankedMutex<HashMap<String, u64>, rank::ThirdPartyBroken>>;
+
+/// Members whose stored login read [`crate::profile::StoredLogin::Unknown`] at
+/// the last drain, so the auto-switch walk passes over them until their store
+/// reads again. In-memory only (no disk record): a process death clears it,
+/// and each scan re-reads every name's `stored_login` lock-free and drops the
+/// healed ones. Leaf like [`ThirdPartyBroken`] — written alone by the two
+/// switch drains, read alone by the scans before `config`.
+pub(crate) type SkippedUnreadable = Arc<RankedMutex<HashSet<String>, rank::SkippedUnreadable>>;
+
+// Test-only: the `SkippedUnreadable` Arc the last `spawn_refresher` call on
+// THIS thread was handed. A wiring pin reads it right after a daemon or TUI
+// scheduler start and asserts `Arc::ptr_eq` against the store that process's
+// drain marks — without a detached tick thread, which `spawn_refresher`
+// suppresses under `cfg!(test)` anyway. Per-thread so parallel tests never
+// observe each other's refresher.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LAST_REFRESHER_SKIP_STORE: std::cell::RefCell<Option<SkippedUnreadable>> =
+        const { std::cell::RefCell::new(None) };
+}
 /// Session-scoped (in-memory) map of third-party profiles suppressed from the
 /// timer, each recorded against the credential fingerprint it failed under
 /// ([`ThirdPartyEntry::credential_fingerprint`]). Never persisted — clears when
@@ -4357,6 +4377,7 @@ pub(crate) struct SchedulerState {
     third_party_status: ThirdPartyStatusStore,
     third_party_streaks: ThirdPartyStreaks,
     third_party_broken: ThirdPartyBroken,
+    skipped_unreadable: SkippedUnreadable,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     /// Single-fetcher lease (issue #27): `acquire()` reports whether THIS
@@ -4451,6 +4472,7 @@ impl SchedulerState {
             third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+            skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
             suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),
             fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -4909,6 +4931,7 @@ pub(crate) fn tick(state: &SchedulerState) {
         &state.third_party_status,
         &state.third_party_streaks,
         &state.third_party_broken,
+        &state.skipped_unreadable,
         &state.poll_streaks,
         &state.kick_blocks,
         &state.activity,
@@ -4928,6 +4951,7 @@ pub(crate) fn tick(state: &SchedulerState) {
         &state.third_party_broken,
         &state.poll_streaks,
         &state.kick_blocks,
+        &state.skipped_unreadable,
     );
     scan_recovery(
         &state.config,
@@ -4938,6 +4962,7 @@ pub(crate) fn tick(state: &SchedulerState) {
         &state.kick_blocks,
         &state.pending_switch,
         &state.third_party_broken,
+        &state.skipped_unreadable,
     );
 
     // tps producer leg, lease holder only (a stood-down tick returned above):
@@ -5432,6 +5457,7 @@ pub(crate) fn spawn_refresher(
     third_party_status: ThirdPartyStatusStore,
     third_party_streaks: ThirdPartyStreaks,
     third_party_broken: ThirdPartyBroken,
+    skipped_unreadable: SkippedUnreadable,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
@@ -5496,6 +5522,7 @@ pub(crate) fn spawn_refresher(
         third_party_status,
         third_party_streaks,
         third_party_broken,
+        skipped_unreadable,
         suppressed_auth_expired,
         shutting_down,
         fetch_lease,
@@ -5506,6 +5533,14 @@ pub(crate) fn spawn_refresher(
         fetcher: crate::providers::fetch_third_party_usage,
         snapshot,
     };
+    // Wiring pin: record which skip store the refresher's scan will read, so a
+    // test asserts it is the SAME `Arc` a drain marks — a refactor that hands
+    // the refresher a fresh store would otherwise make every mark invisible to
+    // the scan while the suite stays green. Test-only, per thread.
+    #[cfg(test)]
+    LAST_REFRESHER_SKIP_STORE.with(|slot| {
+        *slot.borrow_mut() = Some(Arc::clone(&state.skipped_unreadable));
+    });
     // Same test-skip rationale as the status/tokens/pricing workers in
     // `tui/app.rs`: a detached tick thread is never joined, so it could run
     // `tick()` — which itself resolves home-derived paths and makes network
@@ -5758,6 +5793,55 @@ pub(crate) fn reading_dead_names(
         .collect()
 }
 
+/// Re-read each skipped name's `stored_login` lock-free and drop the healed
+/// ones (a read of anything other than [`crate::profile::StoredLogin::Unknown`]),
+/// returning the names that are still unreadable. Callers feed the result into
+/// the walk's target exclusion. Leaf discipline: the skip store is locked,
+/// cloned and released before any disk read; healed names are removed one at a
+/// time under a second short hold. A drain that re-marks a name this scan is
+/// healing (between the clone and the removal) loses that mark — the removal
+/// lands after it — so the member is picked once more before the next give-up
+/// marks it again: one more defer window, never a stuck walk.
+pub(crate) fn current_skipped_unreadable(skipped: &SkippedUnreadable) -> HashSet<ProfileName> {
+    let names: HashSet<String> = skipped.lock().map(|s| s.clone()).unwrap_or_default();
+    let mut still: HashSet<ProfileName> = HashSet::new();
+    let mut healed: Vec<String> = Vec::new();
+    for name in names {
+        let profile = ProfileName::from(name.clone());
+        if matches!(
+            crate::profile::stored_login(&profile),
+            crate::profile::StoredLogin::Unknown
+        ) {
+            still.insert(profile);
+        } else {
+            healed.push(name);
+        }
+    }
+    if !healed.is_empty()
+        && let Ok(mut s) = skipped.lock()
+    {
+        for name in &healed {
+            s.remove(name);
+        }
+    }
+    still
+}
+
+/// The skip set exactly as the last healing scan left it — no `stored_login`
+/// re-read, no removal, no write. Used by readers that run AFTER the scan's
+/// heal on the same tick (the per-session decision leg, the Overview
+/// projection), so a name the scan is about to drop stays skipped in their view
+/// until the next scan, instead of each reader re-reading every skipped
+/// member's store off disk and racing the heal. The global scan runs first on
+/// the same tick off the same stores, so the set these readers clone is the
+/// healed one.
+pub(crate) fn read_skipped_unreadable(skipped: &SkippedUnreadable) -> HashSet<ProfileName> {
+    skipped
+        .lock()
+        .map(|s| s.iter().map(|n| ProfileName::from(n.clone())).collect())
+        .unwrap_or_default()
+}
+
 /// Fill a claude `ChainSnapshot`'s non-config fields (kick-rejected,
 /// reading-dead, fresh) and build the picker usage map — the store-side fill
 /// block shared by `scan_auto_switch` (which clones the fields into its
@@ -5827,6 +5911,7 @@ pub(crate) fn scan_auto_switch(
     third_party_status: &ThirdPartyStatusStore,
     third_party_streaks: &ThirdPartyStreaks,
     third_party_broken: &ThirdPartyBroken,
+    skipped_unreadable: &SkippedUnreadable,
     streaks: &PollStreaks,
     kick_blocks: &KickBlocks,
     _activity: &ActivityStore,
@@ -5858,6 +5943,11 @@ pub(crate) fn scan_auto_switch(
         .lock()
         .map(|m| m.clone())
         .unwrap_or_default();
+    // A member the last drain skipped for an unreadable store rejoins the walk
+    // only once its `stored_login` reads again: re-read each skipped name
+    // lock-free at the top of the scan, drop the healed ones, and carry the
+    // still-unreadable set into the snapshot the walk excludes on.
+    let skipped_names: HashSet<ProfileName> = current_skipped_unreadable(skipped_unreadable);
     // Snapshot under `config` only — drop guard before taking `usage_store`.
     let (
         snapshot,
@@ -5938,6 +6028,11 @@ pub(crate) fn scan_auto_switch(
     without_snapshot.kick_rejected = snapshot.kick_rejected.clone();
     without_snapshot.reading_dead = snapshot.reading_dead.clone();
     without_snapshot.fresh = snapshot.fresh.clone();
+    // The skip set is a target exclusion, never an active-side fact: both runs
+    // share it, unlike `key_rejected`, which the without-run strips from the
+    // active alone.
+    snapshot.skipped_unreadable = skipped_names.into_iter().collect();
+    without_snapshot.skipped_unreadable = snapshot.skipped_unreadable.clone();
     // A third-party member whose api KEY the provider rejected is dead like an
     // OAuth auth-broken member — not config state (live only), so
     // `snapshot_chain` can't fill it: union the live set into `broken` so the
@@ -6019,6 +6114,11 @@ struct SessionDecision {
     /// Whether `member` serves inference from its own endpoint + token, so its
     /// usage credits are never spent by this session: trigger a skips it.
     own_inference: bool,
+    /// The launch transport `snapshot_session_chain` folded into the snapshot,
+    /// re-carried so the walk re-checks a pick through the SAME gate the
+    /// executor's install branch runs
+    /// ([`crate::runtime::swap_target_precondition`]).
+    launch: crate::runtime::LaunchTransport,
     row: crate::live_sessions::LiveSession,
 }
 
@@ -6130,6 +6230,7 @@ fn scan_session_switches(
     third_party_broken: &ThirdPartyBroken,
     streaks: &PollStreaks,
     kick_blocks: &KickBlocks,
+    skipped_unreadable: &SkippedUnreadable,
 ) {
     let rows: Vec<crate::live_sessions::LiveSession> = crate::live_sessions::list()
         .into_iter()
@@ -6270,6 +6371,10 @@ fn scan_session_switches(
         .lock()
         .map(|m| m.clone())
         .unwrap_or_default();
+    // The session walk honours the skip set READ ONLY: the global scan ran first
+    // on the same tick off the same stores and already healed it, so this leg
+    // clones the set as-is rather than re-reading each skipped member's store.
+    let skipped_names: HashSet<ProfileName> = read_skipped_unreadable(skipped_unreadable);
     // Snapshot under `config` only, exactly as `scan_auto_switch` does: holding it
     // while taking `usage_store` is the `App::apply_usage` inversion.
     // Five store/config-snapshot handles ride out of the one config hold; the
@@ -6334,6 +6439,7 @@ fn scan_session_switches(
                     snapshot,
                     member,
                     own_inference,
+                    launch,
                     row,
                 })
             })
@@ -6350,6 +6456,7 @@ fn scan_session_switches(
         mut snapshot,
         member,
         own_inference,
+        launch,
         row,
     } in pending
     {
@@ -6397,6 +6504,10 @@ fn scan_session_switches(
             })
             .map(|m| m.name.clone())
             .collect();
+        // The skip set is a target exclusion, never an active-side fact; the
+        // session snapshot carries the SAME read-only set every pass of the walk
+        // below shares, and the re-walk appends its own rejected names to it.
+        snapshot.skipped_unreadable = skipped_names.iter().cloned().collect();
         let member_broken = snapshot.broken.contains(&member);
         // The session's own spend-cap 429 row (direct evidence), joined through
         // the row's claude child pid -> its session record's `sessionId`, never
@@ -6543,16 +6654,50 @@ fn scan_session_switches(
         // `Off` means "sign every account out", which has no per-session form: a
         // session cannot be left credential-less mid-flight and there is no member
         // name to write. It, and a stay-put `None`, leave the row as it stands.
-        let Some(crate::fallback::SwitchAction::To(target)) =
-            crate::fallback::next_auto_switch_target_with_usage(
+        //
+        // The walk's first clear pick may be a member the executor would refuse:
+        // its in-memory profile still says "login" while its committed store is
+        // now torn or empty (the stale-config race a failed reload leaves), or a
+        // readable login beside a `config.toml` that no longer parses. The leg
+        // therefore re-checks its pick through the SAME gate the executor's
+        // install branch runs (`swap_target_precondition`) and steps past any
+        // refusal — one function, so the checks cannot drift. The `launch` they
+        // pass it can: `crate::fallback::snapshot_session_chain`'s doc carries
+        // the residual ("`launch` is reconstructed from the session's
+        // `start_profile` as it reads NOW, while what is live in the child's
+        // `process.env` is what `acquire` was handed — so an operator editing
+        // that profile mid-session moves this view away from the truth"), and
+        // the executor holds the boot snapshot, so the two can still disagree.
+        // Neither rejection marks the shared skip store: the leg
+        // re-checks its pick every tick, so it needs no memory of the rejection,
+        // and the daemon keeps its own ruled defer/give-up lines for a member
+        // whose store stays unreadable. Each rejection lands in the snapshot's
+        // skip list and the walk re-runs, so at most one check per re-walk,
+        // bounded by the chain length.
+        let target = loop {
+            let picked = match crate::fallback::next_auto_switch_target_with_usage(
                 &snapshot,
                 &usage,
                 &third_party_names,
                 crate::fallback::ActiveBurnRate::FromDisk,
                 must_leave,
                 credit_demand,
-            )
-        else {
+            ) {
+                Some(crate::fallback::SwitchAction::To(name)) => name,
+                _ => break None,
+            };
+            let picked_name = ProfileName::from(picked.as_str());
+            let models = if must_leave {
+                crate::runtime::ModelsRule::Any
+            } else {
+                crate::runtime::ModelsRule::Equal
+            };
+            if crate::runtime::swap_target_precondition(&picked_name, &launch, models).is_ok() {
+                break Some(picked);
+            }
+            snapshot.skipped_unreadable.push(picked_name);
+        };
+        let Some(target) = target else {
             continue;
         };
         // The cursor indexes the ON-DISK chain. `snapshot.chain` is filtered
@@ -6632,6 +6777,7 @@ fn scan_recovery(
     kick_blocks: &KickBlocks,
     pending_switch: &PendingSwitch,
     third_party_broken: &ThirdPartyBroken,
+    skipped_unreadable: &SkippedUnreadable,
 ) {
     // Skip when a previous switch is still pending.
     if let Ok(p) = pending_switch.lock()
@@ -6647,6 +6793,10 @@ fn scan_recovery(
         .lock()
         .map(|m| m.clone())
         .unwrap_or_default();
+    // A member whose stored login stays unreadable is passed over by the
+    // recovery walk exactly like the scan: the drain can never link it, so
+    // re-picking it off the stale config would wedge recovery on it forever.
+    let skipped: HashSet<ProfileName> = current_skipped_unreadable(skipped_unreadable);
 
     // Build chain-member snapshot under config lock, then drop before
     // touching store (avoids the config↔store inversion that
@@ -6729,6 +6879,7 @@ fn scan_recovery(
     // fallback is recoverable after switch-off-all instead of frozen out.
     let members: Vec<crate::fallback::ChainMember> = members
         .into_iter()
+        .filter(|m| !skipped.contains(&m.name))
         .filter(|m| {
             decision_fresh_any(
                 status,

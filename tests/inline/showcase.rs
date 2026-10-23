@@ -337,6 +337,7 @@ fn oauth_profile(
                     ..crate::profile::OAuthToken::default_extra()
                 }),
             }),
+            has_long_lived_sidecar: false,
             provider: None,
         },
         Some(usage),
@@ -368,6 +369,7 @@ fn api_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) 
         disabled: false,
         console: None,
         credentials: None,
+        has_long_lived_sidecar: false,
         provider: None,
     };
     (profile, None, None)
@@ -396,6 +398,7 @@ fn failed_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
             provider: None,
         },
         None,

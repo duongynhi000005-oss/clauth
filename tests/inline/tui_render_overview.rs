@@ -302,6 +302,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
             provider: None,
         },
         snap_with_stats(ReadingsSnapshot::default(), "tp", stats),
@@ -360,6 +361,7 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
             provider: Some(crate::providers::Provider::DeepSeek),
         },
         snap_with_stats(ReadingsSnapshot::default(), name, stats),
@@ -431,10 +433,20 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
             provider: None,
         },
         snap_with_usage(ReadingsSnapshot::default(), name, usage),
     )
+}
+
+/// [`profile`] with a stored OAuth login — the chain/caption fixtures use it
+/// so a login-less member stays the exception; the per-account row fixtures
+/// leave [`profile`] credential-less on purpose.
+fn polled(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, ReadingsSnapshot) {
+    let (mut p, r) = profile(name, threshold, util, reset_secs);
+    p.credentials = Some(crate::testutil::oauth_pair(name));
+    (p, r)
 }
 
 fn config_with(
@@ -498,8 +510,8 @@ fn resumes_line(lines: &[Line<'static>]) -> Option<String> {
 #[test]
 fn all_exhausted_wrap_mode_shows_resumes_hint() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("a", 95.0, 100.0, 3600);
-    let (b, b_readings) = profile("b", 95.0, 100.0, 1800);
+    let (a, a_readings) = polled("a", 95.0, 100.0, 3600);
+    let (b, b_readings) = polled("b", 95.0, 100.0, 1800);
     let (config, readings) = config_with(
         vec![(a, a_readings), (b, b_readings)],
         Some("a"),
@@ -520,8 +532,8 @@ fn all_exhausted_wrap_mode_shows_resumes_hint() {
 #[test]
 fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("a", 95.0, 100.0, 900);
-    let (b, b_readings) = profile("b", 95.0, 100.0, 3600);
+    let (a, a_readings) = polled("a", 95.0, 100.0, 900);
+    let (b, b_readings) = polled("b", 95.0, 100.0, 3600);
     let (mut config, readings) =
         config_with(vec![(a, a_readings), (b, b_readings)], None, vec!["a", "b"]);
     config.state.switch_off_when_spent = true;
@@ -633,8 +645,14 @@ fn an_unmeasured_chain_member_is_marked_on_the_overview_chain_row() {
     // No reading for `blind`: nothing polls a member whose sessions run on a
     // long-lived token with no OAuth pair behind it.
     let rows = |armed: bool| {
-        let (ok, ok_readings) = profile("ok", 95.0, 10.0, 3600);
-        let (blind, _unpolled) = profile("blind", 95.0, 0.0, 3600);
+        let (ok, ok_readings) = polled("ok", 95.0, 10.0, 3600);
+        let (mut blind, _unpolled) = profile("blind", 95.0, 0.0, 3600);
+        // The member the scenario describes holds a long-lived token with no
+        // OAuth pair behind it: the app cache carries the sidecar fact the
+        // render path reads, while the profile records the loaded sidecar so
+        // `holds_login` reads it as a login. Without the sidecar the same
+        // member is the logged-out shape instead.
+        blind.has_long_lived_sidecar = armed;
         let (config, readings) = config_with(
             vec![(ok, ok_readings), (blind, ReadingsSnapshot::default())],
             Some("ok"),
@@ -667,9 +685,14 @@ fn an_unmeasured_chain_member_is_marked_on_the_overview_chain_row() {
         theme::warning().fg,
         "at the warning hue, not stale's faint"
     );
+    let logged_out_row = rows(false)
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("blind"))
+        .expect("the chain row for the logged-out member");
     assert!(
-        !rows(false).iter().map(line_text).any(|t| t.contains('◆')),
-        "the same absent reading without a session token is the logged-out shape"
+        logged_out_row.contains('×'),
+        "the same absent reading without a session token is the logged-out shape: {logged_out_row:?}"
     );
 }
 
@@ -1023,6 +1046,7 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, Readin
                     ..crate::profile::OAuthToken::default_extra()
                 }),
             }),
+            has_long_lived_sidecar: false,
             provider: None,
         },
         ReadingsSnapshot::default(),
@@ -2075,8 +2099,8 @@ fn fallback_panel_parks_trailers_next_to_the_content() {
     // `ghost` sits in the chain with no profile behind it, so its row renders
     // the short `missing` arm. Leading with it proves the column is measured off
     // the WIDEST row rather than whichever one happens to come first.
-    let (short, short_readings) = profile("ab", 100.0, 10.0, 3600);
-    let (long, long_readings) = profile("a-much-longer-name", 100.0, 10.0, 3600);
+    let (short, short_readings) = polled("ab", 100.0, 10.0, 3600);
+    let (long, long_readings) = polled("a-much-longer-name", 100.0, 10.0, 3600);
     let (mut config, readings) = config_with(
         vec![(short, short_readings), (long, long_readings)],
         Some("ab"),
@@ -2583,7 +2607,7 @@ fn deepseek_balance_sheds_brackets_before_it_ever_cuts() {
 fn a_long_chain_name_renders_whole_on_desktop() {
     let _home = crate::testutil::HomeSandbox::new();
     let name = "abcdefghijklmnopqrstuvwxyz";
-    let a = profile(name, 95.0, 10.0, 3600);
+    let a = polled(name, 95.0, 10.0, 3600);
     let (config, readings) = config_with(vec![a], Some(name), vec![name]);
     let app = App::new(config);
     for w in [80usize, 160] {
@@ -2606,7 +2630,7 @@ fn a_long_chain_name_renders_whole_on_desktop() {
 #[test]
 fn the_stay_caption_wraps_without_overrunning_the_first_line() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
+    let a = polled("a", 95.0, 10.0, 3600);
     let (config, readings) = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     // Every caption line, chip included, stays within the pane: the round-1
@@ -5451,8 +5475,8 @@ fn seed_heavy_burn(app: &mut App, name: &str) {
 /// so the margin that matters is the 30 s up to 540 s (a fixture landing on
 /// exactly 540 s rendered `8m` or `9m` by whether the clock moved a millisecond).
 fn healthy_burning_alpha(bravo_pct: f64, switch_off_when_spent: bool) -> App {
-    let (a, a_readings) = profile("alpha", 95.0, 52.5, 3600);
-    let (b, b_readings) = profile("bravo", 95.0, bravo_pct, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 52.5, 3600);
+    let (b, b_readings) = polled("bravo", 95.0, bravo_pct, 3600);
     let (mut config, _readings) = config_with(
         vec![(a, a_readings), (b, b_readings)],
         Some("alpha"),
@@ -5520,9 +5544,9 @@ fn the_off_caption_warns_a_healthy_active_in_the_default_config() {
 #[test]
 fn the_projected_switch_skips_a_kick_rejected_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
-    let (b, b_readings) = profile("bravo", 95.0, 10.0, 3600);
-    let (c, c_readings) = profile("charlie", 95.0, 10.0, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 94.0, 3600);
+    let (b, b_readings) = polled("bravo", 95.0, 10.0, 3600);
+    let (c, c_readings) = polled("charlie", 95.0, 10.0, 3600);
     let (config, _readings) = config_with(
         vec![(a, a_readings), (b, b_readings), (c, c_readings)],
         Some("alpha"),
@@ -5572,9 +5596,9 @@ fn the_projected_switch_skips_a_kick_rejected_member() {
 #[test]
 fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
-    let (b, b_readings) = profile("bravo", 95.0, 10.0, 3600);
-    let (c, c_readings) = profile("charlie", 95.0, 10.0, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 94.0, 3600);
+    let (b, b_readings) = polled("bravo", 95.0, 10.0, 3600);
+    let (c, c_readings) = polled("charlie", 95.0, 10.0, 3600);
     let (config, _readings) = config_with(
         vec![(a, a_readings), (b, b_readings), (c, c_readings)],
         Some("alpha"),
@@ -5623,8 +5647,8 @@ fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
 #[test]
 fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
-    let (b, b_readings) = profile("bravo", 95.0, 10.0, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 94.0, 3600);
+    let (b, b_readings) = polled("bravo", 95.0, 10.0, 3600);
     let (mut config, _readings) = config_with(
         vec![(a, a_readings), (b, b_readings)],
         Some("alpha"),
@@ -5661,11 +5685,11 @@ fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
 #[test]
 fn the_projected_switch_skips_a_live_key_rejected_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 94.0, 3600);
     let (mut bravo, bravo_readings) = third_party_profile(10.0, 10.0);
     bravo.name = "bravo".into();
     let fp = crate::usage::profile_credential_fingerprint(&bravo).expect("fingerprint");
-    let (c, c_readings) = profile("charlie", 95.0, 10.0, 3600);
+    let (c, c_readings) = polled("charlie", 95.0, 10.0, 3600);
     let (config, _readings) = config_with(
         vec![(a, a_readings), (bravo, bravo_readings), (c, c_readings)],
         Some("alpha"),
@@ -5733,7 +5757,7 @@ fn the_deepseek_balance_cell_desktop_matches_the_pre_s9_render() {
 #[test]
 fn the_stay_caption_desktop_rows_match_the_pre_s9_render() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
+    let a = polled("a", 95.0, 10.0, 3600);
     let (config, readings) = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     for w in [76usize, 156] {

@@ -58,7 +58,7 @@ pub(crate) use scheduler::{
     ActivityStore, FetchLeg, FetchStatus, KickBlock, KickBlocks, LastFetchedAt, LegKey,
     NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
     PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue, RotateDone,
-    StartupReceiver, StartupSender, StartupSignal, StatusStore, StreakCounts,
+    SkippedUnreadable, StartupReceiver, StartupSender, StartupSignal, StatusStore, StreakCounts,
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
     ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, WeeklyResetKicks, any_busy,
     any_fetch_leg_admits, any_fetch_leg_polls, bootstrap_fetch, bootstrap_third_party,
@@ -67,8 +67,8 @@ pub(crate) use scheduler::{
     current_key_rejected_names, decision_fresh_any, end_rotation, fill_chain_snapshot_stores,
     is_idle, is_stuck_rate_limited, is_stuck_streak, kick_block_switch_grade, mark_activity,
     mark_fetch_activity, polled_third_party_names, profile_credential_fingerprint,
-    queued_switch_away_is_stale, reading_is_polled, rotation_into_fetch, selected_activity,
-    selected_next_refresh, spawn_refresher, switch_gate_in_flight,
+    queued_switch_away_is_stale, read_skipped_unreadable, reading_is_polled, rotation_into_fetch,
+    selected_activity, selected_next_refresh, spawn_refresher, switch_gate_in_flight,
     switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts, third_party_credentialed,
     usage_cache_clock_of, usage_poll_pair,
 };
@@ -93,6 +93,8 @@ pub(crate) use scheduler::ACTIVE_CAP_MAX_STREAK;
 // (the pending-switch producer) directly, so a queued record's cause is the
 // producer's own output rather than a hand-built one.
 pub(crate) use scheduler::DEGRADED_GAP_CEILING_MS;
+#[cfg(test)]
+pub(crate) use scheduler::LAST_REFRESHER_SKIP_STORE;
 pub(crate) use scheduler::MAX_RETRY_AFTER_MS;
 #[cfg(test)]
 pub(crate) use scheduler::clear_codex_compare_hooks_for_test;

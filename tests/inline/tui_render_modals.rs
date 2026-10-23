@@ -409,7 +409,7 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
         ),
     ];
     for (name, app, section, expected) in cases {
-        let mut term = Terminal::new(TestBackend::new(130, 60)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(130, 70)).unwrap();
         term.draw(|f| draw_help(f, f.area(), app)).unwrap();
         let rows = crate::testutil::buffer_rows(term.backend().buffer());
         let section_row = rows
@@ -496,7 +496,7 @@ fn help_tabs_and_screen_sections_follow_descended_detail_focus() {
         ),
     ];
     for (name, app, screen) in cases {
-        let mut term = Terminal::new(TestBackend::new(130, 60)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(130, 70)).unwrap();
         term.draw(|f| draw_help(f, f.area(), app)).unwrap();
         let rows = crate::testutil::buffer_rows(term.backend().buffer());
         let tabs = rows
@@ -1032,7 +1032,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         .unwrap_or_else(|| panic!("the legend renders:\n{}", rows.join("\n")));
     // The section header, its blank, and one row per mark.
     assert_eq!(
-        rows[head..head + 19].iter().map(slice).collect::<Vec<_>>(),
+        rows[head..head + 20].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "│  GLYPHS                                                                 │"
                 .to_string(),
@@ -1051,6 +1051,8 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
             "│    ×                   auth broken                                      │"
                 .to_string(),
             "│    ×                   key rejected                                     │"
+                .to_string(),
+            "│    ×                   logged out                                       │"
                 .to_string(),
             "│    ⊘                   weekly spent                                     │"
                 .to_string(),
@@ -1075,14 +1077,15 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         ],
     );
 
-    // Every mark's own hue, read off the rendered cell. `⊖` and `⊘` are the
-    // whole point: same shape, different color, different meaning. `×` keeps
-    // one color for both its meanings.
-    let expected: [Color; 17] = [
+    // Every mark's own hue, read off the rendered cell. `⊖` and `⊘` each appear
+    // twice because they split their senses on hue alone; `×` keeps one color
+    // for all three of its senses.
+    let expected: [Color; 18] = [
         crate::tui::theme::accent_2_color(),
         crate::tui::theme::text_dim_color(),
         crate::tui::theme::text_faint_color(),
         crate::tui::theme::text_faint_color(),
+        crate::tui::theme::danger_color(),
         crate::tui::theme::danger_color(),
         crate::tui::theme::danger_color(),
         crate::tui::theme::danger_color(),
@@ -1101,7 +1104,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
     // 2-space gutter all sit ahead of the mark.
     let glyph_x = left + 5;
     let stride = buf.area.width as usize;
-    let got: Vec<Color> = (0..17)
+    let got: Vec<Color> = (0..18)
         .map(|i| buf.content[(head + 2 + i) * stride + glyph_x].fg)
         .collect();
     assert_eq!(got, expected.to_vec());
@@ -4300,9 +4303,8 @@ fn the_check_output_modal_drops_trailing_whitespace_that_overflows() {
 /// One exact pin here, beside the widened (content-fit) help pins above.
 ///
 /// The thumb's extent is part of that shape, so it moves when the legend does:
-/// the `¢ credit cap spent` row wraps to two rows of content, and the thumb is
-/// shorter for it. The wrapped rows above are what this test is for and
-/// none of them changed.
+/// the `× logged out` row joins the legend, and the thumb is shorter for it.
+/// The wrapped rows above are what this test is for and none of them changed.
 #[test]
 fn the_help_modal_wraps_long_rows_at_the_common_width() {
     use ratatui::{Terminal, backend::TestBackend};
@@ -4362,13 +4364,13 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│    ⊖                   canceled            ┃ │",
         "│    ×                   auth broken         ┃ │",
         "│    ×                   key rejected        ┃ │",
-        "│    ⊘                   weekly spent        ┃ │",
+        "│    ×                   logged out          ┊ │",
+        "│    ⊘                   weekly spent        ┊ │",
         "│    ⧗                   claude code blocked ┊ │",
         "│    $                   extra usage spent   ┊ │",
         "│    ◔                   5h window spent     ┊ │",
         "│    ⊘                   one model's week    ┊ │",
         "│  spent, other models ok                    ┊ │",
-        "│    ¢                   credit cap spent,   ┊ │",
         "│                                              │",
         "╰──────────────────────────────────────────────╯",
     ]

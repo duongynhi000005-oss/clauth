@@ -105,7 +105,8 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             bell_threshold: None,
             disabled: false,
             console: None,
-            credentials: None,
+            credentials: Some(crate::testutil::oauth_pair(name)),
+            has_long_lived_sidecar: false,
             provider: None,
         },
         usage,
@@ -154,6 +155,23 @@ fn mark_fresh(mut f: Fixture) -> Fixture {
 /// exercise the return-to-preferred pass.
 fn mark_preferred(mut f: Fixture) -> Fixture {
     f.profile.preferred = true;
+    f
+}
+
+/// Strips the fixture's default login so a walk test can build a member that
+/// holds no login at all (no stored pair, sidecar, api key or env token).
+fn no_login(mut f: Fixture) -> Fixture {
+    f.profile.credentials = None;
+    f
+}
+
+/// Marks a profile as holding a long-lived `session-token.json` sidecar with no
+/// OAuth pair behind it — the shape whose sessions run on a setup token and
+/// whose usage nothing polls, so `no_usage_source` holds and the `NoUsage` rung
+/// fires instead of `LoggedOut`.
+fn with_long_lived_sidecar(mut f: Fixture) -> Fixture {
+    f.profile.credentials = None;
+    f.profile.has_long_lived_sidecar = true;
     f
 }
 
@@ -577,6 +595,40 @@ fn a_session_snapshot_is_none_for_a_member_outside_the_chain() {
             &HashSet::new()
         )
         .is_none()
+    );
+}
+
+/// F4: a credit-leave `models_differ` list admits only members that hold a
+/// login. A login-less member whose `[models]` differ would otherwise merge
+/// into the leave walk, and the per-session leg would then ask
+/// `swap_target_precondition` about it only for the login re-read to refuse —
+/// a wasted disk re-check per tick, and a decision that lands right only when
+/// the disk agrees with memory. Reading the list directly is the observable.
+#[test]
+fn a_credit_leave_models_differ_list_skips_a_member_holding_no_login() {
+    let mut x = no_login(profile_with_util("x", Some(95.0), Some(10.0)));
+    x.profile.models.default = Some("opus".to_string());
+    let mut c = profile_with_util("c", Some(95.0), Some(10.0));
+    c.profile.models.default = Some("opus".to_string());
+    let (config, _readings) = config_with_chain(
+        vec![profile_with_util("a", Some(95.0), Some(100.0)), x, c],
+        "a",
+    );
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None).profile);
+    let snap = snapshot_session_chain(
+        &config,
+        &crate::profile::ProfileName::from("a"),
+        &launch,
+        &HashSet::new(),
+    )
+    .expect("a session snapshot");
+    assert_eq!(
+        snap.models_differ
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c"],
+        "a login-less member whose models differ is not a credit-leave target"
     );
 }
 
@@ -1257,6 +1309,7 @@ fn walk_order_snapshot_walk_matches_the_config_walk_in_both_directions() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec![],
         models_differ: Vec::new(),
@@ -1324,6 +1377,7 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
         models_differ: Vec::new(),
@@ -1508,6 +1562,7 @@ fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
         models_differ: Vec::new(),
@@ -1572,6 +1627,7 @@ fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
         models_differ: Vec::new(),
@@ -1628,6 +1684,7 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh,
         models_differ: Vec::new(),
@@ -1710,6 +1767,7 @@ fn walk_order_soonest_recomputed_home_parks_once_landed_on_the_soonest_member() 
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec!["beta".into(), "alpha".into()],
         models_differ: Vec::new(),
@@ -1860,6 +1918,7 @@ fn headroom_snapshot(order: WalkOrder, chain: &[&str], fresh: &[&str]) -> ChainS
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: fresh.iter().map(|n| ProfileName::from(*n)).collect(),
         models_differ: Vec::new(),
@@ -4471,6 +4530,7 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec![],
         models_differ: Vec::new(),
@@ -4563,6 +4623,7 @@ fn a_third_party_active_never_projects_its_burn() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec![],
         models_differ: Vec::new(),
@@ -5279,6 +5340,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
         match reason {
             BlockedReason::Disabled | BlockedReason::Canceled | BlockedReason::AuthBroken => true,
             BlockedReason::KeyRejected => true,
+            BlockedReason::LoggedOut => true,
             BlockedReason::WeeklySpent { .. }
             | BlockedReason::KickRejected { .. }
             | BlockedReason::BudgetSpent
@@ -5291,10 +5353,11 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
         }
     }
 
-    // The sidecar half of the ladder's lowest rung. Every fixture here is
-    // credential-less, so `no_usage_source` would hold for ALL of them with a
-    // long-lived token installed: each arm passes `NO_TOKEN` to be judged by its
-    // own rung, and the `NoUsage` arm passes `TOKEN` to reach that rung at all.
+    // The sidecar half of the ladder's lowest rung. Each arm passes the token
+    // fact its own member has: every member here is an OAuth one except the
+    // LoggedOut arm's, which holds no login at all, so each passes `NO_TOKEN`,
+    // and only the `NoUsage` arm builds a sidecar-only member
+    // (`with_long_lived_sidecar`) and passes `TOKEN` to reach that rung.
     const TOKEN: bool = true;
     const NO_TOKEN: bool = false;
 
@@ -5384,6 +5447,23 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
         NO_TOKEN,
         &|r| matches!(r, BlockedReason::AuthBroken),
         "AuthBroken",
+        &readings,
+    );
+
+    // LoggedOut — holds no login at all: dead-first, the walk skips it.
+    let (config, readings) = config_with_chain(
+        vec![
+            keeper(),
+            no_login(profile_with_util("cand", Some(90.0), Some(10.0))),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        NO_TOKEN,
+        &|r| matches!(r, BlockedReason::LoggedOut),
+        "LoggedOut",
         &readings,
     );
 
@@ -5533,7 +5613,10 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
 
     // NoUsage: a member clauth cannot measure, with no reading. Display-only.
     let (config, readings) = config_with_chain(
-        vec![keeper(), profile_with_usage("cand", Some(90.0), None)],
+        vec![
+            keeper(),
+            with_long_lived_sidecar(profile_with_usage("cand", Some(90.0), None)),
+        ],
         "keep",
     );
     assert_variant(
@@ -6065,6 +6148,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
         spend_budget,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec![],
         models_differ: Vec::new(),
@@ -7419,8 +7503,10 @@ fn a_rotation_the_store_could_not_keep_is_walked_around() {
 // rather than an in-memory store the walk tests use.
 
 fn start_walk_profile(name: &str) -> Fixture {
+    let mut profile = Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(crate::testutil::oauth_pair(name));
     Fixture {
-        profile: Profile::new(name.to_string(), None, None),
+        profile,
         usage: None,
         fresh: false,
         status: None,
@@ -9230,6 +9316,7 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
         models_differ: Vec::new(),
@@ -9400,6 +9487,7 @@ fn a_credit_demand_leave_lands_on_an_own_endpoint_capped_member() {
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
+        skipped_unreadable: vec![],
         reading_dead: vec![],
         fresh: vec![],
         models_differ: Vec::new(),
@@ -9636,7 +9724,7 @@ fn with_oauth_login(mut f: Fixture) -> Fixture {
 fn no_usage_source_is_a_session_token_without_an_oauth_pair() {
     // The predicate reads the profile alone (no reading, no store), so each
     // shape is taken off its fixture's profile half.
-    let bare = |n: &str| profile_with_usage(n, None, None).profile;
+    let bare = |n: &str| no_login(profile_with_usage(n, None, None)).profile;
     assert!(
         no_usage_source(&bare("st"), true),
         "a long-lived token with no pair: the setup-token shape, nothing to poll"
@@ -9761,7 +9849,7 @@ fn no_usage_source_is_a_session_token_without_an_oauth_pair() {
 /// endpoint and inference-auth halves of this predicate clear.
 #[test]
 fn no_usage_source_leaves_a_member_another_leg_polls_alone() {
-    let bare = |n: &str| profile_with_usage(n, None, None).profile;
+    let bare = |n: &str| no_login(profile_with_usage(n, None, None)).profile;
     let mut console_only = bare("ali");
     console_only.provider = Some(crate::providers::Provider::Alibaba);
     console_only.console = Some(crate::profile::ConsoleCredential {
@@ -9860,12 +9948,18 @@ fn no_usage_marks_a_member_clauth_cannot_measure_whatever_reading_it_holds() {
         )
     };
     assert_eq!(
-        reason(profile_with_usage("cand", Some(90.0), None), true),
+        reason(
+            with_long_lived_sidecar(profile_with_usage("cand", Some(90.0), None)),
+            true
+        ),
         Some(BlockedReason::NoUsage),
     );
     assert_eq!(
-        reason(profile_with_usage("cand", Some(90.0), None), false),
-        None,
+        reason(
+            no_login(profile_with_usage("cand", Some(90.0), None)),
+            false
+        ),
+        Some(BlockedReason::LoggedOut),
         "without a session token it is the logged-out shape, which is not this rung"
     );
     // Why the rung reads no reading at all: whether anything polls this member
@@ -9874,7 +9968,10 @@ fn no_usage_marks_a_member_clauth_cannot_measure_whatever_reading_it_holds() {
     // instead — which let a leftover figure hide the marker while the hazard
     // stayed live.
     assert_eq!(
-        reason(profile_with_util("cand", Some(90.0), Some(40.0)), true),
+        reason(
+            with_long_lived_sidecar(profile_with_util("cand", Some(90.0), Some(40.0))),
+            true
+        ),
         Some(BlockedReason::NoUsage),
         "a leftover reading from a login since removed does not retire it"
     );
@@ -9890,22 +9987,81 @@ fn no_usage_marks_a_member_clauth_cannot_measure_whatever_reading_it_holds() {
     // reading over the line names the figure the walk is acting on too.
     assert!(
         matches!(
-            reason(profile_with_util("cand", Some(90.0), Some(95.0)), true),
+            reason(
+                with_long_lived_sidecar(profile_with_util("cand", Some(90.0), Some(95.0))),
+                true
+            ),
             Some(BlockedReason::FiveHour { .. })
         ),
         "a reading past the line is what the walk reads, so it names the pill"
     );
     assert_eq!(
         reason(
-            mark_disabled(profile_with_usage("cand", Some(90.0), None)),
+            mark_disabled(with_long_lived_sidecar(profile_with_usage(
+                "cand",
+                Some(90.0),
+                None
+            ))),
             true
         ),
         Some(BlockedReason::Disabled),
         "lowest rung: every other reason outranks it"
     );
+    // The three rungs below FiveHour that read a window: each must still
+    // outrank NoUsage on the sidecar-only member NoUsage is about, or the card
+    // would say "can't read usage" over a figure the walk is acting on.
+    assert!(
+        matches!(
+            reason(
+                with_long_lived_sidecar(profile_with_usage(
+                    "cand",
+                    Some(90.0),
+                    Some(usage_credit_capped())
+                )),
+                true
+            ),
+            Some(BlockedReason::CreditCap)
+        ),
+        "a spent usage-credit cap outranks NoUsage on a sidecar-only member"
+    );
+    assert!(
+        matches!(
+            reason(
+                with_long_lived_sidecar(profile_with_usage(
+                    "cand",
+                    Some(90.0),
+                    Some(both_windows(40.0, 99.0))
+                )),
+                true
+            ),
+            Some(BlockedReason::WeeklySoft { .. })
+        ),
+        "a soft weekly line outranks NoUsage on a sidecar-only member"
+    );
+    assert!(
+        matches!(
+            reason(
+                with_long_lived_sidecar(profile_with_usage(
+                    "cand",
+                    Some(90.0),
+                    Some(usage_with_scoped(
+                        10.0,
+                        50.0,
+                        vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
+                    ))
+                )),
+                true
+            ),
+            Some(BlockedReason::ScopedSpent { .. })
+        ),
+        "a spent per-model window outranks NoUsage on a sidecar-only member"
+    );
     let (config, readings) = {
         let (mut config, readings) = config_with_chain(
-            vec![keeper(), profile_with_usage("cand", Some(90.0), None)],
+            vec![
+                keeper(),
+                with_long_lived_sidecar(profile_with_usage("cand", Some(90.0), None)),
+            ],
             "keep",
         );
         config.state.auth_broken = vec![ProfileName::from("cand")];
@@ -9943,7 +10099,7 @@ fn the_walk_treats_an_unmeasured_member_like_any_member_without_a_fresh_reading(
         config_with_chain(
             vec![
                 with_oauth_login(profile_with_util("a", Some(95.0), Some(100.0))),
-                profile_with_usage("blind", Some(95.0), None),
+                with_long_lived_sidecar(profile_with_usage("blind", Some(95.0), None)),
                 c,
             ],
             "a",
@@ -10127,5 +10283,144 @@ fn blocked_reason_says_credit_cap_only_where_the_walk_skips() {
     assert!(
         matches!(five_hour, Some(BlockedReason::FiveHour { .. })),
         "the spent 5h window outranks the credit cap: {five_hour:?}"
+    );
+}
+
+// ── logged-out members: no automatic walk lands on an account holding no login ──
+//
+// cloudy 2026-10-12: every automatic walk reads "holds a login" (a stored OAuth
+// pair, a long-lived session-token sidecar, or an api key / env token); a
+// member holding none is skipped, while sidecar-only and key-only members stay
+// eligible. The walk fixtures above hold a login by default, so these tests
+// strip it only from the member the walk must skip.
+
+/// The shared core behind the daemon walk and the TUI one-shot: an exhausted
+/// active walks past a login-less clear member to the next member that holds
+/// a login. Linking `x` would install an empty login into the global slot.
+#[test]
+fn the_switch_walk_skips_a_member_holding_no_login() {
+    let (config, _readings) = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            no_login(profile_with_util("x", Some(95.0), Some(10.0))),
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let store = store_with_utils(&[("a", 100.0), ("x", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "the walk must pass over the member holding no login"
+    );
+}
+
+/// The return-to-preferred pass never walks home onto a preferred member that
+/// holds no login: with the active healthy and nothing else to return to, the
+/// walk stays put.
+#[test]
+fn return_to_preferred_skips_a_home_member_holding_no_login() {
+    let (config, _readings) = config_with_chain(
+        vec![
+            mark_preferred(no_login(profile_with_util("a", Some(95.0), None))),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "c",
+    );
+    let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    snap.fresh = vec![
+        ProfileName::from("a"),
+        ProfileName::from("b"),
+        ProfileName::from("c"),
+    ];
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a login-less preferred member is no home to return to"
+    );
+}
+
+/// The reason form every non-switch surface reads (home-day eligibility, the
+/// day-list editor hint, the `+ add` picker) names the missing login with the
+/// ruled copy; a key-only member has nothing to name.
+#[test]
+fn walk_blocker_names_a_member_holding_no_login() {
+    let mut key_only = no_login(profile_with_util("k", Some(95.0), None));
+    key_only.profile.api_key = Some("sk-test".to_string());
+    let (config, _readings) = config_with_chain(
+        vec![no_login(profile_with_util("x", Some(95.0), None)), key_only],
+        "x",
+    );
+    assert_eq!(
+        walk_blocker(&config, &ProfileName::from("x"), &HashSet::new()),
+        Some("it has no login or api key"),
+    );
+    assert_eq!(
+        walk_blocker(&config, &ProfileName::from("k"), &HashSet::new()),
+        None,
+        "an api key alone is a login the walk can use"
+    );
+}
+
+/// Sidecar-only and key-only members stay eligible, read the way every process
+/// reads them: off the profiles a config load puts in memory.
+#[test]
+fn the_switch_walk_keeps_a_key_only_and_a_sidecar_only_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut active = crate::testutil::blank_profile(&ProfileName::from("a"));
+    active.credentials = Some(crate::testutil::oauth_pair("a"));
+    let mut key_only = crate::testutil::blank_profile(&ProfileName::from("k"));
+    key_only.api_key = Some("sk-test".to_string());
+    let sidecar_only = crate::testutil::blank_profile(&ProfileName::from("s"));
+    for p in [&active, &key_only, &sidecar_only] {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    crate::testutil::write_long_lived_sidecar(&ProfileName::from("s"));
+
+    for target in ["k", "s"] {
+        crate::profile::save_app_state(&AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "k".into(), "s".into()],
+            fallback_chain: vec!["a".into(), target.into()],
+            ..AppState::default()
+        })
+        .expect("save app state");
+        let config = crate::profile::load_config().expect("load config");
+        let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+        let store = store_with_utils(&[("a", 100.0), (target, 10.0)]);
+        assert_eq!(
+            next_auto_switch_target(&snap, &store),
+            Some(SwitchAction::To(target.to_string())),
+            "{target} holds a login the walk can install"
+        );
+        assert_eq!(
+            walk_blocker(&config, &ProfileName::from(target), &HashSet::new()),
+            None,
+            "{target} serves the chain"
+        );
+    }
+}
+
+/// `start --auto` refuses a login-less member and starts on the next one; its
+/// row carries the `logged out` rung so `--explain` says why.
+#[test]
+fn the_start_walk_skips_a_member_holding_no_login() {
+    let _sb = start_walk_sandbox(&["x", "c"]);
+    let c = start_walk_profile("c");
+    let (config, _readings) = config_with_chain(vec![no_login(start_walk_profile("x")), c], "x");
+
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(
+        rows[0].block,
+        Some(StartBlock::LoggedOut),
+        "the login-less member's row must carry the logged-out rung"
+    );
+    assert_eq!(
+        pick,
+        Some(1),
+        "the start must land on the member holding a login"
     );
 }

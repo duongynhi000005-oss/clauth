@@ -45,6 +45,7 @@ fn oauth(name: &str) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
+        has_long_lived_sidecar: false,
         provider: None,
     }
 }

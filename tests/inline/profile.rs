@@ -98,8 +98,20 @@ fn preferred_days_round_trip_through_config_toml() {
 }
 
 // Chain membership does not matter to `is_home_on` — it reads the profile
-// list — so the fixture only has to hold the profiles themselves.
+// list — so the fixture only has to hold the profiles themselves. The
+// day-claim axes (disabled, off-chain, the flag) judge a member that holds a
+// login; a login-less member reads "logged out" on the same exclusion the walk
+// applies, so the fixture holds one by default unless a test set its own.
 fn config_of(profiles: Vec<Profile>) -> AppConfig {
+    let profiles: Vec<Profile> = profiles
+        .into_iter()
+        .map(|mut p| {
+            if p.credentials.is_none() {
+                p.credentials = Some(crate::testutil::oauth_pair(p.name.as_str()));
+            }
+            p
+        })
+        .collect();
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     AppConfig {
         state: AppState {
@@ -131,6 +143,7 @@ fn a_non_members_list_reads_inert() {
     off_chain.preferred_days = vec![Weekday::Sat];
     let mut flagged = Profile::new("work".to_string(), None, None);
     flagged.preferred = true;
+    flagged.credentials = Some(crate::testutil::oauth_pair("work"));
     let cfg = AppConfig {
         state: AppState {
             profiles: vec![ProfileName::from("work"), ProfileName::from("personal")],
@@ -291,6 +304,7 @@ fn the_collision_notice_is_stable_per_day_and_moves_with_the_claimants() {
 
     let mut third = Profile::new("spare".to_string(), None, None);
     third.preferred_days = vec![Weekday::Sat];
+    third.credentials = Some(crate::testutil::oauth_pair("spare"));
     let mut widened = cfg;
     widened.state.profiles.push(ProfileName::from("spare"));
     widened
@@ -314,6 +328,7 @@ fn the_collision_notice_is_stable_per_day_and_moves_with_the_claimants() {
 fn an_off_chain_list_is_not_home_on_a_day_the_chain_claims() {
     let mut member = Profile::new("work".to_string(), None, None);
     member.preferred_days = vec![Weekday::Sat];
+    member.credentials = Some(crate::testutil::oauth_pair("work"));
     let mut off_chain = Profile::new("personal".to_string(), None, None);
     off_chain.preferred_days = vec![Weekday::Sat];
 
@@ -2166,6 +2181,45 @@ fn pending_sidecar_is_adopted_when_no_commit_exists_at_all() {
     );
 }
 
+/// A stale legacy `.pending` (older than the committed store) is one the RESOLVE
+/// half discards: `read_profile` answers with the committed store and neither
+/// adopts nor removes the sidecar — a read-only question must not mutate a
+/// credential store. `load_profile` keeps its land behaviour for the same shape
+/// (pinned by `pending_sidecar_older_than_the_commit_is_discarded_not_reinstalled`).
+#[test]
+fn read_profile_neither_adopts_nor_removes_a_stale_pending_sidecar() {
+    let _home = HomeSandbox::new();
+    let name = "pending-read-stale";
+    let committed = pair("live-access", "live-refresh");
+    seed_committed(name, &committed);
+
+    let superseded = pair("spent-access", "spent-refresh");
+    stage_rotated_credentials(&crate::profile::ProfileName::from(name), &superseded)
+        .expect("stage_rotated_credentials");
+
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let pending_path = profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json.pending",
+    )
+    .expect("pending path");
+    let now = std::time::SystemTime::now();
+    crate::testutil::set_mtime(&pending_path, now - std::time::Duration::from_secs(60));
+    crate::testutil::set_mtime(&cred_path, now);
+
+    let got = read_profile(&crate::profile::ProfileName::from(name)).expect("read_profile");
+    assert_eq!(
+        refresh_token_of(&got.credentials),
+        Some("live-refresh"),
+        "a stale sidecar resolves as the committed store, never the superseded pair"
+    );
+    assert!(
+        pending_path.exists(),
+        "the read must not remove a stale sidecar; only the load's land leg does"
+    );
+}
+
 /// The adopt rule compares WRITE times, and a per-session swap moves a store's
 /// mtime with no bytes behind it so Claude Code re-reads it. Reading that stamp
 /// as a commit discards a sidecar staged before it — a refresh pair that may be
@@ -2368,6 +2422,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         disabled: false,
         console: None,
         credentials: Some(creds.clone()),
+        has_long_lived_sidecar: false,
         provider: None,
     };
     // Goes through ConfigHandle-equivalent path: save_profile takes the state
@@ -4827,7 +4882,7 @@ fn the_no_rewrite_read_adopts_a_pending_sidecar_lock_free_and_never_writes() {
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_secs(2)));
 
     let started = std::time::Instant::now();
-    let profile = load_profile_without_rewrite(&name).expect("the no-rewrite read succeeds");
+    let profile = read_profile(&name).expect("the no-rewrite read succeeds");
     let waited = started.elapsed();
     crate::lock::set_state_lock_timeout_override(None);
 
@@ -4934,7 +4989,7 @@ fn the_handshake_profile_read_never_waits_on_the_state_flock() {
     let name = ProfileName::from("held");
 
     let started = std::time::Instant::now();
-    let profile = load_profile_without_rewrite(&name).expect("the no-rewrite read succeeds");
+    let profile = read_profile(&name).expect("the no-rewrite read succeeds");
     let waited = started.elapsed();
     assert_eq!(
         profile.env.get("A:B").map(String::as_str),
@@ -4969,4 +5024,110 @@ fn the_handshake_profile_read_never_waits_on_the_state_flock() {
         "the control: load_profile waits on the flock: {control_waited:?}"
     );
     drop(lock);
+}
+
+// ---- `stored_login` (the on-disk drain read) ----
+
+/// A `credentials.json` that exists but cannot be parsed proves nothing: the
+/// read is unknown — a store that exists but cannot be read or parsed — never
+/// "no login".
+#[test]
+fn stored_login_reads_a_torn_credentials_file_as_unknown() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-creds");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::write(
+        dir.join("credentials.json"),
+        "{\"claudeAiOauth\": {\"accessToken\": ",
+    )
+    .expect("write torn credentials.json");
+
+    assert_eq!(
+        crate::profile::stored_login(&name),
+        crate::profile::StoredLogin::Unknown,
+        "an unreadable credentials.json must not read as no login"
+    );
+}
+
+/// A `config.toml` that exists but cannot be parsed proves nothing: the read
+/// is unknown — a store that exists but cannot be read or parsed — never "no
+/// key".
+#[test]
+fn stored_login_reads_a_torn_config_as_unknown() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-config");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::write(
+        dir.join("config.toml"),
+        "api_key = \"sk-test\"\nbase_url = [",
+    )
+    .expect("write torn config.toml");
+
+    assert_eq!(
+        crate::profile::stored_login(&name),
+        crate::profile::StoredLogin::Unknown,
+        "an unreadable config.toml must not read as no login"
+    );
+}
+
+/// A `session-token.json` that exists but cannot be parsed proves nothing: the
+/// read is unknown, never "no sidecar" (`session_token_status` disengages on a
+/// corrupt sidecar, which is right for installing, wrong for proving absence).
+#[test]
+fn stored_login_reads_a_torn_sidecar_as_unknown() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-sidecar");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        "{\"claudeAiOauth\": {\"accessToken\": ",
+    )
+    .expect("write torn session-token.json");
+
+    assert_eq!(
+        crate::profile::stored_login(&name),
+        crate::profile::StoredLogin::Unknown,
+        "an unreadable session-token.json must not read as no login"
+    );
+}
+
+/// Any readable fact proving a login wins, whatever else is unreadable: a
+/// `config.toml` with a usable api key holds a login even beside a torn
+/// `credentials.json`.
+#[test]
+fn stored_login_reads_a_torn_credentials_file_beside_a_readable_api_key_as_holding_a_login() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-beside-key");
+    let mut keyed = crate::testutil::blank_profile(&name);
+    keyed.api_key = Some("sk-test".to_string());
+    save_profile(&keyed).expect("save_profile");
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::write(
+        dir.join("credentials.json"),
+        "{\"claudeAiOauth\": {\"accessToken\": ",
+    )
+    .expect("write torn credentials.json");
+
+    assert_eq!(
+        crate::profile::stored_login(&name),
+        crate::profile::StoredLogin::HoldsLogin,
+        "a readable api key holds a login even beside an unreadable credentials.json"
+    );
+}
+
+/// With no store files at all, the read proves none: every store that exists is
+/// readable and holds nothing.
+#[test]
+fn stored_login_reads_no_files_as_holding_none() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("no-files");
+
+    assert_eq!(
+        crate::profile::stored_login(&name),
+        crate::profile::StoredLogin::HoldsNone,
+        "no store files prove no login"
+    );
 }

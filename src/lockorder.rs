@@ -163,6 +163,13 @@ pub(crate) mod rank {
         /// both switch drains, each comparing the recorded fingerprint with
         /// the current profile under one config snapshot.
         ThirdPartyBroken = 295;
+        /// Members the auto-switch walk passes over because their stored login
+        /// read [`crate::profile::StoredLogin::Unknown`] at the last drain
+        /// (daemon: after give-up; TUI: at first skip). In-memory only, never
+        /// persisted — written alone by the two drains, read alone by the scans
+        /// (which re-read each name's `stored_login` lock-free and drop the
+        /// healed ones) before `Config`. Leaf like [`ThirdPartyBroken`].
+        SkippedUnreadable = 296;
         UsageStore = 300;
         UsageStatus = 350;
         Config = 400;

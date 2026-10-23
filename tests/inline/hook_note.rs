@@ -1805,6 +1805,15 @@ fn seed_chain_with_active_at(active_pct: f64) {
         Default::default(),
     )
     .expect("create b");
+    // The decision-leg replay walks `b` as the clear target: a login-less
+    // member is skipped, so the fixture gives the TARGET a stored login. `a`
+    // stays credential-less so `which::resolve_active` still resolves it
+    // through the credential-less-active tier (its live slot is not linked).
+    let b = config
+        .find_mut(&ProfileName::from("b"))
+        .expect("created member");
+    b.credentials = Some(crate::testutil::oauth_pair("b"));
+    crate::profile::save_profile(b).expect("save login");
     config.state.active_profile = Some(ProfileName::from("a"));
     config.state.fallback_chain = vec![ProfileName::from("a"), ProfileName::from("b")];
     crate::profile::save_app_state(&config.state).expect("save state");

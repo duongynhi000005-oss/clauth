@@ -2565,6 +2565,375 @@ fn on_tick_still_switches_an_ordinary_decision_beside_a_stale_mark() {
     );
 }
 
+/// The TUI's own drain re-checks the queued target's login ON DISK and drops a
+/// target that holds none, the daemon drain's twin: the in-memory profile here
+/// still carries a pair while its store on disk holds nothing (the login went
+/// away after the scan queued it), and linking it would sign the global slot
+/// out.
+#[test]
+fn on_tick_drops_a_queued_target_holding_no_login_on_disk() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp", "ghost"]);
+    let tp = Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("tp-key".to_string()),
+    );
+    save_profile(&tp).expect("save tp");
+    let on_disk = crate::testutil::blank_profile(&ProfileName::from("ghost"));
+    save_profile(&on_disk).expect("save ghost");
+    let mut in_memory = on_disk.clone();
+    in_memory.credentials = Some(crate::testutil::oauth_pair("ghost"));
+    let state = AppState {
+        active_profile: Some(ProfileName::from("tp")),
+        profiles: vec![ProfileName::from("tp"), ProfileName::from("ghost")],
+        fallback_chain: vec![ProfileName::from("tp"), ProfileName::from("ghost")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![tp, in_memory],
+    });
+    app.bootstrap_started = true;
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "ghost".to_string(),
+            key_rejected_cause: None,
+        });
+
+    // First tick drains the queued decision; the second would complete a
+    // switch had one been dispatched.
+    super::on_tick(&mut app);
+    super::on_tick(&mut app);
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("tp"),
+        "a target holding no login on disk is never linked"
+    );
+    assert!(
+        app.pending_switch.lock().expect("pending").is_empty(),
+        "the login-less target is dropped, not re-queued"
+    );
+}
+
+/// The TUI drain's re-check counts a long-lived session-token sidecar as a
+/// login: a sidecar-only target still switches.
+#[test]
+fn on_tick_still_switches_to_a_sidecar_only_target() {
+    use crate::profile::{AppState, Profile, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp", "side"]);
+    let tp = Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("tp-key".to_string()),
+    );
+    save_profile(&tp).expect("save tp");
+    let side = crate::testutil::blank_profile(&ProfileName::from("side"));
+    save_profile(&side).expect("save side");
+    crate::testutil::write_long_lived_sidecar(&ProfileName::from("side"));
+    let state = AppState {
+        active_profile: Some(ProfileName::from("tp")),
+        profiles: vec![ProfileName::from("tp"), ProfileName::from("side")],
+        fallback_chain: vec![ProfileName::from("tp"), ProfileName::from("side")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config = crate::profile::load_config().expect("load config");
+    let mut app = App::new(config);
+    app.bootstrap_started = true;
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "side".to_string(),
+            key_rejected_cause: None,
+        });
+
+    super::on_tick(&mut app);
+    super::on_tick(&mut app);
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("side"),
+        "a sidecar-only target holds a login, so the queued switch lands"
+    );
+}
+
+/// An unreadable store (a `credentials.json` caught mid-write, a damaged
+/// `session-token.json` on a sidecar-only member) proves nothing about the
+/// target's login: the TUI drain skips it silently, like its not-idle skip,
+/// and never links it on a guess (linking a sidecar-only member past its
+/// corrupt sidecar installs no login and signs the global slot out). No
+/// switch gate is dispatched and no auto-switch toast is shown.
+#[test]
+fn on_tick_never_links_a_queued_target_whose_stored_login_cannot_be_read() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_profile};
+    for file in ["session-token.json", "credentials.json"] {
+        let _home = crate::testutil::HomeSandbox::new();
+        crate::testutil::register_names(&["tp", "ghost"]);
+        let tp = Profile::new(
+            "tp".to_string(),
+            Some("https://example.com".to_string()),
+            Some("tp-key".to_string()),
+        );
+        save_profile(&tp).expect("save tp");
+        let on_disk = crate::testutil::blank_profile(&ProfileName::from("ghost"));
+        save_profile(&on_disk).expect("save ghost");
+        // A torn store file: it exists, but cannot be parsed.
+        let dir = crate::profile::profile_dir(&ProfileName::from("ghost")).expect("profile dir");
+        std::fs::write(dir.join(file), "{\"claudeAiOauth\": {\"accessToken\": ")
+            .expect("write torn store");
+        let state = AppState {
+            active_profile: Some(ProfileName::from("tp")),
+            profiles: vec![ProfileName::from("tp"), ProfileName::from("ghost")],
+            fallback_chain: vec![ProfileName::from("tp"), ProfileName::from("ghost")],
+            ..AppState::default()
+        };
+        crate::profile::save_app_state(&state).expect("persist state");
+        let mut app = App::new(AppConfig {
+            state,
+            profiles: vec![tp, on_disk],
+        });
+        app.bootstrap_started = true;
+        app.pending_switch
+            .lock()
+            .expect("pending")
+            .insert(crate::usage::PendingSwitchTarget {
+                target: "ghost".to_string(),
+                key_rejected_cause: None,
+            });
+
+        super::on_tick(&mut app);
+
+        assert!(
+            app.switch_gates.try_recv().is_err(),
+            "a target whose {file} cannot be read dispatches no switch gate"
+        );
+        assert!(
+            !app.toasts.iter().any(|t| t.body.contains("ghost")),
+            "the skip is silent: no auto-switch toast names the unreadable target ({file})"
+        );
+        super::on_tick(&mut app);
+        assert_eq!(
+            app.config().state.active_profile.as_deref(),
+            Some("tp"),
+            "a target whose {file} cannot be read is never linked"
+        );
+    }
+}
+
+/// A chain `alpha -> gamma -> delta` whose active `alpha` reads exhausted and
+/// whose `gamma` store on disk is torn (the in-memory profile still carries
+/// its pair, as a failed reload leaves it). Returns the app and gamma's
+/// readable store bytes.
+fn unreadable_middle_member_app() -> (App, std::path::PathBuf, Vec<u8>) {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_profile};
+    crate::testutil::register_names(&["alpha", "gamma", "delta"]);
+    let profiles: Vec<_> = ["alpha", "gamma", "delta"]
+        .iter()
+        .map(|name| {
+            let mut p = crate::testutil::blank_profile(&ProfileName::from(*name));
+            p.credentials = Some(crate::testutil::oauth_pair(name));
+            save_profile(&p).expect("save profile");
+            p
+        })
+        .collect();
+    let gamma_store = crate::profile::profile_dir(&ProfileName::from("gamma"))
+        .expect("profile dir")
+        .join("credentials.json");
+    let readable = std::fs::read(&gamma_store).expect("read gamma's store");
+    std::fs::write(&gamma_store, "{\"claudeAiOauth\": {\"accessToken\": ")
+        .expect("tear gamma's store");
+    let chain: Vec<ProfileName> = ["alpha", "gamma", "delta"].map(ProfileName::from).to_vec();
+    let state = AppState {
+        active_profile: Some(ProfileName::from("alpha")),
+        profiles: chain.clone(),
+        fallback_chain: chain,
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig { state, profiles });
+    app.bootstrap_started = true;
+    let now = crate::usage::now_epoch_secs();
+    for (name, utilization) in [("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)] {
+        app.usage_store.lock().expect("usage").insert(
+            name.to_string(),
+            crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization,
+                    resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+                }),
+                ..Default::default()
+            },
+        );
+        app.usage_status
+            .lock()
+            .expect("status")
+            .insert(name.to_string(), crate::usage::FetchStatus::Fresh);
+    }
+    (app, gamma_store, readable)
+}
+
+fn tui_scan_once(app: &App) -> Vec<String> {
+    crate::usage::scan_auto_switch(
+        &app.config,
+        &app.usage_store,
+        &app.third_party_usage_store,
+        &app.usage_status,
+        &app.third_party_status,
+        &app.third_party_streaks,
+        &app.third_party_broken,
+        &app.skipped_unreadable,
+        &app.poll_streaks,
+        &app.kick_blocks,
+        &app.activity,
+        &app.pending_switch,
+        &app.pending_switch_off,
+    );
+    let mut queued: Vec<String> = app
+        .pending_switch
+        .lock()
+        .expect("pending")
+        .iter()
+        .map(|t| t.target.clone())
+        .collect();
+    queued.sort();
+    queued
+}
+
+/// The TUI has no backoff: its first silent skip of an unreadable target also
+/// marks the member skipped, so the next scan passes over it and walks on;
+/// once its store reads again it rejoins the walk.
+#[test]
+fn the_tui_scan_passes_over_a_skipped_unreadable_member_until_its_store_reads_again() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, gamma_store, readable) = unreadable_middle_member_app();
+
+    assert_eq!(
+        tui_scan_once(&app),
+        vec!["gamma".to_string()],
+        "precondition: gamma is the walk's first clear pick"
+    );
+    super::on_tick(&mut app);
+    assert!(
+        app.pending_switch.lock().expect("pending").is_empty(),
+        "precondition: the drain skipped gamma"
+    );
+
+    assert_eq!(
+        tui_scan_once(&app),
+        vec!["delta".to_string()],
+        "the next scan passes over the skipped member and walks on"
+    );
+
+    app.pending_switch.lock().expect("pending").clear();
+    std::fs::write(&gamma_store, &readable).expect("heal gamma's store");
+    assert_eq!(
+        tui_scan_once(&app),
+        vec!["gamma".to_string()],
+        "a store that reads again rejoins the walk"
+    );
+    assert_eq!(app.config().state.active_profile.as_deref(), Some("alpha"));
+}
+
+/// The Overview's projected-switch caption runs every frame, so it reads the
+/// skip set as the last scan left it and never re-reads a store on disk or
+/// heals the set itself: a skipped member whose store has healed stays
+/// passed over in the caption until the next scan clears it.
+#[test]
+fn the_projected_switch_caption_reads_the_skip_set_without_healing_it() {
+    use crate::fallback::SwitchAction;
+    let _home = crate::testutil::HomeSandbox::new();
+    let (app, gamma_store, readable) = unreadable_middle_member_app();
+    app.skipped_unreadable
+        .lock()
+        .expect("skip set")
+        .insert("gamma".to_string());
+    std::fs::write(&gamma_store, &readable).expect("heal gamma's store");
+
+    let projection = app.auto_switch_projection(&std::collections::HashSet::new());
+
+    assert_eq!(
+        projection.action,
+        Some(SwitchAction::To("delta".into())),
+        "the caption honours the skip set the last scan left"
+    );
+    assert!(
+        app.skipped_unreadable
+            .lock()
+            .expect("skip set")
+            .contains("gamma"),
+        "drawing the caption never heals the skip set; only the scan does"
+    );
+}
+
+/// The TUI's drain marks `app.skipped_unreadable`; the refresher's scan must
+/// read the SAME `Arc`, or a mark is invisible to every scan and N4 returns
+/// while the suite stays green. Pinned through the refresher's test-only
+/// recording seam.
+#[test]
+fn the_tui_refresher_scans_the_same_skip_store_the_drain_marks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (app, _gamma_store, _readable) = unreadable_middle_member_app();
+
+    app.start_scheduler();
+
+    let recorded = crate::usage::LAST_REFRESHER_SKIP_STORE
+        .with(|slot| slot.borrow().clone())
+        .expect("the refresher records the skip store it received");
+    assert!(
+        std::sync::Arc::ptr_eq(&recorded, &app.skipped_unreadable),
+        "the refresher's scan must read the same store the drain marks"
+    );
+}
+
+/// The startup one-shot is an automatic link too: it re-reads the target's
+/// stored login on disk like the drains, and links neither a store that
+/// cannot be read nor one that proves no login; the next scan handles it.
+#[test]
+fn the_startup_one_shot_never_links_an_unreadable_or_login_less_target() {
+    for on_disk in ["torn", "none"] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (app, gamma_store, _) = unreadable_middle_member_app();
+        if on_disk == "none" {
+            std::fs::remove_file(&gamma_store).expect("remove gamma's store");
+        }
+
+        let action = crate::fallback::auto_switch_if_needed(
+            &app.config,
+            None,
+            &app.usage_store,
+            &app.third_party_usage_store,
+            &app.usage_status,
+            &app.third_party_status,
+            &app.poll_streaks,
+            &app.third_party_streaks,
+            &app.kick_blocks,
+        )
+        .expect("the one-shot runs");
+
+        assert_eq!(
+            app.config().state.active_profile.as_deref(),
+            Some("alpha"),
+            "{on_disk}: the one-shot never links gamma (returned {action:?})"
+        );
+        assert_eq!(
+            crate::profile::load_app_state()
+                .expect("state")
+                .active_profile
+                .as_deref(),
+            Some("alpha"),
+            "{on_disk}: the on-disk active stays alpha"
+        );
+    }
+}
+
 #[test]
 fn config_rows_login_tracks_api_mode_when_draft_types_a_base_url() {
     use super::{ConfigRow, InputState, build_draft_existing, build_draft_new, config_rows};
@@ -10097,6 +10466,7 @@ fn the_walk_ignores_a_keyless_provider_members_cached_reading() {
             &app.third_party_status,
             &app.third_party_streaks,
             &app.third_party_broken,
+            &app.skipped_unreadable,
             &app.poll_streaks,
             &app.kick_blocks,
             &app.activity,
@@ -15979,6 +16349,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
+        has_long_lived_sidecar: false,
         provider: None,
     }
 }
@@ -16315,6 +16686,50 @@ fn fallback_add_enter_raises_confirm_modal_when_the_candidate_has_no_usage_sourc
         confirm.detail.as_deref(),
         Some(super::no_usage_confirm_detail("st", false).as_str()),
         "the modal tests render this builder, so it must be what the add path raises"
+    );
+}
+
+// The mis-fill verdict of `App::installs_session_token`, pinned through the add
+// path: a blank candidate whose `session-token.json` holds a ROTATING pair (a
+// refresh token, so the classifier reads it `NotLongLived`) installs nothing
+// for sessions. The split stays disengaged, `installs_session_token` is false,
+// and the add commits with no confirm — the candidate's own profile holds no
+// login, but the sidecar is a mis-fill, not a login. A cache that counted any
+// sidecar as a token would raise the no-usage confirm here for an account whose
+// switches install `credentials.json` like any other.
+#[test]
+fn fallback_add_enter_a_misfilled_sidecar_raises_no_confirm_when_the_candidate_has_no_usage_source()
+{
+    let _home = crate::testutil::HomeSandbox::new();
+    let mis = crate::testutil::blank_profile(&crate::profile::ProfileName::from("mis"));
+    // A rotating OAuth pair in the sidecar slot: `sidecar_summary` classifies
+    // it Misfilled, so the per-frame cache reads `NotLongLived`, not a token.
+    let sidecar = crate::testutil::oauth_pair("sk-ant-oat-mis");
+    let dir = crate::profile::profile_dir(&mis.name).expect("profile dir");
+    std::fs::create_dir_all(&dir).expect("mkdir profile dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("serialize sidecar"),
+    )
+    .expect("write session-token sidecar");
+
+    let app = add_first_candidate(
+        vec![
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("alice")),
+            mis,
+        ],
+        vec!["alice"],
+        None,
+    );
+    assert_eq!(
+        app.session_tokens.get("mis"),
+        Some(&crate::claude::SessionTokenStatus::NotLongLived),
+        "the add-path cache reads the mis-fill as NotLongLived"
+    );
+    assert!(
+        app.modals.is_empty(),
+        "a mis-filled sidecar raises no confirm: {} modal(s)",
+        app.modals.len()
     );
 }
 
@@ -23223,8 +23638,10 @@ fn a_second_day_notice_does_not_repaint_the_first() {
 
     let mut a = Profile::new("work".to_string(), None, None);
     a.preferred_days = all_weekdays();
+    a.credentials = Some(crate::testutil::oauth_pair("work"));
     let mut b = Profile::new("personal".to_string(), None, None);
     b.preferred_days = all_weekdays();
+    b.credentials = Some(crate::testutil::oauth_pair("personal"));
     let mut app = app_with_chain(vec![a, b]);
 
     warn_day_claim_notices(&mut app);
@@ -23272,8 +23689,10 @@ fn the_day_collision_warning_fires_on_the_edge_only() {
 
     let mut a = Profile::new("work".to_string(), None, None);
     a.preferred_days = all_weekdays();
+    a.credentials = Some(crate::testutil::oauth_pair("work"));
     let mut b = Profile::new("personal".to_string(), None, None);
     b.preferred_days = all_weekdays();
+    b.credentials = Some(crate::testutil::oauth_pair("personal"));
     let mut app = app_with_chain(vec![a, b]);
 
     warn_day_claim_notices(&mut app);

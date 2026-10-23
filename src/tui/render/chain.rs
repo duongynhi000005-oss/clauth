@@ -28,12 +28,13 @@ use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resum
 use super::global_config::reminder_text;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
-    DIAG_CREDIT_CAP, DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_MONTHLY_SOFT,
-    DIAG_MONTHLY_SPENT, DIAG_NO_USAGE, DIAG_OTHER_MODELS_OK, DIAG_STALE, DIAG_WEEKLY_SOFT,
-    DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when, cycle_row_lines, draw_scrolled_lines_with_footnote,
-    draw_selector_list, head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines,
-    key_cell, label_style, master_detail, name_color, pill, place_caret, rail_hint_lines,
-    section_box, section_box_verbatim, select_line, value_caret, wrap_words,
+    DIAG_CREDIT_CAP, DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_LOGGED_OUT,
+    DIAG_MONTHLY_SOFT, DIAG_MONTHLY_SPENT, DIAG_NO_USAGE, DIAG_OTHER_MODELS_OK, DIAG_STALE,
+    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when, cycle_row_lines,
+    draw_scrolled_lines_with_footnote, draw_selector_list, head_cols, help_tooltip_lines,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill,
+    place_caret, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
+    wrap_words,
 };
 use super::prose::{cmd, key, mark_commands};
 use crate::fallback::{
@@ -476,6 +477,7 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
         BlockedReason::Canceled => ("⊖", theme::danger()),
         BlockedReason::AuthBroken => (theme::dead_credential_glyph(), theme::danger()),
         BlockedReason::KeyRejected => (theme::dead_credential_glyph(), theme::danger()),
+        BlockedReason::LoggedOut => (theme::dead_credential_glyph(), theme::danger()),
         BlockedReason::WeeklySpent { .. } => ("⊘", theme::danger()),
         BlockedReason::KickRejected { .. } => ("⧗", theme::warning()),
         BlockedReason::BudgetSpent => ("$", theme::warning()),
@@ -508,6 +510,7 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
         BlockedReason::Canceled => (DIAG_CANCELED.to_string(), theme::danger().bold(), None),
         BlockedReason::AuthBroken => (DIAG_AUTH_BROKEN.to_string(), theme::danger().bold(), None),
         BlockedReason::KeyRejected => (DIAG_KEY_REJECTED.to_string(), theme::danger().bold(), None),
+        BlockedReason::LoggedOut => (DIAG_LOGGED_OUT.to_string(), theme::danger().bold(), None),
         BlockedReason::WeeklySpent { resets_in, monthly } => (
             if *monthly {
                 DIAG_MONTHLY_SPENT.to_string()
@@ -578,6 +581,10 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName, active
             format!("re-login with {}", cmd(&format!("clauth login {name}")))
         }
         BlockedReason::KeyRejected => "re-enter the api key on the setup tab".to_string(),
+        BlockedReason::LoggedOut => format!(
+            "log in with {}, or add an api key on the setup tab",
+            cmd(&format!("clauth login {name}"))
+        ),
         BlockedReason::WeeklySpent { monthly, .. } => {
             if *monthly {
                 "monthly quota is spent".to_string()

@@ -157,6 +157,7 @@ fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
             provider: None,
         },
         status,

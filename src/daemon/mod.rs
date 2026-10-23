@@ -59,7 +59,7 @@ use crate::profile::{
 };
 use crate::usage::{
     ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile,
-    PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore,
+    PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue, SkippedUnreadable, StatusStore,
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
     ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, WeeklyResetKicks,
     bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries,
@@ -1148,6 +1148,7 @@ struct Daemon {
     third_party_status: ThirdPartyStatusStore,
     third_party_streaks: ThirdPartyStreaks,
     third_party_broken: ThirdPartyBroken,
+    skipped_unreadable: SkippedUnreadable,
     /// Scheduler-only stores held on `self` so `forget_memory` can reach the
     /// whole process's name-keyed state.
     weekly_reset_kicks: WeeklyResetKicks,
@@ -1246,6 +1247,7 @@ impl Daemon {
             third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+            skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
             weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
             suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
             // Never set by the daemon: process exit IS its shutdown (a
@@ -1354,6 +1356,7 @@ impl Daemon {
             Arc::clone(&self.third_party_status),
             Arc::clone(&self.third_party_streaks),
             Arc::clone(&self.third_party_broken),
+            Arc::clone(&self.skipped_unreadable),
             Arc::clone(&self.suppressed_auth_expired),
             Arc::clone(&self.shutting_down),
             // Single-fetcher lease (#27): the daemon competes for `usage-fetch.lock`

@@ -258,6 +258,64 @@ fn empty_msg_credless_profile_is_terminal() {
     );
 }
 
+/// A session-token sidecar with no OAuth pair is a login clauth cannot read
+/// usage through: the empty state says what clauth cannot do and how the same
+/// account becomes readable, never "not logged in". Read off the profile a
+/// config load puts in memory, the way the tab reads it.
+#[test]
+fn empty_msg_sidecar_only_profile_names_the_unreadable_usage() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("s");
+    crate::profile::save_profile(&crate::testutil::blank_profile(&name)).expect("save profile");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .expect("save app state");
+    crate::testutil::write_long_lived_sidecar(&name);
+    let config = crate::profile::load_config().expect("load config");
+    let profile = config.find(&name).expect("loaded profile");
+    assert_eq!(
+        oauth_empty_msg(profile, None),
+        "can't read usage, log in the same account with + login on the setup tab"
+    );
+}
+
+/// An Anthropic api key (stored, or an `[env]` token) with no OAuth pair is a
+/// login with no usage windows: nothing to fix, so no fix line.
+#[test]
+fn empty_msg_key_only_profile_has_no_usage_windows() {
+    let mut stored = crate::testutil::blank_profile(&crate::profile::ProfileName::from("k"));
+    stored.api_key = Some("sk-test".to_string());
+    let mut env_token = crate::testutil::blank_profile(&crate::profile::ProfileName::from("e"));
+    env_token
+        .env
+        .insert("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string());
+    for profile in [&stored, &env_token] {
+        assert_eq!(
+            oauth_empty_msg(profile, None),
+            "can't read usage, an api key has no usage windows",
+            "{}",
+            profile.name
+        );
+    }
+}
+
+/// F3d: a profile holding BOTH a long-lived sidecar and an api key reads the
+/// sidecar line — the sidecar branch outranks the key branch, the order ruling
+/// 5's three arms spell. Swapping the two branches must red this.
+#[test]
+fn empty_msg_sidecar_outranks_an_api_key_when_both_hold_a_login() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    profile.api_key = Some("sk-test".to_string());
+    profile.has_long_lived_sidecar = true;
+    assert_eq!(
+        oauth_empty_msg(&profile, None),
+        "can't read usage, log in the same account with + login on the setup tab",
+        "the sidecar line outranks the api-key line"
+    );
+}
+
 #[test]
 fn empty_msg_failed_fetch_is_terminal() {
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
@@ -1571,13 +1629,15 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
     .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
     .collect();
     assert!(
-        body.contains("not logged in"),
+        body.contains("can't read usage, an api key has no usage windows"),
         "the body takes the OAuth arm's empty message, got {body:?}"
     );
     // Notes close the pane (cloudy's placement): after the usage blocks, never
     // between header and body.
     let at_notes = body.find("notes:").expect("notes row present");
-    let at_empty = body.find("not logged in").expect("empty message present");
+    let at_empty = body
+        .find("can't read usage, an api key has no usage windows")
+        .expect("empty message present");
     assert!(
         at_notes > at_empty,
         "notes render below the usage blocks, got {body:?}"

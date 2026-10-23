@@ -153,6 +153,30 @@ fn active_of(d: &Daemon) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The drain marks the daemon's own skip store; the refresher's scan must read
+/// the SAME `Arc`, or a mark is invisible to every scan and N4 returns while the
+/// suite stays green. Pinned through the refresher's test-only recording seam.
+#[test]
+fn the_daemon_refresher_scans_the_same_skip_store_the_drain_marks() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    let daemon = daemon_for(config);
+
+    daemon.spawn_scheduler();
+
+    let recorded = crate::usage::LAST_REFRESHER_SKIP_STORE
+        .with(|slot| slot.borrow().clone())
+        .expect("the refresher records the skip store it received");
+    assert!(
+        std::sync::Arc::ptr_eq(&recorded, &daemon.skipped_unreadable),
+        "the refresher's scan must read the same store the drain marks"
+    );
+}
+
 // ── tick(): the extracted loop body ───────────────────────────────────────────
 
 /// `tick` on an idle daemon with empty queues writes `status.json` and changes
@@ -472,6 +496,432 @@ fn drain_pending_switch_executes_when_idle_and_clean() {
         Some("beta"),
         "an idle, clean, installable target must be switched to"
     );
+}
+
+/// The drain re-checks the queued target on disk and DROPS it when it holds no
+/// login (no stored pair, no session-token sidecar, no api key): linking it
+/// would sign the global slot out. Dropped, never re-queued — a later decision
+/// re-derives the walk.
+#[test]
+fn drain_pending_switch_drops_a_target_holding_no_login() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            blank_profile(&crate::profile::ProfileName::from("beta")),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta");
+    let lines = crate::logline::LogLines::new();
+    let guard = lines.capture_here();
+    daemon.drain_pending_switch();
+    drop(guard);
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a target holding no login must never be linked"
+    );
+    assert!(
+        daemon
+            .pending_switch
+            .lock()
+            .expect("pending_switch")
+            .is_empty(),
+        "the login-less target is dropped, not re-queued"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth daemon: dropping queued switch to 'beta': it has no login or api key"
+                .to_string()
+        ],
+        "the drop's log line is the ruled wording, pinned by equality"
+    );
+}
+
+/// The drain's re-check counts a session-token sidecar and an api key as a
+/// login: a sidecar-only or key-only target still switches.
+#[test]
+fn drain_pending_switch_still_links_a_sidecar_only_or_key_only_target() {
+    for (target, sidecar) in [("beta", true), ("gamma", false)] {
+        let _home = HomeSandbox::new();
+        let mut key_only = blank_profile(&crate::profile::ProfileName::from("gamma"));
+        key_only.api_key = Some("sk-test".to_string());
+        let config = persist(
+            vec![
+                profile_with_creds("alpha", "at-alpha"),
+                blank_profile(&crate::profile::ProfileName::from("beta")),
+                key_only,
+            ],
+            Some("alpha"),
+            90_000,
+        );
+        if sidecar {
+            crate::testutil::write_long_lived_sidecar(&crate::profile::ProfileName::from("beta"));
+        }
+        link_active_clean("alpha");
+        let mut daemon = daemon_for(config);
+
+        stage_switch(&daemon, target);
+        daemon.drain_pending_switch();
+
+        assert_eq!(
+            active_of(&daemon).as_deref(),
+            Some(target),
+            "{target} holds a login, so the queued switch lands"
+        );
+    }
+}
+
+/// A target whose store exists but cannot be read (a `credentials.json` caught
+/// mid-write, a `config.toml` hand-edited with a typo, a damaged
+/// `session-token.json` on a sidecar-only member) proves nothing about its
+/// login either way: the drain neither drops it as logged out nor links it on
+/// a guess (linking a sidecar-only member past its corrupt sidecar installs
+/// no login and signs the global slot out). It defers through the backoff,
+/// re-reading the store on each retry.
+#[test]
+fn drain_pending_switch_defers_a_target_whose_stored_login_cannot_be_read() {
+    let torn: [(&str, &str, &str); 3] = [
+        (
+            "delta",
+            "session-token.json",
+            "{\"claudeAiOauth\": {\"accessToken\": ",
+        ),
+        (
+            "beta",
+            "credentials.json",
+            "{\"claudeAiOauth\": {\"accessToken\": ",
+        ),
+        (
+            "gamma",
+            "config.toml",
+            "api_key = \"sk-test\"\nbase_url = [",
+        ),
+    ];
+    for (target, file, bytes) in torn {
+        let _home = HomeSandbox::new();
+        let mut key_only = blank_profile(&crate::profile::ProfileName::from("gamma"));
+        key_only.api_key = Some("sk-test".to_string());
+        let config = persist(
+            vec![
+                profile_with_creds("alpha", "at-alpha"),
+                profile_with_creds("beta", "at-beta"),
+                key_only,
+                blank_profile(&crate::profile::ProfileName::from("delta")),
+            ],
+            Some("alpha"),
+            90_000,
+        );
+        link_active_clean("alpha");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(target))
+            .expect("profile dir");
+        std::fs::write(dir.join(file), bytes).expect("write torn store");
+        let mut daemon = daemon_for(config);
+
+        stage_switch(&daemon, target);
+        let lines = crate::logline::LogLines::new();
+        let guard = lines.capture_here();
+        daemon.drain_pending_switch();
+        drop(guard);
+
+        assert_eq!(
+            active_of(&daemon).as_deref(),
+            Some("alpha"),
+            "a target whose {file} cannot be read is never linked"
+        );
+        assert_eq!(
+            lines.snapshot(),
+            vec![format!(
+                "clauth daemon: deferring switch to '{target}': its stored login could not be read"
+            )],
+            "an unreadable {file} defers with the ruled reason, pinned by equality"
+        );
+        assert_eq!(
+            queued_targets(&daemon),
+            vec![target.to_string()],
+            "the deferred target is re-queued for a retry"
+        );
+    }
+}
+
+/// The deferral is bounded: a target whose store stays unreadable until its
+/// retry window closes is given up with the same ruled reason, never linked.
+#[test]
+fn drain_pending_switch_gives_up_on_a_store_that_stays_unreadable() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            blank_profile(&crate::profile::ProfileName::from("delta")),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("delta"))
+        .expect("profile dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        "{\"claudeAiOauth\": {\"accessToken\": ",
+    )
+    .expect("write torn sidecar");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "delta");
+    let lines = crate::logline::LogLines::new();
+    let guard = lines.capture_here();
+    daemon.drain_pending_switch();
+    // Close the retry window the first deferral opened.
+    let now = now_ms();
+    let backoff = daemon
+        .switch_backoff
+        .as_mut()
+        .expect("the first drain defers through the backoff");
+    backoff.not_before = now.saturating_sub(1);
+    backoff.retry_until = now.saturating_sub(1);
+    daemon.drain_pending_switch();
+    drop(guard);
+
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth daemon: deferring switch to 'delta': its stored login could not be read"
+                .to_string(),
+            "clauth daemon: gave up switching to 'delta': its stored login could not be read"
+                .to_string(),
+        ],
+        "the deferral, then the give-up, each with the ruled reason"
+    );
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a store that never becomes readable is never linked"
+    );
+    assert!(
+        queued_targets(&daemon).is_empty() && daemon.switch_backoff.is_none(),
+        "the given-up target leaves neither a queued retry nor backoff state"
+    );
+}
+
+/// The retry window closes on its own clock: draining an unreadable target
+/// again and again past each `not_before` keeps the window the first deferral
+/// opened (one `deferring` line, `retry_until` never re-stamped), so the
+/// give-up arrives when that window ends, not never.
+#[test]
+fn an_unreadable_targets_retry_window_is_never_restamped() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            blank_profile(&crate::profile::ProfileName::from("delta")),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("delta"))
+        .expect("profile dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        "{\"claudeAiOauth\": {\"accessToken\": ",
+    )
+    .expect("write torn sidecar");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "delta");
+    let lines = crate::logline::LogLines::new();
+    let guard = lines.capture_here();
+    daemon.drain_pending_switch();
+    let first_window = daemon
+        .switch_backoff
+        .as_ref()
+        .expect("the first drain defers through the backoff")
+        .retry_until;
+    for pass in 0..3 {
+        daemon
+            .switch_backoff
+            .as_mut()
+            .expect("the deferral keeps its backoff state")
+            .not_before = now_ms().saturating_sub(1);
+        daemon.drain_pending_switch();
+        assert_eq!(
+            daemon
+                .switch_backoff
+                .as_ref()
+                .expect("still inside the window")
+                .retry_until,
+            first_window,
+            "pass {pass}: a retry past `not_before` keeps the first deferral's window"
+        );
+    }
+    drop(guard);
+
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth daemon: deferring switch to 'delta': its stored login could not be read"
+                .to_string()
+        ],
+        "one deferral line for the whole window, however many retries"
+    );
+}
+
+/// Inside an open backoff window an unreadable target re-queues quietly, like
+/// every other deferral: the backoff gate runs before the unreadable check, so
+/// neither the attempt count nor `not_before` moves.
+#[test]
+fn an_unreadable_target_inside_its_backoff_window_requeues_quietly() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            blank_profile(&crate::profile::ProfileName::from("delta")),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("delta"))
+        .expect("profile dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        "{\"claudeAiOauth\": {\"accessToken\": ",
+    )
+    .expect("write torn sidecar");
+    let mut daemon = daemon_for(config);
+    let now = now_ms();
+    daemon.switch_backoff = Some(super::SwitchBackoff {
+        target: "delta".into(),
+        attempts: 1,
+        not_before: now + 60_000,
+        reason: "its stored login could not be read".into(),
+        retry_until: now + 120_000,
+    });
+
+    for _ in 0..2 {
+        stage_switch(&daemon, "delta");
+        daemon.drain_pending_switch();
+    }
+
+    let b = daemon.switch_backoff.as_ref().expect("backoff kept");
+    assert_eq!(
+        (b.attempts, b.not_before),
+        (1, now + 60_000),
+        "inside `not_before` the backoff gate re-queues without a new attempt"
+    );
+    assert_eq!(queued_targets(&daemon), vec!["delta".to_string()]);
+}
+
+fn scan_once(d: &Daemon) {
+    crate::usage::scan_auto_switch(
+        &d.config,
+        &d.usage_store,
+        &d.third_party_usage_store,
+        &d.usage_status,
+        &d.third_party_status,
+        &d.third_party_streaks,
+        &d.third_party_broken,
+        &d.skipped_unreadable,
+        &d.poll_streaks,
+        &d.kick_blocks,
+        &d.activity,
+        &d.pending_switch,
+        &d.pending_switch_off,
+    );
+}
+
+/// A member the drain gave up on because its stored login stays unreadable is
+/// passed over by the next scan, which walks on to the next clear member;
+/// once its store reads again it rejoins the walk. Without the skip the scan
+/// re-picks it off the stale in-memory config (a store that cannot be parsed
+/// fails every config reload) and the chain never moves past it.
+#[test]
+fn a_member_given_up_as_unreadable_is_passed_over_until_its_store_reads_again() {
+    let _home = HomeSandbox::new();
+    let mut config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("gamma", "at-gamma"),
+            profile_with_creds("delta", "at-delta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    config.state.fallback_chain = vec!["alpha".into(), "gamma".into(), "delta".into()];
+    save_app_state(&config.state).expect("persist the chain");
+    link_active_clean("alpha");
+    let gamma_store = crate::profile::profile_dir(&crate::profile::ProfileName::from("gamma"))
+        .expect("profile dir")
+        .join("credentials.json");
+    let readable = std::fs::read(&gamma_store).expect("read gamma's store");
+    std::fs::write(&gamma_store, "{\"claudeAiOauth\": {\"accessToken\": ")
+        .expect("tear gamma's store");
+    let mut daemon = daemon_for(config);
+
+    let now = crate::usage::now_epoch_secs();
+    let window = |utilization: f64| crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    for (name, utilization) in [("alpha", 100.0), ("gamma", 10.0), ("delta", 10.0)] {
+        daemon
+            .usage_store
+            .lock()
+            .expect("usage")
+            .insert(name.to_string(), window(utilization));
+        daemon
+            .usage_status
+            .lock()
+            .expect("status")
+            .insert(name.to_string(), crate::usage::FetchStatus::Fresh);
+    }
+
+    scan_once(&daemon);
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["gamma".to_string()],
+        "precondition: gamma is the walk's first clear pick"
+    );
+    daemon.drain_pending_switch();
+    let closed = now_ms().saturating_sub(1);
+    let backoff = daemon
+        .switch_backoff
+        .as_mut()
+        .expect("gamma's unreadable store defers");
+    backoff.not_before = closed;
+    backoff.retry_until = closed;
+    daemon.drain_pending_switch();
+    assert!(
+        queued_targets(&daemon).is_empty(),
+        "precondition: the drain gave gamma up"
+    );
+
+    scan_once(&daemon);
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["delta".to_string()],
+        "the next scan passes over the given-up member and walks on"
+    );
+
+    daemon.pending_switch.lock().expect("pending").clear();
+    std::fs::write(&gamma_store, &readable).expect("heal gamma's store");
+    scan_once(&daemon);
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["gamma".to_string()],
+        "a store that reads again rejoins the walk"
+    );
+    assert_eq!(active_of(&daemon).as_deref(), Some("alpha"));
 }
 
 /// R2 daemon leg: a change site the daemon tick runs — the adopt of a first
@@ -852,6 +1302,7 @@ fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conv
         &daemon.third_party_status,
         &daemon.third_party_streaks,
         &daemon.third_party_broken,
+        &daemon.skipped_unreadable,
         &daemon.poll_streaks,
         &daemon.kick_blocks,
         &daemon.activity,
@@ -960,6 +1411,7 @@ fn drain_pending_switch_drops_a_day_claim_repair_after_key_rejection() {
         &daemon.third_party_status,
         &daemon.third_party_streaks,
         &daemon.third_party_broken,
+        &daemon.skipped_unreadable,
         &daemon.poll_streaks,
         &daemon.kick_blocks,
         &daemon.activity,
@@ -2466,6 +2918,7 @@ fn the_daemon_scan_ignores_a_keyless_provider_members_cached_reading() {
             &d.third_party_status,
             &d.third_party_streaks,
             &d.third_party_broken,
+            &d.skipped_unreadable,
             &d.poll_streaks,
             &d.kick_blocks,
             &d.activity,
@@ -3248,8 +3701,10 @@ fn the_daemon_logs_a_day_collision_once_per_change() {
     let all = || vec![Mon, Tue, Wed, Thu, Fri, Sat, Sun];
     let mut a = blank_profile(&crate::profile::ProfileName::from("work"));
     a.preferred_days = all();
+    a.credentials = Some(crate::testutil::oauth_pair("work"));
     let mut b = blank_profile(&crate::profile::ProfileName::from("personal"));
     b.preferred_days = all();
+    b.credentials = Some(crate::testutil::oauth_pair("personal"));
 
     let mut config = persist(vec![a, b], Some("work"), 60_000);
     config.state.fallback_chain = config.state.profiles.clone();
