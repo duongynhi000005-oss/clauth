@@ -523,7 +523,7 @@ fn a_delivered_answers_payload_is_dropped_while_the_ask_stays_closed() {
 /// the ask: the late close is the ask's last consumer and must drop the kept
 /// payload, keeping only the id.
 #[test]
-fn reviewer_probe_w4_lost_hold_then_answer_then_close() {
+fn a_late_close_after_a_device_answer_drops_the_kept_payload() {
     let (_home, hub, ctx) = session_with_asks(&["q1"]);
     answer(&ctx, "q1", r#"{"answers":{"Which colour?":"blue"}}"#);
     let closed =
@@ -546,7 +546,7 @@ fn reviewer_probe_w4_lost_hold_then_answer_then_close() {
 /// A poll delivering the device's answer command is that ask's last consumer via
 /// the poll path: after delivery the payload is dropped, keeping only the id.
 #[test]
-fn reviewer_probe_w4_poll_delivers_first() {
+fn a_polled_answer_drops_its_payload_with_no_wait_parked() {
     let (_home, hub, ctx) = session_with_asks(&["q1"]);
     answer(&ctx, "q1", r#"{"answers":{"Which colour?":"blue"}}"#);
     let (status, polled) = hub.poll(100, "s-one", Duration::from_millis(50));
