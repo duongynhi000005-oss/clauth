@@ -1104,13 +1104,13 @@ fn total_cost_counts_unpriced_with_tokens() {
         ],
         ..Default::default()
     };
-    let (lines, _meta) = total_lines(&stats, &stats.speed_days, 60, false, Some(&table));
+    let (lines, _meta) = total_lines(&stats, &stats.speed_days, 60, 5, false, Some(&table));
     assert!(
         line_text(&lines[1]).contains("$1.00+"),
         "unpriced token-bearing models floor the lifetime figure, got {:?}",
         line_text(&lines[1])
     );
-    let (bare, _meta) = total_lines(&stats, &stats.speed_days, 60, false, None);
+    let (bare, _meta) = total_lines(&stats, &stats.speed_days, 60, 5, false, None);
     assert!(line_text(&bare[1]).contains('—'), "no table → dash");
 
     // A zero-token unpriced model does NOT floor the figure: the count is
@@ -1129,8 +1129,14 @@ fn total_cost_counts_unpriced_with_tokens() {
         ],
         ..Default::default()
     };
-    let (zero_lines, _meta) =
-        total_lines(&zero_only, &zero_only.speed_days, 60, false, Some(&table));
+    let (zero_lines, _meta) = total_lines(
+        &zero_only,
+        &zero_only.speed_days,
+        60,
+        5,
+        false,
+        Some(&table),
+    );
     let zero_cost = line_text(&zero_lines[1]);
     assert!(
         zero_cost.contains("$1.00") && !zero_cost.contains('+'),
@@ -1619,12 +1625,12 @@ fn model_detail_marks_nothing_on_incomplete_split() {
     );
 }
 
-/// A narrow TOTAL card drops the `cache hit` badge to its own line instead of
-/// clipping its tail off the card edge.
+/// A narrow TOTAL card with a free row drops the `cache hit` badge to its own
+/// line instead of clipping its tail off the card edge.
 #[test]
 fn the_total_cache_hit_badge_drops_to_its_own_line_when_narrow() {
     let stats = populated_stats();
-    let (lines, _) = total_lines(&stats, &stats.speed_days, 24, true, None);
+    let (lines, _) = total_lines(&stats, &stats.speed_days, 24, 5, true, None);
     let texts: Vec<String> = lines.iter().map(line_text).collect();
     assert_eq!(
         texts,
@@ -1960,7 +1966,7 @@ fn the_total_card_avg_speed_reads_the_ledger_speed_rows() {
             gen_ms: 20_000,
         },
     );
-    let (lines, _meta) = total_lines(&stats, &stats.speed_days, 40, false, None);
+    let (lines, _meta) = total_lines(&stats, &stats.speed_days, 40, 5, false, None);
     let avg = lines
         .iter()
         .map(line_text)
@@ -1968,11 +1974,59 @@ fn the_total_card_avg_speed_reads_the_ledger_speed_rows() {
         .expect("a ledger with speed rows shows the avg speed line");
     assert_eq!(avg, "avg speed 90 t/s");
 
-    // The row sits right above `msgs`, under `sessions`.
-    let (lines, _) = total_lines(&stats, &stats.speed_days, 24, true, None);
+    // The row sits right under `sessions`, above `msgs`.
     let texts: Vec<String> = lines.iter().map(line_text).collect();
+    let at = |key: &str| texts.iter().position(|t| t.starts_with(key));
+    let sessions = at("sessions").expect("the card has a sessions row");
     assert_eq!(
-        texts,
+        (at("avg speed"), at("msgs")),
+        (Some(sessions + 1), Some(sessions + 2)),
+        "{texts:?}"
+    );
+
+    // No speed rows, no avg speed line.
+    let empty = populated_stats();
+    let (empty_lines, _) = total_lines(&empty, &empty.speed_days, 40, 5, false, None);
+    assert!(
+        !empty_lines
+            .iter()
+            .map(line_text)
+            .any(|t| t.contains("avg speed")),
+        "no speed rows, no avg speed line"
+    );
+}
+
+/// The `cache hit` badge takes its own line only when the card has a row for
+/// it: at 5 rows with the avg speed row the badge sheds, at 6 it keeps its
+/// line, and with no speed rows it sheds at 4.
+#[test]
+fn the_total_cache_hit_badge_takes_its_own_line_only_when_the_card_has_a_row_for_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut speed = populated_stats();
+    speed.speed_days.insert(
+        "2026-10-14".to_string(),
+        crate::tps::DaySum {
+            output: 1_800,
+            gen_ms: 20_000,
+        },
+    );
+    let plain = populated_stats();
+    let rows = |stats: &TokenStats, h: usize| -> Vec<String> {
+        let (lines, _) = total_lines(stats, &stats.speed_days, 24, h, true, None);
+        lines.iter().map(line_text).collect()
+    };
+    assert_eq!(
+        rows(&speed, 5),
+        [
+            "tokens    170M",
+            "cost      —",
+            "sessions  1,000",
+            "avg speed 90 t/s",
+            "msgs      200K"
+        ]
+    );
+    assert_eq!(
+        rows(&speed, 6),
         [
             "tokens    170M",
             "  0% cache hit",
@@ -1982,17 +2036,76 @@ fn the_total_card_avg_speed_reads_the_ledger_speed_rows() {
             "msgs      200K"
         ]
     );
-
-    // An empty ledger speed map leaves the card exactly as it rendered before.
-    let empty = populated_stats();
-    let (empty_lines, _) = total_lines(&empty, &empty.speed_days, 40, false, None);
-    assert!(
-        !empty_lines
-            .iter()
-            .map(line_text)
-            .any(|t| t.contains("avg speed")),
-        "no speed rows, no avg speed line"
+    assert_eq!(
+        rows(&plain, 4),
+        [
+            "tokens    170M",
+            "cost      —",
+            "sessions  1,000",
+            "msgs      200K"
+        ]
     );
+}
+
+/// The TOTAL card's 5 inner rows as rendered: the card whose top border names
+/// `TOTAL`, cut to its own columns.
+fn total_card_rows(rows: &[String]) -> Vec<String> {
+    let top = rows
+        .iter()
+        .position(|r| r.contains("─ TOTAL"))
+        .unwrap_or_else(|| panic!("no total card on screen: {rows:#?}"));
+    let cells: Vec<char> = rows[top].chars().collect();
+    let title_at = rows[top][..rows[top].find("─ TOTAL").unwrap()]
+        .chars()
+        .count();
+    let left = cells[..title_at].iter().rposition(|c| *c == '╭').unwrap();
+    let right = left + cells[left..].iter().position(|c| *c == '╮').unwrap();
+    rows[top + 1..=top + 5]
+        .iter()
+        .map(|r| {
+            r.chars()
+                .skip(left + 1)
+                .take(right - left - 1)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// On screen, at sizes where the badge cannot sit beside the tokens figure
+/// (34x60 narrow, 60x40 single column), the card with the avg speed row keeps
+/// `msgs` and sheds the badge; at 140x40 the badge sits inline and every row
+/// shows.
+#[test]
+fn the_rendered_total_card_never_clips_msgs_for_the_badge() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = p1_tokens_app(true);
+    app.token_stats.as_mut().unwrap().speed_days.insert(
+        "2026-10-14".to_string(),
+        crate::tps::DaySum {
+            output: 1_800,
+            gen_ms: 20_000,
+        },
+    );
+    for (w, h, badge) in [(34, 60, false), (60, 40, false), (140, 40, true)] {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+        let card = total_card_rows(&crate::testutil::buffer_rows(term.backend().buffer()));
+        assert!(
+            card.iter().any(|r| r.starts_with("avg speed 90 t/s")),
+            "{w}x{h}: {card:#?}"
+        );
+        assert!(
+            card.iter().any(|r| r.starts_with("msgs")),
+            "{w}x{h}: {card:#?}"
+        );
+        assert_eq!(
+            card.iter().any(|r| r.contains("cache hit")),
+            badge,
+            "{w}x{h}: {card:#?}"
+        );
+    }
 }
 
 // ── tps: the daily trend card's speed strip ──────────────────────────────

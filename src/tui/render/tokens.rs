@@ -1003,8 +1003,14 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Total stays the lifetime anchor in every period — the scoped window
     // already owns the first card.
     if on_screen(r.total) {
-        let (total_body, total_meta) =
-            total_lines(stats, &speed_days, inner_w(d.total), count_cache, prices);
+        let (total_body, total_meta) = total_lines(
+            stats,
+            &speed_days,
+            inner_w(d.total),
+            inner_h(d.total),
+            count_cache,
+            prices,
+        );
         card(
             frame,
             d.total,
@@ -1328,11 +1334,14 @@ fn today_speed_line(app: &App, today: Option<crate::tps::DaySum>) -> Line<'stati
 
 /// The lifetime TOTAL card: kv rows grouped on the left (the old right-edge
 /// `msgs`/date scatter read as fragments on wide cards), lifetime date range
-/// as the returned title-right meta.
+/// as the returned title-right meta. `h` is the card's inner rows: the
+/// `cache hit` badge takes its own line only when the rows built here plus one
+/// still fit in it.
 fn total_lines(
     stats: &TokenStats,
     speed_days: &std::collections::BTreeMap<String, crate::tps::DaySum>,
     w: usize,
+    h: usize,
     count_cache: bool,
     prices: Option<&PriceTable>,
 ) -> (Vec<Line<'static>>, Option<String>) {
@@ -1357,16 +1366,11 @@ fn total_lines(
             theme::accent().add_modifier(Modifier::BOLD),
         ),
     ];
-    let mut lines = Vec::new();
-    if span_w(&tokens_left) + cache_badge.width() < w {
-        lines.push(lr(tokens_left, vec![cache_badge], w));
-    } else {
-        // The badge drops to its own line rather than clipping its tail.
-        lines.push(Line::from(tokens_left));
-        lines.push(Line::from(vec![Span::raw("  "), cache_badge]));
-    }
-    lines.push(cost_line("cost", lifetime_cost(prices, &stats.models)));
-    lines.push(Line::from(vec![
+    // Every row after `tokens`, in render order, so the badge's own-line
+    // fallback measures the rows it would share the card with instead of
+    // counting them by hand.
+    let mut tail = vec![cost_line("cost", lifetime_cost(prices, &stats.models))];
+    tail.push(Line::from(vec![
         key("sessions"),
         Span::styled(
             group_thousands(stats.total_sessions as f64, 0),
@@ -1378,7 +1382,7 @@ fn total_lines(
             .values()
             .fold((0u64, 0u64), |(o, g), d| (o + d.output, g + d.gen_ms));
         let avg = crate::tui::app::day_average(crate::tps::DaySum { output, gen_ms });
-        lines.push(Line::from(vec![
+        tail.push(Line::from(vec![
             key("avg speed"),
             avg.map_or_else(
                 || Span::styled("—", theme::faint()),
@@ -1391,10 +1395,23 @@ fn total_lines(
             ),
         ]));
     }
-    lines.push(Line::from(vec![
+    tail.push(Line::from(vec![
         key("msgs"),
         Span::styled(fmt_count(stats.total_messages), theme::body()),
     ]));
+    let mut lines = Vec::new();
+    if span_w(&tokens_left) + cache_badge.width() < w {
+        lines.push(lr(tokens_left, vec![cache_badge], w));
+    } else {
+        lines.push(Line::from(tokens_left));
+        // The card clips any row past its inner height, so the badge takes its
+        // own line only when the rows sharing the card leave one free;
+        // otherwise it sheds.
+        if lines.len() + 1 + tail.len() <= h {
+            lines.push(Line::from(vec![Span::raw("  "), cache_badge]));
+        }
+    }
+    lines.extend(tail);
     let meta = match (stats.first_session_date.as_deref(), last) {
         (Some(first), Some(latest)) => {
             Some(format!("{} → {}", short_date(first), short_date(latest)))
