@@ -49109,8 +49109,8 @@ fn a_q_q_at_the_top_level_during_the_exit_wait_exits_at_once() {
     );
 }
 
-/// Every key but the quit keys is ignored during the exit wait: a jump and a
-/// help press reach no handler.
+/// Every key but the quit keys does nothing but disarm during the exit wait: a
+/// jump and a help press reach no handler.
 #[cfg(unix)]
 #[test]
 fn keys_during_the_exit_wait_are_ignored() {
@@ -49135,6 +49135,196 @@ fn keys_during_the_exit_wait_are_ignored() {
         after_tab == tab && modals == 0,
         "a key reached its handler during the exit wait: tab {tab:?} -> {after_tab:?}, modals={modals}"
     );
+}
+
+/// During the exit wait every key but the quit keys still does nothing of its
+/// own, yet any key disarms an armed quit, `x` included, as it does everywhere:
+/// a first `⌃c` then `x` leaves no arm, so the next `⌃c` only arms again; a
+/// top-level `q` arm ends on `↓` the same way.
+#[cfg(unix)]
+#[test]
+fn any_key_during_the_exit_wait_disarms_an_armed_quit() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_remove_save(&mut rig);
+    rig.app.services.focus = super::ServicesFocus::List;
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        rig.app.exit_wait && !rig.app.quit,
+        "precondition: the exit waits"
+    );
+
+    super::handle_key(&mut rig.app, ctrl_c());
+    let armed = rig.app.armed_quit;
+    super::handle_key(&mut rig.app, key(KeyCode::Char('x')));
+    let after_x = rig.app.armed_quit;
+    super::handle_key(&mut rig.app, ctrl_c());
+    let quit_after_rearm = rig.app.quit;
+    let rearmed = rig.app.armed_quit;
+
+    super::handle_key(&mut rig.app, key(KeyCode::Down));
+    super::handle_key(&mut rig.app, key(KeyCode::Char('q')));
+    let q_armed = rig.app.armed_quit;
+    super::handle_key(&mut rig.app, key(KeyCode::Down));
+    let after_down = rig.app.armed_quit;
+    let still_waiting = rig.app.exit_wait && !rig.app.quit;
+    rig.drain();
+
+    assert_eq!(armed, Some(super::QuitKey::CtrlC), "precondition: ⌃c armed");
+    assert_eq!(
+        after_x, None,
+        "x left the ⌃c arm standing during the exit wait"
+    );
+    assert!(
+        !quit_after_rearm && rearmed == Some(super::QuitKey::CtrlC),
+        "the ⌃c after x completed a quit instead of arming: quit={quit_after_rearm} armed={rearmed:?}"
+    );
+    assert_eq!(q_armed, Some(super::QuitKey::Q), "precondition: q armed");
+    assert_eq!(
+        after_down, None,
+        "↓ left the q arm standing during the exit wait"
+    );
+    assert!(still_waiting, "a disarming key exited or ended the wait");
+}
+
+/// A `q` is a quit key during the exit wait only where it would read the quit
+/// arm (top level, nothing claiming it): under an open help modal it does
+/// nothing but disarm, so the modal stays open, as it does for `esc`.
+#[cfg(unix)]
+#[test]
+fn a_q_under_a_modal_during_the_exit_wait_only_disarms() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_remove_save(&mut rig);
+    rig.app.services.focus = super::ServicesFocus::List;
+    super::handle_key(&mut rig.app, key(KeyCode::Char('?')));
+    let help_open = matches!(rig.app.modals.as_slice(), [super::Modal::Help]);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    let waiting = rig.app.exit_wait && !rig.app.quit;
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, key(KeyCode::Char('q')));
+    let after_q = rig.app.modals.len();
+    let armed_after_q = rig.app.armed_quit;
+    let still_waiting = rig.app.exit_wait && !rig.app.quit;
+    rig.drain();
+
+    assert!(help_open, "precondition: help opened");
+    assert!(waiting, "precondition: the exit waits under the help modal");
+    assert_eq!(
+        after_q, 1,
+        "a q under the help modal closed it during the exit wait"
+    );
+    assert_eq!(armed_after_q, None, "the q left the ⌃c arm standing");
+    assert!(still_waiting, "the q exited or ended the wait");
+}
+
+/// A `q` during an in-flight login only disarms: the login's own `q` cancels
+/// it, so during the exit wait the login stays up and no `login canceled` toast
+/// is raised, while the `⌃c` arm goes.
+#[cfg(unix)]
+#[test]
+fn a_q_during_a_login_during_the_exit_wait_only_disarms() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_remove_save(&mut rig);
+    rig.app.services.focus = super::ServicesFocus::List;
+    rig.app.login = Some(login_session("acct", false, 1));
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    let waiting = rig.app.exit_wait && !rig.app.quit;
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, key(KeyCode::Char('q')));
+    let login_open = rig.app.login.is_some();
+    let armed_after_q = rig.app.armed_quit;
+    let toasted = rig.app.toasts.iter().any(|t| t.body == "login canceled");
+    let still_waiting = rig.app.exit_wait && !rig.app.quit;
+    rig.drain();
+
+    assert!(waiting, "precondition: the exit waits");
+    assert!(login_open, "a q canceled the login during the exit wait");
+    assert!(
+        !toasted,
+        "a q raised the login-canceled toast during the exit wait"
+    );
+    assert_eq!(armed_after_q, None, "the q left the ⌃c arm standing");
+    assert!(still_waiting, "the q exited or ended the wait");
+}
+
+/// The codex twin: a `q` during an in-flight codex login (its modal collapsed)
+/// only disarms during the exit wait; the login's own `q` would cancel it.
+#[cfg(unix)]
+#[test]
+fn a_q_during_a_codex_login_during_the_exit_wait_only_disarms() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_remove_save(&mut rig);
+    rig.app.services.focus = super::ServicesFocus::List;
+    rig.app.codex_login = Some(super::CodexLoginSession {
+        name: "cdx-one".to_string(),
+        generation: 1,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: false,
+    });
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    let waiting = rig.app.exit_wait && !rig.app.quit;
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, key(KeyCode::Char('q')));
+    let login_open = rig.app.codex_login.is_some();
+    let armed_after_q = rig.app.armed_quit;
+    let still_waiting = rig.app.exit_wait && !rig.app.quit;
+    rig.drain();
+
+    assert!(waiting, "precondition: the exit waits");
+    assert!(
+        login_open,
+        "a q canceled the codex login during the exit wait"
+    );
+    assert_eq!(armed_after_q, None, "the q left the ⌃c arm standing");
+    assert!(still_waiting, "the q exited or ended the wait");
+}
+
+/// A `q` typed into an open Config field at the list focus only disarms: the
+/// field's own handler would take it as data, so during the exit wait the draft
+/// keeps its opened value.
+#[cfg(unix)]
+#[test]
+fn a_q_in_an_open_config_field_during_the_exit_wait_only_disarms() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_remove_save(&mut rig);
+    rig.app.tab = super::Tab::Config;
+    rig.app.refresh_interval_draft = Some(SeededInput::new("30"));
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    let waiting = rig.app.exit_wait && !rig.app.quit;
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, key(KeyCode::Char('q')));
+    let typed = rig
+        .app
+        .refresh_interval_draft
+        .as_ref()
+        .map(|draft| draft.input.value.clone());
+    let armed_after_q = rig.app.armed_quit;
+    let still_waiting = rig.app.exit_wait && !rig.app.quit;
+    rig.drain();
+
+    assert!(waiting, "precondition: the exit waits");
+    assert_eq!(
+        typed.as_deref(),
+        Some("30"),
+        "a q typed into the open Config field during the exit wait"
+    );
+    assert_eq!(armed_after_q, None, "the q left the ⌃c arm standing");
+    assert!(still_waiting, "the q exited or ended the wait");
 }
 
 /// A first `⌃c` of a second pair during the exit wait arms the quit and stores

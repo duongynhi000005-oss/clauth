@@ -8048,13 +8048,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // The quit is decided and the exit waits for the running shunt-card writes:
-    // only `⌃c` and a top-level `q` get past here, everything else is ignored —
-    // an edit typed now would die with the exit.
-    if app.exit_wait && !(matches!(key.code, KeyCode::Char('q')) && !has_sub_focus(app)) {
-        return;
-    }
-
     let owner = keyboard_owner(app);
 
     // Every key but a top-level `q` (which reads the arm below) disarms the
@@ -8068,6 +8061,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 && app.login.is_none()
                 && app.codex_login.is_none()
     );
+
+    // The quit is decided and the exit waits for the running shunt-card writes:
+    // only a top-level `q` gets past here (`⌃c` is handled above), everything
+    // else only disarms an armed quit — an edit typed now would die with the exit.
+    if app.exit_wait && !(reads_arm && !has_sub_focus(app)) {
+        app.disarm_quit();
+        return;
+    }
     if !reads_arm {
         app.disarm_quit();
     }
