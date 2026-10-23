@@ -7,18 +7,31 @@
 //! flock never sees (the session is orphaned: `starting…`, no pid). The job
 //! record is Claude Code's own statement that a session uses a config dir.
 //!
-//! One read yields the tree and settings-file name sets. The spare term
+//! One read walks the global `~/.claude/jobs` store and, beside it, each
+//! runtime tree's own `jobs/` dir where that store is authoritative — a copy
+//! host keeps the record inside the tree (its mirror never carries `jobs/`),
+//! and an isolated tree links no `jobs/` so its store is tree-local too; a
+//! symlinked `jobs/` is the global store already read and is never followed. A
+//! tree-local record names only its own tree, so a record naming a different
+//! tree is a stale copy — a copy-host mirror's leftover — and is skipped. One
+//! read yields the tree and settings-file name sets. The spare term
 //! ([`JobTrees::spares`] / [`JobTrees::spares_under`], GC and the destructive
 //! gates) counts a job as live while its job dir exists (until `claude rm`),
 //! whatever its `state`: a finished job may be revived (`claude attach`) and
-//! the cost of sparing its tree is disk. The settings term
-//! ([`JobTrees::spares_settings`]) spares a spawn-settings file a job's
-//! `respawnFlags` name. The rotation term ([`JobTrees::unfinished_under`])
-//! counts only UNFINISHED jobs: a `stopped`/`done`/`failed` job must not freeze
-//! the chain, and only `state` can say "finished" — `firstTerminalAt` cannot (a
-//! revived `running` job keeps the stamp).
+//! the cost of sparing its tree is disk — except in an ISOLATED tree, which no
+//! session can re-enter, where only an UNFINISHED job spares. A record-less job
+//! dir that is a removed job's leftover — an empty `tmp/` and/or an
+//! `exit-cause` file — reads as no job; every other record-less dir stays
+//! unreadable and spares, so a job caught mid-create never reads as collected.
+//! The settings term ([`JobTrees::spares_settings`]) spares a spawn-settings
+//! file a job's `respawnFlags` name. The rotation term
+//! ([`JobTrees::unfinished_under`]) counts only UNFINISHED jobs: a
+//! `stopped`/`done`/`failed` job must not freeze the chain, and only `state`
+//! can say "finished" — `firstTerminalAt` cannot (a revived `running` job keeps
+//! the stamp). A global-store failure is global; a tree-local or profile-dir
+//! failure is SCOPED to that account's trees.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -101,13 +114,18 @@ struct ProviderEnv {
 /// The name sets one readable job-store walk yields. The fields are private
 /// behind the query methods: `unfinished ⊆ named` must hold, and a caller
 /// reading one set directly could break it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct NamedTrees {
     /// Canonical identities of every config dir a live job names, whatever its
     /// `state`. Empty when no job names a tree (or no job exists). A job
     /// naming a dir that no longer resolves contributes nothing: its tree is
     /// already gone.
     named: HashSet<PathBuf>,
+    /// Canonical tree id -> the job ids (job dir names) whose record names that
+    /// tree, from the global store or a tree-local one. Two jobs can name one
+    /// tree, so the set — not the tree's presence in `named` — says when the
+    /// jobs naming a tree changed.
+    named_by_job: HashMap<PathBuf, HashSet<String>>,
     /// Canonical identities of every config dir an UNFINISHED job names — a
     /// subset of `named` (an unfinished job is also live for the spare term).
     unfinished: HashSet<PathBuf>,
@@ -118,24 +136,45 @@ pub(crate) struct NamedTrees {
     /// not a list of strings, so no settings file is recoverable from them and
     /// the caller falls back to the tree rule.
     unknown_flags_trees: HashSet<PathBuf>,
+    /// Scoped fail-closed: every dir (a runtime tree, or a profile dir) whose
+    /// OWN job store could not be read. Only trees under one of these read as
+    /// unreadable — a global store failure is the separate
+    /// [`JobTrees::Unreadable`] arm.
+    unreadable: Vec<UnreadableStore>,
+}
+
+/// One scoped unreadable: the canonical identity a spare/block query matches
+/// against, and the store dir to name in the rotation refusal's `{path}`.
+#[derive(Debug)]
+struct UnreadableStore {
+    /// Canonical identity of the tree or profile dir whose store failed.
+    scope: PathBuf,
+    /// The store dir the operator can act on (the tree's `jobs/`, or the
+    /// profile dir).
+    store: PathBuf,
 }
 
 /// The answer to "which runtime trees and settings files must a sweep or gate
 /// spare?".
 #[derive(Debug)]
 pub(crate) enum JobTrees {
-    /// A readable store, as [`NamedTrees`].
-    Named(NamedTrees),
+    /// A readable store, as [`NamedTrees`]. Boxed: `NamedTrees` dwarfs the
+    /// `Unreadable` arm (clippy::large_enum_variant).
+    Named(Box<NamedTrees>),
     /// The store could not be trusted — a job dir's `state.json` was missing,
     /// unreadable, or unparseable, or a named config dir could not be
-    /// canonicalized while it might still exist. Carries the offending dir for
-    /// a log line that never carries the record's contents.
-    Unreadable(PathBuf),
+    /// canonicalized while it might still exist. `offending` is the deep dir a
+    /// log line names (never the record's contents); `store` is the store dir
+    /// the rotation refusal names (the conventional global store, or the tree's
+    /// `jobs/`).
+    Unreadable { offending: PathBuf, store: PathBuf },
 }
 
 impl JobTrees {
-    /// Whether `tree` must be spared: a live job names it, or the store was
-    /// unreadable (fail closed, the direction `is_session_alive` takes).
+    /// Whether `tree` must be spared: a live job names it, the store was
+    /// unreadable (fail closed, the direction `is_session_alive` takes), or a
+    /// scoped unreadable covers the tree (its own store, or its profile dir,
+    /// could not be read).
     ///
     /// `tree` is canonicalized here so it and the named set share one spelling
     /// ([`crate::canonical::identity`], the compare-or-key purpose). A
@@ -144,18 +183,82 @@ impl JobTrees {
     /// dir. Any other canonicalize failure reads as named.
     pub(crate) fn spares(&self, tree: &Path) -> bool {
         match self {
-            JobTrees::Unreadable(_) => true,
-            JobTrees::Named(sets) if sets.named.is_empty() => false,
+            JobTrees::Unreadable { .. } => true,
+            JobTrees::Named(sets) if sets.named.is_empty() && sets.unreadable.is_empty() => false,
+            JobTrees::Named(sets) => named_or_affected(tree, &sets.named, &sets.unreadable),
+        }
+    }
+
+    /// Whether a live job NAMES `tree` (the named set holds its canonical
+    /// identity), distinct from [`JobTrees::spares`], which also spares a tree
+    /// covered by a scoped unreadable. The GC per-pair spare log uses this so a
+    /// scoped-unreadable spare never claims a job names the tree.
+    pub(crate) fn names(&self, tree: &Path) -> bool {
+        match self {
+            JobTrees::Unreadable { .. } => false,
+            JobTrees::Named(sets) => {
+                if sets.named.is_empty() {
+                    return false;
+                }
+                match crate::canonical::identity(tree) {
+                    Ok(id) => sets.named.contains(&id),
+                    Err(_) => false,
+                }
+            }
+        }
+    }
+
+    /// The set of job ids whose record names `tree`, from any store that names
+    /// it (the global store or the tree's own `jobs/`). Empty when no job names
+    /// it or the store is unreadable. Distinct from [`JobTrees::names`]: two
+    /// jobs can name one tree, and the daemon's copy-host gate re-arms its one
+    /// re-check when THIS set changes (a new job beside an older one), not only
+    /// when it empties.
+    pub(crate) fn job_ids_naming(&self, tree: &Path) -> HashSet<String> {
+        match self {
+            JobTrees::Unreadable { .. } => HashSet::new(),
             JobTrees::Named(sets) => match crate::canonical::identity(tree) {
-                Ok(id) => sets.named.contains(&id),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-                Err(_) => true,
+                Ok(id) => sets.named_by_job.get(&id).cloned().unwrap_or_default(),
+                Err(_) => HashSet::new(),
             },
         }
     }
 
-    /// Whether a live job names a tree UNDER `dir`, or the store is unreadable
-    /// (fail closed). Used by [`crate::runtime::has_live_session`]: a job
+    /// Whether a scoped unreadable is `profile` itself — the account's profile
+    /// dir could not be enumerated. The daemon skips such an account: the
+    /// adoption build reads its config and probes its link mode under that
+    /// dir, so queueing it would start a failing backoff streak that re-takes
+    /// the locks every interval. A tree-local store failure (a scope UNDER the
+    /// profile) does not count: adoption never reads a tree's own `jobs/`.
+    pub(crate) fn profile_dir_unreadable(&self, profile: &Path) -> bool {
+        match self {
+            JobTrees::Unreadable { .. } => true,
+            JobTrees::Named(sets) => {
+                if sets.unreadable.is_empty() {
+                    return false;
+                }
+                match crate::canonical::identity(profile) {
+                    Ok(id) => sets.unreadable.iter().any(|u| u.scope == id),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                    Err(_) => true,
+                }
+            }
+        }
+    }
+
+    /// The store dir every scoped unreadable names, for the sweep-level GC log:
+    /// one entry per scoped unreadable, once per sweep, empty under a global
+    /// [`JobTrees::Unreadable`] (the global line already covers that).
+    pub(crate) fn scoped_unreadable_stores(&self) -> Vec<&Path> {
+        match self {
+            JobTrees::Unreadable { .. } => Vec::new(),
+            JobTrees::Named(sets) => sets.unreadable.iter().map(|u| u.store.as_path()).collect(),
+        }
+    }
+
+    /// Whether a live job names a tree UNDER `dir`, the store is unreadable, or
+    /// a scoped unreadable covers `dir` (its own profile dir, or a tree-local
+    /// store under it). Used by [`crate::runtime::has_live_session`]: a job
     /// naming any tree under a profile's dir is a live session for every gate
     /// that carries (delete, disable, rename), since the marker flock never
     /// sees the `claude --bg` session still reading its config dir. The macOS
@@ -163,61 +266,108 @@ impl JobTrees {
     /// instead.
     pub(crate) fn spares_under(&self, dir: &Path) -> bool {
         match self {
-            JobTrees::Unreadable(_) => true,
-            JobTrees::Named(sets) => named_under(&sets.named, dir),
+            JobTrees::Unreadable { .. } => true,
+            JobTrees::Named(sets) => {
+                named_under(&sets.named, dir) || unreadable_under(dir, &sets.unreadable)
+            }
         }
     }
 
-    /// Whether `file` must be spared: a job's `respawnFlags` name it, or a job
+    /// Whether `file` must be spared: a job's `respawnFlags` name it, a job
     /// whose flags are unreadable names one of `own_trees` (the tree rule's
-    /// fallback), or the store was unreadable (fail closed). `file` and each
-    /// own tree are canonicalized like the tree set. The fallback is loose by
-    /// design: when `own_trees` holds both layouts of a shared file, a job
-    /// naming the bare fake `runtime` spares the Real-mode file beside it too.
+    /// fallback), the store was unreadable (fail closed), or a scoped
+    /// unreadable covers one of `own_trees`. `file` and each own tree are
+    /// canonicalized like the tree set. The fallback is loose by design: when
+    /// `own_trees` holds both layouts of a shared file, a job naming the bare
+    /// fake `runtime` spares the Real-mode file beside it too.
     pub(crate) fn spares_settings(&self, file: &Path, own_trees: &[PathBuf]) -> bool {
         match self {
-            JobTrees::Unreadable(_) => true,
+            JobTrees::Unreadable { .. } => true,
             JobTrees::Named(sets) => {
-                if sets.named_settings.is_empty() && sets.unknown_flags_trees.is_empty() {
+                if sets.named_settings.is_empty()
+                    && sets.unknown_flags_trees.is_empty()
+                    && sets.unreadable.is_empty()
+                {
                     return false;
                 }
                 holds_canonical(&sets.named_settings, file)
                     || own_trees
                         .iter()
                         .any(|tree| holds_canonical(&sets.unknown_flags_trees, tree))
+                    || own_trees
+                        .iter()
+                        .any(|tree| named_or_affected(tree, &HashSet::new(), &sets.unreadable))
             }
         }
     }
 
     /// The canonical tree paths every UNFINISHED job names UNDER `dir`, so the
     /// rotation gate can read each tree's `.credentials.json` and apply the
-    /// same holds-a-refresh-token narrowing the marker term gets. `None` when
-    /// the store is unreadable (fail closed: the caller blocks). A finished job
+    /// same holds-a-refresh-token narrowing the marker term gets. `Err(store)`
+    /// when the store (or a scoped store under `dir`) is unreadable — fail
+    /// closed: the caller blocks and names the store. A finished job
     /// (`stopped`/`done`/`failed`) is not mid-task, so it names nothing here;
     /// an unknown or missing `state` reads unfinished by construction.
     ///
     /// `dir` is canonicalized so it and the set share one spelling; a
     /// `NotFound` canonicalize — the dir is already gone — reads as empty, and
     /// any other failure reads as unreadable, like [`JobTrees::spares`].
-    pub(crate) fn unfinished_under(&self, dir: &Path) -> Option<Vec<PathBuf>> {
+    pub(crate) fn unfinished_under(&self, dir: &Path) -> Result<Vec<PathBuf>, PathBuf> {
         match self {
-            JobTrees::Unreadable(_) => None,
-            JobTrees::Named(sets) if sets.unfinished.is_empty() => Some(Vec::new()),
+            JobTrees::Unreadable { store, .. } => Err(store.clone()),
             JobTrees::Named(sets) => {
                 let dir_id = match crate::canonical::identity(dir) {
                     Ok(id) => id,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(Vec::new()),
-                    Err(_) => return None,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                    Err(_) => return Err(dir.to_path_buf()),
                 };
-                Some(
-                    sets.unfinished
-                        .iter()
-                        .filter(|named| named.starts_with(&dir_id))
-                        .cloned()
-                        .collect(),
-                )
+                if let Some(unreadable) = sets
+                    .unreadable
+                    .iter()
+                    .find(|u| u.scope == dir_id || u.scope.starts_with(&dir_id))
+                {
+                    return Err(unreadable.store.clone());
+                }
+                Ok(sets
+                    .unfinished
+                    .iter()
+                    .filter(|named| named.starts_with(&dir_id))
+                    .cloned()
+                    .collect())
             }
         }
+    }
+}
+
+/// Whether `path`'s canonical identity is named OR lies under a scoped
+/// unreadable. A `NotFound` canonicalize — the path is already gone — reads as
+/// not spared, any other failure as spared (fail closed).
+fn named_or_affected(
+    path: &Path,
+    named: &HashSet<PathBuf>,
+    unreadable: &[UnreadableStore],
+) -> bool {
+    match crate::canonical::identity(path) {
+        Ok(id) => {
+            named.contains(&id)
+                || unreadable
+                    .iter()
+                    .any(|u| id == u.scope || id.starts_with(&u.scope))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// Whether `dir`'s canonical identity IS a scoped unreadable, or has one under
+/// it (a tree-local store in this account failed).
+fn unreadable_under(dir: &Path, unreadable: &[UnreadableStore]) -> bool {
+    match crate::canonical::identity(dir) {
+        Ok(dir_id) => unreadable
+            .iter()
+            .any(|u| u.scope == dir_id || u.scope.starts_with(&dir_id)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => true,
     }
 }
 
@@ -310,49 +460,158 @@ impl<'de> serde::de::Visitor<'de> for RespawnFlagsVisitor {
     }
 }
 
-/// Read Claude Code's job store once. Every entry that is a DIRECTORY is a job
-/// (plain files like `pins.json` are not); a missing `~/.claude/jobs` dir reads
-/// as no jobs. Any job dir whose `state.json` is missing, unreadable, or
-/// unparseable makes the whole store unreadable, so the caller spares every
-/// tree rather than trusting a torn read.
+/// Read Claude Code's job stores once: the global `~/.claude/jobs` and, beside
+/// it, each runtime tree's own `jobs/` dir where that store is authoritative —
+/// a REAL directory in an ISOLATED tree (which never links the store) or in a
+/// SHARED tree (a linked-host shared tree's `jobs` is a symlink, already read
+/// above, so a real dir there was written by Claude Code itself). A tree-local
+/// record names only its own tree — Claude Code writes `CLAUDE_CONFIG_DIR` =
+/// the tree — so a record naming a different tree is a stale copy and is
+/// skipped.
+///
+/// Every entry that is a DIRECTORY is a job (plain files like `pins.json` are
+/// not); a missing store dir reads as no jobs. A global-store failure makes the
+/// whole read unreadable; a tree-local or profile-dir failure is SCOPED to that
+/// dir's trees. Any job dir whose `state.json` is missing, unreadable, or
+/// unparseable makes its STORE unreadable — EXCEPT a missing record whose dir
+/// is a removed job's leftover ([`removed_jobs_leftover`]), which reads as no
+/// job.
 pub(crate) fn job_trees() -> JobTrees {
     #[cfg(test)]
     JOB_TREES_READS.with(|c| c.set(c.get() + 1));
+    let mut sets = NamedTrees {
+        named: HashSet::new(),
+        named_by_job: HashMap::new(),
+        unfinished: HashSet::new(),
+        named_settings: HashSet::new(),
+        unknown_flags_trees: HashSet::new(),
+        unreadable: Vec::new(),
+    };
+
     let jobs_dir = match claude_dir() {
         Ok(dir) => dir.join("jobs"),
         // Fail closed: a store this reader cannot even locate must spare, never
         // collect. `claude_dir` fails only when `home_dir` fails (no home), so
         // there is no real path to name — log the conventional location rather
         // than an empty path.
-        Err(_) => return JobTrees::Unreadable(PathBuf::from("~/.claude/jobs")),
-    };
-    let entries = match std::fs::read_dir(&jobs_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return JobTrees::Named(NamedTrees::default());
+        Err(_) => {
+            return JobTrees::Unreadable {
+                offending: PathBuf::from("~/.claude/jobs"),
+                store: PathBuf::from("~/.claude/jobs"),
+            };
         }
-        Err(_) => return JobTrees::Unreadable(jobs_dir),
     };
-    let mut named = HashSet::new();
-    let mut unfinished = HashSet::new();
-    let mut named_settings = HashSet::new();
-    let mut unknown_flags_trees = HashSet::new();
+    // The global store is authoritative for every account, so a failure here
+    // stays global and the refusal names the conventional store location.
+    if let Err(offending) = read_jobs_dir(&jobs_dir, None, false, &mut sets) {
+        return JobTrees::Unreadable {
+            offending,
+            store: PathBuf::from("~/.claude/jobs"),
+        };
+    }
+
+    let runtime_trees = match crate::runtime::runtime_trees() {
+        Ok(trees) => trees,
+        // A `profiles/` root this walk cannot enumerate means no tree's store
+        // can be seen: global.
+        Err(dir) => {
+            return JobTrees::Unreadable {
+                offending: dir.clone(),
+                store: dir,
+            };
+        }
+    };
+    for profile in runtime_trees.unreadable_profiles {
+        record_unreadable(&mut sets.unreadable, &profile, &profile);
+    }
+    for tree in runtime_trees.trees {
+        let jobs = tree.join("jobs");
+        match std::fs::symlink_metadata(&jobs) {
+            // A symlinked `jobs` IS the global store (the SHARED link on a
+            // linked host), already read above; following it would read every
+            // record twice.
+            Ok(meta) if meta.file_type().is_symlink() => {}
+            Ok(meta) if meta.file_type().is_dir() => {
+                let isolated = tree
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| !crate::runtime::is_shared_runtime_dir_name(name));
+                let owner = match crate::canonical::identity(&tree) {
+                    Ok(id) => id,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => tree.clone(),
+                };
+                if read_jobs_dir(&jobs, Some(&owner), isolated, &mut sets).is_err() {
+                    record_unreadable(&mut sets.unreadable, &tree, &jobs);
+                }
+            }
+            Ok(_) => record_unreadable(&mut sets.unreadable, &tree, &jobs),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => record_unreadable(&mut sets.unreadable, &tree, &jobs),
+        }
+    }
+
+    JobTrees::Named(Box::new(sets))
+}
+
+/// Push one scoped unreadable: `scope` (a tree or profile dir) is canonicalized
+/// for the spare/block matches, and `store` is the dir the refusal names.
+fn record_unreadable(unreadable: &mut Vec<UnreadableStore>, scope: &Path, store: &Path) {
+    let scope = match crate::canonical::identity(scope) {
+        Ok(id) => id,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(_) => scope.to_path_buf(),
+    };
+    unreadable.push(UnreadableStore {
+        scope,
+        store: store.to_path_buf(),
+    });
+}
+
+/// Read one job-store dir into the sets. `owner` is `Some(canonical tree id)`
+/// for a tree-local store and `None` for the global store: a tree-local record
+/// naming a DIFFERENT tree is a stale copy (a copy-host mirror's leftover) and
+/// is skipped. `isolated`
+/// keeps only UNFINISHED jobs — a finished job in an isolated tree (which no
+/// session can re-enter) spares nothing and blocks nothing. A missing dir reads
+/// as no jobs; any other failure returns the offending dir, which the caller
+/// maps to a global or scoped unreadable. The record rules are [`job_trees`]'s:
+/// a plain file is no job, a job naming no config dir contributes nothing, and
+/// a record-less dir is either a removed job's leftover (no job) or unreadable.
+fn read_jobs_dir(
+    jobs_dir: &Path,
+    owner: Option<&Path>,
+    isolated: bool,
+    sets: &mut NamedTrees,
+) -> Result<(), PathBuf> {
+    let entries = match std::fs::read_dir(jobs_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(jobs_dir.to_path_buf()),
+    };
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => return JobTrees::Unreadable(jobs_dir),
-        };
+        let entry = entry.map_err(|_| jobs_dir.to_path_buf())?;
         let job_dir = entry.path();
-        let is_dir = match entry.file_type() {
-            Ok(file_type) => file_type.is_dir(),
-            Err(_) => return JobTrees::Unreadable(job_dir),
-        };
+        let is_dir = entry.file_type().map_err(|_| job_dir.clone())?.is_dir();
         if !is_dir {
             continue;
         }
         let record = match std::fs::read(job_dir.join("state.json")) {
             Ok(bytes) => bytes,
-            Err(_) => return JobTrees::Unreadable(job_dir),
+            // `claude rm` CAN leave the supervisor running — measured with a
+            // second tree's supervisor sharing the roster — and that supervisor
+            // recreates the job dir with no record — an empty `tmp/`, then
+            // `exit-cause` once signalled. A lone bare job's supervisor exits
+            // instead. A creation never makes those shapes (`tmp/` follows
+            // `state.json`), so the leftover reads as no job; every other
+            // record-less dir stays unreadable (fail closed).
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                match removed_jobs_leftover(&job_dir) {
+                    Ok(true) => continue,
+                    Ok(false) | Err(_) => return Err(job_dir.clone()),
+                }
+            }
+            Err(_) => return Err(job_dir.clone()),
         };
         let state: JobState = match serde_json::from_slice(&record) {
             Ok(state) => state,
@@ -366,54 +625,93 @@ pub(crate) fn job_trees() -> JobTrees {
                     state: core.state,
                     respawn_flags: RespawnFlags::Unknown,
                 },
-                Err(_) => return JobTrees::Unreadable(job_dir),
+                Err(_) => return Err(job_dir.clone()),
             },
         };
         let Some(config_dir) = state.provider_env.and_then(|env| env.claude_config_dir) else {
             // A plain `claude --bg` on `~/.claude` names nothing.
             continue;
         };
-        match crate::canonical::identity(&config_dir) {
-            Ok(tree_id) => {
-                let finished = FINISHED_STATES.contains(&state.state.as_str());
-                named.insert(tree_id.clone());
-                if !finished {
-                    unfinished.insert(tree_id.clone());
-                }
-                match state.respawn_flags {
-                    RespawnFlags::Absent => {}
-                    RespawnFlags::Named(values) => {
-                        for value in values {
-                            // Inline JSON names no file; a value that cannot
-                            // resolve as a path scopes the fallback to this
-                            // job's own tree, never the whole store.
-                            if crate::cc_exempt::is_inline_settings(&value) {
-                                continue;
-                            }
-                            match crate::canonical::identity(&value) {
-                                Ok(settings_id) => {
-                                    named_settings.insert(settings_id);
-                                }
-                                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                                Err(_) => {
-                                    unknown_flags_trees.insert(tree_id.clone());
-                                }
-                            }
-                        }
+        let tree_id = match crate::canonical::identity(&config_dir) {
+            Ok(id) => id,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(job_dir.clone()),
+        };
+        // A tree-local record names only its own tree; anything else is a
+        // stale copy of the old global store.
+        if owner.is_some_and(|owner| tree_id.as_path() != owner) {
+            continue;
+        }
+        let finished = FINISHED_STATES.contains(&state.state.as_str());
+        if isolated && finished {
+            continue;
+        }
+        sets.named.insert(tree_id.clone());
+        if let Some(job_id) = job_dir.file_name().and_then(|name| name.to_str()) {
+            sets.named_by_job
+                .entry(tree_id.clone())
+                .or_default()
+                .insert(job_id.to_owned());
+        }
+        if !finished {
+            sets.unfinished.insert(tree_id.clone());
+        }
+        match state.respawn_flags {
+            RespawnFlags::Absent => {}
+            RespawnFlags::Named(values) => {
+                for value in values {
+                    // Inline JSON names no file; a value that cannot
+                    // resolve as a path scopes the fallback to this
+                    // job's own tree, never the whole store.
+                    if crate::cc_exempt::is_inline_settings(&value) {
+                        continue;
                     }
-                    RespawnFlags::Unknown => {
-                        unknown_flags_trees.insert(tree_id);
+                    match crate::canonical::identity(&value) {
+                        Ok(settings_id) => {
+                            sets.named_settings.insert(settings_id);
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(_) => {
+                            sets.unknown_flags_trees.insert(tree_id.clone());
+                        }
                     }
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => return JobTrees::Unreadable(job_dir),
+            RespawnFlags::Unknown => {
+                sets.unknown_flags_trees.insert(tree_id);
+            }
         }
     }
-    JobTrees::Named(NamedTrees {
-        named,
-        unfinished,
-        named_settings,
-        unknown_flags_trees,
-    })
+    Ok(())
+}
+
+/// Whether a record-less job dir is a removed job's leftover: its entries are a
+/// NON-EMPTY subset of {`tmp` = an empty directory, `exit-cause` = a regular
+/// file}. A creation never makes that shape — an empty dir and a
+/// `state.json.tmp.*` staged record are mid-create, and a `tmp/` holding
+/// anything is not the leftover — so only a supervisor that outlived `claude rm`
+/// does. A list that cannot be read is `Err`, which the caller reads as
+/// unreadable (fail closed).
+fn removed_jobs_leftover(job_dir: &Path) -> io::Result<bool> {
+    let mut seen = false;
+    for entry in std::fs::read_dir(job_dir)? {
+        let entry = entry?;
+        seen = true;
+        let name = entry.file_name();
+        if name == "tmp" {
+            if !entry.file_type()?.is_dir() {
+                return Ok(false);
+            }
+            if std::fs::read_dir(entry.path())?.next().is_some() {
+                return Ok(false);
+            }
+        } else if name == "exit-cause" {
+            if !entry.file_type()?.is_file() {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(seen)
 }

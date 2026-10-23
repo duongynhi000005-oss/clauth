@@ -8358,11 +8358,95 @@ fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
 #[test]
 fn rotate_all_detail_promises_what_the_host_actually_does() {
     let want = if cfg!(target_os = "macos") {
-        "accounts with a live clauth start session are skipped."
+        "accounts with a live clauth start or background session are skipped."
     } else {
         "running sessions pick up the new tokens on their next request."
     };
     assert_eq!(super::ROTATE_ALL_DETAIL, want);
+}
+
+/// The single-rotate refusal names WHICH cause blocks it: a launcher's own
+/// session, a background job, or a job store clauth cannot read. One suffix per
+/// cause, pinned by equality with the name fixed and driven through the same
+/// production message (the modal and the toast backstop share it).
+#[test]
+fn the_rotate_refusal_titles_name_their_cause() {
+    for (block, want) in [
+        (
+            crate::runtime::RotationBlock::LiveSession,
+            "'busy' has a live clauth start session",
+        ),
+        (
+            crate::runtime::RotationBlock::BackgroundJob,
+            "'busy' has a background session",
+        ),
+        (
+            crate::runtime::RotationBlock::UnreadableJobStore("~/.claude/jobs".into()),
+            "'busy' can't be checked for background sessions",
+        ),
+    ] {
+        assert_eq!(super::rotate_blocked_message("busy", block), want);
+    }
+}
+
+/// The action menu's modal and the run-time toast backstop both render the
+/// cause title, and the detail line does not change with it. Driven from a
+/// Linux host through the cause seam, since only `/usr/bin/security`'s absence
+/// keeps the production predicate false here.
+#[test]
+fn a_background_rotation_refusal_arms_the_cause_title_in_both_shapes() {
+    use super::{ConfirmAction, Modal, ToastKind, run_confirm_action};
+
+    // The action menu's acknowledge notice.
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::profile::Profile::new(
+        "busy".to_string(),
+        None,
+        None,
+    )]);
+    app.profile_cursor.set(0);
+    crate::runtime::set_rotation_block_override(Some(
+        crate::runtime::RotationBlock::UnreadableJobStore("~/.claude/jobs".into()),
+    ));
+    pick_menu_entry(&mut app, "rotate access token");
+    crate::runtime::set_rotation_block_override(None);
+    let confirm = app
+        .modals
+        .last()
+        .and_then(|m| match m {
+            Modal::Confirm(s) => Some(s),
+            _ => None,
+        })
+        .expect("a blocked rotate arms a modal");
+    assert!(matches!(confirm.on_confirm, ConfirmAction::Acknowledge));
+    assert_eq!(
+        confirm.message,
+        "'busy' can't be checked for background sessions"
+    );
+    assert_eq!(
+        confirm.detail.as_deref(),
+        Some(super::ROTATE_LIVE_SESSION_DETAIL)
+    );
+
+    // The backstop toast for a block that starts between arming and running.
+    let mut app = app_with(vec![crate::profile::Profile::new(
+        "busy".to_string(),
+        None,
+        None,
+    )]);
+    app.profile_cursor.set(0);
+    crate::runtime::set_rotation_block_override(Some(crate::runtime::RotationBlock::BackgroundJob));
+    run_confirm_action(&mut app, ConfirmAction::RotateOne("busy".to_string()));
+    crate::runtime::set_rotation_block_override(None);
+    let toast = app.toasts.back().expect("the refusal is surfaced");
+    assert_eq!(toast.kind, ToastKind::Warning);
+    assert_eq!(
+        toast.body,
+        format!(
+            "'busy' has a background session\n{}",
+            super::ROTATE_LIVE_SESSION_TOAST
+        )
+    );
 }
 
 /// The single-rotate refusal copy. These strings assert a MECHANISM (clauth
@@ -16285,6 +16369,8 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     };
     crate::live_sessions::register(&row).expect("register row");
     let _marker = crate::runtime::hold_session_row_marker(

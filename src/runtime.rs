@@ -172,6 +172,14 @@ const RUNTIME_STEM: &str = "runtime";
 const SESSIONS_STEM: &str = "sessions";
 const ISOLATED_RUNTIME_STEM: &str = "runtime-isolated";
 const ISOLATED_SESSIONS_STEM: &str = "sessions-isolated";
+
+/// The suffix naming the account's fixed BACKGROUND pair (`runtime-bg` +
+/// `sessions-bg`). Shared flavour on BOTH link modes, so it never meets fake
+/// mode's bare `runtime`; every holder enters the one pair and mints its own
+/// `<pid>-<seq>` marker in `sessions-bg`, so the wipe and teardown rules stay
+/// "no held marker and no job names the tree".
+const BACKGROUND_SUFFIX: &str = "-bg";
+
 /// A codex session home under `profiles/<name>/`. Deliberately OUTSIDE the
 /// `runtime*`/`sessions*` stems: the config reconcilers walk
 /// [`shared_runtime_dirs`] and would drop Claude Code's `settings.json` into
@@ -268,15 +276,19 @@ pub(crate) fn is_session_id(s: &str) -> bool {
     })
 }
 
-/// True when `name` is one of the four shapes clauth gives a paired dir with
-/// this stem: the legacy `<stem>` and `<stem>-isolated`, or the per-session
-/// `<stem>-<sid>` and `<stem>-isolated-<sid>`. The single parser behind every
-/// strict name check below, so the flavors and the two layouts cannot drift
-/// apart across them.
+/// True when `name` is one of the shapes clauth gives a paired dir with this
+/// stem: the legacy `<stem>` and `<stem>-isolated`, the per-session
+/// `<stem>-<sid>` and `<stem>-isolated-<sid>`, and the SHARED-flavour
+/// background `<stem>-bg`. The single parser behind every strict name check
+/// below, so the flavors and the three layouts cannot drift apart across them.
 fn is_paired_dir_name(name: &str, stem: &str) -> bool {
     let Some(rest) = name.strip_prefix(stem) else {
         return false;
     };
+    // `-bg` is a shared-flavour name alone: `runtime-isolated-bg` names nothing.
+    if rest == BACKGROUND_SUFFIX {
+        return true;
+    }
     let rest = rest.strip_prefix("-isolated").unwrap_or(rest);
     rest.is_empty() || rest.strip_prefix('-').is_some_and(is_session_id)
 }
@@ -324,10 +336,11 @@ fn is_rescuing_runtime_dir_name(name: &str) -> bool {
         .is_some_and(|base| base.starts_with(ISOLATED_RUNTIME_STEM) && is_runtime_dir_name(base))
 }
 
-/// True for a SHARED runtime dir name — a per-session `runtime-<sid>` or the
-/// legacy bare `runtime` — and false for the isolated flavor or any unrelated
-/// name. Callers that must reach only shared copies (both config reconcilers,
-/// `clauth which`) key on this rather than an exact name.
+/// True for a SHARED runtime dir name — a per-session `runtime-<sid>`, the
+/// legacy bare `runtime`, or the fixed background `runtime-bg` — and false for
+/// the isolated flavor or any unrelated name. Callers that must reach only
+/// shared copies (both config reconcilers, `clauth which`) key on this rather
+/// than an exact name.
 pub(crate) fn is_shared_runtime_dir_name(name: &str) -> bool {
     is_runtime_dir_name(name) && !name.starts_with(ISOLATED_RUNTIME_STEM)
 }
@@ -442,6 +455,79 @@ fn paired_dir_names(isolation: Isolation, session: &str, mode: LinkMode) -> (Str
     )
 }
 
+/// The account's fixed background pair, built from the shared stems so the
+/// pairing rule and the names cannot disagree.
+fn background_dir_names() -> (String, String) {
+    (
+        format!("{RUNTIME_STEM}{BACKGROUND_SUFFIX}"),
+        format!("{SESSIONS_STEM}{BACKGROUND_SUFFIX}"),
+    )
+}
+
+/// The `runtime-bg` tree under `name`'s profile dir — the one tree a Claude
+/// Code background job launched from this account names. A row-based call site
+/// asks this when the row is a background row instead of
+/// [`session_runtime_trees`], whose two arms are the per-session layouts.
+pub(crate) fn background_runtime_tree(name: &ProfileName) -> Result<PathBuf> {
+    let (runtime_name, _) = background_dir_names();
+    profile_subpath(name, &runtime_name)
+}
+
+/// Which holder is entering the fixed background pair. The row carries the
+/// difference: only the daemon's hold is exempt from the macOS rotation gate's
+/// marker term ([`live_session_holds_rotatable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackgroundHold {
+    /// A `clauth start <p> -- --bg` launcher, holding the tree only for its launch.
+    Launcher,
+    /// The daemon, holding it while a Claude Code job names it.
+    Daemon,
+}
+
+/// Which pair a [`ProfileRuntime`] occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionTree {
+    /// The pair [`paired_dir_names`] resolves, keyed by the session's own id.
+    PerSession,
+    /// The account's fixed background pair, shared flavour on both link modes.
+    Background(BackgroundHold),
+}
+
+impl SessionTree {
+    fn is_background(self) -> bool {
+        matches!(self, Self::Background(_))
+    }
+}
+
+/// The in-lock floor's refusal for a background tree on a copy host, typed so
+/// the daemon can tell a designed refusal from an ordinary adoption failure and
+/// re-queue the account at most once (one re-check, so a link-mode flip is
+/// adopted) instead of retrying on the backoff schedule.
+#[derive(Debug)]
+pub(crate) struct CopyHostBackgroundRefusal;
+
+impl std::fmt::Display for CopyHostBackgroundRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "cannot adopt a background tree on this host: it copies runtime trees \
+             instead of linking them",
+        )
+    }
+}
+
+impl std::error::Error for CopyHostBackgroundRefusal {}
+
+/// The approved copy-host background refusal, the flag echoed as typed. ONE
+/// source for both the `start::admit` arm and the in-lock `acquire_background`
+/// launcher arm, so the two sites cannot drift.
+pub(crate) fn copy_host_background_refusal(name: &str, flag: &str) -> String {
+    format!(
+        "'{name}': {flag} cannot run on this host, since it copies runtime trees \
+         instead of linking them and a background session would outlive the \
+         credentials clauth rotates (on Windows, turn on Developer Mode)"
+    )
+}
+
 /// Every path one session addresses, resolved as a unit once its [`LinkMode`] is
 /// known — the mode decides the dir names, so nothing here can be computed
 /// before the probe.
@@ -459,6 +545,23 @@ impl SessionPaths {
         mode: LinkMode,
     ) -> Result<Self> {
         let (runtime_name, sessions_name) = paired_dir_names(isolation, session.as_str(), mode);
+        Self::at(name, session, runtime_name, sessions_name)
+    }
+
+    /// The fixed background pair. Independent of `Isolation` and [`LinkMode`]
+    /// by design: the pair is shared-flavour on both, and the marker is still
+    /// this holder's own `<pid>-<seq>`.
+    fn resolve_background(name: &ProfileName, session: &SessionId) -> Result<Self> {
+        let (runtime_name, sessions_name) = background_dir_names();
+        Self::at(name, session, runtime_name, sessions_name)
+    }
+
+    fn at(
+        name: &ProfileName,
+        session: &SessionId,
+        runtime_name: String,
+        sessions_name: String,
+    ) -> Result<Self> {
         let sessions = profile_subpath(name, &sessions_name)?;
         let pid_file = sessions.join(session.as_str());
         Ok(Self {
@@ -469,7 +572,22 @@ impl SessionPaths {
     }
 }
 
-/// Both paths at which the session a registry row names could hold its liveness
+/// The paths a holder of `tree` addresses for `session`, chosen by
+/// [`SessionTree`] rather than by two call sites agreeing on it.
+fn resolve_tree(
+    name: &ProfileName,
+    isolation: Isolation,
+    tree: SessionTree,
+    session: &SessionId,
+    mode: LinkMode,
+) -> Result<SessionPaths> {
+    match tree {
+        SessionTree::PerSession => SessionPaths::resolve(name, isolation, session, mode),
+        SessionTree::Background(_) => SessionPaths::resolve_background(name, session),
+    }
+}
+
+/// Every path at which the session a registry row names could hold its liveness
 /// marker. The layout lives here so no other module rebuilds it —
 /// `crate::live_sessions` tests a row's liveness through this, and would go
 /// silently stale if it spelled the path itself.
@@ -478,16 +596,22 @@ impl SessionPaths {
 /// transport. The two layouts put the marker in different dirs for a SHARED
 /// session; an isolated session is keyed per session in both modes, so both
 /// arms collapse to one path. Both are derived from [`paired_dir_names`] and a
-/// caller treats the row as live if
-/// EITHER is held — the fail-safe direction, matching [`session_marker_dirs`]'s
-/// deliberately loose filter: a row reaped under a live session is a live
-/// session nothing can be pointed at again, while probing an absent path costs
-/// one `open` that fails.
+/// caller treats the row as live if EITHER is held — the fail-safe direction,
+/// matching [`session_marker_dirs`]'s deliberately loose filter: a row reaped
+/// under a live session is a live session nothing can be pointed at again,
+/// while probing an absent path costs one `open` that fails.
+///
+/// The background pair's marker dir is a third candidate unconditionally
+/// rather than behind a row flag: a background holder is a launcher, the daemon,
+/// or a reload of either, and a row read from an older clauth carries no flag to
+/// ask. A per-session row probing `sessions-bg/<sid>` is answered by an absent
+/// file (a session id never repeats across the two layouts), and a background
+/// row must be found there or GC reaps a live row.
 fn session_marker_paths(
     profile: &ProfileName,
     isolated: bool,
     session_id: &str,
-) -> Result<[PathBuf; 2]> {
+) -> Result<Vec<PathBuf>> {
     let isolation = if isolated {
         Isolation::Isolated
     } else {
@@ -497,7 +621,12 @@ fn session_marker_paths(
         let (_, sessions_name) = paired_dir_names(isolation, session_id, mode);
         Ok(profile_subpath(profile, &sessions_name)?.join(session_id))
     };
-    Ok([marker(LinkMode::Real)?, marker(LinkMode::Fake)?])
+    let (_, background_sessions) = background_dir_names();
+    Ok(vec![
+        marker(LinkMode::Real)?,
+        marker(LinkMode::Fake)?,
+        profile_subpath(profile, &background_sessions)?.join(session_id),
+    ])
 }
 
 /// The two runtime trees a live-sessions row's session could use as its
@@ -507,6 +636,10 @@ fn session_marker_paths(
 /// under whichever tree holds its `sessions` dir. Both modes exist on every
 /// platform (`Real` also on Windows when the process can create symlinks), so
 /// this is not unix-gated.
+///
+/// A background row is not one of these: its tree is
+/// [`background_runtime_tree`], and a caller that holds the row branches on its
+/// `background` bit before asking here.
 pub(crate) fn session_runtime_trees(
     profile: &ProfileName,
     isolated: bool,
@@ -587,8 +720,97 @@ pub(crate) fn hold_session_row_marker(
     Ok(file)
 }
 
+/// Stamp and hold the marker a background row's liveness is read from: the
+/// session-id file in the account's fixed `sessions-bg/`. The twin of
+/// [`hold_session_row_marker`], and here for the same reason — the layout lives
+/// in this module and no test rebuilds it.
+#[cfg(test)]
+pub(crate) fn hold_background_row_marker(name: &ProfileName, session_id: &str) -> Result<File> {
+    let (_, sessions_name) = background_dir_names();
+    let dir = profile_subpath(name, &sessions_name)?;
+    crate::profile::mkdir_700(&dir)?;
+    let file = open_pid_file(&dir.join(session_id))?;
+    file.try_lock()
+        .with_context(|| format!("marker {session_id} already held"))?;
+    Ok(file)
+}
+
 fn profiles_root_dir() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("profiles"))
+}
+
+/// The runtime trees and the profile dirs one walk of `profiles/` found.
+pub(crate) struct RuntimeTrees {
+    /// Every runtime tree under `profiles/`, either flavor and layout.
+    pub(crate) trees: Vec<PathBuf>,
+    /// Profile dirs that could not be enumerated (scoped fail-closed: only the
+    /// trees under one of these read as unreadable).
+    pub(crate) unreadable_profiles: Vec<PathBuf>,
+}
+
+/// Every runtime tree under `profiles/`, either flavor and layout, for the job
+/// reader's tree-local store pass ([`crate::claude_jobs::job_trees`]). A
+/// profile dir is enumerated the way the fail-closed census
+/// ([`live_namespaced_keychain_services`]) does — `read_dir` on every entry,
+/// which FOLLOWS a symlinked or junctioned profile dir — so a tree under one
+/// is either read here or never collected by GC/teardown. Fail closed: a root
+/// that cannot be enumerated is `Err` (a tree-local job store the walk could
+/// not see must not let a sweep collect its tree); a missing root reads as no
+/// trees; an unreadable PROFILE dir is scoped to that profile.
+pub(crate) fn runtime_trees() -> Result<RuntimeTrees, PathBuf> {
+    let root = match profiles_root_dir() {
+        Ok(root) => root,
+        Err(_) => return Err(PathBuf::from("~/.clauth/profiles")),
+    };
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RuntimeTrees {
+                trees: Vec::new(),
+                unreadable_profiles: Vec::new(),
+            });
+        }
+        Err(_) => return Err(root),
+    };
+    let mut out = Vec::new();
+    let mut unreadable_profiles = Vec::new();
+    for profile in entries {
+        let profile = match profile {
+            Ok(profile) => profile,
+            Err(_) => return Err(root),
+        };
+        let children = match std::fs::read_dir(profile.path()) {
+            Ok(children) => children,
+            // A plain file in `profiles/` is not a profile dir; a dir that
+            // vanished mid-walk contributes nothing.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::NotADirectory =>
+            {
+                continue;
+            }
+            Err(_) => {
+                unreadable_profiles.push(profile.path());
+                continue;
+            }
+        };
+        for child in children {
+            let child = match child {
+                Ok(child) => child,
+                Err(_) => {
+                    unreadable_profiles.push(profile.path());
+                    break;
+                }
+            };
+            if child.file_name().to_str().is_some_and(is_runtime_dir_name) {
+                out.push(child.path());
+            }
+        }
+    }
+    Ok(RuntimeTrees {
+        trees: out,
+        unreadable_profiles,
+    })
 }
 
 /// Every marker dir under the profile: each live session's own
@@ -784,8 +1006,18 @@ fn live_session_holds_rotatable(name: &ProfileName) -> bool {
             let Some(session_id) = id.to_str() else {
                 return true;
             };
-            let Some(store) = crate::live_sessions::get(session_id).and_then(|r| r.launch_store)
-            else {
+            let Some(row) = crate::live_sessions::get(session_id) else {
+                return true;
+            };
+            // The daemon's own background hold is no "live session" for this
+            // term: it holds the tree for as long as a Claude Code job names
+            // it, and only that job's being unfinished (the job term) can
+            // strand a rotation. A LAUNCHER's background row carries no such
+            // flag, so its hold still counts.
+            if row.background_hold {
+                continue;
+            }
+            let Some(store) = row.launch_store else {
                 return true;
             };
             if credential_holds_refresh_token(&store) {
@@ -849,16 +1081,38 @@ fn fanout_warning(
     })
 }
 
+/// What blocks a macOS rotation, and therefore which refusal line the caller
+/// renders. The three causes are distinct operator next-steps: retry a moment
+/// (a launcher's own session), `claude stop` (a background job), or retry once
+/// the named store clears (clauth cannot read it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RotationBlock {
+    /// A live `clauth start` marker session holds a store with a refresh token.
+    LiveSession,
+    /// An unfinished Claude Code background job on a tree holding a refresh token.
+    BackgroundJob,
+    /// The job store could not be read, so no profile's chain can be judged.
+    /// Carries the store dir the refusal names (the global store, or the
+    /// account's own tree-local store).
+    UnreadableJobStore(PathBuf),
+}
+
 /// [`rotation_blocked_by_live_session`] over the two things that strand a
 /// rotation on macOS — what every rotation leg and both TUI pre-refusals call.
 ///
-/// The first term is a live marker session holding a rotatable store
+/// The first term is a marker session holding a rotatable store
 /// ([`has_live_marker`] && [`live_session_holds_rotatable`]); the second is an
 /// UNFINISHED Claude Code background job on a tree that holds a refresh token
-/// ([`unfinished_job_holds_rotatable`], a fresh job-store walk over
+/// ([`job_block`], a fresh job-store walk over
 /// [`crate::claude_jobs::JobTrees::unfinished_under`]). A finished job —
 /// `stopped`/`done`/`failed` — is not mid-task, and a job on a refresh-less
 /// tree has nothing to strand, so both free the chain.
+///
+/// The daemon's own background hold is not a marker session here:
+/// [`live_session_holds_rotatable`] skips a row whose `background_hold` is set,
+/// because that hold lasts exactly as long as some job names the tree and the
+/// job term decides it. A launcher's marker in `sessions-bg/` during its launch
+/// is not exempt — it has no such flag.
 ///
 /// `cfg!` is tested FIRST so both probes short-circuit away off macOS:
 /// [`has_live_marker`] is a `read_dir` plus an `open` + `try_lock` per marker,
@@ -871,20 +1125,25 @@ fn fanout_warning(
 /// plus a credential parse per live session), and it only ever narrows an
 /// answer the marker already made `true`.
 ///
-/// One unreadable job-store record blocks EVERY profile's rotation on macOS
-/// until it clears — fail-closed is deliberate, but the cost is a
-/// stalled chain at its 8h mark, not a refused delete, and the refusal copy
-/// still says "has a live clauth start session" while no session runs.
-///
-/// The `cfg!` term is compile-time false off macOS, so a Linux test can reach
-/// neither arm through the host; the test-only override below is the one way
-/// the scheduler's ordering pins can hold both.
-pub(crate) fn rotation_blocked_for(name: &ProfileName) -> bool {
+/// A global job-store failure blocks every profile's rotation on macOS until it
+/// clears; a tree-local failure blocks only the profile whose store failed.
+/// Fail-closed is deliberate, and the cause carries the store's path so the
+/// refusal copy names what it could not read.
+pub(crate) fn rotation_block_for(name: &ProfileName) -> Option<RotationBlock> {
     #[cfg(test)]
-    if let Some(forced) = ROTATION_BLOCKED_OVERRIDE.with(std::cell::Cell::get) {
-        return forced;
+    {
+        if let Some(forced) = ROTATION_BLOCK_CAUSE_OVERRIDE.with(|c| c.borrow().clone()) {
+            return Some(forced);
+        }
+        if let Some(forced) = ROTATION_BLOCKED_OVERRIDE.with(std::cell::Cell::get) {
+            return forced.then_some(RotationBlock::LiveSession);
+        }
     }
-    rotation_blocked_on(name, cfg!(target_os = "macos"))
+    rotation_block_on(name, cfg!(target_os = "macos"))
+}
+
+pub(crate) fn rotation_blocked_for(name: &ProfileName) -> bool {
+    rotation_block_for(name).is_some()
 }
 
 /// The job term: an UNFINISHED Claude Code background job on a tree that holds
@@ -894,28 +1153,67 @@ pub(crate) fn rotation_blocked_for(name: &ProfileName) -> bool {
 /// `session-token.json` sidecar (linked or copied) frees the chain exactly like
 /// a marker session on one. A tree the read cannot judge (no file, a dangling
 /// link, unparseable bytes) holds. Fail closed: an unreadable job store, or a
-/// profile dir that cannot be resolved, blocks.
-fn unfinished_job_holds_rotatable(name: &ProfileName) -> bool {
-    let Some(dir) = profile_dir(name).ok() else {
-        return true;
+/// profile dir that cannot be resolved, blocks with the store's path named.
+fn job_block(name: &ProfileName) -> Option<RotationBlock> {
+    let dir = match profile_dir(name) {
+        Ok(dir) => dir,
+        Err(_) => {
+            return Some(RotationBlock::UnreadableJobStore(PathBuf::from(
+                "~/.claude/jobs",
+            )));
+        }
     };
-    let Some(trees) = crate::claude_jobs::job_trees().unfinished_under(&dir) else {
-        return true;
+    let trees = match crate::claude_jobs::job_trees().unfinished_under(&dir) {
+        Ok(trees) => trees,
+        Err(store) => return Some(RotationBlock::UnreadableJobStore(store)),
     };
     trees
         .iter()
         .any(|tree| credential_holds_refresh_token(&tree.join(".credentials.json")))
+        .then_some(RotationBlock::BackgroundJob)
 }
 
-/// [`rotation_blocked_for`] with the host passed in, so a Linux test drives the
+/// [`rotation_block_for`] with the host passed in, so a Linux test drives the
 /// macOS arm against real marker and job-store state.
-fn rotation_blocked_on(name: &ProfileName, is_macos: bool) -> bool {
-    is_macos
-        && rotation_blocked_by_live_session(
-            (has_live_marker(name) && live_session_holds_rotatable(name))
-                || unfinished_job_holds_rotatable(name),
-            true,
-        )
+pub(crate) fn rotation_block_on(name: &ProfileName, is_macos: bool) -> Option<RotationBlock> {
+    if !is_macos {
+        return None;
+    }
+    // An unreadable profile dir must be the unreadable-store cause, not the
+    // marker term's: the marker probe reads the same dir and fails closed to
+    // "live", but it cannot actually see a session there, and the ruling names
+    // the unreadable path. The job term below would return the same answer;
+    // this early return keeps the marker-first order for the readable case.
+    if let Some(store) = unreadable_profile_dir(name) {
+        return Some(RotationBlock::UnreadableJobStore(store));
+    }
+    if rotation_blocked_by_live_session(
+        has_live_marker(name) && live_session_holds_rotatable(name),
+        true,
+    ) {
+        return Some(RotationBlock::LiveSession);
+    }
+    job_block(name)
+}
+
+/// `Some(profile dir)` when it exists but cannot be enumerated: the one case
+/// the marker term cannot judge — it can neither rule a session out nor claim
+/// one in — so the rotation refusal names the dir as the unreadable store
+/// (the refusal names the unreadable path). `None` when the dir is absent
+/// (idle) or readable.
+fn unreadable_profile_dir(name: &ProfileName) -> Option<PathBuf> {
+    let profile = profile_dir(name).ok()?;
+    match std::fs::read_dir(&profile) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(profile),
+        Ok(_) => None,
+    }
+}
+
+/// [`rotation_block_on`]'s yes/no form, for tests that pose the host themselves.
+#[cfg(test)]
+pub(crate) fn rotation_blocked_on(name: &ProfileName, is_macos: bool) -> bool {
+    rotation_block_on(name, is_macos).is_some()
 }
 
 // Test seam posing the refusal's answer from a Linux host. Thread-local, same
@@ -932,6 +1230,22 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_rotation_blocked_override(forced: Option<bool>) {
     ROTATION_BLOCKED_OVERRIDE.with(|c| c.set(forced));
+}
+
+// Test seam posing WHICH cause blocks, so the three refusal lines' rendering
+// paths are drivable from a Linux host. The bool seam above keeps its arms on
+// [`RotationBlock::LiveSession`]; this one covers the two job-store causes the
+// host can only reach on macOS.
+#[cfg(test)]
+thread_local! {
+    static ROTATION_BLOCK_CAUSE_OVERRIDE: std::cell::RefCell<Option<RotationBlock>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set or clear the test-only cause override. `None` restores the host answer.
+#[cfg(test)]
+pub(crate) fn set_rotation_block_override(forced: Option<RotationBlock>) {
+    ROTATION_BLOCK_CAUSE_OVERRIDE.with(|c| *c.borrow_mut() = forced);
 }
 
 /// Count of live `clauth start` sessions for the profile: the flock-held markers
@@ -1182,11 +1496,21 @@ fn gc_runtime_trees() {
     // this sweep — the fail-closed direction `is_session_alive` takes — and the
     // log names the offending job dir, never its contents.
     let job_trees = crate::claude_jobs::job_trees();
-    if let JobTrees::Unreadable(dir) = &job_trees {
+    if let JobTrees::Unreadable { offending, .. } = &job_trees {
         logline!(
             "clauth: spared every dead runtime tree this sweep: a Claude Code \
              background-job record under {} could not be read",
-            dir.display()
+            offending.display()
+        );
+    }
+    // One line per scoped unreadable (a profile dir, or a tree's own `jobs/`),
+    // once per sweep, naming the store the operator can act on — the per-pair
+    // line stays silent for these, since no job was shown to name the tree.
+    for store in job_trees.scoped_unreadable_stores() {
+        logline!(
+            "clauth: spared runtime trees this sweep: the Claude Code \
+             background-job store {} could not be read",
+            store.display()
         );
     }
     let Ok(root) = profiles_root_dir() else {
@@ -1889,9 +2213,19 @@ fn gc_spawn_settings_files_synced(in_hold: impl FnOnce()) {
                 continue;
             }
             let jobs = jobs_read.get_or_insert_with(crate::claude_jobs::job_trees);
-            let Ok(own_trees) = session_runtime_trees(&profile, isolated, &sid) else {
+            let Ok(trees) = session_runtime_trees(&profile, isolated, &sid) else {
                 continue;
             };
+            // A launcher's file belongs to the pair its session occupied. The
+            // fixed background tree is offered alongside the per-session pair of
+            // every SHARED file: `spares_settings`' fallback is loose by design,
+            // and a background job whose flags cannot be read must spare the
+            // `--settings` file its own respawn names. (An isolated file never
+            // belongs to that pair — `--bg` is refused there.)
+            let mut own_trees = trees.to_vec();
+            if !isolated && let Ok(tree) = background_runtime_tree(&profile) {
+                own_trees.push(tree);
+            }
             if jobs.spares_settings(&file, &own_trees) {
                 continue;
             }
@@ -2022,11 +2356,11 @@ fn gc_one_pair(runtime: &Path, sessions: &Path, job_trees: &JobTrees) -> Result<
     // tombstone — the one order that would rescue-and-delete a tree a live job
     // still reads.
     if job_trees.spares(runtime) {
-        // Log only a NAMED hit: under an unreadable store `spares` is true for
-        // every pair (live ones included), and the sweep-level line already
-        // covered the Unreadable case once per sweep. A per-pair line there
-        // would claim a live job names every tree.
-        if matches!(job_trees, JobTrees::Named(_)) {
+        // Log only a NAMED hit: under an unreadable store (global or scoped)
+        // `spares` is true for pairs no job was shown to name, and the
+        // sweep-level line already covered the unreadable case once per sweep.
+        // A per-pair line there would claim a live job names every tree.
+        if job_trees.names(runtime) {
             logline!(
                 "clauth: spared runtime tree {}: a live Claude Code background job names it",
                 runtime.display()
@@ -2889,25 +3223,40 @@ fn chain_opt_in_survives(requested: bool, isolation: Isolation, mode: LinkMode) 
     requested && isolation == Isolation::Shared && swap_support(mode).is_ok()
 }
 
+/// Probe `name`'s profile dir for the [`LinkMode`] the session's own build
+/// resolves, exactly as [`ProfileRuntime::acquire`] does: create the profile
+/// dir, then [`detect_link_mode`] under the state lock, so two concurrent
+/// starts cannot interleave their probe dotfiles and read a spurious
+/// [`LinkMode::Fake`]. An IO failure propagates rather than reading as either
+/// answer — a probe that could not run says nothing about the host.
+fn probe_profile_link_mode(name: &ProfileName) -> Result<LinkMode> {
+    let profile_root = profile_dir(name)?;
+    with_state_lock(|_held| {
+        crate::profile::mkdir_700(&profile_root)
+            .with_context(|| format!("failed to create {}", profile_root.display()))?;
+        detect_link_mode(&profile_root)
+    })
+}
+
 /// [`swap_support`]'s TRANSPORT arm, which is only knowable by probing. Run LAST
 /// among the `--with-fallback` gates: it is the one leg that writes, so a start
 /// refused for any other cause never materializes a profile dir for an account
 /// that never launched.
 ///
-/// Probes the profile dir exactly as [`ProfileRuntime::acquire`] does, under the
-/// same state lock, so two concurrent starts cannot interleave their probe
-/// dotfiles and read a spurious [`LinkMode::Fake`].
-///
-/// `Ok(None)` is the supported host. An IO failure propagates rather than reading
-/// as either answer — a probe that could not run says nothing about the host.
+/// `Ok(None)` is the supported host.
 pub(crate) fn unsupported_swap_transport(name: &ProfileName) -> Result<Option<SwapUnsupported>> {
-    let profile_root = profile_dir(name)?;
-    let mode = with_state_lock(|_held| {
-        crate::profile::mkdir_700(&profile_root)
-            .with_context(|| format!("failed to create {}", profile_root.display()))?;
-        detect_link_mode(&profile_root)
-    })?;
-    Ok(swap_support(mode).err())
+    Ok(swap_support(probe_profile_link_mode(name)?).err())
+}
+
+/// Whether `name`'s runtime trees are COPIED rather than linked —
+/// [`LinkMode::Fake`], resolved the way [`ProfileRuntime::acquire_background`]
+/// resolves it ([`probe_profile_link_mode`]). A background launch on a copy
+/// host would build the fixed pair as a copy, which cannot follow a rotation
+/// that relinks the credentials a background session holds — the session would
+/// outlive them — so [`crate::start::admit`] refuses it before anything
+/// spawns.
+pub(crate) fn background_copy_host(name: &ProfileName) -> Result<bool> {
+    Ok(probe_profile_link_mode(name)? == LinkMode::Fake)
 }
 
 /// Why a swap onto a named member did not happen. A VALUE rather than an error:
@@ -2926,6 +3275,11 @@ pub(crate) enum SwapRefused {
     /// An `--isolated` session: a throwaway tree, deliberately not part of any
     /// chain.
     IsolatedSession,
+    /// A background holder: its tree is the account's fixed pair, shared by
+    /// every Claude Code job on that account, so a move onto another member
+    /// would bill another account under a running job. Only a cross-account
+    /// target is refused; the holder's own account convergence still runs.
+    FixedAccount,
     ProfileUnreadable(String),
     /// The outgoing member's spent-token record cannot be read, so the session's
     /// own credential file cannot be judged and nothing moved. Names the
@@ -2986,6 +3340,9 @@ impl std::fmt::Display for SwapRefused {
             Self::ShuttingDown => f.write_str("the session is shutting down"),
             Self::AlreadyCurrent => f.write_str("the link already resolves to it"),
             Self::IsolatedSession => f.write_str("an isolated session follows no chain"),
+            Self::FixedAccount => {
+                f.write_str("a background session stays on its account's fixed tree")
+            }
             Self::ProfileUnreadable(e) => write!(f, "its profile could not be read: {e}"),
             Self::OutgoingRecordUnreadable(member) => write!(
                 f,
@@ -3381,6 +3738,10 @@ pub(crate) struct SessionSwap {
     session: SessionId,
     isolation: Isolation,
     mode: LinkMode,
+    /// The pair this session occupies. A background holder resolves every
+    /// per-member path through it, so no executor leg can stamp a
+    /// `sessions-<sid>/` beside the fixed `sessions-bg/`.
+    tree: SessionTree,
     /// This session's own `CLAUDE_CONFIG_DIR`; its `.credentials.json` is what a
     /// swap repoints.
     runtime: PathBuf,
@@ -3407,6 +3768,7 @@ impl SessionSwap {
         session: SessionId,
         isolation: Isolation,
         mode: LinkMode,
+        tree: SessionTree,
         launch: &Profile,
         canonical: PathBuf,
         paths: &SessionPaths,
@@ -3415,6 +3777,7 @@ impl SessionSwap {
             session,
             isolation,
             mode,
+            tree,
             runtime: paths.runtime.clone(),
             launch: LaunchTransport::of(launch),
             launch_marker: paths.pid_file.clone(),
@@ -3453,6 +3816,13 @@ impl SessionSwap {
     fn tick_reconciles(&self) -> u64 {
         self.tick_reconciles
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The paths one member of this session's chain addresses, through the pair
+    /// this session actually occupies. A background holder resolves the fixed
+    /// pair, never a per-session dir the background layout does not have.
+    fn paths_for(&self, member: &ProfileName) -> Result<SessionPaths> {
+        resolve_tree(member, self.isolation, self.tree, &self.session, self.mode)
     }
 
     /// Claim `paths`'s marker for this session, separating a marker this session
@@ -3496,8 +3866,9 @@ impl SessionSwap {
     /// daemon has named a member that differs from the one the link resolves to.
     /// The daemon writes `intended_member` only for a row whose `follows_chain`
     /// is set (`clauth start --with-fallback` requests that), and `clauth
-    /// switch <sid> <profile>` writes one for any live claude row, so a plain
-    /// `start` session no writer has targeted polls and finds nothing to do.
+    /// switch <sid> <profile>` writes one for any live claude row but a
+    /// background one, so a plain `start` session no writer has targeted polls
+    /// and finds nothing to do.
     fn poll(&self) {
         let Some(row) = crate::live_sessions::get(self.session.as_str()) else {
             self.poll_converge();
@@ -3510,6 +3881,18 @@ impl SessionSwap {
             self.poll_converge();
             return;
         };
+        // A background holder is fixed on its ACCOUNT: the tree it reads is the
+        // one pair every Claude Code job on that account shares, so a move would
+        // bill another account under a running job. Its own account's
+        // convergence is not a move and still runs below — a hold adopted
+        // before the account was armed for rolling tokens would otherwise keep
+        // the rotating pair for its whole life. `precondition` refuses the same
+        // tail as the last line of defence.
+        if self.tree.is_background() {
+            self.announce_refusal(&intended, SwapRefused::FixedAccount);
+            self.poll_converge();
+            return;
+        }
         // A credit-cap leave may land on a member whose `[models]` differ; the
         // daemon records that leave reason on the row beside the intent. Every
         // other move keeps the models-equal rule.
@@ -3612,6 +3995,13 @@ impl SessionSwap {
         let intended = ProfileName::from(intended);
         if self.shutdown.is_begun() {
             return Err(SwapRefused::ShuttingDown);
+        }
+        // The fixed background pair is the account's whole tree: every job on it
+        // reads the one credential link, so a cross-account move would also be a
+        // billing change under a running job. The same-member arm below is a
+        // convergence, not a move, and still runs through `paths_for`.
+        if self.tree.is_background() && intended != self.member() {
+            return Err(SwapRefused::FixedAccount);
         }
         swap_support(self.mode).map_err(SwapRefused::Unsupported)?;
         // `--isolated` and fallback-following are mutually exclusive (a throwaway
@@ -3753,8 +4143,7 @@ impl SessionSwap {
                 Drain::Unjudged => return Ok(SwapOutcome::Refused(drain_unjudged(&self.member()))),
             }
 
-            let paths =
-                SessionPaths::resolve(&plan.member, self.isolation, &self.session, self.mode)?;
+            let paths = self.paths_for(&plan.member)?;
             let claim = self.claim_markers(&paths)?;
             if matches!(claim, MarkerClaim::Foreign) {
                 return Ok(SwapOutcome::Refused(SwapRefused::MarkerNotLockable));
@@ -4169,8 +4558,7 @@ impl SessionSwap {
                 return Ok(SwapOutcome::Refused(SwapRefused::AlreadyCurrent));
             }
             let current = self.canonical();
-            let paths =
-                SessionPaths::resolve(&plan.member, self.isolation, &self.session, self.mode)?;
+            let paths = self.paths_for(&plan.member)?;
             let claim = self.claim_markers(&paths)?;
             if matches!(claim, MarkerClaim::Foreign) {
                 return Ok(SwapOutcome::Refused(SwapRefused::MarkerNotLockable));
@@ -4470,6 +4858,71 @@ impl ProfileRuntime {
         stamp_window_closing: impl FnOnce(&SessionPaths, &SessionId),
         hold_released: impl FnOnce(),
     ) -> Result<Self> {
+        Self::acquire_tree(
+            name,
+            isolation,
+            stale_env_keys,
+            follows_chain,
+            launcher,
+            SessionTree::PerSession,
+            None,
+            pre_lock_done,
+            stamp_window_closing,
+            hold_released,
+        )
+    }
+
+    /// Enter the account's fixed background pair as this process's own holder:
+    /// the one codepath that serves both a `clauth start <p> -- --bg` launcher
+    /// and the daemon's adoption, so a second holder meets the same additive
+    /// build and the same "no live marker AND no job names the tree" wipe rule
+    /// a first one does.
+    ///
+    /// `hold` decides only how the registry row marks the hold: the daemon's
+    /// own hold is not a "live session" for the macOS rotation gate's marker
+    /// term, while a launcher's is. `flag` is the launcher's background flag,
+    /// echoed as typed into the copy-host refusal; the daemon passes `None`.
+    pub(crate) fn acquire_background(
+        name: &ProfileName,
+        hold: BackgroundHold,
+        stale_env_keys: &[String],
+        flag: Option<&str>,
+    ) -> Result<Self> {
+        Self::acquire_tree(
+            name,
+            Isolation::Shared,
+            stale_env_keys,
+            false,
+            crate::live_sessions::Launcher::Own,
+            SessionTree::Background(hold),
+            flag,
+            || {},
+            |_, _| {},
+            || {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_tree(
+        name: &ProfileName,
+        isolation: Isolation,
+        stale_env_keys: &[String],
+        follows_chain: bool,
+        launcher: crate::live_sessions::Launcher,
+        tree: SessionTree,
+        flag: Option<&str>,
+        pre_lock_done: impl FnOnce(),
+        stamp_window_closing: impl FnOnce(&SessionPaths, &SessionId),
+        hold_released: impl FnOnce(),
+    ) -> Result<Self> {
+        // The background pair is the shared flavour on both link modes, so the
+        // tree build, the settings merge and the credential link all take the
+        // shared arm whatever the caller asked for.
+        let isolation = if tree.is_background() {
+            Isolation::Shared
+        } else {
+            isolation
+        };
         let claude_home = claude_dir()?;
         if !claude_home.exists() {
             anyhow::bail!("~/.claude not found; install Claude Code first");
@@ -4533,6 +4986,31 @@ impl ProfileRuntime {
             crate::profile::mkdir_700(&profile_root)
                 .with_context(|| format!("failed to create {}", profile_root.display()))?;
             let mode = detect_link_mode(&profile_root)?;
+            // The floor under `start::admit`'s copy-host refusal: a `--bg`
+            // launcher is refused there before anything spawns, but the daemon
+            // reaches `acquire_background` directly, so it must refuse here too
+            // — under the state lock, on the SAME mode the build below consumes
+            // — or a copy host would claim a marker and build a fixed pair a
+            // background session would outlive (the copied tree cannot follow a
+            // rotation that relinks the credentials it holds). A probe that
+            // failed already propagated as the `?` above, so a copy host can
+            // never read as linkable (fail closed). The launcher arm reuses the
+            // approved copy-host refusal; the daemon arm is a TYPED refusal the
+            // daemon re-queues on its own schedule (once per job-set spell,
+            // never a backoff retry), not an adoption failure to retry.
+            if mode == LinkMode::Fake
+                && let SessionTree::Background(hold) = tree
+            {
+                match hold {
+                    BackgroundHold::Launcher => {
+                        let flag = flag.unwrap_or("--bg");
+                        anyhow::bail!("{}", copy_host_background_refusal(name.as_str(), flag));
+                    }
+                    BackgroundHold::Daemon => {
+                        return Err(anyhow::Error::new(CopyHostBackgroundRefusal));
+                    }
+                }
+            }
             // A sid is a NAME, not a claim. `<pid>-<seq>` collides only when a
             // second LIVE process minted the same pair, which needs a `~/.clauth`
             // shared across pid namespaces, or an NFS home, and the collision
@@ -4542,13 +5020,13 @@ impl ProfileRuntime {
             // `is_session_alive` reads every unknown as live, so an unreadable
             // marker moves this session aside instead of parking it.
             let mut session = SessionId::mint();
-            let mut paths = SessionPaths::resolve(name, isolation, &session, mode)?;
+            let mut paths = resolve_tree(name, isolation, tree, &session, mode)?;
             for _ in 0..SID_COLLISION_REMINTS {
                 if !is_session_alive(&paths.pid_file) {
                     break;
                 }
                 session = SessionId::mint();
-                paths = SessionPaths::resolve(name, isolation, &session, mode)?;
+                paths = resolve_tree(name, isolation, tree, &session, mode)?;
             }
             let SessionPaths {
                 runtime,
@@ -4624,7 +5102,7 @@ impl ProfileRuntime {
                      the session stays on its launch account"
                 );
             }
-            let row = crate::live_sessions::LiveSession::starting(
+            let mut row = crate::live_sessions::LiveSession::starting(
                 &session,
                 name,
                 crate::harness::Harness::Claude,
@@ -4638,8 +5116,20 @@ impl ProfileRuntime {
                 // (`swap_to`'s row update; on macOS that waits for the
                 // keychain legs), so `live_session_holds_rotatable` reads the
                 // store of the member the session is ON, never the launch one.
-                Some(canonical.clone()),
+                //
+                // The daemon's background hold leaves it `None`: that hold is
+                // exempt from the rotation gate's marker term, and a store path
+                // would otherwise make it read as a live session sharing the
+                // account's rotating login in `sessions_holding_store`.
+                match tree {
+                    SessionTree::Background(BackgroundHold::Daemon) => None,
+                    _ => Some(canonical.clone()),
+                },
             );
+            if let SessionTree::Background(hold) = tree {
+                row.background = true;
+                row.background_hold = hold == BackgroundHold::Daemon;
+            }
             if let Err(e) = crate::live_sessions::register(&row) {
                 logline!("clauth: registering the live session failed: {e}");
             }
@@ -4711,7 +5201,7 @@ impl ProfileRuntime {
         // launch member fields (env, models, api_key) must describe what the
         // session's settings.json actually carries.
         let swap = std::sync::Arc::new(SessionSwap::new(
-            session, isolation, mode, &fresh, canonical, &paths,
+            session, isolation, mode, tree, &fresh, canonical, &paths,
         ));
         let SessionPaths {
             sessions, pid_file, ..
@@ -5183,6 +5673,22 @@ impl Drop for ForcedFakeLinkMode {
     }
 }
 
+// Test seam: how many times THIS thread has called [`detect_link_mode`], so a
+// test can pin that the daemon's tick thread never probes — the probe writes
+// shared dotfiles, and a tick-side probe would race every locked `clauth start`
+// probe on the same account. Thread-local for the same reason
+// `crate::claude_jobs::JOB_TREES_READS` is: a concurrent test thread's probes
+// land in its own cell.
+#[cfg(test)]
+thread_local! {
+    static LINK_MODE_PROBE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn link_mode_probe_calls() -> usize {
+    LINK_MODE_PROBE_CALLS.with(std::cell::Cell::get)
+}
+
 /// Probe the OS by attempting a real symlink in `probe_dir`. Anything other than
 /// success — privilege denial, unsupported filesystem, the
 /// `cfg(not(any(unix, windows)))` fallback — drops to fake-symlink mode.
@@ -5192,6 +5698,8 @@ impl Drop for ForcedFakeLinkMode {
 /// two dotfiles below match no `runtime*`/`sessions*` predicate, so GC and every
 /// enumeration step over them.
 fn detect_link_mode(probe_dir: &Path) -> Result<LinkMode> {
+    #[cfg(test)]
+    LINK_MODE_PROBE_CALLS.with(|c| c.set(c.get() + 1));
     #[cfg(test)]
     if let Some(mode) = LINK_MODE_OVERRIDE.lock().ok().and_then(|guard| *guard) {
         return Ok(mode);
@@ -5286,7 +5794,7 @@ fn is_session_alive(pid_file: &Path) -> bool {
 ///
 /// Shared vs. per-profile layout:
 /// - **Shared via symlink/copy across all profiles:** every top-level entry
-///   in `~/.claude/` except `settings.json` and `.credentials.json` —
+///   in `~/.claude/` except `settings.json`, `.credentials.json` and `jobs` —
 ///   this includes `projects/`, `todos/`, `statsig/`, `sessions/`, `cache/`,
 ///   `commands/`, `plugins/`, `tasks/`, `teams/`, `hooks/`, `history.jsonl`,
 ///   and similar. Claude Code treats these as user-global state so sharing is
@@ -5340,7 +5848,14 @@ fn build_runtime_dir_with_active_env(
     {
         let entry = entry?;
         let file_name = entry.file_name();
-        if file_name == "settings.json" || file_name == ".credentials.json" {
+        if file_name == "settings.json"
+            || file_name == ".credentials.json"
+            // A copy-host tree never gets the job store: a copied store would
+            // carry removed jobs back and forth (the mirror skips it too). On a
+            // linking host `ensure_store_links` above placed the link, or the
+            // entry is unusable and the walk links it as it stands.
+            || (mode == LinkMode::Fake && file_name == "jobs")
+        {
             continue;
         }
         // A `copy_file` publish in flight, not content. `union_children` skips
@@ -5393,9 +5908,10 @@ const SHARED_STORES: &[(&str, &str)] = &[("jobs", "background jobs"), ("projects
 /// store for the walk to link, and the record would land inside the tree,
 /// where the store never sees it and the next teardown collects it.
 ///
-/// Shared trees on the linking transport only: fake mode copies the store into
-/// the tree and the watchdog's mirror publishes a record written through the
-/// tree back out, and an isolated tree reaches nothing in `~/.claude`. Each
+/// Shared trees on the linking transport only: a copy-host tree gets no job
+/// store at all (the walk and the mirror both skip `jobs`; a record written
+/// there is read from the tree's own `jobs/`), and an isolated tree reaches
+/// nothing in `~/.claude`. Each
 /// absent store is created 0700, the owner-only shape every clauth write
 /// takes; an existing tree entry is left as it is; a store that is unusable or
 /// cannot be created is skipped, so a start the base allowed is never refused
@@ -6711,9 +7227,11 @@ fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<bool> {
 /// state (project history, scratch files) and the user may add `~/.claude/`
 /// entries between ticks, both must propagate. **No deletion**: a file missing
 /// from one side is "not yet seen", never "intentionally removed", so the mirror
-/// never destroys data. Top-level `settings.json` / `.credentials.json` are
-/// skipped (settings is a rewritten copy; credentials has its own stricter
-/// mirror). Fake-symlink mode only.
+/// never destroys data. Top-level `settings.json`, `.credentials.json`,
+/// `.claude.json` and `jobs` are skipped (settings is a rewritten copy;
+/// credentials has its own stricter mirror; `.claude.json` is reconciled
+/// per-profile; `jobs` never enters a copy-host tree either way). Fake-symlink
+/// mode only.
 ///
 /// The walk closes with one pass over [`AliasClasses`], which is what keeps two
 /// `~/.claude` names resolving to ONE file from letting sort order decide whose
@@ -6721,8 +7239,11 @@ fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<bool> {
 fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
     // `.claude.json` is a per-profile copy reconciled by `crate::claude_json`,
     // not part of the `~/.claude/` tree — skip it here so the tree mirror never
-    // copies it into `~/.claude/.claude.json`.
-    let skip_top: HashSet<&str> = ["settings.json", ".credentials.json", ".claude.json"]
+    // copies it into `~/.claude/.claude.json`. `jobs` is skipped too: a copy
+    // host never carries the job store either way (cloudy 2026-10-22), so a
+    // tree's copy of a `claude rm`ed job is never published back into the store
+    // and a store job never comes back out of a tree.
+    let skip_top: HashSet<&str> = ["settings.json", ".credentials.json", ".claude.json", "jobs"]
         .into_iter()
         .collect();
     // The one `canonicalize` this walk pays for: every entry below inherits it.
@@ -7204,11 +7725,15 @@ fn codex_paired_dir_names(isolation: Isolation, session: &str, mode: LinkMode) -
 
 /// Whether `name`'s sessions run under the fake-symlink transport — where a
 /// codex session home holds a COPY of `auth.json`, not a symlink to the
-/// store. The standby refresh reads this: under real symlinks a live session
-/// reads the very file a rotation writes (codex reloads before spending, the
-/// guard serializes), but under fake mode it holds a separate carrier, so a
-/// store rotation would spend a token the session still holds. Only meaningful
-/// when the profile dir exists (a live session guarantees it).
+/// store. The codex standby refresh is the ONLY caller (the daemon's
+/// background adoption probes the mode under the state lock in `acquire_tree`
+/// instead). Under real symlinks a live
+/// session reads the very file a rotation writes (codex reloads before
+/// spending, the guard serializes), but under fake mode it holds a separate
+/// carrier, so a store rotation would spend a token the session still holds.
+/// A missing profile dir or a probe error reads `false` — not fake — so the
+/// refresh proceeds; the caller already checked for a live session, which is
+/// what guarantees the profile dir exists.
 pub(crate) fn profile_uses_fake_transport(name: &str) -> bool {
     let Ok(dir) = profile_dir(&ProfileName::from(name)) else {
         return false;

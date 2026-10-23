@@ -2175,6 +2175,8 @@ fn an_armed_session_silences_the_reader_before_any_read() {
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     })
     .expect("row");
 

@@ -1457,6 +1457,7 @@ fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
         &crate::profile::ProfileName::from("thirdparty"),
         Isolation::Shared,
         true,
+        &[],
     )
     .expect_err("a custom endpoint must refuse under --with-fallback");
     assert_eq!(
@@ -1470,6 +1471,7 @@ fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
         &crate::profile::ProfileName::from("thirdparty"),
         Isolation::Shared,
         false,
+        &[],
     )
     .expect("no flag, no refusal");
 }
@@ -1483,32 +1485,114 @@ fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
 /// the same case: with no `~/.claude/projects`, a transcript written through
 /// the tree is unindexed and dies with it.
 ///
-/// The Real arm is the red-first pin: on the base it places no store link. The
-/// Fake arm is a regression guard, green on the base too: fake mode copies the
-/// store into the tree and the watchdog's mirror already publishes a record
-/// written through the tree back into `~/.claude`.
+/// The red-first pin: on the base it places no store link.
 #[cfg(unix)]
 #[test]
 fn a_background_start_keeps_its_job_in_the_global_store_on_a_fresh_box() {
-    for fake in [false, true] {
+    let sb = HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+
+    let tree: Vec<String> = shim
+        .spawns()
+        .into_iter()
+        .filter(|(_, argv)| argv.split(' ').any(|word| word == "--bg"))
+        .map(|(dir, _)| dir)
+        .collect();
+    assert_eq!(tree.len(), 1, "one background launch");
+    let tree = std::path::PathBuf::from(&tree[0]);
+    let jobs: Vec<std::path::PathBuf> = fs::read_dir(claude.join("jobs"))
+        .map(|dir| dir.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert_eq!(jobs.len(), 1, "the job is in the global store");
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(jobs[0].join("state.json")).expect("job record"))
+            .expect("parse job record");
+    assert_eq!(
+        record["providerEnv"]["CLAUDE_CONFIG_DIR"].as_str(),
+        Some(tree.to_string_lossy().as_ref()),
+        "the record names the tree"
+    );
+    assert!(tree.is_dir(), "the tree outlives its launcher");
+    let transcripts: Vec<std::path::PathBuf> = fs::read_dir(claude.join("projects"))
+        .map(|dir| dir.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        transcripts.len(),
+        1,
+        "the transcript is in the global store the session index reads"
+    );
+}
+
+// ── T33b1: the per-account background tree ────────────────────────────────
+
+/// A sandboxed `clauth start` rig for the background tests: `~/.claude`, the
+/// fake `claude`, and a `profiles.toml` naming the chain `chain_ready_config`
+/// builds.
+#[cfg(unix)]
+fn background_rig(sb: &HomeSandbox) -> crate::testutil::ConfigDirSandbox<'_> {
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let config = crate::testutil::ConfigDirSandbox::new(sb, &claude);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+    config
+}
+
+/// The `CLAUDE_CONFIG_DIR` of every shim call whose argv carries `flag` as a
+/// whole word.
+#[cfg(unix)]
+fn config_dirs_of(fake: &crate::testutil::FakeClaude<'_>, flag: &str) -> Vec<String> {
+    fake.spawns()
+        .into_iter()
+        .filter(|(_, argv)| argv.split(' ').any(|word| word == flag))
+        .map(|(dir, _)| dir)
+        .collect()
+}
+
+/// T33b1 check 1: both spellings of the background flag launch `claude` on
+/// the account's one background tree, `profiles/<p>/runtime-bg`, never a
+/// per-launch `runtime-<sid>`; the launcher's own marker in `sessions-bg/`
+/// lives only for the launch, and the tree outlives it because the job the
+/// launch left names it.
+#[cfg(unix)]
+#[test]
+fn a_background_start_launches_on_the_accounts_background_tree() {
+    for flag in ["--bg", "--background"] {
         let sb = HomeSandbox::new();
-        let claude = sb.home().join(".claude");
-        fs::create_dir_all(&claude).expect("~/.claude");
-        let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
-        let _fake_mode = fake.then(crate::runtime::ForcedFakeLinkMode::new);
-        let shim = crate::testutil::FakeClaude::new(&sb);
-        let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
-        fs::create_dir_all(&clauth_dir).expect("clauth dir");
-        fs::write(
-            clauth_dir.join("profiles.toml"),
-            "profiles = [\"wired\", \"spare\"]\n",
-        )
-        .expect("profiles.toml");
+        let _config_dir = background_rig(&sb);
+        let fake = crate::testutil::FakeClaude::new(&sb);
+        let name = crate::profile::ProfileName::from("wired");
 
         run(
             &chain_ready_config("wired"),
-            &crate::profile::ProfileName::from("wired"),
-            &["--bg".to_string()],
+            &name,
+            &[flag.to_string()],
             Isolation::Shared,
             None,
             false,
@@ -1516,41 +1600,248 @@ fn a_background_start_keeps_its_job_in_the_global_store_on_a_fresh_box() {
         )
         .expect("background start");
 
-        let tree: Vec<String> = shim
-            .spawns()
-            .into_iter()
-            .filter(|(_, argv)| argv.split(' ').any(|word| word == "--bg"))
-            .map(|(dir, _)| dir)
-            .collect();
-        assert_eq!(tree.len(), 1, "fake: {fake}: one background launch");
-        let tree = std::path::PathBuf::from(&tree[0]);
-        let jobs: Vec<std::path::PathBuf> = fs::read_dir(claude.join("jobs"))
-            .map(|dir| dir.flatten().map(|e| e.path()).collect())
-            .unwrap_or_default();
+        let tree = profile_dir_of("wired").join("runtime-bg");
+        let dirs = config_dirs_of(&fake, flag);
         assert_eq!(
-            jobs.len(),
-            1,
-            "fake: {fake}: the job is in the global store"
+            dirs,
+            [tree.to_string_lossy().into_owned()],
+            "{flag}: claude ran on the account's background tree"
         );
-        let record: serde_json::Value =
-            serde_json::from_slice(&fs::read(jobs[0].join("state.json")).expect("job record"))
-                .expect("parse job record");
-        assert_eq!(
-            record["providerEnv"]["CLAUDE_CONFIG_DIR"].as_str(),
-            Some(tree.to_string_lossy().as_ref()),
-            "fake: {fake}: the record names the tree"
+        assert!(
+            !crate::runtime::has_live_marker(&name),
+            "{flag}: the launcher's marker dies with the launch"
         );
         assert!(
             tree.is_dir(),
-            "fake: {fake}: the tree outlives its launcher"
+            "{flag}: the job the launch left keeps its tree"
         );
-        let transcripts: Vec<std::path::PathBuf> = fs::read_dir(claude.join("projects"))
-            .map(|dir| dir.flatten().map(|e| e.path()).collect())
-            .unwrap_or_default();
+        let marker_dirs: Vec<String> = fs::read_dir(profile_dir_of("wired"))
+            .expect("profile dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("sessions"))
+            .collect();
         assert_eq!(
-            transcripts.len(),
-            1,
-            "fake: {fake}: the transcript is in the global store the session index reads"
+            marker_dirs,
+            ["sessions-bg"],
+            "{flag}: the launcher kept its marker in the background pair"
         );
     }
+}
+
+/// T33b1 check 2: a launch while another holder (the daemon) keeps a marker
+/// in `sessions-bg/` enters the same tree: no `failed to claim session
+/// marker`, no wipe of the live tree, and the other holder's marker stays.
+#[cfg(unix)]
+#[test]
+fn a_background_start_enters_the_tree_another_holder_keeps() {
+    let sb = HomeSandbox::new();
+    let _config_dir = background_rig(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let name = crate::profile::ProfileName::from("wired");
+    let config = chain_ready_config("wired");
+    let start = || {
+        run(
+            &config,
+            &name,
+            &["--bg".to_string()],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+    };
+    start().expect("first background start builds the tree");
+    // `claude rm` the first launch's job, so the other holder's marker is the
+    // only thing standing between the second launch and a wipe of the tree.
+    let jobs = sb.home().join(".claude").join("jobs");
+    for job in fs::read_dir(&jobs)
+        .expect("the first launch left a job")
+        .flatten()
+    {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let tree = profile_dir_of("wired").join("runtime-bg");
+    let sessions = profile_dir_of("wired").join("sessions-bg");
+    fs::create_dir_all(&tree).expect("runtime-bg");
+    fs::create_dir_all(&sessions).expect("sessions-bg");
+    let holder = sessions.join("4242-0");
+    let held = crate::runtime::open_pid_file(&holder).expect("holder marker");
+    held.lock().expect("hold the marker");
+    let sentinel = tree.join(".t33b1.tmp.keep");
+    fs::write(&sentinel, b"kept").expect("sentinel");
+
+    start().expect("a second launch enters the held tree");
+
+    let tree_dir = tree.to_string_lossy().into_owned();
+    assert_eq!(
+        config_dirs_of(&fake, "--bg"),
+        [tree_dir.clone(), tree_dir],
+        "both launches ran on the one background tree"
+    );
+    assert_eq!(
+        fs::read(&sentinel).expect("the live tree was not wiped"),
+        b"kept"
+    );
+    assert!(holder.is_file(), "the other holder's marker stays");
+    drop(held);
+}
+
+/// T33b1 N1 (cloudy 2026-10-22, option A): a host that copies runtime trees
+/// instead of linking them would copy a `claude rm`ed job's record back into
+/// the store, so both spellings refuse there before anything spawns or any
+/// tree is built, with the copy cloudy approved.
+#[cfg(unix)]
+#[test]
+fn a_background_start_on_a_copy_host_is_refused_before_anything_spawns() {
+    for flag in ["--bg", "--background"] {
+        let sb = HomeSandbox::new();
+        let _config_dir = background_rig(&sb);
+        let fake = crate::testutil::FakeClaude::new(&sb);
+        let _fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+
+        let err = run(
+            &chain_ready_config("wired"),
+            &crate::profile::ProfileName::from("wired"),
+            &[flag.to_string()],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect_err("a background start on a copy host is refused");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "'wired': {flag} cannot run on this host, since it copies runtime trees \
+                 instead of linking them and a background session would outlive the \
+                 credentials clauth rotates (on Windows, turn on Developer Mode)"
+            )
+        );
+        assert_eq!(fake.spawns(), Vec::new(), "{flag}: nothing spawned");
+        let leftovers: Vec<_> = fs::read_dir(profile_dir_of("wired"))
+            .map(|dir| dir.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers
+                .iter()
+                .all(|n| !n.to_string_lossy().starts_with("runtime")),
+            "{flag}: no runtime tree was built: {leftovers:?}"
+        );
+    }
+}
+
+/// T33b1 check 3: an isolated tree links no `jobs/`, so a background session
+/// started in one is invisible to clauth; both spellings refuse before
+/// anything spawns, with the copy cloudy approved 2026-10-21.
+#[cfg(unix)]
+#[test]
+fn an_isolated_background_start_is_refused_before_anything_spawns() {
+    for flag in ["--bg", "--background"] {
+        let sb = HomeSandbox::new();
+        let _config_dir = background_rig(&sb);
+        let fake = crate::testutil::FakeClaude::new(&sb);
+
+        let err = run(
+            &chain_ready_config("wired"),
+            &crate::profile::ProfileName::from("wired"),
+            &[flag.to_string()],
+            Isolation::Isolated,
+            None,
+            false,
+            None,
+        )
+        .expect_err("an isolated background start is refused");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "'wired': {flag} cannot be combined with --isolated, since background \
+                 sessions run in the account's shared background tree"
+            )
+        );
+        assert_eq!(fake.spawns(), Vec::new(), "{flag}: nothing spawned");
+        let leftovers: Vec<_> = fs::read_dir(profile_dir_of("wired"))
+            .map(|dir| dir.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers
+                .iter()
+                .all(|n| !n.to_string_lossy().starts_with("runtime")),
+            "{flag}: no runtime tree was built: {leftovers:?}"
+        );
+    }
+}
+
+/// The copy-host refusal sits BEFORE the plugin preflight: on a copy host with a
+/// divergent plugin registration the gate fires and the heal would spawn
+/// `claude plugin list --json`, so an empty shim call log proves the refusal
+/// ran first.
+#[cfg(unix)]
+#[test]
+fn a_copy_host_background_refusal_precedes_the_plugin_preflight() {
+    let sb = HomeSandbox::new();
+    let _config_dir = background_rig(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    // A divergent registration: the preflight gate fires and the heal spawns a
+    // `claude plugin list --json` when the launch reaches the preflight.
+    let plugins_dir = sb.home().join(".claude").join("plugins");
+    fs::create_dir_all(&plugins_dir).expect("plugins dir");
+    fs::write(plugins_dir.join("known_marketplaces.json"), "{\"clauth\":").expect("truncated");
+    fs::write(plugins_dir.join("installed_plugins.json"), "{}").expect("installed");
+    let _fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+
+    let err = run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect_err("a background start on a copy host is refused");
+
+    assert_eq!(
+        err.to_string(),
+        "'wired': --bg cannot run on this host, since it copies runtime trees \
+         instead of linking them and a background session would outlive the \
+         credentials clauth rotates (on Windows, turn on Developer Mode)"
+    );
+    assert_eq!(
+        fake.spawns(),
+        Vec::new(),
+        "the copy-host refusal precedes the plugin preflight"
+    );
+}
+
+/// When BOTH an `--isolated` launch and a copy host apply, the `--isolated`
+/// refusal wins, because it is ordered first.
+#[cfg(unix)]
+#[test]
+fn an_isolated_background_start_stays_first_on_a_copy_host() {
+    let sb = HomeSandbox::new();
+    let _config_dir = background_rig(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let _fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+
+    let err = run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Isolated,
+        None,
+        false,
+        None,
+    )
+    .expect_err("an isolated background start is refused");
+
+    assert_eq!(
+        err.to_string(),
+        "'wired': --bg cannot be combined with --isolated, since background \
+         sessions run in the account's shared background tree"
+    );
+    assert_eq!(fake.spawns(), Vec::new(), "nothing spawned");
 }

@@ -247,6 +247,8 @@ fn session_stem_completion_lists_registry_stems_only() {
             last_swap_at: None,
             launch_store: None,
             is_delegate: false,
+            background: false,
+            background_hold: false,
         };
         crate::live_sessions::register(&row).expect("register row");
     }

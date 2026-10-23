@@ -4071,6 +4071,57 @@ fn a_live_session_on_a_rolling_chain_refuses_the_switch_with_the_live_session_co
     assert_eq!(e.text_with_status(), e.text());
 }
 
+/// The two job-store causes render their OWN owner-picked sentences, not the
+/// live-session one: the operator's next step differs (stop the job; retry once
+/// the store clears), so a copy that named a session would send them waiting for
+/// something that never ends. Pinned by equality with every interpolated value
+/// fixed, through the same production leg the marker cause goes through. The
+/// unreadable-store arm uses a TREE-LOCAL path, so the `{path}` interpolation
+/// is pinned with a value the old hard-coded `(~/.claude/jobs)` literal never
+/// matched — reverting the line to that literal reds the assertion.
+#[test]
+fn the_job_store_rotation_refusals_name_their_own_causes() {
+    let home = HomeSandbox::new();
+    let name = "test-roll-refuse";
+    let tree_jobs = home
+        .home()
+        .join(".clauth/profiles/test-roll-refuse/runtime-4242-53/jobs");
+    for (block, want) in [
+        (
+            crate::runtime::RotationBlock::BackgroundJob,
+            "'test-roll-refuse' has a background session still on its rotating login; end it \
+             with claude stop to rotate"
+                .to_string(),
+        ),
+        (
+            crate::runtime::RotationBlock::UnreadableJobStore(tree_jobs.clone()),
+            format!(
+                "can't read claude code's background job list ({}), so \
+                 'test-roll-refuse' is not rotated; retry in a moment",
+                tree_jobs.display()
+            ),
+        ),
+    ] {
+        let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+        crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+        let handle = Arc::new(RankedMutex::new(config));
+
+        crate::runtime::set_rotation_block_override(Some(block));
+        let gate = ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh,
+        );
+        crate::runtime::set_rotation_block_override(None);
+
+        let AuthGate::Transient(e) = gate else {
+            panic!("a blocked rotation must refuse, not install/refresh");
+        };
+        assert_eq!(e.text(), want);
+        assert_eq!(e.text_with_status(), e.text());
+    }
+}
+
 /// The refusal guards a SPEND: a comfortable stored chain stamps the sidecar
 /// with no refresh, so a live session on the rotating pair never blocks it.
 #[test]

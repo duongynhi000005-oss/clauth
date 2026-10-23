@@ -5338,3 +5338,689 @@ fn a_codex_chain_naming_a_claude_profile_queues_nothing_for_it() {
 
     assert_eq!(inbox.try_iter().collect::<Vec<_>>(), []);
 }
+
+// ── T33b1: the daemon holds the per-account background tree ────────────────
+
+#[cfg(target_os = "linux")]
+/// The background pair of `name`, as a launch leaves it: both dirs exist and
+/// a Claude Code job record (state `state`) names the tree. Returns
+/// `(tree, sessions dir, job dir)`. Arms both heal throttles, since every
+/// caller ticks a daemon and neither heal is what these tests are about.
+fn background_pair(
+    sb: &HomeSandbox,
+    name: &str,
+    state: &str,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let profile =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    let tree = profile.join("runtime-bg");
+    let sessions = profile.join("sessions-bg");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let job = crate::testutil::write_claude_job_in(sb.home(), "b6a1c0de", &tree, state, None);
+    (tree, sessions, job)
+}
+
+/// Watchdog threads this process runs for `name`, read off the kernel's
+/// thread names (`comm`, cut to 15 bytes), so the count needs no daemon
+/// accessor.
+#[cfg(target_os = "linux")]
+fn watchdog_threads(name: &str) -> usize {
+    let mut want = format!("clauth-wdog-{name}");
+    want.truncate(15);
+    std::fs::read_dir("/proc/self/task")
+        .expect("task dir")
+        .flatten()
+        .filter(|task| {
+            std::fs::read_to_string(task.path().join("comm"))
+                .is_ok_and(|comm| comm.trim_end() == want)
+        })
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+/// The `live_sessions` rows that start on `name`.
+fn rows_of(name: &str) -> Vec<crate::live_sessions::LiveSession> {
+    crate::live_sessions::list()
+        .into_iter()
+        .filter(|row| row.start_profile == name)
+        .collect()
+}
+
+/// Tick until `done` holds, failing after 20 s with `what`.
+#[cfg(target_os = "linux")]
+fn tick_until(daemon: &mut Daemon, what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let probes = crate::runtime::link_mode_probe_calls();
+    loop {
+        daemon.tick();
+        assert_eq!(
+            crate::runtime::link_mode_probe_calls(),
+            probes,
+            "the tick must never probe the link mode; the adoption worker probes under the lock"
+        );
+        if done() {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "never {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Whether the daemon holds `name`'s background tree: a held marker in
+/// `sessions-bg/`, one row naming that marker, one watchdog.
+#[cfg(target_os = "linux")]
+fn adopted(name: &str, sessions: &std::path::Path) -> bool {
+    let rows = rows_of(name);
+    crate::runtime::has_live_marker(&crate::profile::ProfileName::from(name))
+        && rows.len() == 1
+        && sessions.join(&rows[0].session_id).is_file()
+        && watchdog_threads(name) == 1
+}
+
+/// T33b1 check 4: a tick that finds a job naming an account's background tree
+/// with no daemon hold adopts it: a marker it holds in `sessions-bg/`, a
+/// `live_sessions` row naming that marker, the tree's watchdog. The tick
+/// thread never waits for it: with the account's rotation lock and the state
+/// flock held elsewhere, the tick returns at once and the adoption lands once
+/// they free.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tick_adopts_a_background_tree_a_job_names_without_waiting_on_its_locks() {
+    let sb = HomeSandbox::new();
+    let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
+    let (_tree, sessions, _job) = background_pair(&sb, "bgp", "working");
+    let mut daemon = daemon_for(config);
+
+    let (rot_held_tx, rot_held_rx) = std::sync::mpsc::channel();
+    let (rot_release_tx, rot_release_rx) = std::sync::mpsc::channel::<()>();
+    let rotation_holder = std::thread::spawn(move || {
+        let rotation = crate::testutil::hold_rotation_lock("bgp");
+        rot_held_tx.send(()).expect("report the rotation hold");
+        // Release after the tick's 5 s budget even if nothing signals, so a
+        // tick that waits on the rotation lock returns and the elapsed
+        // assertion below fails instead of the test hanging.
+        let _ = rot_release_rx.recv_timeout(Duration::from_secs(6));
+        drop(rotation);
+    });
+    rot_held_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the rotation lock is held");
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let flock_holder = std::thread::spawn(move || {
+        crate::lock::with_state_lock(|_| {
+            held_tx.send(()).expect("report the hold");
+            // Release after the tick's 5 s budget even if nothing signals, so
+            // a tick that waits on the flock returns and the elapsed
+            // assertion below fails instead of the test hanging.
+            let _ = release_rx.recv_timeout(Duration::from_secs(6));
+            Ok(())
+        })
+        .expect("hold the state flock");
+    });
+    held_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the state flock is held");
+
+    let started = std::time::Instant::now();
+    daemon.tick();
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the tick waited {took:?} on a lock the adoption needs"
+    );
+
+    release_tx.send(()).expect("release the flock");
+    flock_holder.join().expect("flock holder");
+    rot_release_tx.send(()).expect("release the rotation lock");
+    rotation_holder.join().expect("rotation holder");
+    tick_until(&mut daemon, "adopted the background tree", || {
+        adopted("bgp", &sessions)
+    });
+}
+
+/// T33b1 check 5: a fresh daemon re-adopts the tree while the job still names
+/// it; the first daemon's teardown spares the tree and frees its hold.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fresh_daemon_re_adopts_the_background_tree_while_a_job_names_it() {
+    let sb = HomeSandbox::new();
+    let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
+    let (tree, sessions, _job) = background_pair(&sb, "bgp", "working");
+    let mut first = daemon_for(config);
+    tick_until(&mut first, "adopted the background tree", || {
+        adopted("bgp", &sessions)
+    });
+
+    drop(first);
+    assert!(tree.is_dir(), "the job keeps the tree past the daemon");
+    assert!(
+        !crate::runtime::has_live_marker(&crate::profile::ProfileName::from("bgp")),
+        "the old daemon's marker died with it"
+    );
+    assert_eq!(watchdog_threads("bgp"), 0, "its watchdog was joined");
+
+    let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
+    let mut second = daemon_for(config);
+    tick_until(&mut second, "re-adopted the background tree", || {
+        adopted("bgp", &sessions)
+    });
+}
+
+/// T33b1 check 6, the daemon half: once the last job naming the tree is gone
+/// (`claude rm` deletes its job dir), the daemon drops its hold and the pair
+/// is collected: no marker, no row, no watchdog, no tree.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_daemon_releases_the_background_tree_once_its_last_job_is_removed() {
+    let sb = HomeSandbox::new();
+    let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
+    let (tree, sessions, job) = background_pair(&sb, "bgp", "working");
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "adopted the background tree", || {
+        adopted("bgp", &sessions)
+    });
+
+    std::fs::remove_dir_all(&job).expect("claude rm");
+    tick_until(&mut daemon, "released the background tree", || {
+        !tree.exists() && !sessions.exists()
+    });
+    assert_eq!(rows_of("bgp").len(), 0, "the row went with the hold");
+    assert_eq!(watchdog_threads("bgp"), 0, "the watchdog was joined");
+}
+
+/// T33b1 N1 (cloudy 2026-10-22, option A), the daemon half: on a host that
+/// copies runtime trees the daemon never adopts a background tree, since its
+/// copy mirror would republish a removed job's record. The tree itself is
+/// left alone (a job still names it). Control: the same fixture adopts once
+/// the host links again, so the window is no slow adoption.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_daemon_never_adopts_a_background_tree_on_a_copy_host() {
+    let sb = HomeSandbox::new();
+    let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
+    let (tree, sessions, _job) = background_pair(&sb, "bgp", "working");
+    let mut daemon = daemon_for(config);
+    let name = crate::profile::ProfileName::from("bgp");
+
+    let fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let probes = crate::runtime::link_mode_probe_calls();
+    while std::time::Instant::now() < deadline {
+        daemon.tick();
+        assert_eq!(
+            crate::runtime::link_mode_probe_calls(),
+            probes,
+            "the tick must never probe the link mode; the adoption worker probes under the lock"
+        );
+        assert!(
+            !crate::runtime::has_live_marker(&name),
+            "the daemon claimed a marker on a copy host"
+        );
+        assert_eq!(
+            rows_of("bgp").len(),
+            0,
+            "a row was registered on a copy host"
+        );
+        assert_eq!(
+            watchdog_threads("bgp"),
+            0,
+            "a watchdog started on a copy host"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(tree.is_dir(), "the job's tree is left alone");
+    drop(fake_mode);
+
+    tick_until(
+        &mut daemon,
+        "adopted the background tree once the host links",
+        || adopted("bgp", &sessions),
+    );
+}
+
+/// F10: on a copy host the in-lock floor's refusal is a designed skip, not an
+/// adoption failure: the daemon logs it once and re-queues the account at most
+/// once (one re-check, so a link-mode flip is adopted), so no retry streak
+/// re-takes the rotation lock and the state flock every interval while a job
+/// names the tree. The `adoption_attempts` seam pins exactly two queues past
+/// the 10 s re-check.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_daemon_logs_the_copy_host_refusal_once_and_requeues_at_most_once() {
+    let sb = HomeSandbox::new();
+    let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
+    let (_tree, _sessions, _job) = background_pair(&sb, "bgp", "working");
+    let mut daemon = daemon_for(config);
+    let name = crate::profile::ProfileName::from("bgp");
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    while std::time::Instant::now() < deadline {
+        daemon.tick();
+        assert!(
+            !crate::runtime::has_live_marker(&name),
+            "the daemon claimed a marker on a copy host"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(fake_mode);
+    drop(capture);
+
+    let snap = lines.snapshot();
+    let refusals: Vec<&str> = snap
+        .iter()
+        .map(String::as_str)
+        .filter(|line| line.contains("will not adopt 'bgp'"))
+        .collect();
+    assert_eq!(
+        refusals,
+        vec![
+            "clauth daemon: will not adopt 'bgp' background tree on this host: it \
+             copies runtime trees instead of linking them"
+        ],
+        "the copy-host refusal is logged exactly once, with the skip copy"
+    );
+    assert!(
+        !snap
+            .iter()
+            .any(|line| line.contains("adopting 'bgp' background tree failed")),
+        "the copy-host refusal never reads as an adoption failure"
+    );
+    assert_eq!(
+        daemon.background.adoption_attempts, 2,
+        "one adoption attempt plus exactly one re-check, never a backoff retry"
+    );
+}
+
+/// A NEW job naming the tree re-arms the copy-host re-check after the account's
+/// job set emptied: the copy-host gate is pruned beside the re-check timer, so
+/// a later `--bg` job (after Developer Mode is turned on, say) gets one fresh
+/// attempt instead of being skipped for the daemon's life.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_new_background_job_re_arms_the_copy_host_recheck() {
+    let sb = HomeSandbox::new();
+    let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
+    let (tree, _sessions, job) = background_pair(&sb, "bgp", "working");
+    let mut daemon = daemon_for(config);
+
+    let fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    while std::time::Instant::now() < deadline {
+        daemon.tick();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        daemon.background.adoption_attempts, 2,
+        "one adoption attempt plus exactly one re-check on a copy host"
+    );
+
+    // The job set empties: the copy-host gate and its timer are pruned, so the
+    // next job naming the tree gets one fresh attempt.
+    std::fs::remove_dir_all(&job).expect("claude rm");
+    daemon.tick();
+    crate::testutil::write_claude_job_in(sb.home(), "c0ffee00", &tree, "working", None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && daemon.background.adoption_attempts < 3 {
+        daemon.tick();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        daemon.background.adoption_attempts, 3,
+        "a new job re-arms the copy-host re-check, exactly once"
+    );
+    drop(fake_mode);
+}
+
+/// A NEW job beside an OLDER one (the job-id set changed without emptying)
+/// re-arms the copy-host re-check, so once the host links and the set gains a
+/// job, the daemon adopts within the re-check window instead of skipping the
+/// account until a daemon restart.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_new_job_beside_an_older_one_re_arms_the_copy_host_recheck() {
+    let sb = HomeSandbox::new();
+    let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
+    let (tree, sessions, _job) = background_pair(&sb, "bgp", "working");
+    let mut daemon = daemon_for(config);
+
+    // Copy host until the one re-check is spent, then link again.
+    let fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    while std::time::Instant::now() < deadline && daemon.background.adoption_attempts < 2 {
+        daemon.tick();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        daemon.background.adoption_attempts, 2,
+        "one adoption attempt plus exactly one re-check on a copy host"
+    );
+    drop(fake_mode);
+
+    crate::testutil::write_claude_job_in(sb.home(), "c0ffee00", &tree, "working", None);
+    tick_until(
+        &mut daemon,
+        "adopted the background tree once the host links and a new job joins \
+         an older one still naming it",
+        || adopted("bgp", &sessions),
+    );
+}
+
+/// An account whose profile dir is unreadable must not queue an adoption: the
+/// build reads its config and probes its link mode under that dir, so queueing
+/// it would start a failing backoff streak that re-takes the locks every
+/// interval. Drives the reconcile pass directly: the full tick's config reload
+/// re-tightens a chmod-000 profile dir the daemon owns, so only a direct
+/// reconcile pins the scoped unreadable the fix skips.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_daemon_does_not_retry_an_account_whose_profile_dir_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
+    let profile =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("bgp")).expect("dir");
+    // A leftover background pair with no job: the unreadable profile dir reads
+    // as "spares" fail-closed, so without the skip it would queue an adoption.
+    std::fs::create_dir_all(profile.join("runtime-bg")).expect("mkdir tree");
+    std::fs::create_dir_all(profile.join("sessions-bg")).expect("mkdir sessions");
+    let mut daemon = daemon_for(config);
+
+    std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    if std::fs::read_dir(&profile).is_ok() {
+        let _ = std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700));
+        return;
+    }
+    for _ in 0..10 {
+        daemon
+            .background
+            .reconcile(vec![crate::profile::ProfileName::from("bgp")], Vec::new());
+        assert_eq!(
+            daemon.background.adoption_attempts, 0,
+            "an unreadable profile dir must not queue an adoption"
+        );
+    }
+    let _ = std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700));
+}
+
+/// The daemon's tick thread must never probe the link mode: the probe writes
+/// shared dotfiles, so a tick-side probe would race every locked `clauth start`
+/// probe on the same account. The adoption worker probes under the state lock
+/// instead; this pins the tick through a thread-local call counter.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_daemon_tick_never_probes_the_link_mode() {
+    let sb = HomeSandbox::new();
+    let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
+    let (_tree, sessions, _job) = background_pair(&sb, "bgp", "working");
+    let mut daemon = daemon_for(config);
+
+    let before = crate::runtime::link_mode_probe_calls();
+    daemon.tick();
+    assert_eq!(
+        crate::runtime::link_mode_probe_calls(),
+        before,
+        "the tick must never probe the link mode; the adoption worker probes under the lock"
+    );
+    tick_until(&mut daemon, "adopted the background tree", || {
+        adopted("bgp", &sessions)
+    });
+}
+
+/// T33b1 check 8: on macOS the daemon's background hold alone never blocks a
+/// rotation (a stopped job is not mid-task); an unfinished job on the tree
+/// does, through the job term.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_daemons_background_hold_alone_never_blocks_a_macos_rotation() {
+    let sb = HomeSandbox::new();
+    let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
+    let (tree, sessions, job) = background_pair(&sb, "bgp", "stopped");
+    let name = crate::profile::ProfileName::from("bgp");
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "adopted the background tree", || {
+        adopted("bgp", &sessions)
+    });
+
+    assert!(
+        !crate::runtime::rotation_blocked_on(&name, true),
+        "the daemon's hold over a stopped job's tree leaves rotation free"
+    );
+    std::fs::remove_dir_all(&job).expect("drop the stopped job");
+    crate::testutil::write_claude_job_in(sb.home(), "c7d2e1f0", &tree, "working", None);
+    assert!(
+        crate::runtime::rotation_blocked_on(&name, true),
+        "a working job on the tree blocks rotation"
+    );
+}
+
+/// T33b1 check 9: the adopted tree is shared-flavour, so the
+/// `sessions/<pid>.json` record a background session writes through it lands
+/// in the global store, where the bridge resolver looks for a pid no row
+/// joins.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_adopted_background_tree_writes_session_records_to_the_global_store() {
+    let sb = HomeSandbox::new();
+    std::fs::create_dir_all(claude_dir().expect("claude dir").join("sessions"))
+        .expect("global sessions store");
+    let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
+    let (tree, sessions, _job) = background_pair(&sb, "bgp", "working");
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "adopted the background tree", || {
+        adopted("bgp", &sessions)
+    });
+
+    let record = tree.join("sessions").join("4242.json");
+    std::fs::write(&record, b"{}").expect("a record written through the tree");
+    assert!(
+        claude_dir()
+            .expect("claude dir")
+            .join("sessions")
+            .join("4242.json")
+            .is_file(),
+        "the record is in the global store"
+    );
+}
+
+/// F6: a worker that died (a panic) is reported once and stops all queueing, so
+/// nothing falls back to running an acquire or a teardown on the tick thread.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_lost_background_hold_worker_is_reported_and_stops_the_tick_queueing() {
+    let _home = HomeSandbox::new();
+    let mut holds = super::BackgroundHolds::new();
+    // Closing the only work sender ends the worker loop; its done sender drops
+    // with it, which is exactly the shape a panic leaves.
+    drop(holds.work.take());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !holds.worker_gone {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lost worker was never detected"
+        );
+        holds.reconcile(Vec::new(), Vec::new());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(holds.work.is_none(), "no sender is left to hand work to");
+    assert!(holds.pending.is_empty(), "no adoption stays in flight");
+    // A tick that would otherwise adopt must not panic or queue anything.
+    holds.reconcile(vec![crate::profile::ProfileName::from("bgp")], Vec::new());
+    assert!(holds.held.is_empty());
+}
+
+/// F7: a failing adoption backs off per account and its line logs once per
+/// streak, not once per tick.
+#[test]
+fn an_adoption_failure_backs_off_and_logs_once_per_streak() {
+    let mut retry = std::collections::HashMap::new();
+    let name = crate::profile::ProfileName::from("bgp");
+    let first = super::note_adoption_failure(&mut retry, &name, "boom", 1_000)
+        .expect("the first failure of a streak is news");
+    assert!(
+        first.contains("adopting 'bgp' background tree failed"),
+        "the line names the account: {first}"
+    );
+    assert_eq!(
+        retry.get(&name).map(|failure| failure.not_before_ms),
+        Some(1_000 + super::adopt_backoff_ms(1))
+    );
+    assert!(
+        super::note_adoption_failure(&mut retry, &name, "boom", 20_000).is_none(),
+        "an identical failure repeating on the schedule stays silent"
+    );
+    assert!(
+        super::note_adoption_failure(&mut retry, &name, "different", 40_000).is_some(),
+        "a different failure is news"
+    );
+}
+
+/// F7/N7: the first wait is the stated minimum, the rest doubles, and the cap
+/// holds.
+#[test]
+fn the_adoption_backoff_doubles_from_a_floor_and_caps() {
+    assert_eq!(
+        super::adopt_backoff_ms(1),
+        super::ADOPT_BACKOFF_MIN_MS,
+        "one failure waits the stated minimum"
+    );
+    assert_eq!(super::adopt_backoff_ms(2), super::ADOPT_BACKOFF_MIN_MS * 2);
+    assert_eq!(super::adopt_backoff_ms(3), super::ADOPT_BACKOFF_MIN_MS * 4);
+    assert_eq!(
+        super::adopt_backoff_ms(u32::MAX),
+        super::ADOPT_BACKOFF_MAX_MS,
+        "the cap holds however long the streak runs"
+    );
+}
+
+/// N4: a release that cannot be handed to the worker puts the runtime back under
+/// its hold — the marker stays held, and only the daemon's own drop may tear it
+/// down. The receiver is dropped while a sender still lives, the exact window
+/// `hold_back` covers.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_release_send_puts_the_runtime_back_under_its_hold() {
+    let sb = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("bghold");
+    persist(
+        vec![profile_with_creds("bghold", "tok-bghold")],
+        None,
+        60_000,
+    );
+    let (_tree, sessions, job) = background_pair(&sb, "bghold", "working");
+    let runtime = crate::runtime::ProfileRuntime::acquire_background(
+        &name,
+        crate::runtime::BackgroundHold::Daemon,
+        &[],
+        None,
+    )
+    .expect("adopt the background tree");
+    let marker = crate::live_sessions::list()
+        .into_iter()
+        .find(|row| row.start_profile == "bghold")
+        .map(|row| sessions.join(row.session_id))
+        .expect("the hold registered a row");
+    assert!(
+        marker.is_file(),
+        "the hold claims its marker before release"
+    );
+
+    let mut holds = super::BackgroundHolds::new();
+    holds.held.insert(name.clone(), runtime);
+    // The worker is gone: its work receiver is closed and its done channel can
+    // never report anything, so the tick reaches the release it cannot hand off.
+    let (work_tx, work_rx) = crossbeam_channel::unbounded::<super::BackgroundWork>();
+    drop(work_rx);
+    holds.work = Some(work_tx);
+    holds.done = crossbeam_channel::never();
+    std::fs::remove_dir_all(&job).expect("the job is gone from the store");
+
+    holds.reconcile(Vec::new(), Vec::new());
+
+    assert!(holds.worker_gone, "the dead worker is detected");
+    assert!(
+        holds.held.contains_key(&name),
+        "a release that could not be handed off stays under its hold"
+    );
+    assert!(
+        marker.is_file(),
+        "the hold's marker is not torn down on the tick thread"
+    );
+}
+
+/// N5/N7: the tick's own backoff gate. A failing adoption is not retried inside
+/// its window, and its streak goes when the job that named the tree does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failing_adoption_backs_off_on_the_tick_and_its_streak_clears_with_the_job() {
+    let sb = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("bgflap");
+    let (_tree, _sessions, job) = background_pair(&sb, "bgflap", "working");
+    persist(
+        vec![profile_with_creds("bgflap", "tok-bgflap")],
+        None,
+        60_000,
+    );
+    // Every adoption attempt fails deterministically, before it holds anything.
+    std::fs::write(
+        crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join("config.toml"),
+        "[[[",
+    )
+    .expect("corrupt the profile config");
+
+    let mut holds = super::BackgroundHolds::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while holds
+        .retry
+        .get(&name)
+        .is_none_or(|failure| failure.attempts == 0)
+    {
+        holds.reconcile(vec![name.clone()], Vec::new());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the failing adoption was never recorded"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        holds.retry.get(&name).map(|failure| failure.attempts),
+        Some(1),
+        "one failing attempt is one failure"
+    );
+    // Hold the window open for the whole loop, so the gate (not the clock) is
+    // what the next assertion measures.
+    holds
+        .retry
+        .get_mut(&name)
+        .expect("the streak was recorded")
+        .not_before_ms = u64::MAX;
+
+    for _ in 0..100 {
+        holds.reconcile(vec![name.clone()], Vec::new());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        holds.retry.get(&name).map(|failure| failure.attempts),
+        Some(1),
+        "a tick inside the backoff window does not retry the adoption"
+    );
+
+    std::fs::remove_dir_all(&job).expect("the job is gone from the store");
+    holds.reconcile(vec![name.clone()], Vec::new());
+    assert!(
+        !holds.retry.contains_key(&name),
+        "a streak whose job has gone must not delay the next adoption"
+    );
+}

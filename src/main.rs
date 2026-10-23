@@ -777,7 +777,7 @@ fn cmd_start(
     if explain_only {
         // Run the same refusals a real launch runs, so `--explain` answers what
         // a start would do rather than naming a target it would then reject.
-        start::admit(&config, &name, isolation, follows_chain)?;
+        start::admit(&config, &name, isolation, follows_chain, rest)?;
         outln!("{}", format::start_pick_line(name.as_str(), &demand));
         if !rows.is_empty() {
             outln!("{}", format::render_start_walk(&rows, pick));

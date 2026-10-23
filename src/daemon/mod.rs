@@ -1114,6 +1114,393 @@ fn entry_fresh(entry: &status_json::ProfileEntry) -> bool {
     !entry.stale && entry.fetch_status.as_deref() == Some(fresh)
 }
 
+/// The daemon's holds on the per-account background trees, and the worker that
+/// enters and leaves them off the tick thread.
+///
+/// The tick only derives which accounts need adopting or releasing — one job
+/// store read plus one canonicalised lookup per account — and hands the work to
+/// the worker, which may block on the rotation lock and the state flock for as
+/// long as `acquire` and teardown legitimately take. The tick thread itself must
+/// never wait: the run loop's watchdog aborts it at [`WATCHDOG_DEADLINE`]. When
+/// the worker is gone (it panicked), the tick logs once and stops queueing —
+/// never falling back to running an acquire or a teardown inline.
+struct BackgroundHolds {
+    /// One hold per account whose `runtime-bg` a Claude Code job names.
+    held: HashMap<ProfileName, crate::runtime::ProfileRuntime>,
+    /// Accounts an adoption is in flight for, so a later tick does not queue a
+    /// second one.
+    pending: HashSet<ProfileName>,
+    /// One entry per account whose last adoption failed: the retry gate and the
+    /// error the current failure streak already announced.
+    retry: HashMap<ProfileName, AdoptionFailure>,
+    /// Accounts refused on this host: their tree's link mode read as copy on
+    /// an adoption attempt, so no background job can be adopted there. The
+    /// value is the set of job ids naming the tree at the last arm, so a
+    /// change to that set re-arms one re-check; it drives the one-time refusal
+    /// log line and is pruned when the account's job set empties.
+    copy_host: HashMap<ProfileName, HashSet<String>>,
+    /// The next tick at which a refused account may be re-attempted ONCE, so a
+    /// link mode that flipped to real is adopted. Re-armed when the set of job
+    /// ids naming the tree changes.
+    copy_host_next: HashMap<ProfileName, u64>,
+    /// Test seam: how many adoption attempts this daemon queued, so a copy-host
+    /// refusal is pinned as "no 5 s backoff retry" (exactly one attempt past
+    /// the 5 s mark).
+    #[cfg(test)]
+    adoption_attempts: usize,
+    work: Option<crossbeam_channel::Sender<BackgroundWork>>,
+    done: crossbeam_channel::Receiver<BackgroundDone>,
+    /// Set once the worker's channels report it gone: nothing more is queued,
+    /// and no hold is ever torn down on the tick thread.
+    worker_gone: bool,
+}
+
+enum BackgroundWork {
+    Adopt {
+        name: ProfileName,
+        stale_env_keys: Vec<String>,
+    },
+    /// Handed over rather than dropped on the tick thread: teardown takes the
+    /// state flock and joins a watchdog.
+    Release(crate::runtime::ProfileRuntime),
+}
+
+enum BackgroundDone {
+    Adopted(
+        ProfileName,
+        Box<anyhow::Result<crate::runtime::ProfileRuntime>>,
+    ),
+}
+
+/// How long one account waits after an adoption failure, and the error the
+/// current streak logged. Doubling from [`ADOPT_BACKOFF_MIN_MS`], capped at
+/// [`ADOPT_BACKOFF_MAX_MS`].
+struct AdoptionFailure {
+    attempts: u32,
+    not_before_ms: u64,
+    error: String,
+}
+
+const ADOPT_BACKOFF_MIN_MS: u64 = 5_000;
+const ADOPT_BACKOFF_MAX_MS: u64 = 300_000;
+
+/// How long a copy-host-refused account waits before its ONE re-attempt: long
+/// enough to skip the 5 s backoff's first retry, short enough that a link-mode
+/// flip (Developer Mode toggled) is adopted within a tick pass. A second
+/// refusal does not re-arm it; only a job set that emptied and a new job does.
+const COPY_HOST_RECHECK_MS: u64 = 10_000;
+
+/// The wait after `attempts` consecutive adoption failures: the first wait is
+/// the minimum, each further failure doubles it, capped, so a persistently
+/// failing account stops taking the rotation lock and the state flock once per
+/// tick.
+fn adopt_backoff_ms(attempts: u32) -> u64 {
+    ADOPT_BACKOFF_MIN_MS
+        .saturating_mul(1u64 << attempts.saturating_sub(1).min(6))
+        .min(ADOPT_BACKOFF_MAX_MS)
+}
+
+/// Record one failed adoption for `name. Returns the line to log when this is
+/// the streak's first failure or a DIFFERENT error; an identical failure
+/// repeating on the backoff schedule stays silent.
+fn note_adoption_failure(
+    retry: &mut HashMap<ProfileName, AdoptionFailure>,
+    name: &ProfileName,
+    error: &str,
+    now_ms: u64,
+) -> Option<String> {
+    match retry.get_mut(name) {
+        Some(failure) => {
+            failure.attempts += 1;
+            failure.not_before_ms = now_ms.saturating_add(adopt_backoff_ms(failure.attempts));
+            let news = failure.error != error;
+            if news {
+                failure.error = error.to_string();
+            }
+            news.then(|| {
+                format!("clauth daemon: adopting '{name}' background tree failed again: {error}")
+            })
+        }
+        None => {
+            retry.insert(
+                name.clone(),
+                AdoptionFailure {
+                    attempts: 1,
+                    not_before_ms: now_ms.saturating_add(adopt_backoff_ms(1)),
+                    error: error.to_string(),
+                },
+            );
+            Some(format!(
+                "clauth daemon: adopting '{name}' background tree failed: {error}"
+            ))
+        }
+    }
+}
+
+impl BackgroundHolds {
+    fn new() -> Self {
+        let (work_tx, work_rx) = crossbeam_channel::unbounded::<BackgroundWork>();
+        let (done_tx, done_rx) = crossbeam_channel::unbounded::<BackgroundDone>();
+        #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
+        std::thread::Builder::new()
+            .name("clauth-bg-holds".to_string())
+            .spawn(move || {
+                while let Ok(item) = work_rx.recv() {
+                    match item {
+                        BackgroundWork::Adopt {
+                            name,
+                            stale_env_keys,
+                        } => {
+                            let outcome = crate::runtime::ProfileRuntime::acquire_background(
+                                &name,
+                                crate::runtime::BackgroundHold::Daemon,
+                                &stale_env_keys,
+                                None,
+                            );
+                            if done_tx
+                                .send(BackgroundDone::Adopted(name, Box::new(outcome)))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        BackgroundWork::Release(runtime) => drop(runtime),
+                    }
+                }
+            })
+            .expect("failed to spawn the background-hold worker");
+        Self {
+            held: HashMap::new(),
+            pending: HashSet::new(),
+            retry: HashMap::new(),
+            copy_host: HashMap::new(),
+            copy_host_next: HashMap::new(),
+            #[cfg(test)]
+            adoption_attempts: 0,
+            work: Some(work_tx),
+            done: done_rx,
+            worker_gone: false,
+        }
+    }
+
+    /// Drain finished adoptions, then adopt every account whose background tree
+    /// a job names and release every hold no job names any more. Never takes
+    /// the rotation lock or the state flock.
+    fn reconcile(&mut self, names: Vec<ProfileName>, stale_env_keys: Vec<String>) {
+        let now = crate::usage::now_ms();
+        self.drain_adoptions(now);
+        let Some(work) = self.work.clone() else {
+            return;
+        };
+        let jobs = crate::claude_jobs::job_trees();
+        let released: Vec<ProfileName> = self
+            .held
+            .iter()
+            .filter(|(name, _)| {
+                crate::runtime::background_runtime_tree(name).is_ok_and(|tree| !jobs.spares(&tree))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in released {
+            let Some(runtime) = self.held.remove(&name) else {
+                continue;
+            };
+            if let Err(err) = work.send(BackgroundWork::Release(runtime)) {
+                self.hold_back(err.into_inner(), name);
+                self.worker_lost();
+                return;
+            }
+            self.retry.remove(&name);
+        }
+        // An unreadable store names every tree, so it cannot say which accounts
+        // to adopt; leaving the holds as they are is the fail-closed direction
+        // (nothing was released above either).
+        if matches!(jobs, crate::claude_jobs::JobTrees::Unreadable { .. }) {
+            return;
+        }
+        // A streak whose job has gone says nothing about the next one: clearing
+        // it here keeps a stale backoff from delaying an account that is being
+        // adopted again. The copy-host gate and its one-shot re-check timer are
+        // pruned the same way, so a job set that emptied and a NEW job naming
+        // the tree re-arms one fresh re-check.
+        self.retry.retain(|name, _| {
+            crate::runtime::background_runtime_tree(name).is_ok_and(|tree| jobs.spares(&tree))
+        });
+        self.copy_host.retain(|name, _| {
+            crate::runtime::background_runtime_tree(name).is_ok_and(|tree| jobs.spares(&tree))
+        });
+        self.copy_host_next.retain(|name, _| {
+            crate::runtime::background_runtime_tree(name).is_ok_and(|tree| jobs.spares(&tree))
+        });
+        // A refused account re-arms its ONE re-check whenever the set of job
+        // ids naming its tree changes — a new job beside an older one, or a
+        // removed one — not only when the set emptied. Storing the set at each
+        // arm keeps it at most one re-check per distinct set, so a copy host
+        // never turns into a backoff streak while a job keeps naming the tree.
+        for (name, seen) in &mut self.copy_host {
+            let Ok(tree) = crate::runtime::background_runtime_tree(name) else {
+                continue;
+            };
+            let current = jobs.job_ids_naming(&tree);
+            if current != *seen {
+                *seen = current;
+                self.copy_host_next
+                    .insert(name.clone(), now.saturating_add(COPY_HOST_RECHECK_MS));
+            }
+        }
+        for name in names {
+            if self.held.contains_key(&name) || self.pending.contains(&name) {
+                continue;
+            }
+            // A copy-host refusal skips the account until its one scheduled
+            // re-check (a link-mode flip or a job-set change) or until its job
+            // set emptied and a new job re-armed it.
+            if self.copy_host.contains_key(&name) {
+                let Some(next) = self.copy_host_next.get(&name) else {
+                    continue;
+                };
+                if now < *next {
+                    continue;
+                }
+                // The re-check is due: drop the gate so this tick re-queues the
+                // adoption and the worker re-probes the mode under the lock.
+                self.copy_host_next.remove(&name);
+            }
+            if self
+                .retry
+                .get(&name)
+                .is_some_and(|failure| now < failure.not_before_ms)
+            {
+                continue;
+            }
+            let Ok(tree) = crate::runtime::background_runtime_tree(&name) else {
+                continue;
+            };
+            // An account whose profile dir the job reader could not enumerate
+            // cannot be adopted: the build reads its config and probes its link
+            // mode there, so queueing it would start a failing backoff streak
+            // that re-takes the locks every interval. Skipped, lock-free, and
+            // retried the moment the dir reads again.
+            if tree
+                .parent()
+                .is_some_and(|profile| jobs.profile_dir_unreadable(profile))
+            {
+                continue;
+            }
+            if !jobs.spares(&tree) {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                self.adoption_attempts += 1;
+            }
+            match work.send(BackgroundWork::Adopt {
+                name: name.clone(),
+                stale_env_keys: stale_env_keys.clone(),
+            }) {
+                Ok(()) => {
+                    self.pending.insert(name);
+                }
+                Err(_) => {
+                    self.worker_lost();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Take every finished adoption off the channel. A worker that exited (a
+    /// panic) disconnects the channel; that is reported once and stops all
+    /// further queueing rather than being retried forever.
+    fn drain_adoptions(&mut self, now_ms: u64) {
+        loop {
+            match self.done.try_recv() {
+                Ok(BackgroundDone::Adopted(name, outcome)) => {
+                    self.pending.remove(&name);
+                    match *outcome {
+                        Ok(runtime) => {
+                            self.retry.remove(&name);
+                            self.held.insert(name, runtime);
+                        }
+                        Err(e) => {
+                            let copy_host = e
+                                .downcast_ref::<crate::runtime::CopyHostBackgroundRefusal>()
+                                .is_some();
+                            if copy_host {
+                                // A designed refusal, not an adoption failure:
+                                // log once, then let the tick arm ONE re-check
+                                // (never the backoff's growing streak) when it
+                                // sees the job-id set naming the tree, so a
+                                // link-mode flip or a job-set change is adopted
+                                // while a job keeps naming the tree. A second
+                                // refusal neither re-logs nor re-arms it.
+                                if !self.copy_host.contains_key(&name) {
+                                    logline!(
+                                        "clauth daemon: will not adopt '{name}' background \
+                                         tree on this host: it copies runtime trees instead \
+                                         of linking them"
+                                    );
+                                    self.copy_host.insert(name.clone(), HashSet::new());
+                                }
+                            } else if let Some(line) = note_adoption_failure(
+                                &mut self.retry,
+                                &name,
+                                &format!("{e:#}"),
+                                now_ms,
+                            ) {
+                                logline!("{line}");
+                            }
+                        }
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.worker_lost();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The worker is gone: log once, drop the sender so no later tick can hand
+    /// it work, and keep every hold where it is. Nothing here may tear a hold
+    /// down — a teardown joins a watchdog and takes the state flock, which is
+    /// exactly what the tick thread must not do.
+    fn worker_lost(&mut self) {
+        if self.worker_gone {
+            return;
+        }
+        self.worker_gone = true;
+        logline!(
+            "clauth daemon: the background-hold worker stopped; no background tree will be \
+             adopted or released until the daemon restarts"
+        );
+        self.pending.clear();
+        self.work.take();
+    }
+
+    /// Put a runtime whose release could not be handed to the worker back under
+    /// its hold, so the marker stays held and only the daemon's own drop tears
+    /// it down.
+    fn hold_back(&mut self, item: BackgroundWork, name: ProfileName) {
+        if let BackgroundWork::Release(runtime) = item {
+            self.held.insert(name, runtime);
+        }
+    }
+}
+
+impl Drop for BackgroundHolds {
+    fn drop(&mut self) {
+        // Close the work channel (the worker exits after its current item) and
+        // tear each hold down on THIS thread, so a daemon dropping in-process
+        // releases its markers before its own process state ends. A release
+        // already handed to the worker finishes there; nothing waits on it.
+        drop(self.work.take());
+        let held = std::mem::take(&mut self.held);
+        drop(held);
+    }
+}
+
 /// Owns the shared `Arc` stores (cloned into the scheduler) plus main-loop-only
 /// state. Only the main thread touches `self`; the scheduler holds `Arc` clones
 /// of the individual stores.
@@ -1201,6 +1588,8 @@ struct Daemon {
     /// The per-proxy slots every proxy supervisor publishes into, read by
     /// every status write as the `proxies` array.
     proxies: proxies::ProxySlots,
+    /// The daemon's holds on the per-account background trees.
+    background: BackgroundHolds,
 }
 
 impl Daemon {
@@ -1270,6 +1659,7 @@ impl Daemon {
             status_path,
             gateway: gateway::new_handle(),
             proxies: proxies::new_slots(),
+            background: BackgroundHolds::new(),
         }
     }
 

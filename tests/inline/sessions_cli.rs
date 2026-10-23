@@ -1174,6 +1174,8 @@ fn registry_row(sid: &str, profile: &str, harness: crate::harness::Harness) {
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     };
     crate::live_sessions::register(&row).expect("register row");
 }
@@ -1274,6 +1276,60 @@ fn switch_refuses_a_dead_session_row() {
         "a dead row is a runtime error, not a usage error"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
+}
+
+/// A background session is fixed-account (cloudy's T33b1 ruling): both its
+/// rows, the daemon's hold and a launcher's, refuse with the copy cloudy
+/// approved 2026-10-22, and no intent is written for the executor to refuse.
+#[test]
+fn switch_refuses_a_background_session_row() {
+    for hold in [true, false] {
+        let _sb = HomeSandbox::new();
+        let row = crate::live_sessions::LiveSession {
+            session_id: "4242-0".to_string(),
+            start_profile: "work".to_string(),
+            harness: crate::harness::Harness::Claude,
+            pid: 4242,
+            claude_pid: None,
+            launch_families: None,
+            started_at: 0,
+            cwd: None,
+            isolated: false,
+            follows_chain: false,
+            intended_member: None,
+            chain_cursor: None,
+            credit_leave: false,
+            credit_leave_aware: false,
+            current_member: None,
+            last_swap_at: None,
+            launch_store: None,
+            is_delegate: false,
+            background: true,
+            background_hold: hold,
+        };
+        crate::live_sessions::register(&row).expect("register row");
+        let sessions = crate::profile::profile_dir(&crate::profile::ProfileName::from("work"))
+            .expect("profile dir")
+            .join("sessions-bg");
+        std::fs::create_dir_all(&sessions).expect("sessions-bg");
+        let marker = crate::runtime::open_pid_file(&sessions.join("4242-0")).expect("marker");
+        marker.lock().expect("hold the marker");
+
+        let err = run_switch("4242-0", "spare").expect_err("a background row must be refused");
+        assert_eq!(
+            err.to_string(),
+            "session '4242-0' is a background session and cannot be switched from 'work'",
+            "hold: {hold}"
+        );
+        assert_eq!(crate::exit_code(Err(err)), 1);
+        assert!(
+            crate::live_sessions::get("4242-0")
+                .expect("row")
+                .intended_member
+                .is_none(),
+            "hold: {hold}: a refused swap writes nothing"
+        );
+    }
 }
 
 #[test]

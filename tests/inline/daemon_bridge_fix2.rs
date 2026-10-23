@@ -309,6 +309,8 @@ fn register_self_row(session_id: &str) {
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     })
     .expect("register");
 }
@@ -361,6 +363,74 @@ fn the_production_resolver_reads_the_fake_tree() {
     .expect("record");
     let resolved = production_resolver()(pid).expect("resolve from the fake tree");
     assert_eq!(resolved.session_id, sid);
+    assert_eq!(resolved.proc_start, start);
+}
+
+/// A background row resolves to the account's fixed `runtime-bg`, never a
+/// per-session tree: a `clauth start <p> -- --bg` launcher's session record and
+/// the daemon watchdog's tree both live there, and no per-session tree exists
+/// for the row to find.
+/// A background row resolves to the account's fixed `runtime-bg` through the
+/// SB-5 parent arm — the shape production has: a `claude --bg` child's parent is
+/// the `clauth start` holding the launcher row, and that row is a background
+/// row with no hold flag. The daemon's own hold is never a bridge peer, so it is
+/// deliberately not posed here.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_production_resolver_reads_a_background_rows_tree() {
+    let _home = HomeSandbox::new();
+    let mut peer = std::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("the peer child");
+    let peer_pid = peer.id();
+    let parent = std::process::id();
+    let stat = std::fs::read_to_string(format!("/proc/{peer_pid}/stat")).expect("stat");
+    let start = stat
+        .rsplit_once(')')
+        .expect("comm")
+        .1
+        .split_whitespace()
+        .nth(19)
+        .expect("field 22")
+        .to_string();
+    crate::live_sessions::register(&crate::live_sessions::LiveSession {
+        session_id: format!("{parent}-0"),
+        start_profile: "alpha".to_string(),
+        pid: parent,
+        claude_pid: None,
+        launch_families: None,
+        started_at: 0,
+        cwd: None,
+        isolated: false,
+        follows_chain: false,
+        intended_member: None,
+        harness: crate::harness::Harness::Claude,
+        chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
+        current_member: None,
+        last_swap_at: None,
+        launch_store: None,
+        is_delegate: false,
+        background: true,
+        background_hold: false,
+    })
+    .expect("register the launcher row");
+    let _launch = crate::daemon::bridge::LaunchOverride::pose(parent);
+    let profile = crate::profile::ProfileName::from("alpha");
+    let tree = crate::runtime::background_runtime_tree(&profile).expect("tree");
+    let sessions = tree.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    std::fs::write(
+        sessions.join(format!("{peer_pid}.json")),
+        format!(r#"{{"sessionId":"4242-0","pid":{peer_pid},"procStart":"{start}"}}"#),
+    )
+    .expect("record");
+    let resolved = production_resolver()(peer_pid).expect("resolve from the background tree");
+    let _ = peer.kill();
+    let _ = peer.wait();
+    assert_eq!(resolved.session_id, "4242-0");
     assert_eq!(resolved.proc_start, start);
 }
 

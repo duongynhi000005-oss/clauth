@@ -224,6 +224,17 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
              its row is reaped by the next `clauth daemon` or `clauth resume`"
         );
     }
+    // A background session is fixed on its account: its tree is the account's
+    // one fixed pair, shared by every Claude Code job there, so a move would
+    // bill another account under a running job. Refused before any profile
+    // resolution and before any intent is written — the executor refuses the
+    // same shape as its last line of defence.
+    if row.background {
+        anyhow::bail!(
+            "session '{sid}' is a background session and cannot be switched from '{}'",
+            row.start_profile
+        );
+    }
 
     let config = load_config()?;
     let canonical = resolve_profile_name(&config, profile)?;

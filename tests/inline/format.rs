@@ -248,6 +248,19 @@ fn every_transient_cause_renders_its_own_copy() {
             names_next_step: true,
         },
         Row {
+            cause: Cause::BackgroundJobOnRotatingChain("work".to_string()),
+            bare: "'work' has a background session still on its rotating login; end it with claude stop to rotate",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::UnreadableJobStoreOnRotatingChain {
+                profile: "work".to_string(),
+                store: "~/.claude/jobs".to_string(),
+            },
+            bare: "can't read claude code's background job list (~/.claude/jobs), so 'work' is not rotated; retry in a moment",
+            names_next_step: true,
+        },
+        Row {
             cause: Cause::RotationLockHeld("work".to_string()),
             bare: "'work' has a token rotation in progress, retry in a moment",
             names_next_step: true,
@@ -325,6 +338,17 @@ fn only_the_relogin_causes_read_as_permanent() {
         (Cause::RotationLockUnavailable("work".to_string()), false),
         (Cause::SidecarWriteFailed("work".to_string()), false),
         (Cause::LiveSessionOnRotatingChain("work".to_string()), false),
+        (
+            Cause::BackgroundJobOnRotatingChain("work".to_string()),
+            false,
+        ),
+        (
+            Cause::UnreadableJobStoreOnRotatingChain {
+                profile: "work".to_string(),
+                store: "~/.claude/jobs".to_string(),
+            },
+            false,
+        ),
         (Cause::InternalLock, false),
         (Cause::PersistFailed("work".to_string()), false),
         (Cause::StateLockBusy("work".to_string()), false),

@@ -21,7 +21,7 @@ use signal_hook::iterator::{Handle as SignalHandle, Signals};
 use crate::logline::logline;
 use crate::out::errln;
 use crate::profile::{AppConfig, Profile, ProfileName};
-use crate::runtime::{Isolation, ProfileRuntime};
+use crate::runtime::{BackgroundHold, Isolation, ProfileRuntime};
 use crate::spinner::Spinner;
 
 #[cfg(unix)]
@@ -146,17 +146,21 @@ fn refuse_unless_chain_eligible(
 /// `cmd_start`'s explain/launch paths so `--explain` answers what a real launch
 /// would do. The disabled gate is the authoritative one: every caller inherits
 /// it here, before runtime acquire or spawn, so no caller can forget to check.
+/// The background refusals (an `--isolated` launch, or a copy host) run here
+/// too, so `--explain` refuses exactly what a launch would.
 pub(crate) fn admit<'a>(
     config: &'a AppConfig,
     name: &ProfileName,
     isolation: Isolation,
     follows_chain: bool,
+    claude_args: &[String],
 ) -> Result<&'a Profile> {
     crate::refuse_if_disabled(config, name)?;
     let profile = config.find(name).context("profile not found")?;
     if follows_chain {
         refuse_unless_chain_eligible(config, profile, isolation)?;
     }
+    refuse_background_start(name, isolation, follows_chain, claude_args)?;
     Ok(profile)
 }
 
@@ -513,6 +517,60 @@ pub(crate) fn launch_models_from(settings: Vec<String>, env: [Option<String>; 2]
     out
 }
 
+/// The Claude Code background flag in `claude_args`, either spelling, matched
+/// as a WHOLE argv word: its value is the flag itself, never a prefix of a
+/// model name or a prompt.
+fn background_flag(claude_args: &[String]) -> Option<&str> {
+    claude_args
+        .iter()
+        .map(String::as_str)
+        .find(|arg| *arg == "--bg" || *arg == "--background")
+}
+
+/// The refusals a background launch runs before any side effect, shared by
+/// [`admit`] (so `--explain` answers what a real launch would do) and every
+/// launch path through [`run`]. Order is load-bearing: the `--isolated`
+/// refusal is first, and the copy-host probe (the only leg that writes) is
+/// last, so a start refused for `--isolated` never materializes a profile dir.
+fn refuse_background_start(
+    name: &ProfileName,
+    isolation: Isolation,
+    follows_chain: bool,
+    claude_args: &[String],
+) -> Result<()> {
+    // An isolated tree has no shared background pair: the daemon holds the
+    // account's FIXED `runtime-bg`/`sessions-bg` only, so a session launched
+    // into a throwaway isolated tree would keep no watchdog after its launcher
+    // exits. Refused before the plugin preflight, so nothing spawns.
+    if isolation == Isolation::Isolated
+        && let Some(flag) = background_flag(claude_args)
+    {
+        anyhow::bail!(
+            "'{name}': {flag} cannot be combined with --isolated, since background sessions \
+             run in the account's shared background tree"
+        );
+    }
+
+    // The fixed background pair is a COPY on a host that cannot symlink, and a
+    // copied tree cannot follow a rotation that relinks the credentials a
+    // background session holds — it would outlive them — so a background launch
+    // is refused there before anything spawns or any tree is built. Only the
+    // background path (`!follows_chain`) builds the fixed pair; a
+    // `--with-fallback` launch is already refused on a copy host by
+    // `refuse_unless_chain_eligible`. The isolated refusal above stays first
+    // when both apply.
+    if !follows_chain
+        && let Some(flag) = background_flag(claude_args)
+        && crate::runtime::background_copy_host(name)?
+    {
+        anyhow::bail!(
+            "{}",
+            crate::runtime::copy_host_background_refusal(name.as_str(), flag)
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn run(
     config: &AppConfig,
     name: &ProfileName,
@@ -522,7 +580,7 @@ pub(crate) fn run(
     follows_chain: bool,
     announce: Option<&str>,
 ) -> Result<()> {
-    let profile = admit(config, name, isolation, follows_chain)?;
+    let profile = admit(config, name, isolation, follows_chain, claude_args)?;
 
     // Announced after the refusals, so a start that `admit` refuses never
     // announces first.
@@ -551,13 +609,25 @@ pub(crate) fn run(
 
     let runtime = {
         let _spinner = Spinner::start("clauth: preparing runtime");
-        ProfileRuntime::acquire(
-            profile,
-            isolation,
-            &stale_env_keys,
-            follows_chain,
-            crate::live_sessions::Launcher::Own,
-        )?
+        // A background launch lands on the account's one fixed tree, which the
+        // daemon adopts on its next tick. `--with-fallback` keeps its own
+        // per-launch tree: the fixed tree never follows the chain.
+        if background_flag(claude_args).is_some() && !follows_chain {
+            ProfileRuntime::acquire_background(
+                &profile.name,
+                BackgroundHold::Launcher,
+                &stale_env_keys,
+                background_flag(claude_args),
+            )?
+        } else {
+            ProfileRuntime::acquire(
+                profile,
+                isolation,
+                &stale_env_keys,
+                follows_chain,
+                crate::live_sessions::Launcher::Own,
+            )?
+        }
     };
     // A shared store `~/.claude` refused to create would otherwise fail
     // silently: surface the consequence once the spinner is off, the same

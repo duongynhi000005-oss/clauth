@@ -636,6 +636,87 @@ fn mirror_tree_propagates_runtime_edit_to_canonical() {
     );
 }
 
+/// T33b1 r4 F4 (cloudy 2026-10-22): on a copy host the mirror never carries
+/// `jobs/` either way — a tree's copy of a `claude rm`ed job would otherwise be
+/// published straight back into the store, and a store job copied into a tree
+/// would come back from it. Control: an ordinary file still crosses both ways.
+#[test]
+fn mirror_tree_never_carries_the_job_store_either_way() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(claude.join("jobs").join("aaaa0001")).expect("mkdir store job");
+    fs::write(
+        claude.join("jobs").join("aaaa0001").join("state.json"),
+        b"{}",
+    )
+    .expect("store job");
+    fs::create_dir_all(runtime.join("jobs").join("bbbb0002")).expect("mkdir tree job");
+    fs::write(
+        runtime.join("jobs").join("bbbb0002").join("state.json"),
+        b"{}",
+    )
+    .expect("tree job");
+    fs::write(claude.join("todos.json"), b"[]").expect("canonical control");
+    fs::write(runtime.join("notes.json"), b"[]").expect("runtime control");
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert!(
+        !claude.join("jobs").join("bbbb0002").exists(),
+        "a tree's job was published into the store"
+    );
+    assert!(
+        !runtime.join("jobs").join("aaaa0001").exists(),
+        "a store job was copied into the tree"
+    );
+    assert!(
+        runtime.join("todos.json").is_file() && claude.join("notes.json").is_file(),
+        "control: an ordinary file crosses both ways"
+    );
+}
+
+/// The build half of F4: a copy-host shared build never copies `jobs/` into the
+/// tree. Control: a sibling entry still arrives.
+#[test]
+fn a_copy_host_build_brings_no_job_store_into_the_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::create_dir_all(claude_home.join("jobs").join("aaaa0001")).expect("mkdir job");
+        fs::write(
+            claude_home.join("jobs").join("aaaa0001").join("state.json"),
+            b"{}",
+        )
+        .expect("job");
+        fs::create_dir_all(claude_home.join("plugins")).expect("mkdir plugins");
+        fs::write(claude_home.join("plugins").join("p.json"), b"{}").expect("plugin");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("copyhostjobs");
+        let canonical = tmp.path().join("creds.json");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("build");
+
+        assert!(
+            runtime.join("jobs").symlink_metadata().is_err(),
+            "the copy-host tree carries no job store"
+        );
+        assert!(
+            runtime.join("plugins").join("p.json").is_file(),
+            "control: the walk still copied a sibling entry"
+        );
+    });
+}
+
 #[test]
 fn mirror_tree_skips_top_level_settings_and_credentials() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2727,6 +2808,13 @@ fn a_shared_build_skips_a_store_that_is_not_a_usable_dir() {
         assert!(
             !runtime.join("jobs").is_dir(),
             "the tree gets no usable jobs store"
+        );
+        // On a linking host the walk links an unusable entry as it stands,
+        // `jobs` included: only a copy-host tree skips `jobs` outright.
+        assert_eq!(
+            fs::read_link(runtime.join("jobs")).expect("the tree links the jobs entry"),
+            claude_home.join("jobs"),
+            "the tree's jobs links the unusable entry as it stands"
         );
     });
 }
@@ -6511,24 +6599,631 @@ fn gc_collects_a_dead_pair_when_a_plain_file_sits_in_the_job_store() {
     });
 }
 
-/// #7: a job dir caught before its first `state.json` write (only `tmp/` has
-/// been created) spares the dead pair — the reader is fail-closed on a missing
-/// record, not permissive. A permissive arm (`Err(_) if kind == NotFound =>
+/// #7: a job dir caught before its first `state.json` lands spares the dead
+/// pair — the reader is fail-closed on a missing record, not permissive.
+/// Claude Code creates the dir, writes `state.json.tmp.<rand>`, renames it to
+/// `state.json`, and only then creates `tmp/` (measured 5/5, 2.1.308, the T35
+/// probe), so the mid-create shapes are an empty dir and a dir holding only
+/// the staged record. A permissive arm (`Err(_) if kind == NotFound =>
 /// continue`) would collect during job creation.
 #[test]
 fn gc_spares_a_dead_pair_when_a_job_dir_has_no_state_yet() {
+    for (shape, staged) in [("empty", None), ("staged", Some("state.json.tmp.8d511663"))] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".clauth").join("profiles");
+            let (runtime, sessions) = dead_pair(&profiles, "bgmid", "runtime-4242-8", "4242-8");
+            let job = tmp.path().join(".claude").join("jobs").join("0add99ec");
+            fs::create_dir_all(&job).expect("mkdir job dir");
+            if let Some(staged) = staged {
+                fs::write(job.join(staged), b"{\"state\":").expect("staged record");
+            }
+            gc_stale_runtimes();
+            assert!(
+                runtime.join(".claude.json").is_file() && sessions.is_dir(),
+                "{shape}: a job dir with no state.json yet must spare the dead pair"
+            );
+        });
+    }
+}
+
+/// F9 (cloudy 2026-10-22): on a copy host the tree's `jobs/` is its own real
+/// dir (the mirror never carries it), so a `claude --bg` started inside that
+/// session records itself ONLY there. Every job reader must still see it: GC
+/// spares the dead pair and the account counts as live. Control: the same tree
+/// with that record removed is collected.
+#[test]
+fn gc_spares_a_copy_host_tree_whose_own_job_store_names_it() {
+    // T33b1 r5 F9: on a copy host the tree's `jobs/` is its own real dir (the
+    // mirror never carries it, cloudy 2026-10-22), so a `claude --bg` started
+    // inside that session records itself ONLY there. Every job reader must
+    // still see it: GC spares the dead pair and the account counts as live.
+    // Control: the same tree with that record removed is collected.
+    for named in [true, false] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".clauth").join("profiles");
+            let (runtime, sessions) = dead_pair(&profiles, "copyjob", "runtime-4242-11", "4242-11");
+            if named {
+                let job = runtime.join("jobs").join("0add99ee");
+                fs::create_dir_all(&job).expect("mkdir tree job");
+                let record = serde_json::json!({
+                    "state": "working",
+                    "respawnFlags": [],
+                    "providerEnv": { "CLAUDE_CONFIG_DIR": runtime.to_string_lossy() },
+                });
+                fs::write(
+                    job.join("state.json"),
+                    serde_json::to_vec(&record).expect("encode job"),
+                )
+                .expect("tree job");
+                assert!(
+                    has_live_session(&crate::profile::ProfileName::from("copyjob")),
+                    "a job recorded only inside the tree keeps the account live"
+                );
+            }
+            gc_stale_runtimes();
+            assert_eq!(
+                runtime.exists() && sessions.exists(),
+                named,
+                "named: {named}: spared iff the tree's own job store names it"
+            );
+        });
+    }
+}
+
+/// F9 guard: a tree's `jobs/` is read only as a REAL directory. A symlinked
+/// `jobs` — the linked host's shape, where it IS the global store already read
+/// — is never followed, so a poisoned dir it points at cannot make the read
+/// unreadable; the dead pair is still collected.
+#[cfg(unix)]
+#[test]
+fn gc_skips_a_symlinked_tree_jobs_dir() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         let profiles = tmp.path().join(".clauth").join("profiles");
-        let (runtime, sessions) = dead_pair(&profiles, "bgmid", "runtime-4242-8", "4242-8");
-        let job = tmp.path().join(".claude").join("jobs").join("0add99ec");
-        fs::create_dir_all(job.join("tmp")).expect("mkdir job dir");
+        let (runtime, sessions) = dead_pair(&profiles, "bgjobs", "runtime-4242-12", "4242-12");
+        let target = tmp.path().join("poison");
+        fs::create_dir_all(target.join("0add99ef")).expect("mkdir poison job");
+        fs::write(target.join("0add99ef").join("state.json"), b"{\"state\":").expect("bad record");
+        std::os::unix::fs::symlink(&target, runtime.join("jobs")).expect("symlink jobs");
         gc_stale_runtimes();
         assert!(
-            runtime.join(".claude.json").is_file() && sessions.is_dir(),
-            "a job dir with no state.json yet must spare the dead pair"
+            !runtime.exists() && !sessions.exists(),
+            "a symlinked jobs dir is never followed, so its poisoned target spares nothing"
         );
     });
+}
+
+/// F9 guard: a non-dir `jobs` entry in a tree is an unknown shape and fails
+/// closed — the whole read is unreadable, so the dead pair is spared.
+#[test]
+fn gc_spares_a_dead_pair_when_a_tree_jobs_entry_is_not_a_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "bgjobs", "runtime-4242-13", "4242-13");
+        fs::write(runtime.join("jobs"), b"not a dir").expect("jobs file");
+        gc_stale_runtimes();
+        assert!(
+            runtime.exists() && sessions.exists(),
+            "a non-dir jobs entry reads as unreadable and spares the dead pair (fail closed)"
+        );
+    });
+}
+
+/// Write a tree-local job record: `<tree>/jobs/<id>/state.json` naming `names`.
+fn tree_job(tree: &Path, id: &str, state: &str, names: &Path) {
+    let job = tree.join("jobs").join(id);
+    fs::create_dir_all(&job).expect("mkdir tree job");
+    let record = serde_json::json!({
+        "state": state,
+        "respawnFlags": [],
+        "providerEnv": { "CLAUDE_CONFIG_DIR": names.to_string_lossy() },
+    });
+    fs::write(
+        job.join("state.json"),
+        serde_json::to_vec(&record).expect("encode job"),
+    )
+    .expect("write tree job");
+}
+
+/// Chmod `dir` to 0o000 for the fail-closed arms. Returns false (and restores)
+/// when running as root, where the chmod has no effect on readability.
+#[cfg(unix)]
+fn pose_unreadable(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    if fs::read_dir(dir).is_ok() {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        return false;
+    }
+    true
+}
+
+#[cfg(unix)]
+fn restore_readable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+}
+
+/// F19: a symlinked profile dir's trees must still be read by the job walker
+/// (it enumerates the link the way the census does), so GC spares a tree a
+/// tree-local job names and the account counts live.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_profile_dir_still_spares_a_tree_local_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let elsewhere = tmp.path().join("elsewhere");
+        let (real_rt, real_sess) = dead_pair(&elsewhere, "symjob", "runtime-4242-30", "4242-30");
+        fs::create_dir_all(&profiles).expect("mkdir profiles");
+        std::os::unix::fs::symlink(elsewhere.join("symjob"), profiles.join("symjob"))
+            .expect("symlink profile dir");
+        let named = profiles.join("symjob").join("runtime-4242-30");
+        tree_job(&real_rt, "aa000030", "working", &named);
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("symjob")),
+            "a job recorded under a symlinked profile dir keeps the account live"
+        );
+        gc_stale_runtimes();
+        assert!(
+            real_rt.exists() && real_sess.exists(),
+            "a symlinked profile dir's tree-local job spares the tree"
+        );
+    });
+}
+
+/// F23: an isolated tree's own job store spares the tree and blocks
+/// rename/disable only while the job is UNFINISHED; a finished job holds
+/// nothing, since no session can re-enter an isolated tree.
+#[test]
+fn an_isolated_trees_job_store_counts_only_unfinished_jobs() {
+    for (state, spared) in [("working", true), ("stopped", false)] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".clauth").join("profiles");
+            let (runtime, sessions) =
+                dead_pair(&profiles, "isojob", "runtime-isolated-4242-31", "4242-31");
+            tree_job(&runtime, "aa000031", state, &runtime);
+            assert_eq!(
+                has_live_session(&crate::profile::ProfileName::from("isojob")),
+                spared,
+                "{state}: a finished isolated job is not live"
+            );
+            gc_stale_runtimes();
+            assert_eq!(
+                runtime.exists() && sessions.exists(),
+                spared,
+                "{state}: spared iff the isolated job is unfinished"
+            );
+        });
+    }
+}
+
+/// A tree-local record naming a DIFFERENT tree is a stale copy (a copy-host
+/// mirror's leftover) and is skipped, so it cannot pin another account's tree.
+#[test]
+fn a_tree_local_job_naming_another_tree_is_skipped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (b_rt, b_sess) = dead_pair(&profiles, "f24b", "runtime-4242-32", "4242-32");
+        let c_rt = profiles.join("f24c").join("runtime");
+        let c_sess = profiles.join("f24c").join("sessions");
+        fs::create_dir_all(&c_rt).expect("mkdir c");
+        fs::create_dir_all(&c_sess).expect("mkdir c sessions");
+        tree_job(&c_rt, "aa000032", "stopped", &b_rt);
+        assert!(
+            !has_live_session(&crate::profile::ProfileName::from("f24b")),
+            "a tree-local record naming another tree does not make that account live"
+        );
+        gc_stale_runtimes();
+        assert!(
+            !b_rt.exists() && !b_sess.exists(),
+            "a tree-local record naming another tree spares nothing"
+        );
+        assert!(
+            !c_rt.exists() && !c_sess.exists(),
+            "a tree-local store holding only foreign records spares its own tree nothing"
+        );
+    });
+}
+
+/// A linked-shape shared tree (its `CLAUDE.md` reads as a link) whose OWN real
+/// `jobs/` holds a live record written by Claude Code itself must be spared and
+/// count the account live: only a record naming a DIFFERENT tree is a stale
+/// copy. The linked-host shared `jobs/` is a symlink by construction, so a real
+/// dir there was written by the session, never by a mirror.
+#[cfg(unix)]
+#[test]
+fn a_linked_shape_shared_tree_holding_its_own_live_jobs_dir_is_spared() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let tree = profiles.join("g1link").join("runtime-bg");
+        let sessions = profiles.join("g1link").join("sessions-bg");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        std::os::unix::fs::symlink(tmp.path().join("real-claude-md"), tree.join("CLAUDE.md"))
+            .expect("symlink CLAUDE.md");
+        tree_job(&tree, "aa000036", "working", &tree);
+        assert_eq!(
+            crate::runtime::link_mode_of(Some(&tree)),
+            crate::runtime::LinkProbe::Real,
+            "the fixture reads as a linked-host tree"
+        );
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("g1link")),
+            "a linked-shape shared tree's own live jobs record counts the account live"
+        );
+        gc_stale_runtimes();
+        assert!(
+            tree.exists() && sessions.exists(),
+            "the linked-shape shared tree is spared"
+        );
+    });
+}
+
+/// F20 (teardown): a tree-local job keeps the tree past the session teardown.
+#[test]
+fn teardown_spares_a_tree_local_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            let profile = configured_profile("f20tear");
+            seed_profile_store(tmp.path(), "f20tear");
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            let tree = rt.config_dir().to_path_buf();
+            tree_job(&tree, "aa000033", "working", &tree);
+            drop(rt);
+            assert!(
+                tree.is_dir(),
+                "a tree-local job keeps the tree past the session teardown"
+            );
+        });
+    });
+}
+
+/// F20 (acquire wipe): the acquire wipe skips a tree its own job store names.
+#[test]
+fn the_acquire_wipe_spares_a_tree_local_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            let profile = configured_profile("f20wipe");
+            seed_profile_store(tmp.path(), "f20wipe");
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            let tree = rt.config_dir().to_path_buf();
+            tree_job(&tree, "aa000034", "working", &tree);
+            drop(rt);
+            assert!(tree.is_dir(), "teardown spared the tree first");
+            fs::write(tree.join("f20-sentinel"), b"x").expect("sentinel");
+            let rt2 =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire 2");
+            assert!(
+                tree.join("f20-sentinel").is_file(),
+                "the acquire must not wipe a tree its own job store names"
+            );
+            drop(rt2);
+        });
+    });
+}
+
+/// F20 (rotation term): a tree-local unfinished job blocks the macOS rotation.
+#[test]
+fn the_rotation_job_term_reads_a_tree_local_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("f20rot");
+        let tree = tmp.path().join(".clauth/profiles/f20rot/runtime");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        write_creds(&tree.join(".credentials.json"), Some("rt"));
+        tree_job(&tree, "aa000035", "working", &tree);
+        assert_eq!(
+            rotation_block_on(&name, true),
+            Some(RotationBlock::BackgroundJob),
+            "a tree-local unfinished job blocks the rotation"
+        );
+    });
+}
+
+/// F20 (settings spare): a tree-local job's `respawnFlags` spare a settings
+/// file they name.
+#[test]
+fn a_tree_local_job_names_a_settings_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, _sessions) = dead_pair(&profiles, "f20set", "runtime-4242-37", "4242-37");
+        let settings = tmp.path().join("spawn-settings-4242-37.json");
+        fs::write(&settings, b"{}").expect("settings");
+        let job = runtime.join("jobs").join("aa000037");
+        fs::create_dir_all(&job).expect("mkdir tree job");
+        let record = serde_json::json!({
+            "state": "working",
+            "respawnFlags": ["--settings", settings.to_string_lossy()],
+            "providerEnv": { "CLAUDE_CONFIG_DIR": runtime.to_string_lossy() },
+        });
+        fs::write(
+            job.join("state.json"),
+            serde_json::to_vec(&record).expect("encode job"),
+        )
+        .expect("write tree job");
+        let jobs = crate::claude_jobs::job_trees();
+        assert!(
+            jobs.spares_settings(&settings, &[runtime]),
+            "a tree-local job's respawnFlags spare the settings file they name"
+        );
+    });
+}
+
+/// F22 + F21 arm 1: an unreadable tree-local store blocks only ITS account
+/// (live and rotation), never an unrelated account.
+#[cfg(unix)]
+#[test]
+fn a_tree_local_store_failure_blocks_only_its_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "f22a", "runtime-4242-38", "4242-38");
+        let jobs = runtime.join("jobs");
+        fs::create_dir_all(&jobs).expect("mkdir tree jobs");
+        if !pose_unreadable(&jobs) {
+            return;
+        }
+        let name = crate::profile::ProfileName::from("f22a");
+        assert!(
+            has_live_session(&name),
+            "an unreadable tree-local store is live"
+        );
+        assert!(
+            matches!(
+                rotation_block_on(&name, true),
+                Some(RotationBlock::UnreadableJobStore(store))
+                    if store == jobs
+            ),
+            "the rotation names the tree's own store"
+        );
+        gc_stale_runtimes();
+        assert!(
+            runtime.exists() && sessions.exists(),
+            "the tree is spared (fail closed)"
+        );
+        // A second account is untouched by the first's unreadable store.
+        assert!(
+            !has_live_session(&crate::profile::ProfileName::from("f22b")),
+            "an unrelated account is not live"
+        );
+        assert_eq!(
+            rotation_block_on(&crate::profile::ProfileName::from("f22b"), true),
+            None,
+            "an unrelated account's rotation is not blocked"
+        );
+        restore_readable(&jobs);
+    });
+}
+
+/// F21 arm 2: an lstat error on `<tree>/jobs` (an unreadable tree) still spares
+/// the tree — fail closed.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_tree_still_spares_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "f21tree", "runtime-4242-39", "4242-39");
+        if !pose_unreadable(&runtime) {
+            return;
+        }
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("f21tree")),
+            "an unreadable tree reads live"
+        );
+        gc_stale_runtimes();
+        assert!(runtime.exists() && sessions.exists(), "the tree is spared");
+        restore_readable(&runtime);
+    });
+}
+
+/// F21 arm 3 + F22 scoping: an unreadable profile dir blocks only that account.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_profile_dir_blocks_only_that_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let locked = profiles.join("f22locked");
+        fs::create_dir_all(&locked).expect("mkdir locked");
+        if !pose_unreadable(&locked) {
+            return;
+        }
+        assert!(
+            crate::claude_jobs::job_trees().spares_under(&locked),
+            "an unreadable profile dir spares its own account's trees (fail closed)"
+        );
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("f22locked")),
+            "an unreadable profile dir reads live"
+        );
+        assert!(
+            rotation_blocked_on(&crate::profile::ProfileName::from("f22locked"), true),
+            "an unreadable profile dir blocks its account's rotation"
+        );
+        assert!(
+            matches!(
+                rotation_block_on(&crate::profile::ProfileName::from("f22locked"), true),
+                Some(RotationBlock::UnreadableJobStore(store)) if store == locked
+            ),
+            "an unreadable profile dir names itself as the unreadable store, not a live session"
+        );
+        assert!(
+            !has_live_session(&crate::profile::ProfileName::from("f22other")),
+            "an unrelated account is not live"
+        );
+        assert!(
+            !rotation_blocked_on(&crate::profile::ProfileName::from("f22other"), true),
+            "an unrelated account's rotation is not blocked"
+        );
+        restore_readable(&locked);
+    });
+}
+
+/// F21 arm 4: an unreadable `profiles/` root blocks every account (global).
+#[cfg(unix)]
+#[test]
+fn an_unreadable_profiles_root_blocks_every_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(&profiles).expect("mkdir profiles");
+        if !pose_unreadable(&profiles) {
+            return;
+        }
+        assert!(
+            matches!(
+                crate::claude_jobs::job_trees(),
+                crate::claude_jobs::JobTrees::Unreadable { .. }
+            ),
+            "an unreadable profiles root reads the store as unreadable (fail closed)"
+        );
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("f22any")),
+            "an unreadable profiles root reads every account live"
+        );
+        assert!(
+            rotation_blocked_on(&crate::profile::ProfileName::from("f22any"), true),
+            "an unreadable profiles root blocks every account's rotation"
+        );
+        restore_readable(&profiles);
+    });
+}
+
+/// F22 global: an unreadable global `~/.claude/jobs` still blocks every
+/// account, and the refusal names the conventional store path.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_global_store_blocks_every_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let jobs = tmp.path().join(".claude").join("jobs");
+        fs::create_dir_all(&jobs).expect("mkdir global jobs");
+        if !pose_unreadable(&jobs) {
+            return;
+        }
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("f22g")),
+            "an unreadable global store reads every account live"
+        );
+        assert_eq!(
+            rotation_block_on(&crate::profile::ProfileName::from("f22g"), true),
+            Some(RotationBlock::UnreadableJobStore("~/.claude/jobs".into())),
+            "the global refusal names the conventional store path"
+        );
+        restore_readable(&jobs);
+    });
+}
+
+/// cloudy 2026-10-22: `claude rm` can leave the job's supervisor running —
+/// measured with a second tree's supervisor sharing the roster — and that
+/// supervisor recreates the job dir with no record — an empty `tmp/`, then
+/// `exit-cause` once it is signalled (a lone bare job's supervisor exits
+/// instead). A creation never makes those shapes (`tmp/` follows
+/// `state.json`, #7), so a dir holding nothing but an empty `tmp/` and/or an
+/// `exit-cause` file is a removed job and the dead pair is collected. Any other
+/// record-less content stays unreadable and spares, as before.
+#[test]
+fn gc_reads_a_removed_jobs_leftover_dir_as_no_job() {
+    for (shape, with_tmp, with_cause, collected) in [
+        ("tmp only", true, false, true),
+        ("exit-cause only", false, true, true),
+        ("tmp and exit-cause", true, true, true),
+        ("tmp holding a file", true, false, false),
+        ("exit-cause a directory", false, false, false),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".clauth").join("profiles");
+            let (runtime, sessions) = dead_pair(&profiles, "bgrm", "runtime-4242-9", "4242-9");
+            let job = tmp.path().join(".claude").join("jobs").join("0add99ed");
+            fs::create_dir_all(&job).expect("mkdir job dir");
+            if with_tmp {
+                fs::create_dir_all(job.join("tmp")).expect("mkdir tmp");
+            }
+            if with_cause {
+                fs::write(job.join("exit-cause"), b"SIGTERM").expect("exit-cause");
+            }
+            if shape == "tmp holding a file" {
+                fs::write(job.join("tmp").join("x"), b"x").expect("tmp file");
+            }
+            if shape == "exit-cause a directory" {
+                fs::create_dir_all(job.join("exit-cause")).expect("exit-cause dir");
+            }
+            gc_stale_runtimes();
+            assert_eq!(
+                !runtime.exists() && !sessions.exists(),
+                collected,
+                "{shape}: collected iff the dir is a removed job's leftover"
+            );
+        });
+    }
+}
+
+/// The leftover reader's unix-only guard shapes: a `tmp` that is a SYMLINK to
+/// an empty dir (not a real dir), and a job dir whose listing fails (mode
+/// 0o300, so the `state.json` lookup gives NotFound and the listing gives
+/// EACCES). Each stays unreadable, so the dead pair is spared — fail closed.
+#[cfg(unix)]
+#[test]
+fn gc_spares_a_dead_pair_for_unreadable_leftover_guard_shapes() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for (shape, symlink_tmp, unlistable) in [
+        ("tmp a symlink to an empty dir", true, false),
+        ("an unlistable job dir", false, true),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let profiles = tmp.path().join(".clauth").join("profiles");
+            let (runtime, sessions) = dead_pair(&profiles, "bgrm", "runtime-4242-9", "4242-9");
+            let job = tmp.path().join(".claude").join("jobs").join("0add99ed");
+            fs::create_dir_all(&job).expect("mkdir job dir");
+            if symlink_tmp {
+                let target = tmp.path().join("empty");
+                fs::create_dir_all(&target).expect("empty dir");
+                std::os::unix::fs::symlink(&target, job.join("tmp")).expect("symlink tmp");
+            }
+            if unlistable {
+                fs::create_dir_all(job.join("tmp")).expect("mkdir tmp");
+                fs::set_permissions(&job, fs::Permissions::from_mode(0o300)).expect("chmod");
+                // Running with rights that ignore the mode (root): the listing
+                // succeeds, so the unreadable shape cannot be posed; restore
+                // and skip the row rather than fail vacuously.
+                if fs::read_dir(&job).is_ok() {
+                    let _ = fs::set_permissions(&job, fs::Permissions::from_mode(0o700));
+                    return;
+                }
+            }
+            gc_stale_runtimes();
+            let spared = runtime.exists() && sessions.exists();
+            // Restore the mode before asserting so the tempdir teardown can
+            // remove the unlistable dir.
+            if unlistable {
+                let _ = fs::set_permissions(&job, fs::Permissions::from_mode(0o700));
+            }
+            assert!(
+                spared,
+                "{shape}: the dead pair is spared (unreadable, fail closed)"
+            );
+        });
+    }
 }
 
 /// #10: an isolated-flavor (`runtime-isolated-<sid>`) job-named dead pair is
@@ -6655,6 +7350,48 @@ fn gc_logs_no_per_pair_spare_line_under_an_unreadable_store() {
             "no per-pair spare line under an unreadable store, live or dead pair"
         );
         drop(marker);
+    });
+}
+
+/// A scoped failure (a tree's own unreadable `jobs/`) spares the tree and logs
+/// ONE sweep-level line naming the store, once per sweep; the per-pair line
+/// stays silent because no job was shown to name the tree.
+#[cfg(unix)]
+#[test]
+fn a_scoped_store_failure_logs_one_sweep_line_naming_the_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "g6tree", "runtime-4242-41", "4242-41");
+        let jobs = runtime.join("jobs");
+        fs::create_dir_all(&jobs).expect("mkdir tree jobs");
+        if !pose_unreadable(&jobs) {
+            return;
+        }
+        let lines = crate::logline::LogLines::new();
+        {
+            let _cap = lines.capture_here();
+            gc_stale_runtimes();
+        }
+        let snap = lines.snapshot();
+        let sweep_line = format!(
+            "clauth: spared runtime trees this sweep: the Claude Code \
+             background-job store {} could not be read",
+            jobs.display()
+        );
+        assert_eq!(
+            snap.iter().filter(|l| **l == sweep_line).count(),
+            1,
+            "the scoped spare logs one sweep-level line naming the store, by equality"
+        );
+        assert!(
+            !snap
+                .iter()
+                .any(|l| l.contains("a live Claude Code background job names it")),
+            "no per-pair line claims a job names a tree whose store merely could not be read"
+        );
+        assert!(runtime.exists() && sessions.exists(), "the tree is spared");
+        restore_readable(&jobs);
     });
 }
 
@@ -7135,6 +7872,8 @@ fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
             last_swap_at: None,
             launch_store: None,
             is_delegate: false,
+            background: false,
+            background_hold: false,
         };
         crate::live_sessions::register(&dead).expect("register dead");
         dead.session_id = "6001-1".into();
@@ -7389,6 +8128,7 @@ fn lone_session(
         session,
         isolation,
         LinkMode::Real,
+        SessionTree::PerSession,
         launch,
         store,
         &paths,
@@ -7432,6 +8172,7 @@ fn fake_session(
         session,
         isolation,
         LinkMode::Fake,
+        SessionTree::PerSession,
         launch,
         store,
         &paths,
@@ -7855,9 +8596,19 @@ fn rotation_on_macos_reads_an_unknown_or_missing_job_state_as_unfinished() {
         );
 
         fs::remove_file(&record).expect("drop record");
+        fs::remove_dir(job.join("tmp")).expect("drop tmp");
         assert!(
             rotation_blocked_on(&name, true),
             "a job dir without its record yet is unreadable, and unreadable blocks"
+        );
+
+        // A removed job's leftover (cloudy 2026-10-22): its supervisor's empty
+        // `tmp/` plus `exit-cause` is no job, so it blocks nothing.
+        fs::create_dir(job.join("tmp")).expect("leftover tmp");
+        fs::write(job.join("exit-cause"), b"SIGTERM").expect("leftover exit-cause");
+        assert!(
+            !rotation_blocked_on(&name, true),
+            "a removed job's leftover dir is no unfinished job"
         );
 
         fs::remove_dir_all(&job).expect("claude rm");
@@ -10897,6 +11648,8 @@ fn register_row(profile: &str, sid: &str, launch_store: Option<std::path::PathBu
         last_swap_at: None,
         launch_store,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     })
     .expect("register row");
 }
@@ -14178,5 +14931,258 @@ fn an_unreadable_outgoing_record_is_announced_against_the_session_member() {
                 ),
             ]
         );
+    });
+}
+
+/// T33b1 check 7: the account's background pair `runtime-bg` + `sessions-bg`
+/// is a shape every runtime-dir parser knows (GC pairs and collects it, both
+/// config reconcilers walk it as a shared tree, the codex scrub sees a clauth
+/// tree), and nothing reads a sid off it, so `tps` and the hook note skip it.
+/// Its neighbours stay outside: an isolated background tree is refused at
+/// launch, and a suffix past `bg` is no clauth name.
+#[test]
+fn the_background_pair_is_a_runtime_dir_shape_with_no_sid() {
+    assert!(is_runtime_dir_name("runtime-bg"));
+    assert!(is_sessions_dir_name("sessions-bg"));
+    assert!(is_shared_runtime_dir_name("runtime-bg"));
+    assert_eq!(
+        paired_sessions_name("runtime-bg").as_deref(),
+        Some("sessions-bg")
+    );
+    assert_eq!(
+        paired_runtime_name("sessions-bg").as_deref(),
+        Some("runtime-bg")
+    );
+    assert_eq!(sid_of_runtime_dir_name("runtime-bg"), None);
+    assert!(is_clauth_runtime_path(Path::new(
+        "/home/dev/.clauth/profiles/wired/runtime-bg"
+    )));
+    for name in [
+        "runtime-bgx",
+        "runtime-xbg",
+        "runtime-isolated-bg",
+        "runtime-bg-4242-0",
+        "runtime-bg-",
+    ] {
+        assert!(!is_runtime_dir_name(name), "{name} is no clauth tree");
+    }
+    for name in ["sessions-bgx", "sessions-isolated-bg"] {
+        assert!(
+            !is_sessions_dir_name(name),
+            "{name} is no clauth marker dir"
+        );
+    }
+}
+
+/// A background row is live through its `sessions-bg/<sid>` marker: neither
+/// per-session marker dir holds anything for it, so the row sweep and the tally
+/// would reap the daemon's row without the background candidate.
+#[test]
+fn a_background_row_is_live_through_its_sessions_bg_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("bglive");
+        let profile = crate::profile::profile_dir(&name).expect("profile dir");
+        let sessions = profile.join("sessions-bg");
+        fs::create_dir_all(&sessions).expect("mkdir sessions-bg");
+        assert!(!session_row_is_live(&name, false, "7100-0"));
+        let marker = open_pid_file(&sessions.join("7100-0")).expect("marker");
+        marker.lock().expect("hold marker");
+        assert!(
+            session_row_is_live(&name, false, "7100-0"),
+            "the background marker is what makes the row live"
+        );
+        drop(marker);
+        assert!(!session_row_is_live(&name, false, "7100-0"));
+    });
+}
+
+/// T33b1 check 8, the marker half: the daemon's own background hold is exempt
+/// from the macOS rotation gate's marker term, while a launcher's marker in the
+/// same `sessions-bg/` is not. The two cases differ only in the row's
+/// `background_hold` bit, and no job store exists, so the job term is empty and
+/// the marker term alone decides.
+#[test]
+fn only_a_launchers_background_marker_blocks_a_macos_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("bgrot");
+        let profile = crate::profile::profile_dir(&name).expect("profile dir");
+        let sessions = profile.join("sessions-bg");
+        fs::create_dir_all(&sessions).expect("mkdir sessions-bg");
+        let store = profile.join("credentials.json");
+        write_creds(&store, Some("rt-bg"));
+
+        for (sid, hold, want) in [
+            (
+                "7001-0",
+                false,
+                Some(crate::runtime::RotationBlock::LiveSession),
+            ),
+            ("7002-0", true, None),
+        ] {
+            let marker = open_pid_file(&sessions.join(sid)).expect("marker");
+            marker.lock().expect("hold marker");
+            let mut row = crate::testutil::live_row(sid, name.as_str());
+            row.background = true;
+            row.background_hold = hold;
+            row.launch_store = Some(store.clone());
+            crate::live_sessions::register(&row).expect("register");
+            assert_eq!(rotation_block_on(&name, true), want, "{sid}");
+            drop(marker);
+            crate::live_sessions::unregister(sid).expect("unregister");
+        }
+    });
+}
+
+/// T33b1 check 6, the un-Dropped half: a daemon killed by SIGTERM never runs
+/// its runtime's teardown, so its marker file, row and tree stay behind with
+/// no flock. The sweep spares the background pair while a job names the tree
+/// or any marker in `sessions-bg/` is held, and collects it once neither does.
+#[test]
+fn gc_collects_the_background_pair_once_no_marker_is_held_and_no_job_names_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profile = tmp.path().join(".clauth").join("profiles").join("bgp");
+        let runtime = profile.join("runtime-bg");
+        let sessions = profile.join("sessions-bg");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed");
+        drop(open_pid_file(&sessions.join("4242-0")).expect("dead marker"));
+
+        let job = write_claude_job(tmp.path(), "b6a1c0de", &runtime);
+        gc_stale_runtimes();
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "a job naming the tree spares it"
+        );
+
+        fs::remove_dir_all(&job).expect("claude rm");
+        let held = open_pid_file(&sessions.join("4243-0")).expect("live marker");
+        held.lock().expect("hold");
+        gc_stale_runtimes();
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "a held marker spares the tree"
+        );
+
+        drop(held);
+        gc_stale_runtimes();
+        assert!(!runtime.exists(), "the idle background tree is collected");
+        assert!(!sessions.exists(), "its marker dir goes with it");
+    });
+}
+
+/// F3: a background launcher's spawn-settings file is spared by a job on
+/// `runtime-bg` whose flags clauth cannot read. `spares_settings`' fallback is
+/// the only rule that can spare it, and it must be handed the tree the launcher
+/// actually occupied.
+#[test]
+fn gc_spares_a_background_launchers_settings_file_behind_an_unreadable_flags_job() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("bgsettings");
+        let profile = crate::profile::profile_dir(&name).expect("profile dir");
+        let tree = profile.join("runtime-bg");
+        fs::create_dir_all(profile.join("sessions-bg")).expect("mkdir sessions-bg");
+        fs::create_dir_all(&tree).expect("mkdir runtime-bg");
+        let settings = spawn_settings_file(&tree, "5858-0");
+        fs::write(&settings, b"{}").expect("launcher settings file");
+        // A list element that is not a string reads as unreadable flags, so the
+        // fail-closed tree fallback is the only rule that can spare the file.
+        crate::testutil::write_claude_job_flags(
+            tmp.path(),
+            "b6a1c0de",
+            &tree,
+            serde_json::json!([1]),
+        );
+
+        gc_stale_runtimes();
+
+        assert!(
+            settings.is_file(),
+            "a background launcher's settings file must survive a job whose flags \
+             clauth cannot read"
+        );
+    });
+}
+
+/// N2: a background holder is fixed on its ACCOUNT, not frozen on its credential
+/// pair. Its own account's convergence runs like any session's — a hold adopted
+/// before the account was armed for rolling tokens must still move onto the
+/// sidecar, even while a cross-account intent stands on its row — while a move
+/// onto another account is refused, as `precondition` keeps enforcing for every
+/// caller.
+#[test]
+fn a_background_holder_converges_and_refuses_a_cross_account_swap() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a convergence relink") {
+            return;
+        }
+        let launch = member("fixed-a");
+        let store = member_store(&launch);
+        let session = SessionId::mint();
+        let sid = session.as_str().to_string();
+        let paths = SessionPaths::resolve_background(&launch.name, &session).expect("paths");
+        crate::profile::mkdir_700(&paths.runtime).expect("mkdir");
+        create_symlink(&store, &paths.runtime.join(".credentials.json")).expect("link creds");
+        // The launch marker this holder already owns, as `acquire` leaves it:
+        // publishing a convergence asserts it is still held.
+        let _launch_markers = stamp_swapped_markers(&paths)
+            .expect("stamp the launch marker")
+            .expect("the launch member's marker must be free in a fresh sandbox");
+        let mut row = crate::live_sessions::LiveSession::starting(
+            &session,
+            "fixed-a",
+            crate::harness::Harness::Claude,
+            false,
+            false,
+            Launcher::Own,
+            Some(store.to_path_buf()),
+        );
+        // A standing cross-account intent (an older clauth's `switch`, a hand
+        // edit): `poll` must refuse it and still converge the own account.
+        row.intended_member = Some("fixed-b".to_string());
+        crate::live_sessions::register(&row).expect("register row");
+        let swap = SessionSwap::new(
+            session,
+            Isolation::Shared,
+            LinkMode::Real,
+            SessionTree::Background(BackgroundHold::Daemon),
+            &launch,
+            store,
+            &paths,
+        );
+
+        // Arm the account for rolling tokens under the hold.
+        let sidecar = crate::profile::profile_dir(&crate::profile::ProfileName::from("fixed-a"))
+            .expect("profile_dir")
+            .join("session-token.json");
+        write_creds(&sidecar, None);
+
+        swap.poll();
+
+        assert_eq!(
+            fs::read_link(paths.runtime.join(".credentials.json")).expect("read link"),
+            sidecar,
+            "a background holder's converge runs onto its own account's sidecar"
+        );
+        assert_eq!(swap.canonical(), sidecar, "the cell follows the link");
+        assert_eq!(swap.member(), "fixed-a", "the account does not change");
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(
+            row.launch_store.as_deref(),
+            Some(sidecar.as_path()),
+            "the row's launch_store names the sidecar, so the rotation refusal lifts"
+        );
+
+        assert_eq!(
+            swap.precondition("fixed-b").map(|plan| plan.member),
+            Err(SwapRefused::FixedAccount),
+            "a background holder never moves onto another account"
+        );
+        assert_eq!(swap.member(), "fixed-a", "the refusal moved nothing");
     });
 }

@@ -151,6 +151,22 @@ pub(crate) struct LiveSession {
     /// by an older clauth reads as own until that server restarts.
     #[serde(default)]
     pub(crate) is_delegate: bool,
+    /// Whether this row holds the account's fixed background pair
+    /// (`runtime-bg`/`sessions-bg`) rather than a per-session tree. Set once at
+    /// registration and never mutated; callers resolving the row's paths branch
+    /// on it (its marker and tree dirs are the pair's, not `<sid>`-keyed).
+    /// `serde(default)` is the upgrade gate: a row from an older clauth is a
+    /// per-session row, which is what it was.
+    #[serde(default)]
+    pub(crate) background: bool,
+    /// Whether this row is the DAEMON's hold of that pair, as opposed to a
+    /// `clauth start <p> -- --bg` launcher's. The daemon holds the tree exactly
+    /// while a Claude Code job names it, so the macOS rotation gate's marker
+    /// term skips it and the job term decides the tree; a launcher's marker
+    /// during its launch is not skipped. Implies [`Self::background`];
+    /// `serde(default)` is the upgrade gate.
+    #[serde(default)]
+    pub(crate) background_hold: bool,
 }
 
 impl LiveSession {
@@ -184,6 +200,8 @@ impl LiveSession {
             last_swap_at: None,
             launch_store,
             is_delegate: matches!(launcher, Launcher::Delegate),
+            background: false,
+            background_hold: false,
         }
     }
 }
@@ -306,6 +324,15 @@ impl LiveTally {
         let rows = read_registry();
         let unread = rows.is_none();
         let mut tally = Self::from_live_rows(rows.unwrap_or_default().into_iter().filter(|row| {
+            // The daemon's hold is not a clauth start session: it exists while a
+            // Claude Code job names the account's fixed tree, one hold however
+            // many jobs, and it ends when the last job does. Counting it would
+            // put a phantom session on screen and in the stop-shunt confirm.
+            // The launcher's own background row HAS no hold flag and still
+            // counts — it is a real launch, for its launch.
+            if row.background_hold {
+                return false;
+            }
             let probe = crate::profile::ProfileName::from(
                 row.current_member.as_deref().unwrap_or(&row.start_profile),
             );

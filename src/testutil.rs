@@ -1722,6 +1722,8 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     }
 }
 

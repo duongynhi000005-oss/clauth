@@ -65,6 +65,7 @@ impl super::Daemon {
         if !self.next_drain_skipped(deadline) {
             self.drain_pending_switch_off();
         }
+        self.reconcile_background_holds();
         self.write_status();
         // Converge a broken plugin registration in the background. The gate is two
         // registry reads inline and a needed heal runs detached (throttled inside
@@ -81,6 +82,24 @@ impl super::Daemon {
             .map(|c| c.state.update.auto_update)
             .unwrap_or(true);
         crate::herdr::heal_detached(auto_update);
+    }
+
+    /// Hand this tick's background-tree work to the hold worker: adopt every
+    /// configured account whose `runtime-bg` a Claude Code job names, release
+    /// every hold no job names any more.
+    ///
+    /// This reads the job store and a config snapshot and returns; the blocking
+    /// half — the rotation lock, the state flock, the tree build — runs on the
+    /// worker. A tick that waited for it here would spend the run loop's
+    /// watchdog budget on another process's lock.
+    fn reconcile_background_holds(&mut self) {
+        let Ok(cfg) = self.config.lock() else {
+            return;
+        };
+        let names: Vec<ProfileName> = cfg.profiles.iter().map(|p| p.name.clone()).collect();
+        let stale_env_keys = crate::actions::outgoing_env_keys(&cfg);
+        drop(cfg);
+        self.background.reconcile(names, stale_env_keys);
     }
 
     /// Log once, per day and per config change, what today's day lists are

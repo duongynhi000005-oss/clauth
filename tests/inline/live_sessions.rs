@@ -25,6 +25,8 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     }
 }
 
@@ -505,6 +507,47 @@ fn collect_drops_a_row_whose_session_is_no_longer_running() {
             .sessions,
         1,
         "only the row whose marker is still held is a live session"
+    );
+}
+
+/// F8: the daemon's background hold is not a clauth start session — one row per
+/// fixed tree however many jobs, and it exists while a job names the tree, not
+/// while a launch runs. A LAUNCHER's own background row (no hold flag) is still
+/// a session, for its launch.
+#[test]
+fn collect_excludes_the_daemons_background_hold() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+
+    let hold = LiveSession {
+        background: true,
+        background_hold: true,
+        ..row("4242-0", "work")
+    };
+    register(&hold).expect("register the hold row");
+    let _hold_marker = crate::runtime::hold_background_row_marker(&name, "4242-0")
+        .expect("hold the daemon's marker");
+    assert_eq!(
+        LiveTally::collect(&config_with(vec![], "work"))
+            .member(&name)
+            .sessions,
+        0,
+        "the daemon's hold is no session"
+    );
+
+    let launcher = LiveSession {
+        background: true,
+        ..row("4243-0", "work")
+    };
+    register(&launcher).expect("register the launcher row");
+    let _launcher_marker = crate::runtime::hold_background_row_marker(&name, "4243-0")
+        .expect("hold the launcher's marker");
+    assert_eq!(
+        LiveTally::collect(&config_with(vec![], "work"))
+            .member(&name)
+            .sessions,
+        1,
+        "a launcher's own background row still counts"
     );
 }
 

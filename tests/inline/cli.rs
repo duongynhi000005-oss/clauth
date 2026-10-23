@@ -1597,14 +1597,7 @@ mod disabled_target_refusal {
             state: crate::profile::AppState::default(),
             profiles: Vec::new(),
         };
-        crate::actions::create_blank_profile(
-            &mut config,
-            name.to_string(),
-            None,
-            None,
-            Default::default(),
-        )
-        .expect("create profile");
+        seed_blank_profile(&mut config, name);
         crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from(name))
             .expect("disable profile");
     }
@@ -4561,6 +4554,64 @@ fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
     assert_eq!(
         err.to_string(),
         "'a': --with-fallback needs a second account in the fallback chain to move to; add one on the fallback tab, or start without it"
+    );
+}
+
+fn seed_blank_profile(config: &mut crate::profile::AppConfig, name: &str) {
+    crate::actions::create_blank_profile(config, name.to_string(), None, None, Default::default())
+        .expect("create profile");
+}
+
+/// `--explain` runs the same background refusals a real launch runs: an
+/// `--isolated` launch with `--bg`, and a copy host with `--bg`, both print the
+/// refusal rather than the pick line.
+#[test]
+fn cmd_start_explain_runs_the_isolated_background_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    seed_blank_profile(&mut config, "wired");
+
+    let err = cmd_start(
+        &crate::cli::StartTarget::Named("wired".to_owned()),
+        &["--bg".to_owned()],
+        crate::runtime::Isolation::Isolated,
+        false,
+        true,
+    )
+    .expect_err("explain must refuse --bg on --isolated");
+    assert_eq!(
+        err.to_string(),
+        "'wired': --bg cannot be combined with --isolated, since background \
+         sessions run in the account's shared background tree"
+    );
+}
+
+#[test]
+fn cmd_start_explain_refuses_a_background_start_on_a_copy_host() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    seed_blank_profile(&mut config, "wired");
+    let _fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+
+    let err = cmd_start(
+        &crate::cli::StartTarget::Named("wired".to_owned()),
+        &["--bg".to_owned()],
+        crate::runtime::Isolation::Shared,
+        false,
+        true,
+    )
+    .expect_err("explain must refuse --bg on a copy host");
+    assert_eq!(
+        err.to_string(),
+        "'wired': --bg cannot run on this host, since it copies runtime trees \
+         instead of linking them and a background session would outlive the \
+         credentials clauth rotates (on Windows, turn on Developer Mode)"
     );
 }
 

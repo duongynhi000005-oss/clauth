@@ -2632,9 +2632,17 @@ fn session_row_for(pid: u32) -> Option<crate::live_sessions::LiveSession> {
 /// `live_sessions` row whose pid is the peer itself (a delegate's row carries
 /// the claude pid), else the peer's direct parent when that parent is a
 /// `clauth start`/`resume`; `~/.claude` when no row joins (SB-3, SB-5).
+///
+/// A background row resolves to the account's fixed `runtime-bg`, never the
+/// per-session trees: the launcher's session record and the daemon's watchdog
+/// both write through that one tree.
 fn session_config_dir_for(pid: u32) -> Option<PathBuf> {
     match session_row_for(pid) {
         Some(row) => {
+            let profile = crate::profile::ProfileName::from(row.start_profile.as_str());
+            if row.background {
+                return crate::runtime::background_runtime_tree(&profile).ok();
+            }
             crate::runtime::session_sessions_tree(&row.start_profile, row.isolated, &row.session_id)
         }
         None => crate::profile::claude_dir().ok(),
@@ -2650,8 +2658,47 @@ fn parent_pid(pid: u32) -> Option<u32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
+// Test seam for the SB-5 parent arm: the production check reads
+// `/proc/<pid>/cmdline` for a binary literally named `clauth`, which a test
+// cannot stage without a second binary. [`LaunchOverride`] declares one pid a
+// launch for the calling thread's duration; each test drives its own resolver
+// call on its own thread.
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static LAUNCH_OVERRIDE: std::cell::RefCell<std::collections::HashSet<u32>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct LaunchOverride {
+    pid: u32,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl LaunchOverride {
+    pub(crate) fn pose(pid: u32) -> Self {
+        LAUNCH_OVERRIDE.with(|set| {
+            set.borrow_mut().insert(pid);
+        });
+        Self { pid }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for LaunchOverride {
+    fn drop(&mut self) {
+        LAUNCH_OVERRIDE.with(|set| {
+            set.borrow_mut().remove(&self.pid);
+        });
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn is_clauth_launch(pid: u32) -> bool {
+    #[cfg(test)]
+    if LAUNCH_OVERRIDE.with(|set| set.borrow().contains(&pid)) {
+        return true;
+    }
     use std::os::unix::ffi::OsStrExt;
     let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;

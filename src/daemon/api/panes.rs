@@ -286,7 +286,12 @@ fn absent_body(reason: &str) -> PanesBody {
 /// at once, and the dead row's profile must not show as a ghost session.
 pub(crate) fn newest_per_pid(rows: &[LiveSession]) -> Vec<&LiveSession> {
     let mut newest: HashMap<u32, &LiveSession> = HashMap::new();
-    for row in rows {
+    // The daemon's own background hold carries the DAEMON's pid: a daemon
+    // running in a foreground herdr pane would otherwise be joined as that
+    // pane's Claude session (wrong account on the row and in the push). The
+    // hold is not a pane's process. A launcher's background row has no hold
+    // flag and still joins — it IS a `clauth start`.
+    for row in rows.iter().filter(|row| !row.background_hold) {
         match newest.entry(row.pid) {
             Entry::Occupied(mut slot) => {
                 if row.started_at > slot.get().started_at {

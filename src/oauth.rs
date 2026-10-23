@@ -971,14 +971,28 @@ fn sidecar_repair_transient(name: &ProfileName, e: &anyhow::Error) -> crate::for
     sidecar_write_failed(name)
 }
 
-/// CLA-ROLL: a live `clauth start` session is holding the ROTATING pair,
-/// because it started before the sidecar was armed. See
-/// [`crate::format::Cause::LiveSessionOnRotatingChain`].
-fn live_session_on_rotating_chain(name: &ProfileName) -> crate::format::Transient {
-    crate::format::Transient::new(
-        crate::format::Cause::LiveSessionOnRotatingChain(name.to_string()),
-        crate::format::Retry::Stated,
-    )
+/// CLA-ROLL: a macOS rotation is refused. One arm per cause, since each names a
+/// different operator next step — wait, `claude stop`, or retry once the job
+/// store clears. See [`crate::runtime::RotationBlock`].
+fn rotation_block_transient(
+    name: &ProfileName,
+    block: crate::runtime::RotationBlock,
+) -> crate::format::Transient {
+    let cause = match block {
+        crate::runtime::RotationBlock::LiveSession => {
+            crate::format::Cause::LiveSessionOnRotatingChain(name.to_string())
+        }
+        crate::runtime::RotationBlock::BackgroundJob => {
+            crate::format::Cause::BackgroundJobOnRotatingChain(name.to_string())
+        }
+        crate::runtime::RotationBlock::UnreadableJobStore(store) => {
+            crate::format::Cause::UnreadableJobStoreOnRotatingChain {
+                profile: name.to_string(),
+                store: store.display().to_string(),
+            }
+        }
+    };
+    crate::format::Transient::new(cause, crate::format::Retry::Stated)
 }
 
 /// CLA-ROLL: another holder has the rotation lock and this caller must not
@@ -3428,13 +3442,14 @@ fn rolling_install_gate(
     // sidecar existed, so `install_source_path` handed it credentials.json.
     // Its own swap poll converges it onto the sidecar in place; until that
     // lands, spending the refresh here would fail that session's next refresh
-    // (`invalid_grant`) and can blank its own Keychain item. Asked through
-    // `rotation_blocked_for` rather than re-derived, so this leg inherits the
-    // one place that decision lives (and, with it, the fact that the whole
-    // refusal is macOS-only: elsewhere the session reads the very file a
-    // rotation rewrites).
-    if crate::runtime::rotation_blocked_for(name) {
-        return AuthGate::Transient(live_session_on_rotating_chain(name));
+    // (`invalid_grant`) and can blank its own Keychain item. An unfinished
+    // background job on a rotatable tree strands the same way, and an unreadable
+    // job store cannot rule either out. Asked through `rotation_block_for`
+    // rather than re-derived, so this leg inherits the one place that decision
+    // lives (and, with it, the fact that the whole refusal is macOS-only:
+    // elsewhere the session reads the very file a rotation rewrites).
+    if let Some(block) = crate::runtime::rotation_block_for(name) {
+        return AuthGate::Transient(rotation_block_transient(name, block));
     }
     let gate = gate_under_guard(config, name, refresher, &guard, fresh_horizon_ms);
     match gate {

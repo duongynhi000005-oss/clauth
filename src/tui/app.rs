@@ -2108,7 +2108,8 @@ const ROTATE_ALL_MSG: &str = "rotate all access tokens?";
 /// macOS refuses to rotate an account with a running session (it can't reach the
 /// credential that session reads), so the two hosts promise different things.
 #[cfg(target_os = "macos")]
-const ROTATE_ALL_DETAIL: &str = "accounts with a live clauth start session are skipped.";
+const ROTATE_ALL_DETAIL: &str =
+    "accounts with a live clauth start or background session are skipped.";
 #[cfg(not(target_os = "macos"))]
 const ROTATE_ALL_DETAIL: &str = "running sessions pick up the new tokens on their next request.";
 
@@ -2120,9 +2121,24 @@ const ROTATE_ALL_DETAIL: &str = "running sessions pick up the new tokens on thei
 /// `cfg!`, so it still compiles here) — that keeps the strings reviewable and
 /// exact-match pinnable from a Linux run.
 const ROTATE_LIVE_SESSION_MSG: &str = "has a live clauth start session";
+const ROTATE_BACKGROUND_SESSION_MSG: &str = "has a background session";
+const ROTATE_UNREADABLE_JOBS_MSG: &str = "can't be checked for background sessions";
 const ROTATE_LIVE_SESSION_DETAIL: &str = "macos keeps its login in a keychain entry clauth can't write, so rotating would sign the \
      session out.";
 const ROTATE_LIVE_SESSION_TOAST: &str = "macos keeps its login where clauth can't rotate it";
+
+/// The single-rotate refusal sentence for a blocked rotate, one suffix per
+/// cause ([`crate::runtime::RotationBlock`]), so the operator reads what
+/// actually blocks it: a launcher's own session, a background job, or a job
+/// store clauth cannot read.
+fn rotate_blocked_message(name: &str, block: crate::runtime::RotationBlock) -> String {
+    let suffix = match block {
+        crate::runtime::RotationBlock::LiveSession => ROTATE_LIVE_SESSION_MSG,
+        crate::runtime::RotationBlock::BackgroundJob => ROTATE_BACKGROUND_SESSION_MSG,
+        crate::runtime::RotationBlock::UnreadableJobStore(_) => ROTATE_UNREADABLE_JOBS_MSG,
+    };
+    format!("'{name}' {suffix}")
+}
 
 /// What disabling costs, for the action menu's confirm. The Setup row states the
 /// same thing in its own hint (`config::row_hint`) before arming.
@@ -19723,18 +19739,19 @@ fn refresh_usage_identity(app: &mut App, identity: Option<RowIdentity>) {
 /// the menu's identity pick resolves into.
 fn rotate_account(app: &mut App, name: &ProfileName) {
     match account_by_name(app, name) {
-        // macOS refuses this rotation (`runtime::rotation_blocked_for`), so
+        // macOS refuses this rotation (`runtime::rotation_block_for`), so
         // say why up front instead of arming a confirm that no-ops.
-        Some((name, true, _)) if crate::runtime::rotation_blocked_for(&name) => {
-            app.open_modal(Modal::Confirm(ConfirmState {
-                message: format!("'{name}' {ROTATE_LIVE_SESSION_MSG}"),
-                detail: Some(ROTATE_LIVE_SESSION_DETAIL.to_string()),
-                choice: true,
-                scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::Acknowledge,
-            }));
-        }
         Some((name, true, _)) => {
+            if let Some(block) = crate::runtime::rotation_block_for(&name) {
+                app.open_modal(Modal::Confirm(ConfirmState {
+                    message: rotate_blocked_message(name.as_str(), block),
+                    detail: Some(ROTATE_LIVE_SESSION_DETAIL.to_string()),
+                    choice: true,
+                    scroll: ConfirmScroll::default(),
+                    on_confirm: ConfirmAction::Acknowledge,
+                }));
+                return;
+            }
             app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("rotate access token for '{name}'?"),
                 detail: None,
@@ -25049,10 +25066,13 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // running it: on macOS `rotate_one_inner` refuses, and an unguarded
             // "rotating 'X'" toast would be a success-shaped message for a no-op.
             let name = ProfileName::from(name);
-            if crate::runtime::rotation_blocked_for(&name) {
+            if let Some(block) = crate::runtime::rotation_block_for(&name) {
                 app.toast(
                     ToastKind::Warning,
-                    format!("'{name}' {ROTATE_LIVE_SESSION_MSG}\n{ROTATE_LIVE_SESSION_TOAST}"),
+                    format!(
+                        "{}\n{ROTATE_LIVE_SESSION_TOAST}",
+                        rotate_blocked_message(name.as_str(), block)
+                    ),
                 );
                 return;
             }

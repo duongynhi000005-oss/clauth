@@ -154,6 +154,8 @@ fn register_fixture_rows() {
                 "/home/user/.clauth/profiles/uwuclxdy/credentials.json",
             )),
             is_delegate: false,
+            background: false,
+            background_hold: false,
         },
         LiveSession {
             session_id: "1128637-0".to_string(),
@@ -176,6 +178,8 @@ fn register_fixture_rows() {
                 "/home/user/.clauth/profiles/DS5/credentials.json",
             )),
             is_delegate: false,
+            background: false,
+            background_hold: false,
         },
     ];
     for row in rows {
@@ -204,6 +208,8 @@ fn register_delegate_row() {
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     })
     .expect("register the delegate row");
 }
@@ -229,6 +235,8 @@ fn register_orphan_row() {
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     })
     .expect("register the orphan row");
 }
@@ -256,6 +264,8 @@ fn register_stale_tag_row() {
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     })
     .expect("register the stale-tag row");
 }
@@ -535,6 +545,8 @@ fn a_recycled_pid_keeps_only_the_newest_row() {
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     })
     .expect("register the stale pid row");
     let ctx = ctx(fixture_probe());
@@ -583,6 +595,8 @@ fn a_wrapper_launched_clauth_start_is_the_panes_session() {
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     })
     .expect("register the wrapper session");
     let list = r#"{"id":"cli:pane:list","result":{"panes":[{"agent_status":"idle","cwd":"/home/user/repos/app","focused":false,"pane_id":"wX:pX","tab_id":"wX:tX","workspace_id":"wX"}]}}"#;
@@ -636,6 +650,8 @@ fn a_pane_with_no_foreground_job_keeps_its_row_beside_a_joined_pane() {
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     })
     .expect("register the member row");
     let list = r#"{"id":"cli:pane:list","result":{"panes":[{"agent_status":"idle","cwd":"/home/user/repos/rs/clauth","focused":false,"pane_id":"wM:pM","tab_id":"wM:tM","workspace_id":"wM"},{"agent_status":"idle","cwd":"/home/user/repos/shell","focused":false,"pane_id":"wE:pE","tab_id":"wE:tE","workspace_id":"wE"}]}}"#;
@@ -739,6 +755,8 @@ fn sessions_for(row_pid: u32, info: &'static str) -> serde_json::Value {
         last_swap_at: None,
         launch_store: None,
         is_delegate: false,
+        background: false,
+        background_hold: false,
     })
     .expect("register the row");
     let list = r#"{"id":"cli:pane:list","result":{"panes":[{"agent_status":"idle","cwd":"/home/user/repos/app","focused":false,"pane_id":"wK:pK","tab_id":"wK:tK","workspace_id":"wK"}]}}"#;
@@ -809,4 +827,29 @@ fn the_real_no_job_wire_parses_with_no_group_and_no_processes() {
     .expect("the no-job envelope parses");
     assert_eq!(info.foreground_process_group_id, None);
     assert!(info.foreground_processes.is_empty());
+}
+
+/// F9: the daemon's background hold carries the DAEMON's pid, so it never joins
+/// a pane as that pane's Claude session (wrong account on the row and in the
+/// push). A launcher's own background row (no hold flag) still joins — it IS a
+/// `clauth start`.
+#[test]
+fn a_background_hold_row_never_joins_a_pane_pid() {
+    let hold = LiveSession {
+        pid: 7001,
+        background: true,
+        background_hold: true,
+        ..crate::testutil::live_row("7200-0", "bghold")
+    };
+    let launcher = LiveSession {
+        pid: 7002,
+        background: true,
+        ..crate::testutil::live_row("7201-0", "bglaunch")
+    };
+    let rows = [hold, launcher];
+
+    let joined = newest_per_pid(&rows);
+
+    assert_eq!(joined.len(), 1, "only the launcher joins its pid");
+    assert_eq!(joined[0].session_id, "7201-0");
 }

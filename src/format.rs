@@ -141,6 +141,22 @@ pub(crate) enum Cause {
     /// locked and nothing is broken. The next step is the operator's, and it is
     /// specific enough that a generic retry hint would be wrong.
     LiveSessionOnRotatingChain(String),
+    /// An UNFINISHED Claude Code background job still reads this profile's
+    /// rotating pair, so rotating would strand it the same way a live session is
+    /// stranded. Distinct from [`Self::LiveSessionOnRotatingChain`] because the
+    /// next step is the operator's and different: no session is running, so
+    /// waiting changes nothing — only `claude stop` (or letting the job
+    /// finish) frees the chain.
+    BackgroundJobOnRotatingChain(String),
+    /// Claude Code's background-job store could not be read, so clauth cannot
+    /// rule out an unfinished job on a rotatable tree. A GLOBAL store failure
+    /// blocks every profile on macOS until it clears; a tree-local failure
+    /// blocks only the profile whose store failed. Same fail-closed direction
+    /// as the other two arms, and its own copy because none of their next steps
+    /// apply: nothing is running to wait for and nothing is there to stop. The
+    /// `store` is the dir the refusal names (the global store or the account's
+    /// own `jobs/`).
+    UnreadableJobStoreOnRotatingChain { profile: String, store: String },
     /// Another holder has the profile's rotation lock and the caller must not
     /// park behind it — the scheduler's CLA-ROLL re-stamp leg, which runs on a
     /// thread that cannot wait, and the account-mutation refusals, which decline
@@ -231,6 +247,16 @@ impl Cause {
             Self::LiveSessionOnRotatingChain(profile) => {
                 format!(
                     "'{profile}' has a live clauth start session still on its rotating login; retry in a moment"
+                )
+            }
+            Self::BackgroundJobOnRotatingChain(profile) => {
+                format!(
+                    "'{profile}' has a background session still on its rotating login; end it with claude stop to rotate"
+                )
+            }
+            Self::UnreadableJobStoreOnRotatingChain { profile, store } => {
+                format!(
+                    "can't read claude code's background job list ({store}), so '{profile}' is not rotated; retry in a moment"
                 )
             }
             Self::RotationLockHeld(profile) => {
