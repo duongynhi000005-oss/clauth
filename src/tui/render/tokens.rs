@@ -1373,10 +1373,6 @@ fn total_lines(
             theme::body(),
         ),
     ]));
-    lines.push(Line::from(vec![
-        key("msgs"),
-        Span::styled(fmt_count(stats.total_messages), theme::body()),
-    ]));
     if !speed_days.is_empty() {
         let (output, gen_ms) = speed_days
             .values()
@@ -1395,6 +1391,10 @@ fn total_lines(
             ),
         ]));
     }
+    lines.push(Line::from(vec![
+        key("msgs"),
+        Span::styled(fmt_count(stats.total_messages), theme::body()),
+    ]));
     let meta = match (stats.first_session_date.as_deref(), last) {
         (Some(first), Some(latest)) => {
             Some(format!("{} → {}", short_date(first), short_date(latest)))

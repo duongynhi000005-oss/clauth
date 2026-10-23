@@ -1968,6 +1968,21 @@ fn the_total_card_avg_speed_reads_the_ledger_speed_rows() {
         .expect("a ledger with speed rows shows the avg speed line");
     assert_eq!(avg, "avg speed 90 t/s");
 
+    // The row sits right above `msgs`, under `sessions`.
+    let (lines, _) = total_lines(&stats, &stats.speed_days, 24, true, None);
+    let texts: Vec<String> = lines.iter().map(line_text).collect();
+    assert_eq!(
+        texts,
+        [
+            "tokens    170M",
+            "  0% cache hit",
+            "cost      —",
+            "sessions  1,000",
+            "avg speed 90 t/s",
+            "msgs      200K"
+        ]
+    );
+
     // An empty ledger speed map leaves the card exactly as it rendered before.
     let empty = populated_stats();
     let (empty_lines, _) = total_lines(&empty, &empty.speed_days, 40, false, None);
