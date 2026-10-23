@@ -204,10 +204,11 @@ impl Drop for HomeSandbox {
         // `tokio::task::spawn_blocking`).
         let stuck = join_tui_workers_bounded();
         join_background_tasks();
-        // Clear the forget queue, its registered-stores flag and the seed
-        // hooks: under `cargo test` the suite is one process, so a leak or an
-        // armed hook would reach the next test.
+        // Clear the forget queue, its registered-stores flag, the `/profile`
+        // memo and the seed hooks: under `cargo test` the suite is one process,
+        // so a leak or an armed hook would reach the next test.
         crate::usage::reset_pending_forgets_for_test();
+        crate::usage::reset_profile_fetched_for_test();
         crate::usage::clear_seed_hooks_for_test();
         crate::usage::clear_codex_compare_hooks_for_test();
         crate::profile::clear_home_override();

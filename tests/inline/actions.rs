@@ -8313,7 +8313,7 @@ fn oauth_pair(access: &str) -> ClaudeCredentials {
 }
 
 /// A profile with an anchored OAuth login and (when `api_key` is set) a
-/// provider endpoint — the hybrid shape A2/A8 exercise.
+/// provider endpoint — the hybrid shape.
 fn hybrid_profile(name: &str, access: &str, provider_url: &str, api_key: Option<&str>) -> Profile {
     let mut profile = Profile::new(
         name.to_string(),
@@ -8343,7 +8343,7 @@ fn seed_oauth_memory(stores: &crate::usage::MemoryStores, name: &str, interval_m
     );
 }
 
-/// A1: an OAuth log out forgets the reading, status, streak and cadence in THIS
+/// An OAuth log out forgets the reading, status, streak and cadence in THIS
 /// process and drops the disk cache, through the real change site.
 #[test]
 fn an_oauth_log_out_forgets_this_processs_reading_and_disk_cache() {
@@ -8843,16 +8843,19 @@ fn a_same_account_relogin_through_the_install_path_forgets_nothing() {
     let base = epoch_value(&name, Half::OAuth);
 
     // The hook runs this process's compare between the install's credentials
-    // write and its anchor write (inside `seed_login_anchor`'s hold). The
+    // write and its anchor write (inside the install's hold). The
     // compare runs on its own thread, like a real second process: the install
     // thread holds the state flock, which ranks above the compare's epoch, so
     // an in-thread compare would invert the lock order.
     let hook_stores = std::sync::Arc::new(stores);
+    let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     crate::usage::set_compare_hook(
         "acct",
         std::sync::Arc::new({
             let stores = hook_stores.clone();
+            let ran = hook_ran.clone();
             move || {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 let stores = stores.clone();
                 std::thread::spawn(move || {
                     let outcome = reload_and_forget(
@@ -8878,6 +8881,10 @@ fn a_same_account_relogin_through_the_install_path_forgets_nothing() {
     )
     .expect("overwrite in place");
 
+    assert!(
+        hook_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the in-hold compare hook ran"
+    );
     assert_eq!(
         epoch_value(&name, Half::OAuth),
         base,
@@ -8907,13 +8914,16 @@ fn a_same_account_capture_through_the_install_path_forgets_nothing() {
 
     // Same two-process shape as the overwrite hook test: the hook runs this
     // process's compare between the credentials write and the anchor write,
-    // inside `seed_login_anchor`'s hold, on its own thread.
+    // inside the install's hold, on its own thread.
     let hook_stores = std::sync::Arc::new(stores);
+    let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     crate::usage::set_compare_hook(
         "acct",
         std::sync::Arc::new({
             let stores = hook_stores.clone();
+            let ran = hook_ran.clone();
             move || {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 let stores = stores.clone();
                 std::thread::spawn(move || {
                     let outcome = reload_and_forget(
@@ -8946,6 +8956,10 @@ fn a_same_account_capture_through_the_install_path_forgets_nothing() {
     )
     .expect("capture the same account in place");
 
+    assert!(
+        hook_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the in-hold compare hook ran"
+    );
     assert_eq!(
         epoch_value(&name, Half::OAuth),
         base,
@@ -8974,11 +8988,14 @@ fn a_same_account_create_through_the_install_path_forgets_nothing() {
     let base = epoch_value(&name, Half::OAuth);
 
     let hook_stores = std::sync::Arc::new(stores);
+    let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     crate::usage::set_compare_hook(
         "acct",
         std::sync::Arc::new({
             let stores = hook_stores.clone();
+            let ran = hook_ran.clone();
             move || {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 let stores = stores.clone();
                 std::thread::spawn(move || {
                     let outcome = reload_and_forget(
@@ -9013,6 +9030,10 @@ fn a_same_account_create_through_the_install_path_forgets_nothing() {
     )
     .expect("create the same account in place");
 
+    assert!(
+        hook_ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the in-hold compare hook ran"
+    );
     assert_eq!(
         epoch_value(&name, Half::OAuth),
         base,
@@ -9094,7 +9115,7 @@ fn an_own_rename_moves_the_snapshot_entry() {
     );
 }
 
-/// A2: a key edit forgets the old provider's reading, status and streak and
+/// A key edit forgets the old provider's reading, status and streak and
 /// drops the third-party disk cache, while the hybrid's OAuth leg stays.
 #[test]
 fn a_key_edit_forgets_the_old_provider_reading_and_keeps_the_oauth_leg() {
@@ -9217,7 +9238,7 @@ fn a_key_edit_forgets_the_old_provider_reading_and_keeps_the_oauth_leg() {
     );
 }
 
-/// A6: a proven same-account re-login (the anchor re-seeds the SAME uuid) and a
+/// A proven same-account re-login (the anchor re-seeds the SAME uuid) and a
 /// no-op re-save forget nothing — on disk or in memory, the `/profile` stamp
 /// included. A probe body (the normal interactive login) must not seed a
 /// plan-only cache over the live windows either.
@@ -9285,7 +9306,7 @@ fn a_proven_same_account_relogin_forgets_nothing() {
     );
 }
 
-/// A8: a hybrid's OAuth log out forgets the OAuth half alone — the provider
+/// A hybrid's OAuth log out forgets the OAuth half alone — the provider
 /// reading stays, on disk and in memory.
 #[test]
 fn a_hybrid_oauth_log_out_keeps_the_provider_reading() {
@@ -9349,7 +9370,7 @@ fn a_hybrid_oauth_log_out_keeps_the_provider_reading() {
     );
 }
 
-/// A11 rename leg: a rename moves the reading to the new name in memory.
+/// A rename moves the reading to the new name in memory.
 #[test]
 fn renaming_an_account_moves_its_readings() {
     use crate::usage::apply_pending_forgets;
@@ -9408,9 +9429,9 @@ fn renaming_an_account_moves_its_readings() {
     );
 }
 
-/// A1 api leg: blanking the api key forgets the provider's reading, status and
-/// streak in this process and drops the third-party disk cache, through the
-/// real `clear_profile_api_key` → `edit_profile_endpoint` path.
+/// Blanking the api key forgets the provider's reading, status and streak in
+/// this process and drops the third-party disk cache, through the real
+/// `clear_profile_api_key` → `edit_profile_endpoint` path.
 #[test]
 fn an_api_key_log_out_forgets_the_provider_reading_and_disk_cache() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
@@ -9480,8 +9501,8 @@ fn an_api_key_log_out_forgets_the_provider_reading_and_disk_cache() {
     );
 }
 
-/// A2 console leg: storing a NEW Alibaba console session forgets the reading
-/// the OLD session filled.
+/// Storing a NEW Alibaba console session forgets the reading the OLD
+/// session filled.
 #[test]
 fn a_console_change_forgets_the_provider_reading() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
@@ -9535,8 +9556,8 @@ fn a_console_change_forgets_the_provider_reading() {
     );
 }
 
-/// A2 provider leg: moving the endpoint to another provider (same key) forgets
-/// the old provider's reading.
+/// Moving the endpoint to another provider (same key) forgets the old
+/// provider's reading.
 #[test]
 fn a_provider_change_forgets_the_provider_reading() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
@@ -9586,8 +9607,8 @@ fn a_provider_change_forgets_the_provider_reading() {
     );
 }
 
-/// A2 Alibaba key leg: an inference-key edit keeps the console-read usage (the
-/// console session alone is Alibaba's usage identity), on disk and in memory.
+/// An inference-key edit keeps the console-read usage (the console session
+/// alone is Alibaba's usage identity), on disk and in memory.
 #[test]
 fn an_alibaba_key_edit_keeps_the_console_reading() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
@@ -9638,8 +9659,8 @@ fn an_alibaba_key_edit_keeps_the_console_reading() {
     );
 }
 
-/// A2 same-provider base_url leg: a base_url edit over the SAME provider and
-/// key keeps the reading — the fetch sends the same key to the same provider.
+/// A base_url edit over the SAME provider and key keeps the reading — the
+/// fetch sends the same key to the same provider.
 #[test]
 fn a_same_provider_base_url_edit_keeps_the_reading() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
@@ -9689,8 +9710,8 @@ fn a_same_provider_base_url_edit_keeps_the_reading() {
     );
 }
 
-/// A2 generic base_url leg: a generic endpoint's base_url edit forgets the old
-/// reading (the resolved base_url is part of its identity).
+/// A generic endpoint's base_url edit forgets the old reading (the resolved
+/// base_url is part of its identity).
 #[test]
 fn a_generic_base_url_edit_forgets_the_provider_reading() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
@@ -9736,8 +9757,39 @@ fn a_generic_base_url_edit_forgets_the_provider_reading() {
     );
 }
 
-/// A2 generic key leg: a generic endpoint's key edit over the SAME base_url
-/// forgets the old reading (the key is what its fetch sends).
+/// A keyless OAuth account whose stored `base_url` names Alibaba runs on its
+/// login (the effective base_url drops the url), so it holds no third-party
+/// half. Re-saving that same endpoint changes nothing it reads, so its
+/// third-party epoch must not move: both sides of the compare read the
+/// effective base_url.
+#[test]
+fn an_unchanged_endpoint_save_on_a_keyless_oauth_account_forgets_nothing() {
+    use crate::usage::{Half, apply_pending_forgets, epoch_value};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("ali-oauth");
+    let url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com";
+    let profile = hybrid_profile("ali-oauth", "access-A", url, None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["ali-oauth"]);
+    let stores = empty_memory_stores();
+    stores.seed_snapshot(std::slice::from_ref(&name));
+    let base = epoch_value(&name, Half::ThirdParty);
+
+    let mut config = inactive_config(profile);
+    edit_profile_endpoint(&mut config, &name, Some(url.to_string()), None)
+        .expect("re-save the same endpoint");
+    apply_pending_forgets(&stores);
+
+    assert_eq!(
+        epoch_value(&name, Half::ThirdParty),
+        base,
+        "a third-party half the account never had is not forgotten"
+    );
+}
+
+/// A generic endpoint's key edit over the SAME base_url forgets the old
+/// reading (the key is what its fetch sends).
 #[test]
 fn a_generic_key_edit_forgets_the_provider_reading() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
@@ -9783,8 +9835,8 @@ fn a_generic_key_edit_forgets_the_provider_reading() {
     );
 }
 
-/// A2 throughput leg: a key edit forgets the throughput record (the delegates
-/// now run on a different key).
+/// A key edit forgets the throughput record (the delegates now run on
+/// a different key).
 #[test]
 fn a_key_edit_forgets_the_throughput_record() {
     use crate::usage::apply_pending_forgets;
@@ -9825,9 +9877,10 @@ fn a_key_edit_forgets_the_throughput_record() {
     );
 }
 
-/// N5: a hybrid's OAuth log out keeps the throughput record while the delegates
-/// still run on the key. `clear_profile_credentials` with `throughput: true`
-/// (the round-2 M6 mutant) ships green, so this pins the keep direction.
+/// A hybrid's OAuth log out keeps the throughput record while the delegates
+/// still run on the key: `clear_profile_credentials` leaves the throughput half
+/// unchanged. A `throughput: true` plan would drop the record; this test pins
+/// the keep.
 #[test]
 fn a_hybrid_oauth_log_out_keeps_the_throughput_record() {
     use crate::profile_cache::load_profile_cache;
@@ -9910,8 +9963,8 @@ fn the_throughput_identity_reads_the_effective_endpoint_on_both_sides() {
     );
 }
 
-/// A6 no-op leg: re-saving the SAME stored chain (an api re-key's Unchanged
-/// anchor) forgets nothing on disk or in memory.
+/// Re-saving the SAME stored chain (an api re-key's Unchanged anchor) forgets
+/// nothing on disk or in memory.
 #[test]
 fn a_no_op_resave_forgets_nothing() {
     use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
@@ -9963,8 +10016,8 @@ fn a_no_op_resave_forgets_nothing() {
     );
 }
 
-/// A6 backfill leg: an anchor appearing over an UNCHANGED stored token (the
-/// `/profile` backfill) forgets nothing.
+/// An anchor appearing over an UNCHANGED stored token (the `/profile`
+/// backfill) forgets nothing.
 #[test]
 fn an_anchor_backfill_forgets_nothing() {
     use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
@@ -10016,7 +10069,7 @@ fn an_anchor_backfill_forgets_nothing() {
     );
 }
 
-/// A7b: an unproven capture of another account over an anchored profile forgets
+/// An unproven capture of another account over an anchored profile forgets
 /// the OAuth half (the anchor is removed while a login stays).
 #[test]
 fn an_unproven_capture_over_an_anchored_profile_forgets_the_oauth_reading() {
@@ -10069,8 +10122,8 @@ fn an_unproven_capture_over_an_anchored_profile_forgets_the_oauth_reading() {
     );
 }
 
-/// A8 re-login leg: a hybrid's OAuth re-login forgets the OAuth half alone —
-/// the provider reading stays, on disk and in memory.
+/// A hybrid's OAuth re-login forgets the OAuth half alone — the provider
+/// reading stays, on disk and in memory.
 #[test]
 fn a_hybrid_oauth_relogin_keeps_the_provider_reading() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
@@ -10145,8 +10198,8 @@ fn a_hybrid_oauth_relogin_keeps_the_provider_reading() {
     );
 }
 
-/// A11 delete leg: deleting an account forgets BOTH halves in this process's
-/// memory (the directory removal swept the disk).
+/// Deleting an account forgets BOTH halves in this process's memory (the
+/// directory removal swept the disk).
 #[test]
 fn deleting_an_account_forgets_both_halves() {
     use crate::usage::apply_pending_forgets;
@@ -10199,8 +10252,8 @@ fn deleting_an_account_forgets_both_halves() {
     );
 }
 
-/// A11 delete-then-recreate leg: recreating under a deleted name does not
-/// resurrect the old account's reading.
+/// Recreating under a deleted name does not resurrect the old account's
+/// reading.
 #[test]
 fn a_delete_then_recreate_forgets_the_old_reading() {
     use crate::usage::apply_pending_forgets;
@@ -10255,54 +10308,53 @@ fn a_delete_then_recreate_forgets_the_old_reading() {
     );
 }
 
-/// A11 duplicate leg: duplicating over an existing name forgets that name's old
-/// halves (a reused name drops its old reading instead of inheriting it).
+/// A duplicate onto a reused name forgets that name's stale readings instead of
+/// inheriting them; the target exists nowhere but this process's memory.
 #[test]
-fn duplicating_over_an_existing_name_forgets_the_old_halves() {
+fn duplicating_onto_a_reused_name_forgets_its_stale_readings() {
     use crate::usage::apply_pending_forgets;
 
     let _home = HomeSandbox::new();
     let source = Profile::new(
-        "src".to_string(),
+        "dup-src".to_string(),
         Some("https://api.z.ai/api/anthropic".to_string()),
         Some("key-A".to_string()),
     );
-    let target = Profile::new(
-        "dup".to_string(),
-        Some("https://api.deepseek.com/anthropic".to_string()),
-        Some("key-B".to_string()),
-    );
     save_profile(&source).expect("save the source");
-    save_profile(&target).expect("save the target");
-    crate::testutil::register_names(&["src", "dup"]);
+    crate::testutil::register_names(&["dup-src"]);
     let stores = empty_memory_stores();
-    stores
-        .third_party_usage
-        .lock()
-        .unwrap()
-        .insert("dup".to_string(), crate::testutil::stats_with_bars(vec![]));
+    stores.third_party_usage.lock().unwrap().insert(
+        "dup-tgt".to_string(),
+        crate::testutil::stats_with_bars(vec![]),
+    );
 
+    // The target is off disk and off the disk roster; only its stale reading
+    // sits in this process's memory.
     let mut config = AppConfig {
         state: AppState {
-            profiles: vec![ProfileName::from("src"), ProfileName::from("dup")],
-            fallback_chain: vec![ProfileName::from("src"), ProfileName::from("dup")],
-            active_profile: Some(ProfileName::from("src")),
+            profiles: vec![ProfileName::from("dup-src")],
+            fallback_chain: vec![ProfileName::from("dup-src")],
+            active_profile: Some(ProfileName::from("dup-src")),
             ..AppState::default()
         },
-        profiles: vec![source, target],
+        profiles: vec![source],
     };
-    let src_name = ProfileName::from("src");
-    duplicate_profile(&mut config, &src_name, "dup".to_string()).expect("duplicate");
+    let src_name = ProfileName::from("dup-src");
+    duplicate_profile(&mut config, &src_name, "dup-tgt".to_string()).expect("duplicate");
     apply_pending_forgets(&stores);
 
     assert!(
-        !stores.third_party_usage.lock().unwrap().contains_key("dup"),
+        !stores
+            .third_party_usage
+            .lock()
+            .unwrap()
+            .contains_key("dup-tgt"),
         "the old provider reading goes with the reused name"
     );
 }
 
-/// A11 rename-epoch leg: a rename bumps the OLD name's epochs, so a stale
-/// in-flight seed or landing under the old name writes nothing.
+/// A rename bumps the OLD name's epochs, so a stale in-flight seed or landing
+/// under the old name writes nothing.
 #[test]
 fn a_rename_bumps_the_old_names_epochs() {
     use crate::usage::{Half, apply_pending_forgets, epoch_value};
@@ -10485,7 +10537,7 @@ fn a_codex_capture_reseeds_the_shared_reading_from_disk() {
     );
 }
 
-/// N4: a codex account change forgets the shared reading on disk — a stored
+/// A codex account change forgets the shared reading on disk — a stored
 /// `auth.json` with no account id and a captured one with one (and the reverse)
 /// removes `usage_cache.json`, so the re-seed finds nothing to bring back.
 #[test]
@@ -10649,9 +10701,8 @@ fn a_change_site_records_nothing_until_stores_are_registered() {
     );
 }
 
-/// R7: a proven install writes its anchor inside its hold, before the hold's
-/// final state write — a failure after the store write still leaves the profile
-/// anchored.
+/// A proven install writes its anchor inside its hold, after the state write —
+/// so a failed state write still leaves the profile anchored.
 #[test]
 fn a_proven_install_writes_its_anchor_inside_the_hold() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
@@ -10681,7 +10732,7 @@ fn a_proven_install_writes_its_anchor_inside_the_hold() {
 
     assert!(
         load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE).is_some(),
-        "the proven anchor was written inside the hold before the state write failed"
+        "the proven anchor was written inside the hold after the state write failed"
     );
 }
 

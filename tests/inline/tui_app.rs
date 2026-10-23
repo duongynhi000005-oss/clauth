@@ -4486,7 +4486,7 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
     );
 }
 
-/// R13: an overwrite on the preserve path (credentials, base_url and api_key
+/// An overwrite on the preserve path (credentials, base_url and api_key
 /// all omitted, so the stored endpoint and key are kept) keeps the provider
 /// verdict, status and streak — the identity did not change, so nothing
 /// forgets.

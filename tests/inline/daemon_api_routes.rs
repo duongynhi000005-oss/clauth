@@ -3424,12 +3424,16 @@ fn switch_relinks_and_reports_the_previous_account() {
     );
 }
 
-/// N2: the REST `POST /api/v1/switch` overwrite path applies the forget its
-/// change site noted, through a context that holds the daemon's memory stores.
-/// Removing the apply (the round-2 M4 mutant) ships green, so this pins it.
-#[test]
-fn switch_overwrite_applies_the_displaced_reading_forget() {
-    let _home = HomeSandbox::new();
+/// Shared fixture for the two REST-switch forget tests: an overwrite-default
+/// config, a diverged live slot, and fresh memory stores registered and seeded
+/// with a reading for the displaced account. Returns the config and stores for
+/// the caller's request context, plus the store Arcs the assertions drain.
+fn switch_forget_fixture() -> (
+    ConfigHandle,
+    crate::usage::MemoryStores,
+    crate::usage::UsageStore,
+    crate::usage::StatusStore,
+) {
     let config = seeded_config();
     // Overwrite default: the diverged live slot below takes the reconcile
     // (overwrite) path, whose force-snapshot notes the outgoing forget.
@@ -3476,6 +3480,16 @@ fn switch_overwrite_applies_the_displaced_reading_forget() {
     // context will drain.
     let usage = std::sync::Arc::clone(&stores.usage);
     let usage_status = std::sync::Arc::clone(&stores.usage_status);
+    (config, stores, usage, usage_status)
+}
+
+/// The REST `POST /api/v1/switch` overwrite path applies the forget its
+/// change site noted, through a context that holds the daemon's memory stores;
+/// the apply is what lands it, which this test pins.
+#[test]
+fn switch_overwrite_applies_the_displaced_reading_forget() {
+    let _home = HomeSandbox::new();
+    let (config, stores, usage, usage_status) = switch_forget_fixture();
 
     let ctx = ctx_with_stores(std::sync::Arc::clone(&config), stores);
 
@@ -3499,6 +3513,46 @@ fn switch_overwrite_applies_the_displaced_reading_forget() {
             .expect("usage_status")
             .contains_key("alpha"),
         "the displaced account's status is forgotten through the REST switch"
+    );
+}
+
+/// A REST switch whose install fails AFTER the reconcile snapshot noted the
+/// outgoing forget still applies it on the Err arm, which this test pins.
+#[test]
+fn a_failed_rest_switch_still_applies_the_displaced_reading_forget() {
+    let _home = HomeSandbox::new();
+    let (config, stores, usage, usage_status) = switch_forget_fixture();
+
+    // Fail the switch's finish half after the reconcile snapshot noted the
+    // forget: a directory at settings.json refuses the merge-read inside
+    // `apply_profile_to_claude_settings`.
+    let settings = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("settings.json");
+    std::fs::create_dir_all(&settings).expect("settings.json as dir");
+
+    let ctx = ctx_with_stores(std::sync::Arc::clone(&config), stores);
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    assert_eq!(resp.status, 500, "{}", String::from_utf8_lossy(&resp.body));
+    assert!(
+        !usage.lock().expect("usage").contains_key("alpha"),
+        "the displaced account's reading is forgotten even though the REST switch failed"
+    );
+    assert!(
+        !usage_status
+            .lock()
+            .expect("usage_status")
+            .contains_key("alpha"),
+        "the displaced account's status is forgotten even though the REST switch failed"
     );
 }
 

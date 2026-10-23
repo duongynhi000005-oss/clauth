@@ -10067,7 +10067,7 @@ fn a_rebuilt_entry_partitioned_after_a_bump_still_lands() {
     let _old = save_unanchored_login("z", "z-old");
     // A change site forgets `z` (a re-login), then the rebuild writes the new
     // credential before the tick's partition runs.
-    crate::usage::bump_epoch(&z, crate::usage::Half::OAuth);
+    crate::usage::bump_epoch_for_test(&z, crate::usage::Half::OAuth);
     let new = save_unanchored_login("z", "z-new");
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
@@ -17987,7 +17987,7 @@ fn the_catch_up_waits_on_the_flock_without_holding_the_config_lock() {
     assert_eq!(chain_store_refresh(name).as_deref(), Some("rt-mid"));
 }
 
-/// A19: a startup seed racing a change — the epoch moved between its disk read
+/// A startup seed racing a change — the epoch moved between its disk read
 /// and its store write — writes nothing, so a forget cannot be undone by a
 /// stale seed the change's own re-seed raced.
 #[test]
@@ -18025,7 +18025,7 @@ fn a_startup_seed_racing_a_change_writes_nothing() {
 
     // Pose a change landing between the seed's disk read and its store write.
     super::set_seed_hook(super::SeedPhase::PreWrite, crate::usage::Half::OAuth, |n| {
-        crate::usage::bump_epoch(n, crate::usage::Half::OAuth);
+        crate::usage::bump_epoch_for_test(n, crate::usage::Half::OAuth);
     });
 
     crate::usage::bootstrap_fetch(
@@ -18139,8 +18139,8 @@ fn a_seed_holds_the_epoch_guard_through_its_writes() {
     );
 }
 
-/// A19 provider half: the third-party startup seed writes nothing once its
-/// epoch moved between the disk read and the store write.
+/// The third-party startup seed writes nothing once its epoch moved between the
+/// disk read and the store write.
 #[test]
 fn a_third_party_startup_seed_racing_a_change_writes_nothing() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -18167,7 +18167,7 @@ fn a_third_party_startup_seed_racing_a_change_writes_nothing() {
         super::SeedPhase::PreWrite,
         crate::usage::Half::ThirdParty,
         |n| {
-            crate::usage::bump_epoch(n, crate::usage::Half::ThirdParty);
+            crate::usage::bump_epoch_for_test(n, crate::usage::Half::ThirdParty);
         },
     );
     let work = crate::usage::collect_third_party_entries(&[profile]);
@@ -19085,7 +19085,7 @@ fn an_epoch_bump_before_the_worker_starts_still_stamps_nothing() {
     // …then this process's change site lands: new login on disk, its forget
     // bumps the epoch, all before the worker thread starts.
     save_unanchored_login("y", "y-new");
-    crate::usage::bump_epoch(&y, crate::usage::Half::OAuth);
+    crate::usage::bump_epoch_for_test(&y, crate::usage::Half::OAuth);
     let state = completion_order_state();
     *state.config.lock().unwrap() = config;
     *state.tokens.lock().unwrap() = due.clone();

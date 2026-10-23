@@ -6843,7 +6843,11 @@ impl App {
             // the compare's forget (the epoch bump): a partition landing
             // between the two must clone the REBUILT entry, never the old entry
             // under a post-bump epoch — that pairing stamps cadence for the old
-            // credential and delays the new login's first fetch (N1).
+            // credential and delays the new login's first fetch. The reverse
+            // window, a partition between the rebuild and the compare while
+            // the snapshot half still holds the old identity, drops the
+            // rebuilt entry as stale for one tick; it self-heals on the next
+            // compare, never a wrong reading.
             #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             {
                 *self

@@ -210,6 +210,64 @@ fn tick_with_empty_queues_writes_status_and_leaves_active_unchanged() {
     );
 }
 
+/// A forget noted without an immediate per-site drain still lands at the next
+/// tick's safety-net apply, which this test pins.
+#[test]
+fn the_tick_applies_a_noted_forget() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            }),
+            ..Default::default()
+        },
+    );
+    daemon
+        .usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+    // Note the forget directly: no per-site drain runs before the tick, so only
+    // the tick's apply can land it.
+    crate::usage::note_forget(
+        &crate::profile::ProfileName::from("alpha"),
+        crate::usage::Half::OAuth,
+    );
+
+    daemon.tick();
+
+    assert!(
+        !daemon
+            .usage_store
+            .lock()
+            .expect("usage_store")
+            .contains_key("alpha"),
+        "the tick's safety-net apply forgot the noted reading"
+    );
+    assert!(
+        !daemon
+            .usage_status
+            .lock()
+            .expect("usage_status")
+            .contains_key("alpha"),
+        "the tick's safety-net apply forgot the noted status"
+    );
+}
+
 /// The tick is a heal call site: one tick over a broken registration reaches
 /// `claude` through the detached heal. Deleting the call from `tick` reds here,
 /// which a healthy-registration variant could never do — that one is green
@@ -924,9 +982,9 @@ fn a_member_given_up_as_unreadable_is_passed_over_until_its_store_reads_again() 
     assert_eq!(active_of(&daemon).as_deref(), Some("alpha"));
 }
 
-/// R2 daemon leg: a change site the daemon tick runs — the adopt of a first
-/// login during a switch — forgets the displaced OAuth reading right after the
-/// switch's locks drop, the same call the TUI makes.
+/// A change site the daemon tick runs — the adopt of a first login during a
+/// switch — forgets the displaced OAuth reading right after the switch's locks
+/// drop, the same call the TUI makes.
 #[test]
 fn a_daemon_switch_adopt_forgets_the_displaced_reading() {
     let _home = HomeSandbox::new();
@@ -986,7 +1044,7 @@ fn a_daemon_switch_adopt_forgets_the_displaced_reading() {
     );
 }
 
-/// N1: a daemon switch whose install fails AFTER the adopt captured the live
+/// A daemon switch whose install fails AFTER the adopt captured the live
 /// login still forgets the adopted reading — the Err arm applies what the
 /// change site noted before it failed.
 #[test]

@@ -1862,11 +1862,17 @@ fn write_codex_profile_store(
 ) -> Result<std::path::PathBuf> {
     let profile_name = ProfileName::from(name);
     // `refuse_codex_account_swap` blocks a different account on re-auth, so only
-    // a fresh capture moves the codex identity.
+    // a fresh capture moves the codex identity. `before` reads the stored
+    // `auth.json` guard-free, so an unreadable one reads `None` and a
+    // same-account re-capture over it drops the shared cache once; the next poll
+    // refills it.
     let before = read_codex_identity(&profile_name);
     let after = crate::codex_auth::CodexAuth::parse(raw)
         .ok()
         .and_then(|a| a.account_id().map(str::to_string));
+    // Forget-first: the shared cache drops before the `auth.json` write below, so
+    // a failed write leaves the old account's identity on disk with its reading
+    // gone until the next poll — codex has no durable verdict to lose.
     if before != after {
         forget_disk(&profile_name, Half::Codex);
     }

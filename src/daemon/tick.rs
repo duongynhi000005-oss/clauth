@@ -215,7 +215,11 @@ impl super::Daemon {
                 // landing between the two must clone the REBUILT entry, never
                 // the old entry under a post-bump epoch — that pairing stamps
                 // cadence for the old credential and delays the new login's
-                // first fetch (N1).
+                // first fetch. The reverse window, a partition between the
+                // rebuild and the compare while the snapshot half still holds
+                // the old identity, drops the rebuilt entry as stale for one
+                // tick; it self-heals on the next compare, never a wrong
+                // reading.
                 self.rebuild_tokens();
                 crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
                 self.last_reload_fp = current;

@@ -46,28 +46,40 @@ static PROFILE_ENDPOINT_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::
 
 #[cfg(test)]
 pub(crate) fn set_usage_endpoint_override(usage: &str, profile: &str) {
-    if let Ok(mut guard) = USAGE_ENDPOINT_OVERRIDE.lock() {
+    {
+        let mut guard = USAGE_ENDPOINT_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(usage.to_string());
     }
-    if let Ok(mut guard) = PROFILE_ENDPOINT_OVERRIDE.lock() {
-        *guard = Some(profile.to_string());
-    }
+    let mut guard = PROFILE_ENDPOINT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(profile.to_string());
 }
 
 #[cfg(test)]
 pub(crate) fn clear_usage_endpoint_override() {
-    if let Ok(mut guard) = USAGE_ENDPOINT_OVERRIDE.lock() {
+    {
+        let mut guard = USAGE_ENDPOINT_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = None;
     }
-    if let Ok(mut guard) = PROFILE_ENDPOINT_OVERRIDE.lock() {
-        *guard = None;
-    }
+    let mut guard = PROFILE_ENDPOINT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
 }
 
 fn usage_endpoint() -> std::borrow::Cow<'static, str> {
     #[cfg(test)]
     {
-        if let Some(url) = USAGE_ENDPOINT_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
+        if let Some(url) = USAGE_ENDPOINT_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
             return std::borrow::Cow::Owned(url);
         }
         panic!(
@@ -85,8 +97,8 @@ fn profile_endpoint() -> std::borrow::Cow<'static, str> {
     {
         if let Some(url) = PROFILE_ENDPOINT_OVERRIDE
             .lock()
-            .ok()
-            .and_then(|g| g.clone())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
         {
             return std::borrow::Cow::Owned(url);
         }
@@ -161,14 +173,13 @@ fn reserve_slot(current_slot: u64, now: u64) -> (u64, u64) {
 
 /// Block until this caller's spacing slot for `host`, reserving the following slot
 /// for the next caller on the same host. Distinct hosts hold independent slots, so
-/// requests to different endpoints never serialize against each other. A poisoned
-/// lock skips throttling rather than stalling the fetch.
+/// requests to different endpoints never serialize against each other.
 pub(crate) fn await_request_slot(host: &str) {
     let now = now_ms();
     let wait_ms = {
-        let Ok(mut slots) = NEXT_REQUEST_SLOT.lock() else {
-            return;
-        };
+        let mut slots = NEXT_REQUEST_SLOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let slot = slots.entry(host.to_string()).or_insert(0);
         let (next, wait) = reserve_slot(*slot, now);
         *slot = next;
@@ -185,9 +196,10 @@ pub(crate) fn await_request_slot(host: &str) {
 /// shared-process `cargo test` runner (nextest isolates per process).
 #[cfg(test)]
 pub(crate) fn reset_request_slots() {
-    if let Ok(mut slots) = NEXT_REQUEST_SLOT.lock() {
-        slots.clear();
-    }
+    NEXT_REQUEST_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 /// The slot currently reserved for `host`, `None` when it holds none. Test-only
@@ -198,8 +210,9 @@ pub(crate) fn reset_request_slots() {
 pub(crate) fn reserved_request_slot(host: &str) -> Option<u64> {
     NEXT_REQUEST_SLOT
         .lock()
-        .ok()
-        .and_then(|slots| slots.get(host).copied())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(host)
+        .copied()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1202,9 +1215,10 @@ fn get_json(
 /// stamp to be read straight back in as fresh, silently reducing the manual
 /// refresh to a no-op for `/profile`.
 pub(crate) fn expire_profile_ttl(name: &ProfileName) {
-    if let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.remove(name.as_str());
-    }
+    PROFILE_FETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name.as_str());
     remove_profile_cache(name, PROFILE_FETCHED_CACHE_FILE);
 }
 
@@ -1213,9 +1227,20 @@ pub(crate) fn expire_profile_ttl(name: &ProfileName) {
 /// to remove; clearing it here would delete a stamp a refresher just wrote for
 /// the new login.
 pub(crate) fn forget_profile_memo(name: &ProfileName) {
-    if let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.remove(name.as_str());
-    }
+    PROFILE_FETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name.as_str());
+}
+
+/// Test seam: drop every in-memory `/profile` memo entry, so a stamp an
+/// earlier test wrote cannot reach the next test. Called from `HomeSandbox::drop`.
+#[cfg(test)]
+pub(crate) fn reset_profile_fetched_for_test() {
+    PROFILE_FETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 /// The profile has a usable identity anchor. A blank/whitespace uuid is shape
@@ -1242,13 +1267,15 @@ fn has_identity_anchor(name: &ProfileName) -> bool {
 /// own durable write failed is served for its TTL (so a failing write never
 /// storms), at the cost of not seeing a later removal.
 fn last_profile_attempt(name: &ProfileName) -> Option<u64> {
+    let memo = PROFILE_FETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(name.as_str())
+        .copied();
     if let Some(ProfileStamp {
         at_ms,
         durable_landed,
-    }) = PROFILE_FETCHED
-        .lock()
-        .ok()
-        .and_then(|m| m.get(name.as_str()).copied())
+    }) = memo
     {
         // A stamp this process wrote (durable_landed) that is now ABSENT was
         // removed by another process: lapsed, whatever the memo says. A stamp
@@ -1267,15 +1294,16 @@ fn last_profile_attempt(name: &ProfileName) -> Option<u64> {
     // Cold map (process start): adopt the durable stamp and memoize it. The lock
     // is taken fresh here — never held across the read above.
     let disk = load_profile_cache::<u64>(name, PROFILE_FETCHED_CACHE_FILE)?;
-    if let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.insert(
+    PROFILE_FETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
             name.to_string(),
             ProfileStamp {
                 at_ms: disk,
                 durable_landed: true,
             },
         );
-    }
     Some(disk)
 }
 
@@ -1320,15 +1348,16 @@ pub(crate) fn stamp_profile_fetch(name: &ProfileName, now: u64) -> bool {
 /// mismatch or timeout only while the epoch has not moved — the memo is cadence,
 /// so a stale snapshot never re-fetches every tick.
 pub(crate) fn note_profile_memo(name: &ProfileName, now: u64, durable_landed: bool) {
-    if let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.insert(
+    PROFILE_FETCHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
             name.to_string(),
             ProfileStamp {
                 at_ms: now,
                 durable_landed,
             },
         );
-    }
 }
 
 /// Test-only combined helper: decide, then stamp + memo when elected. Pins the
@@ -1749,9 +1778,8 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
     Ok(login_profile_from_raw(p))
 }
 
-/// A test's stand-in for another process's compare landing inside
-/// `seed_login_anchor`'s hold, right before the anchor write. Run once for the
-/// profile it names.
+/// A test's stand-in for another process's compare landing inside the install's
+/// hold, right before the anchor write. Run once for the profile it names.
 #[cfg(test)]
 pub(crate) type CompareHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
@@ -1761,19 +1789,20 @@ static COMPARE_HOOK: std::sync::Mutex<Option<std::collections::HashMap<String, C
 
 #[cfg(test)]
 pub(crate) fn set_compare_hook(profile: &str, f: CompareHook) {
-    if let Ok(mut hooks) = COMPARE_HOOK.lock() {
-        hooks
-            .get_or_insert_with(std::collections::HashMap::new)
-            .insert(profile.to_string(), f);
-    }
+    COMPARE_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(profile.to_string(), f);
 }
 
 #[cfg(test)]
 fn run_compare_hook(profile: &str) {
     let hook = COMPARE_HOOK
         .lock()
-        .ok()
-        .and_then(|mut hooks| hooks.as_mut().and_then(|hooks| hooks.remove(profile)));
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .and_then(|hooks| hooks.remove(profile));
     if let Some(f) = hook {
         f();
     }

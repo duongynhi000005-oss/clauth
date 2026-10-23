@@ -953,8 +953,8 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
             // a kick block, the `/profile` memo); readings, status and leg come
             // back from the disk re-seed, the epoch is monotonic and the
             // re-seed idempotent, and the compare's per-half CAS keeps the
-            // snapshot from regressing, so the cost is at most one extra
-            // request, never a wrong figure.
+            // COMPARE from clobbering a concurrent refresh, so the cost is at
+            // most one extra request, never a wrong figure.
             if let Some(stores) = &ctx.memory_stores {
                 crate::usage::apply_pending_forgets(stores);
             }

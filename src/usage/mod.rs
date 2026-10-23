@@ -109,7 +109,9 @@ pub(crate) use scheduler::{SeedPhase, set_seed_hook};
 // driving a builder through `await_request_slot` doesn't sleep out the window,
 // and read one back so a leg's reservation is assertable without that sleep.
 #[cfg(test)]
-pub(crate) use fetch::{reserved_request_slot, reset_request_slots, set_compare_hook};
+pub(crate) use fetch::{
+    reserved_request_slot, reset_profile_fetched_for_test, reset_request_slots, set_compare_hook,
+};
 // Test-only: the adopt's token → uuid memo outlives a call now, so it also
 // outlives a test. Cleared with the endpoint overrides that make it reachable.
 #[cfg(test)]
@@ -137,4 +139,6 @@ pub(crate) use forget::{
     throughput_for_endpoint, throughput_identity, throughput_identity_for_spawn,
 };
 #[cfg(test)]
-pub(crate) use forget::{bump_epoch, reset_pending_forgets_for_test, try_lock_epoch_for_test};
+pub(crate) use forget::{
+    bump_epoch_for_test, reset_pending_forgets_for_test, try_lock_epoch_for_test,
+};

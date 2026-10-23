@@ -316,7 +316,9 @@ pub(crate) fn read_before_identities(name: &ProfileName) -> BeforeIdentities {
 }
 
 /// Read every half a snapshot holds for `name`, straight from the raw files.
-/// Throughput is absent by design: it has no memory store to forget.
+/// Throughput is absent by design: it has no memory store to forget. Best-effort:
+/// the startup seed has no prior value to preserve, so a torn file reads as no
+/// credential and the first compare that reads it whole forgets once.
 pub(crate) fn read_snapshot_identities(name: &ProfileName) -> SnapshotIdentities {
     let before = read_before_identities(name);
     SnapshotIdentities {
@@ -568,23 +570,30 @@ pub(crate) fn throughput_for_endpoint(
 
 /// The changed halves for an endpoint write: the third-party and throughput
 /// identities of the values about to be written. `endpoint.base_url` is the RAW
-/// managed field, what [`throughput_for_endpoint`] needs. `oauth` is the AFTER
-/// identity (`before.oauth` when the OAuth half is untouched).
+/// managed field, the same form every change site passes; the plan derives the
+/// effective base_url for the provider lookup and the third-party identity, so
+/// BEFORE (read through [`stored_endpoint_identity`]'s effective field) and
+/// AFTER read one rule; `throughput_for_endpoint` derives its own from the raw
+/// field. `oauth` is the AFTER identity (`before.oauth` when the OAuth half is
+/// untouched).
 pub(crate) fn endpoint_identity_plan(
     before: &BeforeIdentities,
     oauth: &OAuthIdentity,
     endpoint: &StoredEndpointIdentity,
     has_credentials: bool,
 ) -> ForgetPlan {
-    let provider = endpoint
-        .base_url
-        .as_deref()
-        .and_then(Provider::from_base_url);
+    let effective = crate::profile::effective_base_url(
+        endpoint.base_url.clone(),
+        has_credentials,
+        endpoint.api_key.as_deref(),
+        &endpoint.env,
+    );
+    let provider = effective.as_deref().and_then(Provider::from_base_url);
     let third_party = third_party_identity(
         provider,
         endpoint.api_key.as_deref(),
         endpoint.console.as_ref(),
-        endpoint.base_url.as_deref(),
+        effective.as_deref(),
     );
     let throughput = throughput_for_endpoint(
         oauth,
@@ -613,8 +622,9 @@ static EPOCH: LazyLock<RankedMutex<EpochMap, rank::Epoch>> =
 pub(crate) fn epoch_value(name: &ProfileName, half: Half) -> u64 {
     EPOCH
         .lock()
-        .ok()
-        .and_then(|m| m.get(&(name.to_string(), half)).copied())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(name.to_string(), half))
+        .copied()
         .unwrap_or(0)
 }
 
@@ -639,11 +649,20 @@ pub(crate) fn epoch_guard_if_current(
     (guard.get(&(name.to_string(), half)).copied().unwrap_or(0) == epoch).then_some(guard)
 }
 
-pub(crate) fn bump_epoch(name: &ProfileName, half: Half) {
-    if let Ok(mut m) = EPOCH.lock() {
-        let e = m.entry((name.to_string(), half)).or_insert(0);
-        *e = e.wrapping_add(1);
-    }
+fn bump_epoch(name: &ProfileName, half: Half) {
+    let mut m = EPOCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let e = m.entry((name.to_string(), half)).or_insert(0);
+    *e = e.wrapping_add(1);
+}
+
+/// Test seam: bump `(name, half)`'s epoch, the private bump the forget paths
+/// call. The `#[path]`-linked scheduler tests call it directly to age a name's
+/// epoch; production visibility stays private to this module.
+#[cfg(test)]
+pub(crate) fn bump_epoch_for_test(name: &ProfileName, half: Half) {
+    bump_epoch(name, half);
 }
 
 /// Test seam: try to acquire the epoch guard, returning `None` while a seed
@@ -710,9 +729,10 @@ pub(crate) fn note_forget(name: &ProfileName, half: Half) {
     if !STORES_REGISTERED.load(Ordering::Acquire) {
         return;
     }
-    if let Ok(mut pending) = PENDING_FORGETS.lock() {
-        pending.push(PendingAction::Forget(name.clone(), half));
-    }
+    let mut pending = PENDING_FORGETS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.push(PendingAction::Forget(name.clone(), half));
 }
 
 /// Record that `old` was renamed to `new`. Called after the record move lands.
@@ -720,9 +740,10 @@ pub(crate) fn note_rename(old: &ProfileName, new: &ProfileName) {
     if !STORES_REGISTERED.load(Ordering::Acquire) {
         return;
     }
-    if let Ok(mut pending) = PENDING_FORGETS.lock() {
-        pending.push(PendingAction::Rename(old.clone(), new.clone()));
-    }
+    let mut pending = PENDING_FORGETS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.push(PendingAction::Rename(old.clone(), new.clone()));
 }
 
 /// Test seam: drop every queued forget and the registered-stores flag, so a
@@ -730,9 +751,10 @@ pub(crate) fn note_rename(old: &ProfileName, new: &ProfileName) {
 /// test's drain. Called from `HomeSandbox::drop`.
 #[cfg(test)]
 pub(crate) fn reset_pending_forgets_for_test() {
-    if let Ok(mut pending) = PENDING_FORGETS.lock() {
-        pending.clear();
-    }
+    PENDING_FORGETS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
     STORES_REGISTERED.store(false, Ordering::Release);
 }
 
@@ -1043,11 +1065,11 @@ fn clear_memory(stores: &MemoryStores, name: &ProfileName, half: Half) {
 /// compare can apply it AFTER its flock-held reads. The queue lock ranks above
 /// the state flock, so the compare takes it inside the hold (ascending).
 fn take_pending_forgets() -> Vec<PendingAction> {
-    PENDING_FORGETS
-        .lock()
-        .ok()
-        .map(|mut p| std::mem::take(&mut *p))
-        .unwrap_or_default()
+    std::mem::take(
+        &mut *PENDING_FORGETS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 /// Drain the forgets and renames a change site noted and apply each to memory.
@@ -1339,6 +1361,66 @@ mod tests {
 
     fn oa(anchor: Option<&str>, token: Option<&str>) -> OAuthIdentity {
         OAuthIdentity::for_values(anchor.map(AccountId::from).as_ref(), token)
+    }
+
+    /// A thread that panics while holding the epoch guard poisons the lock for
+    /// the rest of the process. Every reader and the bump must keep working on
+    /// the inner map, and the value read must agree with the guard's: a bump
+    /// lost to the poison would let a stale seed's compare pass.
+    #[test]
+    fn a_poisoned_epoch_lock_still_bumps_and_reads_the_real_value() {
+        use super::{Half, bump_epoch, epoch_guard, epoch_value};
+        use crate::profile::ProfileName;
+
+        let name = ProfileName::from("poisoned-epoch");
+        let key = (name.to_string(), Half::ThirdParty);
+        bump_epoch(&name, Half::ThirdParty);
+        let base = epoch_guard().get(&key).copied().unwrap_or(0);
+        let _ = std::thread::spawn(|| {
+            let _held = epoch_guard();
+            panic!("poison the epoch lock");
+        })
+        .join();
+
+        bump_epoch(&name, Half::ThirdParty);
+        let through_guard = epoch_guard().get(&key).copied().unwrap_or(0);
+        assert_eq!(through_guard, base + 1, "a bump lands on a poisoned lock");
+        assert_eq!(
+            epoch_value(&name, Half::ThirdParty),
+            through_guard,
+            "the value read agrees with the guard on a poisoned lock"
+        );
+    }
+
+    /// The pending-forget queue is process-global like the epoch: once a
+    /// panicking holder poisons it, a change site's note must still land and
+    /// the store-holder's drain must still return it, or every later forget in
+    /// the process is dropped.
+    #[test]
+    fn a_poisoned_forget_queue_still_takes_notes_and_drains_them() {
+        use super::{
+            Half, PENDING_FORGETS, PendingAction, note_forget, register_memory_stores,
+            take_pending_forgets,
+        };
+        use crate::profile::ProfileName;
+
+        let _sb = crate::testutil::HomeSandbox::new();
+        register_memory_stores();
+        let name = ProfileName::from("poisoned-queue");
+        let _ = std::thread::spawn(|| {
+            let _held = PENDING_FORGETS.lock();
+            panic!("poison the forget queue");
+        })
+        .join();
+
+        note_forget(&name, Half::OAuth);
+        let taken = take_pending_forgets();
+        assert!(
+            taken
+                .iter()
+                .any(|a| matches!(a, PendingAction::Forget(n, Half::OAuth) if *n == name)),
+            "a note lands on a poisoned queue and its drain returns it"
+        );
     }
 
     #[test]

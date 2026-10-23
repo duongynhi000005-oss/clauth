@@ -3604,9 +3604,12 @@ pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
 }
 
 /// The identity-relevant endpoint fields of `name`'s stored `config.toml`, read
-/// lock-free (never `load_profile`, which takes the state flock): the effective
-/// managed base_url, the api key, the console credential and the raw env map.
-/// `None` when the config cannot be read.
+/// lock-free (never `load_profile`, which takes the state flock). `base_url` is
+/// the EFFECTIVE managed base_url when [`stored_endpoint_identity`] reads it, and
+/// the RAW managed field when a change site builds the struct for
+/// [`crate::usage::endpoint_identity_plan`], which derives the effective form
+/// itself; the api key, the console credential and the raw env map are the same
+/// either way. `None` when the config cannot be read.
 pub(crate) struct StoredEndpointIdentity {
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
