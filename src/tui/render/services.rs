@@ -33,7 +33,8 @@ use super::super::app::{
     ShuntOkKey, ShuntSaveKey, UnreadConfig, UpstreamFieldKind, add_row_offered, config_entry_keys,
     config_field_stops, config_view, cycle_options, draft_field_keys, entry_field_keys,
     entry_for_key, entry_kind, entry_name, escape_control, herdr_config_writable, is_cycle_field,
-    parse_herdr_tag_secs, pending_require_line, removable, shunt_field_value, written_display,
+    parse_herdr_tag_secs, pending_require_line, removable, shunt_block_in_view, shunt_field_value,
+    written_display,
 };
 use super::super::theme;
 use super::format::{fixed, grapheme_cells, middle_truncate, spinner_frame, truncate};
@@ -42,9 +43,9 @@ use super::modals::danger_button;
 use super::panes::{
     MIN_VALUE_W, bold_when, chunk_graphemes, cycle_row_lines, draw_following_list, draw_scrollbar,
     draw_scrolled_lines, draw_scrolled_lines_with_footnote, empty_state, empty_state_lines,
-    footnote_lines, footnote_split, head_cols, help_tooltip_lines, help_tooltip_lines_at,
-    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, place_caret,
-    section_box, select_line, value_caret, wrap_words,
+    follow_scroll_offset, footnote_lines, footnote_split, head_cols, help_tooltip_lines,
+    help_tooltip_lines_at, highlight_row, invalid_tooltip_lines, key_cell, label_style,
+    master_detail, place_caret, section_box, select_line, value_caret, wrap_words,
 };
 use super::prose;
 use crate::gateway_edit::{
@@ -378,12 +379,14 @@ fn draw_diagnostic_lines(frame: &mut Frame<'_>, inner: Rect, app: &App, lines: V
 /// `enabled` row's tier-aware toggle glyph is drawn here off the cached record.
 ///
 /// Descended, ↑↓ walks the card's actionable lines one at a time; the render
-/// reads the focused line from the key handler's state and re-settles it (the
-/// descend rule) when a resize or a card change pushed the held line out of
-/// view, or when focus is none while an actionable line is in view, drawing
-/// the caret + hover only while that stop is in view. It publishes the
-/// geometry the key handler walks over (each stop's rendered row, the pane
-/// height, `detail_max_scroll`).
+/// reads the focused block from the key handler's state, follows it with
+/// [`follow_scroll_offset`] and stores the result first — the follow site every
+/// draw, so a walk landing, a refusal growing the block, a page landing and a
+/// resize all keep `SCROLL_PAD` rows past the block — then re-settles the focus
+/// (the descend rule) at the followed offset: only a held stop that left the
+/// card (a recompute dropped it) or a none focus moves, never a block the follow
+/// just brought into view. It publishes the geometry the key handler walks over
+/// (each stop's rendered block, the pane height, `detail_max_scroll`).
 fn draw_shunt_detail(
     frame: &mut Frame<'_>,
     inner: Rect,
@@ -410,7 +413,13 @@ fn draw_shunt_detail(
     // The rendered line each actionable stop lands on, in `check.shunt_focus`
     // order: a `refused`/`pool` sentence above a stop can wrap to several rows,
     // so the in-view test is the rendered index, never the detail index.
+    // `stop_ends` is the exclusive end of each stop's block (parallel to
+    // `stop_rendered`) — the walk pads past a stop's LAST line, so a multi-line
+    // stop (a wrapped cycle run, a dropped token trailer, a refusal `└`) needs
+    // its span, never the next stop's first row (blank lines and eyebrows sit
+    // between groups).
     let mut stop_rendered: Vec<usize> = Vec::with_capacity(check.shunt_focus.len());
+    let mut stop_ends: Vec<usize> = Vec::with_capacity(check.shunt_focus.len());
     let mut move_plan_line: Option<usize> = None;
     for (idx, text) in check.detail.iter().enumerate() {
         if idx < action_start {
@@ -421,6 +430,7 @@ fn draw_shunt_detail(
             let start = lines.len();
             lines.push(shunt_focus_line(focus, text, false, app));
             stop_rendered.push(start);
+            stop_ends.push(start + 1);
         } else {
             if text == "MOVE PLAN" {
                 move_plan_line = Some(lines.len());
@@ -444,6 +454,7 @@ fn draw_shunt_detail(
             render_shunt_config(
                 &mut lines,
                 &mut stop_rendered,
+                &mut stop_ends,
                 &mut eyebrows,
                 view,
                 &app.services.shunt_expanded,
@@ -467,27 +478,56 @@ fn draw_shunt_detail(
     let viewport = inner.height as usize;
     let max_scroll = total.saturating_sub(viewport).min(u16::MAX as usize) as u16;
     app.services.detail_max_scroll.set(max_scroll);
-    let scroll = app.services.detail_scroll.min(max_scroll);
+    let prior = app.services.shunt_scroll.get().min(max_scroll as usize);
 
-    // The focused actionable line. The render re-settles the key handler's
-    // identity (the descend rule — the first actionable line in view, else
-    // none) here, where the geometry is published, when a resize or a card
-    // change pushed the held line out of view, or when focus is none while a
-    // stop is in view; the caret, the footer and every acting key then see the
-    // re-settled line the same frame. The caret and the bold promotion show
-    // only while the detail pane itself holds focus; blurred (the list focused)
-    // the card keeps the line's hover tint and drops both.
+    // The render is the follow site (the forms/Status precedent): follow the
+    // focused block and store the result FIRST, so a walk landing, a refusal
+    // growing the block, a page landing and a resize all keep `SCROLL_PAD` rows
+    // past the block while content remains. No focus means nothing to follow —
+    // the offset stays, so a text scroll is never pulled back.
+    let scroll = match app
+        .services
+        .shunt_focus_kind()
+        .and_then(|kind| check.shunt_focus.iter().position(|s| s.kind() == kind))
+        .and_then(|i| {
+            stop_rendered
+                .get(i)
+                .zip(stop_ends.get(i))
+                .map(|(&start, &end)| (start, end))
+        }) {
+        Some((start, end)) => {
+            follow_scroll_offset(total, viewport, (start, end), prior).min(max_scroll as usize)
+        }
+        None => prior,
+    };
+    app.services.shunt_scroll.set(scroll);
+
+    // Re-settle the key handler's identity at the followed offset (the descend
+    // rule — the first actionable block inside the padded band, else none):
+    // a focus the key just set out of view was brought in by the follow above,
+    // so only a focus whose stop left the card (a recompute) or a none focus
+    // re-settles here. The caret and the bold promotion show only while the
+    // detail pane itself holds focus; blurred (the list focused) the card keeps
+    // the line's hover tint and drops both.
     let detail_focused = app.services.focus == ServicesFocus::Detail;
-    app.services
-        .re_settle_shunt_focus(&check.shunt_focus, &stop_rendered, scroll, viewport);
+    app.services.re_settle_shunt_focus(
+        &check.shunt_focus,
+        &stop_rendered,
+        &stop_ends,
+        total,
+        scroll,
+        viewport,
+    );
+
     let focus_stop = app
         .services
         .shunt_focus_kind()
         .and_then(|kind| check.shunt_focus.iter().position(|s| s.kind() == kind))
         .filter(|&i| {
-            stop_rendered.get(i).is_some_and(|&rendered| {
-                rendered >= scroll as usize && rendered < scroll as usize + viewport
-            })
+            stop_rendered
+                .get(i)
+                .zip(stop_ends.get(i))
+                .is_some_and(|(&start, &end)| shunt_block_in_view(scroll, viewport, start, end))
         });
 
     // The MOVE PLAN eyebrow brightens to `TEXT + bold` while the focus rests
@@ -652,20 +692,22 @@ fn draw_shunt_detail(
     // borrows it), exactly like `detail_max_scroll`.
     app.services.shunt_viewport.set(inner.height);
     app.services.shunt_stop_rows.replace(stop_rendered);
+    app.services.shunt_stop_ends.replace(stop_ends);
+    app.services.shunt_total.set(total);
 
     frame.render_widget(
         Paragraph::new(lines)
             .style(theme::base())
-            .scroll((scroll, 0)),
+            .scroll((scroll as u16, 0)),
         inner,
     );
-    draw_scrollbar(frame, inner, total, scroll as usize, viewport);
+    draw_scrollbar(frame, inner, total, scroll, viewport);
 
     // The native terminal cursor at the typed editor's caret (the Setup
     // editor's rule): the value column plus the caret's cell in the value
     // window, on the row's visible line.
     if let Some((row, lead, caret)) = edit_caret
-        && let Some(visible) = row.checked_sub(scroll as usize).filter(|v| *v < viewport)
+        && let Some(visible) = row.checked_sub(scroll).filter(|v| *v < viewport)
     {
         place_caret(
             frame,
@@ -712,11 +754,13 @@ fn eyebrow_name(group: usize) -> &'static str {
 }
 
 /// The config section's render state: the rows built so far, the published
-/// focus-stop rows (parallel to [`Check::shunt_focus`]), and the one-row-model
-/// field stops every focusable row's membership is checked against.
+/// focus-stop rows and their block ends (parallel to [`Check::shunt_focus`]),
+/// and the one-row-model field stops every focusable row's membership is
+/// checked against.
 struct ConfigRows<'a> {
     lines: &'a mut Vec<Line<'static>>,
     stop_rendered: &'a mut Vec<usize>,
+    stop_ends: &'a mut Vec<usize>,
     field_stops: &'a [ShuntFocus],
 }
 
@@ -730,9 +774,11 @@ struct ConfigRows<'a> {
 /// [`config_entry_keys`] / [`entry_field_keys`] / [`draft_field_keys`] /
 /// [`config_field_stops`] — the same row model the focus walk builds its stops
 /// from — so the two cannot disagree for any view.
+#[allow(clippy::too_many_arguments)]
 fn render_shunt_config(
     lines: &mut Vec<Line<'static>>,
     stop_rendered: &mut Vec<usize>,
+    stop_ends: &mut Vec<usize>,
     eyebrows: &mut [Option<usize>; 5],
     view: &ConfigView,
     expanded: &HashSet<ShuntEntryKey>,
@@ -748,6 +794,7 @@ fn render_shunt_config(
     let mut rows = ConfigRows {
         lines,
         stop_rendered,
+        stop_ends,
         field_stops: &field_stops,
     };
 
@@ -818,13 +865,17 @@ fn push_add(
     let start = rows.lines.len();
     rows.lines.push(add_line(kind, false, app));
     rows.stop_rendered.push(start);
+    rows.stop_ends.push(start + 1);
     if app.services.shunt_drafts.is_open(kind) {
         for field in draft_field_keys(view, kind, &app.services.shunt_drafts) {
             push_field(rows, view, &field, app, width);
         }
         let save_start = rows.lines.len();
-        rows.lines.extend(save_add_lines(kind, false, app, width));
+        let save_rows = save_add_lines(kind, false, app, width);
+        let save_len = save_rows.len();
+        rows.lines.extend(save_rows);
         rows.stop_rendered.push(save_start);
+        rows.stop_ends.push(save_start + save_len);
     }
 }
 
@@ -853,8 +904,11 @@ fn push_token_rows(rows: &mut ConfigRows<'_>, app: &App, width: usize) {
     } else {
         for name in &tokens.stored {
             let start = rows.lines.len();
-            rows.lines.extend(token_row_lines(name, false, app, width));
+            let token_rows = token_row_lines(name, false, app, width);
+            let token_len = token_rows.len();
+            rows.lines.extend(token_rows);
             rows.stop_rendered.push(start);
+            rows.stop_ends.push(start + token_len);
         }
         if let Some(reason) = &tokens.unmanaged_error {
             // The store read fine, so its rows stay; only the unmanaged names
@@ -896,6 +950,7 @@ fn push_token_rows(rows: &mut ConfigRows<'_>, app: &App, width: usize) {
     let add_start = rows.lines.len();
     rows.lines.push(add_token_line(false, app));
     rows.stop_rendered.push(add_start);
+    rows.stop_ends.push(add_start + 1);
 }
 
 /// One `name` + trailer row with the name budgeted in display cells so the
@@ -1033,6 +1088,7 @@ fn push_entry(
         width,
     ));
     rows.stop_rendered.push(start);
+    rows.stop_ends.push(start + 1);
     if expanded.contains(key) {
         for field in entry_field_keys(view, key) {
             push_field(rows, view, &field, app, width);
@@ -1041,8 +1097,11 @@ fn push_entry(
         // engine's `Remove*` cannot address the entry — a duplicated name/id).
         if removable(view, key) {
             let remove_start = rows.lines.len();
-            rows.lines.extend(remove_lines(key, false, app, width));
+            let remove_rows = remove_lines(key, false, app, width);
+            let remove_len = remove_rows.len();
+            rows.lines.extend(remove_rows);
             rows.stop_rendered.push(remove_start);
+            rows.stop_ends.push(remove_start + remove_len);
         }
     }
 }
@@ -1061,12 +1120,14 @@ fn push_field(
 ) {
     let start = rows.lines.len();
     let field_rows = field_row_lines(view, key, false, app, width);
+    let field_len = field_rows.len();
     rows.lines.extend(field_rows);
     if rows
         .field_stops
         .contains(&ShuntFocus::Field { key: key.clone() })
     {
         rows.stop_rendered.push(start);
+        rows.stop_ends.push(start + field_len);
     }
 }
 

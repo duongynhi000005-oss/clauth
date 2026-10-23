@@ -730,7 +730,8 @@ fn shunt_card_pages_by_viewport_minus_one_and_resettles_focus() {
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
     assert_eq!(
-        app.services.detail_scroll, 7,
+        app.services.shunt_scroll.get(),
+        7,
         "the card pages by viewport - 1 = 7"
     );
     let rows = draw_frame(&app, 80, 14);
@@ -746,13 +747,15 @@ fn shunt_card_pages_by_viewport_minus_one_and_resettles_focus() {
     );
     // F11: a page key that leaves the scroll unchanged (already at the end)
     // keeps the held focus instead of re-picking the first action line.
-    app.services.detail_scroll = app.services.detail_max_scroll.get();
+    app.services
+        .shunt_scroll
+        .set(app.services.detail_max_scroll.get() as usize);
     app.services
         .set_shunt_focus(Some(crate::tui::app::ShuntFocusLine::Move));
     handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
     assert_eq!(
-        app.services.detail_scroll,
-        app.services.detail_max_scroll.get(),
+        app.services.shunt_scroll.get(),
+        app.services.detail_max_scroll.get() as usize,
         "the card is already at the bottom"
     );
     assert_eq!(
@@ -810,8 +813,9 @@ fn shunt_page_keeps_held_focus_when_a_resize_fits_the_card() {
     );
     let rendered_before = app
         .services
-        .detail_scroll
-        .min(app.services.detail_max_scroll.get());
+        .shunt_scroll
+        .get()
+        .min(app.services.detail_max_scroll.get() as usize);
     handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
     assert_eq!(
         app.services.shunt_focus_kind(),
@@ -820,8 +824,9 @@ fn shunt_page_keeps_held_focus_when_a_resize_fits_the_card() {
     );
     assert_eq!(
         app.services
-            .detail_scroll
-            .min(app.services.detail_max_scroll.get()),
+            .shunt_scroll
+            .get()
+            .min(app.services.detail_max_scroll.get() as usize),
         rendered_before,
         "the rendered offset stays put"
     );
@@ -1621,8 +1626,11 @@ fn the_shunt_f_with_no_focus_lands_on_the_first_fix_below_the_view_top() {
     let _ = draw_frame(&app, 80, 14);
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
     let _ = draw_frame(&app, 80, 14);
-    // Rows 12..20 show no stop: the render re-settles focus to none.
-    app.services.detail_scroll = 12;
+    // Rows 12..20 show no stop: clear the focus and scroll the view there, so
+    // nothing is focused and no stop is in the padded band (the render's
+    // re-settle leaves the focus none).
+    app.services.shunt_scroll.set(12);
+    app.services.set_shunt_focus(None);
     let _ = draw_frame(&app, 80, 14);
     assert_eq!(
         app.services.shunt_focus_kind(),
@@ -1635,6 +1643,119 @@ fn the_shunt_f_with_no_focus_lands_on_the_first_fix_below_the_view_top() {
         app.services.focused_shunt_focus().map(|s| s.kind()),
         Some(ShuntFocusLine::Admin),
         "f lands on the fix line below the view top, not the one above it"
+    );
+}
+
+/// With nothing focused, `f` takes the next FIX below the view, skipping a
+/// toggle stop that sits nearer: the no-focus pick keeps `f`'s fix filter.
+#[test]
+fn the_shunt_f_with_no_focus_skips_a_toggle_for_the_next_fix() {
+    use crate::tui::app::{Check, Health, ShuntFocus, ShuntFocusLine, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut detail: Vec<String> = (0..30).map(|i| format!("plan row {i:02}")).collect();
+    detail[5] = "f  move stores in".to_string();
+    detail[25] = "f  add admin key".to_string();
+    let check = Check {
+        label: "shunt",
+        health: Health::Warn,
+        detail,
+        fix: Some(ServiceFix::MoveStoresIn),
+        problems: Vec::new(),
+        shunt_focus: vec![
+            ShuntFocus::Fix {
+                line: 5,
+                fix: ServiceFix::MoveStoresIn,
+            },
+            ShuntFocus::Enabled { line: 22 },
+            ShuntFocus::Fix {
+                line: 25,
+                fix: ServiceFix::AddAdminKey,
+            },
+        ],
+        shunt_action_start: Some(0),
+    };
+    let mut app = app_with(check);
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let _ = draw_frame(&app, 80, 14);
+    // Rows 12..20 hold no stop; the toggle (22) and the admin fix (25) both
+    // sit below the view, the toggle nearer.
+    app.services.shunt_scroll.set(12);
+    app.services.set_shunt_focus(None);
+    let _ = draw_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.shunt_focus_kind(),
+        None,
+        "fixture: no stop in view"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let _ = draw_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Admin),
+        "f skips the nearer toggle for the next fix"
+    );
+}
+
+/// With nothing focused and every fix above the view's padded band (the last
+/// one just dropped by a text scroll), `f` wraps to the card's FIRST fix, never
+/// back onto the fix the scroll dropped.
+#[test]
+fn the_shunt_f_with_no_focus_wraps_to_the_first_fix_not_the_dropped_one() {
+    use crate::tui::app::{Check, Health, ShuntFocus, ShuntFocusLine, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut detail: Vec<String> = (0..30).map(|i| format!("plan row {i:02}")).collect();
+    detail[2] = "f  move stores in".to_string();
+    detail[5] = "f  add admin key".to_string();
+    let check = Check {
+        label: "shunt",
+        health: Health::Warn,
+        detail,
+        fix: Some(ServiceFix::MoveStoresIn),
+        problems: Vec::new(),
+        shunt_focus: vec![
+            ShuntFocus::Fix {
+                line: 2,
+                fix: ServiceFix::MoveStoresIn,
+            },
+            ShuntFocus::Fix {
+                line: 5,
+                fix: ServiceFix::AddAdminKey,
+            },
+        ],
+        shunt_action_start: Some(0),
+    };
+    let mut app = app_with(check);
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let _ = draw_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Admin),
+        "fixture: ↓ takes the second fix"
+    );
+    // No stop lies below the admin fix: each ↓ scrolls card text until the
+    // admin row nears the top and the caret drops.
+    let mut dropped = false;
+    for _ in 0..20 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let _ = draw_frame(&app, 80, 14);
+        if app.services.shunt_focus_kind().is_none() {
+            dropped = true;
+            break;
+        }
+    }
+    assert!(dropped, "fixture: a ↓ text scroll drops the caret");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let _ = draw_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Move),
+        "f wraps to the first fix, not the one the scroll dropped"
     );
 }
 
@@ -3923,7 +4044,7 @@ fn the_refused_plans_last_line_is_reachable_at_80x20_and_58x24() {
         app.services.focus = ServicesFocus::Detail;
         // The render clamps against `detail_max_scroll`; a huge value pins the
         // card scrolled to its last line.
-        app.services.detail_scroll = u16::MAX;
+        app.services.shunt_scroll.set(usize::MAX);
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| super::super::draw(f, &app)).unwrap();
         let screen = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
@@ -4276,18 +4397,30 @@ fn down_scrolls_the_refused_card_one_line_each_to_its_last_words() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(caret_stop(&draw_frame(&app, 80, 20)), Some("admin"));
 
-    let max = app.services.detail_max_scroll.get();
+    let max = usize::from(app.services.detail_max_scroll.get());
     assert!(max > 0, "the refused card overflows 80x20");
-    // Each further ↓ scrolls exactly one rendered line; the caret stays on the
-    // admin fix the whole way (it never leaves the viewport here).
-    for _ in 0..max {
-        let before = app.services.detail_scroll;
+    // Landing on the admin fix pads `SCROLL_PAD` rows below it (the render's
+    // follow), so the landing itself advances the scroll to exactly one row
+    // below the top; each further ↓ scrolls exactly one rendered line through
+    // the prose below while the caret stays on the admin fix (the card keeps it
+    // inside the padded band the whole way).
+    let landing = app.services.shunt_scroll.get();
+    assert_eq!(
+        landing, 1,
+        "the ↓ onto the admin fix lands one line down (its block end 13 + pad 2 - viewport 14)"
+    );
+    for _ in landing..max {
+        let before = app.services.shunt_scroll.get();
         handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-        assert_eq!(app.services.detail_scroll, before + 1, "one line per press");
+        assert_eq!(
+            app.services.shunt_scroll.get(),
+            before + 1,
+            "one line per press"
+        );
         assert_eq!(
             caret_stop(&draw_frame(&app, 80, 20)),
             Some("admin"),
-            "focus stays on the admin fix while in view"
+            "focus stays on the admin fix while in the padded band"
         );
     }
     let screen = draw_frame(&app, 80, 20).join("\n");
@@ -4298,7 +4431,8 @@ fn down_scrolls_the_refused_card_one_line_each_to_its_last_words() {
     // At the end, ↓ moves nothing.
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(
-        app.services.detail_scroll, max,
+        app.services.shunt_scroll.get(),
+        max,
         "the scroll stays at the end"
     );
 }
@@ -4374,7 +4508,7 @@ fn the_shunt_detail_hint_names_what_updown_does() {
 
     // One stop, fitting (max scroll 0): no `↑↓` at all.
     app.services.detail_max_scroll.set(0);
-    app.services.detail_scroll = 0;
+    app.services.shunt_scroll.set(0);
     let h = hints(&app);
     assert!(
         h.iter().all(|(k, _)| *k != "↑↓"),
@@ -4382,14 +4516,11 @@ fn the_shunt_detail_hint_names_what_updown_does() {
     );
 }
 
-/// A resize that pushes the focused `move stores in` line off screen re-settles
-/// focus to the first actionable line in view (the descend rule): the caret
-/// lands on `enabled`, the footer offers the re-settled `space/↵ toggle` and no
-/// move verb, `f` opens no confirm, `space` flips `enabled`, and the next `↓`
-/// walks from the re-settled line (landing on the admin fix, not skipping
-/// `enabled`'s successor).
+/// A resize that pushes the focused `move stores in` line off the fold follows
+/// it back into view (the render's per-draw follow, F1's class): the caret
+/// stays on `move` with two rows past it, never re-settled to `enabled`.
 #[test]
-fn a_resize_pushing_focus_off_screen_resettles_to_the_first_line_in_view() {
+fn a_resize_pushing_focus_off_screen_keeps_the_followed_focus() {
     use crate::tui::app::{MovePlanOutcome, handle_key};
     use ratatui::crossterm::event::KeyCode;
     let home = crate::testutil::HomeSandbox::new();
@@ -4422,56 +4553,37 @@ fn a_resize_pushing_focus_off_screen_resettles_to_the_first_line_in_view() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("move"));
 
-    // Resize to 120x14: the move line leaves the view, so focus re-settles to
-    // the first actionable line in view — `enabled`.
+    // Resize to 120x14: the move line leaves the fold, and the render's follow
+    // brings it back — the caret stays on `move`, two rows past it while the
+    // card has them.
     let _ = draw_frame(&app, 120, 14);
-    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
-
-    // The footer offers the re-settled line's verb, never the off-screen one.
-    let hints = super::super::footer::services_hints(&app);
+    let f = shunt_walk_frame(&app, 120, 14);
     assert!(
-        hints.iter().any(|(k, v)| *k == "space/↵" && *v == "toggle"),
-        "the re-settled enabled row offers its toggle verb: {hints:?}"
+        f.pane[f.caret].contains("move stores in"),
+        "the caret stays on move:\n{}",
+        f.pane.join("\n")
     );
+    let below = f.pane.len() - 1 - f.caret;
+    let left = f.total - 1 - f.row;
     assert!(
-        hints.iter().all(|(_, v)| *v != "move stores in"),
-        "no verb for the off-screen move line: {hints:?}"
+        below >= left.min(2),
+        "{below} rows below the followed move line, {left} left:\n{}",
+        f.pane.join("\n")
     );
-    assert!(
-        hints.contains(&("f", "next fix")),
-        "f still walks to a fix line: {hints:?}"
-    );
-
-    // `space` flips the re-settled `enabled` row for real.
-    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
-    assert!(
-        !crate::gateway::GatewayRecord::load()
-            .unwrap()
-            .unwrap()
-            .disabled,
-        "space flips the re-settled enabled row"
-    );
-
-    // The recompute rebuilt the card (the move plan dropped); render once so
-    // the walk sees the fresh geometry, then ↓ walks from the re-settled line:
-    // `enabled` → the admin fix, never skipping `enabled`'s successor.
-    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
-    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("admin"));
 }
 
 /// A card change that pushes the focused `enabled` row — and every actionable
-/// line below it — off screen re-settles focus to none (the descend rule with
-/// no actionable line in view): `space` does not toggle and the footer offers
-/// no verb.
+/// line below it — off the fold is followed by the render (F1's class): the
+/// focused block is kept in view with two rows past it, so `space` still
+/// toggles the row the caret holds.
 #[test]
-fn a_card_change_pushing_every_stop_off_screen_resettles_to_none() {
+fn a_card_change_pushing_every_stop_off_screen_keeps_the_followed_focus() {
     use crate::tui::app::{MovePlanOutcome, handle_key};
     use ratatui::crossterm::event::KeyCode;
     let home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
     let (slot, record, plan) = adopted_three_file_card(&home);
-    // The record on disk (`disabled`), so a buggy `space` would really flip it.
+    // The record on disk (`disabled`), so `space` flips it for real.
     crate::gateway::GatewayRecord::update(|s| {
         *s = Some(record.clone());
         Ok(())
@@ -4491,7 +4603,8 @@ fn a_card_change_pushing_every_stop_off_screen_resettles_to_none() {
     assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
 
     // A worker landing adds a multi-line reason above `enabled`, pushing it
-    // and every stop below it out of view.
+    // and every stop below it out of view; the render's follow keeps the
+    // focused block in view.
     let mut grown = slot;
     grown.reason = Some(
         "the daemon could not start the gateway\nbecause the bind was already held\nby another process\nretrying later".to_string(),
@@ -4510,29 +4623,22 @@ fn a_card_change_pushing_every_stop_off_screen_resettles_to_none() {
         false,
     )];
 
-    // The next render publishes the new geometry and re-settles focus to none
-    // (no actionable line is in view).
     let _ = draw_frame(&app, 120, 14);
-    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), None);
-    assert_eq!(app.services.shunt_focus_kind(), None);
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
     let hints = super::super::footer::services_hints(&app);
     assert!(
-        hints.iter().all(|(k, _)| *k != "↵" && *k != "space/↵"),
-        "no verb offered with no focused line: {hints:?}"
-    );
-    assert!(
-        hints.contains(&("f", "next fix")),
-        "f walks to the off-screen fix lines: {hints:?}"
+        hints.iter().any(|(k, v)| *k == "space/↵" && *v == "toggle"),
+        "the followed enabled row offers its toggle verb: {hints:?}"
     );
 
-    // `space` does not toggle the off-screen `enabled` row.
+    // `space` flips the followed `enabled` row, which the follow kept in view.
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
-        crate::gateway::GatewayRecord::load()
+        !crate::gateway::GatewayRecord::load()
             .unwrap()
             .unwrap()
             .disabled,
-        "space must not toggle a row the user cannot see"
+        "space flips the followed enabled row"
     );
 }
 
@@ -4626,14 +4732,12 @@ fn ascending_keeps_the_card_highlight_but_drops_the_detail_caret() {
     );
 }
 
-/// A none focus re-settles when a change brings an actionable line back into
-/// view: every stop pushed off screen re-settles focus to none (the descend
-/// rule with no stop in view), and the frame that brings the stops back
-/// re-settles it again to the first stop in view — `enabled` — with the
-/// footer offering `space/↵ toggle`; `↓` then walks from the re-settled line
-/// to the admin fix, never skipping `enabled`'s successor.
+/// A card change that pushes the focused block off the fold — and the change
+/// that brings the stops back — both keep the focus on `enabled` via the
+/// render's follow (F1's class); `↓` then walks from it to the admin fix,
+/// never skipping `enabled`'s successor.
 #[test]
-fn bringing_the_stops_back_into_view_resettles_the_none_focus_then_walks_from_it() {
+fn bringing_the_stops_back_into_view_keeps_the_followed_focus_then_walks_from_it() {
     use crate::tui::app::{MovePlanOutcome, handle_key};
     use ratatui::crossterm::event::KeyCode;
     let home = crate::testutil::HomeSandbox::new();
@@ -4658,7 +4762,7 @@ fn bringing_the_stops_back_into_view_resettles_the_none_focus_then_walks_from_it
     assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
 
     // A worker landing adds a multi-line reason above `enabled`, pushing every
-    // stop out of view: focus re-settles to none.
+    // stop out of view; the render's follow keeps the focused block in view.
     let mut grown = slot.clone();
     grown.reason = Some(
         "the daemon could not start the gateway\nbecause the bind was already held\nby another process\nretrying later".to_string(),
@@ -4677,12 +4781,10 @@ fn bringing_the_stops_back_into_view_resettles_the_none_focus_then_walks_from_it
         false,
     )];
     let _ = draw_frame(&app, 120, 14);
-    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), None);
-    assert_eq!(app.services.shunt_focus_kind(), None);
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
 
-    // The reason clears (the worker landed): the stops come back into view and
-    // the none focus re-settles to the first stop in view — `enabled` — with
-    // the re-settled line's verb; ↓ then walks from the re-settled line.
+    // The reason clears (the worker landed): the followed `enabled` stays
+    // focused, and ↓ walks from it to the admin fix.
     app.services.checks = vec![crate::tui::app::shunt_card(
         &slot,
         false,
@@ -4698,13 +4800,81 @@ fn bringing_the_stops_back_into_view_resettles_the_none_focus_then_walks_from_it
     )];
     let _ = draw_frame(&app, 120, 14);
     assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
-    let hints = super::super::footer::services_hints(&app);
-    assert!(
-        hints.iter().any(|(k, v)| *k == "space/↵" && *v == "toggle"),
-        "the re-settled enabled row offers its toggle verb: {hints:?}"
-    );
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("admin"));
+}
+
+/// A held stop that LEAVES the card (a landed token remove recomputes the card
+/// without it) re-settles to the first stop in the padded band instead of
+/// keeping a stale identity whose line no longer renders (the held-focus
+/// branch of the render's re-settle).
+#[test]
+fn a_vanished_held_stop_re_settles_to_the_first_stop_in_the_band() {
+    use crate::tui::app::{ShuntDrafts, ShuntTokens, config_field_stops, handle_key, shunt_check};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = collapsed_upstreams(8);
+    let tokens = ShuntTokens {
+        stored: vec!["alice".to_string(), "bob".to_string()],
+        ..ShuntTokens::default()
+    };
+    let mut app =
+        config_view_app_with_tokens(view.clone(), std::collections::HashSet::new(), tokens);
+    let _ = draw_frame(&app, 100, 16);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    for _ in 0..60 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let Some(f) = shunt_walk_frame_focused(&app, 100, 16) else {
+            continue;
+        };
+        if f.pane[f.caret].contains("alice") {
+            break;
+        }
+    }
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(crate::tui::app::ShuntFocusLine::Token("alice".to_string())),
+        "the ↓ walk holds the alice token"
+    );
+
+    // The token remove lands: the recompute drops alice's stop while the held
+    // focus still names it.
+    let drafts = ShuntDrafts::default();
+    let shrunken = ShuntTokens {
+        stored: vec!["bob".to_string()],
+        ..ShuntTokens::default()
+    };
+    let mut card = shunt_check(&shunt_slot_full(), true, None);
+    card.shunt_focus.extend(config_field_stops(
+        &view,
+        &std::collections::HashSet::new(),
+        &drafts,
+        &shrunken,
+    ));
+    app.services.checks = vec![card];
+    app.services.shunt_tokens = shrunken;
+    app.services.shunt_drafts = drafts;
+    let _ = draw_frame(&app, 100, 16);
+    let settled = app
+        .services
+        .focused_shunt_focus()
+        .map(|s| s.kind())
+        .expect("the vanished stop re-settles to a stop in view");
+    assert_eq!(
+        settled,
+        crate::tui::app::ShuntFocusLine::Add(crate::tui::app::ShuntAddKind::Upstream),
+        "the vanished stop re-settles to the first stop in the padded band"
+    );
+    // The re-settle lands inside the band, so the render's follow has nothing
+    // to move on the next draw.
+    let settled_scroll = app.services.shunt_scroll.get();
+    let _ = draw_frame(&app, 100, 16);
+    assert_eq!(
+        app.services.shunt_scroll.get(),
+        settled_scroll,
+        "the next draw leaves the view put after the re-settle"
+    );
 }
 
 /// From a none focus (with stops in view but no re-settle draw in between),
@@ -4847,7 +5017,7 @@ fn a_stopless_card_still_scrolls_one_line_per_press() {
     let _ = draw_frame(&app, 80, 14);
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(app.services.focus, ServicesFocus::Detail);
-    let max = app.services.detail_max_scroll.get();
+    let max = app.services.detail_max_scroll.get() as usize;
     assert!(max > 0, "the stopless card overflows 80x14");
 
     // The footer names ↑↓ scroll exactly while a press would scroll.
@@ -4859,15 +5029,19 @@ fn a_stopless_card_still_scrolls_one_line_per_press() {
 
     // One line per press, clamped at either end.
     for _ in 0..max {
-        let before = app.services.detail_scroll;
+        let before = app.services.shunt_scroll.get();
         handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-        assert_eq!(app.services.detail_scroll, before + 1, "one line per press");
+        assert_eq!(
+            app.services.shunt_scroll.get(),
+            before + 1,
+            "one line per press"
+        );
     }
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    assert_eq!(app.services.detail_scroll, max, "clamped at the end");
+    assert_eq!(app.services.shunt_scroll.get(), max, "clamped at the end");
     handle_key(&mut app, crate::testutil::key(KeyCode::Up));
     assert_eq!(
-        app.services.detail_scroll,
+        app.services.shunt_scroll.get(),
         max - 1,
         "↑ scrolls back one line"
     );
@@ -5033,6 +5207,984 @@ fn config_view_app_with_tokens(
     app.services.shunt_drafts = drafts;
     app.services.shunt_tokens = tokens;
     app
+}
+
+/// One drawn frame of the shunt card as the walk sees it: the detail pane's
+/// visible rows, the caret's index among them, the caret's row in the whole
+/// card, and the card's height.
+struct ShuntWalkFrame {
+    pane: Vec<String>,
+    caret: usize,
+    row: usize,
+    total: usize,
+}
+
+/// [`shunt_walk_frame`], or `None` while no stop holds the caret (a `↓` over
+/// card text with no stop in view scrolls one line and focuses nothing).
+fn shunt_walk_frame_focused(app: &App, w: u16, h: u16) -> Option<ShuntWalkFrame> {
+    // The draw re-settles the held focus first, so read it after one.
+    let _ = draw_frame(app, w, h);
+    app.services.shunt_focus_kind()?;
+    Some(shunt_walk_frame(app, w, h))
+}
+
+/// Draw `app` at `w`×`h` and read the walk's frame. The card must overflow
+/// its viewport, or the total read off the scroll bound means nothing.
+fn shunt_walk_frame(app: &App, w: u16, h: u16) -> ShuntWalkFrame {
+    let rows = draw_frame(app, w, h);
+    let pane: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.split("││").nth(1))
+        .map(|r| r.trim_matches('│').to_string())
+        .collect();
+    let viewport = usize::from(app.services.shunt_viewport.get());
+    let max = usize::from(app.services.detail_max_scroll.get());
+    assert!(max > 0, "the card fits its viewport:\n{}", rows.join("\n"));
+    assert_eq!(pane.len(), viewport, "pane rows:\n{}", rows.join("\n"));
+    let caret = pane
+        .iter()
+        .position(|r| r.contains('❯'))
+        .unwrap_or_else(|| panic!("no caret in the detail pane:\n{}", rows.join("\n")));
+    let scroll = app.services.shunt_scroll.get().min(max);
+    ShuntWalkFrame {
+        row: scroll + caret,
+        total: max + viewport,
+        pane,
+        caret,
+    }
+}
+
+/// `n` collapsed `api_key` upstreams, `u00` on: single-line entry stops.
+fn collapsed_upstreams(n: usize) -> Vec<UpstreamView> {
+    (0..n)
+        .map(|i| shorthand_up(&format!("u{i:02}"), "api_key"))
+        .collect()
+}
+
+/// Walked by `↓` over a card taller than its viewport, every focused
+/// single-line stop keeps `SCROLL_PAD` (2) visible rows below it while the
+/// card has that many rows left below it; walked back by `↑`, two rows above
+/// it while that many rows sit above it.
+#[test]
+fn the_shunt_walk_keeps_two_rows_past_its_focus_while_content_remains() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = collapsed_upstreams(14);
+    let mut app = config_view_app(view, std::collections::HashSet::new());
+    let _ = draw_frame(&app, 100, 16);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    // The config section alone holds 20 stops (bind, default_provider, 14
+    // entries, four `+ add` rows); each walk lands on every one of them.
+    let mut focused = 0;
+    for press in 0..60 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let Some(f) = shunt_walk_frame_focused(&app, 100, 16) else {
+            continue;
+        };
+        focused += 1;
+        let below = f.pane.len() - 1 - f.caret;
+        let left = f.total - 1 - f.row;
+        assert!(
+            below >= left.min(2),
+            "↓ #{press}: {below} rows below the focus, {left} left in the card:\n{}",
+            f.pane.join("\n")
+        );
+    }
+    assert!(focused >= 20, "the ↓ walk focused {focused} frames");
+    let f = shunt_walk_frame(&app, 100, 16);
+    assert!(
+        f.pane[f.caret].contains("+ add token"),
+        "the ↓ walk ends on the card's last stop:\n{}",
+        f.pane.join("\n")
+    );
+    let mut focused = 0;
+    for press in 0..60 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+        let Some(f) = shunt_walk_frame_focused(&app, 100, 16) else {
+            continue;
+        };
+        focused += 1;
+        assert!(
+            f.caret >= f.row.min(2),
+            "↑ #{press}: {} rows above the focus, {} above it in the card:\n{}",
+            f.caret,
+            f.row,
+            f.pane.join("\n")
+        );
+    }
+    assert!(focused >= 20, "the ↑ walk focused {focused} frames");
+}
+
+/// A multi-line stop counts from its LAST row: `↓` landing on an `auth mode`
+/// cycle row that wraps onto continuation lines shows the whole block and two
+/// rows past it (`accounts`, `effort`), never just its first line at the edge.
+#[test]
+fn the_shunt_walk_keeps_two_rows_past_a_wrapped_stops_last_line() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    let mut upstreams = vec![UpstreamView {
+        name: Some(w("anthropic")),
+        provider: None,
+        kind: None,
+        base_url: None,
+        auth: Some(AuthView {
+            form: AuthForm::Inline,
+            mode: Some(w("claude_oauth")),
+            account: None,
+            accounts: Some(vec![
+                AccountView::Name(w("alice")),
+                AccountView::Name(w("bob")),
+            ]),
+            env: None,
+            header: None,
+        }),
+        effort: None,
+        service_tier: None,
+    }];
+    upstreams.extend(collapsed_upstreams(6));
+    view.upstreams = upstreams;
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "anthropic".into(),
+        occurrence: 0,
+    }]);
+    let mut app = config_view_app(view, expanded);
+    let _ = draw_frame(&app, 100, 16);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let mut landed = None;
+    for _ in 0..40 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let Some(f) = shunt_walk_frame_focused(&app, 100, 16) else {
+            continue;
+        };
+        if f.pane[f.caret].contains("auth mode") {
+            landed = Some(f);
+            break;
+        }
+    }
+    let f = landed.expect("the ↓ walk reaches the auth mode row");
+    let next = f.pane[f.caret..]
+        .iter()
+        .position(|r| r.trim_start().starts_with("accounts"))
+        .map(|i| f.caret + i)
+        .unwrap_or_else(|| {
+            panic!(
+                "the auth mode block's last line is off-screen:\n{}",
+                f.pane.join("\n")
+            )
+        });
+    let last = next - 1;
+    assert!(
+        f.pane[last]
+            .trim_end_matches(['┊', '┃', ' '])
+            .ends_with("none"),
+        "the block ends on its last option:\n{}",
+        f.pane.join("\n")
+    );
+    assert!(
+        f.pane.len() - 1 - last >= 2,
+        "{} rows below the block's last line:\n{}",
+        f.pane.len() - 1 - last,
+        f.pane.join("\n")
+    );
+}
+
+/// A second multi-line stop kind: the open upstream draft's `save upstream`
+/// row with a refusal `└` line trailing it. `↓` landing on it shows the whole
+/// block (the save row + the `└` line) and keeps `SCROLL_PAD` rows past the `└`
+/// line while the card has them — never just the save row at the edge.
+#[test]
+fn the_shunt_walk_keeps_two_rows_past_a_save_refusals_last_line() {
+    use crate::tui::app::{
+        ShuntDrafts, ShuntTokens, UpstreamDraft, config_field_stops, handle_key, shunt_check,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = collapsed_upstreams(8);
+    let expanded = std::collections::HashSet::new();
+    let drafts = ShuntDrafts {
+        upstream: Some(UpstreamDraft {
+            refusal: Some("save refused: name is required".to_string()),
+            ..UpstreamDraft::default()
+        }),
+        ..ShuntDrafts::default()
+    };
+    let mut card = shunt_check(&shunt_slot_full(), true, None);
+    card.shunt_focus.extend(config_field_stops(
+        &view,
+        &expanded,
+        &drafts,
+        &ShuntTokens::default(),
+    ));
+    let mut app = app_with(card);
+    app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
+    app.services.shunt_expanded = expanded;
+    app.services.shunt_drafts = drafts;
+    app.services.shunt_tokens = ShuntTokens::default();
+    let _ = draw_frame(&app, 100, 16);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let mut landed = None;
+    for _ in 0..40 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let Some(f) = shunt_walk_frame_focused(&app, 100, 16) else {
+            continue;
+        };
+        if f.pane[f.caret].contains("save upstream") {
+            landed = Some(f);
+            break;
+        }
+    }
+    let f = landed.expect("the ↓ walk reaches the save upstream row");
+    let last = f.pane[f.caret..]
+        .iter()
+        .position(|r| r.trim_start().starts_with('└'))
+        .map(|i| f.caret + i)
+        .unwrap_or_else(|| {
+            panic!(
+                "the save row's refusal line is off-screen:\n{}",
+                f.pane.join("\n")
+            )
+        });
+    let below = f.pane.len() - 1 - last;
+    let left = f.total - 1 - (f.row + last - f.caret);
+    assert!(
+        below >= left.min(2),
+        "{below} rows below the refusal, {left} left in the card:\n{}",
+        f.pane.join("\n")
+    );
+}
+
+/// `f` scrolling a fix line below the fold into view keeps two rows past it
+/// while the card has them.
+#[test]
+fn the_shunt_f_keeps_two_rows_past_the_fix_it_scrolls_to() {
+    use crate::tui::app::{Check, Health, ShuntFocus, ShuntFocusLine, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut detail: Vec<String> = (0..30).map(|i| format!("plan row {i:02}")).collect();
+    detail[5] = "f  move stores in".to_string();
+    detail[25] = "f  add admin key".to_string();
+    let check = Check {
+        label: "shunt",
+        health: Health::Warn,
+        detail,
+        fix: Some(ServiceFix::MoveStoresIn),
+        problems: Vec::new(),
+        shunt_focus: vec![
+            ShuntFocus::Fix {
+                line: 5,
+                fix: ServiceFix::MoveStoresIn,
+            },
+            ShuntFocus::Fix {
+                line: 25,
+                fix: ServiceFix::AddAdminKey,
+            },
+        ],
+        shunt_action_start: Some(0),
+    };
+    let mut app = app_with(check);
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let f = shunt_walk_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Admin)
+    );
+    assert!(
+        f.pane[f.caret].contains("f  add admin key"),
+        "the caret sits on the fix:\n{}",
+        f.pane.join("\n")
+    );
+    let below = f.pane.len() - 1 - f.caret;
+    assert!(
+        below >= 2,
+        "{below} rows below the fix, 4 left in the card:\n{}",
+        f.pane.join("\n")
+    );
+}
+
+/// From the two-fix card's dropped state (a `↓` text scroll dropped the move
+/// fix, focus none), `f` lands on the admin fix — the next fix the render's
+/// follow would not pull the view back for — with the offset never decreasing,
+/// then repeated `f` walks the fixes in order (B1a).
+#[test]
+fn f_from_a_dropped_focus_lands_on_the_next_fix_without_pulling_the_view_back() {
+    use crate::tui::app::{ShuntFocus, ShuntFocusLine, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut detail: Vec<String> = (0..30).map(|i| format!("plan row {i:02}")).collect();
+    detail[5] = "f  move stores in".to_string();
+    detail[25] = "f  add admin key".to_string();
+    let check = Check {
+        label: "shunt",
+        health: Health::Warn,
+        detail,
+        fix: Some(ServiceFix::MoveStoresIn),
+        problems: Vec::new(),
+        shunt_focus: vec![
+            ShuntFocus::Fix {
+                line: 5,
+                fix: ServiceFix::MoveStoresIn,
+            },
+            ShuntFocus::Fix {
+                line: 25,
+                fix: ServiceFix::AddAdminKey,
+            },
+        ],
+        shunt_action_start: Some(0),
+    };
+    let mut app = app_with(check);
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    // `↓` until the caret drops (the move fix left the padded band).
+    for _ in 0..40 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        if shunt_walk_frame_focused(&app, 80, 14).is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        app.services.shunt_focus_kind(),
+        None,
+        "the ↓ walk drops the move fix"
+    );
+    let max = app.services.detail_max_scroll.get() as usize;
+    let dropped = app.services.shunt_scroll.get().min(max);
+    // `f` from the dropped state lands on the admin fix, and the view never
+    // moves up against the key.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let _ = draw_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Admin),
+        "f from the dropped state lands on the admin fix"
+    );
+    let after = app.services.shunt_scroll.get().min(max);
+    assert!(
+        after >= dropped,
+        "f moves the view up: {dropped} -> {after}"
+    );
+    // Repeated `f` walks the fixes in order (admin -> move -> admin).
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let _ = draw_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Move),
+        "the next f wraps to the move fix"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let _ = draw_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Admin),
+        "the next f walks back to the admin fix"
+    );
+}
+
+/// `↓` on the two-fix card (fixes at lines 5 and 25) scrolls monotonically
+/// down — never re-taking the stop a text scroll dropped and pulling the view
+/// back against the key — until it lands on the admin fix (B1).
+#[test]
+fn down_walks_the_two_fix_card_monotonically_to_admin() {
+    use crate::tui::app::{ShuntFocus, ShuntFocusLine, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut detail: Vec<String> = (0..30).map(|i| format!("plan row {i:02}")).collect();
+    detail[5] = "f  move stores in".to_string();
+    detail[25] = "f  add admin key".to_string();
+    let check = Check {
+        label: "shunt",
+        health: Health::Warn,
+        detail,
+        fix: Some(ServiceFix::MoveStoresIn),
+        problems: Vec::new(),
+        shunt_focus: vec![
+            ShuntFocus::Fix {
+                line: 5,
+                fix: ServiceFix::MoveStoresIn,
+            },
+            ShuntFocus::Fix {
+                line: 25,
+                fix: ServiceFix::AddAdminKey,
+            },
+        ],
+        shunt_action_start: Some(0),
+    };
+    let mut app = app_with(check);
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let max = app.services.detail_max_scroll.get() as usize;
+    let mut prev = app.services.shunt_scroll.get().min(max);
+    let mut reached_admin = false;
+    for press in 0..40 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let _ = draw_frame(&app, 80, 14);
+        let scroll = app.services.shunt_scroll.get().min(max);
+        assert!(
+            scroll >= prev,
+            "↓ #{press} moves the view up: {prev} -> {scroll}"
+        );
+        prev = scroll;
+        if app.services.focused_shunt_focus().map(|s| s.kind()) == Some(ShuntFocusLine::Admin) {
+            reached_admin = true;
+            break;
+        }
+    }
+    assert!(reached_admin, "the ↓ walk reaches the admin fix");
+}
+
+/// The `↑` mirror of the two-fix walk: from the admin fix, `↑` scrolls
+/// monotonically up — never re-taking the dropped stop and pulling the view
+/// back down against the key — until it lands on the move fix (B1).
+#[test]
+fn up_walks_back_from_admin_monotonically_to_move() {
+    use crate::tui::app::{ShuntFocus, ShuntFocusLine, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut detail: Vec<String> = (0..30).map(|i| format!("plan row {i:02}")).collect();
+    detail[5] = "f  move stores in".to_string();
+    detail[25] = "f  add admin key".to_string();
+    let check = Check {
+        label: "shunt",
+        health: Health::Warn,
+        detail,
+        fix: Some(ServiceFix::MoveStoresIn),
+        problems: Vec::new(),
+        shunt_focus: vec![
+            ShuntFocus::Fix {
+                line: 5,
+                fix: ServiceFix::MoveStoresIn,
+            },
+            ShuntFocus::Fix {
+                line: 25,
+                fix: ServiceFix::AddAdminKey,
+            },
+        ],
+        shunt_action_start: Some(0),
+    };
+    let mut app = app_with(check);
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    // Walk ↓ onto the admin fix first.
+    for _ in 0..40 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let _ = draw_frame(&app, 80, 14);
+        if app.services.focused_shunt_focus().map(|s| s.kind()) == Some(ShuntFocusLine::Admin) {
+            break;
+        }
+    }
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Admin),
+        "the ↓ walk reached the admin fix"
+    );
+    let max = app.services.detail_max_scroll.get() as usize;
+    let mut prev = app.services.shunt_scroll.get().min(max);
+    let mut reached_move = false;
+    for press in 0..40 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+        let _ = draw_frame(&app, 80, 14);
+        let scroll = app.services.shunt_scroll.get().min(max);
+        assert!(
+            scroll <= prev,
+            "↑ #{press} moves the view down: {prev} -> {scroll}"
+        );
+        prev = scroll;
+        if app.services.focused_shunt_focus().map(|s| s.kind()) == Some(ShuntFocusLine::Move) {
+            reached_move = true;
+            break;
+        }
+    }
+    assert!(reached_move, "the ↑ walk reaches the move fix");
+}
+
+/// `↓` on the refused plan card at 60x14 scrolls monotonically down — no
+/// press ever moves the view up — until it reaches the card's end, so the
+/// refusal's last lines are reachable (B1).
+#[test]
+fn down_scrolls_the_refused_card_at_60x14_monotonically_to_the_end() {
+    use crate::tui::app::{MovePlanOutcome, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let record = shunt_record(&home, true);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    slot.version = Some("0.49.1".to_string());
+    slot.reason = Some("port busy".to_string());
+    slot.pid = Some(4242);
+    slot.port = Some(3001);
+    slot.restarts = 2;
+    slot.last_exit = Some(crate::daemon::gateway::ExitReport {
+        code: Some(1),
+        signal: None,
+    });
+    let refusal = "the standalone's home names no absolute directory, so clauth cannot tell where the codex CLI's own login (~/.codex/auth.json) sits; nothing was moved; set HOME to an absolute path in the env file, then run the move again".to_string();
+    let mut app = shunt_card_app(
+        slot,
+        true,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(MovePlanOutcome::Refused(refusal)),
+        None,
+    );
+    let _ = draw_frame(&app, 60, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let max = app.services.detail_max_scroll.get() as usize;
+    assert!(max > 0, "the refused card overflows 60x14");
+    let mut prev = app.services.shunt_scroll.get().min(max);
+    let mut reached = false;
+    for press in 0..80 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let _ = draw_frame(&app, 60, 14);
+        let scroll = app.services.shunt_scroll.get().min(max);
+        assert!(
+            scroll >= prev,
+            "↓ #{press} moves the view up: {prev} -> {scroll}"
+        );
+        prev = scroll;
+        if scroll == max {
+            reached = true;
+            break;
+        }
+    }
+    assert!(
+        reached,
+        "↓ reaches the end of the refused card (scroll {prev} of {max})"
+    );
+}
+
+/// The `↑` mirror on the refused plan card at 60x14: from the end, `↑` scrolls
+/// monotonically up — no press ever moves the view down — back to the top (B1).
+#[test]
+fn up_scrolls_the_refused_card_at_60x14_monotonically_to_the_top() {
+    use crate::tui::app::{MovePlanOutcome, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let record = shunt_record(&home, true);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    slot.version = Some("0.49.1".to_string());
+    slot.reason = Some("port busy".to_string());
+    slot.pid = Some(4242);
+    slot.port = Some(3001);
+    slot.restarts = 2;
+    slot.last_exit = Some(crate::daemon::gateway::ExitReport {
+        code: Some(1),
+        signal: None,
+    });
+    let refusal = "the standalone's home names no absolute directory, so clauth cannot tell where the codex CLI's own login (~/.codex/auth.json) sits; nothing was moved; set HOME to an absolute path in the env file, then run the move again".to_string();
+    let mut app = shunt_card_app(
+        slot,
+        true,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(MovePlanOutcome::Refused(refusal)),
+        None,
+    );
+    let _ = draw_frame(&app, 60, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let max = app.services.detail_max_scroll.get() as usize;
+    assert!(max > 0, "the refused card overflows 60x14");
+    // Walk ↓ to the end first.
+    for _ in 0..80 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let _ = draw_frame(&app, 60, 14);
+        if app.services.shunt_scroll.get().min(max) == max {
+            break;
+        }
+    }
+    assert_eq!(
+        app.services.shunt_scroll.get().min(max),
+        max,
+        "the ↓ walk reached the end"
+    );
+    let mut prev = app.services.shunt_scroll.get().min(max);
+    let mut reached = false;
+    for press in 0..80 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+        let _ = draw_frame(&app, 60, 14);
+        let scroll = app.services.shunt_scroll.get().min(max);
+        assert!(
+            scroll <= prev,
+            "↑ #{press} moves the view down: {prev} -> {scroll}"
+        );
+        prev = scroll;
+        if scroll == 0 {
+            reached = true;
+            break;
+        }
+    }
+    assert!(
+        reached,
+        "↑ reaches the top of the refused card (scroll {prev})"
+    );
+}
+
+/// A refusal raised on the focused `save upstream` row after `↵` (the empty
+/// draft refuses with `set its name first`) grows the block on its own event,
+/// and the render's per-draw follow keeps `SCROLL_PAD` rows past the new last
+/// line — the addendum's own case (F1).
+#[test]
+fn the_shunt_render_follows_a_refusal_raised_on_the_focused_save_row() {
+    use crate::tui::app::{
+        ShuntDrafts, ShuntTokens, UpstreamDraft, config_field_stops, handle_key, shunt_check,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = collapsed_upstreams(8);
+    let expanded = std::collections::HashSet::new();
+    let drafts = ShuntDrafts {
+        upstream: Some(UpstreamDraft::default()),
+        ..ShuntDrafts::default()
+    };
+    let mut card = shunt_check(&shunt_slot_full(), true, None);
+    card.shunt_focus.extend(config_field_stops(
+        &view,
+        &expanded,
+        &drafts,
+        &ShuntTokens::default(),
+    ));
+    let mut app = app_with(card);
+    app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
+    app.services.shunt_expanded = expanded;
+    app.services.shunt_drafts = drafts;
+    app.services.shunt_tokens = ShuntTokens::default();
+    let _ = draw_frame(&app, 60, 16);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let mut landed = None;
+    for _ in 0..40 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let Some(f) = shunt_walk_frame_focused(&app, 60, 16) else {
+            continue;
+        };
+        if f.pane[f.caret].contains("save upstream") {
+            landed = Some(f);
+            break;
+        }
+    }
+    let _ = landed.expect("the ↓ walk reaches the save upstream row");
+    // `↵` raises the refusal; the render re-follows the grown block.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let f = shunt_walk_frame(&app, 60, 16);
+    let last = f.pane[f.caret..]
+        .iter()
+        .position(|r| r.trim_start().starts_with('└'))
+        .map(|i| f.caret + i)
+        .unwrap_or_else(|| {
+            panic!(
+                "the save row's refusal line is off-screen:\n{}",
+                f.pane.join("\n")
+            )
+        });
+    let below = f.pane.len() - 1 - last;
+    let left = f.total - 1 - (f.row + last - f.caret);
+    assert!(
+        below >= left.min(2),
+        "{below} rows below the refusal, {left} left in the card:\n{}",
+        f.pane.join("\n")
+    );
+}
+
+/// `PageDown` moves the offset by exactly `viewport - 1` lines and settles on
+/// the first stop already inside the padded band — the line-10 admin fix at
+/// scroll 7 (pane row 3, two rows of pad above it), never a shorter page that
+/// lands on a stop outside the band and lets the render's follow pull it back
+/// (F2, exact landing).
+#[test]
+fn the_shunt_page_keys_keep_two_rows_past_their_focus() {
+    use crate::tui::app::{Check, Health, ServiceFix, ShuntFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let check = Check {
+        label: "shunt",
+        health: Health::Warn,
+        detail: (0..30).map(|i| format!("plan row {i:02}")).collect(),
+        fix: Some(ServiceFix::MoveStoresIn),
+        problems: Vec::new(),
+        shunt_focus: vec![
+            ShuntFocus::Fix {
+                line: 7,
+                fix: ServiceFix::MoveStoresIn,
+            },
+            ShuntFocus::Fix {
+                line: 10,
+                fix: ServiceFix::AddAdminKey,
+            },
+            ShuntFocus::Fix {
+                line: 14,
+                fix: ServiceFix::MoveStoresIn,
+            },
+            ShuntFocus::Fix {
+                line: 21,
+                fix: ServiceFix::AddAdminKey,
+            },
+        ],
+        shunt_action_start: Some(0),
+    };
+    let mut app = app_with(check);
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    let f = shunt_walk_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.shunt_scroll.get(),
+        7,
+        "the page moves the offset by viewport - 1 = 7 lines:\n{}",
+        f.pane.join("\n")
+    );
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(crate::tui::app::ShuntFocusLine::Admin),
+        "the page settles on the line-10 admin fix"
+    );
+    assert_eq!(
+        f.row,
+        10,
+        "the caret sits on the line-10 fix, two rows of pad above it:\n{}",
+        f.pane.join("\n")
+    );
+}
+
+/// Scrolling card text with `↓` drops the caret once the focused row comes
+/// within two rows of the top (the visible change): each press before that
+/// scrolls one line and keeps the caret, and the render never pulls the scroll
+/// back once the caret is gone.
+#[test]
+fn a_text_scroll_drops_the_caret_once_the_focused_row_nears_the_top() {
+    use crate::tui::app::{MovePlanOutcome, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let record = shunt_record(&home, true);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    slot.version = Some("0.49.1".to_string());
+    slot.reason = Some("port busy".to_string());
+    slot.pid = Some(4242);
+    slot.port = Some(3001);
+    slot.restarts = 2;
+    slot.last_exit = Some(crate::daemon::gateway::ExitReport {
+        code: Some(1),
+        signal: None,
+    });
+    let refusal = "the standalone's home names no absolute directory, so clauth cannot tell where the codex CLI's own login (~/.codex/auth.json) sits; nothing was moved; set HOME to an absolute path in the env file, then run the move again".to_string();
+    let mut app = shunt_card_app(
+        slot,
+        true,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(MovePlanOutcome::Refused(refusal)),
+        None,
+    );
+    let _ = draw_frame(&app, 80, 16);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    // Walk onto the admin fix; at 80x16 its block sits just above the fold so
+    // the scroll range below is long enough to drive its row into the top band.
+    let mut on_admin = false;
+    for _ in 0..6 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        if caret_stop(&draw_frame(&app, 80, 16)) == Some("admin") {
+            on_admin = true;
+            break;
+        }
+    }
+    assert!(on_admin, "the ↓ walk reaches the admin fix");
+
+    let mut dropped = false;
+    let mut press = 0;
+    while press < 60 {
+        let Some(f_before) = shunt_walk_frame_focused(&app, 80, 16) else {
+            dropped = true;
+            break;
+        };
+        let scroll_before = f_before.row - f_before.caret;
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        press += 1;
+        match shunt_walk_frame_focused(&app, 80, 16) {
+            Some(f_after) => {
+                let scroll_after = f_after.row - f_after.caret;
+                assert_eq!(scroll_after, scroll_before + 1, "one line per press");
+            }
+            None => {
+                dropped = true;
+                break;
+            }
+        }
+    }
+    assert!(dropped, "the caret drops once the admin row nears the top");
+}
+
+/// The walk moves the view only to restore the pad: a landing whose stop is
+/// already inside the padded band leaves the scroll put, and one that is not
+/// moves by exactly the rows the follow needs (the block's last line ends two
+/// rows from the bottom, or fewer at the card's end) — never re-pinned to
+/// `row - 2` (F4).
+#[test]
+fn the_shunt_walk_moves_the_view_only_to_restore_the_pad() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = collapsed_upstreams(14);
+    let mut app = config_view_app(view, std::collections::HashSet::new());
+    let _ = draw_frame(&app, 100, 16);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let mut prev_scroll = 0usize;
+    let mut focused = 0;
+    for press in 0..40 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let Some(f) = shunt_walk_frame_focused(&app, 100, 16) else {
+            continue;
+        };
+        focused += 1;
+        let scroll = f.row - f.caret;
+        let below = f.pane.len() - 1 - f.caret;
+        let left = f.total - 1 - f.row;
+        assert!(
+            scroll == prev_scroll || below == left.min(2),
+            "↓ #{press}: scroll moved {prev_scroll} -> {scroll} with {below} below, {left} left:\n{}",
+            f.pane.join("\n")
+        );
+        prev_scroll = scroll;
+    }
+    assert!(focused >= 20, "the ↓ walk focused {focused} frames");
+}
+
+/// A token row whose last-token refusal drops onto its own `└` line keeps two
+/// rows past that line when `↓` lands on it — the token end site is bound (F5).
+/// Several tokens sit below `alice`, so the full two-row pad applies and a
+/// one-line-short block end would red this pin.
+#[test]
+fn the_shunt_walk_keeps_two_rows_past_a_token_rows_refusal_line() {
+    use crate::tui::app::{ShuntTokens, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = collapsed_upstreams(8);
+    let tokens = ShuntTokens {
+        stored: vec![
+            "alice".to_string(),
+            "bob".to_string(),
+            "carol".to_string(),
+            "dave".to_string(),
+        ],
+        ..ShuntTokens::default()
+    };
+    let mut app = config_view_app_with_tokens(view, std::collections::HashSet::new(), tokens);
+    let _ = draw_frame(&app, 100, 16);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let mut landed = None;
+    for _ in 0..60 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let Some(f) = shunt_walk_frame_focused(&app, 100, 16) else {
+            continue;
+        };
+        if f.pane[f.caret].contains("alice") {
+            landed = Some(f);
+            break;
+        }
+    }
+    let _ = landed.expect("the ↓ walk reaches the token row");
+    // The focus setter retires a token refusal the moment focus leaves its row,
+    // so it is set only once the walk holds the token.
+    app.services.shunt_token_refusal.replace(Some((
+        "alice".to_string(),
+        "cannot remove the last token".to_string(),
+    )));
+    let f = shunt_walk_frame(&app, 100, 16);
+    let last = f.pane[f.caret..]
+        .iter()
+        .position(|r| r.trim_start().starts_with('└'))
+        .map(|i| f.caret + i)
+        .unwrap_or_else(|| {
+            panic!(
+                "the token row's refusal line is off-screen:\n{}",
+                f.pane.join("\n")
+            )
+        });
+    let below = f.pane.len() - 1 - last;
+    let left = f.total - 1 - (f.row + last - f.caret);
+    assert!(
+        left >= 2,
+        "{left} rows left below the refusal; the fixture needs at least two:\n{}",
+        f.pane.join("\n")
+    );
+    assert!(
+        below >= 2,
+        "{below} rows below the refusal, {left} left in the card:\n{}",
+        f.pane.join("\n")
+    );
+}
+
+/// An expanded entry's `remove <kind>` row with a refusal `└` line keeps two
+/// rows past that line when `↓` lands on it — the remove end site is bound
+/// (F5).
+#[test]
+fn the_shunt_walk_keeps_two_rows_past_a_remove_refusals_last_line() {
+    use crate::tui::app::{ShuntEntryKey, ShuntRemoveRefusal, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = collapsed_upstreams(8);
+    let key = ShuntEntryKey::Upstream {
+        name: "u00".into(),
+        occurrence: 0,
+    };
+    let expanded = std::collections::HashSet::from([key.clone()]);
+    let mut app = config_view_app(view.clone(), expanded);
+    let _ = draw_frame(&app, 100, 16);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let mut landed = None;
+    for _ in 0..60 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        let Some(f) = shunt_walk_frame_focused(&app, 100, 16) else {
+            continue;
+        };
+        if f.pane[f.caret].contains("remove upstream") {
+            landed = Some(f);
+            break;
+        }
+    }
+    let _ = landed.expect("the ↓ walk reaches the remove upstream row");
+    // The focus setter retires a remove refusal the moment focus leaves its
+    // row, so it is set only once the walk holds the remove row.
+    app.services
+        .shunt_remove_refusal
+        .replace(Some(ShuntRemoveRefusal {
+            key,
+            sentence: "cannot remove the only upstream".to_string(),
+            view: Box::new(view),
+        }));
+    let f = shunt_walk_frame(&app, 100, 16);
+    let last = f.pane[f.caret..]
+        .iter()
+        .position(|r| r.trim_start().starts_with('└'))
+        .map(|i| f.caret + i)
+        .unwrap_or_else(|| {
+            panic!(
+                "the remove row's refusal line is off-screen:\n{}",
+                f.pane.join("\n")
+            )
+        });
+    let below = f.pane.len() - 1 - last;
+    let left = f.total - 1 - (f.row + last - f.caret);
+    assert!(
+        below >= left.min(2),
+        "{below} rows below the refusal, {left} left in the card:\n{}",
+        f.pane.join("\n")
+    );
 }
 
 /// The detail pane's content rows keeping the card's own indentation: the
@@ -9169,7 +10321,7 @@ fn a_toast_over_a_shunt_field_caret_hides_the_native_cursor() {
     });
     // The bind row sits below the card header; scroll it to the top so its
     // caret is in view at 45x14.
-    app.services.detail_scroll = 11;
+    app.services.shunt_scroll.set(11);
 
     let mut term = Terminal::new(TestBackend::new(45, 14)).unwrap();
     term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();

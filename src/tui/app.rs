@@ -2612,11 +2612,11 @@ impl ShuntFocus {
 }
 
 /// The identity of the shunt card's focused actionable line, by its kind. The
-/// key handler owns it; the render reads it and re-settles it (the descend
-/// rule) when a resize or a card change pushed the held line out of view. A
-/// resize or a card change keeps focus on the same line while that kind still
-/// exists, so the line index ([`ShuntFocus::line`]) is deliberately not part
-/// of it.
+/// key handler owns it; the render reads it, follows the held block back into
+/// view on a resize or a card change, and re-settles only a vanished stop or a
+/// none focus (the descend rule). A resize or a card change keeps focus on the
+/// same line while that kind still exists, so the line index
+/// ([`ShuntFocus::line`]) is deliberately not part of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShuntFocusLine {
     /// The `enabled` toggle row.
@@ -3727,15 +3727,32 @@ pub(crate) struct ServicesState {
     /// guard; a panicked save drains as a failed outcome that clears it.
     pub(crate) shunt_save_worker: ShuntActionWorker,
     /// The `shunt` detail's focused actionable line, by its kind. Owned by the
-    /// key handler and the recompute; the render reads it to draw the caret,
-    /// and re-settles it (the descend rule) where it publishes the geometry
-    /// when a resize or a card change pushed the held line out of view.
+    /// key handler and the recompute; the render reads it to draw the caret
+    /// and follows the held block back into view where it publishes the
+    /// geometry, re-settling only a vanished stop or a none focus (the descend
+    /// rule).
     pub(crate) shunt_focus: std::cell::RefCell<Option<ShuntFocusLine>>,
     /// The rendered line index of each [`Check::shunt_focus`] stop (parallel to
     /// that list), published by the last render so the key handler can tell
     /// which stops are in view. A stop's rendered row is what the in-view test
     /// measures: a wrapped read-only sentence above a stop can shift it down.
     pub(crate) shunt_stop_rows: std::cell::RefCell<Vec<usize>>,
+    /// The rendered line each stop's block ends on (exclusive), parallel to
+    /// [`Self::shunt_stop_rows`]: the walk pads `SCROLL_PAD` rows past a stop's
+    /// LAST line, so the in-view test needs the block span, not just its first
+    /// row.
+    pub(crate) shunt_stop_ends: std::cell::RefCell<Vec<usize>>,
+    /// The card's total rendered line count from the last render — the
+    /// `follow_scroll_offset` bound. [`ServicesState::detail_max_scroll`] is
+    /// clamped to `u16`, so it cannot recover this.
+    pub(crate) shunt_total: std::cell::Cell<usize>,
+    /// The shunt card's scroll offset: the render reads it, follows the focused
+    /// stop's block via [`follow_scroll_offset`], and writes the result back
+    /// each draw (the forms/Status precedent), so a walk landing, a refusal
+    /// growing the block, a page landing and a resize all keep `SCROLL_PAD` rows
+    /// past the block while content remains. Key handlers read this same state;
+    /// the generic detail keeps its own [`ServicesState::detail_scroll`].
+    pub(crate) shunt_scroll: std::cell::Cell<usize>,
     /// The last rendered shunt pane height, published by the render the way
     /// [`ServicesState::detail_max_scroll`] is — the key handler's viewport.
     pub(crate) shunt_viewport: std::cell::Cell<u16>,
@@ -3859,6 +3876,9 @@ impl Default for ServicesState {
             shunt_save_worker: ShuntActionWorker::new(run_shunt_action),
             shunt_focus: std::cell::RefCell::new(None),
             shunt_stop_rows: std::cell::RefCell::new(Vec::new()),
+            shunt_stop_ends: std::cell::RefCell::new(Vec::new()),
+            shunt_total: std::cell::Cell::new(0),
+            shunt_scroll: std::cell::Cell::new(0),
             shunt_viewport: std::cell::Cell::new(0),
             last_plan_env_source: None,
             delegates: Vec::new(),
@@ -3931,25 +3951,30 @@ impl ServicesState {
     /// The shunt detail's focused actionable line, resolved by the focus
     /// identity the key handler owns and gated by the one in-view predicate
     /// every acting key and the footer consult: the resolved stop holds only
-    /// while its rendered row is on screen (the geometry the last render
-    /// published). A resize or a card change that pushes the focused line out
-    /// of view re-settles focus to the first actionable line in view (the
-    /// descend rule) where the render publishes the geometry, so this only
-    /// reads `None` when no actionable line is in view.
+    /// while any row of its block is on screen (the geometry the last render
+    /// published). A resize or a card change keeps a held block in view (the
+    /// render's per-draw follow); the render's re-settle runs only for a
+    /// vanished stop or a none focus, so this reads `None` when no stop is in
+    /// view.
     pub(crate) fn focused_shunt_focus(&self) -> Option<&ShuntFocus> {
         let kind = self.shunt_focus_kind()?;
         let stops = &self.selected_check()?.shunt_focus;
         let i = stops.iter().position(|s| s.kind() == kind)?;
         let rows = self.shunt_stop_rows.borrow();
-        if rows.len() != stops.len() {
+        let ends = self.shunt_stop_ends.borrow();
+        if rows.len() != stops.len() || ends.len() != stops.len() {
             // No geometry published for this card yet (a key before the first
             // frame, or a unit test that skips the render): with nothing to
             // measure, the by-kind identity is the answer. The in-view gate
             // only applies over a published geometry.
             return Some(&stops[i]);
         }
-        let scroll = self.detail_scroll.min(self.detail_max_scroll.get());
-        shunt_in_view(scroll, self.shunt_viewport.get() as usize, rows[i]).then_some(&stops[i])
+        let scroll = self
+            .shunt_scroll
+            .get()
+            .min(self.detail_max_scroll.get() as usize);
+        shunt_block_in_view(scroll, self.shunt_viewport.get() as usize, rows[i], ends[i])
+            .then_some(&stops[i])
     }
 
     /// Whether a save for `key` is still checking (its own worker in flight).
@@ -3993,32 +4018,39 @@ impl ServicesState {
     }
 
     /// The descend rule applied where the geometry is published: the render
-    /// calls this over the freshly rendered rows so a resize or a card change
-    /// re-settles focus to the first actionable line in view, else none. A
-    /// held line pushed out of view re-settles regardless of pane focus; a
-    /// focus that is none re-settles only while the detail pane holds focus —
-    /// with the list focused, ascend keeps the identity and a none focus is
-    /// the key handler's own state, never settled here.
+    /// follows the held block first, so a resize or a card change keeps it in
+    /// view; this then keeps a held block that is still in view, and re-settles
+    /// only a held stop that left the card (a recompute dropped it) or a none
+    /// focus, to the first stop whose block already sits inside the padded band
+    /// (else none — the render's follow then has nothing to move). The held
+    /// branch runs regardless of pane focus; a none focus re-settles only while
+    /// the detail pane holds focus — with the list focused, ascend keeps the
+    /// identity and a none focus is the key handler's own state, never settled
+    /// here.
     pub(crate) fn re_settle_shunt_focus(
         &self,
         stops: &[ShuntFocus],
         rows: &[usize],
-        scroll: u16,
+        ends: &[usize],
+        total: usize,
+        scroll: usize,
         viewport: usize,
     ) {
         if let Some(kind) = self.shunt_focus_kind() {
             if stops
                 .iter()
                 .position(|s| s.kind() == kind)
-                .and_then(|i| rows.get(i))
-                .is_some_and(|&r| shunt_in_view(scroll, viewport, r))
+                .and_then(|i| rows.get(i).zip(ends.get(i)))
+                .is_some_and(|(&start, &end)| shunt_block_in_view(scroll, viewport, start, end))
             {
                 return;
             }
         } else if self.focus != ServicesFocus::Detail {
             return;
         }
-        self.set_shunt_focus(shunt_first_in_view(stops, rows, scroll, viewport));
+        self.set_shunt_focus(shunt_first_follow_holds(
+            stops, rows, ends, scroll, viewport, total,
+        ));
     }
 
     /// Re-settle the delegates selection against the current job list: the
@@ -9084,6 +9116,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
                 leave_shunt_detail(app);
                 app.services.cursor = 0;
                 app.services.detail_scroll = 0;
+                app.services.shunt_scroll.set(0);
             }
             // Recompute on focus; the cached `claude --version` is not
             // re-probed, but the shunt plan and pool read re-run so a card
@@ -9690,12 +9723,14 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Up if len > 0 => {
                     app.services.cursor = (app.services.cursor + len - 1) % len;
                     app.services.detail_scroll = 0;
+                    app.services.shunt_scroll.set(0);
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
                 KeyCode::Down if len > 0 => {
                     app.services.cursor = (app.services.cursor + 1) % len;
                     app.services.detail_scroll = 0;
+                    app.services.shunt_scroll.set(0);
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
@@ -9703,6 +9738,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     app.services.cursor =
                         selector_page_up(app.services.cursor, &app.services.selector);
                     app.services.detail_scroll = 0;
+                    app.services.shunt_scroll.set(0);
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
@@ -9710,6 +9746,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     app.services.cursor =
                         selector_page_down(app.services.cursor, &app.services.selector);
                     app.services.detail_scroll = 0;
+                    app.services.shunt_scroll.set(0);
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
@@ -9856,9 +9893,10 @@ fn walk_to_next_fix(app: &mut App) {
 }
 
 /// The shunt card's half of [`walk_to_next_fix`]: the next fix stop after the
-/// focused one in card order (the first one from the list, or the first at or
-/// below the top of the view when nothing holds focus), wrapping, scrolled
-/// just far enough to bring it into view.
+/// focused one in card order (the first one from the list, or the first fix
+/// the render's follow would not pull the view back for when nothing holds
+/// focus), wrapping. Setting the focus is all it does: the render is the
+/// follow site, so the next draw pads `SCROLL_PAD` rows past the fix's block.
 fn shunt_walk_to_next_fix(app: &mut App, from_list: bool) {
     let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
         return;
@@ -9869,11 +9907,20 @@ fn shunt_walk_to_next_fix(app: &mut App, from_list: bool) {
     let Some(&first) = fixes.first() else {
         return;
     };
+    if from_list {
+        // `f` from the list descends onto the card at the top.
+        app.services.shunt_scroll.set(0);
+    }
     let rows = app.services.shunt_stop_rows.borrow().clone();
-    let geometry = rows.len() == stops.len();
+    let ends = app.services.shunt_stop_ends.borrow().clone();
+    let geometry = rows.len() == stops.len() && ends.len() == stops.len();
+    let scroll = app
+        .services
+        .shunt_scroll
+        .get()
+        .min(app.services.detail_max_scroll.get() as usize);
     let viewport = app.services.shunt_viewport.get() as usize;
-    let max = app.services.detail_max_scroll.get();
-    let scroll = app.services.detail_scroll.min(max);
+    let total = app.services.shunt_total.get();
     let target = if from_list {
         first
     } else {
@@ -9883,24 +9930,16 @@ fn shunt_walk_to_next_fix(app: &mut App, from_list: bool) {
             .and_then(|f| stops.iter().position(|s| s == f))
         {
             Some(cur) => fixes.iter().copied().find(|&i| i > cur).unwrap_or(first),
-            None if geometry => fixes
-                .iter()
-                .copied()
-                .find(|&i| rows[i] >= scroll as usize)
-                .unwrap_or(first),
+            None if geometry => {
+                shunt_none_focus_target(&rows, &ends, scroll, viewport, total, true, |i| {
+                    stops[i].fix().is_some()
+                })
+                .unwrap_or(first)
+            }
             None => first,
         }
     };
     app.services.set_shunt_focus(Some(stops[target].kind()));
-    if geometry && !shunt_in_view(scroll, viewport, rows[target]) {
-        let row = rows[target];
-        let scroll = if row < scroll as usize {
-            row
-        } else {
-            row + 1 - viewport.max(1)
-        };
-        app.services.detail_scroll = scroll.min(max as usize) as u16;
-    }
 }
 
 /// The plugin detail's problem walk: ↑↓ and `f` move over the fixable
@@ -10002,10 +10041,11 @@ fn track_delegates_selection(app: &mut App) {
 /// the `check output` modal, expand/collapse a config entry, or open/step a
 /// config field editor — `space` cycles a cycle field).
 /// Focus is the key handler's own state (a [`ShuntFocusLine`] identity); the
-/// render reads it and re-settles it (the descend rule) when a resize or a
-/// card change pushed the held line out of view. Only the shunt detail routes
-/// here; the herdr options and plugin problems keep their own walks, every
-/// other detail keeps the scroll-only keymap.
+/// render reads it and follows the held block back into view on a resize or a
+/// card change, re-settling only a vanished stop or a none focus (the descend
+/// rule). Only the shunt detail routes here; the herdr options and plugin
+/// problems keep their own walks, every other detail keeps the scroll-only
+/// keymap.
 fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up => shunt_step(app, false),
@@ -10069,13 +10109,16 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
 }
 
 /// One `↑`/`↓` on the shunt card, over the geometry the last render published
-/// ([`ServicesState::shunt_stop_rows`] + [`ServicesState::shunt_viewport`] +
+/// ([`ServicesState::shunt_stop_rows`] + [`ServicesState::shunt_stop_ends`] +
+/// [`ServicesState::shunt_viewport`] + [`ServicesState::shunt_total`] +
 /// [`ServicesState::detail_max_scroll`]): move focus to the next/previous
 /// actionable line in card order, scrolling one rendered line at a time only
 /// while that target is out of view, and never past either end. Read-only rows
-/// never take focus; with no further actionable line a press scrolls (while
-/// there is text to scroll) and focus stays on its line while that line is in
-/// view.
+/// never take focus. A text scroll (target out of view, or no further stop)
+/// keeps the held focus only while its block sits inside the padded band —
+/// where the render's follow would leave the view put — and drops it the moment
+/// the follow would move, so the render never pulls a text scroll back; the
+/// render is the follow site, so a landing needs no offset math here.
 fn shunt_step(app: &mut App, down: bool) {
     let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
         return;
@@ -10084,35 +10127,38 @@ fn shunt_step(app: &mut App, down: bool) {
         // A card with no actionable line still scrolls one rendered line per
         // ↑↓ (round 1 S14's behaviour): the read-only detail scrolls, and the
         // footer's `↑↓ scroll` is true exactly while this does something.
-        let max = app.services.detail_max_scroll.get();
-        app.services.detail_scroll = if down {
-            app.services.detail_scroll.saturating_add(1).min(max)
+        let max = app.services.detail_max_scroll.get() as usize;
+        let scroll = app.services.shunt_scroll.get().min(max);
+        app.services.shunt_scroll.set(if down {
+            scroll.saturating_add(1).min(max)
         } else {
-            app.services.detail_scroll.min(max).saturating_sub(1)
-        };
+            scroll.saturating_sub(1)
+        });
         return;
     }
     let rows = app.services.shunt_stop_rows.borrow().clone();
-    if rows.len() != stops.len() {
+    let ends = app.services.shunt_stop_ends.borrow().clone();
+    if rows.len() != stops.len() || ends.len() != stops.len() {
         // The render has not published this card's geometry yet (nothing drawn
         // to walk over).
         return;
     }
     let viewport = app.services.shunt_viewport.get() as usize;
-    let max_scroll = app.services.detail_max_scroll.get();
-    let mut scroll = app.services.detail_scroll.min(max_scroll);
+    let total = app.services.shunt_total.get();
+    let max_scroll = app.services.detail_max_scroll.get() as usize;
+    let mut scroll = app.services.shunt_scroll.get().min(max_scroll);
 
     // Reconcile only a held identity that left the view (a resize can move it
-    // out): the descend rule — the first actionable line in view — settles it,
-    // and the step below walks from there. A none focus is NOT reconciled
-    // here: `↓`/`↑` from none start from the target rule itself (the first
-    // stop at/after the top of the view going down, the last before the bottom
-    // going up), so the first visible line is never skipped.
+    // out): the descend rule settles it, and the step below walks from there.
+    // A none focus is NOT reconciled here: `↓`/`↑` from none start from the
+    // target rule itself (a stop the render's follow would not pull the view
+    // back against the key), so a stop a text scroll just dropped is never
+    // re-taken.
     let focus = app.services.shunt_focus_kind().and_then(|kind| {
         stops
             .iter()
             .position(|s| s.kind() == kind)
-            .filter(|&i| shunt_in_view(scroll, viewport, rows[i]))
+            .filter(|&i| shunt_block_in_view(scroll, viewport, rows[i], ends[i]))
             .map(|i| stops[i].kind())
     });
     let cur = focus
@@ -10120,52 +10166,62 @@ fn shunt_step(app: &mut App, down: bool) {
         .and_then(|kind| stops.iter().position(|s| s.kind() == kind));
 
     // The target stop: the one after/before the focused line, or (with no
-    // focus) the first at/after the top of the view going down, the last
-    // before the bottom of the view going up.
+    // focus) the first stop the render's follow would not pull the view back
+    // up for going down, the last it would not pull back down for going up.
     let target = if down {
         match cur {
             Some(cur) => (cur + 1 < stops.len()).then_some(cur + 1),
-            None => (0..stops.len()).find(|&i| rows[i] >= scroll as usize),
+            // From none, `↓` targets the first stop the render's follow would
+            // not pull the view back up for (the stop a text scroll just
+            // dropped): the one none-focus target rule `↓`/`↑`/`f` share.
+            None => shunt_none_focus_target(&rows, &ends, scroll, viewport, total, true, |_| true),
         }
     } else {
         match cur {
-            Some(cur) => (cur > 0).then_some(cur - 1),
-            None => (0..stops.len())
-                .rev()
-                .find(|&i| rows[i] < scroll as usize + viewport),
+            Some(cur) => (cur > 0).then(|| cur - 1),
+            // The `↑` mirror at the bottom band: the last stop the follow
+            // would not pull the view back down for.
+            None => shunt_none_focus_target(&rows, &ends, scroll, viewport, total, false, |_| true),
         }
     };
 
-    // The current focus kept while its line is still in view after a scroll.
+    // The current focus kept while its block sits inside the padded band after
+    // a text scroll — where the render's follow leaves the offset put. Once the
+    // follow would move the view, the focus drops, so the one-line scroll is
+    // never pulled back.
     let stops_ref = &stops;
     let rows_ref = &rows;
-    let keep_focus = move |scroll: u16| {
+    let ends_ref = &ends;
+    let keep_focus = move |scroll: usize| {
         focus.filter(|kind| {
             stops_ref
                 .iter()
                 .position(|s| s.kind() == kind.clone())
-                .is_some_and(|i| shunt_in_view(scroll, viewport, rows_ref[i]))
+                .is_some_and(|i| {
+                    shunt_follow_holds(scroll, viewport, total, rows_ref[i], ends_ref[i])
+                })
         })
     };
 
     match target {
-        Some(t) if shunt_in_view(scroll, viewport, rows[t]) => {
+        Some(t) if shunt_block_in_view(scroll, viewport, rows[t], ends[t]) => {
+            // The target's block is already in view: take it; the render pads
+            // past its block on the next draw.
             app.services.set_shunt_focus(Some(stops[t].kind()));
         }
         Some(_) => {
-            // The target is out of view: scroll one line toward it, then take
-            // it if that brought it into view, else keep the current focus
-            // while its line is still visible.
+            // The target's block is out of view: scroll one line toward it,
+            // then take it if that brought its block into view, else keep the
+            // current focus while it stays inside the padded band.
             if down {
                 scroll = scroll.saturating_add(1).min(max_scroll);
             } else {
                 scroll = scroll.saturating_sub(1);
             }
-            let target_taken = target
-                .filter(|&t| shunt_in_view(scroll, viewport, rows[t]))
-                .map(|t| stops[t].kind());
-            app.services
-                .set_shunt_focus(target_taken.or_else(|| keep_focus(scroll)));
+            match target.filter(|&t| shunt_block_in_view(scroll, viewport, rows[t], ends[t])) {
+                Some(t) => app.services.set_shunt_focus(Some(stops[t].kind())),
+                None => app.services.set_shunt_focus(keep_focus(scroll)),
+            }
         }
         None => {
             // No further actionable line: scroll one line while there is text
@@ -10178,86 +10234,181 @@ fn shunt_step(app: &mut App, down: bool) {
             app.services.set_shunt_focus(keep_focus(scroll));
         }
     }
-    app.services.detail_scroll = scroll;
+    app.services.shunt_scroll.set(scroll);
 }
 
-/// Whether a rendered row is inside the current viewport.
-fn shunt_in_view(scroll: u16, viewport: usize, r: usize) -> bool {
-    r >= scroll as usize && r < scroll as usize + viewport
+/// Whether any row of a stop's block `start..end` (end exclusive) is inside the
+/// current viewport. The one in-view predicate the walk's take gate and
+/// reconcile, `focused_shunt_focus`, the render's caret gate and the held-focus
+/// keep of `settle_shunt_focus`/`re_settle_shunt_focus` all share: a multi-line
+/// stop is in view while any of its rows shows, never its first row alone.
+pub(crate) fn shunt_block_in_view(
+    scroll: usize,
+    viewport: usize,
+    start: usize,
+    end: usize,
+) -> bool {
+    start < scroll + viewport && end > scroll
+}
+
+/// Whether the render's follow over a stop's block `start..end` leaves `scroll`
+/// unchanged — the block already sits inside the padded band (the band shrinks
+/// at the card's ends as [`follow_scroll_offset`] does). The text-scroll arms
+/// keep a held focus only while this holds, and the page keys settle onto the
+/// first stop where it does, so the render never pulls either back.
+fn shunt_follow_holds(
+    scroll: usize,
+    viewport: usize,
+    total: usize,
+    start: usize,
+    end: usize,
+) -> bool {
+    follow_scroll_offset(total, viewport, (start, end), scroll) == scroll
+}
+
+/// The one none-focus target rule the `↓`/`↑` arms of [`shunt_step`] and the
+/// no-focus arm of [`shunt_walk_to_next_fix`] share: the first (down) or last
+/// (up) stop in card order the render's follow over its block would not pull
+/// the view back against the key's direction — `follow_scroll_offset` lands at
+/// or above `scroll` going down, at or below `scroll` going up — so a stop a
+/// text scroll just dropped (still inside the top/bottom band) is never
+/// re-taken. `filter` narrows the candidates (`f` passes only its fix stops;
+/// `↓`/`↑` pass every stop). Returns the stop's index, or `None` when no stop
+/// passes (the caller falls back to its own wrap).
+fn shunt_none_focus_target(
+    rows: &[usize],
+    ends: &[usize],
+    scroll: usize,
+    viewport: usize,
+    total: usize,
+    down: bool,
+    filter: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let pass = |i: usize| {
+        let follow = follow_scroll_offset(total, viewport, (rows[i], ends[i]), scroll);
+        if down {
+            ends[i] > scroll && follow >= scroll
+        } else {
+            rows[i] < scroll + viewport && follow <= scroll
+        }
+    };
+    if down {
+        (0..rows.len()).find(|&i| filter(i) && pass(i))
+    } else {
+        (0..rows.len()).rev().find(|&i| filter(i) && pass(i))
+    }
 }
 
 /// One `PageUp`/`PageDown` on the shunt card: scroll the read-only detail one
-/// page (`viewport - 1` lines), then re-pick the first actionable line in view
-/// (or none) — the same rule a resize applies.
+/// page (`viewport - 1` lines), then re-settle to the first stop whose block
+/// already sits inside the padded band (else none) — the render's follow then
+/// has nothing to move.
 fn shunt_page(app: &mut App, down: bool) {
     let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
         return;
     };
     let rows = app.services.shunt_stop_rows.borrow().clone();
-    if rows.len() != stops.len() {
+    let ends = app.services.shunt_stop_ends.borrow().clone();
+    if rows.len() != stops.len() || ends.len() != stops.len() {
         // Geometry not published yet (a key before the first draw) — as in
         // `shunt_step`, there is nothing to walk over.
         return;
     }
-    let max = app.services.detail_max_scroll.get();
+    let max = app.services.detail_max_scroll.get() as usize;
     let viewport = app.services.shunt_viewport.get() as usize;
+    let total = app.services.shunt_total.get();
     // Compare the RENDERED offset (the stored scroll clamped to the last
     // render's bound), not the raw stored value: a taller terminal leaves the
     // stored scroll above the new bound, and a page over a stale number must
     // not re-pick focus while the rendered view stays put.
-    let before = app.services.detail_scroll.min(max);
+    let before = app.services.shunt_scroll.get().min(max);
     let paged = if down {
-        page_down_scroll(before as usize, max as usize, viewport) as u16
+        page_down_scroll(before, max, viewport)
     } else {
-        page_up_scroll(before as usize, max as usize, viewport) as u16
+        page_up_scroll(before, max, viewport)
     };
-    app.services.detail_scroll = paged;
+    app.services.shunt_scroll.set(paged);
     if paged == before {
         // The card fits, or is already at this end: the held focus stays.
         return;
     }
-    app.services
-        .set_shunt_focus(shunt_first_in_view(&stops, &rows, paged, viewport));
+    app.services.set_shunt_focus(shunt_first_follow_holds(
+        &stops, &rows, &ends, paged, viewport, total,
+    ));
 }
 
-/// The shunt card's descend rule: the first actionable line in view, else
-/// none.
+/// The first stop whose block already sits inside the padded band at `scroll`
+/// (the render's follow leaves `scroll` unchanged), else none. The page keys
+/// and the render's re-settle land here, so the follow has nothing further to
+/// move; a text scroll's dropped focus is not re-picked (it left the band).
+fn shunt_first_follow_holds(
+    stops: &[ShuntFocus],
+    rows: &[usize],
+    ends: &[usize],
+    scroll: usize,
+    viewport: usize,
+    total: usize,
+) -> Option<ShuntFocusLine> {
+    stops
+        .iter()
+        .zip(rows)
+        .zip(ends)
+        .find(|&((_, &start), &end)| shunt_follow_holds(scroll, viewport, total, start, end))
+        .map(|((s, _), _)| s.kind())
+}
+
+/// The first stop whose block is in view (any row showing), else none. The
+/// descend rule lands here: at the top of the card a stop near the bottom edge
+/// is still "in view", and the render's follow then pads it.
 fn shunt_first_in_view(
     stops: &[ShuntFocus],
     rows: &[usize],
-    scroll: u16,
+    ends: &[usize],
+    scroll: usize,
     viewport: usize,
 ) -> Option<ShuntFocusLine> {
     stops
         .iter()
         .zip(rows)
-        .find(|(_, r)| shunt_in_view(scroll, viewport, **r))
-        .map(|(s, _)| s.kind())
+        .zip(ends)
+        .find(|&((_, &start), &end)| shunt_block_in_view(scroll, viewport, start, end))
+        .map(|((s, _), _)| s.kind())
 }
 
 /// The shunt card's descend rule applied on descend: focus keeps its held
-/// identity while that line is in view, else it becomes the first actionable
-/// line in view (else none). Re-descending after an ascend therefore restores
-/// the walk position instead of resetting to the top of the card.
+/// identity while that block is in view, else it becomes the first actionable
+/// block in view (else none) — the render's follow then pads it. Re-descending
+/// after an ascend therefore restores the walk position instead of resetting
+/// to the top of the card.
 fn settle_shunt_focus(app: &mut App) {
     let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
         return;
     };
+    // Descend opens the card at the top (the render then follows the settled
+    // block).
+    app.services.shunt_scroll.set(0);
     let rows = app.services.shunt_stop_rows.borrow().clone();
+    let ends = app.services.shunt_stop_ends.borrow().clone();
     let viewport = app.services.shunt_viewport.get() as usize;
     let scroll = app
         .services
-        .detail_scroll
-        .min(app.services.detail_max_scroll.get());
+        .shunt_scroll
+        .get()
+        .min(app.services.detail_max_scroll.get() as usize);
     let held = app.services.shunt_focus_kind().and_then(|kind| {
         stops
             .iter()
             .position(|s| s.kind() == kind)
-            .filter(|&i| i < rows.len() && shunt_in_view(scroll, viewport, rows[i]))
+            .filter(|&i| {
+                i < rows.len()
+                    && i < ends.len()
+                    && shunt_block_in_view(scroll, viewport, rows[i], ends[i])
+            })
             .map(|i| stops[i].kind())
     });
-    app.services
-        .set_shunt_focus(held.or_else(|| shunt_first_in_view(&stops, &rows, scroll, viewport)));
+    app.services.set_shunt_focus(
+        held.or_else(|| shunt_first_in_view(&stops, &rows, &ends, scroll, viewport)),
+    );
 }
 
 /// Flip the record's `disabled` flag at once, reading and writing the value
@@ -12267,9 +12418,9 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
     }
 
     // A card change keeps the shunt focus by identity while the kind still
-    // exists (a landed action can drop the line that held it); the render
-    // re-settles it (the descend rule) on the next frame when a change pushed
-    // the line out of view, over the freshly rendered geometry.
+    // exists; a landed action can drop the line that held it, so clear it here
+    // and let the render's re-settle pick the first stop in the padded band
+    // over the freshly rendered geometry.
     if let Some(kind) = app.services.shunt_focus_kind()
         && !app
             .services
@@ -19997,7 +20148,7 @@ fn land_shunt_card(app: &mut App, focus: ShuntFocusLine) {
     do_switch(app, Tab::Services);
     select_shunt_check(app);
     app.services.focus = ServicesFocus::Detail;
-    app.services.detail_scroll = 0;
+    app.services.shunt_scroll.set(0);
     app.services.set_shunt_focus(
         app.services
             .selected_check()
