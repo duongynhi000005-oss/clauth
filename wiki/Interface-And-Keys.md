@@ -108,7 +108,7 @@ The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is
 
 There is no `remove field` because none is needed: an env row's <kbd>⏎</kbd> edits its value, and an empty value removes the key. Editing it back is the same row.
 
-`disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session — a Claude Code background job naming one of the profile's runtime trees (launched with `clauth start <p> -- --bg`) counts as a live session, a stopped one too, until `claude rm <id>`; the pick names whichever is in the way.
+`disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session — a Claude Code background job naming one of the profile's runtime trees (launched with `clauth start <p> -- --bg`) counts as a live session, a stopped one too, until `claude rm <id>` (in an `--isolated` session, an unfinished one only); the pick names whichever is in the way.
 
 ## Setup tab rows
 

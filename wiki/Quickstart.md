@@ -70,7 +70,7 @@ clauth list           # account table with cached usage, no network
 | `clauth capture <profile>` | | save the login Claude Code is using now as a new profile; the first one becomes the active account |
 | `clauth rolling-token <profile>` | | serve the profile's sessions a rolling token re-stamped from its usage chain |
 | `clauth static-token <profile>` | `--clear`, `--yes` | bare: restore the preserved mint a rolling token superseded; `--clear` removes the long-lived token entirely |
-| `clauth delete <profile>` | `--yes`, `--force` | remove a profile and every credential it holds, a codex profile included ([Codex](Codex#remove)); without `--force` it refuses while a live session runs — a Claude Code background job naming one of the profile's runtime trees (`clauth start <p> -- --bg`) counts as one, a stopped one too, until `claude rm <id>` |
+| `clauth delete <profile>` | `--yes`, `--force` | remove a profile and every credential it holds, a codex profile included ([Codex](Codex#remove)); without `--force` it refuses while a live session runs — a Claude Code background job naming one of the profile's runtime trees (`clauth start <p> -- --bg`) counts as one, a stopped one too, until `claude rm <id>` (in an `--isolated` session, an unfinished one only) |
 | `clauth disable <profile>` | `--yes` | hide it from auto-switch, polling, and the status feed; files stay |
 | `clauth enable <profile>` | | put a disabled profile back |
 | `clauth limit-reset <profile>` | `--list`, `--yes` | spend one of a codex account's banked usage-limit resets; `--list` shows them and spends nothing ([Codex](Codex#use-a-usage-limit-reset)) |
@@ -78,7 +78,7 @@ clauth list           # account table with cached usage, no network
 | `clauth which` | `--json` | print the profile owning the loaded credentials; inside a `clauth start` codex session, that codex profile |
 | `clauth list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches; codex accounts follow in their own `CODEX` section, which `--all` leaves alone |
 | `clauth jobs` | `--json` | what the delegates are doing: account, elapsed, last output, live runs first; `--json` also carries each run's `session_id`, the handle `delegate({session_id})` takes after a crash, and whether the run was isolated, which is what decides whether that id is a handle at all |
-| `clauth switch <name>` / `clauth switch <sid> <profile>` | | one name switches the global account (the bare `clauth <name>` form, deprecated); two names move a live session, picked up at its next request |
+| `clauth switch <name>` / `clauth switch <sid> <profile>` | | one name switches the global account (the bare `clauth <name>` form, deprecated); two names move a live session, picked up at its next request — a background session (`-- --bg`) is refused: it stays on its account |
 | `clauth sessions` | `--json`, `--tokens` | list Claude Code sessions, newest first |
 | `clauth resume <id\|latest>` | `--profile <name>` | resume a session under a chosen account |
 | `clauth info <id\|latest>` | | print a session's resume command, workspace, and storage path |
