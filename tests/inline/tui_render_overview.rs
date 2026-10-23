@@ -5502,11 +5502,11 @@ fn healthy_burning_alpha(bravo_pct: f64, switch_off_when_spent: bool) -> App {
     app
 }
 
-/// R1 (reviewer probe, ported): the DEFAULT config (burn-aware off) caption
-/// names the member the walk lands on when a healthy active crosses its
-/// threshold. The whole target row is pinned by equality.
+/// The DEFAULT config (burn-aware off) caption names the member the walk lands
+/// on when a healthy active crosses its threshold. The whole target row is
+/// pinned by equality.
 #[test]
-fn reviewer_r1_default_caption_names_the_next_member_for_a_healthy_burning_active() {
+fn default_caption_names_the_next_member_for_a_healthy_burning_active() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = healthy_burning_alpha(10.0, false);
     let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
