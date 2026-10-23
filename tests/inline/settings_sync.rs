@@ -791,7 +791,12 @@ fn a_torn_config_toml_pause_warning_names_the_position_and_never_the_secret() {
     );
     drop(capture);
 
-    let path = home.home().join(".clauth/profiles/p1/config.toml");
+    let path = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("config.toml");
     let expected = format!(
         "clauth: settings.json sync paused — {} is not valid TOML (line 2, column 30); \
          the affected profiles' custom [env] keys are unknown, so no settings are synced \
