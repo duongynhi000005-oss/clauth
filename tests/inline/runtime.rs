@@ -2881,13 +2881,22 @@ fn a_shared_build_skips_a_store_it_cannot_create() {
         // each naming only its own consequence.
         assert_eq!(
             notes,
-            [("jobs", "background jobs"), ("projects", "transcripts")].map(
-                |(store, consequence)| format!(
-                    "clauth: could not create {}: {refused}; this session's {consequence} \
-                     stay in its own tree and are lost when it ends",
+            [
+                (
+                    "jobs",
+                    "background jobs stay in its own tree, where `claude agents` outside it cannot see them",
+                ),
+                (
+                    "projects",
+                    "transcripts stay in its own tree and are lost when it ends",
+                ),
+            ]
+            .map(|(store, consequence)| {
+                format!(
+                    "clauth: could not create {}: {refused}; this session's {consequence}",
                     claude_home.join(store).display()
                 )
-            ),
+            }),
             "one note per store the build could not create"
         );
 

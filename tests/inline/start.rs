@@ -783,7 +783,7 @@ fn start_prints_one_line_per_store_it_cannot_create() {
         let expected = [
             format!(
                 "clauth: could not create {}: {refused}; this session's background jobs \
-                 stay in its own tree and are lost when it ends\n",
+                 stay in its own tree, where `claude agents` outside it cannot see them\n",
                 claude.join("jobs").display()
             ),
             format!(
@@ -839,7 +839,7 @@ fn start_prints_one_line_per_store_it_cannot_create() {
 
         let expected = format!(
             "clauth: could not create {}: {refused}; this session's background jobs \
-             stay in its own tree and are lost when it ends\n",
+             stay in its own tree, where `claude agents` outside it cannot see them\n",
             claude.join("jobs").display()
         );
         assert_eq!(

@@ -5898,19 +5898,31 @@ fn build_runtime_dir_with_active_env(
 }
 
 /// Stores Claude Code writes through its config dir and clauth reads from
-/// `~/.claude`.
-const SHARED_STORES: &[(&str, &str)] = &[("jobs", "background jobs"), ("projects", "transcripts")];
+/// `~/.claude`, each with the ending of the line a start prints when the
+/// store cannot be created.
+const SHARED_STORES: &[(&str, &str)] = &[
+    (
+        "jobs",
+        "background jobs stay in its own tree, where `claude agents` outside it cannot see them",
+    ),
+    (
+        "projects",
+        "transcripts stay in its own tree and are lost when it ends",
+    ),
+];
 
 /// Link the stores a shared tree must reach: Claude Code writes `jobs`
 /// (background job records) and `projects` (transcripts) through its config
 /// dir, and clauth reads them from `~/.claude`. The build's walk only visits
 /// what `~/.claude` already holds, so a box that never wrote either offers no
 /// store for the walk to link, and the record would land inside the tree,
-/// where the store never sees it and the next teardown collects it.
+/// out of sight of `claude agents` run outside it, and a transcript there is
+/// never indexed and dies with the tree.
 ///
-/// Shared trees on the linking transport only: a copy-host tree gets no job
-/// store at all (the walk and the mirror both skip `jobs`; a record written
-/// there is read from the tree's own `jobs/`), and an isolated tree reaches
+/// Shared trees on the linking transport only: a copy-host tree never gets the
+/// global job store linked or copied in (the walk and the mirror both skip
+/// `jobs`), so a record Claude Code writes there lands in the tree's own
+/// `jobs/`, which clauth reads; and an isolated tree reaches
 /// nothing in `~/.claude`. Each
 /// absent store is created 0700, the owner-only shape every clauth write
 /// takes; an existing tree entry is left as it is; a store that is unusable or
@@ -5948,8 +5960,7 @@ fn ensure_store_link(
     // or full `~/.claude` skips this store and the build goes on.
     if let Err(e) = crate::profile::mkdir_700(&global) {
         return Ok(Some(format!(
-            "clauth: could not create {}: {e}; this session's {consequence} \
-             stay in its own tree and are lost when it ends",
+            "clauth: could not create {}: {e}; this session's {consequence}",
             global.display()
         )));
     }
