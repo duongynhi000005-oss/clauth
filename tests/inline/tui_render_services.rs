@@ -3587,8 +3587,9 @@ fn delegate_row_text_renders_inert_with_tooltip_when_herdr_config_does_not_parse
     }
 }
 
-/// The tag-refresh editor renders the edit gutter, the sunken buffer with its
-/// unit, and the range sub-line — the Config-tab refresh editor's shape.
+/// The tag-refresh editor renders the edit gutter, the selection-tinted buffer
+/// with its unit, and the range sub-line — the Config-tab refresh editor's
+/// shape.
 #[test]
 fn herdr_tag_refresh_editor_renders_the_edit_state() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -3609,6 +3610,50 @@ fn herdr_tag_refresh_editor_renders_the_edit_state() {
         screen.contains("min is 1 s"),
         "the range sub-line renders while typing:\n{screen}"
     );
+}
+
+/// The herdr `tag refresh` editor keeps the selected row's `BG_HOVER` tint over
+/// the same cells the row tints at rest, and paints no `BG_SUNKEN` buffer.
+#[test]
+fn an_editing_herdr_tag_refresh_row_keeps_the_selection_tint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for tier in [
+        crate::tui::theme::Tier::Full,
+        crate::tui::theme::Tier::Compatible,
+    ] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let mut app = herdr_options_app(healthy_config());
+        app.services.herdr_options_cursor = 2;
+        let tinted = |app: &App| {
+            let (rows, buf) = render(app);
+            let y = rows
+                .iter()
+                .position(|r| r.contains("tag refresh"))
+                .unwrap_or_else(|| panic!("no tag refresh row:\n{}", rows.join("\n")));
+            let hover: Vec<u16> = (0..W)
+                .filter(|x| buf[(*x, y as u16)].bg == crate::tui::theme::bg_hover())
+                .collect();
+            let sunken: Vec<u16> = (0..W)
+                .filter(|x| buf[(*x, y as u16)].bg == crate::tui::theme::bg_sunken())
+                .collect();
+            (hover, sunken)
+        };
+        let (rest_hover, _) = tinted(&app);
+        assert!(
+            !rest_hover.is_empty(),
+            "the selected row is tinted at rest ({tier:?})"
+        );
+        app.services.herdr_tag_draft = Some(crate::tui::app::SeededInput::new("5"));
+        let (edit_hover, edit_sunken) = tinted(&app);
+        assert!(
+            edit_sunken.is_empty(),
+            "the editor paints no BG_SUNKEN cell ({tier:?})"
+        );
+        assert_eq!(
+            edit_hover, rest_hover,
+            "the editing row keeps the selection tint over the same cells ({tier:?})"
+        );
+    }
 }
 
 #[test]
@@ -8844,7 +8889,7 @@ fn the_add_save_remove_footer_hints_derive_from_state() {
         vec![
             ("↑↓", "row"),
             ("r", "refresh"),
-            ("space/↵", "add"),
+            ("↵", "add"),
             ("a", "actions"),
             ("?", "help"),
         ],
@@ -8869,7 +8914,7 @@ fn the_add_save_remove_footer_hints_derive_from_state() {
         vec![
             ("↑↓", "row"),
             ("r", "refresh"),
-            ("space/↵", "collapse"),
+            ("↵", "collapse"),
             ("a", "actions"),
             ("?", "help"),
         ],
@@ -8906,8 +8951,7 @@ fn the_add_save_remove_footer_hints_derive_from_state() {
     );
 
     // `+ add` while its draft saves: the row is locked, so it sheds its
-    // `space/↵` hint too (nothing it advertises acts). B's P2-B4 plant reds
-    // this leg.
+    // `↵` hint too (nothing it advertises acts).
     app.services
         .set_shunt_focus(Some(ShuntFocusLine::Add(ShuntAddKind::Upstream)));
     assert_eq!(
@@ -8918,7 +8962,7 @@ fn the_add_save_remove_footer_hints_derive_from_state() {
             ("a", "actions"),
             ("?", "help"),
         ],
-        "a saving `+ add` row offers no `space/↵`"
+        "a saving `+ add` row offers no `↵`"
     );
 }
 

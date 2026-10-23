@@ -1950,6 +1950,44 @@ pub(crate) fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
         .collect()
 }
 
+/// Assert `line` draws its toggle in the contract's split colours for the
+/// current tier: full `─●` track LINE + knob ACCENT, `○─` knob TEXT_DIM +
+/// track LINE; compatible `[on]` brackets TEXT_DIM + word ACCENT, `[off]` all
+/// TEXT_DIM.
+pub(crate) fn assert_split_toggle(line: &ratatui::text::Line<'_>, on: bool) {
+    use crate::tui::theme;
+    let cells: Vec<(char, Option<ratatui::style::Color>)> = line
+        .spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(move |c| (c, s.style.fg)))
+        .collect();
+    let text: String = cells.iter().map(|(c, _)| c).collect();
+    let (glyph, expected) = match (theme::tier(), on) {
+        (theme::Tier::Full, true) => ("─●", vec![theme::line_color(), theme::accent_color()]),
+        (theme::Tier::Full, false) => ("○─", vec![theme::text_dim_color(), theme::line_color()]),
+        (theme::Tier::Compatible, true) => (
+            "[on]",
+            vec![
+                theme::text_dim_color(),
+                theme::accent_color(),
+                theme::accent_color(),
+                theme::text_dim_color(),
+            ],
+        ),
+        (theme::Tier::Compatible, false) => ("[off]", vec![theme::text_dim_color(); 5]),
+    };
+    let byte_at = text
+        .find(glyph)
+        .unwrap_or_else(|| panic!("no {glyph:?} toggle in {text:?}"));
+    let start = text[..byte_at].chars().count();
+    let got: Vec<Option<ratatui::style::Color>> = cells[start..start + expected.len()]
+        .iter()
+        .map(|(_, fg)| *fg)
+        .collect();
+    let want: Vec<Option<ratatui::style::Color>> = expected.into_iter().map(Some).collect();
+    assert_eq!(got, want, "toggle {glyph:?} cell colours in {text:?}");
+}
+
 /// Draw one frame through `draw`: the native caret it placed and the buffer.
 pub(crate) fn draw_caret(
     term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,

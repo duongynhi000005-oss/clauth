@@ -1458,3 +1458,35 @@ fn a_typed_config_row_keeps_its_caret_inside_on_a_narrow_pane() {
         }
     }
 }
+
+#[test]
+fn config_toggles_paint_their_parts_in_split_colours() {
+    for tier in [
+        crate::tui::theme::Tier::Full,
+        crate::tui::theme::Tier::Compatible,
+    ] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let mut off_state = toggles();
+        off_state.auto_update = false;
+        crate::testutil::assert_split_toggle(
+            &one_row(
+                GlobalConfigRow::AutoUpdate,
+                false,
+                toggles(),
+                tunables(),
+                None,
+            ),
+            true,
+        );
+        crate::testutil::assert_split_toggle(
+            &one_row(
+                GlobalConfigRow::AutoUpdate,
+                false,
+                off_state,
+                tunables(),
+                None,
+            ),
+            false,
+        );
+    }
+}

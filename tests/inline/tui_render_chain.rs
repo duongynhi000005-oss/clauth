@@ -4374,3 +4374,32 @@ fn the_credit_cap_pill_reads_spent_with_the_other_models_suffix() {
         "the label itself is charged, like the other spent rungs"
     );
 }
+
+#[test]
+fn the_member_card_toggles_paint_their_parts_in_split_colours() {
+    for tier in [
+        crate::tui::theme::Tier::Full,
+        crate::tui::theme::Tier::Compatible,
+    ] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let (cfg, readings) = config_with(vec![profile("a", 95.0, 49.0, 3600)], None, vec!["a"]);
+        let (lines, _, _) = member_detail(
+            &cfg,
+            &crate::profile::ProfileName::from("a"),
+            MemberCard {
+                width: 40,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        );
+        let row = |label: &str| {
+            lines
+                .iter()
+                .find(|l| line_text(l).contains(label))
+                .unwrap_or_else(|| panic!("the card renders a {label:?} row"))
+        };
+        crate::testutil::assert_split_toggle(row("weekly gate"), true);
+        crate::testutil::assert_split_toggle(row("last resort"), false);
+    }
+}

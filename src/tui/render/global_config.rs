@@ -38,7 +38,7 @@ use super::format::truncate;
 use super::panes::{
     MIN_VALUE_W, cycle_row_lines, draw_scrolled_lines, head_cols, help_tooltip_lines,
     highlight_row, invalid_tooltip_lines, key_cell, label_style, place_caret, section_box,
-    value_caret,
+    toggle_value, value_caret,
 };
 
 /// Width of the key column: the longest keys (`allow extra usage` /
@@ -154,17 +154,22 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[
         let tip_len = tip_lines.len();
         match row_editing {
             Some(input) => {
-                // The native terminal cursor owns the caret; the row renders plain
-                // (no highlight) with the edit gutter + sunken field, like the chain
-                // threshold editor. x = the row's gutter and key cell as rendered
-                // ([`edit_lead`] narrows the key on a narrow pane) + the caret's
-                // cell in the value window.
+                // The native terminal cursor owns the caret; the row keeps the
+                // selected row's tint. x = the row's gutter and key cell as
+                // rendered ([`edit_lead`] narrows the key on a narrow pane) +
+                // the caret's cell in the value window.
                 let lead: usize = row_lines
                     .first()
                     .map_or(0, |line| line.spans.iter().take(2).map(Span::width).sum());
                 let cx = inner.x.saturating_add((lead + head_cols(input)) as u16);
                 caret = Some((cx, lines.len()));
-                lines.extend(row_lines);
+                for line in row_lines {
+                    lines.push(if selected {
+                        highlight_row(line, inner.width as usize)
+                    } else {
+                        line
+                    });
+                }
                 lines.extend(tip_lines);
             }
             None => {
@@ -999,18 +1004,15 @@ fn dimmed_toggle_row(key: &str, on: bool, selected: bool) -> Line<'static> {
 
 /// A toggle row: `key  ─●` / `key  ○─`. A pure on/off boolean is a
 /// toggle, not a 2-option cycle — `on`/`off` labels in brackets read as a cycle,
-/// not a switch. Knob `ACCENT` when on, `TEXT_FAINT` off.
+/// not a switch. The value is [`toggle_value`], which splits the glyph's parts
+/// per the contract.
 fn toggle_row(arrow: Span<'static>, key: &str, on: bool, row_selected: bool) -> Line<'static> {
-    let (glyph, style) = if on {
-        (theme::toggle_on(), theme::accent())
-    } else {
-        (theme::toggle_off(), theme::faint())
-    };
-    Line::from(vec![
+    let mut spans = vec![
         arrow,
         Span::styled(key_cell(key, KEY_W, KEY_GUTTER), label_style(row_selected)),
-        Span::styled(glyph, style),
-    ])
+    ];
+    spans.extend(toggle_value(on, false));
+    Line::from(spans)
 }
 
 #[cfg(test)]

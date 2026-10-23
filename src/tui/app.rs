@@ -483,6 +483,26 @@ pub(crate) enum FallbackRow {
     Remove,
 }
 
+impl FallbackRow {
+    /// `space` acts only on state controls: a stepper, continuous or typed-only
+    /// row (whose typed editor `space` opens), a toggle, or the `preferred days`
+    /// cycle. The `remove` action row acts on `↵` alone.
+    pub(crate) fn is_state_control(self) -> bool {
+        match self {
+            FallbackRow::Threshold
+            | FallbackRow::WeeklyAt
+            | FallbackRow::CheckWeekly
+            | FallbackRow::CheckScoped
+            | FallbackRow::CheckCreditCap
+            | FallbackRow::LastResort
+            | FallbackRow::Preferred
+            | FallbackRow::PreferredDays
+            | FallbackRow::MaxSpend => true,
+            FallbackRow::Remove => false,
+        }
+    }
+}
+
 /// One editable line in the Setup tab's detail pane. Built per selection by
 /// [`config_rows`]: auto-start only for OAuth; trailing row is `delete` or
 /// `create`. `Name`/`BaseUrl`/`ApiKey` are text rows; the rest are toggles/actions.
@@ -543,14 +563,14 @@ pub(crate) enum ConfigRow {
     /// one gets the row too — that state needs an exit as much as a live mint),
     /// and dimmed + inert when the account stores no other login, since
     /// clearing would leave it with no credentials at all. Arms on the first
-    /// Space/⏎ and confirms on the second, like `Disabled`'s disable direction:
+    /// ⏎ and confirms on the second, like `Disabled`'s disable direction:
     /// it changes what every future switch installs and, on the active account,
     /// moves a running session's credentials.
     ClearSessionToken,
     /// User-disabled account-action row (`Profile::disabled`), same class as
     /// `Delete`: enabling fires the shared
     /// `actions::enable_profile` immediately (harmless), disabling arms on the
-    /// first Space/⏎ and confirms on the second, via `actions::disable_profile`.
+    /// first ⏎ and confirms on the second, via `actions::disable_profile`.
     /// Dimmed and inert while the account is active or holds a live `clauth
     /// start` session — the same gate the CLI enforces.
     Disabled,
@@ -577,6 +597,37 @@ impl ConfigRow {
                 | ConfigRow::SubagentModel
                 | ConfigRow::BellThreshold
         )
+    }
+
+    /// `space` acts only on state controls: a cycle, a toggle, or a stepper /
+    /// continuous row whose typed editor `space` opens. Action rows and text
+    /// fields act on `↵` alone.
+    pub(crate) fn is_state_control(self) -> bool {
+        match self {
+            ConfigRow::Type
+            | ConfigRow::Family
+            | ConfigRow::Model
+            | ConfigRow::AutoStart
+            | ConfigRow::BellThreshold => true,
+            ConfigRow::Name
+            | ConfigRow::BaseUrl
+            | ConfigRow::ApiKey
+            | ConfigRow::FableModel
+            | ConfigRow::OpusModel
+            | ConfigRow::SonnetModel
+            | ConfigRow::HaikuModel
+            | ConfigRow::SubagentModel
+            | ConfigRow::ModelOverrideAdd
+            | ConfigRow::EnvEntry(_)
+            | ConfigRow::EnvAdd
+            | ConfigRow::Login
+            | ConfigRow::CaptureLogin
+            | ConfigRow::DeleteCreds
+            | ConfigRow::ClearSessionToken
+            | ConfigRow::Disabled
+            | ConfigRow::Delete
+            | ConfigRow::Create => false,
+        }
     }
 }
 
@@ -2506,11 +2557,12 @@ pub(crate) struct Problem {
 
 /// One actionable line on the `shunt` card: a fix (`f  <verb>`), the `enabled`
 /// toggle row, the `check output` line, or a config-section stop (an entry row
-/// whose `↵`/`space` toggles it expanded, or a field row whose `↵`/`space` opens
-/// it and `space` cycles a cycle row). Descended, ↑↓ pages the card one line at
-/// a time; an actionable line takes focus as it scrolls into view, read-only
-/// rows never do, and `space`/`↵` act only on the focused one (`↵` on a fix
-/// line opens its confirm; `f` walks between fix lines).
+/// whose `↵`/`space` toggles it expanded, or a field row whose `↵` opens it and
+/// `space` cycles a cycle row). Descended, ↑↓ pages the card one line at a
+/// time; an actionable line takes focus as it scrolls into view, read-only rows
+/// never do. `space` acts only on the state controls (`enabled`, an entry, a
+/// cycle field); every other focused line acts on `↵` (`↵` on a fix line opens
+/// its confirm; `f` walks between fix lines).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShuntFocus {
     /// An `f  <verb>` line at this detail index.
@@ -2518,7 +2570,7 @@ pub(crate) enum ShuntFocus {
     /// The `enabled` toggle row at this detail index.
     Enabled { line: usize },
     /// The `check output` line at this detail index (a held failed-check
-    /// stderr; ↵/space opens its modal).
+    /// stderr; `↵` opens its modal).
     CheckOutput { line: usize },
     /// A config-section entry row (an upstream, model or route), whose `↵`/
     /// `space` toggles it expanded. Not a `Check::detail` line: the render
@@ -2527,7 +2579,7 @@ pub(crate) enum ShuntFocus {
     /// A config-section field row (an editable `key value` line, or a cycle
     /// row), whose `↵` opens it and `space` cycles a cycle row.
     Field { key: ShuntFieldKey },
-    /// A `+ add <kind>` action row ending its group, whose `↵`/`space` opens
+    /// A `+ add <kind>` action row ending its group, whose `↵` opens
     /// (or folds) that kind's blank draft in place.
     Add { kind: ShuntAddKind },
     /// The `save <kind>` row of an open draft, whose `↵` runs the add.
@@ -2537,7 +2589,7 @@ pub(crate) enum ShuntFocus {
     Remove { key: ShuntEntryKey },
     /// A client-token action-chip row, whose `↵` opens the remove confirm.
     Token { key: String },
-    /// The `+ add token` row ending the client-token group, whose `↵`/`space`
+    /// The `+ add token` row ending the client-token group, whose `↵`
     /// opens the profile picker.
     AddToken,
 }
@@ -10037,9 +10089,11 @@ fn track_delegates_selection(app: &mut App) {
 /// The shunt detail's keymap: ↑↓ walks the actionable lines (landing on each
 /// as it scrolls into view, one line at a time through the read-only text),
 /// `f` walks to the next fix line, `↵` opens the focused fix's confirm, and
-/// `space`/`↵` act on any other focused line (flip the `enabled` toggle, open
-/// the `check output` modal, expand/collapse a config entry, or open/step a
-/// config field editor — `space` cycles a cycle field).
+/// `space`/`↵` act on the card's state controls (flip the `enabled` toggle,
+/// expand/collapse a config entry; `space` steps a cycle field, `↵` opens a
+/// field's editor). The action rows (`check output`, `+ add <kind>`,
+/// `save <kind>`, `remove <kind>`, `+ add token`, a token row) act on `↵`
+/// alone.
 /// Focus is the key handler's own state (a [`ShuntFocusLine`] identity); the
 /// render reads it and follows the held block back into view on a resize or a
 /// card change, re-settling only a vanished stop or a none focus (the descend
@@ -10082,24 +10136,21 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
         },
         KeyCode::Char(' ') => match app.services.focused_shunt_focus() {
             Some(ShuntFocus::Enabled { .. }) => toggle_shunt_enabled(app),
-            Some(ShuntFocus::CheckOutput { .. }) => open_check_output_modal(app),
             Some(ShuntFocus::Entry { key }) => {
                 let key = key.clone();
                 toggle_shunt_entry(app, &key);
             }
-            Some(ShuntFocus::Field { key }) => {
+            Some(ShuntFocus::Field { key }) if is_cycle_field(key) => {
+                // `space` acts only on state controls: a cycle field steps its
+                // pick, while a typed field opens its editor on `↵` alone.
                 let key = key.clone();
-                // `space` on a cycle row moves the pick; on a typed row it
-                // opens the editor, like `↵`.
-                if is_cycle_field(&key) {
-                    step_shunt_pick(app, &key);
-                } else {
-                    open_shunt_field_editor(app, &key);
-                }
+                step_shunt_pick(app, &key);
             }
-            Some(ShuntFocus::Add { kind }) => toggle_shunt_add(app, *kind),
-            Some(ShuntFocus::AddToken) => open_token_picker(app, false),
-            Some(ShuntFocus::SaveAdd { .. })
+            Some(ShuntFocus::CheckOutput { .. })
+            | Some(ShuntFocus::Add { .. })
+            | Some(ShuntFocus::AddToken)
+            | Some(ShuntFocus::Field { .. })
+            | Some(ShuntFocus::SaveAdd { .. })
             | Some(ShuntFocus::Remove { .. })
             | Some(ShuntFocus::Token { .. }) => {}
             Some(ShuntFocus::Fix { .. }) | None => {}
@@ -10500,12 +10551,12 @@ fn rebuild_shunt_config_stops(app: &mut App) {
 
 // ── add and remove rows ─────────────────────────────────────────────────────
 
-/// `↵`/`space` on `+ add <kind>`: open the blank draft in place, or fold it
-/// when it is already open (the Setup `+ new` form's precedent, which `esc` at
-/// rest on a draft row follows too). Focus stays on the `+ add` row.
+/// `↵` on `+ add <kind>`: open the blank draft in place, or fold it when it
+/// is already open (the Setup `+ new` form's precedent, which `esc` at rest on
+/// a draft row follows too). Focus stays on the `+ add` row.
 fn toggle_shunt_add(app: &mut App, kind: ShuntAddKind) {
-    // A locked draft ignores fold (ruling 2): `↵`/`space` on `+ add <kind>` are
-    // inert while its `save <kind>` checks.
+    // A locked draft ignores fold: `↵` on `+ add <kind>` is inert while its
+    // `save <kind>` checks.
     if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
         return;
     }
@@ -10820,11 +10871,10 @@ fn is_rename_field(key: &ShuntFieldKey) -> bool {
 }
 
 /// Open one field's typed editor, seeded from the saved value (`None` = unset).
-/// Both `↵` and `space` open a typed row; a cycle row's `↵` at rest opens the
-/// same custom-value editor. A row whose save is still checking never reopens a
-/// fresh editor over the file's value: `↵`/`space` are inert there, so a
-/// refusal landing later toasts instead of describing text the editor no
-/// longer shows.
+/// `↵` opens a typed row; a cycle row's `↵` at rest opens the same custom-value
+/// editor. A row whose save is still checking never reopens a fresh editor over
+/// the file's value: `↵` is inert there, so a refusal landing later toasts
+/// instead of describing text the editor no longer shows.
 fn open_shunt_field_editor(app: &mut App, key: &ShuntFieldKey) {
     if field_locked(app, key) {
         return;
@@ -13193,7 +13243,7 @@ fn confirm_shunt_remove_token(app: &mut App, profile: &str) {
     }));
 }
 
-/// `↵`/`space` on `+ add token`: open the profile picker — row 0 is
+/// `↵` on `+ add token`: open the profile picker — row 0 is
 /// `+ new profile`, then one row per claude profile in roster order (the
 /// Overview's roster; codex profiles live in their own store, never here).
 /// `require` = the picker serves the `require client tokens` flow, so its
@@ -13984,7 +14034,7 @@ pub(crate) fn shunt_card(
 
     // The failed check's output, after the admin fix lines (an admin edit's
     // sits right under the fix it came from; a config save's follows whatever
-    // fix line the card shows): an actionable line whose ↵/space opens the
+    // fix line the card shows): an actionable line whose ↵ opens the
     // read-only masked-stderr modal.
     if check_output {
         let line = check.detail.len();
@@ -18072,7 +18122,8 @@ pub(crate) fn format_weekly_pct(pct: f64) -> String {
 }
 
 /// Right-pane keymap for a member: ↑↓ walks rows, `+`/`-` steps the threshold,
-/// ⏎/space on remove arms then confirms. Delegates to add picker on `+ add`.
+/// ⏎ on remove arms then confirms; space stays the state-control key.
+/// Delegates to add picker on `+ add`.
 fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
     if selected_chain_member(app).is_none() {
         handle_fallback_add_key(app, key);
@@ -18137,7 +18188,12 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
         // opens the chip picker. Split here so `run_fallback_row` keeps its
         // single meaning for every other row.
         KeyCode::Char(' ') if row == FallbackRow::PreferredDays => step_preferred_days(app),
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        // `remove` is an action row and acts on `↵` alone; every other row's
+        // `space` stays a state control.
+        KeyCode::Char(' ') if row.is_state_control() => {
+            run_fallback_row(app, row);
+        }
+        KeyCode::Enter => {
             run_fallback_row(app, row);
         }
         _ => {}
@@ -18210,7 +18266,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                 app.fallback_detail_total.get(),
             );
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let name = ProfileName::from(candidates[app.fallback_detail_cursor].clone());
             // The sidecar fact from the cache, BEFORE the config guard: the
             // predicate needs it, and reading `session-token.json` here would be
@@ -18368,9 +18424,10 @@ fn reorder_chain_member(app: &mut App, delta: i32) {
     }
 }
 
-/// ⏎/space on a member detail row: a typed row opens its field and `preferred
+/// ⏎ on a member detail row: a typed row opens its field and `preferred
 /// days` its picker; remove arms, then removes on the second press. Each one
-/// pins the member under the cursor.
+/// pins the member under the cursor. Space reaches here for every row but
+/// `remove` and `preferred days` (the key handler splits both out).
 fn run_fallback_row(app: &mut App, row: FallbackRow) {
     match row {
         FallbackRow::Threshold => {
@@ -20437,14 +20494,15 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Char(' ') => {
                     let row = rows[app.config_action_cursor];
-                    // Space cycles the `model` alias, the `+ new` form's `type`,
-                    // and the shunt form's `family` in place; ⏎ opens the model's
-                    // custom field instead. Every other row treats space like ⏎.
-                    match row {
-                        ConfigRow::Model => cycle_model(app),
-                        ConfigRow::Type => cycle_account_type(app),
-                        ConfigRow::Family => cycle_family(app),
-                        _ => run_config_row(app, row),
+                    // `space` drives state controls only; action rows and text
+                    // fields act on `↵` alone.
+                    if row.is_state_control() {
+                        match row {
+                            ConfigRow::Model => cycle_model(app),
+                            ConfigRow::Type => cycle_account_type(app),
+                            ConfigRow::Family => cycle_family(app),
+                            _ => run_config_row(app, row),
+                        }
                     }
                 }
                 _ => {}
@@ -20454,7 +20512,7 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Keys on the Setup codex detail pane: ↑↓ walk its action rows (wrapping),
-/// page keys page them, ⏎/space run the row — `re-login` starts the codex
+/// page keys page them, ⏎ runs the row — `re-login` starts the codex
 /// browser flow, `delete account` arms the inline 2-step then deletes.
 /// Clear the codex detail's armed 2-step (flag + identity together, so neither
 /// can outlive the other and re-arm on a stale name).
@@ -20516,7 +20574,7 @@ fn handle_codex_detail_key(app: &mut App, key: KeyEvent) {
                 app.setup_detail_total.get(),
             );
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let Some(i) = app.setup_codex_index() else {
                 return;
             };
@@ -20556,7 +20614,7 @@ fn pool_provider_name(app: &App, pi: usize) -> Option<String> {
     }
 }
 
-/// Keys on the Setup pool detail pane: ↑↓ walk its action rows, ⏎/space run
+/// Keys on the Setup pool detail pane: ↑↓ walk its action rows, ⏎ runs
 /// them — `refresh` on a worker, `remove` behind the inline 2-step (never the
 /// Overview's confirm modal). The 2-step acts on the selection's own pool pair.
 fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
@@ -20611,7 +20669,7 @@ fn handle_pool_detail_key(app: &mut App, key: KeyEvent) {
                 app.setup_detail_total.get(),
             );
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let Some((pi, ai)) = app.setup_pool_pair() else {
                 return;
             };
@@ -21177,10 +21235,10 @@ fn disarm_armed_action(app: &mut App) {
     }
 }
 
-/// ⏎/space on a detail row: text → capture, toggle → flip, delete → arm/confirm, create → commit.
+/// ⏎ on a detail row: text → capture, toggle → flip, delete → arm/confirm, create → commit.
 fn run_config_row(app: &mut App, row: ConfigRow) {
     // The mint-seeded api key row is a Disabled row: focusable but inert, so
-    // ⏎/space open no editor while the base url still names the gateway.
+    // ⏎ opens no editor while the base url still names the gateway.
     if row == ConfigRow::ApiKey
         && app
             .config_draft
@@ -23030,7 +23088,7 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
                 state.confirm_overwrite = false;
                 state.scroll.set(0);
             }
-            KeyCode::Enter | KeyCode::Char(' ') => {
+            KeyCode::Enter => {
                 if state.confirm_overwrite {
                     let name = ProfileName::from(state.profile.clone());
                     let pending = state.key.clone();
@@ -23070,7 +23128,7 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.pop_modal();
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let choice = EnvCollisionForm::options()[state.cursor.min(last)];
             if choice == EnvCollisionChoice::Overwrite && state.overwrite_needs_review.get() {
                 state.reviewing_overwrite = true;
@@ -24195,7 +24253,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
                 undo_preset_picker_open(app);
             }
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let confirmed = state.choice;
             let action = state.on_confirm.clone();
             let is_preset = matches!(&action, ConfirmAction::ApplyPresetOver(..));
@@ -24211,7 +24269,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
 }
 
 /// The loss warning's grammar over its buttons: `←`/`→` step and stop at the
-/// ends, `tab`/`⇧tab` wrap, `↵`/space choose, `esc`/`q` = `go back`. `discard`
+/// ends, `tab`/`⇧tab` wrap, `↵` chooses, `esc`/`q` = `go back`. `discard`
 /// drops the warned work, `save` validates then commits it, and whichever lands
 /// performs the switch or quit that opened the warning.
 fn handle_loss_warning_key(app: &mut App, key: KeyEvent) {
@@ -24234,7 +24292,7 @@ fn handle_loss_warning_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.pop_modal();
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let focus = state.focus;
             let target = state.target.clone();
             let dirty = state.drop.dirty.clone();
@@ -24799,8 +24857,8 @@ fn focus_shunt_item(app: &mut App, item: Dirty) {
 }
 
 /// Keys on the apply-preset keep / clear confirm: the confirm's grammar over
-/// three buttons. `←`/`→` step and stop at either end, `tab` wraps, `↵`/space
-/// choose, esc/q cancel; `↑`/`↓` and the page keys scroll the body.
+/// three buttons. `←`/`→` step and stop at either end, `tab` wraps, `↵`
+/// chooses, esc/q cancel; `↑`/`↓` and the page keys scroll the body.
 fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
     use PresetApplyButton::{Cancel, Clear, Keep};
     let Some(Modal::PresetApply(form)) = app.modals.last_mut() else {
@@ -24851,7 +24909,7 @@ fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
             app.pop_modal();
             undo_preset_picker_open(app);
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let leftover = match form.focus {
                 Cancel => None,
                 Keep => Some(crate::presets::Leftover::Keep),
@@ -25524,7 +25582,7 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
             // banner keeps carrying the signal until the divergence resolves.
             app.pop_modal();
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let action = actions[state.cursor.min(last)].clone();
             let active = state.active.clone();
             app.pop_modal();
@@ -25711,7 +25769,7 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.pop_modal();
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let cursor = form.cursor;
             let Some(Modal::DivergenceTarget(form)) = app.pop_modal() else {
                 return;
@@ -25749,7 +25807,7 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Keys on the `+ add token` profile picker: Up/Down wrap, PageUp/PageDown
-/// page, `esc`/`q` close, `↵`/`space` pick. Row 0 is `+ new profile` (opens
+/// page, `esc`/`q` close, `↵` picks. Row 0 is `+ new profile` (opens
 /// the new-account form); the profiles sit below it, so the cursor runs
 /// `0..=targets.len()`.
 fn handle_token_picker_key(app: &mut App, key: KeyEvent) {
@@ -25806,7 +25864,7 @@ fn handle_token_picker_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.pop_modal();
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Enter => {
             let cursor = form.cursor;
             let Some(Modal::TokenPicker(form)) = app.pop_modal() else {
                 return;

@@ -1041,23 +1041,60 @@ pub(super) fn label_style(focused: bool) -> Style {
     }
 }
 
-/// Render a typed editor's buffer with uniform `BG_SUNKEN` styling (DANGER fg
+/// Render a typed editor's buffer with no background of its own (DANGER fg
 /// when invalid), the value control-escaped so a control/bidi character the
 /// saved value carried cannot inject into the terminal or reorder the line.
-/// The native terminal cursor — set via `frame.set_cursor_position` — owns the
-/// caret glyph, so no simulated block cursor. A value past the `width` cells
-/// its row gives it scrolls inside them ([`field_window`]). Shared by the
-/// Setup fields, the chain threshold/max-spend editors, the Config-tab
-/// refresh/weekly editors, the Plugin-tab herdr tag-refresh editor, and the
-/// shunt card's field editor.
+/// The ROW carries the selection tint (`BG_HOVER`), so a narrower buffer never
+/// leaves an untinted gap. The native terminal cursor — set via
+/// `frame.set_cursor_position` — owns the caret glyph, so no simulated block
+/// cursor. A value past the `width` cells its row gives it scrolls inside them
+/// ([`field_window`]). Shared by the Setup fields, the chain threshold/
+/// max-spend editors, the Config-tab refresh/weekly editors, the Plugin-tab
+/// herdr tag-refresh editor, and the shunt card's field editor.
 pub(super) fn value_caret(input: &InputState, invalid: bool, width: usize) -> Vec<Span<'static>> {
     let body = if invalid {
         theme::danger()
     } else {
         theme::body()
-    }
-    .bg(theme::bg_sunken());
+    };
     vec![Span::styled(field_window(input, width, 0), body)]
+}
+
+/// A toggle row's value: the tier's glyph from [`theme::toggle_on`] /
+/// [`theme::toggle_off`], painted per the contract — `full` `─●` (track
+/// `LINE`, knob `ACCENT`) / `○─` (knob `TEXT_DIM`, track `LINE`); `compatible`
+/// `[on]`/`[off]` (brackets `TEXT_DIM`, `on` `ACCENT`, `off` `TEXT_DIM`). An
+/// inert row paints the whole glyph faint whatever its state. One helper
+/// feeds the shunt `enabled` row, the herdr toggles, the Config-tab toggles,
+/// the Setup `auto-start` row and the Fallback member-card toggles, so every
+/// on/off toggle changes together.
+pub(super) fn toggle_value(on: bool, inert: bool) -> Vec<Span<'static>> {
+    let glyph = if on {
+        theme::toggle_on()
+    } else {
+        theme::toggle_off()
+    };
+    if inert {
+        return vec![Span::styled(glyph, theme::faint())];
+    }
+    let state = if on { theme::accent() } else { theme::dim() };
+    match theme::tier() {
+        theme::Tier::Full => glyph
+            .char_indices()
+            .map(|(at, c)| {
+                let part = &glyph[at..at + c.len_utf8()];
+                Span::styled(part, if c == '─' { theme::line() } else { state })
+            })
+            .collect(),
+        theme::Tier::Compatible => {
+            let word = glyph.trim_start_matches('[').trim_end_matches(']');
+            vec![
+                Span::styled("[", theme::dim()),
+                Span::styled(word, state),
+                Span::styled("]", theme::dim()),
+            ]
+        }
+    }
 }
 
 /// Rounded box with contract-compliant chrome.

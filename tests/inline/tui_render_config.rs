@@ -2300,3 +2300,43 @@ fn a_toast_over_a_setup_field_caret_hides_the_native_cursor() {
         "the setup caret hides under an open modal"
     );
 }
+
+#[test]
+fn the_auto_start_toggle_paints_its_parts_in_split_colours() {
+    for tier in [
+        crate::tui::theme::Tier::Full,
+        crate::tui::theme::Tier::Compatible,
+    ] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let mut snap = Snap::blank("a");
+        for on in [true, false] {
+            snap.auto_start = on;
+            let line = one_row(
+                ConfigRow::AutoStart,
+                false,
+                false,
+                None,
+                &snap,
+                &InputState::new(""),
+            );
+            crate::testutil::assert_split_toggle(&line, on);
+        }
+    }
+}
+
+/// An editing field sits on its row's selection tint: no sunken buffer fill.
+#[test]
+fn an_editing_setup_field_paints_no_sunken_fill() {
+    let snap = Snap::blank("a");
+    let input = InputState::new("alpha");
+    let line = one_row(ConfigRow::Name, true, true, None, &snap, &input);
+    let text = line_text(&line);
+    assert!(text.contains("alpha"), "the edit buffer renders: {text}");
+    assert!(
+        line.spans
+            .iter()
+            .all(|s| s.style.bg != Some(crate::tui::theme::bg_sunken())),
+        "no span of an editing row paints BG_SUNKEN: {:?}",
+        line.spans
+    );
+}

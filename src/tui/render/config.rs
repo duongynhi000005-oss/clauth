@@ -22,7 +22,7 @@ use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, ListView, MIN_VALUE_W, bold_when,
     cycle_row_lines, draw_following_list, draw_scrolled_lines, head_cols, help_tooltip_lines,
     highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color,
-    picker_row, pill, place_caret, section_box, section_box_verbatim, value_caret,
+    picker_row, pill, place_caret, section_box, section_box_verbatim, toggle_value, value_caret,
 };
 use super::prose::{cmd, cmd_lit, key_lit, spans as prose_spans};
 
@@ -1379,13 +1379,7 @@ fn detail_row(
         }
         // The `+ new` form's account-type cycle, first row of the form.
         ConfigRow::Type => {
-            let lead = vec![
-                arrow,
-                Span::styled(
-                    key_cell("type", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
-                    label_style(selected),
-                ),
-            ];
+            let lead = kv_lead(arrow, "type", selected);
             let options: Vec<(&str, bool)> = [
                 crate::tui::app::NewAccountType::Claude,
                 crate::tui::app::NewAccountType::Codex,
@@ -1398,13 +1392,7 @@ fn detail_row(
         }
         // The shunt form's family cycle.
         ConfigRow::Family => {
-            let lead = vec![
-                arrow,
-                Span::styled(
-                    key_cell("family", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
-                    label_style(selected),
-                ),
-            ];
+            let lead = kv_lead(arrow, "family", selected);
             let options: Vec<(&str, bool)> = [
                 crate::gateway_admin::PoolFamily::Claude,
                 crate::gateway_admin::PoolFamily::Codex,
@@ -1561,12 +1549,9 @@ fn detail_row(
             kv_static(arrow, "alert at", value, style, selected)
         }
         ConfigRow::AutoStart => {
-            let (value, style) = if snap.auto_start {
-                (theme::toggle_on().to_string(), theme::accent())
-            } else {
-                (theme::toggle_off().to_string(), theme::faint())
-            };
-            kv_static(arrow, "auto-start", value, style, selected)
+            let mut spans = kv_lead(arrow, "auto-start", selected);
+            spans.extend(toggle_value(snap.auto_start, false));
+            Line::from(spans)
         }
         ConfigRow::Delete => {
             let label = if armed_action == Some(ConfigRow::Delete) {
@@ -1727,6 +1712,19 @@ fn kv_field(
     ]
 }
 
+/// The shared lead of a Setup key/value row: the gutter glyph and the key
+/// cell, styled by the row's focus. `kv_static`, the `auto-start` toggle and
+/// the `type` / `family` / `model` cycles all build their lead on it.
+fn kv_lead(arrow: Span<'static>, key: &str, focused: bool) -> Vec<Span<'static>> {
+    vec![
+        arrow,
+        Span::styled(
+            key_cell(key, DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+            label_style(focused),
+        ),
+    ]
+}
+
 fn kv_static(
     arrow: Span<'static>,
     key: &str,
@@ -1734,14 +1732,9 @@ fn kv_static(
     value_style: Style,
     focused: bool,
 ) -> Line<'static> {
-    Line::from(vec![
-        arrow,
-        Span::styled(
-            key_cell(key, DETAIL_KEY_W, DETAIL_KEY_GUTTER),
-            label_style(focused),
-        ),
-        Span::styled(value, value_style),
-    ])
+    let mut spans = kv_lead(arrow, key, focused);
+    spans.push(Span::styled(value, value_style));
+    Line::from(spans)
 }
 
 /// Mask a custom env value when its key names a credential (mirrors the api-key row).
@@ -1782,13 +1775,7 @@ fn model_cycle_lines(
     selected: bool,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let lead = vec![
-        arrow,
-        Span::styled(
-            key_cell("model", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
-            label_style(selected),
-        ),
-    ];
+    let lead = kv_lead(arrow, "model", selected);
     let mut options: Vec<(&str, bool)> = vec![("default", current.is_empty())];
     options.extend(MODEL_PRESETS.iter().map(|p| (*p, *p == current)));
     let custom =

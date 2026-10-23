@@ -33,8 +33,8 @@ use super::panes::{
     DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when, cycle_row_lines,
     draw_scrolled_lines_with_footnote, draw_selector_list, head_cols, help_tooltip_lines,
     highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill,
-    place_caret, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
-    wrap_words,
+    place_caret, rail_hint_lines, section_box, section_box_verbatim, select_line, toggle_value,
+    value_caret, wrap_words,
 };
 use super::prose::{cmd, key, mark_commands};
 use crate::fallback::{
@@ -1614,19 +1614,15 @@ fn detail_row(
                 FallbackRow::Preferred => ("preferred", preferred),
                 _ => ("last resort", last_resort),
             };
-            let (value, style) = if on {
-                (theme::toggle_on().to_string(), theme::accent())
-            } else {
-                (theme::toggle_off().to_string(), theme::faint())
-            };
-            Line::from(vec![
+            let mut spans = vec![
                 arrow,
                 Span::styled(
                     key_cell(key, DETAIL_KEY_W, DETAIL_KEY_GUTTER),
                     label_style(selected),
                 ),
-                Span::styled(value, style),
-            ])
+            ];
+            spans.extend(toggle_value(on, false));
+            Line::from(spans)
         }
         FallbackRow::PreferredDays => {
             return match day_picker {

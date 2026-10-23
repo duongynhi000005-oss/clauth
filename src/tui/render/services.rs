@@ -45,7 +45,7 @@ use super::panes::{
     draw_scrolled_lines, draw_scrolled_lines_with_footnote, empty_state, empty_state_lines,
     follow_scroll_offset, footnote_lines, footnote_split, head_cols, help_tooltip_lines,
     help_tooltip_lines_at, highlight_row, invalid_tooltip_lines, key_cell, label_style,
-    master_detail, place_caret, section_box, select_line, value_caret, wrap_words,
+    master_detail, place_caret, section_box, select_line, toggle_value, value_caret, wrap_words,
 };
 use super::prose;
 use crate::gateway_edit::{
@@ -2166,15 +2166,21 @@ fn draw_herdr_detail(
         );
         match row_editing {
             Some(input) => {
-                // The edit row renders plain (no highlight) with the edit
-                // gutter; the native terminal cursor owns the caret, at the
-                // value column plus the caret's cell in the value window.
+                // The edit row keeps the selected row's tint; the native
+                // terminal cursor owns the caret, at the value column plus
+                // the caret's cell in the value window.
                 let cx = inner.x.saturating_add(
                     (option_value_col(*row, inner.width as usize, option_unit(*row))
                         + head_cols(input)) as u16,
                 );
                 caret = Some((cx, lines.len()));
-                lines.extend(row_lines);
+                for line in row_lines {
+                    lines.push(if selected {
+                        highlight_row(line, inner.width as usize)
+                    } else {
+                        line
+                    });
+                }
                 lines.extend(tag_refresh_range_tooltip(input, inner.width as usize));
             }
             None => {
@@ -2306,42 +2312,6 @@ fn option_row(
         }
     }
     vec![Line::from(spans)]
-}
-
-/// A toggle row's value: the tier's glyph from [`theme::toggle_on`] /
-/// [`theme::toggle_off`], painted per the contract — `full` `─●` (track
-/// `LINE`, knob `ACCENT`) / `○─` (knob `TEXT_DIM`, track `LINE`); `compatible`
-/// `[on]`/`[off]` (brackets `TEXT_DIM`, `on` `ACCENT`, `off` `TEXT_DIM`). An
-/// inert row paints the whole glyph faint whatever its state. One helper
-/// feeds the shunt `enabled` row and the herdr toggles, so both change
-/// together.
-fn toggle_value(on: bool, inert: bool) -> Vec<Span<'static>> {
-    let glyph = if on {
-        theme::toggle_on()
-    } else {
-        theme::toggle_off()
-    };
-    if inert {
-        return vec![Span::styled(glyph, theme::faint())];
-    }
-    let state = if on { theme::accent() } else { theme::dim() };
-    match theme::tier() {
-        theme::Tier::Full => glyph
-            .char_indices()
-            .map(|(at, c)| {
-                let part = &glyph[at..at + c.len_utf8()];
-                Span::styled(part, if c == '─' { theme::line() } else { state })
-            })
-            .collect(),
-        theme::Tier::Compatible => {
-            let word = glyph.trim_start_matches('[').trim_end_matches(']');
-            vec![
-                Span::styled("[", theme::dim()),
-                Span::styled(word, state),
-                Span::styled("]", theme::dim()),
-            ]
-        }
-    }
 }
 
 /// Sub-line under the tag-refresh field while typing: the floor, DANGER when

@@ -8179,3 +8179,58 @@ fn the_footer_nav_hint_tracks_the_pane_state() {
         "the descended read-only pane shows the ascend hint"
     );
 }
+
+/// The Config tab's typed editor keeps the selected row's `BG_HOVER` tint over
+/// the same cells the row tints at rest, and paints no `BG_SUNKEN` buffer.
+#[test]
+fn an_editing_config_row_keeps_the_selection_tint() {
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, SeededInput, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    for tier in [
+        crate::tui::theme::Tier::Full,
+        crate::tui::theme::Tier::Compatible,
+    ] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        app.tab = Tab::Config;
+        app.global_config_cursor = GLOBAL_CONFIG_ROWS
+            .iter()
+            .position(|r| *r == GlobalConfigRow::RefreshInterval)
+            .unwrap();
+        let tinted = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+            term.draw(|f| super::draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let rows = crate::testutil::buffer_rows(&buf);
+            let y = rows
+                .iter()
+                .position(|r| r.contains("refresh") && !r.contains("refresh spent"))
+                .unwrap_or_else(|| panic!("no refresh row:\n{}", rows.join("\n")));
+            let hover: Vec<u16> = (0..100u16)
+                .filter(|x| buf[(*x, y as u16)].bg == crate::tui::theme::bg_hover())
+                .collect();
+            let sunken: Vec<u16> = (0..100u16)
+                .filter(|x| buf[(*x, y as u16)].bg == crate::tui::theme::bg_sunken())
+                .collect();
+            (hover, sunken)
+        };
+        let (rest_hover, _) = tinted(&app);
+        assert!(
+            !rest_hover.is_empty(),
+            "the selected row is tinted at rest ({tier:?})"
+        );
+        app.refresh_interval_draft = Some(SeededInput::new("90"));
+        let (edit_hover, edit_sunken) = tinted(&app);
+        assert!(
+            edit_sunken.is_empty(),
+            "the editor paints no BG_SUNKEN cell ({tier:?})"
+        );
+        assert_eq!(
+            edit_hover, rest_hover,
+            "the editing row keeps the selection tint over the same cells ({tier:?})"
+        );
+    }
+}

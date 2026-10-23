@@ -75,11 +75,11 @@ const CHECK_OUTPUT_KEYS: &[(&str, &str)] = &[("↑↓", "scroll"), ("q", "back")
 const Q_BACK: &[(&str, &str)] = &[("q", "back")];
 
 /// A two-button confirm: ←→ (or tab) moves the highlight between the buttons,
-/// ↵ / space commit the highlighted one, `q` backs out.
+/// ↵ commits the highlighted one, `q` backs out.
 const BUTTON_KEYS: &[(&str, &str)] = &[("←→", "pick"), ("↵", "choose"), ("q", "back")];
 
-/// The loss warning's three buttons: ←→ steps and tab wraps between them, ↵ /
-/// space choose the highlighted one, `esc` and `q` both `go back`.
+/// The loss warning's three buttons: ←→ steps and tab wraps between them, ↵
+/// chooses the highlighted one, `esc` and `q` both `go back`.
 const LOSS_WARNING_KEYS: &[(&str, &str)] =
     &[("←→", "pick"), ("↵", "choose"), ("esc · q", "go back")];
 
@@ -883,10 +883,11 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     // The shunt detail walks its actionable lines one at a time: `↑↓ row`
     // while a press would move focus (there are ≥2 stops), `↑↓ scroll` while
     // a press would only scroll the read-only text, and no `↑↓` at all when
-    // neither applies (a fitting one-stop card). `space/↵` act only
-    // on the focused line, and drop while an action runs or nothing holds
-    // focus; `f next fix` stays while the walk can move — derived from the
-    // same gates the handlers read, never copied per branch.
+    // neither applies (a fitting one-stop card). `space` acts only on the
+    // focused state controls (the `enabled` toggle, an entry, a cycle field);
+    // every other focused line acts on `↵`, and both drop while an action runs
+    // or nothing holds focus; `f next fix` stays while the walk can move —
+    // derived from the same gates the handlers read, never copied per branch.
     if label == Some("shunt") {
         let focus = app.services.focused_shunt_focus();
         let stops = app
@@ -918,7 +919,7 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             Some(ShuntFocus::Enabled { .. }) if !app.services.shunt_action.running => {
                 hints.push(("space/↵", "toggle"));
             }
-            Some(ShuntFocus::CheckOutput { .. }) => hints.push(("space/↵", "open")),
+            Some(ShuntFocus::CheckOutput { .. }) => hints.push(("↵", "open")),
             Some(ShuntFocus::Entry { key })
                 if !app.services.saving(&ShuntSaveKey::Remove(key.clone())) =>
             {
@@ -943,7 +944,7 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 if !app.services.saving(&ShuntSaveKey::SaveAdd(*kind)) =>
             {
                 hints.push((
-                    "space/↵",
+                    "↵",
                     if app.services.shunt_drafts.is_open(*kind) {
                         "collapse"
                     } else {

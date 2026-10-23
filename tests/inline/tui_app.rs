@@ -30992,9 +30992,9 @@ fn a_saving_row_sheds_its_edit_hints_in_the_footer() {
 }
 
 /// Returning to a row whose save is still checking never opens a fresh editor
-/// over the file's value: `↵` and `space` are inert there. A refusal landing
-/// with no editor open for its row toasts (round 3's rule), never a `└` line
-/// under a value the editor no longer shows.
+/// over the file's value: `↵` is inert there. A refusal landing with no editor
+/// open for its row toasts, never a `└` line under a value the editor no longer
+/// shows.
 #[cfg(unix)]
 #[test]
 fn entering_a_row_whose_save_still_checks_opens_no_fresh_editor() {
@@ -31051,16 +31051,11 @@ fn entering_a_row_whose_save_still_checks_opens_no_fresh_editor() {
         "up returns to the saving row"
     );
 
-    // `↵` and `space` open nothing on a row whose save is in flight.
+    // `↵` opens nothing on a row whose save is in flight.
     super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
     assert!(
         rig.app.services.shunt_field_edit.is_none(),
         "↵ on a saving row opens no fresh editor"
-    );
-    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
-    assert!(
-        rig.app.services.shunt_field_edit.is_none(),
-        "space on a saving row opens no fresh editor"
     );
 
     // A refusal landing with no editor open toasts, never a `└` under the
@@ -49681,4 +49676,541 @@ fn a_mixed_save_beside_a_clean_herdr_tag_editor_hands_enter_to_the_first_add() {
         "the next enter did not start save upstream: owner={owner:?}"
     );
     rig.drain();
+}
+
+// ── `space` drives state controls only ───────────────────────────────────────
+//
+// An action row (delete, disable, remove) acts on `↵` alone; `space` stays the
+// state controls' key (cycles, toggles, steppers).
+
+#[test]
+fn space_never_arms_a_claude_accounts_delete_or_disable() {
+    let home = crate::testutil::HomeSandbox::new();
+    for (row, armed) in [
+        (&["delete", "account"][..], "press again to delete"),
+        (&["disable", "account"][..], "press again to disable"),
+    ] {
+        let mut app = b3_setup_app(&home, b3_claude_pool());
+        b3_press(&mut app, KeyCode::Enter, 1);
+        // A claude card runs longer than `b3_focus_detail_row`'s walk.
+        let mut seq = vec!["❯"];
+        seq.extend_from_slice(row);
+        let mut steps = 0;
+        while !b3_row_holds(&render_rows(&app), &seq) {
+            assert!(steps < 30, "no detail row reads {row:?} under the caret");
+            b3_press(&mut app, KeyCode::Down, 1);
+            steps += 1;
+        }
+        b3_press(&mut app, KeyCode::Char(' '), 1);
+        assert!(!renders(&app, armed), "`space` on {row:?} must not arm it");
+        b3_press(&mut app, KeyCode::Enter, 1);
+        assert!(renders(&app, armed), "`↵` on {row:?} still arms it");
+    }
+}
+
+#[test]
+fn space_never_arms_a_codex_accounts_delete() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 2);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["delete", "account"]);
+    b3_press(&mut app, KeyCode::Char(' '), 2);
+    assert!(
+        !renders(&app, "press again to delete"),
+        "`space` must not arm the codex delete"
+    );
+    assert!(
+        crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .holds("cdx-one"),
+        "two `space` presses delete nothing"
+    );
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        renders(&app, "press again to delete"),
+        "`↵` still arms the codex delete"
+    );
+}
+
+#[test]
+fn space_never_arms_a_pool_accounts_remove() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Down, 3);
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["remove"]);
+    b3_press(&mut app, KeyCode::Char(' '), 2);
+    assert!(
+        !renders(&app, "press again to remove"),
+        "`space` must not arm the pool remove"
+    );
+    assert_eq!(
+        app.pool_mutation_row, None,
+        "two `space` presses send nothing"
+    );
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert!(
+        renders(&app, "press again to remove"),
+        "`↵` still arms the pool remove"
+    );
+}
+
+#[test]
+fn space_never_arms_a_chain_members_remove() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_member_app();
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == super::FallbackRow::Remove)
+        .expect("the row exists");
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("load the state")
+            .fallback_chain
+            .len(),
+        2,
+        "two `space` presses remove no member"
+    );
+    assert!(
+        !renders(&app, "press again to remove"),
+        "`space` must not arm the remove"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        renders(&app, "press again to remove"),
+        "`↵` still arms the remove"
+    );
+}
+
+/// `space` on a Setup text field opens nothing (edit is `↵`-only there), while
+/// `↵` still opens its editor.
+#[test]
+fn space_on_a_setup_text_field_opens_nothing_while_enter_opens_its_editor() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["name"]);
+    b3_press(&mut app, KeyCode::Char(' '), 1);
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        None,
+        "`space` on a text field opens no editor"
+    );
+    b3_press(&mut app, KeyCode::Enter, 1);
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        Some(super::ConfigRow::Name),
+        "`↵` still opens the text field's editor"
+    );
+}
+
+/// `space` flips the Setup `auto-start` toggle.
+#[test]
+fn space_still_flips_the_setup_auto_start_toggle() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["auto-start"]);
+    let on = |app: &App| {
+        app.config()
+            .find(&crate::profile::ProfileName::from("acct-one"))
+            .is_some_and(|p| p.auto_start)
+    };
+    assert!(!on(&app), "precondition: auto-start starts off");
+    b3_press(&mut app, KeyCode::Char(' '), 1);
+    assert!(on(&app), "`space` still flips the auto-start toggle");
+}
+
+/// `space` on the `alert at` stepper opens its typed editor.
+#[test]
+fn space_on_alert_at_opens_its_editor() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_press(&mut app, KeyCode::Enter, 1);
+    b3_focus_detail_row(&mut app, &["alert", "at"]);
+    b3_press(&mut app, KeyCode::Char(' '), 1);
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        Some(super::ConfigRow::BellThreshold),
+        "`space` on alert at opens its editor"
+    );
+}
+
+/// `space` on the shunt `+ new` form's `family` cycle advances it.
+#[test]
+fn space_on_the_shunt_new_forms_family_row_advances_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = b3_setup_app(&home, b3_claude_pool());
+    b3_new_from_overview(&mut app, 3);
+    b3_focus_detail_row(&mut app, &["family"]);
+    let family = |app: &App| app.config_draft.as_ref().map(|d| d.family);
+    assert_eq!(
+        family(&app),
+        Some(crate::gateway_admin::PoolFamily::Claude),
+        "the shunt form opens on claude"
+    );
+    b3_press(&mut app, KeyCode::Char(' '), 1);
+    assert_eq!(
+        family(&app),
+        Some(crate::gateway_admin::PoolFamily::Codex),
+        "`space` advances the family cycle"
+    );
+}
+
+/// `space` on the shunt card's `+ add token` action row opens nothing, while
+/// `↵` still opens the profile picker.
+#[test]
+fn space_on_add_token_opens_no_picker_while_enter_opens_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(Vec::new());
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::TokenPicker(_))),
+        "`space` on `+ add token` opens no picker"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::TokenPicker(_))),
+        "`↵` still opens the picker"
+    );
+}
+
+/// `space` on a shunt config entry's disclosure row still expands it.
+#[test]
+fn space_still_expands_a_shunt_entry_disclosure_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"anthropic\"\nauth = \"claude_oauth\"\n",
+    )
+    .unwrap();
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(crate::gateway::GatewayRecord::new(config).unwrap());
+        Ok(())
+    })
+    .unwrap();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    app.services.focus = super::ServicesFocus::Detail;
+    let key = super::ShuntEntryKey::Upstream {
+        name: "anthropic".into(),
+        occurrence: 0,
+    };
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Entry(key.clone())));
+    assert!(
+        !app.services.shunt_expanded.contains(&key),
+        "precondition: the entry is collapsed"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        app.services.shunt_expanded.contains(&key),
+        "`space` still expands the entry disclosure"
+    );
+}
+
+/// `space` on a Confirm modal's focused destructive button does nothing, while
+/// `↵` fires it.
+#[test]
+fn space_on_a_confirms_destructive_button_does_nothing_while_enter_fires_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile(
+        "acct-one",
+        "access-acct-one",
+        None,
+        None,
+    )]);
+    app.open_modal(super::Modal::Confirm(super::ConfirmState {
+        message: "delete acct-one?".into(),
+        detail: None,
+        choice: true,
+        scroll: super::ConfirmScroll::default(),
+        on_confirm: super::ConfirmAction::BlankCredentials("acct-one".into()),
+    }));
+    super::handle_confirm_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::Confirm(_))),
+        "`space` on the destructive button does nothing"
+    );
+    assert!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("acct-one"))
+            .is_some_and(|p| p.holds_login()),
+        "`space` leaves the stored login in place"
+    );
+    super::handle_confirm_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty(), "`↵` closes the confirm modal");
+    let stored_login_gone = app
+        .config()
+        .find(&crate::profile::ProfileName::from("acct-one"))
+        .map(|p| !p.holds_login())
+        .unwrap_or(false);
+    assert!(
+        stored_login_gone,
+        "`↵` fires the destructive button: the stored login is gone"
+    );
+}
+
+/// `space` on a pick-one list does not pick; `↵` does.
+#[test]
+fn space_on_a_pick_one_list_does_not_pick() {
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![
+        Profile::new("alice".into(), None, None),
+        Profile::new("bob".into(), None, None),
+    ]);
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let cursor = match app.modals.last() {
+        Some(super::Modal::TokenPicker(form)) => form.cursor,
+        other => panic!("the picker opened, got {other:?}"),
+    };
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    match app.modals.last() {
+        Some(super::Modal::TokenPicker(form)) => {
+            assert_eq!(form.cursor, cursor, "`space` leaves the cursor put");
+        }
+        other => panic!("`space` must not pick, got {other:?}"),
+    }
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, super::Modal::TokenPicker(_))),
+        "`↵` picks and closes the picker"
+    );
+}
+
+/// `space` on a modal checkbox row still toggles it — the re-bind confirm's
+/// account rows keep `space` while its buttons act on `↵` alone.
+#[test]
+fn space_still_toggles_a_modal_checkbox_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    match app.modals.last() {
+        Some(super::Modal::Rebind(form)) => {
+            assert!(!form.checked[0][0], "`space` toggles the checkbox off");
+        }
+        other => panic!("expected the re-bind modal, got {other:?}"),
+    }
+}
+
+/// `space` on a shunt card typed text field (`bind`) opens no editor, while
+/// `↵` opens it: a text field is not a state control.
+#[test]
+fn space_on_a_shunt_typed_field_opens_nothing_while_enter_opens_its_editor() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"anthropic\"\nauth = \"claude_oauth\"\n",
+    )
+    .unwrap();
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(crate::gateway::GatewayRecord::new(config).unwrap());
+        Ok(())
+    })
+    .unwrap();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Field(
+            super::ShuntFieldKey::Bind,
+        )));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(super::ShuntFocus::Field {
+                key: super::ShuntFieldKey::Bind
+            })
+        ),
+        "precondition: focus on `bind`, got {:?}",
+        app.services.focused_shunt_focus()
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        app.services.shunt_field_edit.is_none(),
+        "`space` on `bind` opens no editor"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let opened = app.services.shunt_field_edit.as_ref().map(|s| {
+        (
+            s.key.clone(),
+            matches!(s.edit, super::ShuntFieldEdit::Typed { .. }),
+        )
+    });
+    assert_eq!(
+        opened,
+        Some((super::ShuntFieldKey::Bind, true)),
+        "`↵` opens the typed editor on `bind`"
+    );
+}
+
+/// `space` opens no editor on any typed shunt field kind (a server field, an
+/// entry's text fields, a `+ add` draft field), while `↵` opens each.
+#[cfg(unix)]
+#[test]
+fn space_opens_no_editor_on_any_typed_shunt_field_kind() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFieldEdit, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    let typed = [
+        ShuntFieldKey::DefaultProvider,
+        ShuntFieldKey::Upstream {
+            name: "a".into(),
+            occurrence: 0,
+            field: UpstreamFieldKind::Name,
+        },
+        ShuntFieldKey::Upstream {
+            name: "a".into(),
+            occurrence: 0,
+            field: UpstreamFieldKind::BaseUrl,
+        },
+    ];
+    for key in typed {
+        rig.app.services.shunt_field_edit = None;
+        rig.focus_field(key.clone());
+        assert_eq!(
+            rig.app.services.focused_shunt_focus(),
+            Some(&super::ShuntFocus::Field { key: key.clone() }),
+            "precondition: focus on {key:?}"
+        );
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+        assert!(
+            rig.app.services.shunt_field_edit.is_none(),
+            "`space` opens no editor on {key:?}"
+        );
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+        let got = rig.app.services.shunt_field_edit.as_ref().map(|s| {
+            (
+                s.key.clone(),
+                matches!(s.edit, ShuntFieldEdit::Typed { .. }),
+            )
+        });
+        assert_eq!(
+            got,
+            Some((key.clone(), true)),
+            "`↵` opens the editor on {key:?}"
+        );
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+    }
+    rig.app.services.shunt_field_edit = None;
+    rig.open_add(ShuntAddKind::Upstream);
+    let draft = ShuntFieldKey::Draft {
+        kind: ShuntAddKind::Upstream,
+        field: ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    };
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    assert_eq!(
+        rig.app.services.focused_shunt_focus(),
+        Some(&super::ShuntFocus::Field { key: draft.clone() }),
+        "precondition: focus on the draft's `name`"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        rig.app.services.shunt_field_edit.is_none(),
+        "`space` opens no editor on the draft's `name`"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    let got = rig.app.services.shunt_field_edit.as_ref().map(|s| {
+        (
+            s.key.clone(),
+            matches!(s.edit, ShuntFieldEdit::Typed { .. }),
+        )
+    });
+    assert_eq!(
+        got,
+        Some((draft, true)),
+        "`↵` opens the editor on the draft's `name`"
+    );
+}
+
+/// `space` steps the pick on every cycle shunt field kind, an entry's and a
+/// `+ add` draft's alike.
+#[cfg(unix)]
+#[test]
+fn space_steps_the_pick_on_every_cycle_shunt_field_kind() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFieldEdit, ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    for field in [
+        UpstreamFieldKind::Kind,
+        UpstreamFieldKind::AuthMode,
+        UpstreamFieldKind::Provider,
+    ] {
+        let key = ShuntFieldKey::Upstream {
+            name: "a".into(),
+            occurrence: 0,
+            field,
+        };
+        rig.app.services.shunt_field_edit = None;
+        rig.focus_field(key.clone());
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+        let got = rig
+            .app
+            .services
+            .shunt_field_edit
+            .as_ref()
+            .map(|s| (s.key.clone(), matches!(s.edit, ShuntFieldEdit::Pick { .. })));
+        assert_eq!(
+            got,
+            Some((key.clone(), true)),
+            "`space` steps the pick on {key:?}"
+        );
+    }
+    rig.app.services.shunt_field_edit = None;
+    rig.open_add(ShuntAddKind::Upstream);
+    let draft = ShuntFieldKey::Draft {
+        kind: ShuntAddKind::Upstream,
+        field: ShuntDraftField::Upstream(UpstreamFieldKind::AuthMode),
+    };
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::AuthMode),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+    let got = rig
+        .app
+        .services
+        .shunt_field_edit
+        .as_ref()
+        .map(|s| (s.key.clone(), matches!(s.edit, ShuntFieldEdit::Pick { .. })));
+    assert_eq!(
+        got,
+        Some((draft, true)),
+        "`space` steps the pick on the draft's `auth mode`"
+    );
 }
