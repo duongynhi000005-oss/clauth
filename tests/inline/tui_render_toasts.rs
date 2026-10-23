@@ -96,3 +96,29 @@ fn toast_rows_set_no_background_of_their_own() {
         }
     }
 }
+
+/// A toast built from CLI copy names its command in backticks; the command
+/// stays on one row at a budget that used to split it.
+#[test]
+fn a_backticked_command_in_a_toast_stays_on_one_row() {
+    use crate::tui::app::{Toast, ToastKind};
+    let toast = Toast {
+        kind: ToastKind::Info,
+        body: super::super::prose::mark_commands(
+            "update available\nreinstall with `cargo install clauth`",
+        ),
+        born: Instant::now(),
+    };
+    let rows: Vec<String> = super::toast_rows(&toast, 20)
+        .iter()
+        .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            "update available".to_string(),
+            "reinstall with".to_string(),
+            "cargo install clauth".to_string(),
+        ]
+    );
+}

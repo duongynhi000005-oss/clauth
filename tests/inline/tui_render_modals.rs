@@ -1412,30 +1412,28 @@ fn add_chain_candidate_modal_wraps_the_detail_without_indenting_the_rest() {
         .iter()
         .position(|r| r.contains("log in the same account"))
         .unwrap_or_else(|| panic!("the fix line is on no row:\n{}", rows.join("\n")));
-    // The continuation is the row right after it: at 80 columns the modal is 48
-    // cells wide and the fix sentence cannot fit one row.
-    let rest = first + 1;
-    assert!(
-        rows[rest].contains("so clauth can read its usage."),
-        "the fix line does not wrap onto the next row at 80 columns:\n{}",
-        rows.join("\n")
-    );
-    // The indent INSIDE the modal. The border and the centring padding are
-    // identical on every row, so measuring the raw row would pass whatever the
-    // wrap did; and the needle's own offset is not the column, which is what
-    // made this read green while `usage.` sat alone on a row of its own.
-    let indent = |row: &str| {
-        let inner = row
-            .trim_matches(' ')
+    // At 80 columns the modal is 48 cells wide (42 inside its padding), so the
+    // fix sentence cannot fit one row; the marked command cannot finish the
+    // first row and opens the next one whole.
+    let inner = |row: &str| {
+        row.trim_matches(' ')
             .trim_start_matches('\u{2502}')
-            .trim_end_matches('\u{2502}');
-        inner.len() - inner.trim_start().len()
+            .trim_end_matches('\u{2502}')
+            .to_string()
     };
+    let block: Vec<String> = rows[first..first + 3].iter().map(|r| inner(r)).collect();
+    // The indent INSIDE the modal is pinned by the whole inner rows: the border
+    // and the centring padding are identical on every row, so a raw-row
+    // measure would pass whatever the wrap did.
     assert_eq!(
-        indent(&rows[rest]),
-        indent(&rows[first]),
-        "the continuation starts in the same column as its first row:\n{}",
-        rows[first..=rest].join("\n")
+        block,
+        vec![
+            "  log in the same account with                ".to_string(),
+            "  clauth login blind so clauth can read its   ".to_string(),
+            "  usage.                                      ".to_string(),
+        ],
+        "every continuation starts in the first row's column:\n{}",
+        rows.join("\n")
     );
 }
 
@@ -1985,8 +1983,8 @@ fn the_daemon_start_confirm_renders_its_rows_and_spans() {
             "╭─ CONFIRM ────────────────────────────────────╮".to_string(),
             "│                                              │".to_string(),
             "│  start daemon?                               │".to_string(),
-            "│  spawns the clauth daemon detached: clauth   │".to_string(),
-            "│  daemon                                      │".to_string(),
+            "│  spawns the clauth daemon detached:          │".to_string(),
+            "│  clauth daemon                               │".to_string(),
             "│  logfile at ~/.clauth/daemon.log.            │".to_string(),
             "│                                              │".to_string(),
             "│                             cancel   start   │".to_string(),
@@ -1997,31 +1995,24 @@ fn the_daemon_start_confirm_renders_its_rows_and_spans() {
     let fg = |x: usize, y: usize| modal_cell(&buf, origin, x, y).fg;
     // Content starts at column 3: the border plus two cells of padding.
     assert_eq!(fg(3, 2), theme::text_color(), "the message is TEXT");
-    // The detail wraps between words at 42 cells: the dim prefix, then the
-    // ACCENT command split across the wrap.
-    for x in 3..38 {
+    // The detail wraps between words at 42 cells, and the command that cannot
+    // finish the dim prefix's row moves whole to the next: the dim prefix,
+    // then the ACCENT command on a row of its own.
+    for x in 3..37 {
         assert_eq!(
             fg(x, 3),
             theme::text_dim_color(),
             "the prefix is TEXT_DIM at {x}"
         );
     }
-    for x in 38..44 {
-        let cell = modal_cell(&buf, origin, x, 3);
+    for x in 3..16 {
+        let cell = modal_cell(&buf, origin, x, 4);
         assert_eq!(
             cell.fg,
             theme::accent_color(),
             "the command is ACCENT at {x}"
         );
         assert!(!cell.modifier.contains(Modifier::BOLD), "never bold at {x}");
-    }
-    for x in 3..9 {
-        let cell = modal_cell(&buf, origin, x, 4);
-        assert_eq!(
-            cell.fg,
-            theme::accent_color(),
-            "the wrapped command tail is ACCENT at {x}"
-        );
     }
     for x in 3..35 {
         assert_eq!(
@@ -2042,6 +2033,62 @@ fn the_daemon_start_confirm_renders_its_rows_and_spans() {
     for x in 38..45 {
         assert_eq!(fg(x, 7), theme::text_dim_color(), "start is neutral at {x}");
     }
+}
+
+/// A modal body's marked command is one wrap unit: it moves whole to the next
+/// row when it no longer fits beside the prose, and a command wider than a
+/// whole row breaks at its own spaces rather than inside a word.
+#[test]
+fn a_modal_body_keeps_a_marked_command_whole_and_breaks_it_only_at_its_spaces() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let state = ConfirmState {
+        message: "rewrite the row?".into(),
+        detail: Some(format!(
+            "validated by {}",
+            super::prose::cmd("herdr config check")
+        )),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::HerdrDelegateRowText(std::path::PathBuf::from("/h.toml")),
+    };
+    let (_, rows, _) = render_confirm(&state, 34, 20);
+    assert_eq!(
+        rows,
+        vec![
+            "╭─ CONFIRM ──────────────────╮".to_string(),
+            "│                            │".to_string(),
+            "│  rewrite the row?          │".to_string(),
+            "│  validated by              │".to_string(),
+            "│  herdr config check        │".to_string(),
+            "│                            │".to_string(),
+            "│         cancel   confirm   │".to_string(),
+            "│                            │".to_string(),
+            "╰────────────────────────────╯".to_string(),
+        ],
+        "34 columns"
+    );
+    let (_, rows, _) = render_confirm(&state, 20, 20);
+    assert_eq!(
+        rows,
+        vec![
+            "╭─ CONFIRM ────╮".to_string(),
+            "│              │".to_string(),
+            "│  rewrite     │".to_string(),
+            "│  the row?    │".to_string(),
+            "│  validated   │".to_string(),
+            "│  by herdr    │".to_string(),
+            "│  config      │".to_string(),
+            "│  check       │".to_string(),
+            "│              │".to_string(),
+            "│     cancel   │".to_string(),
+            "│    confirm   │".to_string(),
+            "│              │".to_string(),
+            "╰──────────────╯".to_string(),
+        ],
+        "20 columns"
+    );
 }
 
 /// `stop shunt?` with its count clause: the exact rows and a DANGER `stop`
@@ -5365,4 +5412,88 @@ fn the_help_modal_writes_page_keys_joined() {
         }
     }
     assert!(joined, "some help section names `pgup/pgdn`");
+}
+
+/// The heal confirm's real detail ends in a period pressed against the
+/// command. At 27 columns the command is one cell wider than an inner row, so
+/// it splits at its own spaces with the period riding `check`; at 28 it fits a
+/// row whole and the period opens the next. Rows are pinned border to content.
+#[test]
+fn heal_herdr_confirm_keeps_the_punctuated_command_whole() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let state = ConfirmState {
+        message: "add the keybinding and sidebar row to herdr's config?".into(),
+        detail: Some(format!(
+            "writes them into herdr's config.toml and validates the result with {}.",
+            prose::cmd("herdr config check")
+        )),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::HealHerdrConfig(std::path::PathBuf::from("/tmp/x")),
+    };
+    let wrapped = |width: u16, count: usize| {
+        let (_buf, rows, _origin) = render_confirm(&state, width, 24);
+        let first = rows
+            .iter()
+            .position(|r| r.contains("writes them into"))
+            .unwrap_or_else(|| panic!("the detail is on no row at {width}:\n{}", rows.join("\n")));
+        rows[first..first + count]
+            .iter()
+            .map(|r| r.trim_end_matches([' ', '\u{2502}']).to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        wrapped(27, 6),
+        vec![
+            "\u{2502}  writes them into",
+            "\u{2502}  herdr's",
+            "\u{2502}  config.toml and",
+            "\u{2502}  validates the",
+            "\u{2502}  result with herdr",
+            "\u{2502}  config check.",
+        ],
+        "the command is wider than an inner row at 27, so it breaks at its spaces"
+    );
+    assert_eq!(
+        wrapped(28, 7),
+        vec![
+            "\u{2502}  writes them into",
+            "\u{2502}  herdr's",
+            "\u{2502}  config.toml and",
+            "\u{2502}  validates the",
+            "\u{2502}  result with",
+            "\u{2502}  herdr config check",
+            "\u{2502}  .",
+        ],
+        "the command fits a whole inner row at 28"
+    );
+}
+
+/// An indented modal body whose first word is a marked command never merges
+/// the indent into the command: the command takes a row it fits instead of
+/// being cut mid-word.
+#[test]
+fn an_indented_modal_line_never_cuts_a_command() {
+    let text = format!("  {} x", prose::cmd("clauth herdr install"));
+    let (spans, units) = prose::marked(&text, Style::default()).into_parts();
+    let rows: Vec<String> = chunk_line_units(Line::from(spans), 21, &units)
+        .iter()
+        .map(line_text)
+        .collect();
+    assert_eq!(rows, vec!["clauth herdr install", "x"]);
+}
+
+/// A control character before a command must not shift its unit range: the
+/// unit ranges and the modal flatten count the same graphemes, so the prose
+/// space after the command still breaks and the command stays whole.
+#[test]
+fn a_control_char_before_a_command_does_not_shift_its_unit() {
+    let text = format!("x\u{1b}y {} cc", prose::cmd("QA QB"));
+    let (spans, units) = prose::marked(&text, Style::default()).into_parts();
+    let rows: Vec<String> = chunk_line_units(Line::from(spans), 8, &units)
+        .iter()
+        .map(line_text)
+        .collect();
+    assert_eq!(rows, vec!["xy QA QB", "cc"]);
 }

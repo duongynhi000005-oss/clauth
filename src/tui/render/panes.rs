@@ -978,47 +978,10 @@ pub(super) fn chunk_graphemes(text: &str, width: usize) -> Vec<String> {
 
 /// Greedy word-wrap to `width` cells, measured the way the buffer renders: by
 /// grapheme, a wide one taking two; long words are hard-split between
-/// graphemes.
+/// graphemes. The fill lives in [`prose`], so marked copy wraps by the same
+/// rule (a marked key or command as one unit).
 pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    let mut line_w = 0;
-    for word in text.split_whitespace() {
-        let word_w = Span::raw(word).width();
-        if word_w > width {
-            if !line.is_empty() {
-                lines.push(std::mem::take(&mut line));
-            }
-            let mut chunks = chunk_graphemes(word, width);
-            let last = chunks.pop().unwrap_or_default();
-            lines.extend(chunks);
-            line = last;
-            line_w = Span::raw(&line).width();
-            continue;
-        }
-        let extra = usize::from(!line.is_empty());
-        if line_w + extra + word_w > width {
-            lines.push(std::mem::take(&mut line));
-            line.push_str(word);
-            line_w = word_w;
-        } else {
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(word);
-            line_w += extra + word_w;
-        }
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
+    prose::plain_wrap(text, width)
 }
 
 /// A ` └ text` help sub-line wrapped to `width`: the `└ ` leader stays `LINE`,

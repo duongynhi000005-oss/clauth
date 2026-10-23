@@ -2058,6 +2058,38 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     );
 }
 
+/// A card too narrow for the whole fix line wraps it before the command, so
+/// `clauth login <name>` stays on one row the user can copy.
+#[test]
+fn a_narrow_card_keeps_the_relogin_command_on_one_row() {
+    let (p, p_readings) = profile("alpha", 95.0, 10.0, 7200);
+    let (mut cfg, readings) = config_with(vec![(p, p_readings)], Some("other"), vec!["alpha"]);
+    cfg.state.auth_broken.push("alpha".into());
+    let (lines, _, _) = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("alpha"),
+        MemberCard {
+            width: 26,
+            ..Default::default()
+        },
+        &HashSet::new(),
+        &readings,
+    );
+    let text: Vec<String> = lines.iter().map(line_text).collect();
+    let at = text
+        .iter()
+        .position(|l| l.starts_with("└ "))
+        .unwrap_or_else(|| panic!("no fix line in {text:#?}"));
+    assert_eq!(
+        text[at..at + 2].to_vec(),
+        vec![
+            "└ re-login with".to_string(),
+            "  clauth login alpha".to_string(),
+        ],
+        "the command moved whole to the continuation row"
+    );
+}
+
 /// The selector rail shows `#n` and keeps a CONSTANT width across one- and
 /// two-digit positions, so every name in the list starts on the same column.
 /// A ragged rail is what a bare `{}` would give, and it is invisible in any

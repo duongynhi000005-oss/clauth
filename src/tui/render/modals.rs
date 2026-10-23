@@ -194,7 +194,7 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects
         frame,
         area,
         "LOGIN",
-        lines,
+        BodyLine::all(lines),
         0,
         None,
         ModalTail {
@@ -266,7 +266,7 @@ fn draw_codex_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame,
         area,
         "LOGIN",
-        lines,
+        BodyLine::all(lines),
         0,
         None,
         ModalTail {
@@ -310,7 +310,7 @@ fn draw_modal_focused(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
-    lines: Vec<Line<'_>>,
+    lines: Vec<BodyLine>,
     focus: std::ops::Range<usize>,
     follow: ModalFollow<'_>,
 ) {
@@ -423,18 +423,74 @@ struct ModalTail<'a> {
     toast_rects: &'a [Rect],
 }
 
+/// One body line and the grapheme ranges it wraps as a unit — a marked key or
+/// command, which [`chunk_line`] keeps off a break.
+struct BodyLine {
+    line: Line<'static>,
+    units: Vec<std::ops::Range<usize>>,
+}
+
+impl From<Line<'static>> for BodyLine {
+    fn from(line: Line<'static>) -> Self {
+        Self {
+            line,
+            units: Vec::new(),
+        }
+    }
+}
+
+impl From<prose::Marked> for BodyLine {
+    fn from(marked: prose::Marked) -> Self {
+        let (spans, units) = marked.into_parts();
+        Self {
+            line: Line::from(spans),
+            units,
+        }
+    }
+}
+
+impl BodyLine {
+    /// Plain lines: no unit in them, every break point a word's.
+    fn all(lines: Vec<Line<'static>>) -> Vec<Self> {
+        lines.into_iter().map(Self::from).collect()
+    }
+
+    /// A marked line behind `prefix` spans (an edit gutter, a help row's key
+    /// cell): its units shift past them.
+    fn prefixed(prefix: Vec<Span<'static>>, marked: prose::Marked) -> Self {
+        let shift: usize = prefix
+            .iter()
+            .map(|span| {
+                Span::raw(span.content.replace('\t', " "))
+                    .styled_graphemes(Style::default())
+                    .count()
+            })
+            .sum();
+        let Self { line, mut units } = Self::from(marked);
+        for unit in &mut units {
+            unit.start += shift;
+            unit.end += shift;
+        }
+        let spans: Vec<Span<'static>> = prefix.into_iter().chain(line.spans).collect();
+        Self {
+            line: Line::from(spans),
+            units,
+        }
+    }
+}
+
 fn draw_modal_scrolled(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
-    lines: Vec<Line<'_>>,
+    lines: Vec<BodyLine>,
     scroll: u16,
     focus: Option<(std::ops::Range<usize>, &std::cell::Cell<usize>, FocusEnd)>,
     tail: ModalTail<'_>,
 ) -> ModalDraw {
     let content_w = lines
         .iter()
-        .map(|line| normalize_tabs(line).width())
+        .map(|body| normalize_tabs(&body.line).width())
         .max()
         .unwrap_or(0) as u16;
     let button_w = match &tail.extra {
@@ -450,7 +506,9 @@ fn draw_modal_scrolled(
     let mut focus_rows = (0, 0);
     let mut line_starts: Vec<usize> = Vec::with_capacity(line_count);
     let mut rows: Vec<Line<'static>> = Vec::new();
-    for (i, mut line) in lines.into_iter().enumerate() {
+    for (i, body) in lines.into_iter().enumerate() {
+        let mut line = body.line;
+        let mut units = body.units;
         if let Some(ModalExtra::Field { at, label, input }) = &tail.extra
             && *at == i
         {
@@ -460,6 +518,7 @@ fn draw_modal_scrolled(
             let value = field_window(input, inner_w.saturating_sub(lead), 1);
             if !input.value.is_empty() {
                 line = labelled_value(label, value, true);
+                units.clear();
             }
             caret_row = Some((rows.len(), lead + head_cols(input)));
         }
@@ -470,7 +529,7 @@ fn draw_modal_scrolled(
             focus_rows.1 = rows.len();
         }
         line_starts.push(rows.len());
-        rows.extend(chunk_line(line, inner_w));
+        rows.extend(chunk_line_units(line, inner_w, &units));
     }
     if focus
         .as_ref()
@@ -625,28 +684,62 @@ fn normalize_tabs(line: &Line<'_>) -> Line<'static> {
 /// counted as one char would overrun its row, which ratatui cuts with no `…`.
 /// A word wider than `w` splits by grapheme, whole; a grapheme wider than `w`
 /// takes a row of its own, whole. A tab is one break space. Only a break's
-/// whitespace run is dropped: a leading indent is kept, trailing whitespace
-/// that fits stays and the overflow drops, and a non-breaking space
-/// (U+00A0/U+202F/U+2007) is never a break point.
+/// whitespace run is dropped: a leading indent is kept, unless its first word
+/// is a marked unit that cannot share the indent's row (the unit stays whole
+/// instead), trailing whitespace that fits stays and the overflow drops, and a
+/// non-breaking space (U+00A0/U+202F/U+2007) is never a break point.
 fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
+    chunk_line_units(line, w, &[])
+}
+
+/// One flattened body grapheme: its text, display cells, style and the marked
+/// unit it belongs to.
+type Flat = (String, usize, Style, Option<usize>);
+
+/// [`chunk_line`] over a line carrying marked units ([`prose::marked`]): a
+/// grapheme inside a unit range only breaks where the unit does, so a key or
+/// command that fits a row stays on one. Punctuation pressed against a unit is
+/// placed beside it, never measured with it: the leading glue stays where it
+/// fits, the unit takes a row it fits, and the trailing glue opens the next
+/// row when it cannot ride the unit's. A unit wider than the row still breaks
+/// at its own spaces, then by grapheme like prose.
+fn chunk_line_units(
+    line: Line<'_>,
+    w: usize,
+    units: &[std::ops::Range<usize>],
+) -> Vec<Line<'static>> {
     let line = normalize_tabs(&line);
     if w == 0 || line.width() <= w {
         return vec![line];
     }
 
-    // Flatten to (grapheme, cells, style), so a word spanning styled spans
-    // still wraps as one word and each broken row re-coalesces its styles.
-    let mut flat: Vec<(String, usize, Style)> = Vec::new();
+    // Flatten to (grapheme, cells, style, unit), so a word spanning styled
+    // spans still wraps as one word and each broken row re-coalesces its
+    // styles.
+    let mut flat: Vec<Flat> = Vec::new();
+    let mut at = 0usize;
+    let mut unit = 0usize;
     for span in &line.spans {
         for grapheme in Span::raw(span.content.as_ref()).styled_graphemes(Style::default()) {
+            while units.get(unit).is_some_and(|range| range.end <= at) {
+                unit += 1;
+            }
+            let held = units
+                .get(unit)
+                .filter(|range| range.contains(&at))
+                .map(|_| unit);
             flat.push((
                 grapheme.symbol.to_string(),
                 Span::raw(grapheme.symbol).width(),
                 span.style,
+                held,
             ));
+            at += 1;
         }
     }
-    // Break points are whitespace minus the glue U+00A0/U+202F/U+2007.
+    // Break points are whitespace minus the glue U+00A0/U+202F/U+2007, and
+    // never one a marked unit holds: a unit breaks only where it is split for
+    // being wider than a row.
     let is_break_space = |sym: &str| {
         !sym.is_empty()
             && sym
@@ -658,15 +751,18 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
     // else, the glue non-breaking spaces included).
     #[derive(Clone)]
     enum Atom {
-        Space(Vec<(String, usize, Style)>),
-        Word(Vec<(String, usize, Style)>),
+        Space(Vec<Flat>),
+        Word(Vec<Flat>),
+        /// A marked run that fits a row: placed whole, never cell-split.
+        Unit(Vec<Flat>),
     }
     let mut atoms: Vec<Atom> = Vec::new();
     let mut idx = 0;
     while idx < flat.len() {
-        let spacey = is_break_space(&flat[idx].0);
-        let mut run: Vec<(String, usize, Style)> = Vec::new();
-        while idx < flat.len() && is_break_space(&flat[idx].0) == spacey {
+        let spacey = is_break_space(&flat[idx].0) && flat[idx].3.is_none();
+        let mut run: Vec<Flat> = Vec::new();
+        while idx < flat.len() && (is_break_space(&flat[idx].0) && flat[idx].3.is_none()) == spacey
+        {
             run.push(flat[idx].clone());
             idx += 1;
         }
@@ -676,29 +772,86 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
             Atom::Word(run)
         });
     }
+    // A word wider than a row is cut at the edges of its marked run when the
+    // run alone fits a row: punctuation pressed against a command is placed
+    // beside it, never measured with it. A run wider than a row still breaks
+    // at its own spaces like prose.
+    let mut split: Vec<Atom> = Vec::with_capacity(atoms.len());
+    for atom in atoms {
+        match atom {
+            Atom::Word(word) if word.iter().map(|g| g.1).sum::<usize>() > w => {
+                if let Some((start, end)) = unit_bounds(&word)
+                    && word[start..end].iter().map(|g| g.1).sum::<usize>() <= w
+                {
+                    if start > 0 {
+                        split.push(Atom::Word(word[..start].to_vec()));
+                    }
+                    split.push(Atom::Unit(word[start..end].to_vec()));
+                    if end < word.len() {
+                        split.push(Atom::Word(word[end..].to_vec()));
+                    }
+                    continue;
+                }
+                if !word.iter().any(|g| g.3.is_some() && is_break_space(&g.0)) {
+                    split.push(Atom::Word(word));
+                    continue;
+                }
+                let mut run: Vec<Flat> = Vec::new();
+                let mut spacey = None;
+                for g in word {
+                    let now = is_break_space(&g.0);
+                    if spacey.is_some_and(|last| last != now) {
+                        let done = std::mem::take(&mut run);
+                        split.push(if spacey == Some(true) {
+                            Atom::Space(done)
+                        } else {
+                            Atom::Word(done)
+                        });
+                    }
+                    spacey = Some(now);
+                    run.push(g);
+                }
+                if !run.is_empty() {
+                    split.push(if spacey == Some(true) {
+                        Atom::Space(run)
+                    } else {
+                        Atom::Word(run)
+                    });
+                }
+            }
+            other => split.push(other),
+        }
+    }
+    let mut atoms = split;
     // A leading indent glues to the first word: when the two don't fit one row
     // the word splits by cell and keeps the indent on its first row, unless the
     // indent leaves no room for the first grapheme of the word — then the indent
-    // takes whitespace-only leading rows and the word starts the next.
+    // takes whitespace-only leading rows and the word starts the next. A marked
+    // run is never cell-split for the indent's sake: it keeps the break path,
+    // which drops the indent and gives the run a row it fits.
     if atoms.len() >= 2
         && let Atom::Space(indent) = atoms[0].clone()
-        && let Atom::Word(mut word) = atoms[1].clone()
+        && let Atom::Word(word) = atoms[1].clone()
     {
-        let mut merged = indent;
-        merged.append(&mut word);
-        atoms[0] = Atom::Word(merged);
-        atoms.remove(1);
+        let merged_w: usize = indent.iter().chain(word.iter()).map(|g| g.1).sum();
+        if !word.iter().any(|g| g.3.is_some()) || merged_w <= w {
+            let mut merged = indent;
+            merged.extend(word);
+            atoms[0] = Atom::Word(merged);
+            atoms.remove(1);
+        }
     }
 
     let line_style = line.style;
     let alignment = line.alignment;
     let mut rows: Vec<Line<'static>> = Vec::new();
-    let mut cur: Vec<(String, usize, Style)> = Vec::new();
+    let mut cur: Vec<(String, usize, Style, Option<usize>)> = Vec::new();
     let mut used = 0usize;
 
-    let flush = |rows: &mut Vec<Line<'static>>, cur: &mut Vec<(String, usize, Style)>| {
+    let flush = |rows: &mut Vec<Line<'static>>,
+                 cur: &mut Vec<(String, usize, Style, Option<usize>)>| {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        for (sym, _, style) in cur.drain(..) {
+        for (sym, _, style, _) in cur.drain(..) {
             match spans.last_mut() {
                 Some(last) if last.style == style => last.content.to_mut().push_str(&sym),
                 _ => spans.push(Span::styled(sym, style)),
@@ -708,9 +861,9 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
         row.alignment = alignment;
         rows.push(row);
     };
-    let push = |g: (String, usize, Style),
+    let push = |g: (String, usize, Style, Option<usize>),
                 used: &mut usize,
-                cur: &mut Vec<(String, usize, Style)>,
+                cur: &mut Vec<(String, usize, Style, Option<usize>)>,
                 rows: &mut Vec<Line<'static>>| {
         let gw = g.1;
         if *used + gw <= w {
@@ -734,11 +887,20 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
                     push(g, &mut used, &mut cur, &mut rows);
                 }
             }
+            Atom::Unit(unit) => {
+                let unit_w: usize = unit.iter().map(|(_, cw, _, _)| *cw).sum();
+                if !cur.is_empty() && used + unit_w > w {
+                    flush(&mut rows, &mut cur);
+                    used = 0;
+                }
+                used += unit_w;
+                cur.extend(unit);
+            }
             Atom::Space(space) => {
-                let sp_w: usize = space.iter().map(|(_, cw, _)| *cw).sum();
+                let sp_w: usize = space.iter().map(|(_, cw, _, _)| *cw).sum();
                 match atoms.peek() {
-                    Some(Atom::Word(next)) => {
-                        let next_w: usize = next.iter().map(|(_, cw, _)| *cw).sum();
+                    Some(Atom::Word(next) | Atom::Unit(next)) => {
+                        let next_w: usize = next.iter().map(|(_, cw, _, _)| *cw).sum();
                         if used + sp_w + next_w <= w {
                             for g in space {
                                 let gw = g.1;
@@ -746,7 +908,9 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
                                 used += gw;
                             }
                         } else {
-                            flush(&mut rows, &mut cur);
+                            if !cur.is_empty() {
+                                flush(&mut rows, &mut cur);
+                            }
                             used = 0;
                         }
                     }
@@ -778,6 +942,18 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
         flush(&mut rows, &mut cur);
     }
     rows
+}
+
+/// The first and last grapheme of a word's marked run when the run is one
+/// contiguous range: punctuation pressed against the run sits outside these
+/// bounds.
+fn unit_bounds(word: &[Flat]) -> Option<(usize, usize)> {
+    let start = word.iter().position(|g| g.3.is_some())?;
+    let end = word.iter().rposition(|g| g.3.is_some())? + 1;
+    if word[start..end].iter().any(|g| g.3.is_none()) {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// Rounded `ACCENT_2` border, uppercase italic dim title, base `BG` fill.
@@ -880,10 +1056,8 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         _ => "confirm".to_string(),
     };
 
-    let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(
-        state.message.clone(),
-        theme::body(),
-    ))];
+    let mut lines: Vec<BodyLine> =
+        vec![Line::from(Span::styled(state.message.clone(), theme::body())).into()];
     // A detail may be several lines, and each is PROSE: split on the newlines
     // the caller wrote and leave the wrapping to the modal, which breaks
     // between words and drops the break's whitespace run (`chunk_line`). No
@@ -893,40 +1067,49 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     // fix would be one run of prose.
     if let Some(detail) = &state.detail {
         for line in detail.lines() {
-            lines.push(Line::from(prose::spans(line, theme::dim())));
+            lines.push(prose::marked(line, theme::dim()).into());
         }
     }
     // The daemon-start confirm carries its two lines here rather than in
     // `detail`, which its caller leaves `None`.
     if matches!(state.on_confirm, ConfirmAction::StartDaemon) {
-        lines.push(Line::from(prose::spans(
-            concat!(
-                "spawns the clauth daemon detached: ",
-                cmd_lit!("clauth daemon")
-            ),
-            theme::dim(),
-        )));
-        lines.push(Line::from(Span::styled(
-            "logfile at ~/.clauth/daemon.log.",
-            theme::dim(),
-        )));
+        lines.push(
+            prose::marked(
+                concat!(
+                    "spawns the clauth daemon detached: ",
+                    cmd_lit!("clauth daemon")
+                ),
+                theme::dim(),
+            )
+            .into(),
+        );
+        lines.push(
+            Line::from(Span::styled(
+                "logfile at ~/.clauth/daemon.log.",
+                theme::dim(),
+            ))
+            .into(),
+        );
     }
     // The token-add confirm's third line names only what the overwrite
     // replaces, `None` when the profile had neither a base url nor a key.
     if let ConfirmAction::AddToken { replace, .. } = &state.on_confirm
         && let Some(replace) = replace
     {
-        lines.push(Line::from(prose::spans(replace, theme::dim())));
+        lines.push(prose::marked(replace, theme::dim()).into());
     }
     // The require confirm's third line names the profiles whose `base_url`
     // names the gateway; empty = none to name, no line.
     if let ConfirmAction::RequireClientTokens { profiles } = &state.on_confirm
         && !profiles.is_empty()
     {
-        lines.push(Line::from(prose::spans(
-            &format!("profiles using the gateway: {profiles}."),
-            theme::dim(),
-        )));
+        lines.push(
+            prose::marked(
+                &format!("profiles using the gateway: {profiles}."),
+                theme::dim(),
+            )
+            .into(),
+        );
     }
     // An acknowledge-only notice has nothing to cancel — a single focused `close`.
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
@@ -961,10 +1144,10 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
 /// `go back · discard`) group under the modals button rule.
 fn draw_loss_warning(frame: &mut Frame<'_>, area: Rect, state: &LossWarningState) {
     // One line per sentence so a sentence never shares a row with the next.
-    let lines: Vec<Line<'_>> = state
+    let lines: Vec<BodyLine> = state
         .body_lines()
         .into_iter()
-        .map(|sentence| Line::from(prose::spans(&sentence, theme::body())))
+        .map(|sentence| prose::marked(&sentence, theme::body()).into())
         .collect();
 
     let buttons = loss_warning_buttons(state);
@@ -1101,7 +1284,7 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
         frame,
         area,
         "CONFIRM",
-        lines,
+        BodyLine::all(lines),
         0,
         focus,
         ModalTail {
@@ -1186,7 +1369,7 @@ fn draw_preset_apply(frame: &mut Frame<'_>, area: Rect, form: &PresetApplyForm) 
         frame,
         area,
         "CONFIRM",
-        lines,
+        BodyLine::all(lines),
         form.scroll.offset,
         None,
         ModalTail {
@@ -1248,7 +1431,7 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
         frame,
         area,
         "DIVERGENCE",
-        lines,
+        BodyLine::all(lines),
         first + cursor..first + cursor + 1,
         ModalFollow {
             saved: &form.scroll,
@@ -1321,7 +1504,7 @@ fn draw_divergence_target(frame: &mut Frame<'_>, area: Rect, form: &DivergenceTa
         frame,
         area,
         "SAVE LOGIN",
-        lines,
+        BodyLine::all(lines),
         cursor + 2..cursor + 3,
         ModalFollow {
             saved: &form.scroll,
@@ -1354,7 +1537,7 @@ fn draw_token_picker(frame: &mut Frame<'_>, area: Rect, form: &TokenPickerForm) 
         frame,
         area,
         "ADD TOKEN",
-        lines,
+        BodyLine::all(lines),
         cursor + 2..cursor + 3,
         ModalFollow {
             saved: &form.scroll,
@@ -1425,7 +1608,7 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
             frame,
             area,
             "CONFIRM",
-            lines,
+            BodyLine::all(lines),
             form.scroll.get().min(u16::MAX as usize) as u16,
             None,
             ModalTail {
@@ -1504,7 +1687,7 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
         frame,
         area,
         "KEY IN USE",
-        lines,
+        BodyLine::all(lines),
         2 + cursor * 2..4 + cursor * 2,
         ModalFollow {
             saved: &form.scroll,
@@ -1588,7 +1771,7 @@ fn draw_name_field(
         frame,
         area,
         title,
-        lines,
+        BodyLine::all(lines),
         0,
         None,
         ModalTail {
@@ -1635,7 +1818,7 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
         frame,
         area,
         "PRESET",
-        lines,
+        BodyLine::all(lines),
         2 + cursor..3 + cursor,
         ModalFollow {
             saved: &form.scroll,
@@ -1940,7 +2123,7 @@ fn draw_check_output(frame: &mut Frame<'_>, area: Rect, body: &str, app: &App) {
         frame,
         area,
         "check output",
-        lines,
+        BodyLine::all(lines),
         app.check_output_scroll,
         None,
         ModalTail {
@@ -2028,7 +2211,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .filter(|(k, _)| !shadowed.contains(k))
         .collect();
 
-    let mut lines: Vec<Line<'_>> = Vec::new();
+    let mut lines: Vec<BodyLine> = Vec::new();
     if !nav.is_empty() {
         lines.extend(key_section("tabs", nav));
     }
@@ -2122,48 +2305,51 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
     ]
 }
 
-fn key_section(title: &str, pairs: &[(&str, &str)]) -> Vec<Line<'static>> {
+fn key_section(title: &str, pairs: &[(&str, &str)]) -> Vec<BodyLine> {
     let mut lines = section_head(title);
     for (key, desc) in pairs {
         lines.push(help_row(key, desc));
     }
-    lines.push(Line::from(""));
+    lines.push(Line::from("").into());
     lines
 }
 
-fn glyph_section(title: &str, rows: Vec<(Span<'static>, &'static str)>) -> Vec<Line<'static>> {
+fn glyph_section(title: &str, rows: Vec<(Span<'static>, &'static str)>) -> Vec<BodyLine> {
     let mut lines = section_head(title);
     lines.extend(rows.into_iter().map(|(mark, desc)| glyph_row(mark, desc)));
-    lines.push(Line::from(""));
+    lines.push(Line::from("").into());
     lines
 }
 
-fn section_head(title: &str) -> Vec<Line<'static>> {
+fn section_head(title: &str) -> Vec<BodyLine> {
     vec![
         Line::from(Span::styled(
             title.to_uppercase(),
             Style::default().fg(theme::text_dim_color()),
-        )),
-        Line::from(""),
+        ))
+        .into(),
+        Line::from("").into(),
     ]
 }
 
 const HELP_KEY_W: usize = 18;
 const HELP_KEY_GUTTER: usize = 2;
 
-fn help_row(key: &str, desc: &str) -> Line<'static> {
-    let mut spans = vec![Span::styled(
+fn help_row(key: &str, desc: &str) -> BodyLine {
+    let head = Span::styled(
         format!("  {}", key_cell(key, HELP_KEY_W, HELP_KEY_GUTTER)),
         Style::default().fg(theme::accent_color()).bold(),
-    )];
-    spans.extend(prose::spans(desc, Style::default().fg(theme::text_color())));
-    Line::from(spans)
+    );
+    BodyLine::prefixed(
+        vec![head],
+        prose::marked(desc, Style::default().fg(theme::text_color())),
+    )
 }
 
 /// A legend row, aligned to the same description column the key rows open at.
 /// The mark keeps the style its renderer gave it — a hue-split glyph read in
 /// the accent every other key row wears would document the wrong thing.
-fn glyph_row(mark: Span<'static>, desc: &str) -> Line<'static> {
+fn glyph_row(mark: Span<'static>, desc: &str) -> BodyLine {
     Line::from(vec![
         Span::raw("  "),
         mark,
@@ -2171,6 +2357,7 @@ fn glyph_row(mark: Span<'static>, desc: &str) -> Line<'static> {
         Span::raw(key_cell("", HELP_KEY_W - 1, HELP_KEY_GUTTER)),
         Span::styled(desc.to_string(), Style::default().fg(theme::text_color())),
     ])
+    .into()
 }
 
 fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'static> {
