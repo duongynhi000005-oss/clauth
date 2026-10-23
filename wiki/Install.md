@@ -35,15 +35,17 @@ cargo build --release
 
 ## Updates
 
-A binary install checks GitHub for a newer release in the background on launch and replaces itself once every check passes:
+A binary install checks GitHub for a newer release in the background whenever the TUI opens and replaces itself once every check passes:
 
-1. the release tag is newer than the running build
+1. the release tag is newer than the running build, and the release lists this platform's binary at 256 MiB or less
 2. `sha256sums.txt` downloads
 3. its minisign signature verifies against a public key compiled into the binary
-4. the platform asset's SHA-256 matches that sums file
-5. the new binary is written, fsynced, and swapped in atomically
+4. the platform asset downloads, no larger than the size the release lists, and its SHA-256 matches that sums file
+5. the new binary is swapped in: renamed over the old one in one step on Linux and macOS; on Windows the old one is moved aside first, so a failure right there leaves no `clauth.exe` until you reinstall
 
-Any failing step skips the update and leaves the running binary alone. The check runs at launch, so turning auto-update off (the Config tab's `auto-update` row, persisted as `[update] auto_update = false` in profiles.toml) takes effect the next time clauth starts. `CLAUTH_NO_UPDATE=1` turns the whole thing off even when the toggle is on. Full chain: [SECURITY.md](https://github.com/uwuclxdy/clauth/blob/mommy/SECURITY.md#auto-update-verification).
+Any failing step skips the update and writes one line to `~/.clauth/clauth.log`; through step 4 the running binary is left alone. Quitting the TUI gives a running check 5 s to finish, longer only while the new binary is being swapped in; past that the update is dropped silently until the TUI next opens. The check starts when the TUI opens, so turning auto-update off (the Config tab's `auto-update` row, persisted as `[update] auto_update = false` in profiles.toml) takes effect the next time the TUI opens. `CLAUTH_NO_UPDATE=1` turns the whole thing off even when the toggle is on. Full chain: [SECURITY.md](https://github.com/uwuclxdy/clauth/blob/mommy/SECURITY.md#auto-update-verification).
+
+A binary install on v0.17.0 or older cannot download a current release and never updates itself: replace it once with the latest binary from the releases page (or rerun the install script with `--nocargo`), and updates resume from there.
 
 ## Shell completions
 

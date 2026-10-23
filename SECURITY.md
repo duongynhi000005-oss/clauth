@@ -8,7 +8,7 @@ Report privately through GitHub: open the repo's **Security** tab and pick **Rep
 
 ## Supported versions
 
-Only the latest release. Binary installs stay current through the verified auto-updater below; `cargo` installs update with `cargo install clauth`.
+Only the latest release. Binary installs stay current through the verified auto-updater below, except that an install on v0.17.0 or older must download a newer release by hand once; `cargo` installs update with `cargo install clauth`.
 
 ## Data at rest
 
@@ -66,7 +66,7 @@ Every request clauth makes, and what rides along with it:
 
 | Endpoint | When | Carries |
 |----------|------|---------|
-| `api.github.com/repos/uwuclxdy/clauth/releases/latest` + release assets | background update check on launch (binary installs only) | no credentials, just a `User-Agent` |
+| `api.github.com/repos/uwuclxdy/clauth/releases/latest` + release assets | background update check when the TUI opens: the release listing on every install, the sums, signature and asset on binary installs only | no credentials, just a `User-Agent` |
 | `platform.claude.com/v1/oauth/token` | token refresh ahead of expiry, on a rejected request, and on `t` force-rotate | your stored refresh token |
 | `claude.com/cai/oauth/authorize` | `clauth login` interactive sign-in, opened in your browser or shown as a link for you to open anywhere | no credentials; a PKCE challenge + random `state` |
 | `platform.claude.com/v1/oauth/token` | `clauth login` authorization-code exchange; a pasted code sends Claude Code's hosted redirect URI and the same `state` | the one-time auth code + PKCE verifier (mints a fresh token pair) |
@@ -148,13 +148,15 @@ Nothing else sends inference or writes to your account.
 
 ## Auto-update verification
 
-Binary installs check for a newer release in the background on launch, unless auto-update is off (the Config tab's `auto-update` row, persisted as `[update] auto_update = false` in profiles.toml) or `CLAUTH_NO_UPDATE=1` is set. Every step fails closed, so if any of them errors the update is skipped and the running binary stays put:
+Binary installs check for a newer release in the background whenever the TUI opens, unless auto-update is off (the Config tab's `auto-update` row, persisted as `[update] auto_update = false` in profiles.toml) or `CLAUTH_NO_UPDATE=1` is set. Every step fails closed, so if any of them errors the update is skipped and one line saying so goes to `~/.clauth/clauth.log`; through step 4 the running binary stays put:
 
-1. Ask the GitHub releases API for the latest tag; stop if it isn't newer.
+1. Ask the GitHub releases API for the latest tag; stop if it isn't newer. A newer release that lists no asset for this platform, or lists it above 256 MiB, stops the update here.
 2. Download `sha256sums.txt`. A fetch error stops here (no integrity, no update).
 3. Download `sha256sums.txt.minisig` and check it against a minisign public key pinned at compile time. A missing or bad signature stops the update. The key is a constant, so nothing at runtime can swap it out.
-4. Download the platform asset (10 MB ceiling) and check its SHA-256 against the now-trusted sums file. A mismatch stops the update.
-5. Write to a temp file, fsync, then self-replace atomically. The new binary takes over on the next launch.
+4. Download the platform asset, refusing any body larger than the size the release lists, and check its SHA-256 against the now-trusted sums file. A mismatch stops the update.
+5. Write it into a fresh temp directory (owner-only on Linux and macOS), then self-replace. On Linux and macOS a copy lands beside the binary and is renamed over it in one step. On Windows the running binary is renamed aside before the new one is copied in, so a failure or a kill in between leaves no `clauth.exe` at its path until you reinstall. The new binary takes over on the next launch.
+
+Each releases-API, sums and signature request gives up after 35 s end to end. The asset download gets 35 s plus its listed size at 16 KiB/s, so a link averaging 16 KiB/s or more finishes and a slower or stalled one gives up; the next TUI open tries again.
 
 `cargo` installs (binary under `~/.cargo/bin`) are told an update exists but never replaced. Auto-update off or `CLAUTH_NO_UPDATE=1` turns the whole thing off.
 
