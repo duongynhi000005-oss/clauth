@@ -799,6 +799,173 @@ fn hybrid_renders_the_activity_and_deadline_of_its_provider_cache() {
     }
 }
 
+/// A logged-in oauth profile whose published OAuth deadline already passed and
+/// which no fetch leg has marked: the state a row is in when it falls due while
+/// the scheduler is still busy with an earlier fetch round.
+fn app_with_a_passed_deadline(name: &str) -> App {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    use crate::usage::FetchLeg;
+
+    let mut due = oauth(name, false);
+    due.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "access".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    let key = due.name.clone();
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![key.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![due],
+    });
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(FetchLeg::OAuth.key(key), crate::usage::now_ms() - 1_500);
+    app
+}
+
+/// Cells of the first frame row holding `needle`, drawn at `w` x `h`.
+fn cells_of_row_holding(app: &App, w: u16, h: u16, needle: &str) -> Vec<ratatui::buffer::Cell> {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let rows = crate::testutil::buffer_rows(&buf);
+    let y = rows
+        .iter()
+        .position(|r| r.contains(needle))
+        .unwrap_or_else(|| panic!("no row holds {needle:?}:\n{}", rows.join("\n")));
+    (0..w).map(|x| buf[(x, y as u16)].clone()).collect()
+}
+
+#[test]
+fn an_overview_row_past_its_deadline_spins_queued_instead_of_reading_zero() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let mut app = app_with_a_passed_deadline("dueacct");
+    app.tab = Tab::Overview;
+    let cells = cells_of_row_holding(&app, 100, 24, "dueacct");
+    let text: String = cells.iter().map(|c| c.symbol()).collect();
+    assert!(
+        !text.split_whitespace().any(|w| w == "0s"),
+        "a passed deadline must not freeze the timer at `0s`:\n{text}"
+    );
+    let spinner: Vec<_> = cells
+        .iter()
+        .filter(|c| crate::spinner::SPINNER_FRAMES.contains(&c.symbol()))
+        .collect();
+    assert_eq!(
+        spinner.len(),
+        1,
+        "the due row shows one queued spinner frame in its timer slot:\n{text}"
+    );
+    assert_eq!(
+        spinner[0].fg,
+        crate::tui::theme::text_faint_color(),
+        "the queued spinner is the gray (TEXT_FAINT) one"
+    );
+}
+
+#[test]
+fn a_usage_status_row_past_its_deadline_reads_queued_instead_of_refresh_in_zero() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let mut app = app_with_a_passed_deadline("dueacct");
+    app.tab = Tab::Usage;
+    let usage = dump(&app, 100, 24);
+    assert!(
+        !usage.contains("refresh in 0s"),
+        "a passed deadline must not read `refresh in 0s`:\n{usage}"
+    );
+    let queued = usage
+        .lines()
+        .find(|l| l.contains(" queued"))
+        .unwrap_or_else(|| panic!("the due row's status line names `queued`:\n{usage}"));
+    assert!(
+        crate::spinner::SPINNER_FRAMES
+            .iter()
+            .any(|f| queued.contains(&format!("{f} queued"))),
+        "`queued` follows its spinner frame:\n{queued}"
+    );
+}
+
+/// A stood-down instance mirrors another process's disk and runs no fetch round
+/// of its own, so a past published deadline is its own cache-mtime estimate, not
+/// a due fetch. Both surfaces must render that row as a countdown — the floored
+/// `0s` under its staleness cue — never a `queued` spinner promising work this
+/// process will not do.
+#[test]
+fn a_stood_down_row_past_its_deadline_keeps_its_countdown_not_queued() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let mut app = app_with_a_passed_deadline("dueacct");
+    // Another instance wins the usage-fetch lease first; its `File` must stay
+    // alive so the flock stays held for the rest of the test.
+    let other = crate::daemon::FetchLease::new();
+    assert!(other.acquire(), "the competing instance wins the lease");
+    assert!(
+        !app.fetch_lease.acquire(),
+        "this TUI stands down while another instance holds the lease"
+    );
+
+    // A cached reading is the staleness case: the timer keeps the amber cue a
+    // `queued` spinner would replace.
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("dueacct".to_string(), crate::usage::FetchStatus::Cached);
+
+    app.tab = Tab::Overview;
+    let cells = cells_of_row_holding(&app, 100, 24, "dueacct");
+    let text: String = cells.iter().map(|c| c.symbol()).collect();
+    assert!(
+        !cells
+            .iter()
+            .any(|c| crate::spinner::SPINNER_FRAMES.contains(&c.symbol())),
+        "a stood-down row must not claim a queued fetch:\n{text}"
+    );
+    assert_eq!(
+        text.split_whitespace().filter(|w| *w == "0s").count(),
+        1,
+        "the mirror's past estimate floors at `0s`:\n{text}"
+    );
+    let zero = cells
+        .iter()
+        .position(|c| c.symbol() == "0")
+        .unwrap_or_else(|| panic!("the timer slot holds no countdown:\n{text}"));
+    assert_eq!(
+        cells[zero + 1].symbol(),
+        "s",
+        "the cell is a countdown:\n{text}"
+    );
+    assert_eq!(
+        cells[zero].fg,
+        crate::tui::theme::warning_color(),
+        "the stood-down countdown keeps its amber staleness cue:\n{text}"
+    );
+
+    app.tab = Tab::Usage;
+    let usage = dump(&app, 100, 24);
+    assert!(
+        !usage.lines().any(|l| l.contains(" queued")),
+        "a stood-down status row names no queued fetch:\n{usage}"
+    );
+    assert!(
+        usage.contains("refresh in 0s"),
+        "the mirror's past estimate reads `refresh in 0s`:\n{usage}"
+    );
+}
+
 #[test]
 fn a_two_line_toast_bolds_the_head_and_dims_the_detail() {
     let _home = crate::testutil::HomeSandbox::new();

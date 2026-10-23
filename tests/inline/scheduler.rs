@@ -1486,10 +1486,11 @@ fn a_panicking_oauth_worker_records_failed_status() {
     );
 }
 
-/// Third-party twin: the join loop's panic arm records Failed in the provider
-/// status store AND clears the live broken mark — a panicked worker produced no
+/// Third-party twin: the reap's panic arm records Failed in the provider status
+/// store, clears the live broken mark — a panicked worker produced no
 /// key-rejection, so a pre-seeded mark must not survive to keep a recovered
-/// member chain-broken.
+/// member chain-broken — and frees the provider slot its worker marked
+/// `Fetching` before the fetch that died, which no landing will ever clear.
 #[test]
 fn a_panicking_third_party_worker_records_failed_status() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1522,6 +1523,12 @@ fn a_panicking_third_party_worker_records_failed_status() {
             .expect("broken store unpoisoned")
             .contains_key("boom"),
         "a panic clears the live broken mark — no key rejection was observed"
+    );
+    // The worker marked its own provider slot `Fetching` before the fetch that
+    // panicked; no landing will clear it, so an unreaped slot spins forever.
+    assert!(
+        super::is_idle(&state.activity, &crate::profile::ProfileName::from("boom")),
+        "the reap frees the panicked worker's provider slot"
     );
 }
 
@@ -8124,7 +8131,6 @@ fn third_party_state_at_interval(
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
         display_reader: false,
         last_history_prune: AtomicU64::new(super::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -9554,7 +9560,6 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(true),
         display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -9652,7 +9657,6 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(true),
         display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -9834,7 +9838,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
     use crate::profile::{AppConfig, AppState};
     use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
     use crate::usage::UsageInfo;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
     let _home = crate::testutil::HomeSandbox::new();
 
     // Another instance wins the lease first; its `File` must stay alive so the
@@ -9881,7 +9885,6 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         // A DIFFERENT lease over the same file → its acquire() is denied while
         // `other` holds the flock.
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
         display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -9916,8 +9919,8 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         "stood down: the store is hydrated from the shared cache"
     );
     assert!(
-        state.standdown_active.load(Ordering::Relaxed),
-        "the stand-down edge is recorded"
+        !state.fetch_lease.fetches_here(),
+        "the lease records the stand-down"
     );
     drop(other);
 }
@@ -9994,7 +9997,6 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         shutting_down: Arc::new(AtomicBool::new(false)),
         // Nothing else holds the flock, so this tick is the fetcher.
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
         display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -10115,7 +10117,6 @@ fn a_rebuilt_entry_partitioned_after_a_bump_still_lands() {
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
         display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -10215,7 +10216,6 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
         display_reader: false,
         last_history_prune: AtomicU64::new(stale_prune),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -10335,7 +10335,6 @@ fn auto_start_queue_election_is_wired_into_tick() {
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
         display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -10948,7 +10947,6 @@ fn completion_order_state() -> super::SchedulerState {
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
         display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -14769,7 +14767,6 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
         display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -15025,7 +15022,6 @@ fn auto_start_queue_election_drops_a_canceled_account_from_the_store_only() {
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
         display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -15146,7 +15142,6 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
         display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -18386,7 +18381,6 @@ fn tps_state(lease: Arc<crate::daemon::FetchLease>) -> super::SchedulerState {
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: lease,
-        standdown_active: AtomicBool::new(false),
         display_reader: true,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -20097,7 +20091,6 @@ fn a_tick_with_all_legs_due_under_a_wedge_takes_one_wait() {
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
         display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -20131,7 +20124,7 @@ fn a_tick_with_all_legs_due_under_a_wedge_takes_one_wait() {
 
 /// W1 (no-codex): a tick with OAuth + third-party + a kick due and NO codex
 /// under one wedge takes one wait in total. The three legs are CONCURRENT (the
-/// OAuth drain, the third-party join loop, the kick worker), so with no
+/// OAuth drain, the third-party drain, the kick worker), so with no
 /// sequential-first codex leg to set the flag ahead of them, the queued holds
 /// must re-read the flag after winning the in-process `THREAD_LOCK` and skip —
 /// otherwise each leg waits its own bound (count ≥ 2). Red when the re-check
@@ -20256,7 +20249,6 @@ fn a_tick_with_no_codex_due_under_a_wedge_takes_one_wait() {
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-        standdown_active: AtomicBool::new(false),
         display_reader: false,
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -20850,5 +20842,242 @@ fn a_dead_pid_record_with_its_real_start_does_not_make_the_429_ambiguous() {
         decision_of("8198-0"),
         (Some("b".to_string()), Some(1)),
         "a dead pid's record carrying its real start must not suppress the session's own 429"
+    );
+}
+
+// ── third-party leg: completion-ordered landings ─────────────────────────────
+//
+// The third-party twin of `oauth_completions_apply_in_completion_order_not_list_order`:
+// a fast provider's landing (mark cleared, countdown published) must not wait
+// behind a slower provider listed before it.
+
+/// Held closed by the test while `slow`'s fetch must stay in flight; the
+/// fetcher is a plain `fn`, so the gate is static.
+static JOIN_ORDER_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+fn join_order_fetcher(
+    target: &crate::providers::ThirdPartyTarget,
+    _key: &str,
+    _hint: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    let slow = matches!(
+        target,
+        crate::providers::ThirdPartyTarget::Generic { base_url } if base_url.contains("slow")
+    );
+    if slow {
+        let (lock, cvar) = &JOIN_ORDER_GATE;
+        let guard = lock.lock().unwrap();
+        let _released = cvar
+            .wait_timeout_while(guard, std::time::Duration::from_secs(30), |open| !*open)
+            .unwrap();
+    }
+    Ok(crate::testutil::stats_with_bars(Vec::new()))
+}
+
+fn join_order_entry(name: &str, base_url: &str) -> ThirdPartyEntry {
+    let profile_name = crate::profile::ProfileName::from(name);
+    ThirdPartyEntry {
+        name: profile_name.clone(),
+        target: crate::providers::ThirdPartyTarget::Generic {
+            base_url: base_url.to_string(),
+        },
+        api_key: "key".to_string(),
+        identity: crate::usage::third_party_identity(None, Some("key"), None, Some(base_url)),
+        epoch_at_spawn: crate::usage::epoch_value(&profile_name, crate::usage::Half::ThirdParty),
+    }
+}
+
+#[test]
+fn third_party_landings_apply_in_completion_order_not_list_order() {
+    use std::time::{Duration, Instant};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *JOIN_ORDER_GATE.0.lock().unwrap() = false;
+
+    // Distinct hosts, so the per-host request spacing never sits between them:
+    // only the order landings are applied in can delay `fast`.
+    let slow_url = "https://slow.join-order.example";
+    let fast_url = "https://fast.join-order.example";
+    let state = third_party_state(join_order_fetcher);
+    {
+        let mut config = state.config.lock().unwrap();
+        for (name, url) in [("slow", slow_url), ("fast", fast_url)] {
+            let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+            p.base_url = Some(url.to_string());
+            p.api_key = Some("key".to_string());
+            config.profiles.push(p);
+        }
+    }
+    *state.third_party_tokens.lock().unwrap() = vec![
+        join_order_entry("slow", slow_url),
+        join_order_entry("fast", fast_url),
+    ];
+
+    /// Opens the gate on drop, so `slow` returns and the scope joins even when
+    /// an assertion below fails.
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let (lock, cvar) = &JOIN_ORDER_GATE;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+    }
+
+    std::thread::scope(|scope| {
+        let _release = Release;
+        scope.spawn(|| super::tick(&state));
+
+        // In completion order `fast` lands while `slow` is still held; a
+        // list-order drain is parked on `slow` and never reaches `fast`.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let fast_marked = state
+                .activity
+                .lock()
+                .unwrap()
+                .get("fast")
+                .and_then(|a| a.fetch(FetchLeg::ThirdParty))
+                .is_some();
+            let fast_counted = state
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .get(&tp_key("fast"))
+                .is_some_and(|next| *next > super::now_ms());
+            if !fast_marked && fast_counted {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "`fast` never landed while `slow` held the head of the list: \
+                 third-party landings still apply in list order"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            state
+                .activity
+                .lock()
+                .unwrap()
+                .get("slow")
+                .and_then(|a| a.fetch(FetchLeg::ThirdParty))
+                .is_some(),
+            "`slow` is still in flight when `fast` lands, so `fast` did not wait on it"
+        );
+    });
+
+    assert!(
+        state.activity.lock().unwrap().is_empty(),
+        "every mark cleared once the leg drains"
+    );
+}
+
+/// The lines an instance logs about the usage-fetch lease while another
+/// instance holds it for two ticks and then exits, with or without the TUI's
+/// UI-thread acquire (`App::finish_bootstrap`) on the same shared lease ahead
+/// of the first tick. Every line from every step is captured, so a line raised
+/// by the UI-thread acquire counts the same as one raised inside a tick.
+fn lease_transition_lines(ui_thread_acquires_first: bool) -> Vec<String> {
+    let _home = crate::testutil::HomeSandbox::new();
+    let other = crate::daemon::FetchLease::new();
+    assert!(other.acquire(), "the other instance wins the lease");
+    let state = third_party_state(stub_auth_expired);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _cap = lines.capture_here();
+        if ui_thread_acquires_first {
+            assert!(
+                !state.fetch_lease.acquire(),
+                "the UI-thread acquire is denied"
+            );
+        }
+        super::tick(&state);
+        super::tick(&state);
+        drop(other);
+        super::tick(&state);
+        super::tick(&state);
+    }
+    lease_lines(&lines)
+}
+
+/// The captured lines that speak about the usage-fetch lease.
+fn lease_lines(lines: &crate::logline::LogLines) -> Vec<String> {
+    lines
+        .snapshot()
+        .into_iter()
+        .filter(|l| l.contains("usage-fetch lease"))
+        .collect()
+}
+
+#[test]
+fn a_lease_never_denied_logs_no_transition() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_auth_expired);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _cap = lines.capture_here();
+        assert!(state.fetch_lease.acquire(), "a free lease is won");
+        super::tick(&state);
+        super::tick(&state);
+    }
+    assert_eq!(
+        lease_lines(&lines),
+        Vec::<String>::new(),
+        "an instance that never stood down logs neither transition"
+    );
+}
+
+#[test]
+fn an_unreadable_lease_file_logs_its_stand_down_then_its_acquire() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_auth_expired);
+    // A directory where the lock file belongs: the lease cannot open it.
+    let lock_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("usage-fetch.lock");
+    std::fs::create_dir_all(&lock_path).expect("mkdir lock path");
+    let lines = crate::logline::LogLines::new();
+    {
+        let _cap = lines.capture_here();
+        super::tick(&state);
+        super::tick(&state);
+        assert!(
+            !state.fetch_lease.fetches_here(),
+            "an unreadable lease file stands this instance down"
+        );
+        std::fs::remove_dir(&lock_path).expect("rmdir lock path");
+        super::tick(&state);
+        super::tick(&state);
+    }
+    assert_eq!(
+        lease_lines(&lines),
+        vec![
+            "clauth: another instance holds the usage-fetch lease: standing down (rendering from the shared cache)"
+                .to_string(),
+            "clauth: acquired the usage-fetch lease: fetching".to_string(),
+        ],
+        "an unreadable lease file logs one stand-down, then one acquire once it reads"
+    );
+}
+
+#[test]
+fn an_instance_beside_a_lease_holder_logs_its_stand_down_once() {
+    let want = vec![
+        "clauth: another instance holds the usage-fetch lease: standing down (rendering from the shared cache)"
+            .to_string(),
+        "clauth: acquired the usage-fetch lease: fetching".to_string(),
+    ];
+    assert_eq!(
+        lease_transition_lines(false),
+        want,
+        "a tick-first instance logs one stand-down, then one acquire"
+    );
+    assert_eq!(
+        lease_transition_lines(true),
+        want,
+        "an instance whose UI thread asked for the lease first still logs one \
+         stand-down, then one acquire"
     );
 }

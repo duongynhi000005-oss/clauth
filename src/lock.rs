@@ -341,7 +341,7 @@ thread_local! {
 // Test seam shortening `state_lock_timeout` so a wedge can be posed without a
 // real 25 s wait. `None` is the production deadline. Process-wide, not
 // thread-local: a tick's landing and kick holds run on DIFFERENT threads (the
-// drain, the third-party join loop, the kick workers), and a wedge posed under
+// drain, the third-party drain, the kick workers), and a wedge posed under
 // the tick's flag must shorten every one of those waits, not just the test
 // thread's. Reset by `HomeSandbox` (which serializes the whole suite through
 // `HOME_TEST_LOCK`), so a parallel test never sees a leaked override.

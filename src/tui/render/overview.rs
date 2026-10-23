@@ -1101,21 +1101,23 @@ fn render_overview_row(
             .ok()
             .map(|activity| crate::usage::selected_activity(&activity, profile))
             .unwrap_or(ProfileActivity::Idle);
+        let next_refresh = app
+            .next_refresh_per_profile
+            .lock()
+            .ok()
+            .and_then(|m| selected_next_refresh(&m, profile));
+        let activity =
+            crate::usage::display_activity(activity, next_refresh, app.fetch_lease.fetches_here());
         if !matches!(activity, ProfileActivity::Idle) {
             let frame = spinner_frame(app.tick_count);
             let style = spinner_style(activity);
             Span::styled(format!("{frame:>inner$} ", inner = inner), style)
         } else {
-            let secs_str = app
-                .next_refresh_per_profile
-                .lock()
-                .ok()
-                .and_then(|m| selected_next_refresh(&m, profile))
-                .map(|next_ms| {
-                    let now = now_ms();
-                    let secs = ((next_ms as i64 - now as i64) / 1000).max(0);
-                    format!("{secs}s")
-                });
+            let secs_str = next_refresh.map(|next_ms| {
+                let now = now_ms();
+                let secs = ((next_ms as i64 - now as i64) / 1000).max(0);
+                format!("{secs}s")
+            });
             match secs_str {
                 Some(s) => Span::styled(
                     format!("{:>inner$} ", s, inner = inner),

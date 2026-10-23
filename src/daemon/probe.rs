@@ -25,10 +25,12 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use crate::logline::logline;
 use crate::profile::clauth_dir;
 
 /// How stale `status.json` may be before the `[ daemon ]` header chip flips
@@ -768,6 +770,25 @@ pub(crate) fn standby_waiting() -> bool {
     matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
+/// The stand-down / acquired lines, each logged only on its own edge of
+/// [`FetchLease::stood_down`].
+const STOOD_DOWN_LINE: &str = concat!(
+    "clauth: another instance holds the usage-fetch lease: standing down ",
+    "(rendering from the shared cache)"
+);
+const ACQUIRED_LINE: &str = "clauth: acquired the usage-fetch lease: fetching";
+
+/// Log a stand-down / lease-acquired transition. Either the TUI or the daemon
+/// can stand down (whichever didn't win the lease). [`logline!`] routes by
+/// PROCESS, never by the calling thread: the daemon's line (stamping on) to
+/// `daemon.log`, an interactive TUI's (stderr still a terminal) to
+/// `~/.clauth/clauth.log` — so the line a TUI raises on its UI thread from
+/// `App::finish_bootstrap` is recorded without ever painting over the accounts
+/// pane.
+fn standdown_transition_log(msg: &str) {
+    logline!("{msg}");
+}
+
 /// The single-fetcher lease over `usage-fetch.lock` (#27). Once acquired the
 /// [`File`] is retained for the process lifetime, so the flock is held for life
 /// and released only on exit — deliberately NOT re-acquired per tick, which
@@ -780,6 +801,12 @@ pub(crate) fn standby_waiting() -> bool {
 #[derive(Default)]
 pub(crate) struct FetchLease {
     held: Mutex<Option<File>>,
+    /// Whether the last [`acquire`](Self::acquire) stood down. The one record of
+    /// who fetches: a display surface reads it to tell a row of its own due
+    /// schedule from a mirror's cache-mtime estimate, and its two edges are the
+    /// only places the stand-down / acquired lines are logged, so a UI-thread
+    /// acquire and a tick acquire can never disagree about either.
+    stood_down: AtomicBool,
 }
 
 impl FetchLease {
@@ -791,8 +818,17 @@ impl FetchLease {
     /// when THIS instance holds the lease (fetch this tick), `false` when another
     /// instance holds it or the lock is unreadable (stand down and hydrate from
     /// the shared cache). Idempotent once held: a held lease short-circuits to
-    /// `true`, so the flock is never re-taken. Both error arms of the try-lock
-    /// stand down — an io error is never a licence to dup-fetch.
+    /// `true`, so the flock is never re-taken. Every step of the attempt past
+    /// that short-circuit — an unresolvable `~/.clauth`, an unopenable lock file,
+    /// either try-lock error — yields no lease, so all of them stand down
+    /// through the one tail below: an io error is never a licence to dup-fetch.
+    ///
+    /// Each transition line is logged on [`Self::stood_down`]'s own edge: the
+    /// callers include a TUI's `finish_bootstrap` on the UI thread and the
+    /// scheduler's tick, so a caller-side flag would miss the other caller's
+    /// stand-down and log it never or twice. The edge is decided under the
+    /// `held` guard — two concurrent callers still split one transition between
+    /// them — and the line is logged after the guard drops.
     pub(crate) fn acquire(&self) -> bool {
         let mut held = match self.held.lock() {
             Ok(g) => g,
@@ -801,25 +837,62 @@ impl FetchLease {
         if held.is_some() {
             return true;
         }
-        let Ok(dir) = clauth_dir() else {
-            return false;
+        let taken = self.try_take_lease();
+        let fetched = taken.is_some();
+        if let Some(file) = taken {
+            *held = Some(file);
+        }
+        let transition = if fetched {
+            self.mark_acquired()
+        } else {
+            self.mark_stood_down()
         };
+        drop(held);
+        if let Some(line) = transition {
+            standdown_transition_log(line);
+        }
+        fetched
+    }
+
+    /// Take the lease file, or `None` when the attempt cannot yield one. Every
+    /// failure collapses here, so no failure can skip the caller's tail and
+    /// answer `false` without recording the stand-down.
+    fn try_take_lease(&self) -> Option<File> {
+        let dir = clauth_dir().ok()?;
         // The lease file lives in `~/.clauth`; ensure the dir exists (best-effort,
         // 0o700) so a first-run TUI with no daemon can still take the lease.
         // `serve()` already creates it for the daemon; a TUI normally reaches here
         // with the dir already present (profiles live in it).
         let _ = crate::profile::mkdir_700(&dir);
-        let Ok(file) = crate::profile::open_state_file(&dir.join(super::FETCH_LOCK_FILE)) else {
-            return false;
-        };
+        let file = crate::profile::open_state_file(&dir.join(super::FETCH_LOCK_FILE)).ok()?;
         match file.try_lock() {
-            Ok(()) => {
-                *held = Some(file);
-                true
-            }
-            Err(std::fs::TryLockError::WouldBlock) => false,
-            Err(std::fs::TryLockError::Error(_)) => false,
+            Ok(()) => Some(file),
+            Err(std::fs::TryLockError::WouldBlock | std::fs::TryLockError::Error(_)) => None,
         }
+    }
+
+    /// Record a stand-down and return the line to log when this call is the
+    /// false→true edge, so a tick that keeps losing the lease says so once.
+    /// The caller logs it after the `held` guard drops.
+    fn mark_stood_down(&self) -> Option<&'static str> {
+        (!self.stood_down.swap(true, Ordering::Relaxed)).then_some(STOOD_DOWN_LINE)
+    }
+
+    /// Record an acquire and return the line to log when this call is the
+    /// true→false edge. The caller logs it after the `held` guard drops.
+    fn mark_acquired(&self) -> Option<&'static str> {
+        self.stood_down
+            .swap(false, Ordering::Relaxed)
+            .then_some(ACQUIRED_LINE)
+    }
+
+    /// Whether this instance runs the usage fetches itself. `false` means it
+    /// mirrors another process's disk, so the deadline it publishes is its own
+    /// cache-mtime estimate rather than a fetch it is about to run. A lease not
+    /// yet tried reads `true`: an instance that has not stood down is the one
+    /// about to fetch.
+    pub(crate) fn fetches_here(&self) -> bool {
+        !self.stood_down.load(Ordering::Relaxed)
     }
 }
 

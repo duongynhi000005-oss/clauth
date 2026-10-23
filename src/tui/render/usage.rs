@@ -70,6 +70,9 @@ struct DiagFlags {
 struct HeaderState {
     activity: ProfileActivity,
     next_refresh_ms: Option<u64>,
+    /// Whether this instance runs the usage fetches itself (see
+    /// [`crate::usage::display_activity`]); a stood-down mirror reads `false`.
+    fetches_here: bool,
     tick: u64,
     /// Consecutive-failure counts for the shown profile (zeroed when absent).
     /// The retry suffix names which retry the countdown leads to, so a deep slot
@@ -251,6 +254,7 @@ fn draw_usage_detail(
             .lock()
             .ok()
             .and_then(|m| selected_next_refresh(&m, profile)),
+        fetches_here: app.fetch_lease.fetches_here(),
         tick: app.tick_count,
         streaks: {
             let mut s = streaks
@@ -1634,6 +1638,28 @@ fn status_lines(
     // never run. Both would be false claims, so the block ends here — with
     // nothing else wrong that leaves a single row and a lone `└`.
     if disabled {
+        return render_status_rows(rows, w);
+    }
+
+    // A deadline already past with no leg marked is the scheduler's fan-out
+    // window: the profile is due and the next tick on this instance fetches it,
+    // so the fetch row reads `queued` like a marked one rather than a countdown
+    // frozen at `0s`. Only the instance that fetches draws it — a stood-down
+    // mirror has no fan-out of its own, and `display_activity` leaves its row a
+    // countdown.
+    let activity = crate::usage::display_activity(
+        header.activity,
+        header.next_refresh_ms,
+        header.fetches_here,
+    );
+    if matches!(activity, ProfileActivity::Queued) {
+        rows.push(DiagRow {
+            content: vec![Span::styled(
+                format!("{} {}", spinner_frame(header.tick), activity_verb(activity)),
+                spinner_style(activity),
+            )],
+            hint: None,
+        });
         return render_status_rows(rows, w);
     }
 

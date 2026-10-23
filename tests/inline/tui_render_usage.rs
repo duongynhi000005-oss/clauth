@@ -1249,6 +1249,7 @@ fn header_lines_plan_falls_back_to_account_tier() {
     });
     // No `usage`, no `third_party_usage` → the plan-label fallback is exercised.
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1322,6 +1323,7 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         "fixture must be the hybrid shape, or this pins nothing"
     );
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1366,6 +1368,7 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
         }),
     });
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1419,6 +1422,7 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
             None => ReadingsSnapshot::default(),
         };
         let header = HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: None,
             tick: 0,
@@ -1537,6 +1541,7 @@ fn header_lines_kick_text_truncates_then_drops_on_tight_rows() {
         },
     );
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1589,6 +1594,7 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
     );
 
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1656,6 +1662,7 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
         Some("sk-fixture".to_string()),
     );
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1704,6 +1711,7 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
         },
     );
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1766,6 +1774,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
         },
     );
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1798,6 +1807,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
 fn disabled_rung_header(kick: bool) -> HeaderState {
     use crate::usage::KickBlock;
     HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1834,6 +1844,7 @@ fn status_text(ls: &[Line<'_>]) -> String {
 #[test]
 fn status_lines_renders_stale_cue_from_age_alone() {
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1874,6 +1885,7 @@ fn status_lines_stale_cue_coexists_with_cached_fetch_status() {
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
     let readings = snap_with_stale(readings, "a");
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1897,6 +1909,7 @@ fn status_lines_stale_prepends_the_fetch_row() {
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
     let readings = snap_with_stale(readings, "a");
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1958,6 +1971,7 @@ fn status_lines_keyless_third_party_renders_no_key_pill() {
         "a",
     );
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -2007,6 +2021,7 @@ fn status_lines_keyless_third_party_renders_no_key_pill() {
 #[test]
 fn status_lines_no_key_gate_is_the_work_lists_membership() {
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -2077,6 +2092,7 @@ fn status_lines_no_key_gate_is_the_work_lists_membership() {
 fn status_lines_oauth_profile_never_renders_no_key() {
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -2215,6 +2231,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
     let header = |kick_block: Option<KickBlock>| HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -2302,6 +2319,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 14_000),
             tick: 0,
@@ -2384,6 +2402,7 @@ fn status_lines_connects_two_plus_hints_into_one_rail() {
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 45_000),
             tick: 0,
@@ -2455,6 +2474,7 @@ fn status_lines_single_hint_has_no_rail() {
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Failed);
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 20_000),
         tick: 0,
@@ -2500,6 +2520,7 @@ fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 30_000),
             tick: 0,
@@ -2554,6 +2575,7 @@ fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 14_000),
             tick: 0,
@@ -2597,6 +2619,7 @@ fn rate_limited_suffix_counts_the_retry() {
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::RateLimited);
     let header = |streak: u32| HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -2641,6 +2664,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
     let header = |refresh_fail: u32| HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -2703,6 +2727,7 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
             .expect("a streak pill")
     };
     let header = |streaks: StreakCounts| HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -2774,6 +2799,7 @@ fn spent_skipped_account_pill_is_bare() {
             .join("\n")
     };
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -2830,6 +2856,7 @@ fn spent_skipped_account_pill_is_bare() {
 #[test]
 fn the_usage_teach_names_a_monthly_quota() {
     let header = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -3330,6 +3357,7 @@ fn status_lines_renders_the_auto_start_divergence() {
         joined(status_lines(
             &profile,
             &HeaderState {
+                fetches_here: true,
                 activity: ProfileActivity::Idle,
                 next_refresh_ms: Some(now_ms() + 90_000),
                 tick: 0,
@@ -3372,6 +3400,7 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
     let out = joined(status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 90_000),
             tick: 0,
@@ -3414,6 +3443,7 @@ fn auth_broken_suppresses_the_lesser_pills() {
     let out = joined(status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 90_000),
             tick: 0,
@@ -3473,6 +3503,7 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
     let out = joined(status_lines(
         &profile,
         &HeaderState {
+            fetches_here: true,
             activity: ProfileActivity::Idle,
             next_refresh_ms: None,
             tick: 0,
@@ -3580,6 +3611,7 @@ fn header_lines_pricing_row_only_with_windows() {
     let _home = crate::testutil::HomeSandbox::new();
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
     let base = HeaderState {
+        fetches_here: true,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,

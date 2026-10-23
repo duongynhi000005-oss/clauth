@@ -3810,12 +3810,20 @@ fn fetch_oauth_due_with_flagged<F>(
     });
 }
 
-/// Apply up to `expected` OAuth outcomes in the order their fetches COMPLETE
-/// (each worker sends on `rx` when its fetch returns). Per outcome: clear the
-/// spinner, propagate a rotated token pair into the live snapshot, read
-/// `is_active` at apply time, write the outcome, republish the countdown.
-/// Bounded by `expected`, and it bails the instant `rx` disconnects (every
-/// sender dropped) so a panicked worker's missing message can never wedge it.
+/// Stream up to `expected` completions in the order their fetches COMPLETE (each
+/// worker sends on `rx` when its fetch returns), so a slow entry never stalls a
+/// faster one's spinner-clear and countdown behind it in the `due` list (the
+/// join-order stall). Ends early if `rx` disconnects — every sender dropped — so
+/// a panicked worker's missing message can never wedge a leg. Both fetch legs
+/// drain through here; they differ only in what one landing does.
+fn drain_completions<T>(rx: &Receiver<T>, expected: usize) -> impl Iterator<Item = T> + '_ {
+    std::iter::from_fn(move || rx.recv().ok()).take(expected)
+}
+
+/// Apply up to `expected` OAuth outcomes in the order their fetches COMPLETE.
+/// Per outcome: clear the spinner, propagate a rotated token pair into the live
+/// snapshot, read `is_active` at apply time, write the outcome, republish the
+/// countdown.
 fn drain_oauth_completions(
     state: &SchedulerState,
     rx: &Receiver<FetchOutcome>,
@@ -3826,8 +3834,7 @@ fn drain_oauth_completions(
     // Each landing below takes its own short state-flock hold, but once one
     // landing or kick hold of the tick has timed out the batch's later
     // landings skip the flock without waiting and take the timeout path.
-    for _ in 0..expected {
-        let Ok(outcome) = rx.recv() else { break };
+    for outcome in drain_completions(rx, expected) {
         clear_fetch_activity(&state.activity, &FetchLeg::OAuth.key(outcome.name.clone()));
         // Re-anchor (A→B): the ride-along forgot the disk caches and seeded the
         // new plan in its hold; forget the old account's memory here (bump epoch,
@@ -3932,6 +3939,17 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
     fetch_third_party_due_flagged(state, due, None)
 }
 
+/// One third-party fetch's result plus the spawn-time identity its landing gates
+/// on, sent on the leg's completion channel.
+struct ThirdPartyOutcome {
+    name: ProfileName,
+    fingerprint: u64,
+    identity: Option<u64>,
+    epoch_at_spawn: u64,
+    is_generic: bool,
+    result: Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError>,
+}
+
 /// [`fetch_third_party_due`] with the tick's `timed_out` flag: once any landing
 /// or kick hold of the tick has timed out, the later landing holds skip the
 /// flock without waiting.
@@ -3949,6 +3967,8 @@ fn fetch_third_party_due_flagged(
         );
     }
 
+    let expected = due.len();
+    let (tx, rx) = std::sync::mpsc::channel::<ThirdPartyOutcome>();
     let fetcher = state.fetcher;
     let handles: Vec<_> = due
         .into_iter()
@@ -3977,18 +3997,41 @@ fn fetch_third_party_due_flagged(
             let host = entry.target.throttle_key();
             let activity = Arc::clone(&state.activity);
             let worker_key = FetchLeg::ThirdParty.key(entry.name.clone());
+            let outcome_name = name.clone();
+            let tx = tx.clone();
             let h = std::thread::spawn(move || {
                 await_request_slot(&host);
                 mark_fetch_activity(&activity, &worker_key, ProfileActivity::Fetching);
-                fetcher(&entry.target, &entry.api_key, hint.as_deref())
+                let result = fetcher(&entry.target, &entry.api_key, hint.as_deref());
+                // A drained receiver drops this; harmless. A panicking worker
+                // never reaches here and drops its sender, which ends the drain.
+                let _ = tx.send(ThirdPartyOutcome {
+                    name: outcome_name,
+                    fingerprint,
+                    identity,
+                    epoch_at_spawn,
+                    is_generic,
+                    result,
+                });
             });
-            (name, fingerprint, identity, epoch_at_spawn, is_generic, h)
+            (name, fingerprint, h)
         })
         .collect();
+    // Drop the spare sender so the drain unblocks once every worker's clone is
+    // gone (a panicked worker drops its clone on unwind).
+    drop(tx);
 
-    for (name, fingerprint, identity, epoch_at_spawn, is_generic, h) in handles {
-        match h.join() {
-            Ok(Ok(stats)) => {
+    for outcome in drain_completions(&rx, expected) {
+        let ThirdPartyOutcome {
+            name,
+            fingerprint,
+            identity,
+            epoch_at_spawn,
+            is_generic,
+            result,
+        } = outcome;
+        match result {
+            Ok(stats) => {
                 clear_fetch_activity(&state.activity, &FetchLeg::ThirdParty.key(name.clone()));
                 // Section 1: under the flock, the disk writes gate on the spawn
                 // identity still matching the stored one.
@@ -4028,7 +4071,7 @@ fn fetch_third_party_due_flagged(
                     ThirdPartyDeferral::Standard,
                 );
             }
-            Ok(Err(err)) => {
+            Err(err) => {
                 clear_fetch_activity(&state.activity, &FetchLeg::ThirdParty.key(name.clone()));
                 // Cache cold-fills an absent entry only — never overwrites live
                 // store data with disk state (same rule as the OAuth path).
@@ -4123,17 +4166,19 @@ fn fetch_third_party_due_flagged(
                     deferral,
                 );
             }
-            Err(_) => {
-                // Worker panicked — clear slot so the spinner doesn't freeze,
-                // and record Failed (the OAuth reap's reason applies here too:
-                // a panicked worker produces no outcome, so a Fresh status kept
-                // over an aging cache would be the one stale-behind-a-dot leak).
-                clear_fetch_activity(&state.activity, &FetchLeg::ThirdParty.key(name.clone()));
-                if let Ok(mut st) = state.third_party_status.lock() {
-                    st.insert(name.to_string(), FetchStatus::Failed);
-                }
-                update_third_party_broken(&state.third_party_broken, &name, false, fingerprint);
+        }
+    }
+
+    // Reap the workers. A panicked worker sent nothing, so its `Fetching` mark
+    // would freeze the spinner and a Fresh status would sit over an aging cache
+    // (the OAuth reap's reason); this is the only site left to clear either.
+    for (name, fingerprint, h) in handles {
+        if h.join().is_err() {
+            clear_fetch_activity(&state.activity, &FetchLeg::ThirdParty.key(name.clone()));
+            if let Ok(mut st) = state.third_party_status.lock() {
+                st.insert(name.to_string(), FetchStatus::Failed);
             }
+            update_third_party_broken(&state.third_party_broken, &name, false, fingerprint);
         }
     }
 }
@@ -4289,6 +4334,36 @@ pub(crate) fn selected_next_refresh(
         .copied()
 }
 
+/// The activity a display surface shows for a profile's fetch slot: `selected`,
+/// except an [`ProfileActivity::Idle`] one whose published deadline is at or
+/// before now reads [`ProfileActivity::Queued`].
+///
+/// Countdowns publish once at a tick's start and the tick thread then blocks
+/// for the whole fan-out, so a profile that falls due inside that window has a
+/// past deadline and no mark raised for it. Deriving the cue from the deadline
+/// keeps that row honest (a spinner, never a frozen `0s`) without a second
+/// writer, and routing both the Overview timer slot and the Usage status row
+/// through here keeps the two tabs from reading the same row differently.
+///
+/// `fetches_here` scopes the derivation to the instance that runs the fetches
+/// itself. A stood-down instance mirrors another process's disk, and the
+/// deadline it publishes there is its own cache-mtime estimate — nothing on it
+/// is about to fetch, so its rows keep their countdown and staleness cue.
+pub(crate) fn display_activity(
+    selected: ProfileActivity,
+    next_refresh: Option<u64>,
+    fetches_here: bool,
+) -> ProfileActivity {
+    match selected {
+        ProfileActivity::Idle
+            if fetches_here && next_refresh.is_some_and(|next| next <= now_ms()) =>
+        {
+            ProfileActivity::Queued
+        }
+        selected => selected,
+    }
+}
+
 /// Every profile that could own a `usage_history.jsonl`, disabled and
 /// third-party included. Deliberately WIDER than [`collect_tokens`]'s work-list
 /// and than [`collect_oauth_seed_names`]: retention is a property of the file on
@@ -4387,9 +4462,6 @@ pub(crate) struct SchedulerState {
     /// fetcher, and with the tick thread so the flock stays held for the process
     /// lifetime.
     fetch_lease: Arc<crate::daemon::FetchLease>,
-    /// Whether the previous tick stood down — transition edges get one log
-    /// line each way, never a per-tick repeat.
-    standdown_active: AtomicBool,
     /// Whether a display surface reads THIS process's third-party usage store
     /// (a TUI's Usage tab / chain render). A headless daemon has none, so its
     /// stand-down hydration seeds the work list, never the display superset — a
@@ -4476,7 +4548,6 @@ impl SchedulerState {
             suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),
             fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-            standdown_active: AtomicBool::new(false),
             display_reader: false,
             last_history_prune: AtomicU64::new(now_ms()),
             claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
@@ -4645,17 +4716,8 @@ pub(crate) fn tick(state: &SchedulerState) {
     // exiting (flock auto-released on process death). An unreadable lock stands
     // down too: an io error is never a licence to dup-fetch.
     if !state.fetch_lease.acquire() {
-        if !state.standdown_active.swap(true, Ordering::Relaxed) {
-            standdown_transition_log(
-                "clauth: another instance holds the usage-fetch lease: standing \
-                 down (rendering from the shared cache)",
-            );
-        }
         standdown_tick(state, interval_ms);
         return;
-    }
-    if state.standdown_active.swap(false, Ordering::Relaxed) {
-        standdown_transition_log("clauth: acquired the usage-fetch lease: fetching");
     }
 
     // Retention trim for the logs this process appends to. Under the lease, so
@@ -4709,7 +4771,7 @@ pub(crate) fn tick(state: &SchedulerState) {
     // instead of spending a tick on a 401 the kick then has to undo.
     //
     // One per-tick `timed_out` flag, handed to the codex leg (this thread),
-    // the OAuth drain + kick workers, and the third-party join loop below: once
+    // the OAuth drain + kick workers, and the third-party drain below: once
     // ANY landing or kick hold of the tick has timed out, the tick's later
     // landing and kick holds skip the flock without waiting, so a peer's flock
     // hold stalls the tick at most once (cloudy 2026-10-17).
@@ -4891,8 +4953,8 @@ pub(crate) fn tick(state: &SchedulerState) {
         .chain(tp_due.iter().map(NamedEntry::key))
         .collect();
 
-    // Both legs fan out concurrently so the third-party leg no longer waits behind
-    // the OAuth join loop. Per-host pacing (`await_request_slot`) keeps accounts on
+    // Both legs fan out concurrently, so neither waits behind the other's
+    // fan-out. Per-host pacing (`await_request_slot`) keeps accounts on
     // the same endpoint serialized while distinct hosts (the Anthropic OAuth host vs
     // each api-key provider) run in parallel. The scope joins the third-party leg
     // before the post-fetch scans below, preserving their "both legs done" ordering.
@@ -4901,8 +4963,8 @@ pub(crate) fn tick(state: &SchedulerState) {
             let flag = Arc::clone(&timed_out);
             move || {
                 s.spawn(move || {
-                    // The third-party join loop shares the tick's `timed_out`
-                    // flag, never a private one.
+                    // The third-party drain shares the tick's `timed_out` flag,
+                    // never a private one.
                     fetch_third_party_due_flagged(state, tp_due, Some(flag.as_ref()));
                 })
             }
@@ -5232,15 +5294,6 @@ fn apply_codex_switch(
     }
 }
 
-/// Log a stand-down / lease-acquired transition. Either the TUI or the daemon
-/// can stand down now (whichever didn't win the lease). `logline!` routes the
-/// daemon's line to `daemon.log` and an interactive TUI's to
-/// `~/.clauth/clauth.log`, so it is recorded without ever painting over the
-/// accounts pane.
-fn standdown_transition_log(msg: &str) {
-    logline!("{msg}");
-}
-
 /// One scheduler tick while a live daemon owns the loop. The daemon
 /// fetches, rotates, and decides switches; this side only re-reads its work
 /// product so the UI stays current:
@@ -5526,7 +5579,6 @@ pub(crate) fn spawn_refresher(
         suppressed_auth_expired,
         shutting_down,
         fetch_lease,
-        standdown_active: AtomicBool::new(false),
         display_reader,
         last_history_prune,
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
