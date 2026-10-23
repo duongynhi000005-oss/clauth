@@ -6241,8 +6241,7 @@ impl App {
         // The caption names where the walk lands, so it honours the live skip
         // set — but it runs every frame, so it READS the set as the last scan
         // left it (no `stored_login` read, no write): the scan already heals
-        // each cadence, and a per-frame disk read on the render path is what
-        // `docs/tui-design.md`'s "never per frame" bars.
+        // each cadence, and the render path never reads disk per frame.
         snapshot.skipped_unreadable =
             crate::usage::read_skipped_unreadable(&self.skipped_unreadable)
                 .into_iter()
