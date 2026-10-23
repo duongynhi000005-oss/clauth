@@ -20089,6 +20089,20 @@ fn a_modal_drops_the_herdr_landing_and_f_drops_it() {
     );
 }
 
+/// `with_full_sprite(false)` reaches the header: the logo's top row is the
+/// simplified mascot's body-edge band, not the full sprite's arm-and-eye row.
+#[test]
+fn with_full_sprite_false_paints_the_simplified_logo_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app().with_full_sprite(false);
+    app.anim_phase_ms = Some(5_000);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+    let row: String = (0..10).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+    assert_eq!(row, "▗ ▗   ▖ ▖ ");
+}
+
 /// With no modal, the landing is the first tick's after the probe result is
 /// sent: `on_tick` drains the probe before its 1 s Services refresh, and the
 /// refresh is held off here so only the drain can land it. A probe that

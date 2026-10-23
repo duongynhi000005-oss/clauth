@@ -3,16 +3,23 @@
 //! The sprite, its pose tables and its fifteen animations are extracted from
 //! Claude Code 2.1.309 (its embedded build `1ce7e4ff2da8d4b0…`), where the
 //! same component paints the wordmark's left column. Frames advance on the
-//! TUI's own 80 ms tick rather than the source's 60 ms redraw, so every frame
-//! is shown once at the cadence the rest of the TUI animates at.
+//! TUI's own 80 ms tick rather than the source's 60 ms redraw: the frame index
+//! is `elapsed / 80 ms`, so a frame whose tick runs late is skipped rather
+//! than queued, and an extra draw repeats the current frame.
 //!
-//! Idle motion is the five in-place animations (eyes, arms, feet): one every
-//! ten seconds, replacing the old one-frame blink. The ten travelling or
-//! turning ones play as the bigger moment on launch and every thirty minutes.
-//! cloud code also gates the full sprite behind a non-Apple-Terminal check and
-//! paints poof/shadow effects in its `inactive` colour; both are ported, the
-//! terminal fallback's simplified eyes are not. The ultra-effort wand beside
-//! the sprite is untouched.
+//! Claude Code withholds the full sprite on Apple's Terminal.app and paints a
+//! simplified one there instead; the verdict is read once from `TERM_PROGRAM`
+//! at TUI startup and carried in as a bool. Both arms are ported: the
+//! simplified sprite, and the source's filter that drops facing sequences and
+//! animations whose first frame reads as the rest pose, when the simplified
+//! arm is in use. Not ported: the source's `prefersReducedMotion` check, which
+//! turns the animation off entirely, since clauth has no such setting.
+//!
+//! Idle motion is the short idle set — look, wink, boop, tap, sneeze — one
+//! every ten seconds. The longer set — jump, celebrate, skip, spin, peekaboo,
+//! drop, waddle, peek, turn, coin-hop — plays on launch and every thirty
+//! minutes; `celebrate` is clauth's addition to Claude Code's pool. Poof and
+//! shadow marks paint in the source's `inactive` colour.
 
 use std::sync::LazyLock;
 
@@ -24,7 +31,17 @@ const FRAME_MS: u64 = 80;
 const SUBTLE_PERIOD_MS: u64 = 10_000;
 const BIG_PERIOD_MS: u64 = 30 * 60 * 1000;
 
-const ANIM_COUNT: usize = 15;
+/// The startup gate: `false` selects the simplified sprite arm, the one
+/// Claude Code paints on Apple's Terminal.app (see the module doc). Only
+/// `TERM_PROGRAM` is consulted. Claude Code's own gate (as of 2.1.309)
+/// checks other variables first, e.g. `CURSOR_TRACE_ID`,
+/// `TERMINAL_EMULATOR=JetBrains-JediTerm` or a `kitty` `TERM`,
+/// so a Terminal.app pane that exports one of them paints simplified here
+/// where Claude Code paints full; the reverse cannot happen, since Claude Code
+/// answers `Apple_Terminal` only from the raw `TERM_PROGRAM` read.
+pub(crate) fn full_sprite(term_program: Option<&str>) -> bool {
+    term_program != Some("Apple_Terminal")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Eyes {
@@ -169,8 +186,27 @@ impl Anim {
         }
     }
 
+    /// The animation's frames. A match, not an index into the table, so a new
+    /// variant fails to compile here instead of panicking at runtime.
     fn frames(self) -> &'static [Frame] {
-        ANIMS[self as usize].as_slice()
+        let anims = &*ANIMS;
+        match self {
+            Self::Jump => &anims.jump,
+            Self::Look => &anims.look,
+            Self::Celebrate => &anims.celebrate,
+            Self::Skip => &anims.skip,
+            Self::Spin => &anims.spin,
+            Self::Peekaboo => &anims.peekaboo,
+            Self::Drop => &anims.drop,
+            Self::Waddle => &anims.waddle,
+            Self::Peek => &anims.peek,
+            Self::Wink => &anims.wink,
+            Self::Boop => &anims.boop,
+            Self::Tap => &anims.tap,
+            Self::Sneeze => &anims.sneeze,
+            Self::Turn => &anims.turn,
+            Self::CoinHop => &anims.coin_hop,
+        }
     }
 }
 
@@ -192,7 +228,26 @@ const BIG: [Anim; 10] = [
     Anim::CoinHop,
 ];
 
-static ANIMS: LazyLock<[Vec<Frame>; ANIM_COUNT]> = LazyLock::new(build_anims);
+/// The frame table, one named field per animation.
+struct Anims {
+    jump: Vec<Frame>,
+    look: Vec<Frame>,
+    celebrate: Vec<Frame>,
+    skip: Vec<Frame>,
+    spin: Vec<Frame>,
+    peekaboo: Vec<Frame>,
+    drop: Vec<Frame>,
+    waddle: Vec<Frame>,
+    peek: Vec<Frame>,
+    wink: Vec<Frame>,
+    boop: Vec<Frame>,
+    tap: Vec<Frame>,
+    sneeze: Vec<Frame>,
+    turn: Vec<Frame>,
+    coin_hop: Vec<Frame>,
+}
+
+static ANIMS: LazyLock<Anims> = LazyLock::new(build_anims);
 
 fn frame(pose: Pose, opts: Opts) -> Frame {
     Frame {
@@ -227,7 +282,7 @@ fn push_poof_pair(frames: &mut Vec<Frame>) {
     ));
 }
 
-/// The eye-close + rest pair most sequences land on.
+/// The eye-close + rest pair several sequences land on.
 fn push_blink(frames: &mut Vec<Frame>) {
     push(frames, CLOSED, 1, Opts::default());
     frames.push(frame(DEFAULT, Opts::default()));
@@ -256,7 +311,7 @@ fn jump_frames() -> Vec<Frame> {
     frames
 }
 
-fn build_anims() -> [Vec<Frame>; ANIM_COUNT] {
+fn build_anims() -> Anims {
     let jump = jump_frames();
 
     let mut look = Vec::new();
@@ -660,40 +715,60 @@ fn build_anims() -> [Vec<Frame>; ANIM_COUNT] {
     push_poof_pair(&mut coin_hop);
     push(&mut coin_hop, DEFAULT, 1, Opts::default());
 
-    [
-        jump, look, celebrate, skip, spin, peekaboo, drop, waddle, peek, wink, boop, tap, sneeze,
-        turn, coin_hop,
-    ]
+    Anims {
+        jump,
+        look,
+        celebrate,
+        skip,
+        spin,
+        peekaboo,
+        drop,
+        waddle,
+        peek,
+        wink,
+        boop,
+        tap,
+        sneeze,
+        turn,
+        coin_hop,
+    }
 }
 
 /// One rendered cell: the glyph plus what its colours mean. Only the header
-/// maps kinds to styles, so the sprite tables stay colour-free.
+/// maps kinds to styles, so the sprite tables stay colour-free. A body glyph
+/// and an eye cut-out share [`CellKind::Body`], and a turned pose's body
+/// glyphs and facing cut-outs share [`CellKind::FacingBody`]: the header's
+/// paragraph already paints the app background under every cell, so the
+/// source's `clawd_background` cut-outs are the plain surface here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CellKind {
     Empty,
     Body,
-    /// Body-coloured glyph over the app background — the eye cut-outs.
-    Eye,
-    /// Background-coloured glyph on the body — closed lids and winks.
+    /// Background-coloured glyph on the body — closed lids, winks, and the
+    /// simplified sprite's filled body block.
     Lid,
     FacingBody,
-    /// The turned-away cut in a facing frame, over the app background.
-    FacingCut,
     /// Poof and shadow marks, the source's `inactive` colour.
     Inactive,
 }
 
 pub(crate) type Art = [[(char, CellKind); COLS]; ROWS];
 
-pub(crate) fn rest_art() -> Art {
-    render(&REST)
+pub(crate) fn rest_art(full_sprite: bool) -> Art {
+    render(&REST, full_sprite)
 }
 
-pub(crate) fn render(frame: &Frame) -> Art {
+/// Draw one frame. `full_sprite` is the startup verdict: `false` paints the
+/// simplified sprite instead (see the module doc).
+pub(crate) fn render(frame: &Frame, full_sprite: bool) -> Art {
     let mut art = [[(' ', CellKind::Empty); COLS]; ROWS];
-    match frame.pose {
-        Pose::Face { eyes, arms, feet } => draw_face(&mut art, eyes, arms, feet),
-        Pose::Facing(facing) => draw_facing(&mut art, facing),
+    match (frame.pose, full_sprite) {
+        (Pose::Face { eyes, arms, feet }, true) => draw_face(&mut art, eyes, arms, feet),
+        (Pose::Facing(facing), true) => draw_facing(&mut art, facing),
+        (Pose::Face { eyes, .. }, false) => draw_simplified(&mut art, eyes),
+        // The simplified sprite carries one eye pair and no facings, so every
+        // turned pose paints as an open face, as the source does.
+        (Pose::Facing(_), false) => draw_simplified(&mut art, Eyes::Open),
     }
     if frame.offset != 0 || frame.x != 0 {
         art = shift(&art, frame.x, frame.offset);
@@ -702,12 +777,38 @@ pub(crate) fn render(frame: &Frame) -> Art {
     art
 }
 
+/// The source's simplified sprite: a body edge either side of a body-filled
+/// eye band, a solid body row, then the short feet row. No arms, foot poses
+/// or facings exist in this arm.
+fn draw_simplified(art: &mut Art, eyes: Eyes) {
+    let band = match eyes {
+        Eyes::Open => " \u{2597}   \u{2596} ",
+        Eyes::Left => " \u{2598}   \u{2598} ",
+        Eyes::Right => " \u{259D}   \u{259D} ",
+        Eyes::Closed => " \u{2582}   \u{2582} ",
+        Eyes::Wink => " \u{2597}   \u{2582} ",
+    };
+    place(art, 0, 0, "\u{2597}", CellKind::Body);
+    place(art, 1, 0, band, CellKind::Lid);
+    place(art, 8, 0, "\u{2596}", CellKind::Body);
+    for col in 1..8 {
+        place_cell(art, col, 1, ' ', CellKind::Lid);
+    }
+    place(
+        art,
+        1,
+        2,
+        "\u{2598}\u{2598}   \u{259D}\u{259D}",
+        CellKind::Body,
+    );
+}
+
 fn draw_face(art: &mut Art, eyes: Eyes, arms: Arms, feet: Feet) {
     let arm = arm_art(arms);
     place(art, 0, 0, arm.r1l, CellKind::Body);
     let mut col = 2;
     for &(glyphs, lid) in eye_spans(eyes) {
-        let kind = if lid { CellKind::Lid } else { CellKind::Eye };
+        let kind = if lid { CellKind::Lid } else { CellKind::Body };
         for glyph in glyphs.chars() {
             place_cell(art, col, 0, glyph, kind);
             col += 1;
@@ -720,22 +821,15 @@ fn draw_face(art: &mut Art, eyes: Eyes, arms: Arms, feet: Feet) {
         2,
         1,
         "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
-        CellKind::Eye,
+        CellKind::Body,
     );
     place(art, 7, 1, arm.r2r, CellKind::Body);
     place(art, 0, 2, feet_art(feet), CellKind::Body);
 }
 
 fn draw_facing(art: &mut Art, facing: Facing) {
-    for (row, &(glyphs, from, to)) in facing_rows(facing).iter().enumerate() {
-        for (col, glyph) in glyphs.chars().enumerate() {
-            let kind = if (from..to).contains(&col) {
-                CellKind::FacingCut
-            } else {
-                CellKind::FacingBody
-            };
-            place_cell(art, col, row, glyph, kind);
-        }
+    for (row, &glyphs) in facing_rows(facing).iter().enumerate() {
+        place(art, 0, row, glyphs, CellKind::FacingBody);
     }
 }
 
@@ -845,107 +939,71 @@ fn feet_art(feet: Feet) -> &'static str {
     }
 }
 
-fn facing_rows(facing: Facing) -> &'static [(&'static str, usize, usize)] {
-    const RIGHT_12: &[(&str, usize, usize)] = &[
-        (
-            " \u{2590}\u{2588}\u{259c}\u{2588}\u{2588}\u{259b}\u{2588} ",
-            2,
-            8,
-        ),
-        (
-            "\u{259d}\u{259c}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}",
-            2,
-            7,
-        ),
-        (" \u{259d}\u{259d}   \u{259d}\u{259d} ", 0, 0),
+fn facing_rows(facing: Facing) -> &'static [&'static str] {
+    const RIGHT_12: &[&str] = &[
+        " \u{2590}\u{2588}\u{259c}\u{2588}\u{2588}\u{259b}\u{2588} ",
+        "\u{259d}\u{259c}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}",
+        " \u{259d}\u{259d}   \u{259d}\u{259d} ",
     ];
-    const RIGHT_30: &[(&str, usize, usize)] = &[
-        ("  \u{2588}\u{259b}\u{2588}\u{2588}\u{259b}\u{258c} ", 2, 7),
-        (
-            " \u{259d}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{259b} ",
-            2,
-            7,
-        ),
-        ("  \u{2598}\u{2598}  \u{2598}\u{2598} ", 0, 0),
+    const RIGHT_30: &[&str] = &[
+        "  \u{2588}\u{259b}\u{2588}\u{2588}\u{259b}\u{258c} ",
+        " \u{259d}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{259b} ",
+        "  \u{2598}\u{2598}  \u{2598}\u{2598} ",
     ];
-    const RIGHT_55: &[(&str, usize, usize)] = &[
-        ("  \u{2590}\u{2588}\u{259b}\u{2588}\u{259c}  ", 3, 7),
-        ("  \u{2590}\u{2588}\u{2588}\u{2588}\u{2588}  ", 3, 7),
-        ("  \u{259d}\u{259d} \u{259d}\u{259d}  ", 0, 0),
+    const RIGHT_55: &[&str] = &[
+        "  \u{2590}\u{2588}\u{259b}\u{2588}\u{259c}  ",
+        "  \u{2590}\u{2588}\u{2588}\u{2588}\u{2588}  ",
+        "  \u{259d}\u{259d} \u{259d}\u{259d}  ",
     ];
-    const RIGHT_75: &[(&str, usize, usize)] = &[
-        ("   \u{2588}\u{2588}\u{259b}\u{258c}  ", 3, 6),
-        ("   \u{2588}\u{2588}\u{2588}\u{258c}  ", 3, 6),
-        ("   \u{2598}  \u{2598}  ", 0, 0),
+    const RIGHT_75: &[&str] = &[
+        "   \u{2588}\u{2588}\u{259b}\u{258c}  ",
+        "   \u{2588}\u{2588}\u{2588}\u{258c}  ",
+        "   \u{2598}  \u{2598}  ",
     ];
-    const EDGE: &[(&str, usize, usize)] = &[
-        ("   \u{2590}\u{2588}\u{2588}   ", 4, 6),
-        ("   \u{2590}\u{2588}\u{2588}   ", 4, 6),
-        ("   \u{259d} \u{259d}   ", 0, 0),
+    const EDGE: &[&str] = &[
+        "   \u{2590}\u{2588}\u{2588}   ",
+        "   \u{2590}\u{2588}\u{2588}   ",
+        "   \u{259d} \u{259d}   ",
     ];
-    const BACK_105: &[(&str, usize, usize)] = &[
-        ("   \u{2588}\u{2588}\u{2588}\u{258c}  ", 3, 6),
-        ("   \u{2588}\u{2588}\u{2588}\u{258c}  ", 3, 6),
-        ("   \u{2598}  \u{2598}  ", 0, 0),
+    const BACK_105: &[&str] = &[
+        "   \u{2588}\u{2588}\u{2588}\u{258c}  ",
+        "   \u{2588}\u{2588}\u{2588}\u{258c}  ",
+        "   \u{2598}  \u{2598}  ",
     ];
-    const BACK_125: &[(&str, usize, usize)] = &[
-        ("  \u{2590}\u{2588}\u{2588}\u{2588}\u{2588}  ", 3, 7),
-        ("  \u{2590}\u{2588}\u{2588}\u{2588}\u{2588}  ", 3, 7),
-        ("  \u{259d}\u{259d} \u{259d}\u{259d}  ", 0, 0),
+    const BACK_125: &[&str] = &[
+        "  \u{2590}\u{2588}\u{2588}\u{2588}\u{2588}  ",
+        "  \u{2590}\u{2588}\u{2588}\u{2588}\u{2588}  ",
+        "  \u{259d}\u{259d} \u{259d}\u{259d}  ",
     ];
-    const BACK_150: &[(&str, usize, usize)] = &[
-        ("  \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{258c} ", 2, 7),
-        (
-            " \u{259d}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{259b} ",
-            2,
-            7,
-        ),
-        ("  \u{2598}\u{2598}  \u{2598}\u{2598} ", 0, 0),
+    const BACK_150: &[&str] = &[
+        "  \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{258c} ",
+        " \u{259d}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{259b} ",
+        "  \u{2598}\u{2598}  \u{2598}\u{2598} ",
     ];
-    const BACK: &[(&str, usize, usize)] = &[
-        (
-            " \u{2590}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} ",
-            2,
-            8,
-        ),
-        (
-            "\u{259d}\u{259c}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}",
-            2,
-            7,
-        ),
-        (" \u{259d}\u{259d}   \u{259d}\u{259d} ", 0, 0),
+    const BACK: &[&str] = &[
+        " \u{2590}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588} ",
+        "\u{259d}\u{259c}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}",
+        " \u{259d}\u{259d}   \u{259d}\u{259d} ",
     ];
-    const LEFT_75: &[(&str, usize, usize)] = &[
-        ("   \u{259b}\u{2588}\u{2588}\u{258c}  ", 3, 6),
-        ("   \u{2588}\u{2588}\u{2588}\u{258c}  ", 3, 6),
-        ("   \u{2598}  \u{2598}  ", 0, 0),
+    const LEFT_75: &[&str] = &[
+        "   \u{259b}\u{2588}\u{2588}\u{258c}  ",
+        "   \u{2588}\u{2588}\u{2588}\u{258c}  ",
+        "   \u{2598}  \u{2598}  ",
     ];
-    const LEFT_55: &[(&str, usize, usize)] = &[
-        ("  \u{2590}\u{259c}\u{259b}\u{2588}\u{2588}  ", 3, 7),
-        ("  \u{2590}\u{2588}\u{2588}\u{2588}\u{2588}  ", 3, 7),
-        ("  \u{259d}\u{259d} \u{259d}\u{259d}  ", 0, 0),
+    const LEFT_55: &[&str] = &[
+        "  \u{2590}\u{259c}\u{259b}\u{2588}\u{2588}  ",
+        "  \u{2590}\u{2588}\u{2588}\u{2588}\u{2588}  ",
+        "  \u{259d}\u{259d} \u{259d}\u{259d}  ",
     ];
-    const LEFT_30: &[(&str, usize, usize)] = &[
-        ("  \u{259b}\u{2588}\u{2588}\u{259b}\u{2588}\u{258c} ", 2, 7),
-        (
-            " \u{259d}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{259b} ",
-            2,
-            7,
-        ),
-        ("  \u{2598}\u{2598}  \u{2598}\u{2598} ", 0, 0),
+    const LEFT_30: &[&str] = &[
+        "  \u{259b}\u{2588}\u{2588}\u{259b}\u{2588}\u{258c} ",
+        " \u{259d}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{259b} ",
+        "  \u{2598}\u{2598}  \u{2598}\u{2598} ",
     ];
-    const LEFT_12: &[(&str, usize, usize)] = &[
-        (
-            " \u{2590}\u{259b}\u{2588}\u{2588}\u{2588}\u{259c}\u{2588} ",
-            2,
-            8,
-        ),
-        (
-            "\u{259d}\u{259c}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}",
-            2,
-            7,
-        ),
-        (" \u{259d}\u{259d}   \u{259d}\u{259d} ", 0, 0),
+    const LEFT_12: &[&str] = &[
+        " \u{2590}\u{259b}\u{2588}\u{2588}\u{2588}\u{259c}\u{2588} ",
+        "\u{259d}\u{259c}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}",
+        " \u{259d}\u{259d}   \u{259d}\u{259d} ",
     ];
     match facing {
         Facing::Right12 => RIGHT_12,
@@ -964,6 +1022,54 @@ fn facing_rows(facing: Facing) -> &'static [(&'static str, usize, usize)] {
     }
 }
 
+/// The pools the simplified sprite can animate: Claude Code keeps only the
+/// animations that read as motion without a facing or a rest-pose opening.
+static SUBTLE_SIMPLIFIED: LazyLock<Vec<Anim>> = LazyLock::new(|| simplified_pool(&SUBTLE));
+static BIG_SIMPLIFIED: LazyLock<Vec<Anim>> = LazyLock::new(|| simplified_pool(&BIG));
+
+fn simplified_pool(pool: &[Anim]) -> Vec<Anim> {
+    pool.iter()
+        .copied()
+        .filter(|&anim| reads_as_motion(anim))
+        .collect()
+}
+
+/// Claude Code's filter for the simplified sprite: it cannot show a facing,
+/// and an animation whose first frame has open eyes and no offset reads as the
+/// rest pose.
+fn reads_as_motion(anim: Anim) -> bool {
+    let frames = anim.frames();
+    let Some(first) = frames.first() else {
+        return false;
+    };
+    if frames
+        .iter()
+        .any(|frame| matches!(frame.pose, Pose::Facing(_)))
+    {
+        return false;
+    }
+    match first.pose {
+        Pose::Face { eyes, .. } => eyes != Eyes::Open || first.offset != 0 || first.x != 0,
+        Pose::Facing(_) => false,
+    }
+}
+
+fn subtle_pool(full_sprite: bool) -> &'static [Anim] {
+    if full_sprite {
+        &SUBTLE
+    } else {
+        SUBTLE_SIMPLIFIED.as_slice()
+    }
+}
+
+fn big_pool(full_sprite: bool) -> &'static [Anim] {
+    if full_sprite {
+        &BIG
+    } else {
+        BIG_SIMPLIFIED.as_slice()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Playing {
     anim: Anim,
@@ -978,19 +1084,22 @@ pub(crate) struct Clawd {
     next_subtle_ms: u64,
     next_big_ms: u64,
     seed: u64,
+    /// The startup verdict on `TERM_PROGRAM`. False paints the simplified arm
+    /// and restricts the animation pools to what still reads there.
+    pub(crate) full_sprite: bool,
 }
 
 impl Clawd {
     pub(crate) fn new() -> Self {
-        let mut clawd = Self {
+        Self {
             playing: None,
             next_subtle_ms: SUBTLE_PERIOD_MS,
-            next_big_ms: BIG_PERIOD_MS,
+            // Zero, so the first tick (always after the first paint) opens the
+            // launch animation; startup work before it cannot clip it.
+            next_big_ms: 0,
             seed: random_seed(),
-        };
-        let anim = BIG[clawd.pick(BIG.len())];
-        clawd.playing = Some(Playing { anim, start_ms: 0 });
-        clawd
+            full_sprite: true,
+        }
     }
 
     pub(crate) fn tick(&mut self, now_ms: u64) {
@@ -1002,7 +1111,8 @@ impl Clawd {
             self.playing = None;
         }
         if now_ms >= self.next_big_ms {
-            let anim = BIG[self.pick(BIG.len())];
+            let pool = big_pool(self.full_sprite);
+            let anim = pool[self.pick(pool.len())];
             self.playing = Some(Playing {
                 anim,
                 start_ms: now_ms,
@@ -1012,7 +1122,8 @@ impl Clawd {
             // lands a full period after it rather than in its shadow.
             self.next_subtle_ms = now_ms.saturating_add(SUBTLE_PERIOD_MS);
         } else if now_ms >= self.next_subtle_ms {
-            let anim = SUBTLE[self.pick(SUBTLE.len())];
+            let pool = subtle_pool(self.full_sprite);
+            let anim = pool[self.pick(pool.len())];
             self.playing = Some(Playing {
                 anim,
                 start_ms: now_ms,
@@ -1055,12 +1166,14 @@ fn random_seed() -> u64 {
     let mut bytes = [0u8; 8];
     match getrandom::fill(&mut bytes) {
         Ok(()) => u64::from_le_bytes(bytes) | 1,
+        // Cosmetic choice only: a fixed pick is a fine fallback for a failed
+        // entropy read, and the seed must stay non-zero for the xorshift.
         Err(_) => 1,
     }
 }
 
 /// Render tests sample specific animations; a fixed seed keeps every run on
-/// the same choice. The player tests overwrite it where they need another.
+/// the same choice.
 #[cfg(test)]
 fn random_seed() -> u64 {
     0x9E37_79B9_7F4A_7C15

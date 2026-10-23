@@ -4,6 +4,7 @@ use crate::tui::app::{App, Tab};
 use crate::usage::{UsageInfo, UsageWindow};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::style::Color;
 use std::collections::BTreeMap;
 
 fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>) {
@@ -106,6 +107,35 @@ fn render_header_rows(app: &App, width: u16) -> Vec<String> {
     })
     .unwrap();
     crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// The logo column's cells as `(glyph, fg, bg)`: a style claim pins the whole
+/// row rather than the cells a defect happens to leave alone.
+fn styled_logo_rows(app: &App, width: u16) -> Vec<Vec<(String, Color, Color)>> {
+    let height = header_height(app);
+    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let readings = app.readings_snapshot();
+    term.draw(|f| {
+        let area = f.area();
+        super::draw(f, area, app, &readings);
+    })
+    .unwrap();
+    let buf = term.backend().buffer();
+    (0..header_height(app))
+        .map(|y| {
+            (0..10)
+                .map(|x| {
+                    let cell = &buf[(x, y)];
+                    (cell.symbol().to_string(), cell.fg, cell.bg)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// One expected `(glyph, fg, bg)` cell.
+fn styled(glyph: &str, fg: Color, bg: Color) -> (String, Color, Color) {
+    (glyph.to_string(), fg, bg)
 }
 
 /// A header row's content past the claude-glyph column (0..10).
@@ -1705,31 +1735,165 @@ fn the_header_logo_rests_on_the_clawd_default_pose() {
 
 /// A closed lid inverts: background-coloured glyph over the body colour, the
 /// way claude code paints it. The open eye's background is the app's own, not
-/// a black box over the themed surface.
+/// a black box over the themed surface. Every cell of every logo row is
+/// pinned, so a kind-to-style regression anywhere in the sprite reds this.
 #[test]
 fn the_wink_frame_paints_its_lid_over_the_body_colour() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.clawd.play(crate::tui::clawd::Anim::Wink, 0);
     app.anim_phase_ms = Some(0);
-    let mut term = Terminal::new(TestBackend::new(80, header_height(&app))).unwrap();
-    let readings = app.readings_snapshot();
-    term.draw(|f| {
-        let area = f.area();
-        super::draw(f, area, &app, &readings);
-    })
-    .unwrap();
-    let buf = term.backend().buffer();
-    let lid = buf.cell((6, 0)).expect("lid cell");
-    assert_eq!(lid.symbol(), "▂");
-    assert_eq!(
-        lid.fg,
-        crate::tui::theme::base().bg.expect("themed background")
-    );
-    assert_eq!(lid.bg, crate::tui::theme::accent_2_color());
-    let eye = buf.cell((2, 0)).expect("eye cell");
-    assert_eq!(
-        eye.bg,
-        crate::tui::theme::base().bg.expect("themed background")
-    );
+    use crate::tui::theme;
+    let bg = theme::bg();
+    let body = theme::accent_2_color();
+    let text = theme::text_color();
+    let want = [
+        vec![
+            styled(" ", body, bg),
+            styled("▐", body, bg),
+            styled("▛", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("▂", bg, body),
+            styled("█", body, bg),
+            styled(" ", text, bg),
+            styled(" ", text, bg),
+        ],
+        vec![
+            styled("▝", body, bg),
+            styled("▜", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("▀", body, bg),
+            styled(" ", text, bg),
+        ],
+        vec![
+            styled(" ", body, bg),
+            styled("▝", body, bg),
+            styled("▝", body, bg),
+            styled(" ", body, bg),
+            styled(" ", body, bg),
+            styled(" ", body, bg),
+            styled("▝", body, bg),
+            styled("▝", body, bg),
+            styled(" ", body, bg),
+            styled(" ", text, bg),
+        ],
+    ];
+    assert_eq!(styled_logo_rows(&app, 80), want.to_vec());
+}
+
+/// A poof/shadow frame: the shadow marks paint in the source's `inactive`
+/// colour, and every other logo cell in the row is the body colour.
+#[test]
+fn the_coin_hop_shadow_frame_paints_its_marks_inactive_and_the_rest_body() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    // Frame index = elapsed / 80 ms, so frame 2 draws 160 ms in.
+    const FRAME_MS: u64 = 80;
+    app.clawd.play(crate::tui::clawd::Anim::CoinHop, 0);
+    app.anim_phase_ms = Some(FRAME_MS * 2);
+    use crate::tui::theme;
+    let bg = theme::bg();
+    let body = theme::accent_2_color();
+    let text = theme::text_color();
+    let faint = theme::text_faint_color();
+    let want = [
+        vec![
+            styled("▗", body, bg),
+            styled("▟", body, bg),
+            styled("▛", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("▛", body, bg),
+            styled("█", body, bg),
+            styled("▄", body, bg),
+            styled(" ", text, bg),
+        ],
+        vec![
+            styled(" ", body, bg),
+            styled("▜", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("█", body, bg),
+            styled("▘", body, bg),
+            styled(" ", text, bg),
+        ],
+        vec![
+            styled(" ", body, bg),
+            styled("▝", body, bg),
+            styled("▝", body, bg),
+            styled("▁", faint, bg),
+            styled("▁", faint, bg),
+            styled("▁", faint, bg),
+            styled("▝", body, bg),
+            styled("▝", body, bg),
+            styled(" ", body, bg),
+            styled(" ", text, bg),
+        ],
+    ];
+    assert_eq!(styled_logo_rows(&app, 80), want.to_vec());
+}
+
+/// The simplified arm Claude Code falls back to on Apple's Terminal.app: body
+/// edges either side of a body-filled eye band, then the short feet row. The
+/// full arm stays pinned by the rest test above, on the default.
+#[test]
+fn the_simplified_sprite_arm_replaces_the_full_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app =
+        app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy")).with_full_sprite(false);
+    app.anim_phase_ms = Some(5_000);
+    use crate::tui::theme;
+    let bg = theme::bg();
+    let body = theme::accent_2_color();
+    let text = theme::text_color();
+    let want = [
+        vec![
+            styled("▗", body, bg),
+            styled(" ", bg, body),
+            styled("▗", bg, body),
+            styled(" ", bg, body),
+            styled(" ", bg, body),
+            styled(" ", bg, body),
+            styled("▖", bg, body),
+            styled(" ", bg, body),
+            styled("▖", body, bg),
+            styled(" ", text, bg),
+        ],
+        vec![
+            styled(" ", text, bg),
+            styled(" ", bg, body),
+            styled(" ", bg, body),
+            styled(" ", bg, body),
+            styled(" ", bg, body),
+            styled(" ", bg, body),
+            styled(" ", bg, body),
+            styled(" ", bg, body),
+            styled(" ", text, bg),
+            styled(" ", text, bg),
+        ],
+        vec![
+            styled(" ", text, bg),
+            styled("▘", body, bg),
+            styled("▘", body, bg),
+            styled(" ", body, bg),
+            styled(" ", body, bg),
+            styled(" ", body, bg),
+            styled("▝", body, bg),
+            styled("▝", body, bg),
+            styled(" ", text, bg),
+            styled(" ", text, bg),
+        ],
+    ];
+    assert_eq!(styled_logo_rows(&app, 80), want.to_vec());
 }

@@ -2802,7 +2802,8 @@ fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {
     // detection channel: no flag, no config key, so a normal terminal can
     // never trip it by accident.
     let herdr_mode = std::env::var("HERDR_ENV").as_deref() == Ok("1");
-    tui::run(config, herdr_mode)
+    let full_sprite = tui::full_sprite(std::env::var("TERM_PROGRAM").ok().as_deref());
+    tui::run(config, herdr_mode, full_sprite)
 }
 
 /// Feature→test traceability map.

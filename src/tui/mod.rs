@@ -6,6 +6,8 @@ mod clawd;
 mod render;
 pub(crate) mod theme;
 
+pub(crate) use clawd::full_sprite;
+
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -20,20 +22,28 @@ const TICK: Duration = Duration::from_millis(80);
 
 /// Launch the full-screen TUI. Returns on quit (`q` twice, `⌃c` twice, or a
 /// fatal error).
-/// `herdr_mode` is decided once by `cmd_tui` from `HERDR_ENV` and applied to
-/// the constructed [`app::App`] via [`app::App::with_herdr_mode`]; nothing
+/// `herdr_mode` and `full_sprite` are decided once by `cmd_tui` from
+/// `HERDR_ENV` and `TERM_PROGRAM` and applied to the constructed [`app::App`]
+/// via [`app::App::with_herdr_mode`] / [`app::App::with_full_sprite`]; nothing
 /// else here reads the environment.
-pub(crate) fn run(config: AppConfig, herdr_mode: bool) -> Result<()> {
+pub(crate) fn run(config: AppConfig, herdr_mode: bool, full_sprite: bool) -> Result<()> {
     // `try_init` owns raw mode + alt screen and installs a restore panic hook,
     // so a panic mid-draw no longer leaves the terminal corrupted.
     let mut terminal = ratatui::try_init().context("Failed to initialize the terminal")?;
-    let outcome = run_loop(&mut terminal, config, herdr_mode);
+    let outcome = run_loop(&mut terminal, config, herdr_mode, full_sprite);
     ratatui::restore();
     outcome
 }
 
-fn run_loop(terminal: &mut DefaultTerminal, config: AppConfig, herdr_mode: bool) -> Result<()> {
-    let mut application = app::App::new(config).with_herdr_mode(herdr_mode);
+fn run_loop(
+    terminal: &mut DefaultTerminal,
+    config: AppConfig,
+    herdr_mode: bool,
+    full_sprite: bool,
+) -> Result<()> {
+    let mut application = app::App::new(config)
+        .with_herdr_mode(herdr_mode)
+        .with_full_sprite(full_sprite);
     // Non-blocking reconcile: fast path runs inline; verdict sequenced via
     // `StartupSignal`. Bootstrap is spawned from `on_tick` once reconcile
     // settles — neither blocks the first paint.

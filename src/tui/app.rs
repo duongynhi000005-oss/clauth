@@ -6035,6 +6035,13 @@ impl App {
         self
     }
 
+    /// `false` paints Claude Code's simplified mascot, the one it draws on
+    /// Apple's Terminal.app.
+    pub(crate) fn with_full_sprite(mut self, full_sprite: bool) -> Self {
+        self.clawd.full_sprite = full_sprite;
+        self
+    }
+
     /// The production write path for the tally after construction: it also widens
     /// the header chip's held count width, so a count shrinking by a digit
     /// moves nothing right of the chip.

@@ -14,7 +14,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -554,9 +554,10 @@ fn shunt_chip_color(app: &App) -> ratatui::style::Color {
 }
 
 fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let full_sprite = app.clawd.full_sprite;
     let art = match app.clawd.frame(app.anim_ms()) {
-        Some(current) => clawd::render(current),
-        None => clawd::rest_art(),
+        Some(current) => clawd::render(current, full_sprite),
+        None => clawd::rest_art(full_sprite),
     };
     let lines: Vec<Line<'static>> = art.iter().map(|row| Line::from(row_spans(row))).collect();
     let para = Paragraph::new(lines).style(theme::base());
@@ -583,12 +584,10 @@ fn row_spans(row: &[(char, CellKind); clawd::COLS]) -> Vec<Span<'static>> {
 
 fn cell_style(kind: CellKind) -> Style {
     let body = theme::accent_2_color();
-    let background = theme::base().bg.unwrap_or(Color::Reset);
     match kind {
         CellKind::Empty => Style::default(),
         CellKind::Body | CellKind::FacingBody => Style::default().fg(body),
-        CellKind::Eye | CellKind::FacingCut => Style::default().fg(body).bg(background),
-        CellKind::Lid => Style::default().fg(background).bg(body),
+        CellKind::Lid => Style::default().fg(theme::bg()).bg(body),
         CellKind::Inactive => Style::default().fg(theme::text_faint_color()),
     }
 }
