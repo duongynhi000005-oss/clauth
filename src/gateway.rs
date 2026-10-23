@@ -501,9 +501,9 @@ pub(crate) fn recorded_daemon_identity() -> Option<DaemonIdentity> {
 fn read_env_record() -> Result<Option<DaemonEnvRecord>> {
     let path = daemon_env_path()?;
     match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .with_context(|| format!("failed to parse {}", path.display())),
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
     }
@@ -3543,16 +3543,23 @@ fn parse_config(text: &str) -> Result<DocumentMut> {
         .map_err(|e| config_parse_error(text, &e))
 }
 
-/// The error for a config `text` that does not parse: the line, never the
-/// parser's own message, which quotes the text.
+/// The error for a config `text` that does not parse: the line and column,
+/// never the parser's own message, which quotes the text.
 pub(crate) fn config_parse_error(text: &str, e: &toml_edit::TomlError) -> anyhow::Error {
-    match e.span().and_then(|span| text.get(..span.start)) {
-        Some(head) => anyhow!(
-            "the shunt config does not parse as TOML (line {})",
-            head.matches('\n').count() + 1
-        ),
-        None => anyhow!("the shunt config does not parse as TOML"),
-    }
+    let position = e
+        .span()
+        .and_then(|span| crate::format::toml_position_from_span(text, span.start));
+    config_parse_refusal(position)
+}
+
+/// The shared shunt-frame refusal: the one owner of the `the shunt config does
+/// not parse as TOML` literal, so the two sites that refuse an unparsed shunt
+/// config ([`config_parse_error`] and the gateway-edit parse) cannot drift
+/// apart.
+pub(crate) fn config_parse_refusal(
+    position: Option<crate::format::ParsePosition>,
+) -> anyhow::Error {
+    crate::format::parse_refusal("the shunt config does not parse as TOML", position)
 }
 
 fn need_in(doc: &DocumentMut, key_ref: &str) -> Result<AdminNeed, ConfigEditRefusal> {

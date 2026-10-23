@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use crate::lock::StateLock;
 use crate::profile::{
     DEFAULT_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT, MIN_WEEKLY_SWITCH_PCT, ProfileName,
-    atomic_write_600, clauth_dir, mkdir_700, read_toml_file,
+    atomic_write_600, clauth_dir, mkdir_700,
 };
 
 /// The codex roster and its per-harness slots: the same four fields
@@ -79,6 +79,22 @@ pub(crate) struct CodexState {
     weekly_switch_threshold: Option<f64>,
 }
 
+/// Why a codex roster could not be loaded, with the parse position carried
+/// apart from the io failure so a caller can render each by type. The parse
+/// position is the one [`crate::format::toml_parse_position`] derives; a
+/// non-parse failure carries the same anyhow chain [`CodexState::load`] would
+/// surface.
+#[derive(Debug)]
+pub(crate) enum CodexRosterError {
+    /// `codex_state_path()` failed: the roster path is unknowable.
+    NoHome(anyhow::Error),
+    /// The file exists but could not be read (an io failure).
+    Read(anyhow::Error),
+    /// The file read but is not valid toml; the position, when the error
+    /// carries a span.
+    Parse(Option<crate::format::ParsePosition>),
+}
+
 impl CodexState {
     /// Read the roster, lock-free — the reader's snapshot, same contract as
     /// `load_app_state`. A missing file is an empty roster: an install that
@@ -86,10 +102,27 @@ impl CodexState {
     /// to misread.
     pub(crate) fn load() -> Result<Self> {
         let path = codex_state_path()?;
+        Self::load_with_position().map_err(|e| match e {
+            CodexRosterError::Parse(pos) => crate::format::parse_error(path.display(), pos),
+            CodexRosterError::Read(e) | CodexRosterError::NoHome(e) => e,
+        })
+    }
+
+    /// The single read+normalize body, split by failure type so the roster
+    /// logline can render a parse position and an io failure differently.
+    /// [`CodexState::load`] maps this back to the anyhow shape every other
+    /// caller wants.
+    pub(crate) fn load_with_position() -> Result<Self, CodexRosterError> {
+        let path = codex_state_path().map_err(CodexRosterError::NoHome)?;
         if !path.exists() {
             return Ok(Self::default());
         }
-        let mut state: Self = read_toml_file(&path)?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))
+            .map_err(CodexRosterError::Read)?;
+        let mut state: Self = toml::from_str(&content).map_err(|e| {
+            CodexRosterError::Parse(crate::format::toml_parse_position(&content, &e))
+        })?;
         // Normalized at load the way `load_app_state` normalizes the claude
         // line: left raw, an out-of-band hand-edit would survive every save.
         // Through the accessor, so the band and its reset-to-default stay

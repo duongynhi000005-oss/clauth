@@ -321,6 +321,33 @@ fn an_unreadable_store_refuses_and_is_never_rewritten() {
     );
 }
 
+/// A string where the `schema` number belongs would otherwise quote it in the
+/// parser's message; the read names the position alone.
+#[test]
+fn a_mistyped_store_names_the_position() {
+    let _home = HomeSandbox::new();
+    let path = store_path().expect("path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "{\"schema\": \"sk-c2probe-NOTAKEY\"}").expect("mistyped store");
+
+    let err = match read_store() {
+        Err(e) => e,
+        Ok(_) => panic!("a mistyped store must fail the read"),
+    };
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        format!(
+            "{} is not a device list clauth can read (line 1, column 31)",
+            path.display()
+        )
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
 /// A tier and a field this build does not know survive its rewrite: the row
 /// was written by a newer clauth, and a downgrade adding a device must not
 /// erase what that build meant.

@@ -86,8 +86,12 @@ impl CodexAuth {
     /// chain is gone" (the spec's blanket rule for a file codex writes in
     /// place).
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
-        let raw: serde_json::Value =
-            serde_json::from_slice(bytes).context("auth.json did not parse")?;
+        let raw: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
+            crate::format::parse_refusal(
+                "auth.json did not parse",
+                crate::format::json_parse_position(&e),
+            )
+        })?;
         anyhow::ensure!(raw.is_object(), "auth.json is not an object");
         Ok(Self { raw })
     }
@@ -325,12 +329,21 @@ pub(crate) fn refresh_codex_chain_at(
     match result {
         Ok(mut resp) => {
             let status = resp.status().as_u16();
-            let text = resp.body_mut().read_to_string().unwrap_or_default();
             if (200..300).contains(&status) {
+                let text = resp
+                    .body_mut()
+                    .read_to_string()
+                    .map_err(|e| CodexRefreshError::Transient(e.to_string()))?;
                 serde_json::from_str::<CodexTokenResponse>(&text).map_err(|e| {
-                    CodexRefreshError::Transient(format!("token response did not parse: {e}"))
+                    let message = crate::format::parse_refusal(
+                        "token response did not parse",
+                        crate::format::json_body_position(&e),
+                    )
+                    .to_string();
+                    CodexRefreshError::Transient(message)
                 })
             } else {
+                let text = resp.body_mut().read_to_string().unwrap_or_default();
                 Err(classify_refresh_failure(status, &text))
             }
         }

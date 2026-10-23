@@ -491,11 +491,19 @@ fn exchange_code_at(
         .send(body)
         .context("codex token exchange transport failed")?;
     let status = resp.status().as_u16();
-    let text = resp.body_mut().read_to_string().unwrap_or_default();
     if !(200..300).contains(&status) {
         bail!("codex token exchange returned HTTP {status}");
     }
-    serde_json::from_str(&text).context("codex token exchange response did not parse")
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .context("codex token exchange transport failed")?;
+    serde_json::from_str(&text).map_err(|e| {
+        crate::format::parse_refusal(
+            "codex token exchange response did not parse",
+            crate::format::json_body_position(&e),
+        )
+    })
 }
 
 fn exchange_code(code: &str, verifier: &str, redirect_uri: &str) -> Result<CodeExchange> {

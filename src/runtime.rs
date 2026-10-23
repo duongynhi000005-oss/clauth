@@ -1352,8 +1352,9 @@ pub(crate) mod namespaced_keychain_ledger {
     pub(crate) fn load() -> Result<Owners> {
         let path = path()?;
         let owners = match std::fs::read_to_string(&path) {
-            Ok(body) => serde_json::from_str::<Owners>(&body)
-                .with_context(|| format!("failed to parse {}", path.display()))?,
+            Ok(body) => serde_json::from_str::<Owners>(&body).map_err(|e| {
+                crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+            })?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Owners::default()),
             Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
         };
@@ -1553,8 +1554,9 @@ pub(crate) mod namespaced_keychain_ledger {
     pub(crate) fn load_in_flight() -> Result<InFlightDeletes> {
         let path = in_flight_path()?;
         let deletes = match std::fs::read_to_string(&path) {
-            Ok(body) => serde_json::from_str::<InFlightDeletes>(&body)
-                .with_context(|| format!("failed to parse {}", path.display()))?,
+            Ok(body) => serde_json::from_str::<InFlightDeletes>(&body).map_err(|e| {
+                crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+            })?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(InFlightDeletes::default());
             }

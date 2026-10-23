@@ -1006,6 +1006,26 @@ fn a_user_settings_file_that_is_not_an_object_warns_and_passes_through() {
     );
 }
 
+/// A settings file that does not parse names the position.
+#[cfg(unix)]
+#[test]
+fn a_user_settings_file_that_does_not_parse_names_the_position() {
+    let l = layout(true);
+    fs::write(l.cwd.join("torn.json"), "{\"env\": \"sk-c2probe-NOTAKEY").unwrap();
+    let passthrough = ["--settings", "torn.json"];
+    let a = apply(&l, &passthrough);
+    assert_eq!(a.argv, strings(&passthrough));
+    assert_eq!(
+        a.warning.as_deref(),
+        Some(
+            format!(
+                "clauth: --settings \"torn.json\": not a settings object (line 1, column 27); {TAIL}"
+            )
+            .as_str()
+        )
+    );
+}
+
 #[test]
 fn inline_settings_json_that_does_not_parse_warns_without_echoing_it() {
     let l = layout(true);
@@ -1013,11 +1033,11 @@ fn inline_settings_json_that_does_not_parse_warns_without_echoing_it() {
     let passthrough = ["--settings", bad];
     let a = apply(&l, &passthrough);
     assert_eq!(a.argv, strings(&passthrough));
-    let reason = serde_json::from_str::<Value>(bad).unwrap_err().to_string();
     assert_eq!(
         a.warning.as_deref(),
         Some(
-            format!("clauth: --settings JSON is not a settings object ({reason}); {TAIL}").as_str()
+            format!("clauth: --settings JSON is not a settings object (line 1, column 26); {TAIL}")
+                .as_str()
         )
     );
     assert!(!a.warning.unwrap().contains("folded-marker"));

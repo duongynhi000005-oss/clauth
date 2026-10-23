@@ -2577,13 +2577,20 @@ pub(crate) fn enforce_clauth_perms(root: &Path) {
 pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
+    serde_json::from_str(&content).map_err(|e| {
+        crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+    })
 }
 
 pub(crate) fn read_toml_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
+    toml::from_str(&content).map_err(|e| {
+        crate::format::parse_error(
+            path.display(),
+            crate::format::toml_parse_position(&content, &e),
+        )
+    })
 }
 
 /// The configured active profile, read from `profiles.toml` alone. For callers
@@ -3764,8 +3771,12 @@ fn read_profile_source(name: &ProfileName) -> Result<ProfileSource> {
     let config: ProfileConfig = if raw_config.trim().is_empty() {
         ProfileConfig::default()
     } else {
-        toml::from_str(&raw_config)
-            .with_context(|| format!("failed to parse {name}/config.toml"))?
+        toml::from_str(&raw_config).map_err(|e| {
+            crate::format::parse_error(
+                format!("{name}/config.toml"),
+                crate::format::toml_parse_position(&raw_config, &e),
+            )
+        })?
     };
 
     let cred_path = profile_credentials_path(name)?;

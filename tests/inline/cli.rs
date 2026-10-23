@@ -5265,11 +5265,16 @@ fn a_corrupt_codex_roster_fails_the_claude_only_verbs_as_a_runtime_error() {
     let err = resolve_or_bail(&config, "cx", "disable").expect_err("the roster does not load");
     assert_eq!(
         err.to_string(),
-        format!("failed to parse {}", roster.display())
+        format!("failed to parse {} at line 1, column 21", roster.display())
+    );
+    assert_eq!(
+        format!("{err:#}"),
+        err.to_string(),
+        "no source chain carries the parser's message or the file bytes"
     );
     assert!(
-        err.root_cause().downcast_ref::<toml::de::Error>().is_some(),
-        "the parse error is the cause, never hidden: {err:?}"
+        err.source().is_none(),
+        "the parse error must not ride as a source carrying the file bytes: {err:?}"
     );
     assert!(
         err.downcast_ref::<UsageError>().is_none(),

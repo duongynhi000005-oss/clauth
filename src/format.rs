@@ -913,6 +913,125 @@ pub(crate) fn start_refusal(demand: &[String], rows: &[StartCandidate]) -> Strin
     }
 }
 
+// ── Parse-position diagnostics ─────────────────────────────────────────────
+//
+// A parse error of a file clauth reads can carry the parser's own message,
+// which quotes the offending source line (toml) or the offending value
+// (serde_json), and that text can hold a credential. Every surface therefore
+// renders only the position — `failed to parse <label> at line L, column C`,
+// `failed to parse <label> at line L` for a json error at column 0, or the
+// bare `failed to parse <label>` for an empty file (an end-of-input error at
+// line 1, column 0), an io failure, a `from_value` error (which carries line
+// 0), or a span-less toml error — so a secret in the file never reaches a log
+// line or an error print. The json position is the parser's own line and
+// column; the toml column is a char count from the line start.
+
+/// A parse position to render: a 1-based line and column, or a line alone
+/// when the error names a line but no column. `Copy` so callers pass it by
+/// value like the `(usize, usize)` pair it replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParsePosition {
+    /// A 1-based line and column.
+    LineColumn { line: usize, column: usize },
+    /// A 1-based line alone — a serde_json error with `column() == 0`, which
+    /// is never a real 1-based column.
+    Line(usize),
+}
+
+/// The 1-based `(line, column)` of a byte `start` in `text`, counted in chars
+/// from the line start. `None` when `start` falls past the end of `text` or
+/// sits off a UTF-8 char boundary. The shared core the toml and toml_edit
+/// helpers call, so the column math lives once. toml's own column also counts
+/// chars from the line start, but falls back to the byte offset from the line
+/// start when the char at the span's start is multi-byte; the two differ there
+/// after multi-byte text, and at EOF after a trailing newline.
+pub(crate) fn toml_position_from_span(text: &str, start: usize) -> Option<ParsePosition> {
+    let head = text.get(..start)?;
+    let line = head.matches('\n').count() + 1;
+    let column = match head.rfind('\n') {
+        Some(nl) => head[nl + 1..].chars().count() + 1,
+        None => head.chars().count() + 1,
+    };
+    Some(ParsePosition::LineColumn { line, column })
+}
+
+/// The 1-based `(line, column)` of a `toml::de::Error`, via
+/// [`toml_position_from_span`]. `None` when the error carries no span (a typed
+/// deserialize over a `toml::Value`).
+pub(crate) fn toml_parse_position(text: &str, e: &toml::de::Error) -> Option<ParsePosition> {
+    toml_position_from_span(text, e.span()?.start)
+}
+
+/// The position of a `serde_json::Error`: a 1-based line and column, a line
+/// alone when the error reports `column() == 0` (a whole-value type error or a
+/// file torn right after a newline), or `None` when there is nothing to name —
+/// an io failure, a `line() == 0` error, or an unexpected end of input at line
+/// 1 column 0 (an empty file).
+pub(crate) fn json_parse_position(e: &serde_json::Error) -> Option<ParsePosition> {
+    if e.line() == 0 {
+        return None;
+    }
+    match e.classify() {
+        serde_json::error::Category::Io => None,
+        // An unexpected end of input at line 1 column 0 is an empty file: no
+        // line has content to name, so the bare frame stays bare. A file torn
+        // right after a newline ends at column 0 on line >= 2 and names the
+        // line.
+        serde_json::error::Category::Eof if e.line() == 1 && e.column() == 0 => None,
+        _ if e.column() == 0 => Some(ParsePosition::Line(e.line())),
+        _ => Some(ParsePosition::LineColumn {
+            line: e.line(),
+            column: e.column(),
+        }),
+    }
+}
+
+/// The position of a `serde_json::Error` in a network body — never a file:
+/// a body names serde's line whenever serde has one, so an empty reply (an
+/// end-of-input error at line 1, column 0) renders `line 1` where
+/// [`json_parse_position`] keeps the empty-file carve-out and stays bare. Every
+/// other error renders exactly as [`json_parse_position`] renders it.
+pub(crate) fn json_body_position(e: &serde_json::Error) -> Option<ParsePosition> {
+    json_parse_position(e).or_else(|| (e.line() > 0).then_some(ParsePosition::Line(e.line())))
+}
+
+/// The shared position fragment — `line L, column C` or `line L` — or `None`
+/// when there is no position to name.
+pub(crate) fn parse_position(position: Option<ParsePosition>) -> Option<String> {
+    position.map(|pos| match pos {
+        ParsePosition::LineColumn { line, column } => format!("line {line}, column {column}"),
+        ParsePosition::Line(line) => format!("line {line}"),
+    })
+}
+
+/// A fresh `failed to parse <label>` error carrying no parser error as its
+/// source: every surface printing `{e}`/`{e:#}` renders the position and
+/// nothing else (`{e:?}` can append a backtrace under `RUST_BACKTRACE`).
+pub(crate) fn parse_error(
+    label: impl std::fmt::Display,
+    position: Option<ParsePosition>,
+) -> anyhow::Error {
+    match parse_position(position) {
+        Some(pos) => anyhow::anyhow!("failed to parse {label} at {pos}"),
+        None => anyhow::anyhow!("failed to parse {label}"),
+    }
+}
+
+/// A sentence-framed parse refusal — `<frame> (line L, column C)`, or
+/// `<frame> (line L)` for a line-only position — as a fresh, source-free
+/// error, for the sites whose own copy states the failure in a sentence rather
+/// than the `failed to parse <label>` frame. A `None` position renders the
+/// bare frame.
+pub(crate) fn parse_refusal(
+    frame: impl std::fmt::Display,
+    position: Option<ParsePosition>,
+) -> anyhow::Error {
+    match parse_position(position) {
+        Some(pos) => anyhow::anyhow!("{frame} ({pos})"),
+        None => anyhow::anyhow!("{frame}"),
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/format.rs"]
 mod tests;

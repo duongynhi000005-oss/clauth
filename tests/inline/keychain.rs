@@ -1136,23 +1136,45 @@ fn carried_raw_quarantines_only_an_unparseable_reads_bytes() {
 /// hand-written impl redacts `raw` to a length, because a derived `Debug` would
 /// print live credential bytes and a stray `{:?}` on this error would put a
 /// session on a log line (`ConsoleCredential`'s hand-written impl is the
-/// precedent).
+/// precedent). Pinned by EQUALITY on the truncated input, so a revert to
+/// printing serde's error (under any field name) reds.
 #[test]
 fn an_unparseable_items_debug_never_prints_the_bytes() {
+    let raw = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-TRUNCATED"#;
     let parse_error =
-        serde_json::from_str::<serde_json::Value>("not json").expect_err("parse fails");
+        serde_json::from_str::<serde_json::Value>(raw).expect_err("a torn item fails the parse");
     let item = UnparseableItem {
-        raw: r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-SECRET"#.to_string(),
+        raw: format!("{raw}\n"),
         parse_error,
     };
-    let rendered = format!("{item:?}");
-    assert!(
-        !rendered.contains("sk-ant-oat01-SECRET"),
-        "Debug on the salvaged bytes must print a length, never the bytes: {rendered}"
+    assert_eq!(
+        format!("{item:?}"),
+        "UnparseableItem { raw_len: 56, parse_position: Some(LineColumn { line: 1, column: 55 }) }"
     );
-    assert!(
-        rendered.contains("raw_len"),
-        "the hand-written Debug is what keeps them off: {rendered}"
+}
+
+/// `UnparseableItem`'s `Display` pinned by EQUALITY: the two event lines that
+/// name it check by `starts_with` and split past the position, so a `Display`
+/// that re-appends serde's text after the position would keep both green. This
+/// locks the whole rendering — the position alone, never serde's error. The
+/// `{:#}` pin closes the same leak through `source()`: a plant that carries the
+/// parse error as the item's source renders it after the position there.
+#[test]
+fn an_unparseable_items_display_is_the_position_alone() {
+    let raw = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-TRUNCATED"#;
+    let parse_error =
+        serde_json::from_str::<serde_json::Value>(raw).expect_err("a torn item fails the parse");
+    let item = UnparseableItem {
+        raw: format!("{raw}\n"),
+        parse_error,
+    };
+    assert_eq!(
+        item.to_string(),
+        "Keychain item is not valid JSON (line 1, column 55)"
+    );
+    assert_eq!(
+        format!("{:#}", anyhow::Error::new(item)),
+        "Keychain item is not valid JSON (line 1, column 55)"
     );
 }
 
@@ -1416,9 +1438,9 @@ fn a_merge_over_unparseable_bytes_quarantines_them_and_still_writes() {
     assert!(
         event.starts_with(
             "clauth: could not read the macOS Keychain login before replacing it (Keychain item \
-             is not valid JSON"
+             is not valid JSON (line 1, column 55)"
         ),
-        "the line keeps its current shape: {event}"
+        "the line keeps its position-only shape: {event}"
     );
     let (_, salvaged) = event
         .split_once("— their raw bytes are preserved at ")
@@ -1599,9 +1621,9 @@ fn a_sign_out_over_unparseable_bytes_quarantines_them_and_still_deletes() {
     assert!(
         event.starts_with(
             "clauth: signed Claude Code out of the macOS Keychain by deleting the item: it could \
-             not be read first (Keychain item is not valid JSON"
+             not be read first (Keychain item is not valid JSON (line 1, column 55)"
         ),
-        "the line keeps its current shape: {event}"
+        "the line keeps its position-only shape: {event}"
     );
     let (_, salvaged) = event
         .split_once("— their raw bytes are preserved at ")

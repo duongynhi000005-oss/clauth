@@ -982,3 +982,132 @@ fn standby_tick_rotates_every_due_chain_through_the_wire() {
         "BOTH stores hold a rotated pair, one per wire call"
     );
 }
+
+/// A torn `auth.json` names the position of the syntax error. The parser's
+/// syntax message never quotes a value, so the pin is the position alone.
+#[test]
+fn a_torn_auth_json_names_the_position() {
+    let bytes = b"{ \"tokens\": { \"refresh_token\": \"sk-c2probe-NOTAKEY";
+    let err = CodexAuth::parse(bytes).expect_err("a torn auth.json fails the parse");
+    let rendered = format!("{err:#}");
+    assert_eq!(rendered, "auth.json did not parse (line 1, column 50)");
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
+/// A 200 token body that does not parse carries the position in the transient
+/// failure. The syntax message never quotes a value, so the pin is the
+/// position alone.
+#[test]
+fn a_torn_token_body_names_the_position() {
+    let (addr, handle) = crate::testutil::serve_endpoints(1, |_path, _i| {
+        (200, "{\"access_token\": \"sk-c2probe-NOTAKEY".to_string())
+    });
+    let err = refresh_codex_chain_at(&format!("{addr}/oauth/token"), "rt.old")
+        .expect_err("a torn body fails the refresh");
+    let rendered = match &err {
+        CodexRefreshError::Transient(message) => message.clone(),
+        other => panic!("expected a transient failure, got {other:?}"),
+    };
+    assert_eq!(rendered, "token response did not parse (line 1, column 36)");
+    let _ = handle.join();
+}
+
+/// An empty 2xx body is an end-of-input error at line 1, column 0: a token
+/// body is a network reply, never a file, so it still names line 1 (the
+/// endpoint truncated its reply) instead of staying bare like an empty file.
+#[test]
+fn an_empty_token_body_names_line_1() {
+    let (addr, handle) = crate::testutil::serve_endpoints(1, |_path, _i| (200, String::new()));
+    let err = refresh_codex_chain_at(&format!("{addr}/oauth/token"), "rt.old")
+        .expect_err("an empty body fails the refresh");
+    let rendered = match &err {
+        CodexRefreshError::Transient(message) => message.clone(),
+        other => panic!("expected a transient failure, got {other:?}"),
+    };
+    assert_eq!(rendered, "token response did not parse (line 1)");
+    let _ = handle.join();
+}
+
+/// Serve one POST a reply whose body read fails: it declares `content_length`
+/// but writes only `body` bytes, then closes. A `body` shorter than
+/// `content_length` cuts the reply mid-body; a `body` of invalid UTF-8 (with an
+/// honest `content_length`) fails the read's UTF-8 check. Both read failures
+/// reach the caller before any parse, so no position exists to name.
+fn serve_unreadable_body(
+    status: u16,
+    body: &'static [u8],
+    content_length: usize,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    let handle = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        crate::testutil::drain_http_request(&mut sock);
+        let _ = sock.write_all(
+            format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let _ = sock.write_all(body);
+        let _ = sock.shutdown(std::net::Shutdown::Write);
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+/// A 2xx reply whose body read fails (the connection cut mid-body) is a
+/// transport failure, never `token response did not parse (line 1)`: the reply
+/// was never read, so it has no position. Pinned by equality to the transport
+/// rendering — the read error's own Display.
+#[test]
+fn a_2xx_body_cut_short_is_a_transport_failure() {
+    let (addr, handle) = serve_unreadable_body(
+        200,
+        b"{\"access_token\": \"at\", \"refresh_token\": \"rt\"",
+        300,
+    );
+    let err = refresh_codex_chain_at(&format!("{addr}/oauth/token"), "rt.old")
+        .expect_err("a cut body fails the refresh");
+    let rendered = match &err {
+        CodexRefreshError::Transient(message) => message.clone(),
+        other => panic!("expected a transient failure, got {other:?}"),
+    };
+    assert_ne!(rendered, "token response did not parse (line 1)");
+    assert_eq!(rendered, "io: Peer disconnected");
+    let _ = handle.join();
+}
+
+/// A 2xx reply whose body is not UTF-8 fails the read itself, so it too is a
+/// transport failure — never a parse position. The read error carries no body
+/// byte.
+#[test]
+fn a_non_utf8_body_is_a_transport_failure() {
+    let (addr, handle) = serve_unreadable_body(200, &[0xFF, 0xFE, 0x00, 0x01], 4);
+    let err = refresh_codex_chain_at(&format!("{addr}/oauth/token"), "rt.old")
+        .expect_err("a non-UTF-8 body fails the refresh");
+    let rendered = match &err {
+        CodexRefreshError::Transient(message) => message.clone(),
+        other => panic!("expected a transient failure, got {other:?}"),
+    };
+    assert_eq!(rendered, "io: stream did not contain valid UTF-8");
+    let _ = handle.join();
+}
+
+/// A non-2xx reply still classifies by its status even when its body is
+/// unreadable: the non-2xx arm needs only the status split, so the unread body
+/// falls back to `""` and the 400 names `rejected`.
+#[test]
+fn a_non_2xx_reply_with_an_unreadable_body_classifies_by_status() {
+    let (addr, handle) = serve_unreadable_body(400, b"short", 300);
+    let err = refresh_codex_chain_at(&format!("{addr}/oauth/token"), "rt.old")
+        .expect_err("a 400 fails the refresh");
+    match &err {
+        CodexRefreshError::Dead("rejected") => {}
+        other => panic!("expected Dead(rejected), got {other:?}"),
+    }
+    let _ = handle.join();
+}

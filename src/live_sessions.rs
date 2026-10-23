@@ -537,8 +537,12 @@ fn update(session_id: &str, edit: impl FnOnce(&mut LiveSession)) -> Result<()> {
     with_state_lock(|_held| {
         let bytes = std::fs::read(&path)
             .with_context(|| format!("no live-session row for {session_id}"))?;
-        let mut row: LiveSession = serde_json::from_slice(&bytes)
-            .with_context(|| format!("unreadable live-session row for {session_id}"))?;
+        let mut row: LiveSession = serde_json::from_slice(&bytes).map_err(|e| {
+            crate::format::parse_refusal(
+                format!("unreadable live-session row for {session_id}"),
+                crate::format::json_parse_position(&e),
+            )
+        })?;
         edit(&mut row);
         write_row(&row)
     })

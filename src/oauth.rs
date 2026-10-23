@@ -223,8 +223,7 @@ pub(crate) enum TokenFailure {
     Body {
         status: u16,
         kind: &'static str,
-        line: usize,
-        column: usize,
+        position: Option<crate::format::ParsePosition>,
         len: usize,
     },
 }
@@ -280,14 +279,21 @@ impl TokenFailure {
             Self::Body {
                 status,
                 kind,
-                line,
-                column,
+                position,
                 len,
-            } => format!(
-                "HTTP {status} but the body did not parse as a token response \
-                 ({kind} at line {line}, column {column}); {len} bytes withheld \
-                 (contains live credentials)"
-            ),
+            } => {
+                let pos = crate::format::parse_position(*position);
+                match pos {
+                    Some(pos) => format!(
+                        "HTTP {status} but the body did not parse as a token response \
+                         ({kind} at {pos}); {len} bytes withheld (contains live credentials)"
+                    ),
+                    None => format!(
+                        "HTTP {status} but the body did not parse as a token response \
+                         ({kind}); {len} bytes withheld (contains live credentials)"
+                    ),
+                }
+            }
         }
     }
 }
@@ -296,6 +302,7 @@ impl TokenFailure {
 /// — taking `e` by reference so the serde error itself cannot be moved into the
 /// result and carried onward.
 fn token_parse_error(e: &serde_json::Error, status: u16, body_len: usize) -> TokenFailure {
+    let position = crate::format::json_body_position(e);
     TokenFailure::Body {
         status,
         kind: match e.classify() {
@@ -304,8 +311,7 @@ fn token_parse_error(e: &serde_json::Error, status: u16, body_len: usize) -> Tok
             serde_json::error::Category::Data => "unexpected shape",
             serde_json::error::Category::Eof => "truncated",
         },
-        line: e.line(),
-        column: e.column(),
+        position,
         len: body_len,
     }
 }
@@ -2084,11 +2090,19 @@ fn land_pair_with(
                          that failed a rotation back). Live file left untouched; {}",
                         crate::format::RESOLVE_IN_TUI
                     ),
-                    Ok(crate::claude::LiveSlotFollow::Unreadable(e)) => logline!(
-                        "clauth: rotated '{name}' but the live .credentials.json could not be \
-                         parsed to check its login ({e}); live file left untouched. Run \
-                         `clauth {name}` to reinstall"
-                    ),
+                    Ok(crate::claude::LiveSlotFollow::Unreadable(pos)) => {
+                        let head = crate::format::parse_refusal(
+                            format!(
+                                "clauth: rotated '{name}' but the live .credentials.json could \
+                                 not be parsed to check its login"
+                            ),
+                            pos,
+                        );
+                        logline!(
+                            "{head}; live file left untouched. Run \
+                             `clauth {name}` to reinstall"
+                        )
+                    }
                     Err(e) => logline!(
                         "clauth: rotated '{name}' but following the live .credentials.json \
                          failed: {e:#}. A running claude signs out when its old token expires; \
@@ -3691,11 +3705,16 @@ pub(crate) fn restamp_rolling_token(
                  re-stamp back). Live file left untouched; {}",
                 crate::format::RESOLVE_IN_TUI
             ),
-            Ok(crate::claude::LiveSlotFollow::Unreadable(e)) => logline!(
-                "clauth: re-stamped '{name}' but the live .credentials.json could not be \
-                 parsed to check its login ({e}); live file left untouched. Run \
-                 `clauth {name}` to reinstall"
-            ),
+            Ok(crate::claude::LiveSlotFollow::Unreadable(pos)) => {
+                let head = crate::format::parse_refusal(
+                    format!(
+                        "clauth: re-stamped '{name}' but the live .credentials.json could not be \
+                         parsed to check its login"
+                    ),
+                    pos,
+                );
+                logline!("{head}; live file left untouched. Run `clauth {name}` to reinstall")
+            }
             Err(e) => logline!(
                 "clauth: re-stamped '{name}' but following the live .credentials.json failed: \
                  {e:#}. A running claude signs out when its old token expires; run \

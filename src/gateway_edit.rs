@@ -38,8 +38,8 @@ use toml_edit::{Array, Document, InlineTable, Item, Key, Table, TableLike, Value
 
 use crate::gateway::{
     BIND_ENV, BindRefusal, ConfigBindRefused, GatewayRecord, StoreMoveRefusal, config_parse_error,
-    file_env, inherited_env, read_config_for_edit, recorded_env_for_holder_pid, resolve_bind,
-    spawned_env_var, write_checked,
+    config_parse_refusal, file_env, inherited_env, read_config_for_edit,
+    recorded_env_for_holder_pid, resolve_bind, spawned_env_var, write_checked,
 };
 
 // ── the view ────────────────────────────────────────────────────────────────
@@ -629,7 +629,7 @@ fn plan_with(
         .into(),
     })?;
     let original: toml::Table = toml::from_str(text)
-        .map_err(|_| anyhow::anyhow!("the shunt config does not parse as TOML"))?;
+        .map_err(|e| config_parse_refusal(crate::format::toml_parse_position(text, &e)))?;
     let Some(expected) = semantic::apply(&original, edit, ctx.forms(edit)) else {
         return Err(EditBug {
             op,

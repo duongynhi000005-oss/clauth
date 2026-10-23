@@ -191,20 +191,35 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
     // can never become a member (a codex home matches no `runtime*` stem) —
     // so a codex `[env]` can neither join the union nor, unparseable, pause a
     // claude-only sync.
-    let codex = match crate::codex_profiles::CodexState::load() {
+    let codex = match crate::codex_profiles::CodexState::load_with_position() {
         Ok(state) => {
             CODEX_ROSTER_WARNED.store(false, Ordering::Relaxed);
             state
         }
-        Err(e) => {
+        Err(err) => {
             if !CODEX_ROSTER_WARNED.swap(true, Ordering::Relaxed) {
                 let path = clauth_dir().ok()?.join("codex-profiles.toml");
-                logline!(
-                    "clauth: {} did not yield the codex roster ({}); settings.json sync \
-                     reads every profile dir as claude until it reads cleanly",
-                    path.display(),
-                    e.root_cause()
-                );
+                match err {
+                    crate::codex_profiles::CodexRosterError::Parse(pos) => {
+                        let head = crate::format::parse_refusal(
+                            format!("clauth: {} did not yield the codex roster", path.display()),
+                            pos,
+                        );
+                        logline!(
+                            "{head}; settings.json sync reads every profile dir as claude until \
+                             it reads cleanly"
+                        );
+                    }
+                    crate::codex_profiles::CodexRosterError::Read(e) => {
+                        logline!(
+                            "clauth: {} did not yield the codex roster ({}); settings.json sync \
+                             reads every profile dir as claude until it reads cleanly",
+                            path.display(),
+                            e.root_cause()
+                        );
+                    }
+                    crate::codex_profiles::CodexRosterError::NoHome(_) => {}
+                }
             }
             crate::codex_profiles::CodexState::default()
         }
@@ -243,7 +258,14 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
         };
         match toml::from_str::<EnvOnlyConfig>(&raw) {
             Ok(config) => keys.extend(config.env.into_keys()),
-            Err(e) => return warn_paused(&path, &format!("is not valid TOML ({e})")),
+            Err(e) => {
+                let reason = crate::format::parse_refusal(
+                    "is not valid TOML",
+                    crate::format::toml_parse_position(&raw, &e),
+                )
+                .to_string();
+                return warn_paused(&path, &reason);
+            }
         }
     }
     ENV_KEYS_WARNED.store(false, Ordering::Relaxed);

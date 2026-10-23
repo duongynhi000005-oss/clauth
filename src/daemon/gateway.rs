@@ -2506,9 +2506,9 @@ pub(crate) fn read_marker() -> Result<Option<ChildMarker>> {
 
 fn read_marker_at(path: &Path) -> Result<Option<ChildMarker>> {
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .with_context(|| format!("failed to parse {}", path.display())),
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
     }

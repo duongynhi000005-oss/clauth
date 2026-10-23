@@ -474,16 +474,42 @@ pub(crate) fn parse_settings_value(
                     &format!("cannot read it ({})", strip_os_error(&detail)),
                 )
             })?;
-        parse_json_object(&content)
-            .map_err(|detail| path_warning(value, &format!("not a settings object ({detail})")))
+        parse_json_object(&content).map_err(|detail| path_warning(value, &detail.refusal()))
     }
 }
 
-fn parse_json_object(text: &str) -> Result<Map<String, Value>, String> {
+/// Why a `--settings` value is not a JSON object.
+enum NotSettingsObject {
+    /// The text parses but is not an object (`[1,2]`, `"str"`).
+    NotAnObject,
+    /// The text does not parse, carrying its position.
+    Unparseable(Option<crate::format::ParsePosition>),
+}
+
+impl NotSettingsObject {
+    /// The `not a settings object` refusal: `(line L, column C)` — or
+    /// `(line L)` for a column-0 error — for a parse error (bare when there is
+    /// no position), or the fixed `(not a JSON object)` for a value that
+    /// parses but is not an object.
+    fn refusal(&self) -> String {
+        match self {
+            NotSettingsObject::NotAnObject => {
+                "not a settings object (not a JSON object)".to_string()
+            }
+            NotSettingsObject::Unparseable(pos) => {
+                crate::format::parse_refusal("not a settings object", *pos).to_string()
+            }
+        }
+    }
+}
+
+fn parse_json_object(text: &str) -> Result<Map<String, Value>, NotSettingsObject> {
     match serde_json::from_str::<Value>(text) {
         Ok(Value::Object(map)) => Ok(map),
-        Ok(_) => Err("not a JSON object".to_string()),
-        Err(e) => Err(e.to_string()),
+        Ok(_) => Err(NotSettingsObject::NotAnObject),
+        Err(e) => Err(NotSettingsObject::Unparseable(
+            crate::format::json_parse_position(&e),
+        )),
     }
 }
 
@@ -564,8 +590,8 @@ fn path_warning(value: &str, reason: &str) -> String {
 }
 
 /// The inline-JSON warning: the value is never echoed.
-fn inline_warning(reason: &str) -> String {
-    format!("clauth: --settings JSON is not a settings object ({reason}); {TAIL}")
+fn inline_warning(detail: &NotSettingsObject) -> String {
+    format!("clauth: --settings JSON is {}; {TAIL}", detail.refusal())
 }
 
 /// The malformed-`hooks` warning: the value IS a settings object, one field

@@ -219,6 +219,28 @@ fn each_writers_update_preserves_the_others_fields() {
     assert_eq!(after.chain_cursor, Some(2));
 }
 
+/// A string where the `pid` number belongs would otherwise quote it in the
+/// parser's message; the update names the position alone.
+#[test]
+fn an_unreadable_row_names_the_position() {
+    let _home = HomeSandbox::new();
+    let path = row_path("4242-0").expect("row path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "{\"pid\": \"sk-c2probe-NOTAKEY\"}").expect("mistyped row");
+
+    let err = update_as_daemon("4242-0", |d| d.set_intended_member("kerry"))
+        .expect_err("a mistyped row must fail the update");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        "unreadable live-session row for 4242-0 (line 1, column 28)"
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
 /// A delegate's row is registered by the `clauth mcp` that spawns it (that
 /// process's `std::process::id()` is what register reads) and re-keyed onto the
 /// delegate child right after spawn. `set_pid` is the mutator behind the

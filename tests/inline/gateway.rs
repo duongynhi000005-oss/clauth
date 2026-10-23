@@ -160,12 +160,12 @@ fn an_adopt_refuses_a_config_that_does_not_parse() {
     assert_eq!(
         err.downcast_ref::<ConfigUnparsed>(),
         Some(&ConfigUnparsed(
-            "the shunt config does not parse as TOML (line 2)".to_string()
+            "the shunt config does not parse as TOML (line 2, column 8)".to_string()
         ))
     );
     assert_eq!(
         err.to_string(),
-        "the shunt config does not parse as TOML (line 2)"
+        "the shunt config does not parse as TOML (line 2, column 8)"
     );
 
     let yaml = home.home().join("shunt.yaml");
@@ -2576,7 +2576,7 @@ fn a_config_that_does_not_parse_names_the_line_never_its_text() {
         .expect_err("a bare value is not TOML");
     assert_eq!(
         format!("{err:#}"),
-        "the shunt config does not parse as TOML (line 2)"
+        "the shunt config does not parse as TOML (line 2, column 11)"
     );
 }
 

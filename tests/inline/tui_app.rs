@@ -25145,7 +25145,10 @@ fn the_adopt_refuses_an_unparsed_config_before_reading_any_bind() {
     let _held = crate::daemon::hold_daemon_lock();
     match super::run_adopt(&config) {
         super::ShuntActionOutcome::AdoptFailed { error } => {
-            assert_eq!(error, "the shunt config does not parse as TOML (line 2)")
+            assert_eq!(
+                error,
+                "the shunt config does not parse as TOML (line 2, column 8)"
+            )
         }
         other => panic!("expected the parse refusal, got {other:?}"),
     }

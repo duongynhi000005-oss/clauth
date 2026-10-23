@@ -271,10 +271,13 @@ pub(crate) fn read_store() -> Result<Store> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Store::empty()),
         Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
     };
-    let mut store: Store = serde_json::from_slice(&bytes).with_context(|| {
-        format!(
-            "{} is not a push subscription list clauth can read",
-            path.display()
+    let mut store: Store = serde_json::from_slice(&bytes).map_err(|e| {
+        crate::format::parse_refusal(
+            format!(
+                "{} is not a push subscription list clauth can read",
+                path.display()
+            ),
+            crate::format::json_parse_position(&e),
         )
     })?;
     store.schema = store.schema.max(SCHEMA);

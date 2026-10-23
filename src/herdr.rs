@@ -1275,8 +1275,12 @@ fn sidebar_state(doc: &toml::Value) -> SidebarState {
 /// user-owned comes through here intact, and the verdicts below report it
 /// as hand-owned instead of re-adding it.
 fn plan_config(existing: &str, key: &str, delegate_row_text: bool) -> Result<ConfigPlan> {
-    let doc: toml::Value = toml::from_str(existing)
-        .context("herdr's config.toml does not parse; fix it before wiring clauth into it")?;
+    let doc: toml::Value = toml::from_str(existing).map_err(|e| {
+        crate::format::parse_refusal(
+            "herdr's config.toml does not parse; fix it before wiring clauth into it",
+            crate::format::toml_parse_position(existing, &e),
+        )
+    })?;
 
     let mut plan = ConfigPlan {
         append: String::new(),

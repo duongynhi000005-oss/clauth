@@ -1082,8 +1082,8 @@ pub(crate) enum LiveSlotFollow {
     /// Unlike the Keychain mirror (whose truncated bytes are almost always
     /// clauth's own cut-off write), clauth never writes this file
     /// non-atomically, so there is nothing of ours to heal. Untouched.
-    /// Carries the parse error (positions and field names, never values).
-    Unreadable(serde_json::Error),
+    /// Carries the position alone, never the values the parser would quote.
+    Unreadable(Option<crate::format::ParsePosition>),
     /// No live file, or a live symlink (which follows the store write itself).
     Noop,
 }
@@ -1111,15 +1111,20 @@ pub(crate) fn follow_live_file_login(
     let bytes = std::fs::read(&link).context("failed to read .credentials.json")?;
     let live = match serde_json::from_slice::<ClaudeCredentials>(&bytes) {
         Ok(live) => live,
-        Err(e) => return Ok(LiveSlotFollow::Unreadable(e)),
+        Err(e) => {
+            return Ok(LiveSlotFollow::Unreadable(
+                crate::format::json_parse_position(&e),
+            ));
+        }
     };
     let recognized =
         live_login_is_empty(&live) || live.access_token().is_some_and(|t| candidates.contains(&t));
     if !recognized {
         return Ok(LiveSlotFollow::NotOurs);
     }
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&bytes).context("failed to parse .credentials.json")?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        crate::format::parse_error(".credentials.json", crate::format::json_parse_position(&e))
+    })?;
     value["claudeAiOauth"] =
         serde_json::to_value(incoming).context("failed to serialize the incoming login")?;
     atomic_write_600(
@@ -1413,10 +1418,13 @@ pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result
         Err(e) => return Err(e),
     };
     let bytes = serde_json::to_vec(&blob).context("failed to serialize the Keychain item")?;
-    let parsed: ClaudeCredentials = serde_json::from_slice(&bytes).with_context(|| {
-        format!(
-            "the Keychain item for {} is not Claude credentials",
-            config_dir.display()
+    let parsed: ClaudeCredentials = serde_json::from_slice(&bytes).map_err(|e| {
+        crate::format::parse_refusal(
+            format!(
+                "the Keychain item for {} is not Claude credentials",
+                config_dir.display()
+            ),
+            crate::format::json_parse_position(&e),
         )
     })?;
     if parsed.claude_ai_oauth.is_none() {
@@ -1836,10 +1844,13 @@ pub(crate) fn failed_read_degrades_to_delete(class: SecurityExitClass) -> bool {
 #[cfg(target_os = "macos")]
 fn checked_store_at(path: &Path) -> Result<serde_json::Value> {
     let store: serde_json::Value = read_json_file(path)?;
-    let parsed = serde_json::from_value::<ClaudeCredentials>(store.clone()).with_context(|| {
-        format!(
-            "install source is not Claude credentials: {}",
-            path.display()
+    let parsed = serde_json::from_value::<ClaudeCredentials>(store.clone()).map_err(|e| {
+        crate::format::parse_refusal(
+            format!(
+                "install source is not Claude credentials: {}",
+                path.display()
+            ),
+            crate::format::json_parse_position(&e),
         )
     })?;
     anyhow::ensure!(
@@ -2281,10 +2292,12 @@ fn read_store_for_merge(path: &Path, purpose: &str) -> Option<serde_json::Value>
     match serde_json::from_slice(&bytes) {
         Ok(value) => Some(value),
         Err(e) => {
-            logline!(
-                "clauth: {} is not valid JSON ({e}), so {purpose}",
-                path.display()
-            );
+            let frame = crate::format::parse_refusal(
+                format!("{} is not valid JSON", path.display()),
+                crate::format::json_parse_position(&e),
+            )
+            .to_string();
+            logline!("clauth: {frame}, so {purpose}");
             None
         }
     }

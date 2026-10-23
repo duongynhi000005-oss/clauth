@@ -5300,6 +5300,46 @@ fn a_sidecar_that_does_not_parse_says_its_keys_were_not_kept() {
     );
 }
 
+/// The same tear with a token value renders the position alone.
+#[test]
+fn a_sidecar_that_does_not_parse_names_the_position() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let sidecar = sidecar_of("a");
+    fs::write(
+        &sidecar,
+        b"{ \"claudeAiOauth\": { \"accessToken\": \"sk-c2probe-NOTAKEY",
+    )
+    .expect("tear the sidecar");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    write_session_token(
+        &crate::profile::ProfileName::from("a"),
+        &mint_for("a2"),
+        crate::usage::now_ms() as i64,
+    )
+    .expect("the re-mint still lands");
+    drop(capture);
+
+    let snapshot = lines.snapshot();
+    let expected = format!(
+        "clauth: {} is not valid JSON (line 1, column 55), so this write goes ahead \
+         without the non-login keys it may hold (a design login, MCP logins)",
+        sidecar.display()
+    );
+    assert!(
+        snapshot.iter().any(|line| line == &expected),
+        "the skip line names the position: expected {expected:?} in {snapshot:?}"
+    );
+    assert!(
+        snapshot
+            .iter()
+            .all(|line| !line.contains("sk-c2probe-NOTAKEY")),
+        "the token must never reach the log: {snapshot:?}"
+    );
+}
+
 /// With preservation on, a sign-out drops the login and the keys that
 /// authenticate or identify its account, and keeps the design login and every
 /// key no account owns. `enterpriseGateway` goes: it is a gateway credential,

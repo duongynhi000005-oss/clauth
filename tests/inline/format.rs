@@ -857,3 +857,195 @@ fn the_explain_age_cell_says_not_yet_where_the_fallback_pill_says_cannot() {
         "and they are not the pill's, which says what clauth cannot do"
     );
 }
+
+#[test]
+fn toml_parse_position_names_the_line_and_column_of_a_torn_line() {
+    // `api_key = "sk-c2probe-NOTAKEY` is an unterminated string; the span's
+    // start sits at end-of-input (byte 29), so the position is line 1, the
+    // column one past the last char (30).
+    let text = "api_key = \"sk-c2probe-NOTAKEY";
+    let e = toml::from_str::<toml::Value>(text).unwrap_err();
+    assert_eq!(
+        super::toml_parse_position(text, &e),
+        Some(super::ParsePosition::LineColumn {
+            line: 1,
+            column: 30
+        })
+    );
+}
+
+#[test]
+fn toml_parse_position_counts_the_column_in_chars_not_bytes() {
+    // Three two-byte `é` chars inside the string: a byte-counting column would
+    // read 18, the char-counting column is 15 (11 ASCII chars + 3 chars + 1).
+    let text = "api_key = \"ééé";
+    let e = toml::from_str::<toml::Value>(text).unwrap_err();
+    assert_eq!(
+        super::toml_parse_position(text, &e),
+        Some(super::ParsePosition::LineColumn {
+            line: 1,
+            column: 15
+        })
+    );
+}
+
+#[test]
+fn toml_parse_position_is_none_without_a_span() {
+    // Deserializing a plain `toml::Value` (a string where a number is
+    // expected) fails through serde's custom error, which carries no span —
+    // the `Registry::load` re-parse shape.
+    let v: toml::Value = toml::from_str("x = \"not a number\"").unwrap();
+    let e = v
+        .try_into::<std::collections::HashMap<String, u64>>()
+        .unwrap_err();
+    assert_eq!(super::toml_parse_position("x = \"not a number\"", &e), None);
+}
+
+#[test]
+fn json_parse_position_is_none_for_an_io_error() {
+    let e = serde_json::Error::io(std::io::Error::other("boom"));
+    assert_eq!(e.line(), 0);
+    assert_eq!(super::json_parse_position(&e), None);
+}
+
+#[test]
+fn json_parse_position_names_the_line_and_column_of_torn_json() {
+    let text = "{ \"claudeAiOauth\": { \"accessToken\": \"torn";
+    let e = serde_json::from_str::<serde_json::Value>(text).unwrap_err();
+    assert_eq!(
+        super::json_parse_position(&e),
+        Some(super::ParsePosition::LineColumn {
+            line: 1,
+            column: 41
+        })
+    );
+}
+
+#[test]
+fn json_parse_position_renders_line_alone_when_the_column_is_zero() {
+    // A typed parse whose top-level type is wrong reports line 1, column 0 —
+    // a column of 0 is never a real 1-based position, so the position is the
+    // line alone.
+    let e =
+        serde_json::from_str::<std::collections::HashMap<String, u64>>("[{\"endpoint\": \"x\"}]")
+            .unwrap_err();
+    assert_eq!(e.line(), 1);
+    assert_eq!(e.column(), 0);
+    assert_eq!(
+        super::json_parse_position(&e),
+        Some(super::ParsePosition::Line(1))
+    );
+}
+
+#[test]
+fn json_parse_position_is_none_for_an_empty_input() {
+    // An empty input is an unexpected end of input at column 0: no line has
+    // content to name, so there is no position (the bare frame).
+    let e = serde_json::from_str::<serde_json::Value>("").unwrap_err();
+    assert_eq!(e.line(), 1);
+    assert_eq!(e.column(), 0);
+    assert!(matches!(e.classify(), serde_json::error::Category::Eof));
+    assert_eq!(super::json_parse_position(&e), None);
+}
+
+#[test]
+fn json_parse_position_names_the_line_for_a_file_torn_after_a_newline() {
+    // A file torn right after a newline is an end-of-input error at column 0
+    // on line >= 2. The empty-file carve-out is line 1 column 0 alone, so
+    // these name the line.
+    for text in ["{\"a\": 1,\n", "\n"] {
+        let e = serde_json::from_str::<serde_json::Value>(text).unwrap_err();
+        assert!(matches!(e.classify(), serde_json::error::Category::Eof));
+        assert_eq!(e.line(), 2);
+        assert_eq!(e.column(), 0);
+        assert_eq!(
+            super::json_parse_position(&e),
+            Some(super::ParsePosition::Line(2))
+        );
+    }
+}
+
+#[test]
+fn parse_error_renders_the_position_and_nothing_else() {
+    let e = super::parse_error(
+        "gamma/config.toml",
+        Some(super::ParsePosition::LineColumn {
+            line: 1,
+            column: 30,
+        }),
+    );
+    assert_eq!(
+        format!("{e}"),
+        "failed to parse gamma/config.toml at line 1, column 30"
+    );
+    assert_eq!(format!("{e:#}"), format!("{e}"));
+    assert!(
+        e.source().is_none(),
+        "the parse error must not ride as a source: {e:?}"
+    );
+    assert!(
+        !format!("{e}").contains("sk-c2probe-NOTAKEY"),
+        "a secret in the input never reaches the rendered error: {e}"
+    );
+}
+
+#[test]
+fn parse_error_renders_line_alone_for_a_column_zero_position() {
+    let e = super::parse_error("gamma/config.toml", Some(super::ParsePosition::Line(2)));
+    assert_eq!(
+        format!("{e}"),
+        "failed to parse gamma/config.toml at line 2"
+    );
+    assert_eq!(format!("{e:#}"), format!("{e}"));
+    assert!(
+        e.source().is_none(),
+        "the parse error must not ride as a source: {e:?}"
+    );
+}
+
+#[test]
+fn parse_error_renders_the_bare_label_without_a_position() {
+    let e = super::parse_error("gamma/config.toml", None);
+    assert_eq!(format!("{e}"), "failed to parse gamma/config.toml");
+    assert_eq!(format!("{e:#}"), format!("{e}"));
+    assert!(
+        e.source().is_none(),
+        "the parse error must not ride as a source: {e:?}"
+    );
+}
+
+#[test]
+fn parse_refusal_keeps_the_frame_and_appends_the_position() {
+    let e = super::parse_refusal(
+        "is not valid TOML",
+        Some(super::ParsePosition::LineColumn {
+            line: 1,
+            column: 30,
+        }),
+    );
+    assert_eq!(format!("{e}"), "is not valid TOML (line 1, column 30)");
+    let e = super::parse_refusal("is not valid TOML", None);
+    assert_eq!(format!("{e}"), "is not valid TOML");
+}
+
+#[test]
+fn parse_refusal_renders_line_alone_for_a_column_zero_position() {
+    let e = super::parse_refusal("is not valid TOML", Some(super::ParsePosition::Line(2)));
+    assert_eq!(format!("{e}"), "is not valid TOML (line 2)");
+}
+
+#[test]
+fn parse_position_renders_the_shared_fragment() {
+    assert_eq!(
+        super::parse_position(Some(super::ParsePosition::LineColumn {
+            line: 2,
+            column: 7,
+        })),
+        Some("line 2, column 7".to_string())
+    );
+    assert_eq!(
+        super::parse_position(Some(super::ParsePosition::Line(2))),
+        Some("line 2".to_string())
+    );
+    assert_eq!(super::parse_position(None), None);
+}

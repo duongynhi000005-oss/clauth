@@ -297,6 +297,90 @@ fn a_rejected_code_exchange_names_the_status() {
     assert_eq!(handle.join().expect("join stub").len(), 1);
 }
 
+/// A 200 body torn mid-string still names the position in the error, and the
+/// parser error never rides as its source.
+#[test]
+fn an_unparseable_exchange_body_names_the_position() {
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(1, |_path, _i| {
+        (200, "{\"id_token\": \"sk-c2probe-NOTAKEY".to_string())
+    });
+    let err = match exchange_code_at(
+        &format!("{addr}/oauth/token"),
+        "c",
+        "v",
+        "http://localhost:1455/auth/callback",
+    ) {
+        Ok(_) => panic!("a torn body fails the exchange"),
+        Err(e) => e,
+    };
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        "codex token exchange response did not parse (line 1, column 32)"
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+    let _ = handle.join();
+}
+
+/// A 200 body that is a bare JSON string where the exchange object belongs is
+/// a type error whose base rendering quoted the string value; the composed
+/// line names the position alone, never the value.
+#[test]
+fn a_mistyped_exchange_body_names_the_position_and_never_the_value() {
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(1, |_path, _i| {
+        (200, "\"sk-c2probe-NOTAKEY\"".to_string())
+    });
+    let err = match exchange_code_at(
+        &format!("{addr}/oauth/token"),
+        "c",
+        "v",
+        "http://localhost:1455/auth/callback",
+    ) {
+        Ok(_) => panic!("a string body fails the exchange"),
+        Err(e) => e,
+    };
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        "codex token exchange response did not parse (line 1, column 20)"
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+    let _ = handle.join();
+}
+
+/// An empty 2xx body is an end-of-input error at line 1, column 0: the
+/// exchange body is a network reply, never a file, so it still names line 1
+/// instead of staying bare like an empty file.
+#[test]
+fn an_empty_exchange_body_names_line_1() {
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(1, |_path, _i| (200, String::new()));
+    let err = match exchange_code_at(
+        &format!("{addr}/oauth/token"),
+        "c",
+        "v",
+        "http://localhost:1455/auth/callback",
+    ) {
+        Ok(_) => panic!("an empty body fails the exchange"),
+        Err(e) => e,
+    };
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        "codex token exchange response did not parse (line 1)"
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+    let _ = handle.join();
+}
+
 /// The api-key mint is best-effort by contract: the key on a 2xx body that
 /// carries one, `Ok(None)` on a 4xx, so a login that only wants the ChatGPT
 /// chain still completes.
@@ -715,4 +799,98 @@ fn a_reader_finishing_after_the_wait_ended_writes_no_page() {
         response, "",
         "an already-ended login writes no page of any kind"
     );
+}
+
+/// Serve one POST a reply whose body read fails: it declares `content_length`
+/// but writes only `body` bytes, then closes. A `body` shorter than
+/// `content_length` cuts the reply mid-body; a `body` of invalid UTF-8 (with an
+/// honest `content_length`) fails the read's UTF-8 check. Both read failures
+/// reach the caller before any parse, so no position exists to name.
+fn serve_unreadable_body(
+    status: u16,
+    body: &'static [u8],
+    content_length: usize,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::Write;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    let handle = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        crate::testutil::drain_http_request(&mut sock);
+        let _ = sock.write_all(
+            format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let _ = sock.write_all(body);
+        let _ = sock.shutdown(std::net::Shutdown::Write);
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+/// A 2xx exchange reply whose body read fails (the connection cut mid-body) is
+/// a transport failure: the status is checked first, then the body read fails
+/// under the exchange's transport context, carrying no body byte and no
+/// position.
+#[test]
+fn a_2xx_exchange_body_cut_short_is_a_transport_failure() {
+    let (addr, handle) = serve_unreadable_body(
+        200,
+        b"{\"access_token\": \"at\", \"refresh_token\": \"rt\"",
+        300,
+    );
+    let err = match exchange_code_at(
+        &format!("{addr}/oauth/token"),
+        "c",
+        "v",
+        "http://localhost:1455/auth/callback",
+    ) {
+        Ok(_) => panic!("a cut body fails the exchange"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        format!("{err:#}"),
+        "codex token exchange transport failed: io: Peer disconnected"
+    );
+    let _ = handle.join();
+}
+
+/// A 2xx exchange reply whose body is not UTF-8 fails the read itself, under
+/// the same transport context and with no body byte.
+#[test]
+fn a_non_utf8_exchange_body_is_a_transport_failure() {
+    let (addr, handle) = serve_unreadable_body(200, &[0xFF, 0xFE, 0x00, 0x01], 4);
+    let err = match exchange_code_at(
+        &format!("{addr}/oauth/token"),
+        "c",
+        "v",
+        "http://localhost:1455/auth/callback",
+    ) {
+        Ok(_) => panic!("a non-UTF-8 body fails the exchange"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        format!("{err:#}"),
+        "codex token exchange transport failed: io: stream did not contain valid UTF-8"
+    );
+    let _ = handle.join();
+}
+
+/// A non-2xx exchange reply names its status before the body is read, so an
+/// unreadable body never masks the status.
+#[test]
+fn a_non_2xx_exchange_reply_with_an_unreadable_body_names_the_status() {
+    let (addr, handle) = serve_unreadable_body(400, b"short", 300);
+    let err = match exchange_code_at(
+        &format!("{addr}/oauth/token"),
+        "c",
+        "v",
+        "http://localhost:1455/auth/callback",
+    ) {
+        Ok(_) => panic!("a 400 fails the exchange"),
+        Err(e) => e,
+    };
+    assert_eq!(err.to_string(), "codex token exchange returned HTTP 400");
+    let _ = handle.join();
 }

@@ -178,13 +178,20 @@ impl Registry {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
         };
-        let table: toml::Table = toml::from_str(&content)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let table: toml::Table = toml::from_str(&content).map_err(|e| {
+            crate::format::parse_error(
+                path.display(),
+                crate::format::toml_parse_position(&content, &e),
+            )
+        })?;
         let (misconfigured, rest) = split_unknown_key_rows(table)
             .with_context(|| format!("invalid proxy registry {}", path.display()))?;
-        let disk: BTreeMap<String, DiskRow> = toml::Value::Table(rest)
-            .try_into()
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let disk: BTreeMap<String, DiskRow> = toml::Value::Table(rest).try_into().map_err(|e| {
+            crate::format::parse_error(
+                path.display(),
+                crate::format::toml_parse_position(&content, &e),
+            )
+        })?;
         Self::from_disk(disk, misconfigured)
             .with_context(|| format!("invalid proxy registry {}", path.display()))
     }

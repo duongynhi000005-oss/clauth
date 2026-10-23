@@ -836,6 +836,24 @@ fn token_parse_error_redacts_the_2xx_body() {
     );
 }
 
+/// An empty 2xx body is an end-of-input error at line 1, column 0: the
+/// operator line names the line alone, never a false "column 0".
+#[test]
+fn token_parse_error_names_a_column_zero_body_by_line_alone() {
+    let body = "";
+    let err = match serde_json::from_str::<TokenResponse>(body) {
+        Ok(_) => panic!("an empty body must fail to parse into TokenResponse"),
+        Err(e) => e,
+    };
+    let msg = super::token_parse_error(&err, 200, body.len()).log_detail();
+
+    assert_eq!(
+        msg,
+        "HTTP 200 but the body did not parse as a token response \
+         (truncated at line 1); 0 bytes withheld (contains live credentials)"
+    );
+}
+
 // ── refresh_rejection_is_terminal (the 400/401/403 truth table) ─────────────
 
 /// 400/403 are terminal ONLY with a confirming `invalid_grant` body. The token
@@ -4979,6 +4997,208 @@ fn repro_104_restamp_follows_a_regular_file_live_slot() {
     assert!(
         raw.get("mcpOAuth").is_some(),
         "blocks CC wrote beside the login survive the follower"
+    );
+}
+
+/// A live slot whose login block carries a token where a number belongs would
+/// otherwise quote the value in the parser's message; the re-stamp's unreadable
+/// line names the position alone, never the value.
+#[test]
+fn an_unreadable_live_slot_names_the_position_and_never_the_value() {
+    let _home = HomeSandbox::new();
+    let name = "test-live-slot-unreadable";
+    let far_chain = crate::usage::now_ms() as i64 + 24 * 3_600_000;
+    let mut config = rolling_config(name, Some("rt-old"), Some(far_chain));
+    config.state.active_profile = Some(crate::profile::ProfileName::from(name));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &fed_bearer("at-fed-dying"),
+    )
+    .expect("feed");
+    let claude_dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude_dir).expect("mkdir");
+    let live_path = claude_dir.join(".credentials.json");
+    // `expiresAt` wants a number; a token string there is a type error whose
+    // position is the end of the value (line 1, column 72).
+    std::fs::write(
+        &live_path,
+        b"{\"claudeAiOauth\": {\"accessToken\": \"a\", \"expiresAt\": \"sk-c2probe-NOTAKEY\"}}",
+    )
+    .expect("write live");
+    let handle = Arc::new(RankedMutex::new(config));
+    let sink = crate::logline::LogLines::new();
+    let capture = sink.capture_here();
+    assert!(matches!(
+        restamp_rolling_token(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
+        AuthGate::Ready
+    ));
+    drop(capture);
+
+    let snapshot = sink.snapshot();
+    let expected = format!(
+        "clauth: re-stamped '{name}' but the live .credentials.json could not be \
+         parsed to check its login (line 1, column 72); live file left untouched. Run \
+         `clauth {name}` to reinstall"
+    );
+    assert!(
+        snapshot.iter().any(|line| line == &expected),
+        "the re-stamp line names the position: expected {expected:?} in {snapshot:?}"
+    );
+    assert!(
+        snapshot
+            .iter()
+            .all(|line| !line.contains("sk-c2probe-NOTAKEY")),
+        "the value must never reach the log: {snapshot:?}"
+    );
+}
+
+/// An empty live slot has no position to name; the re-stamp's unreadable line
+/// renders the bare frame, with no stray space before the `;`. The pinned line
+/// is the follower's own output, so its presence also proves the re-stamp
+/// reached the follower (a re-stamp that skips it logs nothing there).
+#[test]
+fn a_restamp_over_an_empty_live_slot_names_the_bare_frame() {
+    let _home = HomeSandbox::new();
+    let name = "test-restamp-live-slot-empty";
+    let far_chain = crate::usage::now_ms() as i64 + 24 * 3_600_000;
+    let mut config = rolling_config(name, Some("rt-old"), Some(far_chain));
+    config.state.active_profile = Some(crate::profile::ProfileName::from(name));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &fed_bearer("at-fed-dying"),
+    )
+    .expect("feed");
+    let claude_dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude_dir).expect("mkdir");
+    let live_path = claude_dir.join(".credentials.json");
+    std::fs::write(&live_path, b"").expect("write live");
+    let handle = Arc::new(RankedMutex::new(config));
+    let sink = crate::logline::LogLines::new();
+    let capture = sink.capture_here();
+    assert!(matches!(
+        restamp_rolling_token(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
+        AuthGate::Ready
+    ));
+    drop(capture);
+
+    let snapshot = sink.snapshot();
+    let expected = format!(
+        "clauth: re-stamped '{name}' but the live .credentials.json could not be \
+         parsed to check its login; live file left untouched. Run \
+         `clauth {name}` to reinstall"
+    );
+    assert!(
+        snapshot.iter().any(|line| line == &expected),
+        "the re-stamp line renders the bare frame: expected {expected:?} in {snapshot:?}"
+    );
+}
+
+/// A rotation over a live slot whose login block carries a token where a
+/// number belongs would otherwise quote the value in the parser's message; the
+/// rotation's unreadable line names the position alone, never the value. The
+/// pinned line is the follower's own output, so its presence also proves the
+/// rotation reached the follower (a rotation that skips it logs nothing).
+#[test]
+fn a_rotation_over_an_unreadable_live_slot_names_the_position_and_never_the_value() {
+    let _home = HomeSandbox::new();
+    let name = "test-rotation-live-slot-unreadable";
+    let mut config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
+    config.state.active_profile = Some(crate::profile::ProfileName::from(name));
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let claude_dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude_dir).expect("mkdir");
+    let live_path = claude_dir.join(".credentials.json");
+    // `expiresAt` wants a number; a token string there is a type error whose
+    // position is the end of the value (line 1, column 72).
+    std::fs::write(
+        &live_path,
+        b"{\"claudeAiOauth\": {\"accessToken\": \"a\", \"expiresAt\": \"sk-c2probe-NOTAKEY\"}}",
+    )
+    .expect("write live");
+    let handle = Arc::new(RankedMutex::new(config));
+    let sink = crate::logline::LogLines::new();
+    let capture = sink.capture_here();
+    persist_rotation(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        TokenResponse {
+            access_token: "at-rotated".to_string(),
+            refresh_token: "rt-rotated".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+    drop(capture);
+
+    let snapshot = sink.snapshot();
+    let expected = format!(
+        "clauth: rotated '{name}' but the live .credentials.json could not be \
+         parsed to check its login (line 1, column 72); live file left untouched. Run \
+         `clauth {name}` to reinstall"
+    );
+    assert!(
+        snapshot.iter().any(|line| line == &expected),
+        "the rotation line names the position: expected {expected:?} in {snapshot:?}"
+    );
+    assert!(
+        snapshot
+            .iter()
+            .all(|line| !line.contains("sk-c2probe-NOTAKEY")),
+        "the value must never reach the log: {snapshot:?}"
+    );
+}
+
+/// An empty live slot has no position to name; the rotation's unreadable line
+/// renders the bare frame, with no stray space before the `;`.
+#[test]
+fn a_rotation_over_an_empty_live_slot_names_the_bare_frame() {
+    let _home = HomeSandbox::new();
+    let name = "test-rotation-live-slot-empty";
+    let mut config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
+    config.state.active_profile = Some(crate::profile::ProfileName::from(name));
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let claude_dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude_dir).expect("mkdir");
+    let live_path = claude_dir.join(".credentials.json");
+    std::fs::write(&live_path, b"").expect("write live");
+    let handle = Arc::new(RankedMutex::new(config));
+    let sink = crate::logline::LogLines::new();
+    let capture = sink.capture_here();
+    persist_rotation(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        TokenResponse {
+            access_token: "at-rotated".to_string(),
+            refresh_token: "rt-rotated".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+    drop(capture);
+
+    let snapshot = sink.snapshot();
+    let expected = format!(
+        "clauth: rotated '{name}' but the live .credentials.json could not be \
+         parsed to check its login; live file left untouched. Run \
+         `clauth {name}` to reinstall"
+    );
+    assert!(
+        snapshot.iter().any(|line| line == &expected),
+        "the rotation line renders the bare frame: expected {expected:?} in {snapshot:?}"
     );
 }
 

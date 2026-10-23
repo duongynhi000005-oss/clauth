@@ -193,6 +193,26 @@ fn a_missing_registry_reads_empty() {
     assert_eq!(Registry::load().expect("load"), Registry::default());
 }
 
+/// A torn registry would otherwise quote the source line in the parser's
+/// message; the load names the position alone.
+#[test]
+fn a_torn_registry_names_the_position() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(&path, "api_key = \"sk-c2probe-NOTAKEY");
+
+    let err = Registry::load().expect_err("a torn registry fails the load");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        format!("failed to parse {} at line 1, column 30", path.display())
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
 /// Every invalid row fails the load naming the row and the field; none is
 /// dropped while the rest load.
 #[test]

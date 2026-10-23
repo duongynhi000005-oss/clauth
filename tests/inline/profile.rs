@@ -5131,3 +5131,122 @@ fn stored_login_reads_no_files_as_holding_none() {
         "no store files prove no login"
     );
 }
+
+/// A torn `config.toml` line would otherwise quote the api key in the parser's
+/// own message; the load renders the position alone, so the key never reaches
+/// `{e:?}`/`{e:#}` on any surface.
+#[test]
+fn a_torn_config_toml_names_the_position_and_never_the_secret() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("c2-torn");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let config_path = profile_subpath(&name, "config.toml").expect("config path");
+    // `api_key = "sk-c2probe-NOTAKEY` is an unterminated string: the span sits
+    // at end-of-input, so the position is line 1, column 30 (29 chars, one
+    // past the last).
+    std::fs::write(&config_path, "api_key = \"sk-c2probe-NOTAKEY").expect("write torn config");
+    let err = load_profile(&name).expect_err("a torn config fails the load");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        "failed to parse c2-torn/config.toml at line 1, column 30"
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
+#[test]
+fn read_toml_file_names_the_position_and_never_the_secret() {
+    let _home = HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    let roster = clauth.join("profiles.toml");
+    std::fs::write(&roster, "api_key = \"sk-c2probe-NOTAKEY").expect("write torn roster");
+    let err = read_toml_file::<toml::Value>(&roster).expect_err("a torn roster fails the read");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        format!("failed to parse {} at line 1, column 30", roster.display())
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
+/// A token string where the `expiresAt` number belongs is a type error; the
+/// position names the spot without quoting the value.
+#[test]
+fn read_json_file_names_the_position_and_never_the_secret() {
+    let _home = HomeSandbox::new();
+    let cred = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("credentials.json");
+    crate::profile::mkdir_700(cred.parent().expect("parent")).expect("mkdir .clauth");
+    std::fs::write(
+        &cred,
+        "{\"claudeAiOauth\": {\"expiresAt\": \"sk-c2probe-NOTAKEY\"}}",
+    )
+    .expect("write credentials");
+    let err = read_json_file::<ClaudeCredentials>(&cred)
+        .expect_err("a token string where a number belongs fails the read");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        format!("failed to parse {} at line 1, column 52", cred.display())
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
+/// A json error whose column is 0 (a whole-value type mismatch) names the line
+/// alone: there is no column to point at, but the file has a line to open.
+#[test]
+fn read_json_file_renders_line_alone_when_the_column_is_zero() {
+    let _home = HomeSandbox::new();
+    let cred = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("credentials.json");
+    crate::profile::mkdir_700(cred.parent().expect("parent")).expect("mkdir .clauth");
+    // A top-level array where a map is expected fails with line 1, column 0.
+    std::fs::write(&cred, "[{\"endpoint\": \"x\"}]").expect("write credentials");
+    let err = read_json_file::<std::collections::HashMap<String, u64>>(&cred)
+        .expect_err("a top-level array where a map belongs fails the read");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        format!("failed to parse {} at line 1", cred.display())
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
+/// A file torn right after a newline is an end-of-input error at column 0 on
+/// line 2: the empty-file carve-out is line 1 column 0 alone, so this names
+/// line 2 rather than rendering the bare label.
+#[test]
+fn read_json_file_names_the_line_for_a_file_torn_after_a_newline() {
+    let _home = HomeSandbox::new();
+    let cred = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("credentials.json");
+    crate::profile::mkdir_700(cred.parent().expect("parent")).expect("mkdir .clauth");
+    std::fs::write(&cred, "{\"a\": 1,\n").expect("write credentials");
+    let err = read_json_file::<serde_json::Value>(&cred)
+        .expect_err("a file torn right after a newline fails the read");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        format!("failed to parse {} at line 2", cred.display())
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}

@@ -552,7 +552,10 @@ impl std::fmt::Debug for UnparseableItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnparseableItem")
             .field("raw_len", &self.raw.len())
-            .field("parse_error", &self.parse_error)
+            .field(
+                "parse_position",
+                &crate::format::json_parse_position(&self.parse_error),
+            )
             .finish()
     }
 }
@@ -561,8 +564,16 @@ impl std::fmt::Display for UnparseableItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The bytes stay off the Display: this text reaches event lines, and
         // the point of carrying them on the struct is to keep them out of
-        // exactly those lines until the quarantine file takes them.
-        write!(f, "Keychain item is not valid JSON: {}", self.parse_error)
+        // exactly those lines until the quarantine file takes them. The
+        // position renders through the shared fragment, never serde's text.
+        write!(
+            f,
+            "{}",
+            crate::format::parse_refusal(
+                "Keychain item is not valid JSON",
+                crate::format::json_parse_position(&self.parse_error)
+            )
+        )
     }
 }
 

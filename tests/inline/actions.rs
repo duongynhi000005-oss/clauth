@@ -7949,7 +7949,9 @@ fn deleting_the_last_token_reads_the_gateway_and_refuses_only_what_it_cannot_tel
             }
             "config not TOML" => {
                 std::fs::write(record.config(), "[server.auth]\nheader = \"x").expect("config");
-                Err(unread("the shunt config does not parse as TOML (line 2)"))
+                Err(unread(
+                    "the shunt config does not parse as TOML (line 2, column 12)",
+                ))
             }
             "record names YAML" => {
                 let yaml = home.home().join("etc").join("shunt.yaml");
