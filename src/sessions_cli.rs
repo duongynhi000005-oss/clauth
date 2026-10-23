@@ -418,7 +418,9 @@ fn shadowing_hold(target: &str, found: Option<&SessionRef>) -> Option<IsolatedHo
         }
         return crate::sessions::live_isolated_holds()
             .into_iter()
-            .find(|h| h.session.id == target);
+            .find(|h| {
+                h.session.id == target && !crate::sessions::is_workflow_journal(&h.session.path)
+            });
     }
     let newest = crate::sessions::live_isolated_top_level_holds()
         .into_iter()

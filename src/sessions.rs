@@ -629,27 +629,31 @@ fn collect_jsonl(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> bool {
     complete
 }
 
+/// A workflow run's journal (`…/workflows/wf_<id>/journal.jsonl`): a run log,
+/// not a conversation transcript, so it is no session a lookup may name.
+pub(crate) fn is_workflow_journal(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "journal.jsonl")
+        && path.parent().is_some_and(|parent| {
+            parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("wf_"))
+                && parent
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "workflows")
+        })
+}
+
 /// Walk every `*.jsonl` under one store's `projects/` dir into `by_id`, keeping
 /// the newest entry when a session id appears in more than one file. A file
-/// with no usable stem or an unreadable mtime is skipped.
+/// with no usable stem, an unreadable mtime, or a workflow run's journal is
+/// skipped.
 fn walk_store(projects: &Path, source: &SessionSource, by_id: &mut HashMap<String, Walked>) {
     let mut paths = Vec::new();
     collect_jsonl(projects, WALK_MAX_DEPTH, &mut paths);
     for path in paths {
-        // Workflow journals are run logs, not conversation transcripts. Keep
-        // sibling agent transcripts and ordinary sessions named `journal`.
-        let is_workflow_journal = path.file_name().is_some_and(|name| name == "journal.jsonl")
-            && path.parent().is_some_and(|parent| {
-                parent
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("wf_"))
-                    && parent
-                        .parent()
-                        .and_then(Path::file_name)
-                        .is_some_and(|name| name == "workflows")
-            });
-        if is_workflow_journal {
+        if is_workflow_journal(&path) {
             continue;
         }
         let (Some(id), Some(updated)) = (session_id_from_path(&path), mtime_of(&path)) else {
@@ -821,6 +825,7 @@ fn global_transcripts(depth: usize) -> Vec<PathBuf> {
 pub(crate) fn find_session(session_id: &str) -> Option<SessionRef> {
     let (updated, path) = global_transcripts(WALK_MAX_DEPTH)
         .into_iter()
+        .filter(|p| !is_workflow_journal(p))
         .filter(|p| session_id_from_path(p).as_deref() == Some(session_id))
         .filter_map(|p| mtime_of(&p).map(|t| (t, p)))
         .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))?;
@@ -865,8 +870,8 @@ pub(crate) fn workspace_of(session_id: &str) -> Option<PathBuf> {
     find_session(session_id)?.workspace()
 }
 
-/// Every transcript a live isolated runtime is holding, at the same tier-1 cost
-/// (filenames and mtimes, nothing opened).
+/// Every `*.jsonl` a live isolated runtime is holding, workflow journals
+/// included, at the same tier-1 cost (filenames and mtimes, nothing opened).
 ///
 /// These are never resolutions — a resume spawns against the shared store and
 /// cannot read any of them. They exist to EXPLAIN what the shared store alone

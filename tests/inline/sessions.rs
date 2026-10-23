@@ -364,6 +364,48 @@ fn build_index_skips_workflow_journals_but_keeps_transcripts() {
     assert_eq!(journal.first_message.as_deref(), Some("real session"));
 }
 
+/// `clauth info` / `clauth resume` look an id up without the index, so the
+/// exact-id lookup must skip a workflow journal the way the listing does, or
+/// `clauth info journal` keeps answering with a run log.
+#[test]
+fn find_session_skips_workflow_journals_but_keeps_their_siblings() {
+    let sb = HomeSandbox::new();
+    let project = sb.home().join(".claude/projects/-w-workflow");
+    let workflow = project.join("session/subagents/workflows/wf_x");
+    write_jsonl(
+        &project.join("session.jsonl"),
+        &[user_line("session", "/w/workflow", "parent")],
+    );
+    write_jsonl(
+        &workflow.join("journal.jsonl"),
+        &[json!({"agentId": "agent-a1b2c3d4", "key": "x", "type": "started"}).to_string()],
+    );
+    let agent = workflow.join("agent-a1b2c3d4.jsonl");
+    write_jsonl(&agent, &[user_line("session", "/w/workflow", "subagent")]);
+
+    assert_eq!(
+        find_session("journal").map(|s| s.path),
+        None,
+        "the exact-id lookup skips a workflow journal"
+    );
+    assert_eq!(
+        find_session("agent-a1b2c3d4").map(|s| s.path),
+        Some(agent),
+        "the agent transcript beside it still resolves"
+    );
+
+    let real = project.join("journal.jsonl");
+    write_jsonl(
+        &real,
+        &[user_line("journal", "/w/workflow", "real session")],
+    );
+    assert_eq!(
+        find_session("journal").map(|s| s.path),
+        Some(real),
+        "a top-level session named `journal` still resolves"
+    );
+}
+
 #[test]
 fn last_user_message_comes_from_the_tail_not_the_head() {
     let sb = HomeSandbox::new();
@@ -2121,14 +2163,15 @@ fn newest_session_takes_the_greatest_mtime_then_the_smallest_id() {
 /// `journal`) match nothing: `--print` errors out and the interactive path opens
 /// the session picker with no match (CC 2.1.221). `latest` has to end in a
 /// session CC will open, so it takes the newest of those even when a nested file
-/// is newer — while the listing and the exact-id lookup keep carrying them.
+/// is newer — while the listing and the exact-id lookup keep carrying the
+/// `agent-<hex>` transcripts (a workflow journal is no session at all).
 #[test]
 fn newest_session_skips_the_nested_transcripts_a_resume_cannot_open() {
     let sb = HomeSandbox::new();
     let projects = sb.home().join(".claude/projects/-w-a");
     let top = projects.join("s-top.jsonl");
     let agent = projects.join("s-top/subagents/agent-a0722a48260618b8a.jsonl");
-    let journal = projects.join("s-top/subagents/workflows/wf-1/journal.jsonl");
+    let journal = projects.join("s-top/subagents/workflows/wf_1/journal.jsonl");
     write_jsonl(&top, &[user_line("s-top", "/w/a", "top")]);
     write_jsonl(&agent, &[user_line("s-top", "/w/a", "subagent")]);
     write_jsonl(&journal, &[user_line("s-top", "/w/a", "workflow")]);
@@ -2185,6 +2228,54 @@ fn live_isolated_holds_reports_what_the_lookup_excludes() {
         holds[0].session.updated,
         SystemTime::UNIX_EPOCH + Duration::from_secs(5_000),
         "the mtime a `latest` comparison needs comes back with it"
+    );
+}
+
+/// The workflow-journal skip is for the readers that resolve an id; the owner
+/// prune keeps seeing every `*.jsonl` a live isolated run holds, so an owner row
+/// keyed by a journal's stem survives exactly as it did before the skip.
+#[test]
+fn prune_keeps_an_owner_named_after_an_isolated_workflow_journal() {
+    let sb = HomeSandbox::new();
+    let global = sb.home().join(".claude/projects/-w-g/sglobal.jsonl");
+    write_jsonl(&global, &[user_line("sglobal", "/w/g", "hi global")]);
+    let iso = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso");
+    write_jsonl(
+        &iso.join("siso.jsonl"),
+        &[user_line("siso", "/w/iso", "hi iso")],
+    );
+    write_jsonl(
+        &iso.join("siso/subagents/workflows/wf_y/journal.jsonl"),
+        &[json!({"agentId": "agent-e5f6a7b8", "key": "y", "type": "started"}).to_string()],
+    );
+    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
+    lock_file.lock().unwrap(); // held so the runtime reads as live
+    let mut store = SessionProfiles::default();
+    for id in ["sglobal", "siso", "journal", "gone"] {
+        store
+            .sessions
+            .insert(id.into(), SessionOwner::Known("iso".into()));
+    }
+    let mut paths = Vec::new();
+    let complete = collect_jsonl(
+        &sb.home().join(".claude/projects"),
+        WALK_MAX_DEPTH,
+        &mut paths,
+    );
+
+    prune_owner_store(&mut store, &paths, complete);
+    drop(lock_file);
+
+    let mut kept: Vec<String> = store.sessions.keys().cloned().collect();
+    kept.sort();
+    assert_eq!(
+        kept,
+        ["journal", "sglobal", "siso"],
+        "only `gone` has no transcript anywhere"
     );
 }
 

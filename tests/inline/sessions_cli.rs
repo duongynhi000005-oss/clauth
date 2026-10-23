@@ -918,6 +918,44 @@ fn latest_refuses_rather_than_substituting_when_an_isolated_run_holds_the_newest
     );
 }
 
+/// A workflow journal is a run log the listing never shows, so naming one an
+/// isolated run holds answers "no session found", never "held"; the agent
+/// transcript beside it stays a held session.
+#[test]
+fn an_isolated_workflow_journal_is_no_held_session() {
+    let sb = HomeSandbox::new();
+    let ws = sb.home().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let workflow = sb.home().join(
+        ".clauth/profiles/iso/runtime-isolated/projects/-w-iso/siso/subagents/workflows/wf_y",
+    );
+    write_jsonl(
+        &workflow.join("journal.jsonl"),
+        &[json!({"agentId": "agent-e5f6a7b8", "key": "y", "type": "started"}).to_string()],
+    );
+    write_jsonl(
+        &workflow.join("agent-e5f6a7b8.jsonl"),
+        &[user_line("siso", &ws.to_string_lossy(), "subagent")],
+    );
+    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
+    lock_file.lock().unwrap(); // held so the runtime reads as live
+
+    let journal = resolve_session("journal");
+    let agent = resolve_session("agent-e5f6a7b8");
+    drop(lock_file);
+
+    assert!(
+        matches!(journal, Resolved::Missing),
+        "a workflow journal an isolated run holds is no session"
+    );
+    assert!(
+        matches!(agent, Resolved::Held(ref h) if h.session.id == "agent-e5f6a7b8"),
+        "the agent transcript beside it is still reported held"
+    );
+}
+
 /// The shadowing check ranges over the same kind of file `latest` itself does.
 /// A nested transcript in a live isolated store can be newer than everything and
 /// is still never anybody's `latest`, so refusing on one would strand the resume
