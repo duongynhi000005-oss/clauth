@@ -20556,13 +20556,15 @@ fn the_overview_long_slot_labels_a_monthly_only_accounts_quota() {
         },
     );
     // qwen's marked monthly cache, re-anchored so its reset stays live. The
-    // stamp is `now + 30d + 6h` (not the exact `now + 30d` the reanchor helper
-    // writes) so the countdown sits mid-bucket and stays `30d 6h` across the
-    // run's sub-second drift.
+    // countdown floors to whole hours, so a stamp of exactly `now + 30d + 6h`
+    // reads `30d 5h` once a clock second ticks before the draw; `+ 6h 30m`
+    // sits mid-bucket and reads `30d 6h` for up to 30 minutes of drift.
     let mut stats: crate::providers::ThirdPartyStats =
         serde_json::from_str(crate::testutil::QWEN_MONTHLY_CACHE).expect("captured cache parses");
     for bar in &mut stats.bars {
-        bar.resets_at = Some(epoch_secs_to_iso(now_epoch_secs() + 30 * 86_400 + 6 * 3600));
+        bar.resets_at = Some(epoch_secs_to_iso(
+            now_epoch_secs() + 30 * 86_400 + 6 * 3600 + 30 * 60,
+        ));
     }
     app.third_party_usage_store
         .lock()
