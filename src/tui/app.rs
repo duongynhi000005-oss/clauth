@@ -58,6 +58,7 @@ use crate::profile::{
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
+use crate::tui::clawd;
 use crate::tui::render::prose::{self, cmd_lit};
 use crate::tui::render::{ListView, follow_scroll_offset, truncate};
 use crate::tui::theme;
@@ -5109,6 +5110,9 @@ pub(crate) struct App {
     pub(crate) unsaved_live_login: bool,
     /// Origin of the ambient-animation phase clock; read through [`App::anim_ms`].
     pub(crate) started_at: Instant,
+    /// Header mascot playback: a random big animation at launch and every 30
+    /// minutes, a subtler one every 10 seconds.
+    pub(crate) clawd: clawd::Clawd,
     /// Pinned animation phase for render tests that must sample a specific point
     /// of the wave. Backdating `started_at` instead would subtract from
     /// `Instant::now()`, which panics on a host whose uptime is shorter than the
@@ -5827,6 +5831,7 @@ impl App {
             snapshot,
             unsaved_live_login: false,
             started_at: Instant::now(),
+            clawd: clawd::Clawd::new(),
             #[cfg(test)]
             anim_phase_ms: None,
             #[cfg(test)]
@@ -26417,6 +26422,8 @@ fn apply_console_login(
 
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
+    let now_ms = app.anim_ms();
+    app.clawd.tick(now_ms);
     // Safety net: a forget noted without an immediate drain still lands before
     // the next frame reads the stores; the per-site drains keep this a no-op.
     app.apply_forgets();

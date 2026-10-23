@@ -2,6 +2,7 @@
 //! between ratatui, the `App` state machine, and shutdown housekeeping.
 
 mod app;
+mod clawd;
 mod render;
 pub(crate) mod theme;
 

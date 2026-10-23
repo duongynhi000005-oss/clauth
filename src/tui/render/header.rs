@@ -1,5 +1,5 @@
-//! Top bar: claude glyph on the left; brand, usage gauge and status source in
-//! the text column to the right. Three rows always — [`header_height`] keeps
+//! Top bar: the Clawd mascot on the left; brand, usage gauge and status source
+//! in the text column to the right. Three rows always — [`header_height`] keeps
 //! `render::draw`'s layout in step.
 //!
 //! Row 0 reads `clauth vX.Y.Z` on the left with the herdr tag between them,
@@ -13,14 +13,15 @@
 //! usage bar before the name.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, Health, ReadingsSnapshot, Tab, gateway_health, live_count_text, live_number_spans,
 };
+use super::super::clawd::{self, CellKind};
 use super::super::theme;
 use super::format::{bar_string_with_cells, fixed_split};
 use super::services::health_color;
@@ -553,26 +554,43 @@ fn shunt_chip_color(app: &App) -> ratatui::style::Color {
 }
 
 fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let blink = (app.anim_ms() % 6000) < 200;
-
-    let style = Style::default().fg(theme::accent_2_color());
-
-    let logo_top = if blink {
-        " ▐█████▌ "
-    } else {
-        " ▐▛███▜▌ "
+    let art = match app.clawd.frame(app.anim_ms()) {
+        Some(current) => clawd::render(current),
+        None => clawd::rest_art(),
     };
-    let logo_mid = "▝▜█████▛▘";
-    let logo_eyes = "  ▘▘ ▝▝  ";
-
-    let lines = vec![
-        Line::from(Span::styled(logo_top, style)).alignment(Alignment::Left),
-        Line::from(Span::styled(logo_mid, style)).alignment(Alignment::Left),
-        Line::from(Span::styled(logo_eyes, style)).alignment(Alignment::Left),
-    ];
-
+    let lines: Vec<Line<'static>> = art.iter().map(|row| Line::from(row_spans(row))).collect();
     let para = Paragraph::new(lines).style(theme::base());
     frame.render_widget(para, area);
+}
+
+fn row_spans(row: &[(char, CellKind); clawd::COLS]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut glyphs = String::new();
+    let mut run_kind = row[0].1;
+    for &(glyph, kind) in row {
+        if kind != run_kind {
+            spans.push(Span::styled(
+                std::mem::take(&mut glyphs),
+                cell_style(run_kind),
+            ));
+            run_kind = kind;
+        }
+        glyphs.push(glyph);
+    }
+    spans.push(Span::styled(glyphs, cell_style(run_kind)));
+    spans
+}
+
+fn cell_style(kind: CellKind) -> Style {
+    let body = theme::accent_2_color();
+    let background = theme::base().bg.unwrap_or(Color::Reset);
+    match kind {
+        CellKind::Empty => Style::default(),
+        CellKind::Body | CellKind::FacingBody => Style::default().fg(body),
+        CellKind::Eye | CellKind::FacingCut => Style::default().fg(body).bg(background),
+        CellKind::Lid => Style::default().fg(background).bg(body),
+        CellKind::Inactive => Style::default().fg(theme::text_faint_color()),
+    }
 }
 
 #[cfg(test)]

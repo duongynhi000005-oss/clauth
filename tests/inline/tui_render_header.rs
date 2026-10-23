@@ -128,33 +128,34 @@ fn a_wide_glyph_active_name_keeps_the_status_indicator_whole() {
             "abcdefghijklmnopqrstuvwxyz",
             &[
                 (27, "▝▜█████"),
-                (28, "▝▜█████▛"),
-                (34, "▝▜█████▛▘       ● status.claude.ai"),
-                (45, "▝▜█████▛▘ abcdefgh… 49%    ● status.claude.ai"),
+                (28, "▝▜██████"),
+                (34, "▝▜██████▀       ● status.claude.ai"),
+                (45, "▝▜██████▀ abcdefgh… 49%    ● status.claude.ai"),
             ],
         ),
         (
             "cjk-日本語アカウント",
             &[
                 (27, "▝▜█████"),
-                (28, "▝▜█████▛"),
-                (34, "▝▜█████▛▘       ● status.claude.ai"),
-                (45, "▝▜█████▛▘ cjk-日 本 … 49%    ● status.claude.ai"),
+                (28, "▝▜██████"),
+                (34, "▝▜██████▀       ● status.claude.ai"),
+                (45, "▝▜██████▀ cjk-日 本 … 49%    ● status.claude.ai"),
             ],
         ),
         (
             "emoji-🧭⚠️-account",
             &[
                 (27, "▝▜█████"),
-                (28, "▝▜█████▛"),
-                (34, "▝▜█████▛▘       ● status.claude.ai"),
-                (45, "▝▜█████▛▘ emoji-🧭 … 49%    ● status.claude.ai"),
+                (28, "▝▜██████"),
+                (34, "▝▜██████▀       ● status.claude.ai"),
+                (45, "▝▜██████▀ emoji-🧭 … 49%    ● status.claude.ai"),
             ],
         ),
     ];
     for (name, cases) in want {
         let mut app = app_with(vec![oauth_profile(name, 49.0)], Some(name));
         app.tab = Tab::Usage;
+        app.anim_phase_ms = Some(5_000);
         for &(w, expected) in *cases {
             let rows = render_header_rows(&app, w);
             assert_eq!(rows[1].trim_end(), expected, "row 1 for {name} at {w} cols");
@@ -1338,14 +1339,15 @@ fn the_ascii_active_name_desktop_rows_match_the_pre_s9_render() {
         Some("abcdefghijklmnopqrstuvwxyz"),
     );
     app.tab = Tab::Usage;
+    app.anim_phase_ms = Some(5_000);
     for (w, expected) in [
         (
             80u16,
-            "▝▜█████▛▘ abcdefghijklmno… 49% [█████░░░░░]                   ● status.claude.ai",
+            "▝▜██████▀ abcdefghijklmno… 49% [█████░░░░░]                   ● status.claude.ai",
         ),
         (
             160u16,
-            "▝▜█████▛▘ [ 0 live ]  [ — tok/s ] · abcdefghijklmno… 49% [█████░░░░░]                                                                         ● status.claude.ai",
+            "▝▜██████▀ [ 0 live ]  [ — tok/s ] · abcdefghijklmno… 49% [█████░░░░░]                                                                         ● status.claude.ai",
         ),
     ] {
         let rows = render_header_rows(&app, w);
@@ -1364,14 +1366,15 @@ fn the_wide_glyph_active_names_desktop_rows_replace_the_pre_s9_clip() {
         Some("cjk-日本語アカウント"),
     );
     app.tab = Tab::Usage;
+    app.anim_phase_ms = Some(5_000);
     for (w, expected) in [
         (
             80u16,
-            "▝▜█████▛▘ cjk-日 本 語 ア カ … 49% [█████░░░░░]                    ● status.claude.ai",
+            "▝▜██████▀ cjk-日 本 語 ア カ … 49% [█████░░░░░]                    ● status.claude.ai",
         ),
         (
             160u16,
-            "▝▜█████▛▘ [ 0 live ]  [ — tok/s ] · cjk-日 本 語 ア カ … 49% [█████░░░░░]                                                                          ● status.claude.ai",
+            "▝▜██████▀ [ 0 live ]  [ — tok/s ] · cjk-日 本 語 ア カ … 49% [█████░░░░░]                                                                          ● status.claude.ai",
         ),
     ] {
         let rows = render_header_rows(&app, w);
@@ -1684,4 +1687,49 @@ fn the_speed_suffix_stays_inside_its_charged_ceiling() {
     app.set_tps(Some(tps_snapshot(1_000, 1.0, Some(12_345.0))));
     let row = row_content(&app, 160, 1);
     assert!(row.contains("[████░░░░░░] (12k t/s)"), "{row:?}");
+}
+
+/// Between animations the logo returns to the mascot's rest pose, the same
+/// frame claude code paints in its composer.
+#[test]
+fn the_header_logo_rests_on_the_clawd_default_pose() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.anim_phase_ms = Some(5_000);
+    let rows = render_header_rows(&app, 80);
+    let expected = [" ▐▛███▛█ ", "▝▜██████▀", " ▝▝   ▝▝ "];
+    for (row, art) in rows.iter().zip(expected) {
+        assert_eq!(row.chars().take(9).collect::<String>(), art, "{row:?}");
+    }
+}
+
+/// A closed lid inverts: background-coloured glyph over the body colour, the
+/// way claude code paints it. The open eye's background is the app's own, not
+/// a black box over the themed surface.
+#[test]
+fn the_wink_frame_paints_its_lid_over_the_body_colour() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.clawd.play(crate::tui::clawd::Anim::Wink, 0);
+    app.anim_phase_ms = Some(0);
+    let mut term = Terminal::new(TestBackend::new(80, header_height(&app))).unwrap();
+    let readings = app.readings_snapshot();
+    term.draw(|f| {
+        let area = f.area();
+        super::draw(f, area, &app, &readings);
+    })
+    .unwrap();
+    let buf = term.backend().buffer();
+    let lid = buf.cell((6, 0)).expect("lid cell");
+    assert_eq!(lid.symbol(), "▂");
+    assert_eq!(
+        lid.fg,
+        crate::tui::theme::base().bg.expect("themed background")
+    );
+    assert_eq!(lid.bg, crate::tui::theme::accent_2_color());
+    let eye = buf.cell((2, 0)).expect("eye cell");
+    assert_eq!(
+        eye.bg,
+        crate::tui::theme::base().bg.expect("themed background")
+    );
 }

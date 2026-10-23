@@ -993,7 +993,10 @@ fn a_two_line_toast_bolds_the_head_and_dims_the_detail() {
             .enumerate()
             .find(|(_, l)| l.contains(needle))
             .unwrap_or_else(|| panic!("`{needle}` missing from toast:\n{out}"));
-        let col = line.find(needle).unwrap();
+        // The header's block glyphs are one cell but three bytes, so the
+        // buffer's cell index counts characters, not the string's byte offset.
+        let byte = line.find(needle).unwrap();
+        let col = line[..byte].chars().count();
         buf.content[row * (w as usize) + col].modifier
     };
 
@@ -8004,31 +8007,32 @@ fn the_header_gauge_keeps_two_rounded_decimals_at_every_width() {
     use crate::tui::app::Tab;
     let mut app = p1_readings_app();
     app.tab = Tab::Tokens;
+    app.anim_phase_ms = Some(5_000);
     let want: &[(&str, u16, &str)] = &[
-        ("alpha", 28, "▝▜█████▛"),
-        ("bravo", 28, "▝▜█████▛"),
-        ("charlie", 28, "▝▜█████▛"),
-        ("alpha", 45, "▝▜█████▛▘ alpha 1%         ● status.claude.ai"),
-        ("bravo", 45, "▝▜█████▛▘ bravo 73.42%     ● status.claude.ai"),
+        ("alpha", 28, "▝▜██████"),
+        ("bravo", 28, "▝▜██████"),
+        ("charlie", 28, "▝▜██████"),
+        ("alpha", 45, "▝▜██████▀ alpha 1%         ● status.claude.ai"),
+        ("bravo", 45, "▝▜██████▀ bravo 73.42%     ● status.claude.ai"),
         (
             "charlie",
             45,
-            "▝▜█████▛▘ charlie 100%     ● status.claude.ai",
+            "▝▜██████▀ charlie 100%     ● status.claude.ai",
         ),
         (
             "alpha",
             80,
-            "▝▜█████▛▘ alpha 1% [░░░░░░░░░░]                               ● status.claude.ai",
+            "▝▜██████▀ alpha 1% [░░░░░░░░░░]                               ● status.claude.ai",
         ),
         (
             "bravo",
             80,
-            "▝▜█████▛▘ bravo 73.42% [███████░░░]                           ● status.claude.ai",
+            "▝▜██████▀ bravo 73.42% [███████░░░]                           ● status.claude.ai",
         ),
         (
             "charlie",
             80,
-            "▝▜█████▛▘ charlie 100% [██████████]                           ● status.claude.ai",
+            "▝▜██████▀ charlie 100% [██████████]                           ● status.claude.ai",
         ),
     ];
     for (active, w, row) in want {
