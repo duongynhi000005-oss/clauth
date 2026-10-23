@@ -5374,10 +5374,50 @@ fn watchdog_threads(name: &str) -> usize {
         .expect("task dir")
         .flatten()
         .filter(|task| {
-            std::fs::read_to_string(task.path().join("comm"))
-                .is_ok_and(|comm| comm.trim_end() == want)
+            let Some(comm) = read_task_file(&task.path(), "comm") else {
+                return false;
+            };
+            comm.trim_end() == want && !task_is_exiting(&task.path())
         })
         .count()
+}
+
+/// One `/proc/self/task/<tid>/<file>`, or `None` once the task is gone (not
+/// found, no such process). Any other read failure panics, so a full fd table
+/// never hides a live thread from a count.
+#[cfg(target_os = "linux")]
+fn read_task_file(task: &std::path::Path, file: &str) -> Option<String> {
+    match std::fs::read_to_string(task.join(file)) {
+        Ok(text) => Some(text),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            None
+        }
+        Err(e) => panic!("cannot read {}: {e}", task.join(file).display()),
+    }
+}
+
+/// Whether a `/proc/self/task/<tid>` entry is a thread already past its exit:
+/// a joined thread stays listed for a moment with `PF_EXITING` (0x4) set in
+/// its `stat` flags (field 9), so counting it would read a joined watchdog as
+/// alive. A task gone by the time `stat` is read counts as exiting.
+#[cfg(target_os = "linux")]
+fn task_is_exiting(task: &std::path::Path) -> bool {
+    const PF_EXITING: u64 = 0x4;
+    let Some(stat) = read_task_file(task, "stat") else {
+        return true;
+    };
+    // Fields after the parenthesised `comm`, which may itself hold spaces:
+    // state is field 3, so flags (field 9) is the 7th after the `)`.
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return true;
+    };
+    rest.split_whitespace()
+        .nth(6)
+        .and_then(|flags| flags.parse::<u64>().ok())
+        .is_none_or(|flags| flags & PF_EXITING != 0)
 }
 
 #[cfg(target_os = "linux")]
@@ -5391,7 +5431,7 @@ fn rows_of(name: &str) -> Vec<crate::live_sessions::LiveSession> {
 
 /// Tick until `done` holds, failing after 20 s with `what`.
 #[cfg(target_os = "linux")]
-fn tick_until(daemon: &mut Daemon, what: &str, mut done: impl FnMut() -> bool) {
+fn tick_until(daemon: &mut Daemon, what: &str, mut done: impl FnMut(&Daemon) -> bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let probes = crate::runtime::link_mode_probe_calls();
     loop {
@@ -5401,7 +5441,7 @@ fn tick_until(daemon: &mut Daemon, what: &str, mut done: impl FnMut() -> bool) {
             probes,
             "the tick must never probe the link mode; the adoption worker probes under the lock"
         );
-        if done() {
+        if done(daemon) {
             return;
         }
         assert!(std::time::Instant::now() < deadline, "never {what}");
@@ -5409,12 +5449,27 @@ fn tick_until(daemon: &mut Daemon, what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// Whether the daemon holds `name`'s background tree: a held marker in
-/// `sessions-bg/`, one row naming that marker, one watchdog.
+/// Tick until no adoption is queued or in flight, failing after 20 s: an
+/// adoption the worker still runs after a test drops its forced link mode would
+/// see the real one and could adopt behind the test's back.
 #[cfg(target_os = "linux")]
-fn adopted(name: &str, sessions: &std::path::Path) -> bool {
+fn tick_until_no_adoption_pending(daemon: &mut Daemon) {
+    tick_until(daemon, "settled its queued adoptions", |d| {
+        d.background.pending.is_empty()
+    });
+}
+
+/// Whether the daemon holds `name`'s background tree: the hold is in the
+/// daemon's own map (the worker's acquire alone lands the marker, row and
+/// watchdog before the tick collects the runtime, and a daemon dropped before
+/// the worker hands the runtime back leaves its teardown to the worker), a
+/// held marker in `sessions-bg/`, one row naming that marker, one watchdog.
+#[cfg(target_os = "linux")]
+fn adopted(daemon: &Daemon, name: &str, sessions: &std::path::Path) -> bool {
+    let account = crate::profile::ProfileName::from(name);
     let rows = rows_of(name);
-    crate::runtime::has_live_marker(&crate::profile::ProfileName::from(name))
+    daemon.background.held.contains_key(&account)
+        && crate::runtime::has_live_marker(&account)
         && rows.len() == 1
         && sessions.join(&rows[0].session_id).is_file()
         && watchdog_threads(name) == 1
@@ -5478,8 +5533,8 @@ fn a_tick_adopts_a_background_tree_a_job_names_without_waiting_on_its_locks() {
     flock_holder.join().expect("flock holder");
     rot_release_tx.send(()).expect("release the rotation lock");
     rotation_holder.join().expect("rotation holder");
-    tick_until(&mut daemon, "adopted the background tree", || {
-        adopted("bgp", &sessions)
+    tick_until(&mut daemon, "adopted the background tree", |d| {
+        adopted(d, "bgp", &sessions)
     });
 }
 
@@ -5492,8 +5547,8 @@ fn a_fresh_daemon_re_adopts_the_background_tree_while_a_job_names_it() {
     let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
     let (tree, sessions, _job) = background_pair(&sb, "bgp", "working");
     let mut first = daemon_for(config);
-    tick_until(&mut first, "adopted the background tree", || {
-        adopted("bgp", &sessions)
+    tick_until(&mut first, "adopted the background tree", |d| {
+        adopted(d, "bgp", &sessions)
     });
 
     drop(first);
@@ -5502,12 +5557,16 @@ fn a_fresh_daemon_re_adopts_the_background_tree_while_a_job_names_it() {
         !crate::runtime::has_live_marker(&crate::profile::ProfileName::from("bgp")),
         "the old daemon's marker died with it"
     );
-    assert_eq!(watchdog_threads("bgp"), 0, "its watchdog was joined");
+    assert_eq!(
+        watchdog_threads("bgp"),
+        0,
+        "the old daemon's watchdog is no longer running"
+    );
 
     let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
     let mut second = daemon_for(config);
-    tick_until(&mut second, "re-adopted the background tree", || {
-        adopted("bgp", &sessions)
+    tick_until(&mut second, "re-adopted the background tree", |d| {
+        adopted(d, "bgp", &sessions)
     });
 }
 
@@ -5521,16 +5580,16 @@ fn the_daemon_releases_the_background_tree_once_its_last_job_is_removed() {
     let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
     let (tree, sessions, job) = background_pair(&sb, "bgp", "working");
     let mut daemon = daemon_for(config);
-    tick_until(&mut daemon, "adopted the background tree", || {
-        adopted("bgp", &sessions)
+    tick_until(&mut daemon, "adopted the background tree", |d| {
+        adopted(d, "bgp", &sessions)
     });
 
     std::fs::remove_dir_all(&job).expect("claude rm");
-    tick_until(&mut daemon, "released the background tree", || {
+    tick_until(&mut daemon, "released the background tree", |_| {
         !tree.exists() && !sessions.exists()
     });
     assert_eq!(rows_of("bgp").len(), 0, "the row went with the hold");
-    assert_eq!(watchdog_threads("bgp"), 0, "the watchdog was joined");
+    assert_eq!(watchdog_threads("bgp"), 0, "no watchdog is still running");
 }
 
 /// T33b1 N1 (cloudy 2026-10-22, option A), the daemon half: on a host that
@@ -5574,12 +5633,17 @@ fn the_daemon_never_adopts_a_background_tree_on_a_copy_host() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(tree.is_dir(), "the job's tree is left alone");
+    tick_until_no_adoption_pending(&mut daemon);
+    assert!(
+        daemon.background.copy_host.contains_key(&name),
+        "the copy host refused the account before the host links"
+    );
     drop(fake_mode);
 
     tick_until(
         &mut daemon,
         "adopted the background tree once the host links",
-        || adopted("bgp", &sessions),
+        |d| adopted(d, "bgp", &sessions),
     );
 }
 
@@ -5611,6 +5675,7 @@ fn the_daemon_logs_the_copy_host_refusal_once_and_requeues_at_most_once() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    tick_until_no_adoption_pending(&mut daemon);
     drop(fake_mode);
     drop(capture);
 
@@ -5677,6 +5742,7 @@ fn a_new_background_job_re_arms_the_copy_host_recheck() {
         daemon.background.adoption_attempts, 3,
         "a new job re-arms the copy-host re-check, exactly once"
     );
+    tick_until_no_adoption_pending(&mut daemon);
     drop(fake_mode);
 }
 
@@ -5703,6 +5769,11 @@ fn a_new_job_beside_an_older_one_re_arms_the_copy_host_recheck() {
         daemon.background.adoption_attempts, 2,
         "one adoption attempt plus exactly one re-check on a copy host"
     );
+    tick_until_no_adoption_pending(&mut daemon);
+    assert!(
+        !adopted(&daemon, "bgp", &sessions),
+        "the copy host refused both attempts before the host links"
+    );
     drop(fake_mode);
 
     crate::testutil::write_claude_job_in(sb.home(), "c0ffee00", &tree, "working", None);
@@ -5710,7 +5781,7 @@ fn a_new_job_beside_an_older_one_re_arms_the_copy_host_recheck() {
         &mut daemon,
         "adopted the background tree once the host links and a new job joins \
          an older one still naming it",
-        || adopted("bgp", &sessions),
+        |d| adopted(d, "bgp", &sessions),
     );
 }
 
@@ -5772,8 +5843,8 @@ fn the_daemon_tick_never_probes_the_link_mode() {
         before,
         "the tick must never probe the link mode; the adoption worker probes under the lock"
     );
-    tick_until(&mut daemon, "adopted the background tree", || {
-        adopted("bgp", &sessions)
+    tick_until(&mut daemon, "adopted the background tree", |d| {
+        adopted(d, "bgp", &sessions)
     });
 }
 
@@ -5788,8 +5859,8 @@ fn the_daemons_background_hold_alone_never_blocks_a_macos_rotation() {
     let (tree, sessions, job) = background_pair(&sb, "bgp", "stopped");
     let name = crate::profile::ProfileName::from("bgp");
     let mut daemon = daemon_for(config);
-    tick_until(&mut daemon, "adopted the background tree", || {
-        adopted("bgp", &sessions)
+    tick_until(&mut daemon, "adopted the background tree", |d| {
+        adopted(d, "bgp", &sessions)
     });
 
     assert!(
@@ -5817,8 +5888,8 @@ fn an_adopted_background_tree_writes_session_records_to_the_global_store() {
     let config = persist(vec![profile_with_creds("bgp", "tok-bgp")], None, 60_000);
     let (tree, sessions, _job) = background_pair(&sb, "bgp", "working");
     let mut daemon = daemon_for(config);
-    tick_until(&mut daemon, "adopted the background tree", || {
-        adopted("bgp", &sessions)
+    tick_until(&mut daemon, "adopted the background tree", |d| {
+        adopted(d, "bgp", &sessions)
     });
 
     let record = tree.join("sessions").join("4242.json");

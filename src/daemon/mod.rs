@@ -1491,10 +1491,16 @@ impl BackgroundHolds {
 
 impl Drop for BackgroundHolds {
     fn drop(&mut self) {
-        // Close the work channel (the worker exits after its current item) and
+        // Close the work channel (the worker runs what is already queued, then
+        // exits; a failed send back ends it early and the rest of the queue is
+        // dropped unrun, a queued release tearing its runtime down there) and
         // tear each hold down on THIS thread, so a daemon dropping in-process
         // releases its markers before its own process state ends. A release
-        // already handed to the worker finishes there; nothing waits on it.
+        // already handed to the worker finishes there. An adoption's runtime
+        // already sent back is torn down here, when the `done` receiver drops
+        // with this struct; one the worker finishes later fails its send and is
+        // torn down on the worker. Nothing waits on the worker, which may sit on
+        // a blocking rotation lock.
         drop(self.work.take());
         let held = std::mem::take(&mut self.held);
         drop(held);
