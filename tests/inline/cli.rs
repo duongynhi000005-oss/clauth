@@ -4816,6 +4816,26 @@ fn cmd_start_auto_takes_a_credit_capped_member_whose_session_runs_opus() {
         .expect("opus bills the subscription, so a spent credit cap does not stop it");
 }
 
+/// An agent launch naming no model is judged on its union side, and the union
+/// family Claude Code bills against credits refuses first: fable is
+/// credit-billed, so the capped member's credit rung fires on the demand's own
+/// family and the row names it. The agent's own model never enters the judgment
+/// (clauth reads no agent def), so this row is the credit cap, not an unknown
+/// model.
+#[test]
+fn cmd_start_auto_refuses_an_agent_launch_whose_fallback_bills_a_spent_cap() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+
+    let err = cmd_start_auto_with(&["--agent", "rev", "--fallback-model", "fable"])
+        .expect_err("the launch's fable fallback bills a spent credit cap");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
 /// A billing-off account carrying a stale full limit is never capped: the
 /// credit rung keys on `credit_capped()`, never a stale percent, so a fable
 /// demand still runs there.
@@ -4854,8 +4874,8 @@ fn cmd_start_auto_refuses_a_family_the_cached_flag_bills_against_credits() {
 }
 
 /// No `[models] default`: the session runs Claude Code's own default, which
-/// may bill credits, so a capped member is judged credit-billed while its gate
-/// is on (the scoped gate's blanket rule).
+/// may bill credits, so a capped member is judged credit-billed whatever its
+/// credit gate says.
 #[test]
 fn cmd_start_auto_refuses_a_credit_capped_member_with_no_known_model_while_its_gate_is_on() {
     let sb = crate::testutil::HomeSandbox::new();
@@ -4870,14 +4890,475 @@ fn cmd_start_auto_refuses_a_credit_capped_member_with_no_known_model_while_its_g
     );
 }
 
+/// The gate steers the chain walk only: a launch whose model clauth cannot
+/// know still refuses a capped member with its gate off.
 #[test]
-fn cmd_start_auto_takes_a_credit_capped_member_with_no_known_model_while_its_gate_is_off() {
+fn cmd_start_auto_refuses_a_credit_capped_member_with_no_known_model_while_its_gate_is_off() {
     let sb = crate::testutil::HomeSandbox::new();
     let _env = no_model_env(&sb);
     seed_credit_spend_member(None, false, true);
 
-    cmd_start_auto(Isolation::Shared)
-        .expect("the gate off keeps a capped member in rotation for an unknown model");
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("an unknown model is judged credit-billed whatever the gate says");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// An `--agent` launch naming no model runs whatever its def says, which
+/// clauth never reads: a capped member refuses it with its gate off, even
+/// beside an opus default and an opus def file.
+#[test]
+fn cmd_start_auto_refuses_an_agent_launch_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    let agents = sb.home().join(".claude").join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("rev.md"),
+        "---\nname: rev\ndescription: test agent\nmodel: opus\n---\nYou review.\n",
+    )
+    .unwrap();
+
+    let err = cmd_start_auto_with(&["--agent", "rev"]).expect_err("the agent's model is unknown");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A named model decides an agent launch alone.
+#[test]
+fn cmd_start_auto_takes_an_agent_launch_naming_a_subscription_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, true);
+
+    cmd_start_auto_with(&["--agent", "rev", "--model", "opus"])
+        .expect("the launch names opus, which bills the subscription");
+}
+
+/// An unplaceable `--fallback-model` beside a placeable headline refuses a
+/// capped member: the demand reads as unknown, so the
+/// refusal names no family.
+#[test]
+fn cmd_start_auto_refuses_an_unplaceable_fallback_beside_a_known_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+
+    let err = cmd_start_auto_with(&["--fallback-model", "glm-4.6"])
+        .expect_err("glm-4.6 cannot be placed");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// The unplaceable model makes only the CREDIT judgment unknown: the scoped
+/// rung keeps narrowing to the families the launch is known to run, so an
+/// uncapped member whose fable week is spent still refuses a fable launch by
+/// that week, naming fable.
+#[test]
+fn cmd_start_auto_an_unplaceable_fallback_leaves_the_scoped_rung_on_its_known_families() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(Some("fable"), "opus");
+
+    let err = cmd_start_auto_with(&["--fallback-model", "glm-4.6"])
+        .expect_err("the member's session runs fable, and its fable week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// A resumed session that was started as an agent runs that agent again
+/// (measured on Claude Code 2.1.309: the transcript's `agent-setting` record),
+/// so a `--resume` naming no model is an agent launch.
+#[test]
+fn cmd_start_auto_refuses_a_resumed_agent_session_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    let ws = sb.home().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let transcript = sb.home().join(".claude/projects/-ws/sagent.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(
+        &transcript,
+        [
+            serde_json::json!({"sessionId": "sagent", "cwd": ws, "message": {"role": "user", "content": "hi"}}).to_string(),
+            serde_json::json!({"type": "agent-setting", "agentSetting": "pa", "sessionId": "sagent"}).to_string(),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let err = cmd_start_auto_with(&["--resume", "sagent"])
+        .expect_err("the resumed session runs agent pa, whose model is unknown");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// `--continue` names no transcript clauth can pin (Claude Code picks the cwd's
+/// newest conversation, which clauth never mirrors), so a launch naming no model
+/// fails closed as an agent launch naming no model: a capped member refuses with
+/// the unknown-demand rung.
+#[test]
+fn cmd_start_auto_refuses_an_unresolvable_continue_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+
+    let err = cmd_start_auto_with(&["--continue"])
+        .expect_err("an unresolvable --continue is an unknown demand");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A transcript `<home>/.claude/projects/-ws/<id>.jsonl` recorded in the
+/// workspace `<home>/ws` (created): one user line, `pad` filler user lines of
+/// ~1 KiB each, then one `agent-setting` record per name in `agents`.
+fn write_start_transcript(
+    sb: &crate::testutil::HomeSandbox,
+    id: &str,
+    pad: usize,
+    agents: &[&str],
+) {
+    let ws = sb.home().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let transcript = sb
+        .home()
+        .join(".claude/projects/-ws")
+        .join(format!("{id}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    let mut lines = vec![
+        serde_json::json!({"sessionId": id, "cwd": ws, "message": {"role": "user", "content": "hi"}})
+            .to_string(),
+    ];
+    let filler = "f".repeat(1024);
+    for _ in 0..pad {
+        lines.push(
+            serde_json::json!({"sessionId": id, "cwd": ws, "message": {"role": "user", "content": filler}})
+                .to_string(),
+        );
+    }
+    for agent in agents {
+        lines.push(
+            serde_json::json!({"type": "agent-setting", "agentSetting": agent, "sessionId": id})
+                .to_string(),
+        );
+    }
+    std::fs::write(&transcript, lines.join("\n")).unwrap();
+}
+
+/// Every resume form whose transcript clauth cannot pin by an exact id it
+/// finds is an unknown demand when no model is named:
+/// `--continue`/`-c` (Claude Code picks the newest conversation in the cwd),
+/// a bare `--resume` (the picker, a following flag is no value), a session
+/// name (`--resume`/`-r <name>`), an id clauth finds no transcript for, and
+/// `--from-pr` with or without its value. The store's only session runs no
+/// agent, so a walk that resolves any of them to it admits the opus member.
+#[test]
+fn cmd_start_auto_refuses_every_resume_it_cannot_pin_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "splain", 0, &[]);
+
+    let forms: &[&[&str]] = &[
+        &["--continue"],
+        &["-c"],
+        &["--resume"],
+        &["--resume", "--verbose"],
+        &["--resume", "probename"],
+        &["-r", "probename"],
+        &["--resume", "0b6c3c55-0000-4000-8000-000000000000"],
+        &["--from-pr"],
+        &["--from-pr", "12"],
+    ];
+    let mut wrong = Vec::new();
+    for form in forms {
+        match cmd_start_auto_with(form) {
+            Ok(()) => wrong.push(format!("{form:?}: admitted")),
+            Err(e)
+                if e.to_string()
+                    != "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago" =>
+            {
+                wrong.push(format!("{form:?}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "forms not refused as unknown: {wrong:#?}");
+}
+
+/// `-r <id>` is the short spelling of an exact-id resume: the transcript's
+/// agent record makes it an agent launch.
+#[test]
+fn cmd_start_auto_refuses_a_short_flag_resume_of_an_agent_session() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "sagent", 0, &["pa"]);
+
+    let err = cmd_start_auto_with(&["-r", "sagent"])
+        .expect_err("the resumed session runs agent pa, whose model is unknown");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// The agent record can sit anywhere in the transcript (measured on Claude
+/// Code 2.1.309: a session that took its agent at a later resume wrote its only
+/// record at byte 275,031), so an exact-id resume scans the whole transcript.
+#[test]
+fn cmd_start_auto_refuses_a_resume_whose_agent_record_sits_deep_in_the_transcript() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "sdeep", 300, &["pa"]);
+
+    let err = cmd_start_auto_with(&["--resume", "sdeep"])
+        .expect_err("the resumed session runs agent pa, whose model is unknown");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A named model decides a resume alone, whatever the transcript or the resume
+/// form: a capped member with its gate off takes each one naming opus.
+#[test]
+fn cmd_start_auto_a_named_model_decides_every_resume() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), false, true);
+    write_start_transcript(&sb, "sagent", 0, &["pa"]);
+
+    let forms: &[&[&str]] = &[
+        &["--resume", "sagent", "--model", "opus"],
+        &["-r", "sagent", "--model", "opus"],
+        &["--continue", "--model", "opus"],
+        &["-c", "--model", "opus"],
+        &["--resume", "--model", "opus"],
+        &["--resume", "probename", "--model", "opus"],
+        &["--from-pr", "--model", "opus"],
+    ];
+    let mut wrong = Vec::new();
+    for form in forms {
+        if let Err(e) = cmd_start_auto_with(form) {
+            wrong.push(format!("{form:?}: {e}"));
+        }
+    }
+    assert!(wrong.is_empty(), "named-model resumes refused: {wrong:#?}");
+}
+
+/// A resume value Claude Code never opens as a transcript is unpinnable
+/// (measured on 2.1.309: each opens the interactive picker): a nested
+/// subagent transcript's id (`agent-<hex>`, which CC answers no-match for), and
+/// `-r=<id>`, whose value CC receives as `=<id>`. Neither may resolve to a
+/// transcript clauth then reads as running no agent.
+#[test]
+fn cmd_start_auto_refuses_a_resume_value_claude_code_never_opens() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "splain", 0, &[]);
+    let nested = sb
+        .home()
+        .join(".claude/projects/-ws/splain/subagents/agent-abc123.jsonl");
+    std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    std::fs::write(
+        &nested,
+        serde_json::json!({"sessionId": "splain", "cwd": sb.home().join("ws"), "message": {"role": "user", "content": "hi"}})
+            .to_string(),
+    )
+    .unwrap();
+
+    let mut wrong = Vec::new();
+    for form in [
+        &["--resume", "agent-abc123"][..],
+        &["-r", "agent-abc123"][..],
+        &["-r=splain"][..],
+    ] {
+        match cmd_start_auto_with(form) {
+            Ok(()) => wrong.push(format!("{form:?}: admitted")),
+            Err(e)
+                if e.to_string()
+                    != "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago" =>
+            {
+                wrong.push(format!("{form:?}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "forms not refused as unknown: {wrong:#?}");
+}
+
+/// `--teleport [session]` resumes a session (Claude Code 2.1.309 `--help`)
+/// clauth cannot pin: with no model named it is an unknown demand.
+#[test]
+fn cmd_start_auto_refuses_a_teleport_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "splain", 0, &[]);
+
+    let mut wrong = Vec::new();
+    for form in [
+        &["--teleport"][..],
+        &["--teleport", "splain"][..],
+        &["--teleport=splain"][..],
+    ] {
+        match cmd_start_auto_with(form) {
+            Ok(()) => wrong.push(format!("{form:?}: admitted")),
+            Err(e)
+                if e.to_string()
+                    != "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago" =>
+            {
+                wrong.push(format!("{form:?}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "forms not refused as unknown: {wrong:#?}");
+    cmd_start_auto_with(&["--teleport", "--model", "opus"])
+        .expect("a named model decides a teleport alone");
+}
+
+/// `--cloud [description|session_id|url]` can attach to a cloud session clauth
+/// cannot pin, so with no model named it is an unknown demand whatever its
+/// value. `attach` and `respawn` reopen a background session and stay fresh
+/// launches judged on the member's own model.
+#[test]
+fn cmd_start_auto_refuses_a_cloud_session_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+
+    let mut wrong = Vec::new();
+    for form in [
+        &["--cloud"][..],
+        &["--cloud", "fix the build"][..],
+        &["--cloud", "https://claude.ai/code/abc"][..],
+        &["--cloud=abc"][..],
+    ] {
+        match cmd_start_auto_with(form) {
+            Ok(()) => wrong.push(format!("{form:?}: admitted")),
+            Err(e)
+                if e.to_string()
+                    != "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago" =>
+            {
+                wrong.push(format!("{form:?}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "forms not refused as unknown: {wrong:#?}");
+    cmd_start_auto_with(&["--cloud", "abc", "--model", "opus"])
+        .expect("a named model decides a cloud session alone");
+    cmd_start_auto_with(&["attach", "3f2a"]).expect("attach is a fresh launch on opus");
+    cmd_start_auto_with(&["respawn", "3f2a"]).expect("respawn is a fresh launch on opus");
+}
+
+/// A capped member whose week also reads past its soft line: the row an
+/// unknown-headline launch shows does not depend on whether the launch also
+/// carries a known fallback. `--agent rev` alone and `--agent rev
+/// --fallback-model sonnet` render the same row.
+#[test]
+fn cmd_start_auto_an_unknown_headline_row_ignores_a_known_fallback() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    let name = crate::profile::ProfileName::from("a");
+    let mut usage = cmd_start_usage();
+    if let Some(week) = usage.seven_day.as_mut() {
+        week.utilization = 99.5;
+    }
+    usage.spend = Some(crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(50.0),
+        limit: Some(50.0),
+        percent: Some(100.0),
+        currency: Some("USD".to_owned()),
+    });
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+
+    let alone = cmd_start_auto_with(&["--agent", "rev"])
+        .expect_err("a capped, week-spent member refuses")
+        .to_string();
+    assert_eq!(
+        alone,
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+    let with_fallback = cmd_start_auto_with(&["--agent", "rev", "--fallback-model", "sonnet"])
+        .expect_err("a capped, week-spent member refuses")
+        .to_string();
+    assert_eq!(with_fallback, alone);
+    let continued = cmd_start_auto_with(&["--continue", "--fallback-model", "sonnet"])
+        .expect_err("a capped, week-spent member refuses")
+        .to_string();
+    assert_eq!(continued, alone);
+}
+
+/// An agent launch naming no model keeps its known union side on the SCOPED
+/// rung: with the member's scoped gate off, its
+/// spent fable week still refuses the launch's `--fallback-model fable`, naming
+/// fable. Only the credit rung reads the agent's headline as unknown.
+#[test]
+fn cmd_start_auto_an_agent_launch_keeps_its_fallback_on_the_scoped_rung() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(Some("opus"), "opus");
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&name).unwrap();
+    profile.check_scoped = false;
+    crate::profile::save_profile(&profile).unwrap();
+
+    let err = cmd_start_auto_with(&["--agent", "rev", "--fallback-model", "fable"])
+        .expect_err("the launch's fable fallback meets a spent fable week");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// With the scoped gate on, an agent launch's unknown headline still meets the
+/// blanket judgment: a spent opus week refuses the launch even though its known
+/// side (a fable fallback) is clear, since the agent may run opus.
+#[test]
+fn cmd_start_auto_an_agent_launch_under_the_scoped_gate_meets_every_scoped_window() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: Some("opus"),
+            env: &[],
+            spent: "7d opus",
+        }],
+    );
+
+    let err = cmd_start_auto_with(&["--agent", "rev", "--fallback-model", "fable"])
+        .expect_err("the agent may run opus, whose week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d opus 99%, other models ok   usage 4m ago"
+    );
 }
 
 fn cmd_start_auto_with(args: &[&str]) -> anyhow::Result<()> {

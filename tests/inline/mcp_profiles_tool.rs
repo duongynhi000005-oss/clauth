@@ -175,6 +175,19 @@ fn an_unrecognised_scope_is_refused_by_name() {
     );
 }
 
+/// A caller-spelled scope is echoed flat in that refusal: an embedded newline
+/// cannot forge a second line.
+#[test]
+fn an_unrecognised_scope_value_is_echoed_flat() {
+    let _home = HomeSandbox::new();
+    let result = call_profiles(None, Some("sessions\nforged"));
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        first_text(&result),
+        "error: unrecognized scope \"sessions forged\": accepted \"all\" and \"session\""
+    );
+}
+
 /// The trim itself. `has_live_session` and `throughput` are absent unless they
 /// say something, and the endpoint prints as a host. Emitted unconditionally
 /// these were 39% of a 27-profile response, nearly all of it `false` and rows

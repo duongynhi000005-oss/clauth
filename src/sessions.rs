@@ -233,6 +233,8 @@ struct TranscriptLine {
     #[allow(dead_code)]
     timestamp: Option<String>,
     message: Option<Message>,
+    #[serde(rename = "agentSetting")]
+    agent_setting: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -333,6 +335,44 @@ fn read_head(path: &Path) -> Head {
         workspace: cwd.unwrap_or_default(),
         first_message,
     }
+}
+
+/// The last `agent-setting` record's agent name over the WHOLE transcript.
+///
+/// The record can sit anywhere: Claude Code writes it when an agent is set or
+/// restored, never per turn, so a session that took its agent at a later resume
+/// carries its only record past any bounded head window. The scan therefore
+/// streams the whole file and parses only the lines whose text carries the
+/// record kind (a substring prefilter keeps a multi-megabyte transcript cheap).
+/// A non-UTF-8 line is one bad record, not the end of the file: it is skipped,
+/// as is an unparseable one.
+fn read_last_agent(path: &Path) -> Option<String> {
+    let Ok(file) = File::open(path) else {
+        return None;
+    };
+    let mut last = None;
+    for line in BufReader::new(file).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(_) => break,
+        };
+        if !line.contains("\"agent-setting\"") {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<TranscriptLine>(&line) else {
+            continue;
+        };
+        if let Some(a) = parsed
+            .agent_setting
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            last = Some(a.to_owned());
+        }
+    }
+    last
 }
 
 /// The last user message, found by walking the tail's lines backward — never a
@@ -804,6 +844,12 @@ impl SessionRef {
         let workspace = read_head(&self.path).workspace;
         (!workspace.is_empty()).then(|| PathBuf::from(workspace))
     }
+
+    /// The last `agent-setting` record's agent name over the whole transcript
+    /// ([`read_last_agent`]): the agent a resume runs again.
+    pub(crate) fn agent(&self) -> Option<String> {
+        read_last_agent(&self.path)
+    }
 }
 
 /// Every `*.jsonl` path in the global store, none of them opened. `depth` picks
@@ -818,12 +864,28 @@ fn global_transcripts(depth: usize) -> Vec<PathBuf> {
     paths
 }
 
-/// Locate one session by exact id. When the same id sits in more than one
-/// project-slug dir, the newest mtime wins and an equal mtime falls back to the
-/// greater path — [`insert_newest`]'s rule, so a targeted lookup and the index
-/// resolve one id to the same file.
+/// Locate one session by exact id over the whole store, nested transcripts
+/// included and workflow journals skipped — the lookup `clauth resume` and
+/// `clauth info` resolve an id with (`clauth sessions` lists through
+/// [`build_index`]). When the same id sits in more than one project-slug dir,
+/// the newest mtime wins and an equal mtime falls back to the greater path —
+/// [`insert_newest`]'s rule, so a targeted lookup and the index resolve one id
+/// to the same file.
 pub(crate) fn find_session(session_id: &str) -> Option<SessionRef> {
-    let (updated, path) = global_transcripts(WALK_MAX_DEPTH)
+    find_session_within(WALK_MAX_DEPTH, session_id)
+}
+
+/// [`find_session`] limited to [`TOP_LEVEL_DEPTH`]: the transcripts Claude Code
+/// can actually open for a resume value. A nested `agent-<hex>` stem is found
+/// by the browsing lookup, but CC answers no-match for it (see
+/// [`TOP_LEVEL_DEPTH`]), so a resume value that names one cannot be pinned and
+/// its launch stays unreadable.
+pub(crate) fn find_session_top_level(session_id: &str) -> Option<SessionRef> {
+    find_session_within(TOP_LEVEL_DEPTH, session_id)
+}
+
+fn find_session_within(depth: usize, session_id: &str) -> Option<SessionRef> {
+    let (updated, path) = global_transcripts(depth)
         .into_iter()
         .filter(|p| !is_workflow_journal(p))
         .filter(|p| session_id_from_path(p).as_deref() == Some(session_id))
@@ -860,14 +922,6 @@ pub(crate) fn newest_session() -> Option<SessionRef> {
                 .then_with(|| a.2.cmp(&b.2))
         })
         .map(|(updated, id, path)| SessionRef { id, path, updated })
-}
-
-/// The workspace one session was recorded in, located by transcript filename —
-/// [`find_session`] plus [`SessionRef::workspace`] in one call, which is all the
-/// `delegate` resume path needs. `None` covers both dead ends it reports as one:
-/// no transcript of that id, and a transcript recording no workspace.
-pub(crate) fn workspace_of(session_id: &str) -> Option<PathBuf> {
-    find_session(session_id)?.workspace()
 }
 
 /// Every `*.jsonl` a live isolated runtime is holding, workflow journals

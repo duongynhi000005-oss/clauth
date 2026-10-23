@@ -392,8 +392,14 @@ fn delegate_refusal(reason: &str) -> CallToolResult {
 /// leads, then the fix clause. Placement rule 4's corollary makes the refusal
 /// carry the whole lesson, and the clause is a closed set composed on
 /// [`ProfileNotFoundFix`] so the call sites cannot split the server's refusal
-/// vocabulary.
+/// vocabulary. Each name is echoed as its own token: a caller-supplied name can
+/// carry a control character, and a list is never cut mid-name.
 fn profile_not_found(names: &str, fix: ProfileNotFoundFix) -> String {
+    let names = names
+        .split(", ")
+        .map(echo_name)
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("profile not found: {names}; {}", fix.clause())
 }
 
@@ -863,9 +869,9 @@ pub(crate) struct DelegateArgs {
     /// arguments come last, so they win where a flag repeats (including
     /// `--model` when `model` is set), except a `--settings` before `--`, which
     /// clauth merges into its own settings file when it passes one.
-    /// `--session-id`, `--resume` and `--fork-session` are refused: clauth pins
-    /// the session id and exports it as `CLAUTH_DELEGATE_SESSION_ID`; resume
-    /// through `session_id`.
+    /// `--session-id`, `--resume`, `--fork-session`, `--from-pr` and
+    /// `--teleport` are refused: clauth pins the session id and exports it as
+    /// `CLAUTH_DELEGATE_SESSION_ID`; resume through `session_id`.
     ///
     /// A delegate that must write files needs
     /// `args: ["--dangerously-skip-permissions"]`; without it the session
@@ -916,8 +922,8 @@ can carry `disabled`, `login expired`, `no api key`, `credit cap spent` or \
 `subscription canceled`; when `delegate` refuses an account, its refusal names the state and the \
 fix. `subscription canceled` never means a refusal, and `login expired` does not mean one on an \
 account that has its own `host` and api key, which delegates on that key. `credit cap spent` \
-refuses a delegate whose model bills usage credits, and one naming no model while the account's \
-credit gate is on."
+refuses a delegate whose model bills usage credits, and one whose model clauth cannot tell: none \
+named, one it cannot place, or an agent run with no model named."
     )]
     async fn profiles(
         &self,
@@ -932,7 +938,8 @@ credit gate is on."
             let payload = serde_json::json!({
                 "ok": false,
                 "reason": format!(
-                    "unrecognized scope \"{raw}\": accepted \"all\" and \"session\""
+                    "unrecognized scope \"{}\": accepted \"all\" and \"session\"",
+                    echo_name(raw)
                 ),
             });
             let prose = render::profiles_prose(&payload);
@@ -1210,11 +1217,13 @@ across accounts."
         };
         if depth >= 1 {
             // The refusal fires before target validation, but the caller's own
-            // spelling is known here: name the targets it asked for. `profiles`
-            // is an optional key, present only when the caller named one.
+            // spelling is known here: name the targets it asked for, each
+            // echoed flat and capped so no name it sent can forge a line in
+            // the payload or run unbounded. `profiles` is an optional key,
+            // present only when the caller named one.
             let payload = match &profiles {
                 Some(names) => serde_json::json!({
-                    "profiles": names,
+                    "profiles": names.iter().map(|n| echo_name(n)).collect::<Vec<_>>(),
                     "is_error": true,
                     "result": "delegation depth exceeded (max 1)",
                 }),
@@ -1272,17 +1281,21 @@ across accounts."
         // exports it as `CLAUTH_DELEGATE_SESSION_ID`, which hook exemptions
         // key on. A raw flag landing after the pin (caller `args` run last)
         // would move the child off that id and silently break the equality,
-        // so refuse every spelling that can name or fork a session.
+        // and a resume form clauth cannot pin would run a session it never
+        // judged. A flag that resumes a session is refused whatever it is.
         if args.as_ref().is_some_and(|a| {
             args_carry_flag(a, "--session-id")
                 || args_carry_flag(a, "--resume")
                 || args_carry_flag(a, "-r")
                 || args_carry_flag(a, "--fork-session")
+                || args_carry_flag(a, "--from-pr")
+                || args_carry_flag(a, "--teleport")
         }) {
             return Ok(delegate_refusal(
-                "`args` cannot carry `--session-id`, `--resume`/`-r` or `--fork-session`: \
-                 clauth pins the delegate's session id and exports it as \
-                 `CLAUTH_DELEGATE_SESSION_ID`; resume through the `session_id` argument",
+                "`args` cannot carry `--session-id`, `--resume`/`-r`, `--fork-session`, \
+                 `--from-pr` or `--teleport`: clauth pins the delegate's session id and \
+                 exports it as `CLAUTH_DELEGATE_SESSION_ID`; resume through the `session_id` \
+                 argument",
             ));
         }
         // The result mode is a closed set: unset means inline, `"file"` means
@@ -1292,7 +1305,8 @@ across accounts."
             Some("file") => true,
             Some(other) => {
                 return Ok(delegate_refusal(&format!(
-                    "unrecognized result \"{other}\": accepted \"file\""
+                    "unrecognized result \"{}\": accepted \"file\"",
+                    echo_name(other)
                 )));
             }
         };
@@ -1348,7 +1362,7 @@ across accounts."
                         return Ok(delegate_refusal(&format!(
                             "can't tell which account session '{}' ran on; pass `profiles` \
                              naming the account to spend",
-                            truncate(id, 64)
+                            echo_name(id)
                         )));
                     }
                 },
@@ -1366,16 +1380,36 @@ across accounts."
             // read it would not use.
             let stale_env_keys = crate::actions::outgoing_env_keys(&config);
             let credit_billed = crate::claude_json::credit_billed_families();
+            // A fan-out carrying `session_id` resumes that session on every
+            // member, so its pre-flight judges the resume's own workspace,
+            // exactly as the single-background arm does. Best-effort: an
+            // unresolvable transcript falls back to the caller cwd; the actual
+            // spawn refuses it for itself. The resumed session's agent rides in
+            // as `--agent` (the same fold `delegate_families` makes), so the
+            // demand below sees it without a second resume parameter.
+            let (workspace, resume_agent) =
+                resolve_resume_workspace_off_runtime(session_id.as_deref())
+                    .await
+                    .map(|(ws, agent)| (Some(ws), agent))
+                    .unwrap_or((None, None));
+            let mut demand_args = args.clone().unwrap_or_default();
+            if let Some(agent) = resume_agent
+                && crate::start::parsed_agent_arg(&demand_args).is_none()
+            {
+                demand_args.push("--agent".to_owned());
+                demand_args.push(agent);
+            }
             match resolve_fanout(
                 &config,
                 &raw,
                 model.as_deref(),
+                subagent_type.as_deref(),
                 isolation,
                 &stale_env_keys,
                 &credit_billed,
-                args.as_deref().unwrap_or(&[]),
+                &demand_args,
                 env.as_ref().unwrap_or(&HashMap::new()),
-                spawn_cwd(None, cwd.as_deref()).as_deref(),
+                spawn_cwd(workspace, cwd.as_deref()).as_deref(),
             ) {
                 Ok(names) => Target::Many(names),
                 Err(reason) => return Ok(delegate_refusal(&reason)),
@@ -1427,18 +1461,23 @@ across accounts."
                     // the caller's cwd (mirrors `run_delegate`). Best-effort:
                     // an unresolvable transcript falls back to the caller cwd —
                     // the spend gates here do not own the resume resolution,
-                    // which the actual spawn refuses for itself.
-                    let workspace = session_id
-                        .as_deref()
-                        .and_then(|id| resolve_resume_workspace(id).ok());
-                    let (models, families) = delegate_families(
+                    // which the actual spawn refuses for itself. The resumed
+                    // session's own agent is folded into the demand too.
+                    let (workspace, resume_agent) =
+                        resolve_resume_workspace_off_runtime(session_id.as_deref())
+                            .await
+                            .map(|(ws, agent)| (Some(ws), agent))
+                            .unwrap_or((None, None));
+                    let (models, families, agent_without_model) = delegate_families(
                         target,
                         isolation,
                         model.as_deref(),
+                        subagent_type.as_deref(),
                         &extra_args,
                         &caller_env,
                         &stale_env_keys,
                         spawn_cwd(workspace, cwd.as_deref()).as_deref(),
+                        resume_agent.as_deref(),
                     );
                     if let Err(reason) = preflight_target(
                         target,
@@ -1446,6 +1485,7 @@ across accounts."
                         &name_pn,
                         &models,
                         &families,
+                        agent_without_model.as_deref(),
                         &credit_billed,
                     ) {
                         return Ok(delegate_refusal(&reason));
@@ -2814,9 +2854,9 @@ async fn monitor_batch(
                 {
                     orphan_reasons.push(reason);
                 }
-                serde_json::json!({ "job_id": id, "status": "unknown" })
+                serde_json::json!({ "job_id": echo_name(&id), "status": "unknown" })
             }
-            WaitOutcome::Running(record) => running_payload(&id, &record, now_ms()),
+            WaitOutcome::Running(record) => running_payload(&echo_name(&id), &record, now_ms()),
             WaitOutcome::Done(record) => {
                 // An owned record's file is already evicted by its claim; a
                 // refused one (mismatched self-report) was renamed back and
@@ -2828,7 +2868,10 @@ async fn monitor_batch(
                 // self-report is wrapped under `result` first), so the caller's
                 // per-id markers cannot collide with delegate output.
                 if let serde_json::Value::Object(map) = &mut payload {
-                    map.insert("job_id".to_string(), serde_json::Value::String(id.clone()));
+                    map.insert(
+                        "job_id".to_string(),
+                        serde_json::Value::String(echo_name(&id)),
+                    );
                     map.insert(
                         "status".to_string(),
                         serde_json::Value::String("done".to_string()),
@@ -3558,38 +3601,81 @@ fn cancelled_envelope(
     payload
 }
 
-/// Resolve a `resume` id to the workspace its transcript was recorded under.
-/// Claude Code resolves `--resume <id>` only within `projects/<slug-of-cwd>/`, so
-/// a resume spawned anywhere else is told the conversation does not exist.
+/// Resolve a `resume` id to the workspace its transcript was recorded under,
+/// plus the agent the transcript's last `agent-setting` record names (the agent
+/// a resume runs again). The id must pin a top-level transcript: Claude Code
+/// answers no-match for a nested `agent-<hex>` stem. The workspace is where
+/// clauth spawns so the resumed conversation keeps the project settings and cwd
+/// it was recorded under; Claude Code itself opens a session id recorded under
+/// another project's cwd (measured on CC 2.1.309: a projB id resumed from projA
+/// ran, exit 0), so the recorded workspace is clauth's own choice, not a
+/// constraint CC imposes.
 ///
 /// `latest` is refused, though `clauth resume` takes it: the newest session in
 /// the whole store is usually the operator's own live one, and spending an
 /// account's window continuing that is never what a delegate meant by it.
-fn resolve_resume_workspace(session_id: &str) -> std::result::Result<std::path::PathBuf, String> {
+fn resolve_resume_workspace(
+    session_id: &str,
+) -> std::result::Result<(std::path::PathBuf, Option<String>), String> {
     if session_id == "latest" {
         return Err(
             "resume needs an exact session id; `latest` is a `clauth resume` shorthand".to_string(),
         );
     }
-    let workspace = crate::sessions::workspace_of(session_id).ok_or_else(|| {
-        format!("can't resume '{session_id}': no transcript for it, or none recording a workspace")
-    })?;
+    let (session, workspace) = pinned_resume(session_id)?;
+    Ok((workspace, session.agent()))
+}
+
+/// The transcript one resume id pins and the workspace it records, or the
+/// refusal naming which dead end stopped it: no top-level transcript, no
+/// recorded workspace in it, or that workspace since removed. One function owns
+/// those checks, shared by the spawn path (which adds the transcript's agent,
+/// [`resolve_resume_workspace`]) and the origin read (which needs only the
+/// workspace, [`resume_workspace_head`]).
+fn pinned_resume(
+    session_id: &str,
+) -> std::result::Result<(crate::sessions::SessionRef, std::path::PathBuf), String> {
+    let no_transcript = || {
+        format!(
+            "can't resume '{}': no transcript for it, or none recording a workspace",
+            echo_name(session_id)
+        )
+    };
+    let session = crate::sessions::find_session_top_level(session_id).ok_or_else(no_transcript)?;
+    let workspace = session.workspace().ok_or_else(no_transcript)?;
     if !workspace.is_dir() {
         return Err(format!(
-            "can't resume '{session_id}': workspace '{}' no longer exists",
+            "can't resume '{}': workspace '{}' no longer exists",
+            echo_name(session_id),
             workspace.display()
         ));
     }
-    Ok(workspace)
+    Ok((session, workspace))
 }
 
-/// Refuse a `cwd` that disagrees with the workspace a `resume` must run in,
-/// rather than spawning where Claude Code will not find the transcript. Both
-/// sides are canonicalized: one spelling of a path is not the same string as
-/// another spelling of it.
+/// [`resolve_resume_workspace`] off the runtime thread. The resolution scans the
+/// whole transcript for its last agent record, and the server's single-threaded
+/// runtime must not hold its one thread for that read. Both pre-flight callers
+/// read an unresolved resume as "fall back to the caller's cwd", so a failed
+/// blocking task lands in the same `None`.
+async fn resolve_resume_workspace_off_runtime(
+    session_id: Option<&str>,
+) -> Option<(std::path::PathBuf, Option<String>)> {
+    let id = session_id?.to_owned();
+    tokio::task::spawn_blocking(move || resolve_resume_workspace(&id).ok())
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Refuse a `cwd` that disagrees with the workspace a `resume` must run in: the
+/// child runs in the recorded workspace so the resumed conversation keeps its
+/// project settings and cwd, and a caller-named `cwd` would silently move it.
+/// Both sides are canonicalized: one spelling of a path is not the same string
+/// as another spelling of it.
 fn check_resume_cwd(given: &str, workspace: &std::path::Path) -> std::result::Result<(), String> {
     let given_real = crate::canonical::identity(given)
-        .map_err(|e| format!("cwd '{given}' cannot be resolved: {e}"))?;
+        .map_err(|e| format!("cwd '{}' cannot be resolved: {e}", echo_path(given)))?;
     let workspace_real = crate::canonical::identity(workspace).map_err(|e| {
         format!(
             "workspace '{}' cannot be resolved: {e}",
@@ -3598,8 +3684,9 @@ fn check_resume_cwd(given: &str, workspace: &std::path::Path) -> std::result::Re
     })?;
     if given_real != workspace_real {
         return Err(format!(
-            "cwd '{given}' is not the workspace this session was recorded in ('{}'); \
+            "cwd '{}' is not the workspace this session was recorded in ('{}'); \
              drop `cwd` and clauth uses the recorded one",
+            echo_path(given),
             workspace.display()
         ));
     }
@@ -3715,25 +3802,28 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // that resolution REPLACES the caller's cwd instead of sitting beside it; a
     // `cwd` that disagrees is a mistake worth naming, not one to spawn into.
     // Resolved before the pre-flight so the demand reads the project settings
-    // of the directory the child will actually run in.
-    let workspace = match opts.resume {
+    // of the directory the child will actually run in, and the resumed
+    // session's own agent (folded as `--agent` when the call names none).
+    let (workspace, resume_agent) = match opts.resume {
         Some(id) => {
-            let workspace = resolve_resume_workspace(id)?;
+            let (workspace, agent) = resolve_resume_workspace(id)?;
             if let Some(dir) = opts.cwd {
                 check_resume_cwd(dir, &workspace)?;
             }
-            Some(workspace)
+            (Some(workspace), agent)
         }
-        None => None,
+        None => (None, None),
     };
-    let (models, families) = delegate_families(
+    let (models, families, agent_without_model) = delegate_families(
         target,
         opts.isolation,
         opts.model,
+        opts.subagent_type,
         &opts.extra_args,
         &opts.env,
         &stale_env_keys,
         spawn_cwd(workspace.clone(), opts.cwd).as_deref(),
+        resume_agent.as_deref(),
     );
     let credit_billed = crate::claude_json::credit_billed_families();
     // Mirrors `disable_profile`'s own live-session refusal from the other
@@ -3747,13 +3837,17 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         &profile_name,
         &models,
         &families,
+        agent_without_model.as_deref(),
         &credit_billed,
     )?;
 
     if let Some(dir) = opts.cwd
         && !std::path::Path::new(dir).is_dir()
     {
-        return Err(format!("cwd does not exist or is not a directory: {dir}"));
+        return Err(format!(
+            "cwd does not exist or is not a directory: {}",
+            echo_path(dir)
+        ));
     }
 
     // Guard kept alive across spawn+wait; dropped on return for RAII teardown.
@@ -4260,31 +4354,65 @@ fn live_jobs_guard(now: u64) -> Option<String> {
 }
 
 /// The demand a delegate run on `profile` may bill, judged by the SAME resolver
-/// [`crate::start::member_launch_models`] uses for a start: the call's
+/// [`crate::start::member_launch_demand`] uses for a start: the call's
 /// `extra_args`, its caller `env` model keys, its `model` argument (which the
-/// args outrank), and the spawn `cwd`'s project settings. Returns the raw model
-/// strings (for the unplaceable-model refusal) and their resolved families.
+/// args outrank), its `subagent_type` (folded in as `--agent`), the resumed
+/// session's own agent (`resume_agent`, folded as `--agent` when the call names
+/// none), and the spawn `cwd`'s project settings. Returns the raw model strings
+/// (for the unplaceable-model refusal), their resolved families, and the agent
+/// name the launch named with no model to decide its headline.
+#[allow(clippy::too_many_arguments)]
 fn delegate_families(
     profile: &Profile,
     isolation: Isolation,
     model: Option<&str>,
+    subagent_type: Option<&str>,
     extra_args: &[String],
     env: &HashMap<String, String>,
     stale_env_keys: &[String],
     cwd: Option<&std::path::Path>,
-) -> (Vec<String>, Vec<String>) {
-    let models = crate::start::member_launch_models(
+    resume_agent: Option<&str>,
+) -> (Vec<String>, Vec<String>, Option<String>) {
+    // Fold `subagent_type` / a resumed session's agent into the args as
+    // `--agent <name>`, the same flag the spawned command carries, so the
+    // resolver's one agent chain sees it. An explicit `subagent_type` or a
+    // non-blank args `--agent` outranks the resumed session's own agent, so the
+    // transcript's record is only folded when neither names one. A blank
+    // `subagent_type` (`""`, `"  "`) is absent, as Claude Code ignores it and
+    // the transcript's agent still runs; the same rule `parsed_agent_arg`
+    // applies to the args.
+    let mut agent_args;
+    let args = match subagent_type.filter(|s| !s.trim().is_empty()) {
+        Some(agent) => {
+            agent_args = Vec::with_capacity(extra_args.len() + 2);
+            agent_args.extend_from_slice(extra_args);
+            agent_args.push("--agent".to_owned());
+            agent_args.push(agent.to_owned());
+            agent_args.as_slice()
+        }
+        None => match resume_agent {
+            Some(agent) if crate::start::parsed_agent_arg(extra_args).is_none() => {
+                agent_args = Vec::with_capacity(extra_args.len() + 2);
+                agent_args.extend_from_slice(extra_args);
+                agent_args.push("--agent".to_owned());
+                agent_args.push(agent.to_owned());
+                agent_args.as_slice()
+            }
+            _ => extra_args,
+        },
+    };
+    let demand = crate::start::member_launch_demand(
         profile,
         isolation,
         stale_env_keys,
-        extra_args,
+        args,
         model,
         crate::start::EnvLeg::Caller,
         cwd,
         |key| env.get(key).cloned(),
     );
-    let families = crate::fallback::demand_from(&models);
-    (models, families)
+    let families = crate::fallback::demand_from(&demand.models);
+    (demand.models, families, demand.agent_without_model)
 }
 
 /// Refuse a resolved target that `delegate` must not spend on: a profile the
@@ -4323,14 +4451,16 @@ fn delegate_families(
 /// path's own check plus the backstop for a target that changed after its
 /// pre-flight (the config is re-loaded there). `models` is the demand's raw
 /// model strings; `families` its resolved families (empty means none resolved —
-/// the demand is unknown); `credit_billed` the set Claude Code bills against
-/// usage credits, read once by the caller.
+/// the demand is unknown); `agent_without_model` the agent name the launch
+/// named with no model to decide its headline; `credit_billed` the set Claude
+/// Code bills against usage credits, read once by the caller.
 fn preflight_target(
     profile: &Profile,
     config: &AppConfig,
     name: &ProfileName,
     models: &[String],
     families: &[String],
+    agent_without_model: Option<&str>,
     credit_billed: &[String],
 ) -> std::result::Result<(), String> {
     if profile.is_disabled() {
@@ -4383,10 +4513,11 @@ fn preflight_target(
     // LAST: a spent usage-credit cap refuses a delegate whose model Claude Code
     // bills against usage credits. A KNOWN demand (a family resolved) decides
     // by its own families whatever the gate says; an unknown demand (no model
-    // resolved) is judged credit-billed only while the profile's credit gate is
-    // on. Keyed on `credit_capped()`, never a stale percent or a billing-off
-    // limit. An account serving inference from its own endpoint + token never
-    // spends its OAuth usage credits, so its spent cap refuses nothing.
+    // resolved) is judged credit-billed whatever the gate says too — the gate
+    // steers the chain walk only. Keyed on `credit_capped()`, never a stale
+    // percent or a billing-off limit. An account serving inference from its own
+    // endpoint + token never spends its OAuth usage credits, so its spent cap
+    // refuses nothing.
     if !crate::claude::has_own_inference_endpoint(profile)
         && load_usage(name).is_some_and(|u| u.credit_capped())
     {
@@ -4396,22 +4527,32 @@ fn preflight_target(
                  against usage credits; name another account or another model"
             ));
         }
-        // Both unknown-demand arms judge credit-billed only while the gate is
-        // on: an unknown demand (no model resolved) is "off takes it", so a
-        // gate-off account admits a model clauth cannot place, exactly as it
-        // admits a run naming no model at all.
-        if families.is_empty() && profile.check_credit_cap {
-            // A named model clauth cannot place in a family gets its own arm,
-            // never the "names no model" one.
-            if let Some(model) = models
-                .iter()
-                .find(|m| crate::fallback::demand_from([m.as_str()]).is_empty())
-            {
-                return Err(format!(
-                    "credit cap spent: {name} runs {model}, which clauth cannot tell is billed \
-                     against usage credits; name another account or a known model"
-                ));
-            }
+        // Any model clauth cannot place refuses a capped account, even beside
+        // one it can place: the family set may still be non-empty, so this arm
+        // sits outside the unknown-demand block. The caller's own spelling is
+        // echoed through the same flatten-and-cap as an agent name, since a
+        // model string is caller input too.
+        if let Some(model) = models
+            .iter()
+            .find(|m| crate::fallback::demand_from([m.as_str()]).is_empty())
+        {
+            return Err(format!(
+                "credit cap spent: {name} runs {}, which clauth cannot tell is billed \
+                 against usage credits; name another account or a known model",
+                echo_name(model)
+            ));
+        }
+        // A launch naming an agent and no model gets its own arm, after the
+        // union side's known families: clauth reads no agent def, so the model
+        // the agent runs is unknowable, never "no model named".
+        if let Some(agent) = agent_without_model {
+            return Err(format!(
+                "credit cap spent: {name} runs agent {}, whose model clauth cannot \
+                 tell; name another account or a model",
+                echo_name(agent)
+            ));
+        }
+        if families.is_empty() {
             return Err(format!(
                 "credit cap spent: {name} names no model to run, and its default may \
                  bill usage credits; name another account or a model"
@@ -4429,14 +4570,18 @@ fn preflight_target(
 /// does not serve its own inference, an unfunded one (the provider's own
 /// balance verdict).
 /// Runs before any spawn: N delegates is N real usage windows with no undo.
-/// `model`, `isolation`, `stale_env_keys`, `extra_args`, `env`, `cwd` and
-/// `credit_billed` are the demand inputs every member's credit gate is judged
-/// under, read once by the caller.
+/// `model`, `subagent_type`, `isolation`, `stale_env_keys`, `extra_args`,
+/// `env`, `cwd` and `credit_billed` are the demand inputs every member's
+/// credit gate is judged under, read once by the caller. A fan-out carrying a
+/// resume folds that session's agent into `extra_args` as `--agent` (the same
+/// fold [`delegate_families`] makes for the single-background arm), so no
+/// second resume parameter is needed here.
 #[allow(clippy::too_many_arguments)]
 fn resolve_fanout(
     config: &AppConfig,
     raw: &[String],
     model: Option<&str>,
+    subagent_type: Option<&str>,
     isolation: Isolation,
     stale_env_keys: &[String],
     credit_billed: &[String],
@@ -4462,7 +4607,8 @@ fn resolve_fanout(
     for name in raw {
         if !seen.insert(name.to_ascii_lowercase()) {
             return Err(format!(
-                "duplicate profile in `profiles`: `{name}` (case-insensitive)"
+                "duplicate profile in `profiles`: `{}` (case-insensitive)",
+                echo_name(name)
             ));
         }
     }
@@ -4489,14 +4635,16 @@ fn resolve_fanout(
         let profile = config
             .find(&ProfileName::from(name.clone()))
             .ok_or_else(|| profile_not_found(name, ProfileNotFoundFix::CallProfiles))?;
-        let (models, families) = delegate_families(
+        let (models, families, agent_without_model) = delegate_families(
             profile,
             isolation,
             model,
+            subagent_type,
             extra_args,
             env,
             stale_env_keys,
             cwd,
+            None,
         );
         preflight_target(
             profile,
@@ -4504,6 +4652,7 @@ fn resolve_fanout(
             &ProfileName::from(name.clone()),
             &models,
             &families,
+            agent_without_model.as_deref(),
             credit_billed,
         )?;
     }
@@ -4537,7 +4686,10 @@ fn read_prompt_path(cwd: Option<&str>, raw: &str) -> std::result::Result<String,
     let path = std::path::Path::new(raw);
     if path.is_absolute() {
         let real = crate::canonical::identity(path).map_err(|e| {
-            format!("prompt `{raw}` does not resolve: {e}; check the path or pass text")
+            format!(
+                "prompt `{}` does not resolve: {e}; check the path or pass text",
+                echo_path(raw)
+            )
         })?;
         return read_resolved_prompt(&real, raw);
     }
@@ -4554,7 +4706,8 @@ fn normalize_join(
 ) -> std::result::Result<std::path::PathBuf, String> {
     if std::path::Path::new(rel).is_absolute() {
         return Err(format!(
-            "prompt `{rel}` refused: absolute path (must be relative to `cwd`)"
+            "prompt `{}` refused: absolute path (must be relative to `cwd`)",
+            echo_path(rel)
         ));
     }
     let mut parts: Vec<std::ffi::OsString> = Vec::new();
@@ -4563,7 +4716,10 @@ fn normalize_join(
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
                 if parts.pop().is_none() {
-                    return Err(format!("prompt `{rel}` refused: path escapes `cwd`"));
+                    return Err(format!(
+                        "prompt `{}` refused: path escapes `cwd`",
+                        echo_path(rel)
+                    ));
                 }
             }
             std::path::Component::Normal(part) => parts.push(part.to_os_string()),
@@ -4574,7 +4730,8 @@ fn normalize_join(
             // the caller named, so refuse by name.
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 return Err(format!(
-                    "prompt `{rel}` refused: absolute path (must be relative to `cwd`)"
+                    "prompt `{}` refused: absolute path (must be relative to `cwd`)",
+                    echo_path(rel)
                 ));
             }
         }
@@ -4596,21 +4753,27 @@ fn read_prompt_file(cwd: Option<&str>, rel: &str) -> std::result::Result<String,
         Some(dir) => std::path::PathBuf::from(dir),
         None => std::env::current_dir().map_err(|e| format!("cwd cannot be resolved: {e}"))?,
     };
-    let base_real = crate::canonical::identity(&base)
-        .map_err(|e| format!("cwd '{}' cannot be resolved: {e}", base.display()))?;
+    let base_real = crate::canonical::identity(&base).map_err(|e| {
+        format!(
+            "cwd '{}' cannot be resolved: {e}",
+            echo_path(&base.display().to_string())
+        )
+    })?;
     let candidate = normalize_join(&base_real, rel)?;
     // Re-check immediately before the read: canonicalize resolves any symlink, so
     // a link pointing outside `cwd` fails the starts_with check, and the resolved
     // path is the file opened below. A miss names the path, the cwd and the fix.
     let real = crate::canonical::identity(&candidate).map_err(|e| {
         format!(
-            "prompt `{rel}` does not resolve under cwd '{}': {e}; check the path, or pass the prompt as text",
-            crate::canonical::display(&base_real).display()
+            "prompt `{}` does not resolve under cwd '{}': {e}; check the path, or pass the prompt as text",
+            echo_path(rel),
+            echo_path(&crate::canonical::display(&base_real).display().to_string())
         )
     })?;
     if !real.starts_with(&base_real) {
         return Err(format!(
-            "prompt `{rel}` refused: symlink target resolves outside `cwd`"
+            "prompt `{}` refused: symlink target resolves outside `cwd`",
+            echo_path(rel)
         ));
     }
     read_resolved_prompt(&real, rel)
@@ -4626,7 +4789,7 @@ fn read_resolved_prompt(
     label: &str,
 ) -> std::result::Result<String, String> {
     crate::profile::read_capped_file(real, PROMPT_FILE_CAP)
-        .map_err(|detail| format!("prompt `{label}` refused: {detail}"))
+        .map_err(|detail| format!("prompt `{}` refused: {detail}", echo_path(label)))
 }
 
 /// Read an already-opened, type-checked prompt handle — the seam the growth and
@@ -4636,7 +4799,7 @@ fn read_resolved_prompt(
 #[cfg(test)]
 fn read_prompt_handle(file: std::fs::File, rel: &str) -> std::result::Result<String, String> {
     crate::profile::read_validated_handle(file, PROMPT_FILE_CAP)
-        .map_err(|detail| format!("prompt `{rel}` refused: {detail}"))
+        .map_err(|detail| format!("prompt `{}` refused: {detail}", echo_path(rel)))
 }
 
 /// A reserved background job: the spec every later write of it goes through,
@@ -4706,13 +4869,16 @@ impl DelegateOrigin {
     /// Resolved once per call, before any mint. The cwd takes the same
     /// precedence `run_delegate` spawns under ([`spawn_cwd`]), made absolute
     /// against the server's own cwd the way the spawn resolves a relative one;
-    /// a resume whose workspace does not resolve falls through to the caller's
-    /// `cwd`, since `run_delegate` refuses that run anyway. The account is whichever profile
-    /// owns this server's session credentials (`which::resolve_active`, the
-    /// `which` tool's own answer). The host is the process that spawned this
-    /// server and the conversation it is in at this call ([`host_session`]).
+    /// a resume's workspace comes from the transcript HEAD alone
+    /// ([`resume_workspace_head`]), never the whole-file agent scan the
+    /// pre-flight pays, and one that does not resolve falls through to the
+    /// caller's `cwd`, since `run_delegate` refuses that run anyway. The account
+    /// is whichever profile owns this server's session credentials
+    /// (`which::resolve_active`, the `which` tool's own answer). The host is the
+    /// process that spawned this server and the conversation it is in at this
+    /// call ([`host_session`]).
     fn resolve(config: &AppConfig, resume: Option<&str>, cwd: Option<&str>) -> Self {
-        let workspace = resume.and_then(|id| resolve_resume_workspace(id).ok());
+        let workspace = resume.and_then(resume_workspace_head);
         Self {
             cwd: spawn_cwd(workspace, cwd)
                 .and_then(|dir| std::path::absolute(dir).ok())
@@ -4722,6 +4888,17 @@ impl DelegateOrigin {
             host_pid: host_pid(),
         }
     }
+}
+
+/// The workspace a resume id was recorded under: the origin cwd needs no
+/// whole-transcript read, and the pre-flight it runs beside already pays the
+/// one agent scan this call would repeat. The dead ends are
+/// [`pinned_resume`]'s, so the origin falls back exactly where the resume
+/// refuses.
+fn resume_workspace_head(session_id: &str) -> Option<std::path::PathBuf> {
+    pinned_resume(session_id)
+        .ok()
+        .map(|(_session, workspace)| workspace)
 }
 
 /// The conversation the host process `pid` is in now: its Claude Code session
@@ -5758,7 +5935,9 @@ fn drain_pipe<R: std::io::Read>(reader: &mut R) -> Vec<u8> {
 }
 
 /// Truncate a string to `max` bytes (on a char boundary) for an error payload,
-/// appending an ellipsis when clipped.
+/// appending an ellipsis when clipped. Kept byte-based and literal for the
+/// 2000-byte child-output reasons: those are JSON strings, where a newline
+/// forges nothing and a stack trace reads better as written.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -5768,6 +5947,61 @@ fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+/// Whether `c` breaks or reorders a line in prose a caller reads: a control
+/// character (C0, DEL and C1, NEL included), the Unicode line and paragraph
+/// separators, or a bidi control. These and only these: a combining mark, a
+/// joiner, a zero-width space, a no-break space, a soft hyphen and a BOM sit
+/// mid-line and reorder nothing, so they are ordinary text.
+fn line_breaker(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0}'..='\u{1f}'
+            | '\u{7f}'..='\u{9f}'
+            | '\u{61c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Echo a caller-supplied path in a refusal. A path is returned exactly as
+/// written — an ordinary path, a Windows `\`, a literal backslash-`n` pair —
+/// unless it holds a character that breaks or reorders a line (a control
+/// character, U+2028, U+2029, a bidi control) or a `"`; one that does is
+/// returned quoted, with every special character escaped and every backslash
+/// doubled. A raw echo can then never contain `"`, so it can never read the
+/// same as a quoted one, and an embedded newline cannot forge a second line in
+/// the payload. The path keeps its full length — a path cut at 64 characters
+/// names nothing — and the OS bounds it already.
+fn echo_path(s: &str) -> String {
+    if s.contains('"') || s.chars().any(line_breaker) {
+        format!("{s:?}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Echo a caller-supplied name (an agent name, a session id, a profile name as
+/// the caller spelled it) in a refusal: every character that breaks or reorders
+/// a line is flattened to a space, so an embedded newline cannot forge a second
+/// line, then the echo is capped at 64 CHARACTERS (never bytes), appending an
+/// ellipsis when cut. Every other character — an accent, a joiner, a no-break
+/// space — is kept as written. A name is not a path — it names nothing on disk
+/// — so it takes the flat form rather than [`echo_path`]'s quoted one.
+fn echo_name(s: &str) -> String {
+    let clean: String = s
+        .chars()
+        .map(|c| if line_breaker(c) { ' ' } else { c })
+        .collect();
+    if clean.chars().count() <= 64 {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(64).collect();
+    cut.push('…');
+    cut
 }
 
 /// How long a client may treat `server/discover` and `tools/list` as fresh. Both

@@ -1757,12 +1757,14 @@ pub(crate) enum StartBlock {
 /// disk, and `families` the models a launch is about to run: `Some` narrows the
 /// per-model weekly judgment to exactly those families regardless of
 /// `check_scoped` (a KNOWN demand supersedes the blanket gate), `None` keeps
-/// today's blanket behaviour gated by `check_scoped`. `credit_billed` is the
-/// set of model families Claude Code bills against usage credits, read once by
-/// the walk — a known demand crossing it is refused whatever the credit gate
-/// says, an unknown one only while the gate is on. `needs_oauth` is
-/// `--with-fallback`, which refuses a member the chain could never move the
-/// session off.
+/// today's blanket behaviour gated by `check_scoped`. `unplaceable` is the
+/// walk's own verdict that the demand holds a model clauth cannot place, so the
+/// CREDIT rung alone reads it as unknown while the scoped rung keeps narrowing
+/// to `families`. `credit_billed` is the set of model
+/// families Claude Code bills against usage credits, read once by the walk — a
+/// known demand crossing it is refused whatever the credit gate says, and an
+/// unknown one whatever the gate says too. `needs_oauth` is `--with-fallback`,
+/// which refuses a member the chain could never move the session off.
 ///
 /// The aggregate decision is computed once by [`is_exhausted_from_info`] (the
 /// walk's own predicate); the `WeeklySpent`/`FiveHour`/`WeeklySoft` rungs only
@@ -1771,8 +1773,10 @@ pub(crate) enum StartBlock {
 /// auth-broken, logged-out, kick-rejected, non-OAuth under `--with-fallback`) AND not
 /// exhausted AND scoped-clear AND credit-clear. Every rung but `NotOauth` is
 /// one the switch walk also skips or refuses on, except the demand-narrowed
-/// rungs (`ScopedSpent`, `CreditCap`) under a known demand; the active-slot
-/// skip is the walk's alone, since a start has no active to leave.
+/// `ScopedSpent` rung under a known demand, and the `CreditCap` rung, which
+/// fires whatever the credit gate says (the gate steers the chain walk only);
+/// the active-slot skip is the walk's alone, since a start has no active to
+/// leave.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_block(
     config: &AppConfig,
@@ -1782,6 +1786,7 @@ pub(crate) fn start_block(
     kick_rejected: bool,
     needs_oauth: bool,
     families: Option<&[String]>,
+    unplaceable: bool,
     credit_billed: &[String],
 ) -> Option<StartBlock> {
     if profile.is_disabled() {
@@ -1844,18 +1849,20 @@ pub(crate) fn start_block(
     }
     // A spent usage-credit cap refuses a launch Claude Code would bill against
     // usage credits. A KNOWN demand decides by its own families whatever the
-    // credit gate says; an unknown demand (no model resolved) is judged
-    // credit-billed only while the gate is on — the scoped gate's blanket rule.
-    // Keyed on `credit_capped()`, never a stale percent or a billing-off limit.
-    // An account serving inference from its own endpoint + token never spends
-    // its OAuth usage credits, so its spent cap blocks no launch.
+    // credit gate says; an unknown demand (no model resolved, or one clauth
+    // cannot place) is judged credit-billed whatever the gate says too — the
+    // gate steers the chain walk only. Keyed on
+    // `credit_capped()`, never a stale percent or a billing-off limit. An
+    // account serving inference from its own endpoint + token never spends its
+    // OAuth usage credits, so its spent cap blocks no launch.
     if !crate::claude::has_own_inference_endpoint(profile)
         && usage.is_some_and(UsageInfo::credit_capped)
     {
-        let billed = match families {
-            Some(fams) => fams.iter().any(|f| credit_billed.contains(f)),
-            None => member.check_credit_cap,
-        };
+        let billed = unplaceable
+            || match families {
+                Some(fams) => fams.iter().any(|f| credit_billed.contains(f)),
+                None => true,
+            };
         if billed {
             return Some(StartBlock::CreditCap);
         }
@@ -1896,7 +1903,7 @@ pub(crate) struct StartCandidate {
 /// The `--auto` walk: every resolvable fallback-chain member in chain order,
 /// each judged by [`start_block`] with the models THAT member's session will
 /// run (its own runtime overlay plus the process-env pair passed in and the
-/// passthrough args — see [`crate::start::member_launch_models`]), plus the
+/// passthrough args — see [`crate::start::member_launch_demand`]), plus the
 /// index of the first clear member (freshness PREFERRED in pass one, any
 /// freshness accepted in pass two — the same preference the switch walk gives
 /// its target in [`next_auto_switch_target`]). `env_models` is the process-env
@@ -1929,6 +1936,23 @@ pub(crate) fn start_walk(
     // runtime write uses, so the demand's settings-derived models are exactly
     // the runtime's `settings.json` models.
     let stale_env_keys = crate::actions::outgoing_env_keys(config);
+    // A resumed or continued session runs its transcript's agent again: fold
+    // that agent into the demand args when the launch names none. A resume form
+    // clauth cannot pin, with no named model,
+    // is an unknown HEADLINE: its union side is still judged, its headline is
+    // not.
+    let resumed = crate::start::resumed_agent(claude_args);
+    let named_model = crate::start::parsed_model_args(claude_args).0.is_some();
+    let unknown_resume = matches!(resumed, crate::start::ResumedAgent::Unknown) && !named_model;
+    let mut folded_args: Vec<String>;
+    let eff_args: &[String] = match &resumed {
+        crate::start::ResumedAgent::Agent(name) => {
+            folded_args = claude_args.to_vec();
+            folded_args.extend_from_slice(&["--agent".to_owned(), name.clone()]);
+            &folded_args
+        }
+        _ => claude_args,
+    };
     let mut rows: Vec<StartCandidate> = Vec::with_capacity(names.len());
     // The reading each row's walk-order ranking reads, built in the same loop
     // as the rows (parallel vec, same indices) so the walk below can order
@@ -1962,27 +1986,115 @@ pub(crate) fn start_walk(
         let stale = windows.stale();
         let fresh = windows.fresh();
         let kick_rejected = kick.iter().any(|k| k == name);
-        let demand = demand_from(crate::start::member_launch_models(
-            profile,
-            isolation,
-            &stale_env_keys,
-            claude_args,
-            None,
-            crate::start::EnvLeg::Process,
-            cwd,
-            crate::start::process_model_env_of(&env_models),
-        ));
-        let families = (!demand.is_empty()).then_some(demand.as_slice());
-        let block = start_block(
-            config,
-            &member,
-            profile,
-            usage,
-            kick_rejected,
-            needs_oauth,
-            families,
-            &credit_billed,
-        );
+        let demand = if unknown_resume {
+            crate::start::LaunchDemand {
+                models: crate::start::member_launch_unknown_headline_models(
+                    profile,
+                    isolation,
+                    &stale_env_keys,
+                    eff_args,
+                    crate::start::EnvLeg::Process,
+                    cwd,
+                    crate::start::process_model_env_of(&env_models),
+                ),
+                agent_without_model: None,
+            }
+        } else {
+            crate::start::member_launch_demand(
+                profile,
+                isolation,
+                &stale_env_keys,
+                eff_args,
+                None,
+                crate::start::EnvLeg::Process,
+                cwd,
+                crate::start::process_model_env_of(&env_models),
+            )
+        };
+        // An agent launch naming no model, or a resume form clauth cannot pin
+        // with no named model, has an unknown HEADLINE. Its known union families
+        // are still judged narrowed, and only the credit rung reads the headline
+        // as unknown: neither empties `models`.
+        let unknown_headline = unknown_resume || demand.agent_without_model.is_some();
+        let models = demand.models;
+        // A demand holding a model clauth cannot place reads as unknown to the
+        // CREDIT rung alone: the scoped rung keeps narrowing to the known
+        // families, so the refusal for a spent known family still names it,
+        // while a credit refusal names none.
+        let known = demand_from(&models);
+        let unplaceable = models.iter().any(|m| demand_from([m.as_str()]).is_empty());
+        let families = (!known.is_empty()).then_some(known.as_slice());
+        let (block, blanket) = if unknown_headline {
+            // The known families are always judged narrowed (a known demand
+            // supersedes the blanket gate), AND the member's own `check_scoped`
+            // gate adds the blanket judgment: the agent may run any family. The
+            // second call's `families: None` carries both that and the credit
+            // rung's unknown headline.
+            let narrowed = start_block(
+                config,
+                &member,
+                profile,
+                usage,
+                kick_rejected,
+                needs_oauth,
+                families,
+                unplaceable,
+                &credit_billed,
+            );
+            let all = start_block(
+                config,
+                &member,
+                profile,
+                usage,
+                kick_rejected,
+                needs_oauth,
+                None,
+                unplaceable,
+                &credit_billed,
+            );
+            // The row is the union of two judgments, so it reports the rung
+            // `start_block` itself would decide first: its return order puts the
+            // scoped rung above the credit rung and the credit rung above the
+            // family-independent rungs below it. Only two sites can differ — a
+            // narrowed scoped rung (names its own families), and everything the
+            // blanket call decided — so the union is the earlier of the two
+            // whenever the narrowed call did not go quiet. `blanket` is true
+            // when the block names no family: the blanket scoped rung, the
+            // credit rung's unknown side, and every headline-independent rung.
+            match (narrowed, all) {
+                // Scoped outranks credit, and the narrowed block is the one
+                // naming the launch's known families.
+                (Some(b @ StartBlock::ScopedSpent { .. }), _) => (Some(b), false),
+                (_, Some(b @ StartBlock::ScopedSpent { .. })) => (Some(b), true),
+                // A credit block the NARROWED judgment reached names the billed
+                // known families; an unplaceable model names none. The blanket
+                // call's credit rung is its unknown side and always names none.
+                (Some(StartBlock::CreditCap), _) => (Some(StartBlock::CreditCap), unplaceable),
+                (_, Some(StartBlock::CreditCap)) => (Some(StartBlock::CreditCap), true),
+                (_, b) => (b, true),
+            }
+        } else {
+            let block = start_block(
+                config,
+                &member,
+                profile,
+                usage,
+                kick_rejected,
+                needs_oauth,
+                families,
+                unplaceable,
+                &credit_billed,
+            );
+            (block, false)
+        };
+        let row_demand = if unknown_headline && blanket {
+            Vec::new()
+        } else {
+            match (&block, unplaceable) {
+                (Some(StartBlock::CreditCap), true) => Vec::new(),
+                _ => known.clone(),
+            }
+        };
         readings.push(if walk_order == WalkOrder::Chain {
             None
         } else {
@@ -1994,7 +2106,7 @@ pub(crate) fn start_walk(
             age,
             stale,
             fresh,
-            demand,
+            demand: row_demand,
             now,
         });
     }

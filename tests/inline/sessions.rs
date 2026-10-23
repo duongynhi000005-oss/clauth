@@ -2040,12 +2040,15 @@ fn rescue_preserves_the_source_file_mode() {
 
 // ── targeted lookup (`clauth resume`/`info` and the `delegate` resume path) ──
 
-/// `--resume` only resolves a session under its own workspace, so the delegate
-/// path needs one transcript's recorded `cwd` and nothing else. This lookup is
-/// deliberately not `build_index`, which head- and tail-reads every transcript in
-/// the store to build previews it would then throw away.
+/// The delegate path needs one transcript's recorded `cwd` (and the agent it
+/// resumes): clauth spawns a resume in that workspace so the conversation keeps
+/// its project settings and cwd. Claude Code itself opens an id recorded under
+/// another project's cwd (measured on 2.1.309: a projB id resumed from projA
+/// ran, exit 0). This lookup is deliberately not `build_index`, which head- and
+/// tail-reads every transcript in the store to build previews it would then
+/// throw away.
 #[test]
-fn workspace_of_finds_a_sessions_recorded_cwd() {
+fn find_session_top_level_finds_a_sessions_recorded_cwd() {
     let sb = HomeSandbox::new();
     write_jsonl(
         &sb.home().join(".claude/projects/-w-res/sres.jsonl"),
@@ -2056,29 +2059,60 @@ fn workspace_of_finds_a_sessions_recorded_cwd() {
         &[user_line("sother", "/w/other", "unrelated")],
     );
 
+    let sres = find_session_top_level("sres").expect("a top-level transcript");
     assert_eq!(
-        workspace_of("sres"),
+        sres.workspace(),
         Some(PathBuf::from("/w/res")),
         "the workspace comes from the transcript, not from the lossy dir slug"
     );
+    assert_eq!(sres.agent(), None);
+    let sother = find_session_top_level("sother").expect("a top-level transcript");
     assert_eq!(
-        workspace_of("sother"),
+        sother.workspace(),
         Some(PathBuf::from("/w/other")),
         "a store with several sessions still resolves each to its own"
     );
-    assert_eq!(workspace_of("nosuchsession"), None);
+    assert!(find_session_top_level("nosuchsession").is_none());
 }
 
 /// A transcript recording no `cwd` leaves a resume nowhere to run, which is the
-/// same dead end as no transcript at all.
+/// same dead end as no transcript at all. The sibling with a `cwd` keeps the
+/// verdict from reading as "this lookup never answers a workspace".
 #[test]
-fn workspace_of_treats_a_cwd_less_transcript_as_unresolvable() {
+fn a_cwd_less_transcript_has_no_resume_workspace() {
     let sb = HomeSandbox::new();
     write_jsonl(
         &sb.home().join(".claude/projects/-w-bare/sbare.jsonl"),
         &[json!({"sessionId": "sbare", "message": {"role": "user", "content": "hi"}}).to_string()],
     );
-    assert_eq!(workspace_of("sbare"), None);
+    write_jsonl(
+        &sb.home().join(".claude/projects/-w-has/shas.jsonl"),
+        &[user_line("shas", "/w/has", "hello")],
+    );
+    let sbare = find_session_top_level("sbare").expect("a top-level transcript");
+    assert_eq!(sbare.workspace(), None);
+    let shas = find_session_top_level("shas").expect("a top-level transcript");
+    assert_eq!(shas.workspace(), Some(PathBuf::from("/w/has")));
+}
+
+/// A resume value pins only a top-level transcript: the nested `agent-<hex>`
+/// stem is still found by the browsing lookup (so `sessions`/`info` keep
+/// naming it), but Claude Code answers no-match for it, so the resume lookup is
+/// the same dead end as a missing id.
+#[test]
+fn the_resume_lookup_rejects_a_nested_transcript() {
+    let sb = HomeSandbox::new();
+    let nested = sb
+        .home()
+        .join(".claude/projects/-w-a/s-top/subagents/agent-abc123.jsonl");
+    write_jsonl(&nested, &[user_line("s-top", "/w/a", "sub")]);
+
+    assert_eq!(find_session_top_level("agent-abc123").map(|s| s.path), None);
+    assert_eq!(
+        find_session("agent-abc123").map(|s| s.path),
+        Some(nested),
+        "the browsing lookup still reaches the nested transcript"
+    );
 }
 
 /// A duplicated id must resolve to the same file the index would pick, or

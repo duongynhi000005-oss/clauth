@@ -371,23 +371,22 @@ fn a_credit_capped_target_refuses_its_own_credit_billed_default() {
     );
 }
 
+/// An unknown demand may bill credits, so a capped account refuses it whatever
+/// its credit gate says: the gate steers the chain walk only.
 #[test]
-fn a_credit_capped_target_refuses_a_run_naming_no_model_while_its_gate_is_on() {
-    let home = HomeSandbox::new();
-    let cwd = seed_credit_spend_target(&home, None, true, true);
+fn a_credit_capped_target_refuses_a_run_naming_no_model_whatever_its_gate_says() {
+    for gate in [true, false] {
+        let home = HomeSandbox::new();
+        let cwd = seed_credit_spend_target(&home, None, gate, true);
 
-    let err = delegate_to_capped(None, &cwd).expect_err("an unknown model may bill credits");
-    assert_eq!(
-        err,
-        "credit cap spent: capped names no model to run, and its default may bill usage credits; name another account or a model"
-    );
-}
-
-#[test]
-fn a_credit_capped_target_admits_a_run_naming_no_model_while_its_gate_is_off() {
-    let home = HomeSandbox::new();
-    let cwd = seed_credit_spend_target(&home, None, false, true);
-    assert_admitted(delegate_to_capped(None, &cwd));
+        let err = delegate_to_capped(None, &cwd).expect_err("an unknown model may bill credits");
+        assert_eq!(
+            err,
+            "credit cap spent: capped names no model to run, and its default may bill usage credits; name another account or a model",
+            "gate {gate}"
+        );
+        drop(home);
+    }
 }
 
 /// [`delegate_to_capped`] with the call's own `args` and `env`.
@@ -504,16 +503,18 @@ fn a_credit_capped_target_refuses_a_model_it_cannot_place() {
     );
 }
 
-/// An unknown demand is judged credit-billed only while the gate is on: with
-/// the gate off, an unplaceable model is admitted, exactly like a run naming
-/// no model at all.
+/// The gate off changes nothing for an unplaceable model: a capped account
+/// refuses it like a run naming no model at all.
 #[test]
-fn a_credit_capped_target_admits_an_unplaceable_model_with_its_gate_off() {
+fn a_credit_capped_target_refuses_an_unplaceable_model_with_its_gate_off() {
     let home = HomeSandbox::new();
     let cwd = seed_credit_spend_target(&home, None, false, true);
-    // Control: no model at all, gate off, is admitted.
-    assert_admitted(delegate_to_capped(None, &cwd));
-    assert_admitted(delegate_to_capped(Some("glm-4.6"), &cwd));
+
+    let err = delegate_to_capped(Some("glm-4.6"), &cwd).expect_err("an unplaceable model");
+    assert_eq!(
+        err,
+        "credit cap spent: capped runs glm-4.6, which clauth cannot tell is billed against usage credits; name another account or a known model"
+    );
 }
 
 /// The alias remap must not slice the original by a length measured on a
@@ -691,6 +692,198 @@ fn a_delegate_reads_a_project_settings_model_from_its_spawn_cwd() {
     assert_eq!(err, REFUSES_FABLE);
 }
 
+// A run started as an agent (`subagent_type`, `--agent`, the settings `agent`
+// key) runs whatever model its def names, and clauth reads no def: with no
+// named model, a capped account refuses it whatever its credit gate says; a
+// named model decides alone.
+
+fn delegate_as_agent(
+    agent: &str,
+    model: Option<&str>,
+    args: &[&str],
+    env: &[(&str, &str)],
+    cwd: &std::path::Path,
+) -> std::result::Result<serde_json::Value, String> {
+    run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "hello",
+        model,
+        cwd: cwd.to_str(),
+        env: env
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+        extra_args: args.iter().map(|a| (*a).to_owned()).collect(),
+        resume: None,
+        subagent_type: Some(agent),
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+}
+
+fn refuses_agent(agent: &str) -> String {
+    format!(
+        "credit cap spent: capped runs agent {agent}, whose model clauth cannot tell; name another account or a model"
+    )
+}
+
+/// The account's own default is a subscription model, so only the agent makes
+/// the run's model unknown.
+#[test]
+fn an_agent_run_naming_no_model_refuses_whatever_the_gate_says() {
+    for gate in [true, false] {
+        let home = HomeSandbox::new();
+        let cwd = seed_credit_spend_target(&home, Some("opus"), gate, true);
+
+        let err = delegate_as_agent("rev", None, &[], &[], &cwd)
+            .expect_err("the agent's model is unknown");
+        assert_eq!(err, refuses_agent("rev"), "gate {gate}");
+        drop(home);
+    }
+}
+
+/// A subscription model in the env and a def file naming one change nothing:
+/// the def may override `ANTHROPIC_MODEL`, and clauth reads no def.
+#[test]
+fn an_agent_run_refuses_beside_a_subscription_model_it_cannot_trust() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let agents = home.home().join(".claude").join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("rev.md"),
+        "---\nname: rev\ndescription: d\nmodel: opus\n---\nYou review.\n",
+    )
+    .unwrap();
+
+    let err = delegate_as_agent("rev", None, &[], &[("ANTHROPIC_MODEL", "opus")], &cwd)
+        .expect_err("the agent's model is unknown");
+    assert_eq!(err, refuses_agent("rev"));
+}
+
+/// A named model decides an agent run alone: `--model` outranks the def
+/// (measured on Claude Code 2.1.308).
+#[test]
+fn a_named_model_decides_an_agent_run() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+
+    assert_admitted(delegate_as_agent("rev", Some("opus"), &[], &[], &cwd));
+    assert_admitted(delegate_as_agent(
+        "rev",
+        None,
+        &["--model", "opus"],
+        &[],
+        &cwd,
+    ));
+    let err = delegate_as_agent("rev", Some("fable"), &[], &[], &cwd).expect_err("fable bills");
+    assert_eq!(err, REFUSES_FABLE);
+}
+
+/// `--agent` in the args, a `--settings` passthrough's `agent` key and the
+/// shared base settings' `agent` key each make an agent run.
+#[test]
+fn every_way_to_name_an_agent_makes_an_agent_run() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("opus"), false, true);
+
+    let r = delegate_to_capped_with(None, &["--agent", "rev"], &[], &cwd);
+    assert_eq!(r.expect_err("an args agent"), refuses_agent("rev"));
+    let r = delegate_to_capped_with(None, &["--settings", r#"{"agent":"rev"}"#], &[], &cwd);
+    assert_eq!(r.expect_err("a passthrough agent"), refuses_agent("rev"));
+
+    std::fs::create_dir_all(home.home().join(".claude")).unwrap();
+    std::fs::write(
+        home.home().join(".claude").join("settings.json"),
+        r#"{"agent":"usr"}"#,
+    )
+    .unwrap();
+    let r = delegate_to_capped(None, &cwd);
+    assert_eq!(r.expect_err("a user-settings agent"), refuses_agent("usr"));
+}
+
+/// A project's settings `agent` key in the spawn cwd makes an agent run. The
+/// account names no default, so a miss refuses with the no-model line instead
+/// of reaching a spawn in this real cwd.
+#[test]
+fn a_project_settings_agent_key_makes_an_agent_run() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, None, false, true);
+    let cwd = home.home().join("proj");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.json"),
+        r#"{"agent":"rev"}"#,
+    )
+    .unwrap();
+
+    let err = delegate_to_capped(None, &cwd).expect_err("an agent run");
+    assert_eq!(err, refuses_agent("rev"));
+}
+
+/// The refusal echoes the name the caller spelled, bounded to 64 chars through
+/// the same echo helper the unknown-id arm uses.
+#[test]
+fn an_agent_name_is_truncated_in_the_refusal() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("opus"), false, true);
+    let long = "x".repeat(100);
+
+    let err = delegate_as_agent(&long, None, &[], &[], &cwd).expect_err("the agent is unknown");
+    assert_eq!(err, refuses_agent(&format!("{}…", "x".repeat(64))));
+}
+
+/// A caller-supplied agent name crossing the trust boundary into a refusal is
+/// flattened before it is echoed: a control character becomes a space, so an
+/// embedded newline cannot forge a second line in the payload. The share
+/// `truncate` is not the flattener: a multi-line child output keeps its lines.
+#[test]
+fn the_echoed_name_flattens_control_characters_in_an_error_payload() {
+    assert_eq!(super::echo_name("a\nb"), "a b");
+    assert_eq!(super::echo_name("a\u{1b}[31mred"), "a [31mred");
+}
+
+/// Control: an account whose cap is not spent, and one serving its own
+/// endpoint, run an agent naming no model.
+#[test]
+fn an_agent_run_on_an_uncapped_or_own_endpoint_account_is_admitted() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("opus"), true, false);
+    assert_admitted(delegate_as_agent("rev", None, &[], &[], &cwd));
+    drop(home);
+
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("fable"), true, true);
+    let name = crate::profile::ProfileName::from("capped");
+    let mut profile = crate::profile::load_profile(&name).expect("load profile");
+    profile.env.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "http://127.0.0.1:9".to_owned(),
+    );
+    profile
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_owned(), "test-token".to_owned());
+    crate::profile::save_profile(&profile).expect("save profile");
+    assert_admitted(delegate_as_agent("rev", None, &[], &[], &cwd));
+}
+
+/// Any model clauth cannot place refuses a capped account, even beside one it
+/// can place.
+#[test]
+fn an_unplaceable_fallback_beside_a_known_model_refuses() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+
+    let r = delegate_to_capped_with(Some("opus"), &["--fallback-model", "glm-4.6"], &[], &cwd);
+    assert_eq!(
+        r.expect_err("glm-4.6 cannot be placed"),
+        "credit cap spent: capped runs glm-4.6, which clauth cannot tell is billed against usage credits; name another account or a known model"
+    );
+}
+
 /// A billing-off account carrying a stale full limit is never capped: the
 /// delegate gate keys on `credit_capped()`, never a stale percent, so a fable
 /// demand still runs there (on to the cwd check).
@@ -773,6 +966,7 @@ fn a_quarantined_and_capped_oauth_target_refuses_with_the_login_expired_sentence
             &name,
             &["fable".to_string()],
             &["fable".to_string()],
+            None,
             &["fable".to_string()],
         ),
         Err(crate::format::login_expired(&name).line()),
@@ -1402,6 +1596,7 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
         &config,
         &raw,
         None,
+        None,
         Isolation::Shared,
         &[],
         &[],
@@ -1470,6 +1665,7 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
         &config,
         &raw,
         None,
+        None,
         Isolation::Shared,
         &[],
         &[],
@@ -1534,6 +1730,7 @@ fn resolve_fanout_refuses_an_auth_broken_member_by_name() {
         &config,
         &raw,
         None,
+        None,
         Isolation::Shared,
         &[],
         &[],
@@ -1580,6 +1777,7 @@ fn a_disabled_and_quarantined_target_refuses_as_disabled() {
         &config,
         &raw,
         None,
+        None,
         Isolation::Shared,
         &[],
         &[],
@@ -1621,6 +1819,7 @@ fn a_quarantined_and_keyless_third_party_target_refuses_as_keyless() {
     let err = resolve_fanout(
         &config,
         &raw,
+        None,
         None,
         Isolation::Shared,
         &[],
@@ -1675,6 +1874,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
             &config,
             &raw,
             None,
+            None,
             Isolation::Shared,
             &[],
             &[],
@@ -1696,6 +1896,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
             &crate::profile::ProfileName::from("ds-keyq"),
             &[],
             &[],
+            None,
             &[],
         ),
         Ok(()),
@@ -1732,6 +1933,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
             &crate::profile::ProfileName::from("generic-q"),
             &[],
             &[],
+            None,
             &[],
         ),
         Ok(()),
@@ -1763,6 +1965,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
             &crate::profile::ProfileName::from("oauth-q"),
             &[],
             &[],
+            None,
             &[],
         ),
         Err(crate::format::login_expired(&crate::profile::ProfileName::from("oauth-q")).line()),
@@ -1811,6 +2014,7 @@ fn resolve_fanout_passes_when_every_member_is_delegable() {
     let names = resolve_fanout(
         &config,
         &raw,
+        None,
         None,
         Isolation::Shared,
         &[],
@@ -2252,6 +2456,1107 @@ fn fanout_refuses_a_credit_billed_model_named_in_args() {
         .map(|rd| rd.flatten().count())
         .unwrap_or(0);
     assert_eq!(job_count, 0, "a refused fan-out writes no job file");
+}
+
+/// The fan-out pre-flight judges each member with the call's `subagent_type`,
+/// the same way the single-background arm does: an agent run naming no model
+/// refuses the capped member before any job or spawn. Without the agent the
+/// refusal would be the no-model line, so the text pins that the fan-out saw it.
+#[test]
+fn fanout_refuses_an_agent_run_naming_no_model() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "solo".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-test".to_string()),
+        Default::default(),
+    )
+    .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "capped".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let capped_name = crate::profile::ProfileName::from("capped");
+    let mut capped = crate::profile::load_profile(&capped_name).expect("load capped");
+    capped.check_credit_cap = true;
+    crate::profile::save_profile(&capped).expect("save capped");
+    crate::profile_cache::write_profile_cache(
+        &capped_name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            spend: Some(crate::usage::SpendInfo {
+                enabled: true,
+                used: Some(50.0),
+                limit: Some(50.0),
+                percent: Some(100.0),
+                currency: Some("USD".to_owned()),
+            }),
+            ..Default::default()
+        },
+    );
+
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the sandbox),
+    // restored unconditionally below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
+
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let result = rt
+        .block_on(async {
+            server
+                .delegate_with(
+                    DelegateArgs {
+                        profiles: Some(vec!["solo".to_string(), "capped".to_string()]),
+                        prompt: Some("hello".to_string()),
+                        model: None,
+                        cwd: None,
+                        env: None,
+                        args: None,
+                        session_id: None,
+                        subagent_type: Some("rev".to_string()),
+                        allowed_tools: None,
+                        permission_mode: None,
+                        result: None,
+                        isolated: None,
+                        background: Some(true),
+                    },
+                    ProgressSink::none(),
+                )
+                .await
+        })
+        .expect("delegate returns a tool result, never a transport error");
+
+    // SAFETY: restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a capped member refuses the fan-out"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("refusal text");
+    assert_eq!(
+        text,
+        "delegate failed: credit cap spent: capped runs agent rev, whose model clauth \
+         cannot tell; name another account or a model"
+    );
+    let job_count = jobs::jobs_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(job_count, 0, "a refused fan-out writes no job file");
+}
+
+/// The single-background pre-flight judges the call's `subagent_type` too: a
+/// capped target refuses an agent run naming no model before its job file is
+/// reserved. Without the agent it would refuse with the no-model line.
+#[test]
+fn background_refuses_an_agent_run_naming_no_model() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, None, false, true);
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the sandbox),
+    // restored unconditionally below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
+
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let result = rt
+        .block_on(async {
+            server
+                .delegate_with(
+                    DelegateArgs {
+                        profiles: Some(vec!["capped".to_string()]),
+                        prompt: Some("hello".to_string()),
+                        model: None,
+                        cwd: None,
+                        env: None,
+                        args: None,
+                        session_id: None,
+                        subagent_type: Some("rev".to_string()),
+                        allowed_tools: None,
+                        permission_mode: None,
+                        result: None,
+                        isolated: None,
+                        background: Some(true),
+                    },
+                    ProgressSink::none(),
+                )
+                .await
+        })
+        .expect("delegate returns a tool result, never a transport error");
+
+    // SAFETY: restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("refusal text");
+    assert_eq!(
+        text,
+        "delegate failed: credit cap spent: capped runs agent rev, whose model clauth \
+         cannot tell; name another account or a model"
+    );
+    let job_count = jobs::jobs_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(job_count, 0, "a refused background run writes no job file");
+}
+
+/// A resumed session that was started as an agent runs that agent again
+/// (measured on Claude Code 2.1.309: the transcript's last `agent-setting`
+/// record), so a resume naming no model is an agent run. The capped target
+/// names no default, so a miss refuses with the no-model line instead of
+/// reaching a spawn in this real workspace.
+#[test]
+fn a_resumed_agent_session_naming_no_model_refuses() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, None, false, true);
+    let ws = home.home().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let transcript = home.home().join(".claude/projects/-ws/sagent.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(
+        &transcript,
+        [
+            serde_json::json!({"sessionId": "sagent", "cwd": ws, "message": {"role": "user", "content": "hi"}}).to_string(),
+            serde_json::json!({"type": "agent-setting", "agentSetting": "old", "sessionId": "sagent"}).to_string(),
+            serde_json::json!({"type": "agent-setting", "agentSetting": "pa", "sessionId": "sagent"}).to_string(),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let err = run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "go on",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: Some("sagent"),
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+    .expect_err("the resumed session runs agent pa");
+    assert_eq!(err, refuses_agent("pa"));
+}
+
+/// A transcript `<home>/.claude/projects/-ws/<id>.jsonl` recorded in the
+/// workspace `<home>/ws` (created): one user line, `pad` filler user lines of
+/// ~1 KiB each, then one `agent-setting` record per name in `agents`. Returns
+/// the workspace.
+fn write_resume_transcript(
+    home: &HomeSandbox,
+    id: &str,
+    pad: usize,
+    agents: &[&str],
+) -> std::path::PathBuf {
+    let ws = home.home().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let transcript = home
+        .home()
+        .join(".claude/projects/-ws")
+        .join(format!("{id}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    let mut lines = vec![
+        serde_json::json!({"sessionId": id, "cwd": ws, "message": {"role": "user", "content": "hi"}})
+            .to_string(),
+    ];
+    let filler = "f".repeat(1024);
+    for _ in 0..pad {
+        lines.push(
+            serde_json::json!({"sessionId": id, "cwd": ws, "message": {"role": "user", "content": filler}})
+                .to_string(),
+        );
+    }
+    for agent in agents {
+        lines.push(
+            serde_json::json!({"type": "agent-setting", "agentSetting": agent, "sessionId": id})
+                .to_string(),
+        );
+    }
+    std::fs::write(&transcript, lines.join("\n")).unwrap();
+    ws
+}
+
+/// The agent record can sit anywhere in the transcript: a session that took
+/// its agent at a later resume carries its only record past any head window
+/// (measured on Claude Code 2.1.309: one at byte 275,031). The whole transcript
+/// is scanned, so a record 300 KiB in still makes the resume an agent run.
+#[test]
+fn a_resume_whose_agent_record_sits_deep_in_the_transcript_refuses() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, None, false, true);
+    write_resume_transcript(&home, "sdeep", 300, &["pa"]);
+
+    let err = run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "go on",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: Some("sdeep"),
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+    .expect_err("the resumed session runs agent pa");
+    assert_eq!(err, refuses_agent("pa"));
+}
+
+/// A blank `subagent_type` passes `--agent ""`, which Claude Code ignores
+/// (measured on 2.1.309: a resume with it still runs the transcript's agent),
+/// so it never hides the resumed session's agent.
+#[test]
+fn a_blank_subagent_type_leaves_the_resumed_agent_in_force() {
+    for blank in ["", "  "] {
+        let home = HomeSandbox::new();
+        let _ = seed_credit_spend_target(&home, None, false, true);
+        write_resume_transcript(&home, "sagent", 0, &["pa"]);
+
+        let err = run_delegate(DelegateOpts {
+            profile: "capped",
+            prompt: "go on",
+            model: None,
+            cwd: None,
+            env: HashMap::new(),
+            extra_args: Vec::new(),
+            resume: Some("sagent"),
+            subagent_type: Some(blank),
+            allowed_tools: None,
+            permission_mode: None,
+            isolation: Isolation::Shared,
+            depth: 0,
+            handoff: None,
+        })
+        .expect_err("the resumed session runs agent pa");
+        assert_eq!(err, refuses_agent("pa"), "subagent_type {blank:?}");
+        drop(home);
+    }
+}
+
+/// A background fan-out carrying `session_id` resumes that session on every
+/// member, so its pre-flight judges the resumed agent and refuses up front,
+/// writing no job file. Both members name no default, so a pre-flight that
+/// misses the agent refuses with the no-model line instead.
+#[test]
+fn fanout_refuses_a_resumed_agent_session_naming_no_model() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, None, true, true);
+    let mut config = crate::profile::load_config().expect("load config");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "capped2".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let capped2 = crate::profile::ProfileName::from("capped2");
+    crate::profile_cache::write_profile_cache(
+        &capped2,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            spend: Some(crate::usage::SpendInfo {
+                enabled: true,
+                used: Some(50.0),
+                limit: Some(50.0),
+                percent: Some(100.0),
+                currency: Some("USD".to_owned()),
+            }),
+            ..Default::default()
+        },
+    );
+    write_resume_transcript(&home, "sagent", 0, &["pa"]);
+
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the sandbox),
+    // restored unconditionally below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
+
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let result = rt
+        .block_on(async {
+            server
+                .delegate_with(
+                    DelegateArgs {
+                        profiles: Some(vec!["capped".to_string(), "capped2".to_string()]),
+                        prompt: Some("go on".to_string()),
+                        model: None,
+                        cwd: None,
+                        env: None,
+                        args: None,
+                        session_id: Some("sagent".to_string()),
+                        subagent_type: None,
+                        allowed_tools: None,
+                        permission_mode: None,
+                        result: None,
+                        isolated: None,
+                        background: Some(true),
+                    },
+                    ProgressSink::none(),
+                )
+                .await
+        })
+        .expect("delegate returns a tool result, never a transport error");
+
+    // SAFETY: restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("refusal text");
+    assert_eq!(text, format!("delegate failed: {}", refuses_agent("pa")));
+    let job_count = jobs::jobs_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(job_count, 0, "a refused fan-out writes no job file");
+}
+
+/// The echo caps an agent name at 64 CHARACTERS: a multi-byte name
+/// keeps 64 of its chars, never 64 bytes.
+#[test]
+fn an_agent_name_is_cut_at_64_characters_not_bytes() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("opus"), false, true);
+    let long = "é".repeat(100);
+
+    let err = delegate_as_agent(&long, None, &[], &[], &cwd).expect_err("the agent is unknown");
+    assert_eq!(err, refuses_agent(&format!("{}…", "é".repeat(64))));
+}
+
+/// An agent name carrying a control character is flattened in the refusal it
+/// is echoed into, so an embedded newline cannot forge a second line.
+#[test]
+fn an_agent_name_with_a_newline_is_echoed_on_one_line() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("opus"), false, true);
+
+    let err = delegate_as_agent("a\nb", None, &[], &[], &cwd).expect_err("the agent is unknown");
+    assert_eq!(err, refuses_agent("a b"));
+}
+
+/// The error-payload truncate keeps a multi-line child output as written: a
+/// stack trace in a `claude exited with` reason rides a JSON string, where a
+/// newline forges nothing, and flattening it would run its lines together.
+#[test]
+fn truncate_keeps_the_lines_of_a_child_output() {
+    assert_eq!(super::truncate("a\nb\tc", 2000), "a\nb\tc");
+}
+
+/// The `delegate` tool's text reply for one background call with `args` on
+/// `capped`, run in `cwd`.
+fn delegate_reply_with_args(args: &[&str], cwd: &std::path::Path) -> String {
+    delegate_reply(DelegateArgs {
+        profiles: Some(vec!["capped".to_string()]),
+        prompt: Some("go on".to_string()),
+        model: None,
+        cwd: cwd.to_str().map(str::to_owned),
+        env: None,
+        args: Some(args.iter().map(|a| (*a).to_owned()).collect()),
+        session_id: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        result: None,
+        isolated: None,
+        background: Some(true),
+    })
+}
+
+/// The `delegate` tool's text reply for one call.
+fn delegate_reply(call: DelegateArgs) -> String {
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the caller's
+    // sandbox), restored unconditionally below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let result = rt
+        .block_on(async { server.delegate_with(call, ProgressSink::none()).await })
+        .expect("delegate returns a tool result, never a transport error");
+    // SAFETY: restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+    result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text")
+}
+
+/// `--from-pr` and `--teleport` resume a session clauth never sees, beside the
+/// id it pins (measured on Claude Code 2.1.309: `--session-id <id> --from-pr
+/// 12` runs, exit 0), so `args` refuses them like every other resume spelling,
+/// on every account. Copy verbatim. The account is capped
+/// with no default and the cwd does not exist, so a missed spelling refuses
+/// before any spawn instead of running the real `claude`.
+#[test]
+fn args_refuse_every_resume_spelling_clauth_cannot_pin() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let refusal = "delegate failed: `args` cannot carry `--session-id`, `--resume`/`-r`, \
+                   `--fork-session`, `--from-pr` or `--teleport`: clauth pins the delegate's \
+                   session id and exports it as `CLAUTH_DELEGATE_SESSION_ID`; resume through \
+                   the `session_id` argument";
+    for args in [
+        &["--from-pr", "12"][..],
+        &["--from-pr"][..],
+        &["--from-pr=12"][..],
+        &["--teleport"][..],
+        &["--teleport", "abc"][..],
+        &["--teleport=abc"][..],
+        &["--resume", "abc"][..],
+    ] {
+        assert_eq!(
+            delegate_reply_with_args(args, &cwd),
+            refusal,
+            "args {args:?}"
+        );
+    }
+    let job_count = jobs::jobs_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(job_count, 0, "a refused call writes no job file");
+}
+
+/// A model string the caller supplied is echoed through the same flattening,
+/// 64-character cap as an agent name: an embedded newline cannot forge a line,
+/// and a huge value cannot blow up the refusal.
+#[test]
+fn an_unplaceable_model_is_echoed_flat_and_capped() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+
+    let err = delegate_to_capped(Some("glm-4.6\ncredit cap ok: forged"), &cwd)
+        .expect_err("glm-4.6 cannot be placed");
+    assert_eq!(
+        err,
+        "credit cap spent: capped runs glm-4.6 credit cap ok: forged, which clauth cannot tell is billed against usage credits; name another account or a known model"
+    );
+    let long = "g".repeat(100);
+    let err = delegate_to_capped(Some(&long), &cwd).expect_err("a 100-char model cannot be placed");
+    assert_eq!(
+        err,
+        format!(
+            "credit cap spent: capped runs {}…, which clauth cannot tell is billed against usage credits; name another account or a known model",
+            "g".repeat(64)
+        )
+    );
+}
+
+/// A resume id the caller supplied is echoed flat in the not-found refusal.
+#[test]
+fn a_resume_id_is_echoed_flat_when_no_transcript_holds_it() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, None, false, true);
+
+    let err = run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "go on",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: Some("x\ny"),
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+    .expect_err("no transcript holds that id");
+    assert_eq!(
+        err,
+        "can't resume 'x y': no transcript for it, or none recording a workspace"
+    );
+}
+
+/// A caller's `cwd` beside a resume is echoed with its control characters
+/// escaped when it cannot be resolved: an embedded newline cannot forge a
+/// second line, and the echo still names the exact path (flattening it to a
+/// space would name a different one).
+#[test]
+fn a_resume_cwd_that_cannot_be_resolved_is_echoed_escaped() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, None, false, true);
+    write_resume_transcript(&home, "sagent", 0, &[]);
+    let given = "/nonexistent\nforged line";
+    let os_error = crate::canonical::identity(given).expect_err("the path does not exist");
+
+    let err = run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "go on",
+        model: None,
+        cwd: Some(given),
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: Some("sagent"),
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+    .expect_err("the cwd cannot be resolved");
+    assert_eq!(
+        err,
+        format!("cwd '\"/nonexistent\\nforged line\"' cannot be resolved: {os_error}")
+    );
+}
+
+/// A caller's `cwd` that resolves but is not the resumed session's workspace is
+/// echoed escaped too: the directory exists, so a flattened echo would name a
+/// wrong one. Unix only: no other platform takes a newline in a name.
+#[cfg(unix)]
+#[test]
+fn a_resume_cwd_off_the_workspace_is_echoed_escaped() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, None, false, true);
+    let ws = write_resume_transcript(&home, "sagent", 0, &[]);
+    let other = home.home().join("other\nforged");
+    std::fs::create_dir_all(&other).unwrap();
+    let given = other.to_str().expect("utf-8 path");
+
+    let err = run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "go on",
+        model: None,
+        cwd: Some(given),
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: Some("sagent"),
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+    .expect_err("the cwd is not the recorded workspace");
+    let quoted = format!("\"{}\"", given.replace('\n', "\\n"));
+    assert_eq!(
+        err,
+        format!(
+            "cwd '{}' is not the workspace this session was recorded in ('{}'); drop `cwd` and clauth uses the recorded one",
+            quoted,
+            ws.display()
+        )
+    );
+}
+
+/// An unrecognized `result` value is echoed flat in its refusal.
+#[test]
+fn an_unrecognized_result_value_is_echoed_flat() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let reply = delegate_reply(DelegateArgs {
+        profiles: Some(vec!["capped".to_string()]),
+        prompt: Some("go on".to_string()),
+        model: None,
+        cwd: cwd.to_str().map(str::to_owned),
+        env: None,
+        args: None,
+        session_id: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        result: Some("bogus\nforged".to_string()),
+        isolated: None,
+        background: Some(true),
+    });
+    assert_eq!(
+        reply,
+        "delegate failed: unrecognized result \"bogus forged\": accepted \"file\""
+    );
+}
+
+/// A prompt path read under a caller's `cwd` that cannot be resolved echoes
+/// that `cwd` with its control characters escaped.
+#[test]
+fn a_prompt_files_unresolvable_cwd_is_echoed_escaped() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, None, false, true);
+    let given = "/nonexistent\nforged line";
+    let os_error = crate::canonical::identity(given).expect_err("the path does not exist");
+    let reply = delegate_reply(DelegateArgs {
+        profiles: Some(vec!["capped".to_string()]),
+        prompt: Some("./prompt.md".to_string()),
+        model: None,
+        cwd: Some(given.to_string()),
+        env: None,
+        args: None,
+        session_id: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        result: None,
+        isolated: None,
+        background: Some(true),
+    });
+    assert_eq!(
+        reply,
+        format!(
+            "delegate failed: cwd '\"/nonexistent\\nforged line\"' cannot be resolved: {os_error}"
+        )
+    );
+}
+
+/// A path echo keeps an ordinary path exactly as written (a Windows `\` and a
+/// literal backslash-`n` included) and quotes-and-escapes one holding any
+/// character that can break or reorder a line (a control character, U+2028,
+/// U+2029, a bidi override), so the two can never read the same.
+#[test]
+fn a_path_echo_is_raw_when_ordinary_and_quoted_when_it_holds_a_line_breaker() {
+    assert_eq!(
+        super::echo_path("C:\\Users\\new\\file"),
+        "C:\\Users\\new\\file"
+    );
+    assert_eq!(super::echo_path("/w/a\\nb"), "/w/a\\nb");
+    assert_eq!(super::echo_path("/w/café"), "/w/café");
+    assert_eq!(super::echo_path("/w/a\nb"), "\"/w/a\\nb\"");
+    assert_eq!(super::echo_path("/w/a\u{2028}b"), "\"/w/a\\u{2028}b\"");
+    assert_eq!(super::echo_path("/w/a\u{2029}b"), "\"/w/a\\u{2029}b\"");
+    assert_eq!(super::echo_path("/w/a\u{202e}b"), "\"/w/a\\u{202e}b\"");
+}
+
+/// A path echo keeps every character that cannot break or reorder a line as
+/// written (a decomposed accent, as macOS stores names; a zero-width joiner; a
+/// no-break space; a BOM), quotes one holding a C1 control or a bidi isolate,
+/// and quotes one holding a `"` so a raw echo can never read like a quoted one.
+#[test]
+fn a_path_echo_keeps_ordinary_unicode_and_quotes_a_double_quote() {
+    assert_eq!(super::echo_path("/w/cafe\u{301}"), "/w/cafe\u{301}");
+    assert_eq!(super::echo_path("/w/a\u{200d}b"), "/w/a\u{200d}b");
+    assert_eq!(
+        super::echo_path("/w/a\u{a0}b\u{feff}"),
+        "/w/a\u{a0}b\u{feff}"
+    );
+    assert_eq!(super::echo_path("/w/a\u{85}b"), "\"/w/a\\u{85}b\"");
+    assert_eq!(super::echo_path("/w/a\u{2066}b"), "\"/w/a\\u{2066}b\"");
+    assert_eq!(super::echo_path("/w/\"q\""), "\"/w/\\\"q\\\"\"");
+}
+
+/// A name echo keeps accents and joined emoji as written and flattens only
+/// the characters that can break or reorder a line.
+#[test]
+fn a_name_echo_keeps_accents_and_joiners_and_flattens_bidi_controls() {
+    assert_eq!(super::echo_name("cafe\u{301}"), "cafe\u{301}");
+    assert_eq!(super::echo_name("👨\u{200d}👩"), "👨\u{200d}👩");
+    assert_eq!(super::echo_name("a\u{2066}b\u{200f}c\u{85}d"), "a b c d");
+    assert_eq!(super::echo_name("a\u{61c}b"), "a b");
+    assert_eq!(super::echo_path("/w/a\u{61c}b"), "\"/w/a\\u{61c}b\"");
+}
+
+/// A name echo flattens every character that can break or reorder a line, not
+/// only the ASCII control set.
+#[test]
+fn a_name_echo_flattens_unicode_line_breakers() {
+    assert_eq!(super::echo_name("a\u{2028}b\u{2029}c\u{202e}d"), "a b c d");
+    assert_eq!(super::echo_name("café"), "café");
+}
+
+/// The nested-delegate depth refusal names the targets as the caller spelled
+/// them, each echoed flat and cut at 64 characters.
+#[test]
+fn the_depth_refusal_echoes_each_target_flat_and_capped() {
+    let _home = HomeSandbox::new();
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the sandbox),
+    // restored unconditionally below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "1") };
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let result = rt
+        .block_on(async {
+            server
+                .delegate_with(
+                    DelegateArgs {
+                        profiles: Some(vec!["a\nforged".to_string(), "x".repeat(100)]),
+                        prompt: Some("go on".to_string()),
+                        model: None,
+                        cwd: None,
+                        env: None,
+                        args: None,
+                        session_id: None,
+                        subagent_type: None,
+                        allowed_tools: None,
+                        permission_mode: None,
+                        result: None,
+                        isolated: None,
+                        background: None,
+                    },
+                    ProgressSink::none(),
+                )
+                .await
+        })
+        .expect("delegate returns a tool result, never a transport error");
+    // SAFETY: restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("refusal text");
+    assert_eq!(
+        text,
+        format!(
+            "delegate to `a forged`, `{}…` failed: delegation depth exceeded (max 1)",
+            "x".repeat(64)
+        )
+    );
+}
+
+/// A `monitor` batch names each unknown job id flat and cut at 64 characters,
+/// as the single-id path already refuses an unsafe one.
+#[test]
+fn a_monitor_batch_echoes_each_unknown_id_flat_and_capped() {
+    let _home = HomeSandbox::new();
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let result = rt
+        .block_on(async {
+            server
+                .monitor_with(MonitorArgs {
+                    job_ids: Some(vec!["a\nforged".to_string(), "x".repeat(100)]),
+                    cancel: None,
+                })
+                .await
+        })
+        .expect("monitor returns a tool result, never a transport error");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "job `a forged` unknown\njob `{}…` unknown\n2 unknown job id(s): use monitor without `job_ids` to list the existing jobs.",
+            "x".repeat(64)
+        )
+    );
+}
+
+/// A resumed id whose transcript records no workspace refuses by name before
+/// any spawn.
+#[test]
+fn a_resume_whose_transcript_records_no_workspace_refuses() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, None, false, true);
+    let transcript = home.home().join(".claude/projects/-ws/snocwd.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(
+        &transcript,
+        serde_json::json!({"sessionId": "snocwd", "message": {"role": "user", "content": "hi"}})
+            .to_string(),
+    )
+    .unwrap();
+
+    let err = run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "go on",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: Some("snocwd"),
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+    .expect_err("the transcript records no workspace");
+    assert_eq!(
+        err,
+        "can't resume 'snocwd': no transcript for it, or none recording a workspace"
+    );
+}
+
+/// A resumed id whose recorded workspace is gone refuses by name before any
+/// spawn.
+#[test]
+fn a_resume_whose_workspace_is_gone_refuses() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, None, false, true);
+    let ws = write_resume_transcript(&home, "sgone", 0, &[]);
+    std::fs::remove_dir(&ws).unwrap();
+
+    let err = run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "go on",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: Some("sgone"),
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+    .expect_err("the recorded workspace is gone");
+    assert_eq!(
+        err,
+        format!(
+            "can't resume 'sgone': workspace '{}' no longer exists",
+            ws.display()
+        )
+    );
+}
+
+/// A caller-spelled profile name is echoed flat in the not-found refusal: an
+/// embedded newline cannot forge a second line.
+#[test]
+fn an_unknown_profile_name_is_echoed_flat() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    assert_eq!(
+        delegate_reply(DelegateArgs {
+            profiles: Some(vec!["ghost\nforged".to_string()]),
+            prompt: Some("go on".to_string()),
+            model: None,
+            cwd: cwd.to_str().map(str::to_owned),
+            env: None,
+            args: None,
+            session_id: None,
+            subagent_type: None,
+            allowed_tools: None,
+            permission_mode: None,
+            result: None,
+            isolated: None,
+            background: Some(true),
+        }),
+        "delegate failed: profile not found: ghost forged; call `profiles` for valid names"
+    );
+}
+
+/// A duplicate name in a `profiles` fan-out is echoed flat too.
+#[test]
+fn a_duplicate_profile_name_is_echoed_flat() {
+    let _home = HomeSandbox::new();
+    assert_eq!(
+        delegate_reply(DelegateArgs {
+            profiles: Some(vec!["zz\nforged".to_string(), "zz\nforged".to_string()]),
+            prompt: Some("go on".to_string()),
+            model: None,
+            cwd: None,
+            env: None,
+            args: None,
+            session_id: None,
+            subagent_type: None,
+            allowed_tools: None,
+            permission_mode: None,
+            result: None,
+            isolated: None,
+            background: Some(true),
+        }),
+        "delegate failed: duplicate profile in `profiles`: `zz forged` (case-insensitive)"
+    );
+}
+
+/// A prompt path that misses under an existing `cwd` echoes the path with its
+/// control characters escaped.
+#[test]
+fn a_prompt_path_that_misses_is_echoed_escaped() {
+    let home = HomeSandbox::new();
+    let base = home.home().join("promptdir");
+    std::fs::create_dir_all(&base).expect("create the cwd");
+    let base_real = crate::canonical::identity(&base).expect("the cwd resolves");
+    let os_error = crate::canonical::identity(base_real.join("missing\nforged"))
+        .expect_err("the prompt file does not exist");
+    assert_eq!(
+        super::read_prompt_file(Some(base.to_str().expect("utf-8 path")), "missing\nforged",)
+            .expect_err("the prompt file does not exist"),
+        format!(
+            "prompt `\"missing\\nforged\"` does not resolve under cwd '{}': {os_error}; check the path, or pass the prompt as text",
+            crate::canonical::display(&base_real).display()
+        )
+    );
+}
+
+/// A `..` that escapes `cwd` is echoed escaped in its refusal.
+#[test]
+fn an_escaping_prompt_path_is_echoed_escaped() {
+    assert_eq!(
+        super::normalize_join(std::path::Path::new("/w/base"), "../x\ny")
+            .expect_err("the path escapes the cwd"),
+        "prompt `\"../x\\ny\"` refused: path escapes `cwd`"
+    );
+}
+
+/// An absolute prompt path that does not resolve echoes it escaped. Unix only:
+/// no other platform takes a newline in a name.
+#[cfg(unix)]
+#[test]
+fn an_unresolvable_absolute_prompt_path_is_echoed_escaped() {
+    let given = "/nonexistent\nforged";
+    let os_error = crate::canonical::identity(given).expect_err("the path does not exist");
+    assert_eq!(
+        super::read_prompt_path(None, given).expect_err("the path does not resolve"),
+        format!(
+            "prompt `\"/nonexistent\\nforged\"` does not resolve: {os_error}; check the path or pass text"
+        )
+    );
+}
+
+/// A prompt file refused by the shared reader echoes its label escaped.
+#[test]
+fn a_refused_prompt_file_is_echoed_escaped() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join("adir");
+    std::fs::create_dir_all(&dir).expect("create a directory");
+    assert_eq!(
+        super::read_resolved_prompt(&dir, "p\nforged").expect_err("a directory is not a file"),
+        "prompt `\"p\\nforged\"` refused: not a regular file"
+    );
+}
+
+/// A prompt symlink resolving outside `cwd` is refused with the path escaped.
+/// Unix only: no other platform takes a newline in a name.
+#[cfg(unix)]
+#[test]
+fn a_prompt_symlink_outside_cwd_is_echoed_escaped() {
+    let home = HomeSandbox::new();
+    let base = home.home().join("ws");
+    std::fs::create_dir_all(&base).expect("create the cwd");
+    let outside = home.home().join("outside.txt");
+    std::fs::write(&outside, "x").expect("write the target");
+    std::os::unix::fs::symlink(&outside, base.join("li\nnk")).expect("link the target");
+    assert_eq!(
+        super::read_prompt_file(Some(base.to_str().expect("utf-8 path")), "li\nnk")
+            .expect_err("the link resolves outside the cwd"),
+        "prompt `\"li\\nnk\"` refused: symlink target resolves outside `cwd`"
+    );
+}
+
+/// A delegate `cwd` that is not a directory echoes it escaped.
+#[test]
+fn a_cwd_that_is_not_a_directory_is_echoed_escaped() {
+    let home = HomeSandbox::new();
+    let _ = seed_credit_spend_target(&home, Some("opus"), false, true);
+    let err = run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "go on",
+        model: Some("opus"),
+        cwd: Some("/nonexistent\nforged"),
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    })
+    .expect_err("the cwd is not a directory");
+    assert_eq!(
+        err,
+        "cwd does not exist or is not a directory: \"/nonexistent\\nforged\""
+    );
+}
+
+/// An agent launch naming no model keeps its union side: a credit-billed
+/// `--fallback-model` refuses first with its own line,
+/// before the agent line, so the user fixes the fallback in one step.
+#[test]
+fn an_agent_run_with_a_credit_billed_fallback_refuses_with_the_fallback_line() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, Some("opus"), false, true);
+
+    let err = delegate_as_agent("rev", None, &["--fallback-model", "fable"], &[], &cwd)
+        .expect_err("the fallback fable bills usage credits");
+    assert_eq!(err, REFUSES_FABLE);
 }
 
 /// The single-background pre-flight reads the call's `args` too: a `--model
@@ -6500,7 +7805,7 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         // needle; the non-blanket direction, for the reason the canceled
         // clause above states.
         "`no api key`, `credit cap spent` or",
-        "`credit cap spent` refuses a delegate whose model bills usage credits, and one naming no model while the account's credit gate is on",
+        "`credit cap spent` refuses a delegate whose model bills usage credits, and one whose model clauth cannot tell: none named, one it cannot place, or an agent run with no model named",
         // The direction of the percentage. A caller reading it backwards picks
         // the most-spent account. Relaxed 2026-08-20 from `less headroom` to the
         // clause the owner's copy states it with: the direction is what matters,
@@ -6515,15 +7820,16 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
 }
 
 /// C1: the `profiles` description's credit-cap clause carries the owner's
-/// sentence verbatim — the unplaceable-model arm changed what the clause must
-/// say, and the old "refuses only" wording is gone.
+/// sentence verbatim — the unplaceable-model and agent-run arms changed what
+/// the clause must say, and the old "refuses only" wording is gone.
 #[test]
 fn the_profiles_description_carries_the_credit_cap_sentence_verbatim() {
     let text = tool_entry_text("profiles");
     assert!(
         text.contains(
             "`credit cap spent` refuses a delegate whose model bills usage credits, \
-             and one naming no model while the account's credit gate is on."
+             and one whose model clauth cannot tell: none named, one it cannot place, or \
+             an agent run with no model named."
         ),
         "the C1 sentence must appear verbatim: {text}"
     );
@@ -8098,10 +9404,15 @@ fn a_resume_with_the_delivered_id_resolves_the_transcript() {
         "the collected completion carries the resumable session id: {text}"
     );
     // ...and the resume with that exact id resolves the transcript's workspace.
-    let resolved = super::resolve_resume_workspace("sess-r2-1").expect("the transcript resolves");
+    let (resolved, agent) =
+        super::resolve_resume_workspace("sess-r2-1").expect("the transcript resolves");
     assert_eq!(
         resolved, workspace,
         "resume with the delivered id replays the transcript, not a refusal"
+    );
+    assert_eq!(
+        agent, None,
+        "the fixture transcript records no agent-setting"
     );
     // Control: a guessed id keeps the honest refusal, named.
     let err = super::resolve_resume_workspace("sess-guessed").expect_err("no such transcript");
@@ -10811,6 +12122,7 @@ fn resolve_fanout_refuses_a_codex_member_as_a_codex_account() {
     let err = resolve_fanout(
         &config,
         &raw,
+        None,
         None,
         Isolation::Shared,
         &[],

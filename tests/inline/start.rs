@@ -1845,3 +1845,420 @@ fn an_isolated_background_start_stays_first_on_a_copy_host() {
     );
     assert_eq!(fake.spawns(), Vec::new(), "nothing spawned");
 }
+
+// ── the agent demand without a def reader ────────────────────────────────
+
+#[test]
+fn parsed_agent_arg_reads_both_spellings_and_the_last_wins() {
+    assert_eq!(
+        parsed_agent_arg(&["--agent".to_owned(), "rev".to_owned()]),
+        Some("rev".to_owned())
+    );
+    assert_eq!(
+        parsed_agent_arg(&["--agent=rev".to_owned()]),
+        Some("rev".to_owned())
+    );
+    assert_eq!(
+        parsed_agent_arg(&[
+            "--agent=first".to_owned(),
+            "--agent".to_owned(),
+            "last".to_owned(),
+        ]),
+        Some("last".to_owned()),
+        "the last --agent wins"
+    );
+    assert_eq!(parsed_agent_arg(&["--agent=".to_owned()]), None);
+    assert_eq!(
+        parsed_agent_arg(&["--agent".to_owned(), "".to_owned()]),
+        None,
+        "a blank separate-arg value is absent"
+    );
+    assert_eq!(
+        parsed_agent_arg(&[
+            "--agent".to_owned(),
+            "rev".to_owned(),
+            "--agent".to_owned(),
+            "".to_owned(),
+        ]),
+        Some("rev".to_owned()),
+        "a blank never clears an earlier flag"
+    );
+    assert_eq!(parsed_agent_arg(&["-p".to_owned(), "hi".to_owned()]), None);
+}
+
+/// An agent launch naming no model is an unknown demand: the resolver never
+/// opens an agent def.
+#[test]
+fn an_agent_run_naming_no_model_is_an_unknown_demand() {
+    let _home = HomeSandbox::new();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &["--agent".to_owned(), "rev".to_owned()],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.agent_without_model.as_deref(), Some("rev"));
+    assert!(demand.models.is_empty(), "{:?}", demand.models);
+}
+
+// ── a resumed/continued session runs its transcript's agent ──────────────
+
+fn write_resume_transcript(home: &std::path::Path, id: &str, cwd: &str, agents: &[&str]) {
+    write_resume_transcript_padded(home, id, 0, cwd, agents);
+}
+
+/// The same transcript with `pad` ~1 KiB filler user lines between the first
+/// line and the agent records, so a record can sit past a bounded head window.
+fn write_resume_transcript_padded(
+    home: &std::path::Path,
+    id: &str,
+    pad: usize,
+    cwd: &str,
+    agents: &[&str],
+) {
+    let dir = home.join(".claude/projects/-w-res");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut lines = vec![
+        serde_json::json!({
+            "sessionId": id,
+            "cwd": cwd,
+            "message": {"role": "user", "content": "hi"},
+        })
+        .to_string(),
+    ];
+    let filler = "f".repeat(1024);
+    for _ in 0..pad {
+        lines.push(
+            serde_json::json!({"sessionId": id, "cwd": cwd, "message": {"role": "user", "content": filler}})
+                .to_string(),
+        );
+    }
+    for a in agents {
+        lines.push(
+            serde_json::json!({"type": "agent-setting", "agentSetting": a, "sessionId": id})
+                .to_string(),
+        );
+    }
+    std::fs::write(dir.join(format!("{id}.jsonl")), lines.join("\n")).unwrap();
+}
+
+/// `--resume <id>` reads the transcript's LAST `agent-setting` record, so the
+/// session resumes as that agent.
+#[test]
+fn resumed_agent_reads_the_transcripts_last_agent_setting() {
+    let sb = HomeSandbox::new();
+    write_resume_transcript(sb.home(), "sagent", "/w/res", &["old", "pa"]);
+    assert_eq!(
+        resumed_agent(&["--resume".to_owned(), "sagent".to_owned()]),
+        ResumedAgent::Agent("pa".to_owned()),
+        "the last agent-setting record names the resumed agent"
+    );
+}
+
+/// An explicit `--agent` outranks the resumed session's agent: the transcript
+/// is never read, and the resolver names the explicit agent.
+#[test]
+fn an_explicit_agent_outranks_a_resumed_sessions_agent() {
+    let sb = HomeSandbox::new();
+    write_resume_transcript(sb.home(), "sagent", "/w/res", &["pa"]);
+    assert_eq!(
+        resumed_agent(&[
+            "--resume".to_owned(),
+            "sagent".to_owned(),
+            "--agent".to_owned(),
+            "rev".to_owned(),
+        ]),
+        ResumedAgent::NotResumed,
+        "an explicit --agent keeps the transcript unread"
+    );
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &[
+            "--resume".to_owned(),
+            "sagent".to_owned(),
+            "--agent".to_owned(),
+            "rev".to_owned(),
+        ],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.agent_without_model.as_deref(), Some("rev"));
+}
+
+/// Every resume form whose transcript clauth cannot pin is unknown, so the
+/// caller treats it as an agent launch naming no model — whatever the store
+/// holds. A `--continue` names no transcript at all here: Claude Code picks the
+/// cwd's newest conversation, which clauth never mirrors.
+#[test]
+fn a_continue_and_every_unpinnable_resume_form_fail_closed() {
+    let sb = HomeSandbox::new();
+    let args = |form: &[&str]| form.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        resumed_agent(&args(&["--continue"])),
+        ResumedAgent::Unknown,
+        "an empty store pins no continue"
+    );
+    write_resume_transcript(sb.home(), "scont", "/w/res", &["pa"]);
+    for form in [
+        &["--continue"][..],
+        &["-c"][..],
+        &["--resume"][..],
+        &["--resume", "--verbose"][..],
+        &["--resume", "probename"][..],
+        &["-r", "probename"][..],
+        &["--from-pr"][..],
+        &["--from-pr", "12"][..],
+    ] {
+        assert_eq!(
+            resumed_agent(&args(form)),
+            ResumedAgent::Unknown,
+            "{form:?} cannot be pinned to a transcript"
+        );
+    }
+}
+
+/// A non-UTF-8 line is one bad record: the whole-transcript agent scan skips it
+/// and keeps reading, so a record after it still names the resumed agent.
+#[test]
+fn a_non_utf8_line_does_not_stop_the_agent_scan() {
+    let sb = HomeSandbox::new();
+    let dir = sb.home().join(".claude/projects/-w-res");
+    fs::create_dir_all(&dir).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(
+        serde_json::json!({
+            "sessionId": "sbad",
+            "cwd": "/w/res",
+            "message": {"role": "user", "content": "hi"},
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"\xff\xfe not utf8\n");
+    bytes.extend_from_slice(
+        serde_json::json!({"type": "agent-setting", "agentSetting": "pa", "sessionId": "sbad"})
+            .to_string()
+            .as_bytes(),
+    );
+    fs::write(dir.join("sbad.jsonl"), bytes).unwrap();
+    assert_eq!(
+        resumed_agent(&["--resume".to_owned(), "sbad".to_owned()]),
+        ResumedAgent::Agent("pa".to_owned()),
+        "the record after the bad line still names the agent"
+    );
+}
+
+/// `-r` as the last token is a bare resume (no value), which is unpinnable: a
+/// token starting with `-` is never a resume value.
+#[test]
+fn a_bare_resume_short_flag_at_the_end_is_unpinnable() {
+    let _sb = HomeSandbox::new();
+    assert_eq!(
+        resumed_agent(&["-r".to_owned()]),
+        ResumedAgent::Unknown,
+        "a trailing -r takes no value"
+    );
+}
+
+/// The equals spelling of an exact-id resume pins the transcript like the
+/// spaced one, and scans the WHOLE transcript: a record past any bounded head
+/// window still makes it an agent launch.
+#[test]
+fn an_equals_spelling_resume_scans_the_whole_transcript() {
+    let sb = HomeSandbox::new();
+    write_resume_transcript_padded(sb.home(), "sagent", 300, "/w/res", &["pa"]);
+    assert_eq!(
+        resumed_agent(&["--resume=sagent".to_owned()]),
+        ResumedAgent::Agent("pa".to_owned())
+    );
+}
+
+/// An unpinnable resume recording no model keeps its union side on the recorded
+/// launch families — `--fallback-model fable` here — and never the settings or
+/// env headline: clauth cannot tell which model the un-pinned transcript runs.
+#[test]
+fn an_unpinnable_resume_records_its_union_families_not_the_headline() {
+    let _home = HomeSandbox::new();
+    let p = Profile::new("blank".to_string(), None, None);
+    let families = launch_families_for(
+        &p,
+        Isolation::Shared,
+        &[],
+        &["--fallback-model".to_owned(), "fable".to_owned()],
+        &ResumedAgent::Unknown,
+        false,
+        None,
+        &[Some("opus".to_owned()), None],
+    );
+    assert_eq!(
+        families,
+        vec!["fable".to_owned()],
+        "the union side is recorded, the unknown headline is not"
+    );
+}
+
+/// An agent launch records its union side: the agent's own model is unknown
+/// (clauth reads no def), so the launch is recorded on its `--fallback-model`
+/// and never on the process env's model.
+#[test]
+fn an_agent_launch_records_its_fallback_not_the_env_headline() {
+    let _home = HomeSandbox::new();
+    let p = Profile::new("blank".to_string(), None, None);
+    let families = launch_families_for(
+        &p,
+        Isolation::Shared,
+        &[],
+        &["--fallback-model".to_owned(), "fable".to_owned()],
+        &ResumedAgent::Agent("pa".to_owned()),
+        false,
+        None,
+        &[Some("opus".to_owned()), None],
+    );
+    assert_eq!(
+        families,
+        vec!["fable".to_owned()],
+        "the union side is recorded, the env headline is not"
+    );
+}
+
+/// A short-flag cluster: a glued `-r<id>` is an exact-id resume Claude Code
+/// opens (`-r<uuid>` resumes), while `-r=<id>` hands it the value `=<id>` and a
+/// `c` in the cluster is `--continue`. The first pins an agent session, the
+/// other two are unpinnable.
+#[test]
+fn a_short_flag_cluster_glues_its_resume_value_or_continues() {
+    let sb = HomeSandbox::new();
+    write_resume_transcript(sb.home(), "sagent", "/w/res", &["pa"]);
+    let args = |form: &[&str]| form.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        resumed_agent(&args(&["-rsagent"])),
+        ResumedAgent::Agent("pa".to_owned()),
+        "the glued tail is the resume id"
+    );
+    for form in [&["-r=sagent"][..], &["-cv"][..]] {
+        assert_eq!(
+            resumed_agent(&args(form)),
+            ResumedAgent::Unknown,
+            "{form:?} cannot be pinned to a transcript"
+        );
+    }
+}
+/// A def file and a subscription env model change nothing: clauth reads no def,
+/// so a def's model never reaches the demand and it stays unknown.
+#[test]
+fn a_def_file_never_steers_an_agent_run() {
+    let home = HomeSandbox::new();
+    let agents = home.home().join(".claude").join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    fs::write(
+        agents.join("rev.md"),
+        "---\nname: rev\ndescription: d\nmodel: fable\n---\nYou review.\n",
+    )
+    .unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &["--agent".to_owned(), "rev".to_owned()],
+        None,
+        EnvLeg::Caller,
+        None,
+        |k| {
+            if k == "ANTHROPIC_MODEL" {
+                Some("opus".to_owned())
+            } else {
+                None
+            }
+        },
+    );
+    assert_eq!(demand.agent_without_model.as_deref(), Some("rev"));
+    assert!(
+        demand.models.is_empty(),
+        "no def is read: even a fable def and an opus env are unknown: {:?}",
+        demand.models
+    );
+}
+
+/// A settings `agent` key with an empty string is absent, never an agent run.
+#[test]
+fn a_blank_settings_agent_value_is_ignored() {
+    let _home = HomeSandbox::new();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &["--settings".to_owned(), r#"{"agent":""}"#.to_owned()],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.agent_without_model, None);
+}
+
+/// The isolated runtime's overlay holds no agent key: the sandbox user
+/// `settings.json` agent is ignored there.
+#[test]
+fn an_isolated_runtime_ignores_the_user_settings_agent_key() {
+    let home = HomeSandbox::new();
+    fs::create_dir_all(home.home().join(".claude")).unwrap();
+    fs::write(
+        home.home().join(".claude").join("settings.json"),
+        r#"{"agent":"rev"}"#,
+    )
+    .unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Isolated,
+        &[],
+        &[],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(
+        demand.agent_without_model, None,
+        "the isolated overlay holds no agent key"
+    );
+}
+
+/// The shared runtime's overlay reads the user settings `agent` key, which
+/// makes an agent run with no named model.
+#[test]
+fn an_overlay_settings_agent_key_is_the_sessions_agent() {
+    let home = HomeSandbox::new();
+    fs::create_dir_all(home.home().join(".claude")).unwrap();
+    fs::write(
+        home.home().join(".claude").join("settings.json"),
+        r#"{"agent":"rev"}"#,
+    )
+    .unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &[],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.agent_without_model.as_deref(), Some("rev"));
+    assert!(demand.models.is_empty());
+}

@@ -6055,7 +6055,7 @@ fn unlink_link(path: &Path, label: &str) {
 /// live `~/.claude/settings.json` under shared isolation, none under isolated
 /// (the overlay starts from `{}`). One helper for both the runtime write
 /// ([`write_merged_settings`]) and the start demand's derived model read
-/// ([`crate::start::member_launch_models`]), so the two cannot drift on which
+/// ([`crate::start::member_launch_demand`]), so the two cannot drift on which
 /// isolation keeps the global settings.
 pub(crate) fn settings_base(claude_home: &Path, isolation: Isolation) -> Option<PathBuf> {
     match isolation {

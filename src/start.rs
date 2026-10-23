@@ -166,7 +166,7 @@ pub(crate) fn admit<'a>(
 
 /// The process-env model overrides a launcher can inherit, in pair order: the
 /// headline model, then the subagent model. The pair order is the contract
-/// between [`process_model_env`] and [`member_launch_models`]' scrub filter, so
+/// between [`process_model_env`] and [`member_launch_demand`]'s scrub filter, so
 /// reading and filtering cannot drift.
 const PROCESS_MODEL_ENV_KEYS: [&str; 2] = ["ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"];
 
@@ -178,7 +178,7 @@ pub(crate) fn process_model_env() -> [Option<String>; 2] {
     PROCESS_MODEL_ENV_KEYS.map(|key| std::env::var(key).ok())
 }
 
-/// The `env_of` reader for [`member_launch_models`]: maps a model env key to
+/// The `env_of` reader for [`member_launch_demand`]: maps a model env key to
 /// its slot in the process-env pair, so the start and fallback paths pass one
 /// closure instead of each writing the match.
 pub(crate) fn process_model_env_of(
@@ -245,18 +245,26 @@ pub(crate) fn parsed_model_args(claude_args: &[String]) -> (Option<String>, Vec<
     (headline, fallbacks)
 }
 
-/// The model strings one chain member's session may run, by Claude Code's own
-/// precedence:
+/// The model strings a launch may run, plus the agent name a launch named with
+/// no model to decide the headline. clauth reads no agent def, so such a launch
+/// is an unknown demand, which the delegate pre-flight renders with its own
+/// copy and the `--auto` walk renders as the unknown-demand rung.
+#[derive(Debug)]
+pub(crate) struct LaunchDemand {
+    pub(crate) models: Vec<String>,
+    pub(crate) agent_without_model: Option<String>,
+}
+
+/// The model strings one chain member's session may run:
 ///
-/// - the HEADLINE is exactly one model: the last `--model` in `claude_args`,
-///   else the delegate's `model`, else `ANTHROPIC_MODEL` as the child sees it
-///   (settings `env` applied over an inherited/caller value), else the settings
-///   `model` by source precedence (a `--settings <file|json>` passthrough, then
-///   project-local `.claude/settings.local.json`, then project
-///   `.claude/settings.json`, then the runtime overlay; the project sources are
-///   skipped where `cwd` is the real `$HOME`, and each is read only when a
-///   `--setting-sources` list names its tier);
-/// - UNIONED beside it: the overlay's `fallbackModel` entries, every
+/// - a named model (the last `--model` in `claude_args`, else the delegate's
+///   `model`) decides the headline and the agent is irrelevant;
+/// - else, an agent (the last `--agent`, else the settings `agent` key by tier:
+///   `--settings` passthrough > project > overlay) with no named model makes
+///   the HEADLINE unknown: clauth reads no agent def, so the model the agent
+///   runs cannot be told, while the union side stays in the demand;
+/// - else the session's own model is the headline;
+/// - UNIONED beside the headline: the overlay's `fallbackModel` entries, every
 ///   `--fallback-model` value, and `CLAUDE_CODE_SUBAGENT_MODEL` as the child
 ///   sees it (passthrough env, else project env, else overlay env, else
 ///   inherited/caller where it survives);
@@ -274,7 +282,7 @@ pub(crate) fn parsed_model_args(claude_args: &[String]) -> (Option<String>, Vec<
 /// model env key; the `env_leg` decides whether that value survives the scrub
 /// into the child.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn member_launch_models(
+pub(crate) fn member_launch_demand(
     profile: &Profile,
     isolation: Isolation,
     stale_env_keys: &[String],
@@ -283,7 +291,60 @@ pub(crate) fn member_launch_models(
     env_leg: EnvLeg,
     cwd: Option<&Path>,
     env_of: impl Fn(&str) -> Option<String>,
+) -> LaunchDemand {
+    member_launch_demand_with(
+        profile,
+        isolation,
+        stale_env_keys,
+        claude_args,
+        delegate_model,
+        env_leg,
+        cwd,
+        env_of,
+        false,
+    )
+}
+
+/// The union-side models alone of a launch whose HEADLINE clauth cannot tell: an
+/// unpinnable resume, which runs whatever model the transcript clauth could not
+/// pin names. Same sources and alias remap as a model-less agent launch, minus
+/// the agent name (none is known).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn member_launch_unknown_headline_models(
+    profile: &Profile,
+    isolation: Isolation,
+    stale_env_keys: &[String],
+    claude_args: &[String],
+    env_leg: EnvLeg,
+    cwd: Option<&Path>,
+    env_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
+    member_launch_demand_with(
+        profile,
+        isolation,
+        stale_env_keys,
+        claude_args,
+        None,
+        env_leg,
+        cwd,
+        env_of,
+        true,
+    )
+    .models
+}
+
+#[allow(clippy::too_many_arguments)]
+fn member_launch_demand_with(
+    profile: &Profile,
+    isolation: Isolation,
+    stale_env_keys: &[String],
+    claude_args: &[String],
+    delegate_model: Option<&str>,
+    env_leg: EnvLeg,
+    cwd: Option<&Path>,
+    env_of: impl Fn(&str) -> Option<String>,
+    unknown_headline: bool,
+) -> LaunchDemand {
     let base = crate::profile::claude_dir()
         .ok()
         .and_then(|home| crate::runtime::settings_base(&home, isolation));
@@ -292,6 +353,12 @@ pub(crate) fn member_launch_models(
     let project = project_model_sources(cwd, claude_args);
 
     let (arg_model, arg_fallbacks) = parsed_model_args(claude_args);
+    let named_model = arg_model.or_else(|| {
+        delegate_model
+            .filter(|m| !m.trim().is_empty())
+            .map(|m| m.to_owned())
+    });
+
     let mut union = overlay.fallbacks.clone();
     union.extend(arg_fallbacks);
     let survives = |key: &str| match env_leg {
@@ -313,21 +380,250 @@ pub(crate) fn member_launch_models(
         .clone()
         .or_else(|| project.model.clone())
         .or_else(|| overlay.model.clone());
-    let headline = arg_model
-        .or_else(|| {
-            delegate_model
-                .filter(|m| !m.trim().is_empty())
-                .map(|m| m.to_owned())
-        })
-        .or_else(|| child_env(PROCESS_MODEL_ENV_KEYS[0]))
-        .or(settings_model);
+    let session_model = child_env(PROCESS_MODEL_ENV_KEYS[0]).or(settings_model);
 
-    let mut out = launch_models_from(union, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
-    if let Some(m) = headline {
-        out.insert(0, m);
+    let mut models: Vec<String>;
+    let mut agent_without_model: Option<String> = None;
+    if let Some(named) = named_model {
+        // A named model decides the headline; the agent (named or not) is
+        // irrelevant.
+        models = launch_models_from(union, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        models.insert(0, named);
+        remap_model_aliases(&mut models, &child_env);
+    } else if unknown_headline {
+        // The transcript clauth could not pin names the headline, so only the
+        // union side is known — the shape a model-less agent launch resolves.
+        models = launch_models_from(union, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        remap_model_aliases(&mut models, &child_env);
+    } else if let Some(agent) = parsed_agent_arg(claude_args).or_else(|| {
+        passthrough
+            .agent
+            .clone()
+            .or_else(|| project.agent.clone())
+            .or_else(|| overlay.agent.clone())
+    }) {
+        // clauth reads no agent def: the agent's model is
+        // the unknown HEADLINE. The union side stays in `models` so the delegate
+        // pre-flight refuses a credit-billed union family first, and
+        // `launch_families` still records the union families.
+        agent_without_model = Some(agent);
+        models = launch_models_from(union, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        remap_model_aliases(&mut models, &child_env);
+    } else {
+        models = launch_models_from(union, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        if let Some(session) = session_model {
+            models.insert(0, session);
+        }
+        remap_model_aliases(&mut models, &child_env);
     }
-    remap_model_aliases(&mut out, &child_env);
-    out
+    LaunchDemand {
+        models,
+        agent_without_model,
+    }
+}
+
+/// The last `--agent` value in the args, both spellings. A blank value is
+/// absent (mirrors [`parsed_model_args`]): it never clears an earlier flag.
+pub(crate) fn parsed_agent_arg(claude_args: &[String]) -> Option<String> {
+    let mut agent = None;
+    let mut args = claude_args.iter();
+    while let Some(a) = args.next() {
+        if let Some(v) = a.strip_prefix("--agent=")
+            && !v.trim().is_empty()
+        {
+            agent = Some(v.to_owned());
+        } else if a == "--agent"
+            && let Some(v) = args.next()
+            && !v.trim().is_empty()
+        {
+            agent = Some(v.clone());
+        }
+    }
+    agent
+}
+
+/// The agent a resume launch runs, as far as clauth can pin it. An exact-id
+/// resume (`--resume <id>`, `--resume=<id>`, `-r <id>`, `-r<id>`) whose value
+/// [`crate::sessions::find_session_top_level`] finds scans that whole
+/// transcript: Claude Code re-runs its last `agent-setting` agent, so the launch
+/// is an agent launch. Every other resume form — `--continue`/`-c`, a bare
+/// `--resume` (a following flag is no value), a session name rather than an id,
+/// an id with no top-level transcript here, `-r=<id>` (Claude Code receives the
+/// value `=<id>`), `--from-pr`, `--teleport`, `--cloud` — leaves clauth unable
+/// to say which transcript runs, and any one of them present makes the launch
+/// unpinnable. An explicit `--agent` in the args outranks the transcript, so the
+/// transcript is never read then.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ResumedAgent {
+    NotResumed,
+    Agent(String),
+    /// A resume form clauth cannot pin to a transcript: the caller fails closed
+    /// as an agent launch naming no model when no model is named.
+    Unknown,
+}
+
+pub(crate) fn resumed_agent(claude_args: &[String]) -> ResumedAgent {
+    if parsed_agent_arg(claude_args).is_some() {
+        return ResumedAgent::NotResumed;
+    }
+    let (values, unpinnable) = resume_forms(claude_args);
+    if unpinnable {
+        return ResumedAgent::Unknown;
+    }
+    let mut pinned = None;
+    for value in values {
+        match crate::sessions::find_session_top_level(value.trim()) {
+            Some(session) => pinned = Some(session),
+            None => return ResumedAgent::Unknown,
+        }
+    }
+    match pinned.and_then(|session| session.agent()) {
+        Some(agent) => ResumedAgent::Agent(agent),
+        None => ResumedAgent::NotResumed,
+    }
+}
+
+/// Every resume form in the args: the exact-id values given (`--resume <v>`,
+/// `--resume=<v>`, `-r <v>`, `-r<v>`), and whether any form clauth cannot pin
+/// is present (`--continue`/`-c`, `--from-pr`, `--teleport`, `--cloud`, a bare
+/// `--resume` with no value or a `-`-prefixed token beside it, `-r=<v>`, whose
+/// `=` the short-option spelling hands Claude Code as part of the value). A
+/// value-taking `-r` in a short-flag cluster consumes the rest of its own token,
+/// else the next token; a `c` in the same cluster is `--continue` with getopt
+/// semantics.
+fn resume_forms(claude_args: &[String]) -> (Vec<&str>, bool) {
+    let mut values = Vec::new();
+    let mut unpinnable = false;
+    let mut i = 0;
+    while i < claude_args.len() {
+        let arg = claude_args[i].as_str();
+        if let Some(value) = arg.strip_prefix("--resume=") {
+            values.push(value);
+        } else if arg == "--resume" {
+            // A token starting with `-` is a flag, never a resume value
+            // (`--resume --verbose` is a bare `--resume`).
+            match claude_args.get(i + 1).filter(|v| !v.starts_with('-')) {
+                Some(value) => {
+                    values.push(value.as_str());
+                    i += 1;
+                }
+                None => unpinnable = true,
+            }
+        } else if arg == "--continue"
+            || arg == "--from-pr"
+            || arg.starts_with("--from-pr=")
+            || arg == "--teleport"
+            || arg.starts_with("--teleport=")
+            || arg == "--cloud"
+            || arg.starts_with("--cloud=")
+        {
+            unpinnable = true;
+        } else if let Some(shorts) = arg.strip_prefix('-').filter(|s| !s.starts_with('-')) {
+            match shorts.char_indices().find(|&(_, c)| c == 'r') {
+                Some((at, _)) => {
+                    // The glued value is taken literally, `=` included: Claude
+                    // Code's short-option parser hands `-r=x` the value `=x`.
+                    let rest = &shorts[at + 1..];
+                    if !rest.is_empty() {
+                        values.push(rest);
+                    } else {
+                        match claude_args.get(i + 1).filter(|v| !v.starts_with('-')) {
+                            Some(value) => {
+                                values.push(value.as_str());
+                                i += 1;
+                            }
+                            None => unpinnable = true,
+                        }
+                    }
+                    if shorts[..at].contains('c') {
+                        unpinnable = true;
+                    }
+                }
+                None if shorts.contains('c') => unpinnable = true,
+                None => {}
+            }
+        }
+        i += 1;
+    }
+    (values, unpinnable)
+}
+
+/// The model strings alone of [`member_launch_demand`]: what a call site that
+/// only records the resolved families (the launch row) needs, without the agent
+/// name.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn member_launch_models(
+    profile: &Profile,
+    isolation: Isolation,
+    stale_env_keys: &[String],
+    claude_args: &[String],
+    delegate_model: Option<&str>,
+    env_leg: EnvLeg,
+    cwd: Option<&Path>,
+    env_of: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    member_launch_demand(
+        profile,
+        isolation,
+        stale_env_keys,
+        claude_args,
+        delegate_model,
+        env_leg,
+        cwd,
+        env_of,
+    )
+    .models
+}
+
+/// The model families a start records on its session row: what
+/// [`member_launch_models`] resolves, except that an unpinnable resume naming
+/// no model records its union side alone
+/// ([`member_launch_unknown_headline_models`]) — the transcript's headline is
+/// unknown, so a settings or env model is never recorded as the model this
+/// launch ran. An exact-id resume's agent is folded into the demand as
+/// `--agent`, the same fold the `--auto` walk makes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_families_for(
+    profile: &Profile,
+    isolation: Isolation,
+    stale_env_keys: &[String],
+    claude_args: &[String],
+    resumed: &ResumedAgent,
+    named_model: bool,
+    spawn_cwd: Option<&Path>,
+    env_models: &[Option<String>; 2],
+) -> Vec<String> {
+    let env_of = process_model_env_of(env_models);
+    if matches!(resumed, ResumedAgent::Unknown) && !named_model {
+        return crate::fallback::demand_from(member_launch_unknown_headline_models(
+            profile,
+            isolation,
+            stale_env_keys,
+            claude_args,
+            EnvLeg::Process,
+            spawn_cwd,
+            env_of,
+        ));
+    }
+    let mut folded;
+    let demand_args: &[String] = match resumed {
+        ResumedAgent::Agent(name) => {
+            folded = claude_args.to_vec();
+            folded.extend_from_slice(&["--agent".to_owned(), name.clone()]);
+            &folded
+        }
+        _ => claude_args,
+    };
+    crate::fallback::demand_from(member_launch_models(
+        profile,
+        isolation,
+        stale_env_keys,
+        demand_args,
+        None,
+        EnvLeg::Process,
+        spawn_cwd,
+        env_of,
+    ))
 }
 
 /// Substitute a member's `[models]` alias remap for any demand string that
@@ -484,6 +780,9 @@ fn project_model_sources(
         let src = crate::claude::model_sources_from_json(&settings);
         if out.model.is_none() {
             out.model = src.model;
+        }
+        if out.agent.is_none() {
+            out.agent = src.agent;
         }
         if out.env_anthropic.is_none() {
             out.env_anthropic = src.env_anthropic;
@@ -691,17 +990,19 @@ pub(crate) fn run(
     // post-spawn flock hold covers only the field writes: the row's update
     // below takes the state flock, and the demand must name what this launch
     // actually ran.
+    let resumed = resumed_agent(claude_args);
+    let named_model = parsed_model_args(claude_args).0.is_some();
     let env_models = process_model_env();
-    let launch_families = crate::fallback::demand_from(member_launch_models(
+    let launch_families = launch_families_for(
         profile,
         isolation,
         &stale_env_keys,
         claude_args,
-        None,
-        EnvLeg::Process,
+        &resumed,
+        named_model,
         spawn_cwd.as_deref(),
-        process_model_env_of(&env_models),
-    ));
+        &env_models,
+    );
     let mut child = command.spawn().context("failed to spawn claude")?;
     // Record the child's pid and the launch demand's resolved families on the
     // row once the child exists: the daemon's spend-cap decision leg joins a

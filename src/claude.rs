@@ -2977,13 +2977,16 @@ pub(crate) fn claude_settings_env_keys() -> Result<Vec<String>> {
 /// the top-level `model` and `env.ANTHROPIC_MODEL` are headline candidates a
 /// `--model` flag or an explicit `model` argument replaces, while the
 /// `fallbackModel` entries and `env.CLAUDE_CODE_SUBAGENT_MODEL` are unioned into
-/// the demand whatever the headline. The four `ANTHROPIC_DEFAULT_*_MODEL` keys
+/// the demand whatever the headline; the top-level `agent` names the session's
+/// agent, the settings-tier leg of the agent chain. The four
+/// `ANTHROPIC_DEFAULT_*_MODEL` keys
 /// carry the `[models]` alias remap, read here so the remap resolves what the
 /// child actually sees. Read off the SAME overlay `build_claude_settings_json`
 /// writes, so the two cannot drift on the builder or base choice.
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeModelSources {
     pub(crate) model: Option<String>,
+    pub(crate) agent: Option<String>,
     pub(crate) fallbacks: Vec<String>,
     pub(crate) env_anthropic: Option<String>,
     pub(crate) env_subagent: Option<String>,
@@ -3012,13 +3015,18 @@ impl RuntimeModelSources {
 }
 
 /// The model slots a settings object carries, read off the keys Claude Code
-/// itself reads: top-level `model`, `fallbackModel`, and the model `env` keys.
-/// Shared by the overlay reader, the project settings tiers and the
+/// itself reads: top-level `model`, `agent`, `fallbackModel`, and the model
+/// `env` keys. Shared by the overlay reader, the project settings tiers and the
 /// `--settings` passthrough tier, so the three fold the same keys.
 pub(crate) fn model_sources_from_json(settings: &serde_json::Value) -> RuntimeModelSources {
     let env = |key: &str| settings["env"][key].as_str().map(str::to_owned);
     RuntimeModelSources {
         model: settings["model"].as_str().map(str::to_owned),
+        agent: settings["agent"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
         fallbacks: settings["fallbackModel"]
             .as_array()
             .map(|fb| {
