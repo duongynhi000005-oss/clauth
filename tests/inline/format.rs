@@ -753,6 +753,7 @@ fn render_start_walk_matches_the_approved_layout() {
             fresh: true,
             demand: Vec::new(),
             now: 1_782_000_000,
+            no_poll: None,
         },
         StartCandidate {
             name: crate::profile::ProfileName::from("D2"),
@@ -762,6 +763,7 @@ fn render_start_walk_matches_the_approved_layout() {
             fresh: true,
             demand: Vec::new(),
             now: 1_782_000_000,
+            no_poll: None,
         },
         StartCandidate {
             name: crate::profile::ProfileName::from("D3"),
@@ -771,6 +773,7 @@ fn render_start_walk_matches_the_approved_layout() {
             fresh: false,
             demand: Vec::new(),
             now: 1_782_000_000,
+            no_poll: None,
         },
     ];
     assert_eq!(
@@ -793,6 +796,7 @@ fn start_walk_age_uses_the_iso_date_at_thirty_days() {
         fresh: false,
         demand: Vec::new(),
         now: 1_782_000_000,
+        no_poll: None,
     }];
     let date = chrono::DateTime::from_timestamp(1_782_000_000 - 3_456_000, 0)
         .unwrap()
@@ -819,6 +823,7 @@ fn start_lines_match_the_approved_copy() {
             fresh: true,
             demand: Vec::new(),
             now: 1_782_000_000,
+            no_poll: None,
         },
         StartCandidate {
             name: crate::profile::ProfileName::from("D2"),
@@ -828,6 +833,7 @@ fn start_lines_match_the_approved_copy() {
             fresh: true,
             demand: Vec::new(),
             now: 1_782_000_000,
+            no_poll: None,
         },
     ];
     let two = ["opus".to_owned(), "sonnet".to_owned()];
@@ -854,21 +860,24 @@ fn start_lines_match_the_approved_copy() {
     );
 }
 
-/// Two surfaces speak about a missing reading and they mean DIFFERENT things.
-/// This cell means "not read yet", which is true of any account whose first
-/// poll is pending; the Fallback pill (`DIAG_NO_USAGE`) means clauth cannot read
-/// that account at all. Nothing else pins the split: a mutation that reused one
-/// constant for both passes the whole suite, which is why this test exists.
+/// The age cell has three absences and they mean DIFFERENT things. "no usage
+/// yet" means "not read yet", true of any account whose first poll is pending;
+/// "can't read usage" (the Fallback pill's own words) means clauth cannot read
+/// that account at all; "api key, no usage windows" means it has no windows to
+/// read. Each of the latter two is pinned beside this test; this one pins the
+/// pending case, which no other assertion rules out: a mutation that reused the
+/// pill's constant for it passes the whole suite, which is why this test exists.
 #[test]
 fn the_explain_age_cell_says_not_yet_where_the_fallback_pill_says_cannot() {
     let absent = StartCandidate {
-        name: crate::profile::ProfileName::from("blind"),
+        name: crate::profile::ProfileName::from("pending"),
         block: None,
         age: OauthAge::Absent,
         stale: false,
         fresh: false,
         demand: Vec::new(),
         now: 1_782_000_000,
+        no_poll: None,
     };
     assert_eq!(
         start_age_cell(&absent),
@@ -879,6 +888,55 @@ fn the_explain_age_cell_says_not_yet_where_the_fallback_pill_says_cannot() {
         start_age_cell(&absent),
         DIAG_NO_USAGE,
         "and they are not the pill's, which says what clauth cannot do"
+    );
+}
+
+/// The two absences whose cell names a reason: a member clauth cannot measure
+/// says what clauth cannot do, in the Fallback pill's own words; an api-key-only
+/// member says it has no usage windows to read. A DATED or UNDATED reading keeps
+/// its age cell whatever the reason — that member holds a reading.
+#[test]
+fn the_explain_age_cell_names_why_no_poll_is_coming() {
+    let row = |age, no_poll| StartCandidate {
+        name: crate::profile::ProfileName::from("m"),
+        block: None,
+        age,
+        stale: false,
+        fresh: false,
+        demand: Vec::new(),
+        now: 1_782_000_000,
+        no_poll,
+    };
+    assert_eq!(
+        render_start_walk(
+            &[row(OauthAge::Absent, Some(NoPollReason::CannotMeasure))],
+            None
+        ),
+        "  m  ok   ◆ can't read usage",
+    );
+    assert_eq!(
+        render_start_walk(
+            &[row(OauthAge::Absent, Some(NoPollReason::ApiKeyOnly))],
+            None
+        ),
+        "  m  ok   api key, no usage windows",
+    );
+    assert_eq!(
+        render_start_walk(
+            &[row(
+                OauthAge::Dated(240_000),
+                Some(NoPollReason::CannotMeasure)
+            )],
+            None
+        ),
+        "  m  ok   usage 4m ago",
+    );
+    assert_eq!(
+        render_start_walk(
+            &[row(OauthAge::Undated, Some(NoPollReason::CannotMeasure))],
+            None
+        ),
+        "  m  ok   usage undated (stale)",
     );
 }
 

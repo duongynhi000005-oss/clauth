@@ -8279,6 +8279,7 @@ fn shared_demand_shares_the_same_families_in_any_order() {
             fresh: false,
             demand: vec!["opus".to_owned(), "sonnet".to_owned()],
             now: 0,
+            no_poll: None,
         },
         StartCandidate {
             name: ProfileName::from("b"),
@@ -8288,6 +8289,7 @@ fn shared_demand_shares_the_same_families_in_any_order() {
             fresh: false,
             demand: vec!["sonnet".to_owned(), "opus".to_owned()],
             now: 0,
+            no_poll: None,
         },
     ];
     assert_eq!(
@@ -10453,5 +10455,88 @@ fn the_start_walk_skips_a_member_holding_no_login() {
         pick,
         Some(1),
         "the start must land on the member holding a login"
+    );
+}
+
+/// A member clauth cannot measure (a long-lived sidecar, no OAuth pair) holds a
+/// login, so its `--explain` verdict stays `ok`; its age cell says clauth
+/// cannot read its usage, never `no usage yet`, which promises a first poll
+/// that never comes. The refusal renders the same rows, so it says it too —
+/// reachable only once nothing is picked, here with the member disabled and the
+/// other spent.
+#[test]
+fn the_start_walk_marks_a_member_clauth_cannot_measure() {
+    let _sb = start_walk_sandbox(&["blind", "work"]);
+    start_walk_write_usage("work", &start_walk_usage(240, 10.0, 10.0));
+    let (config, _readings) = config_with_chain(
+        vec![
+            with_long_lived_sidecar(start_walk_profile("blind")),
+            start_walk_profile("work"),
+        ],
+        "work",
+    );
+
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(
+        crate::format::render_start_walk(&rows, pick),
+        "  blind  ok   ◆ can't read usage\n* work   ok   usage 4m ago",
+    );
+
+    // A real refusal renders only a no-pick walk: `blind` disabled, `work` spent.
+    start_walk_write_usage("work", &start_walk_usage(240, 100.0, 10.0));
+    let mut blind = with_long_lived_sidecar(start_walk_profile("blind"));
+    blind.profile.disabled = true;
+    let (config, _readings) = config_with_chain(vec![blind, start_walk_profile("work")], "work");
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(pick, None);
+    assert_eq!(
+        crate::format::start_refusal(&[], &rows),
+        "--auto found no chain member with headroom\n  blind  disabled   ◆ can't read usage\n  work   5h 100%    usage 4m ago",
+    );
+}
+
+/// A member holding only an Anthropic api key sits in no fetch leg's work list
+/// (no login pair, no provider endpoint), so no poll is ever coming: its age
+/// cell says it has no usage windows, never `no usage yet`.
+#[test]
+fn the_start_walk_says_an_api_key_member_has_no_usage_windows() {
+    let _sb = start_walk_sandbox(&["api", "work"]);
+    start_walk_write_usage("work", &start_walk_usage(240, 10.0, 10.0));
+    let mut api = start_walk_profile("api");
+    api.profile.credentials = None;
+    api.profile.api_key = Some("sk-ant-api-key".to_string());
+    let (config, _readings) = config_with_chain(vec![api, start_walk_profile("work")], "work");
+
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(
+        crate::format::render_start_walk(&rows, pick),
+        "  api   ok   api key, no usage windows\n* work  ok   usage 4m ago",
+    );
+}
+
+/// `api key, no usage windows` is a claim about an Anthropic key alone. A key
+/// routed to another endpoint through `[env] ANTHROPIC_BASE_URL` talks to a
+/// provider that may have windows, and a key beside a long-lived sidecar is the
+/// sidecar's account too: neither gets that cell.
+#[test]
+fn the_api_key_cell_skips_a_routed_key_and_a_key_beside_a_sidecar() {
+    let _sb = start_walk_sandbox(&["envkey", "keysc", "work"]);
+    start_walk_write_usage("work", &start_walk_usage(240, 10.0, 10.0));
+    let mut routed = start_walk_profile("envkey");
+    routed.profile.credentials = None;
+    routed.profile.api_key = Some("zai-key".to_string());
+    routed.profile.env.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        "https://api.z.ai/api/anthropic".to_string(),
+    );
+    let mut beside = with_long_lived_sidecar(start_walk_profile("keysc"));
+    beside.profile.api_key = Some("sk-ant-api-key".to_string());
+    let (config, _readings) =
+        config_with_chain(vec![routed, beside, start_walk_profile("work")], "work");
+
+    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    assert_eq!(
+        crate::format::render_start_walk(&rows, pick),
+        "  envkey  ok   no usage yet\n  keysc   ok   no usage yet\n* work    ok   usage 4m ago",
     );
 }

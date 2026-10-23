@@ -10,7 +10,7 @@
 
 use chrono::{DateTime, Datelike, Local, Timelike};
 
-use crate::fallback::{StartBlock, StartCandidate};
+use crate::fallback::{NoPollReason, StartBlock, StartCandidate};
 use crate::profile::Profile;
 use crate::profile_json::OauthAge;
 use crate::usage::{PlanTier, UsageInfo, humanize_duration};
@@ -762,9 +762,15 @@ pub(crate) const DIAG_STALE: &str = "stale data";
 /// poll is still coming", the opposite of this state, and it is what the
 /// `--explain` age cell prints for an account whose first poll really is
 /// coming. The verb is the one the add confirm and
-/// the daemon line already use ("can't read ... usage"), so the three surfaces
-/// say one thing.
+/// the daemon line already use ("can't read ... usage"), so every surface says
+/// one thing.
 pub(crate) const DIAG_NO_USAGE: &str = "can't read usage";
+
+/// The mark preceding [`DIAG_NO_USAGE`] as a state, one source so its two
+/// renderers cannot drift: the CLI's `--explain` age cell and the Fallback
+/// chain's selector-row marker (`chain::reason_marker`), which the help legend
+/// also takes its glyph from.
+pub(crate) const DIAG_NO_USAGE_GLYPH: &str = "◆";
 
 /// A seconds age as the relative ladder (`4m ago`, `2h ago`, `3d ago`), open
 /// ended into weeks. The TUI's `relative_age` (`tui/render/format.rs`) and the
@@ -864,10 +870,17 @@ fn start_age_cell(row: &StartCandidate) -> String {
             }
         }
         OauthAge::Undated => "usage undated (stale)".to_string(),
-        // NOT `DIAG_NO_USAGE`: here the absence really is "not read yet",
-        // which is what this cell has always said and what it still means for
-        // an account whose first poll is pending.
-        OauthAge::Absent => "no usage yet".to_string(),
+        // The default absence is "not read yet". When the walk found no fetch
+        // leg will ever read this member's usage, its answer rides the row and
+        // the cell names why instead, in the fallback pill's own words where it
+        // has them.
+        OauthAge::Absent => match row.no_poll {
+            Some(NoPollReason::CannotMeasure) => {
+                format!("{DIAG_NO_USAGE_GLYPH} {DIAG_NO_USAGE}")
+            }
+            Some(NoPollReason::ApiKeyOnly) => "api key, no usage windows".to_string(),
+            None => "no usage yet".to_string(),
+        },
     }
 }
 

@@ -1881,13 +1881,29 @@ pub(crate) fn start_block(
     None
 }
 
+/// Why no poll will ever read a chain member's usage, as [`start_walk`] judged
+/// it: a missing reading on such a member is permanent, not a first poll still
+/// pending, so its age cell names the reason instead of promising a poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoPollReason {
+    /// A long-lived session token with nothing clauth can read usage through
+    /// ([`no_usage_source`]).
+    CannotMeasure,
+    /// Inference authenticated by an api key or `[env]` token
+    /// ([`crate::claude::has_inference_auth`]), with no routing endpoint, no
+    /// long-lived sidecar, and no fetch leg that admits it
+    /// ([`crate::usage::any_fetch_leg_admits`]): nothing publishes usage
+    /// windows for such a member.
+    ApiKeyOnly,
+}
+
 /// One chain member as the start walk judged it, with enough to render the
 /// `--explain` row: the verdict, the cache age (for the staleness cell), whether
-/// that age reads stale, and whether the reading is DATED and fresh (pass one's
-/// preference). `demand` is the member's own model-family demand — the one its
-/// per-model judgment ran under, printed when it is the pick; the refusal
-/// header names it only when every judged member carries the same demand
-/// ([`shared_demand`]).
+/// that age reads stale, whether the reading is DATED and fresh (pass one's
+/// preference), and why no poll will ever read its usage when none will.
+/// `demand` is the member's own model-family demand — the one its per-model
+/// judgment ran under, printed when it is the pick; the refusal header names it
+/// only when every judged member carries the same demand ([`shared_demand`]).
 pub(crate) struct StartCandidate {
     pub(crate) name: ProfileName,
     pub(crate) block: Option<StartBlock>,
@@ -1898,6 +1914,10 @@ pub(crate) struct StartCandidate {
     /// The walk's reference instant (epoch seconds), so a DATED age's ISO-date
     /// arm can be derived as `now - age` without a second clock read.
     pub(crate) now: i64,
+    /// Why no poll will ever read this member's usage, when the walk found that
+    /// none will; `None` otherwise. Rides the row because the renderer receives
+    /// the row, not the [`Profile`].
+    pub(crate) no_poll: Option<NoPollReason>,
 }
 
 /// The `--auto` walk: every resolvable fallback-chain member in chain order,
@@ -1985,6 +2005,17 @@ pub(crate) fn start_walk(
         };
         let stale = windows.stale();
         let fresh = windows.fresh();
+        let no_poll = if no_usage_source(profile, profile.has_long_lived_sidecar) {
+            Some(NoPollReason::CannotMeasure)
+        } else if !crate::usage::any_fetch_leg_admits(profile)
+            && crate::claude::has_inference_auth(profile)
+            && profile.routing_endpoint().is_none()
+            && !profile.has_long_lived_sidecar
+        {
+            Some(NoPollReason::ApiKeyOnly)
+        } else {
+            None
+        };
         let kick_rejected = kick.iter().any(|k| k == name);
         let demand = if unknown_resume {
             crate::start::LaunchDemand {
@@ -2108,6 +2139,7 @@ pub(crate) fn start_walk(
             fresh,
             demand: row_demand,
             now,
+            no_poll,
         });
     }
     if rows.is_empty() {
