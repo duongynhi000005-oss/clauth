@@ -92,7 +92,8 @@ pub(crate) fn assert_one_budget_timeout<T: std::fmt::Debug>(result: &anyhow::Res
 /// does. A socket closed with the request still unread sends a RST instead of a
 /// FIN: Windows then fails the client's read with `os error 10053`, and macOS
 /// refuses the client's next `SO_RCVTIMEO` with `EINVAL` (CI run 39758751460).
-pub(crate) fn read_request_head(sock: &mut std::net::TcpStream) {
+/// Returns the bytes read, through `\r\n\r\n` or the read's end.
+pub(crate) fn read_request_head(sock: &mut std::net::TcpStream) -> Vec<u8> {
     use std::io::Read;
     let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
     let mut head = Vec::new();
@@ -103,6 +104,7 @@ pub(crate) fn read_request_head(sock: &mut std::net::TcpStream) {
             Ok(n) => head.extend_from_slice(&buf[..n]),
         }
     }
+    head
 }
 
 /// RAII home sandbox: acquires `HOME_TEST_LOCK` and redirects `home_dir()` into

@@ -11788,6 +11788,34 @@ fn saved_off_update_leaves_new_app_with_no_update_handle() {
     );
 }
 
+/// With the toggle on, `App::new` spawns the update thread, and in a test build
+/// that thread ends at once with nothing sent: the check calls
+/// `api.github.com` and, on a build older than the latest release, would
+/// self-replace the test binary.
+#[test]
+fn a_saved_on_app_spawns_a_check_that_ends_at_once_in_a_test_build() {
+    use crate::profile::AppConfig;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(&home, &[("CLAUTH_NO_UPDATE", None)]);
+    let state = crate::profile::AppState::default();
+    assert!(state.update.auto_update, "the default toggle is on");
+    let app = App::new(AppConfig {
+        state,
+        profiles: Vec::new(),
+    });
+    assert!(
+        app.update_handle.is_some(),
+        "saved on → the update thread spawns"
+    );
+    assert_eq!(
+        app.update_results
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .err(),
+        Some(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        "a test build's check ends at once and sends nothing"
+    );
+}
+
 // `money spent` is its own row, not an alias of `quota spent`: staying is free
 // when quota runs out and costs money when a budget does, so the two must be
 // settable in opposite directions.

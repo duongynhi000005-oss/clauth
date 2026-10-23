@@ -14,7 +14,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -4853,8 +4852,8 @@ pub(crate) struct App {
     pub(crate) below_width_floor: bool,
     /// Startup update check result; drained in `on_tick`. Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
-    /// Join handle for the update check thread; joined on TUI exit for clean shutdown.
-    pub(crate) update_handle: Option<JoinHandle<()>>,
+    /// Update check thread handle; awaited on TUI exit for clean shutdown.
+    pub(crate) update_handle: Option<update::UpdateThread>,
 
     /// In-flight login worker of any method (Setup tab); `None` when idle.
     pub(crate) login: Option<LoginSession>,
@@ -27541,14 +27540,12 @@ pub(crate) fn shutdown(app: &mut App) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Wait up to 5 s for the update check to finish; let it detach if it's
-    // still running (a slow network shouldn't delay TUI exit indefinitely).
+    // Wait up to 5 s for the update check to finish, detaching a still-running
+    // check after that (a slow download shouldn't delay TUI exit) — but never
+    // while the replace step runs, so this shutdown path can't strand the
+    // self-replace's staged file beside the binary.
     if let Some(handle) = app.update_handle.take() {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !handle.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        drop(handle);
+        handle.wait_on_exit(Duration::from_secs(5));
     }
     {
         let mut cfg = app.config();
