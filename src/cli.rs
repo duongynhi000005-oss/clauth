@@ -455,11 +455,11 @@ pub(crate) enum Command {
     #[command(name = "__complete", hide = true)]
     Complete {
         /// The codex roster instead of the claude one (for `limit-reset`).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["live_sessions", "resumable"])]
         codex: bool,
         /// Print `~/.clauth/live_sessions/`'s file stems instead of profile
         /// names.
-        #[arg(long = "live-sessions", hide = true)]
+        #[arg(long = "live-sessions", hide = true, conflicts_with = "resumable")]
         live_sessions: bool,
         /// Print `latest` plus the global store's top-level session ids
         /// instead of profile names.

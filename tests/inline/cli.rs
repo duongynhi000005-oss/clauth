@@ -1365,6 +1365,25 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
     );
 }
 
+/// `__complete` prints one list per call: two mode flags at once are a usage
+/// error, never a silent pick of one of the lists.
+#[test]
+fn the_complete_mode_flags_refuse_each_other() {
+    for pair in [
+        ["--codex", "--live-sessions"],
+        ["--codex", "--resumable"],
+        ["--live-sessions", "--resumable"],
+    ] {
+        let args = ["__complete", pair[0], pair[1]];
+        let err = parse(&args).expect_err("two `__complete` modes must not parse");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{args:?}"
+        );
+    }
+}
+
 /// The bundled plugin manifest spells clauth subcommands as strings, and a
 /// rename on either side is silent: the hook keeps being registered and just
 /// exits non-zero on every fire. Derives both sides and compares, rather than
