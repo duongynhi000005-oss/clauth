@@ -3517,16 +3517,11 @@ impl LaunchTransport {
 /// this encoding makes every pre-upgrade row mismatch every member until its
 /// session restarts, so treat it as a format.
 fn env_digest(env: &std::collections::BTreeMap<String, String>) -> String {
-    /// Length-delimited so no two field splits can collide (`ab|c` vs `a|bc`).
-    fn field(hasher: &mut Sha256, bytes: &[u8]) {
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    }
     let mut hasher = Sha256::new();
     hasher.update((env.len() as u64).to_le_bytes());
     for (key, value) in env {
-        field(&mut hasher, key.as_bytes());
-        field(&mut hasher, value.as_bytes());
+        crate::usage::hash_field(&mut hasher, key.as_bytes());
+        crate::usage::hash_field(&mut hasher, value.as_bytes());
     }
     hex::encode(<[u8; 32]>::from(hasher.finalize()))
 }

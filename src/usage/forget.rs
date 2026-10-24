@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
+use sha2::{Digest, Sha256};
+
 use crate::lockorder::{RankedMutex, rank};
 use crate::profile::{
     AccountId, ConsoleCredential, ProfileName, StoredEndpointIdentity, stored_access_token,
@@ -61,16 +63,27 @@ impl ForgetPlan {
     }
 }
 
+/// Writes one field into the digest: its length as a little-endian `u64`, then
+/// its bytes. Length-delimited so no two field splits can collide (`ab|c` vs
+/// `a|bc`).
+///
+/// This is the byte format behind three digests: `runtime::env_digest` on the
+/// live-session row, `ThirdPartyEntry::credential_fingerprint` keying
+/// `third_party_auth.json`, and forget's in-memory identities via
+/// `digest_fields`. The first two are persisted, so changing this encoding
+/// moves every stored value of both.
+pub(crate) fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
 /// SHA-256 over length-delimited fields, head-truncated to a u64 — the same
-/// shape as the third-party fingerprint, so no two field splits collide. A
-/// collision costs one extra or one missed forget, never a wrong identity on
-/// disk.
+/// shape as the third-party fingerprint. A collision costs one extra or one
+/// missed forget, never a wrong identity on disk.
 fn digest_fields(fields: &[&[u8]]) -> u64 {
-    use sha2::{Digest as _, Sha256};
     let mut hasher = Sha256::new();
     for field in fields {
-        hasher.update((field.len() as u64).to_le_bytes());
-        hasher.update(field);
+        hash_field(&mut hasher, field);
     }
     let digest = hasher.finalize();
     let mut head = [0u8; 8];
@@ -173,9 +186,12 @@ pub(crate) fn oauth_changed(before: &OAuthIdentity, after: &OAuthIdentity) -> bo
     }
 }
 
-/// The provider literal the digest uses, a literal per variant rather than the
-/// user-facing display name (which may be reworded and would reset identities).
-fn provider_bytes(provider: Provider) -> &'static [u8] {
+/// The provider literal both third-party digests hash: the in-memory usage
+/// identity here and the persisted `credential_fingerprint` that keys
+/// `third_party_auth.json`. A literal per variant rather than the user-facing
+/// display name, which may be reworded: a changed literal resets every identity
+/// and retires every recorded fingerprint.
+pub(crate) fn provider_bytes(provider: Provider) -> &'static [u8] {
     match provider {
         Provider::DeepSeek => b"deepseek",
         Provider::Zai => b"zai",

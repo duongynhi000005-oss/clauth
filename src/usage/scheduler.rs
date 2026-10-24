@@ -347,42 +347,25 @@ impl ThirdPartyEntry {
     /// as a format. A collision costs one profile one extra suppressed cadence.
     pub(crate) fn credential_fingerprint(&self) -> u64 {
         use sha2::{Digest as _, Sha256};
-        /// Length-delimited so no two field splits can collide (`ab|c` vs `a|bc`).
-        fn field(hasher: &mut Sha256, bytes: &[u8]) {
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(bytes);
-        }
         let mut hasher = Sha256::new();
-        field(&mut hasher, self.api_key.as_bytes());
+        crate::usage::hash_field(&mut hasher, self.api_key.as_bytes());
         match &self.target {
             crate::providers::ThirdPartyTarget::Known { provider, console } => {
-                field(&mut hasher, b"known");
-                // A literal per variant, NOT `display_name`: that is user-facing
-                // copy and may be reworded, which would silently reset every
-                // recorded fingerprint.
-                field(
-                    &mut hasher,
-                    match provider {
-                        crate::providers::Provider::DeepSeek => b"deepseek".as_slice(),
-                        crate::providers::Provider::Zai => b"zai".as_slice(),
-                        crate::providers::Provider::Alibaba => b"alibaba".as_slice(),
-                        crate::providers::Provider::OpenRouter => b"openrouter".as_slice(),
-                        crate::providers::Provider::MiniMax => b"minimax".as_slice(),
-                    },
-                );
+                crate::usage::hash_field(&mut hasher, b"known");
+                crate::usage::hash_field(&mut hasher, crate::usage::provider_bytes(*provider));
                 match console {
                     Some(c) => {
-                        field(&mut hasher, b"console");
-                        field(&mut hasher, c.token.as_bytes());
-                        field(&mut hasher, c.site.as_str().as_bytes());
-                        field(&mut hasher, c.region.as_bytes());
+                        crate::usage::hash_field(&mut hasher, b"console");
+                        crate::usage::hash_field(&mut hasher, c.token.as_bytes());
+                        crate::usage::hash_field(&mut hasher, c.site.as_str().as_bytes());
+                        crate::usage::hash_field(&mut hasher, c.region.as_bytes());
                     }
-                    None => field(&mut hasher, b"no-console"),
+                    None => crate::usage::hash_field(&mut hasher, b"no-console"),
                 }
             }
             crate::providers::ThirdPartyTarget::Generic { base_url } => {
-                field(&mut hasher, b"generic");
-                field(&mut hasher, base_url.as_bytes());
+                crate::usage::hash_field(&mut hasher, b"generic");
+                crate::usage::hash_field(&mut hasher, base_url.as_bytes());
             }
         }
         let digest = hasher.finalize();
