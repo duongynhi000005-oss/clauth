@@ -50229,3 +50229,151 @@ fn space_steps_the_pick_on_every_cycle_shunt_field_kind() {
         "`space` steps the pick on the draft's `auth mode`"
     );
 }
+
+/// A loss-warning `save` whose changed set holds a shunt rename that would
+/// open its own confirm stops before anything commits: the tab stays, the
+/// instant herdr tag keeps its stored value, and the rename confirm is the
+/// open modal. Keys open one editor at a time, so the herdr draft is written
+/// straight into its field to stand an instant item beside the open shunt
+/// editor; the next test covers the set keys alone can reach. An env-key
+/// collision is the one further dialog no set can hold beside another item.
+#[cfg(unix)]
+#[test]
+fn a_save_stops_before_committing_when_an_item_opens_a_further_dialog() {
+    use super::{ConfirmAction, ShuntFieldKey, UpstreamFieldKind};
+    let text = "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Name,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Backspace));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char('b')));
+    let before = rig.app.config().state.herdr.tag_watch_secs;
+    let mut draft = SeededInput::new(&before.to_string());
+    draft.input = InputState::new(&(before + 7).to_string());
+    rig.app.services.herdr_tag_draft = Some(draft);
+    let tab = rig.app.tab;
+    super::handle_key(&mut rig.app, alt_digit('1'));
+    let warned = matches!(
+        rig.app.modals.last(),
+        Some(super::Modal::LossWarning(s))
+            if s.drop.dirty.contains(&super::Dirty::HerdrTag)
+                && s
+                    .drop
+                    .dirty
+                    .iter()
+                    .any(|d| matches!(d, super::Dirty::ShuntField(_)))
+    );
+    assert!(
+        warned,
+        "the switch opened no loss warning over both items: {:?}",
+        rig.app.modals.last()
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(rig.app.tab, tab, "the save switched the tab");
+    assert!(
+        rig.app.services.herdr_tag_draft.is_some(),
+        "the save committed the instant herdr tag"
+    );
+    assert_eq!(
+        rig.app.config().state.herdr.tag_watch_secs,
+        before,
+        "the save changed the instant item's stored value"
+    );
+    assert!(
+        matches!(
+            rig.app.modals.last(),
+            Some(super::Modal::Confirm(s)) if matches!(s.on_confirm, ConfirmAction::RenameField { .. })
+        ),
+        "the further dialog is not the open modal: {:?}",
+        rig.app.modals.last()
+    );
+    assert!(
+        rig.app.services.shunt_save.is_none() && !rig.config_text().contains("name = \"b\""),
+        "the rename itself committed before its confirm"
+    );
+    rig.drain();
+}
+
+/// A shunt rename beside a typed `+ add` draft, both reached by keys: the
+/// quit's `save` opens the rename confirm and commits neither item.
+#[cfg(unix)]
+#[test]
+fn a_save_over_a_rename_beside_an_add_draft_opens_the_rename_confirm() {
+    use super::{ConfirmAction, ShuntAddKind, ShuntDraftField, ShuntFieldKey, UpstreamFieldKind};
+    let text = "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("zz");
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Name,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Backspace));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char('b')));
+    let dirty = format!("{:?}", super::changed_work(&rig.app));
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        matches!(rig.app.modals.last(), Some(Modal::LossWarning(_))),
+        "precondition: the quit form is open: {dirty}"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(!rig.app.quit, "the save quit: {dirty}");
+    assert!(
+        matches!(
+            rig.app.modals.last(),
+            Some(super::Modal::Confirm(s)) if matches!(s.on_confirm, ConfirmAction::RenameField { .. })
+        ),
+        "the rename confirm is not the open modal ({dirty}): {:?}",
+        rig.app.modals.last()
+    );
+    assert!(
+        rig.app.services.shunt_save.is_none(),
+        "a shunt save started before the rename confirm: {dirty}"
+    );
+    let saved = rig.config_text();
+    assert!(
+        !saved.contains("name = \"zz\"") && !saved.contains("name = \"b\""),
+        "the save wrote an item before the rename confirm: {saved}"
+    );
+    rig.drain();
+}
+
+/// `x` during the exit wait dismisses nothing of the save cue: the footer keeps
+/// naming the running write even after the dismiss key.
+#[cfg(unix)]
+#[test]
+fn x_does_not_clear_the_save_cue_during_the_exit_wait() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    start_remove_save(&mut rig);
+    super::handle_key(&mut rig.app, ctrl_c());
+    super::handle_key(&mut rig.app, ctrl_c());
+    assert!(
+        rig.app.exit_wait && !rig.app.quit,
+        "precondition: the exit waits"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char('x')));
+    assert_eq!(
+        footer_row(&rig.app, 80, 24).trim_end(),
+        " i saving a… · ⌃c ⌃c quit now",
+        "x cleared the saving cue during the exit wait"
+    );
+    rig.drain();
+}
