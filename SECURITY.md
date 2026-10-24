@@ -41,6 +41,7 @@ Per-profile state lives under `~/.clauth/`. On Unix that whole tree is owner-onl
 | `~/.clauth/jobs/<id>.json` | backgrounded `delegate` prompt + result | file `0600`, dir `0700` |
 | `~/.clauth/live_sessions/<sid>.json`, `~/.clauth/live_bare/<pid>` | liveness markers for running sessions: pid, profile name, working directory, flags. No credentials | file `0600`, dir `0700` |
 | `~/.clauth/keychain-quarantine/<UTC>-<pid>-<service>.json` | macOS only: raw bytes of a Keychain item that read back as anything other than the JSON object Claude Code expects, preserved before the write or sign-out that would otherwise destroy them — live credential bytes, which is why nothing prunes the dir | file `0600`, dir `0700` |
+| `~/.clauth/daemon-stops-in-flight.json` | runtime trees whose own Claude Code supervisor stop is in flight, the supervisors that wedged on SIGTERM (pid and start time) and, on macOS and Windows, the trees already announced as spared. No credential | file `0600` |
 | usage and price caches, session history, logs, lock files (`~/.clauth/`) | last-known usage, third-party state, burn samples (which carry the account email), event log, advisory locks | file `0600`, dir `0700` |
 | `~/.local/share/clauth/` (macOS `~/Library/Application Support/clauth/`, Windows `%APPDATA%\clauth\`) | the bundled Claude Code plugin, laid down where `claude plugin` can register it: `plugin.json`, the `hooks/` dir, a generated `marketplace.json`, and an install marker under `markers/`. Content-keyed under `versions/`, with a `current@claude` pointer at the live one. No credentials | your umask; not re-tightened |
 
@@ -182,6 +183,8 @@ Every command below goes through an argument vector, never a shell, so there is 
 | `hostname -f` (macOS, Linux), `powershell.exe` evaluating `[System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName` (Windows) | `clauth daemon --listen` without `--cert`/`--key` only: once at startup, to learn which lego certificate to load. Naming the certificate outright runs neither command. No part of it comes from you — the argument vector is a compile-time constant — and the answer is rejected unless it looks like a hostname before it is used as a filename in the certificate directory named by `~/.clauth/tls.json`, which is yours to edit and owner-only like the rest of the tree |
 
 clauth runs no other external commands.
+
+clauth also sends one signal without running a command, on Linux and macOS only: collecting a runtime tree (GC, teardown, delete, rename, the daemon's release of `runtime-bg`) sends SIGTERM to the pid the tree's own `daemon.lock`/`daemon.status.json` names, and only once that pid is verified as that tree's `claude daemon run` supervisor by start time, argv and `CLAUDE_CONFIG_DIR` (`/proc` on Linux, `proc_pidinfo` + `KERN_PROCARGS2` on macOS). Anything unverified is never signalled, a supervisor still alive after the bounded wait spares the tree and is not re-signalled for ten minutes, and `claude daemon stop` is never run: it also stops Claude Code's installed service.
 
 ## First-run shell completions
 

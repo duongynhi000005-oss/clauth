@@ -127,7 +127,7 @@ A saved Claude Code account's rows:
 | `email` | read-only: the address of the account's Claude login, on an `oauth` account once clauth has read it with the plan tier (re-read hourly); hidden after a log out |
 | `provider` | read-only, present only for an endpoint clauth recognises: which provider it typed the account as |
 | `token` | read-only state of a stored long-lived setup token, above the editable rows, in one of eight states. Static: `long-lived · ~Nd left`, `expires in ~Nd` inside a month, `long-lived · no recorded expiry`, and `expired`. Rolling: `rolling · re-stamps in ~Nh`, `rolling · re-stamp due` inside the last hour, `rolling · no recorded expiry`, and `rolling token stalled` once nothing re-stamped it in time. `mis-filled` is neither: the sidecar holds a rotating pair the split cannot use. The charged states carry the fix beneath them ([Configuration](Configuration#account-types)) |
-| `name` | the profile name; a rename is refused while the account has a live session, a background job counting as one (see `disable account` above) |
+| `name` | the profile name; a rename is refused while the account has a live session, a background job counting as one (see `disable account` above), and while a runtime tree still has a background supervisor clauth cannot verify and stop (retry once it has exited; nothing overrides it here) |
 | `auto-start` | whether clauth opens the 5h window with a 1-token ping ([Configuration](Configuration#auto-start-the-5-hour-window)) |
 | `alert at` | the 5h % at which this account's alert fires: the TUI toast, and the daemon's `bell_command` ([Configuration](Configuration#profilestoml)); <kbd>+</kbd>/<kbd>-</kbd> step it by 5, starting at 95% from `off`; <kbd>⏎</kbd> types a value from 0 to 100, and an empty one turns it off |
 | `base url` | the API endpoint; blank means an OAuth account |
@@ -139,7 +139,7 @@ A saved Claude Code account's rows:
 | `log out` | drops the stored credentials, keeps the profile |
 | `clear long-lived token` | drops that token so the account's own OAuth login installs again, or signs Claude Code out when the account has only an api key behind it; the row's hint names which. Appears while ANY long-lived piece exists — the token, the preserved mint backup, or a set `rolling_token` flag — arms on the first press, clears on the second (the full exit: flag, sidecar, and backup together). Faint and inert when clearing would strip the account's last credential; a flag-only account disarms regardless, since no credential is touched |
 | `disable account` / `enable account` | hides the account from auto-switch and polling, keeping its files |
-| `delete account` | removes the profile; arms on the first press, deletes on the second |
+| `delete account` | removes the profile; arms on the first press, deletes on the second; with no live session it is refused while a runtime tree still has a background supervisor clauth cannot verify and stop (retry once it has exited, or run `clauth delete <name> --force`) |
 
 ## Config tab rows
 
