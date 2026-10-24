@@ -1295,21 +1295,32 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         command(&["__complete"]),
         Command::Complete {
             codex: false,
-            live_sessions: false
+            live_sessions: false,
+            resumable: false
         }
     ));
     assert!(matches!(
         command(&["__complete", "--codex"]),
         Command::Complete {
             codex: true,
-            live_sessions: false
+            live_sessions: false,
+            resumable: false
         }
     ));
     assert!(matches!(
         command(&["__complete", "--live-sessions"]),
         Command::Complete {
             codex: false,
-            live_sessions: true
+            live_sessions: true,
+            resumable: false
+        }
+    ));
+    assert!(matches!(
+        command(&["__complete", "--resumable"]),
+        Command::Complete {
+            codex: false,
+            live_sessions: false,
+            resumable: true
         }
     ));
     assert!(matches!(command(&["mcp-await-job"]), Command::McpAwaitJob));

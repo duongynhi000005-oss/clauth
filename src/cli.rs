@@ -450,7 +450,8 @@ pub(crate) enum Command {
 
     /// Print one profile name per line, for the shell completion scripts;
     /// `--live-sessions` prints the live-session registry's id stems instead,
-    /// for `clauth switch`'s first position.
+    /// for `clauth switch`'s first position; `--resumable` prints `latest`
+    /// plus the global store's top-level session ids, for `resume` and `info`.
     #[command(name = "__complete", hide = true)]
     Complete {
         /// The codex roster instead of the claude one (for `limit-reset`).
@@ -460,6 +461,10 @@ pub(crate) enum Command {
         /// names.
         #[arg(long = "live-sessions", hide = true)]
         live_sessions: bool,
+        /// Print `latest` plus the global store's top-level session ids
+        /// instead of profile names.
+        #[arg(long, hide = true)]
+        resumable: bool,
     },
 
     /// CC's `apiKeyHelper` body for an api-key profile: print the profile's

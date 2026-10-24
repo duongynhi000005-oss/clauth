@@ -332,7 +332,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Complete {
             codex,
             live_sessions,
-        } => cmd_complete(codex, live_sessions),
+            resumable,
+        } => cmd_complete(codex, live_sessions, resumable),
         Command::ApiKey { profile } => cmd_api_key(&profile),
         Command::OauthToken { profile } => cmd_oauth_token(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
@@ -408,11 +409,13 @@ fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
     }
 }
 
-fn cmd_complete(codex: bool, live_sessions: bool) -> Result<()> {
+fn cmd_complete(codex: bool, live_sessions: bool, resumable: bool) -> Result<()> {
     if codex {
         completions::print_codex_profile_names();
     } else if live_sessions {
         completions::print_session_stems();
+    } else if resumable {
+        completions::print_resume_targets();
     } else {
         completions::print_profile_names();
     }

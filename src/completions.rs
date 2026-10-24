@@ -82,6 +82,10 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && { [ "${COMP_WORDS[1]}" = "resume" ] || [ "${COMP_WORDS[1]}" = "info" ]; }; then
+        COMPREPLY=( $(compgen -W "$(clauth __complete --resumable 2>/dev/null)" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 4 ] && [ "${COMP_WORDS[1]}" = "resume" ] && [ "${COMP_WORDS[2]}" = "--profile" ]; then
+        COMPREPLY=( $(compgen -W "$(clauth __complete --resumable 2>/dev/null)" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--yes -y --force" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "static-token" ] && [ "${cur:0:2}" = "--" ]; then
@@ -214,6 +218,15 @@ _clauth() {
         _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == jobs ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (resume|info) ]]; then
+        local -a sids
+        sids=("${(@f)$(clauth __complete --resumable 2>/dev/null)}")
+        _describe 'session' sids
+        [[ "${words[2]}" == resume ]] && _values 'flag' '--profile[resume under this profile instead of prompting]'
+    elif (( CURRENT == 5 )) && [[ "${words[2]}" == resume && "${words[3]}" == --profile ]]; then
+        local -a sids
+        sids=("${(@f)$(clauth __complete --resumable 2>/dev/null)}")
+        _describe 'session' sids
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
         _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
@@ -250,6 +263,9 @@ const FISH_TEMPLATE: &str = r#"function __clauth_profiles
 end
 function __clauth_sessions
     clauth __complete --live-sessions 2>/dev/null
+end
+function __clauth_resumable
+    clauth __complete --resumable 2>/dev/null
 end
 complete -c clauth -f
 complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
@@ -317,6 +333,9 @@ complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (c
 complete -c clauth -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
 complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
+complete -c clauth -f -n "__fish_seen_subcommand_from resume; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session
+complete -c clauth -f -n "__fish_seen_subcommand_from info; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session
+complete -c clauth -f -n 'set -l t (commandline -opc); and test (count $t) -eq 4; and contains -- "$t[2]" resume; and contains -- "$t[3]" --profile' -a "(__clauth_resumable)" -d Session
 __CLATHA_LOGIN_FLAGS__
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"
@@ -486,6 +505,21 @@ fn live_session_stems() -> Vec<String> {
 pub(crate) fn print_session_stems() {
     for stem in live_session_stems() {
         outln!("{stem}");
+    }
+}
+
+/// `clauth resume` / `clauth info` completion words: the word `latest`, then
+/// every top-level session id of the global store, sorted. `latest` resolves
+/// to the newest of these same top-level sessions.
+fn resume_targets() -> Vec<String> {
+    let mut targets = vec!["latest".to_string()];
+    targets.extend(crate::sessions::resumable_session_ids());
+    targets
+}
+
+pub(crate) fn print_resume_targets() {
+    for target in resume_targets() {
+        outln!("{target}");
     }
 }
 

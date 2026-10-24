@@ -924,6 +924,22 @@ pub(crate) fn newest_session() -> Option<SessionRef> {
         .map(|(updated, id, path)| SessionRef { id, path, updated })
 }
 
+/// Every top-level session id in the global store, sorted and deduplicated:
+/// the ids a shell offers after `resume` and after `info`, beside `latest`. Only
+/// [`TOP_LEVEL_DEPTH`], the depth [`newest_session`] resolves at: Claude Code
+/// opens a top-level transcript alone, so a nested subagent transcript's
+/// `agent-<hex>` stem never appears, and the depth also keeps every workflow
+/// journal out. Filenames alone, so building the list opens no transcript.
+pub(crate) fn resumable_session_ids() -> Vec<String> {
+    let mut ids: Vec<String> = global_transcripts(TOP_LEVEL_DEPTH)
+        .into_iter()
+        .filter_map(|path| session_id_from_path(&path))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// Every `*.jsonl` a live isolated runtime is holding, workflow journals
 /// included, at the same tier-1 cost (filenames and mtimes, nothing opened).
 ///

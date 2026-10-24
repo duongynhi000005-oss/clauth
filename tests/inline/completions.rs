@@ -268,6 +268,268 @@ fn session_stem_completion_lists_registry_stems_only() {
     assert!(live_session_stems().is_empty());
 }
 
+/// `__complete --resumable` feeds `clauth resume` / `clauth info`: the word
+/// `latest`, then every top-level transcript stem of the global store, sorted,
+/// each once. A nested subagent transcript (`agent-<hex>`), a workflow journal
+/// and a non-transcript file are never offered: Claude Code opens only a
+/// top-level session id. A store that does not exist offers `latest` alone.
+#[test]
+fn resume_completion_offers_latest_and_top_level_session_ids() {
+    let sb = HomeSandbox::new();
+    let projects = sb.home().join(".claude").join("projects");
+    let first = "0b6f2c1e-1111-4a4a-8a8a-000000000001";
+    let second = "7d0e9a42-2222-4b4b-9b9b-000000000002";
+    let third = "c3a1f0b9-3333-4c4c-acac-000000000003";
+    assert_eq!(
+        resume_targets(),
+        vec!["latest".to_string()],
+        "no store yet: `latest` alone, never an error"
+    );
+
+    let a = projects.join("-home-u-a");
+    let b = projects.join("-home-u-b");
+    let nested = a.join(first).join("subagents");
+    let journal = a.join(first).join("workflows").join("wf_1");
+    for dir in [&nested, &journal, &b] {
+        std::fs::create_dir_all(dir).expect("seed store dirs");
+    }
+    for path in [
+        a.join(format!("{second}.jsonl")),
+        a.join(format!("{first}.jsonl")),
+        b.join(format!("{third}.jsonl")),
+        // The same session copied into a second project dir: offered once.
+        b.join(format!("{first}.jsonl")),
+        nested.join("agent-a1b2c3d4e5f6.jsonl"),
+        journal.join("journal.jsonl"),
+        a.join("notes.txt"),
+    ] {
+        std::fs::write(&path, b"{}\n").expect("seed a store file");
+    }
+
+    assert_eq!(
+        resume_targets(),
+        vec![
+            "latest".to_string(),
+            first.to_string(),
+            second.to_string(),
+            third.to_string(),
+        ],
+    );
+}
+
+/// The `__complete` mode the scripts shell out to for session ids parses.
+#[test]
+fn the_resumable_complete_mode_parses() {
+    use clap::Parser as _;
+    let cli = crate::cli::Cli::try_parse_from(["clauth", "__complete", "--resumable"]);
+    assert!(cli.is_ok(), "{:?}", cli.err());
+}
+
+/// Every `--resumable` shellout sends its stderr to /dev/null: a failing call
+/// (a binary older than its script) would otherwise print into the prompt on
+/// every TAB after `resume` or `info`.
+#[test]
+fn every_resumable_shellout_drops_its_stderr() {
+    const MODE: &str = "clauth __complete --resumable";
+    for (shell, script, sites) in [("bash", &*BASH, 2), ("zsh", &*ZSH, 2), ("fish", &*FISH, 1)] {
+        assert_eq!(
+            script.matches(MODE).count(),
+            sites,
+            "{shell}: `--resumable` shellouts"
+        );
+        assert_eq!(
+            script.matches(&format!("{MODE} 2>/dev/null")).count(),
+            sites,
+            "{shell}: a `--resumable` shellout without `2>/dev/null`"
+        );
+    }
+}
+
+/// Whether `branch` offers the `__complete --resumable` words: inline, or by
+/// calling a fish function whose body runs that shellout.
+fn offers_resumable(branch: &str, script: &str) -> bool {
+    const MODE: &str = "clauth __complete --resumable";
+    branch.contains(MODE)
+        || script
+            .split("function ")
+            .skip(1)
+            .filter(|def| {
+                def.split("\nend")
+                    .next()
+                    .is_some_and(|body| body.contains(MODE))
+            })
+            .filter_map(|def| def.split_whitespace().next())
+            .any(|name| branch.contains(&format!("({name})")))
+}
+
+/// zsh and fish offer the session ids at the first position after `resume`
+/// and after `info`, and `resume` keeps its `--profile` flag beside them. The
+/// first position alone: no shell offers session ids at `switch`, whose ids
+/// are the live-session registry's.
+#[test]
+fn zsh_and_fish_offer_session_ids_after_resume_and_info() {
+    for verb in ["resume", "info"] {
+        let zsh_first = guarded_arms(&ZSH, |guard| {
+            zsh_word_matches(guard, 2, verb) && guard.contains("CURRENT == 3")
+        })
+        .unwrap_or_else(|| panic!("zsh must have a first-position arm for `{verb}`"));
+        assert!(
+            offers_resumable(&zsh_first, &ZSH) && zsh_first.contains("_describe 'session'"),
+            "zsh must offer session ids right after `{verb}`:\n{zsh_first}"
+        );
+
+        let fish = subcommand_branch("fish", &FISH, verb)
+            .unwrap_or_else(|| panic!("fish must have lines for `{verb}`"));
+        assert!(
+            offers_resumable(&fish, &FISH),
+            "fish must offer session ids after `{verb}`:\n{fish}"
+        );
+    }
+    let zsh_resume = subcommand_branch("zsh", &ZSH, "resume").expect("zsh resume arms");
+    assert!(
+        zsh_resume.contains("'--profile["),
+        "zsh keeps resume's --profile flag"
+    );
+    let switch = subcommand_branch("zsh", &ZSH, "switch").expect("zsh switch arms");
+    assert!(
+        !offers_resumable(&switch, &ZSH),
+        "switch offers registry ids, never transcript ids"
+    );
+}
+
+/// bash, driven for real: the script is sourced under a stub `clauth` and
+/// `_clauth` runs with the words a TAB would hand it. After `resume` and after
+/// `info` it offers the `__complete --resumable` words filtered by the typed
+/// prefix and nothing else; a `--` after `resume` still offers `--profile`.
+#[cfg(unix)]
+#[test]
+fn bash_offers_session_ids_after_resume_and_info() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("clauth.bash");
+    std::fs::write(&script, BASH.as_str()).expect("write script");
+    let complete = |words: &str, cword: usize| -> Vec<String> {
+        let driver = format!(
+            r#"clauth() {{
+    case "$*" in
+        "__complete --resumable") printf '%s\n' latest 0b6f-a 0b6f-b 7d0e-c ;;
+        "__complete") printf '%s\n' work ;;
+    esac
+}}
+source "{script}"
+COMP_WORDS=({words})
+COMP_CWORD={cword}
+_clauth
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+            script = script.display(),
+        );
+        let out = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", &driver])
+            .output()
+            .expect("run bash");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    for verb in ["resume", "info"] {
+        assert_eq!(
+            complete(&format!(r#"clauth {verb} """#), 2),
+            vec!["latest", "0b6f-a", "0b6f-b", "7d0e-c"],
+            "every resumable word after `{verb}`"
+        );
+        assert_eq!(
+            complete(&format!("clauth {verb} 0b"), 2),
+            vec!["0b6f-a", "0b6f-b"],
+            "the typed prefix filters the words after `{verb}`"
+        );
+    }
+    assert_eq!(complete("clauth resume --", 2), vec!["--profile"]);
+    // `resume --profile <name> <id>` is a valid order, so the id is still owed
+    // after the flag's value; the flag's own value is a profile.
+    assert_eq!(complete(r#"clauth resume --profile """#, 3), vec!["work"]);
+    assert_eq!(
+        complete(r#"clauth resume --profile work """#, 4),
+        vec!["latest", "0b6f-a", "0b6f-b", "7d0e-c"],
+    );
+    // Once the id is typed, nothing more is owed.
+    for verb in ["resume", "info"] {
+        assert!(
+            complete(&format!(r#"clauth {verb} 0b6f-a """#), 3).is_empty(),
+            "no second id after `{verb} <id>`"
+        );
+    }
+}
+
+/// zsh offers the ids after `resume --profile <name>` too, and fish offers
+/// them only at a position that takes one: every fish line offering them
+/// carries a word-count guard, the way the `switch` lines do, and one of them
+/// is the `--profile <name>` shape.
+#[test]
+fn zsh_and_fish_offer_session_ids_only_where_an_id_is_owed() {
+    let zsh_after_flag = guarded_arms(&ZSH, |guard| {
+        zsh_word_matches(guard, 2, "resume")
+            && zsh_word_matches(guard, 3, "--profile")
+            && guard.contains("CURRENT == 5")
+    })
+    .expect("zsh must have an arm for `resume --profile <name> <TAB>`");
+    assert!(
+        offers_resumable(&zsh_after_flag, &ZSH) && zsh_after_flag.contains("_describe 'session'"),
+        "zsh must offer session ids after `resume --profile <name>`:\n{zsh_after_flag}"
+    );
+
+    // Whole lines, the way the `proxy` guard lines are pinned: a joiner, the
+    // word source or the command name drifting changes where fish offers ids.
+    // `commandline -opc` holds the words before the one being completed:
+    // `clauth <verb>` (2, so `-lt 3`) for the id after the verb, and
+    // `clauth resume --profile <name>` (4) for the id after the flag.
+    let fish_id_lines: Vec<&str> = FISH
+        .lines()
+        .filter(|l| l.starts_with("complete ") && offers_resumable(l, &FISH))
+        .collect();
+    assert_eq!(
+        fish_id_lines,
+        [
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from resume; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session"#,
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from info; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session"#,
+            r#"complete -c clauth -f -n 'set -l t (commandline -opc); and test (count $t) -eq 4; and contains -- "$t[2]" resume; and contains -- "$t[3]" --profile' -a "(__clauth_resumable)" -d Session"#,
+        ],
+        "fish offers ids after `resume`, after `info`, and after `resume --profile <name>`, nowhere else"
+    );
+}
+
+/// Building the list opens no transcript: a top-level `<id>.jsonl` that is a
+/// FIFO blocks any reader forever, so a list that opens files never returns,
+/// while one built from filenames offers the FIFO's stem like any other.
+#[cfg(unix)]
+#[test]
+fn resume_completion_opens_no_transcript() {
+    let sb = HomeSandbox::new();
+    let project = sb.home().join(".claude").join("projects").join("-home-u-a");
+    std::fs::create_dir_all(&project).expect("seed the project dir");
+    let id = "f1f0f1f0-4444-4d4d-bdbd-000000000004";
+    let status = std::process::Command::new("mkfifo")
+        .arg(project.join(format!("{id}.jsonl")))
+        .status()
+        .expect("mkfifo runs");
+    assert!(status.success());
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(resume_targets());
+    });
+    let targets = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("listing the ids must never open a transcript");
+    assert_eq!(targets, vec!["latest".to_string(), id.to_string()]);
+}
+
 /// Every shell must offer `--setup-token` under the `login` subcommand — the
 /// long-lived-token capture flow (#53), gated to login like the other login
 /// flags. Mirrors the `--isolated` coverage above.
