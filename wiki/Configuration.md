@@ -209,7 +209,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `weekly_threshold` | float | chain value | per-account override of the 7d line (a monthly-only account's 30d quota gates on it instead), 50-100 |
 | `check_weekly` | bool | `true` | count the aggregate weekly window against this account |
 | `check_scoped` | bool | `true` | count per-model weekly windows against this account |
-| `check_credit_cap` | bool | `true` | keep auto-switch off this account while its usage-credit cap is spent; an account that serves its own endpoint with its own key never spends those credits, so no gate applies to it |
+| `check_credit_cap` | bool | `true` | keep auto-switch off this account while its usage-credit cap is spent, and sort it after the others on its line in the plugin's `profiles` roster; never a refusal (a delegate or `start --auto` launch whose model clauth cannot tell is refused whatever this says); an account that serves its own endpoint with its own key never spends those credits, so no gate applies to it |
 | `last_resort` | bool | `false` | the chain's parking spot |
 | `preferred` | bool | `false` | the home account clauth returns to once it is clear |
 | `preferred_days` | string array | `[]` | weekdays this account is home, in local time; claims those days against every account, while `preferred` keeps the days no list claims |
