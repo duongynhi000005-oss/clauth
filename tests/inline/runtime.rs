@@ -10000,6 +10000,33 @@ fn a_launch_transport_serializes_to_a_stable_row_format() {
     assert_eq!(value["has_api_key"], true);
     let back: LaunchTransport = serde_json::from_value(value).expect("round-trip");
     assert_eq!(back, LaunchTransport::of(&routed));
+
+    // Every `ModelSettings` field is a `settings.json` key a session boots with,
+    // so a renamed serde key would read `None` on every pre-upgrade row and flip
+    // the leg to `ModelsDiffers`. Pin every key literal and the round-trip.
+    let mut modeled = make_profile("fmt-models");
+    modeled.models = crate::profile::ModelSettings {
+        default: Some("model-default".into()),
+        opus: Some("model-opus".into()),
+        sonnet: Some("model-sonnet".into()),
+        haiku: Some("model-haiku".into()),
+        fable: Some("model-fable".into()),
+        subagent: Some("model-subagent".into()),
+    };
+    let value = serde_json::to_value(LaunchTransport::of(&modeled)).expect("serialize");
+    assert_eq!(
+        value["models"],
+        serde_json::json!({
+            "default": "model-default",
+            "opus": "model-opus",
+            "sonnet": "model-sonnet",
+            "haiku": "model-haiku",
+            "fable": "model-fable",
+            "subagent": "model-subagent",
+        })
+    );
+    let back: LaunchTransport = serde_json::from_value(value).expect("round-trip");
+    assert_eq!(back, LaunchTransport::of(&modeled));
 }
 
 /// A `credentials.json` that parses but holds no login installs an empty login

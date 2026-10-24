@@ -6492,6 +6492,69 @@ fn a_row_without_a_boot_transport_decides_off_the_start_profile_as_it_reads_now(
     assert_eq!(decision_of("4242-0"), (Some("b".to_string()), Some(1)));
 }
 
+/// Delete `name` through the real `actions::delete_profile`, so the fixture
+/// poses exactly the state `clauth delete` leaves. The leg's reconstruct path
+/// reads the in-memory config, so a fixture that removed only part of the
+/// delete would not pose the real failure.
+fn delete_profile_like_clauth(config: &crate::profile::ConfigHandle, name: &str) {
+    let name = crate::profile::ProfileName::from(name);
+    let rotation =
+        crate::actions::rotation_guard_for_mutation(&name).expect("uncontended rotation lock");
+    let mut cfg = config.lock().unwrap();
+    crate::actions::delete_profile(&mut cfg, &name, false, &rotation).expect("delete");
+}
+
+/// A row this clauth wrote records its boot transport, and the leg judges
+/// candidates against that record — never against the start profile as it reads
+/// now. A session that swapped off its start profile and then had that profile
+/// deleted still decides, because the record alone drives the walk. An OLDER
+/// row (no `boot_transport`) must reconstruct from the start profile, which is
+/// gone, so its `?` drops it before the walk and it gets no decision.
+#[test]
+fn a_deleted_start_profile_still_lets_a_recorded_boot_transport_decide_but_not_an_older_row() {
+    let run = |recorded: bool| -> (Option<String>, Option<usize>) {
+        let _home = crate::testutil::HomeSandbox::new();
+        let config = session_config(&["a", "b", "c"], Some("a"));
+        let mut row = session_row("4242-0", "a");
+        row.current_member = Some("b".to_string());
+        if recorded {
+            let boot = config
+                .lock()
+                .unwrap()
+                .find(&crate::profile::ProfileName::from("a"))
+                .expect("member a")
+                .clone();
+            row.boot_transport = Some(crate::runtime::LaunchTransport::of(&boot));
+        }
+        assert_eq!(
+            row.boot_transport.is_some(),
+            recorded,
+            "fixture: a recorded row carries its boot transport, an older row does not"
+        );
+        let _marker = register_live_row(&row);
+        delete_profile_like_clauth(&config, "a");
+        scan_sessions(
+            &config,
+            &session_store(&[("b", 100.0), ("c", 10.0)]),
+            &all_fresh(&["b", "c"]),
+        );
+        decision_of("4242-0")
+    };
+
+    assert_eq!(
+        run(true),
+        (Some("c".to_string()), Some(1)),
+        "a recorded boot transport survives the deleted start profile and \
+         still points the session at the next viable member"
+    );
+    assert_eq!(
+        run(false),
+        (None, None),
+        "an older row must reconstruct from the deleted start profile and \
+         drops out of the decision"
+    );
+}
+
 /// B4. `Off` means "sign every account out". A session cannot be left
 /// credential-less mid-flight and there is no member name to write, so the row is
 /// left exactly as it stands — including an intent a previous tick put there.
@@ -8063,6 +8126,107 @@ fn tp_entry(name: &str) -> ThirdPartyEntry {
             crate::usage::Half::ThirdParty,
         ),
     }
+}
+
+/// `credential_fingerprint` is the key of the persisted dead-credential record
+/// (`third_party_auth.json`), so its bytes are a format: a change silently
+/// retires every record on disk. Every encoding branch is pinned: the
+/// `Known`+console arm, the `Known`+`None` (no-console) arm, each provider
+/// literal, and the generic arm. The values below were computed outside the
+/// crate — Python `hashlib.sha256` over each field as a little-endian `u64`
+/// byte length then its UTF-8 bytes, in call order, the first 8 digest bytes
+/// read little-endian:
+///
+/// ```python
+/// import hashlib, struct
+/// def f(b): return struct.pack("<Q", len(b)) + b
+/// def known(key, provider, console=None):
+///     parts = [f(key), f(b"known"), f(provider)]
+///     if console is None:
+///         parts.append(f(b"no-console"))
+///     else:
+///         parts += [f(b"console"), f(console[0]), f(console[1]), f(console[2])]
+///     return int.from_bytes(hashlib.sha256(b"".join(parts)).digest()[:8], "little")
+/// generic = b"".join([f(b"key-generic"), f(b"generic"), f(b"https://example.com")])
+/// print(known(b"key-ds", b"deepseek", (b"console-token", b"domestic", b"cn-beijing")))
+/// print(known(b"key-zai", b"zai"))
+/// print(known(b"key-alibaba", b"alibaba"))
+/// print(known(b"key-openrouter", b"openrouter"))
+/// print(known(b"key-minimax", b"minimax"))
+/// print(int.from_bytes(hashlib.sha256(generic).digest()[:8], "little"))
+/// ```
+#[test]
+fn the_credential_fingerprint_is_byte_stable() {
+    let known = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from("fp-known"),
+        target: crate::providers::ThirdPartyTarget::Known {
+            provider: crate::providers::Provider::DeepSeek,
+            console: Some(crate::profile::ConsoleCredential {
+                token: "console-token".into(),
+                site: crate::profile::ConsoleSite::Domestic,
+                region: "cn-beijing".into(),
+            }),
+        },
+        api_key: "key-ds".into(),
+        identity: None,
+        epoch_at_spawn: 0,
+    };
+    let zai = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from("fp-zai"),
+        target: crate::providers::ThirdPartyTarget::Known {
+            provider: crate::providers::Provider::Zai,
+            console: None,
+        },
+        api_key: "key-zai".into(),
+        identity: None,
+        epoch_at_spawn: 0,
+    };
+    let alibaba = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from("fp-alibaba"),
+        target: crate::providers::ThirdPartyTarget::Known {
+            provider: crate::providers::Provider::Alibaba,
+            console: None,
+        },
+        api_key: "key-alibaba".into(),
+        identity: None,
+        epoch_at_spawn: 0,
+    };
+    let openrouter = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from("fp-openrouter"),
+        target: crate::providers::ThirdPartyTarget::Known {
+            provider: crate::providers::Provider::OpenRouter,
+            console: None,
+        },
+        api_key: "key-openrouter".into(),
+        identity: None,
+        epoch_at_spawn: 0,
+    };
+    let minimax = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from("fp-minimax"),
+        target: crate::providers::ThirdPartyTarget::Known {
+            provider: crate::providers::Provider::MiniMax,
+            console: None,
+        },
+        api_key: "key-minimax".into(),
+        identity: None,
+        epoch_at_spawn: 0,
+    };
+    let generic = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from("fp-generic"),
+        target: crate::providers::ThirdPartyTarget::Generic {
+            base_url: "https://example.com".into(),
+        },
+        api_key: "key-generic".into(),
+        identity: None,
+        epoch_at_spawn: 0,
+    };
+
+    assert_eq!(known.credential_fingerprint(), 13154461245473617918);
+    assert_eq!(zai.credential_fingerprint(), 17658913403931444822);
+    assert_eq!(alibaba.credential_fingerprint(), 9721452606494246625);
+    assert_eq!(openrouter.credential_fingerprint(), 2700516531537418038);
+    assert_eq!(minimax.credential_fingerprint(), 12723206617646663265);
+    assert_eq!(generic.credential_fingerprint(), 5156188025442888900);
 }
 
 /// A provider store entry whose provider publishes one live 5h bar at `pct`.
