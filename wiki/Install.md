@@ -61,6 +61,8 @@ clauth completions bash             # print the script to stdout instead
 
 `CLAUTH_NO_COMPLETIONS=1` skips the first-run prompt entirely.
 
+`clauth resume` and `clauth info` complete session ids (and `latest`). An install from before this release keeps its old script: run `clauth completions install` once to pick it up.
+
 ## Claude Code plugin
 
 The plugin is a separate step, installed from the TUI's Services tab and covered on [Claude Code plugin](Claude-Code-Plugin). Because that install drives the `claude plugin` CLI, it needs a recent `claude`: an older one fails the install naming the version it wants.
