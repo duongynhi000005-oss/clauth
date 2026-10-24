@@ -17,7 +17,8 @@ use ratatui::widgets::{Block, Paragraph};
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
 use super::format::{
-    NO_DATA, duration_label, fixed, middle_truncate, relative_age, spinner_frame, truncate,
+    NO_DATA, duration_label, fixed, grapheme_cells, middle_truncate, prefix_in_cells, relative_age,
+    spinner_frame, truncate,
 };
 use super::panes::{
     draw_scrollbar, empty_state, follow_scroll_offset, key_cell, master_detail, section_box,
@@ -135,9 +136,20 @@ fn incident_rows(
         None => style,
     };
 
+    // The stacked selector reaches content widths under the 2-cell gutter; the
+    // row keeps its leading indent inside `content_w` rather than overrunning.
+    let gutter = content_w.min(2);
+    let (caret_text, caret_w) = prefix_in_cells(
+        if selected && pane_focused {
+            "❯ "
+        } else {
+            "  "
+        },
+        gutter,
+    );
     let caret = if selected && pane_focused {
         Span::styled(
-            "❯ ",
+            caret_text,
             with_bg(
                 Style::default()
                     .fg(theme::accent_color())
@@ -145,7 +157,7 @@ fn incident_rows(
             ),
         )
     } else {
-        Span::styled("  ", with_bg(Style::default()))
+        Span::styled(caret_text, with_bg(Style::default()))
     };
     // Unselected titles read as primary content (TEXT); the selected one keeps
     // the focused TEXT + bold promotion.
@@ -158,48 +170,102 @@ fn incident_rows(
     } else {
         with_bg(theme::body())
     };
-    let title = truncate(&incident.title, content_w.saturating_sub(2));
+    let title = truncate(&incident.title, content_w.saturating_sub(caret_w));
     let mut line1 = vec![caret, Span::styled(title, title_style)];
     pad_to(&mut line1, content_w, tint);
 
     // Line 2: 2-space gutter + `[ impact ]` pill (severity only, no status
-    // word) + right-aligned age. Ongoing incidents swap the age for a semantic
-    // dot. Fit priority: impact > age/dot.
-    let mut line2: Vec<Span<'static>> = vec![Span::styled("  ", with_bg(Style::default()))];
-    let mut used = 2usize;
+    // word) + right-aligned age. Ongoing incidents swap the age for the phase
+    // colour's `●` beside its word. Ongoing: phase word > impact; resolved:
+    // impact > age.
+    let mut line2: Vec<Span<'static>> =
+        vec![Span::styled(" ".repeat(gutter), with_bg(Style::default()))];
+    let mut used = gutter;
+
+    let active = incident.is_active();
+    let word = if active {
+        Some(incident.phase.word())
+    } else {
+        None
+    };
+    let word_w = word.as_deref().map_or(0, grapheme_cells);
 
     if !matches!(incident.impact, Impact::None) {
         let (iword, icolor) = impact_pill(&incident.impact);
-        line2.extend([
-            Span::styled("[ ", with_bg(theme::dim())),
-            Span::styled(
-                iword.clone(),
-                with_bg(Style::default().fg(icolor).add_modifier(Modifier::BOLD)),
-            ),
-            Span::styled(" ]", with_bg(theme::dim())),
-        ]);
-        used += 2 + iword.chars().count() + 2; // "[ word ]" — no gap before it
+        let pill_w = 2 + grapheme_cells(&iword) + 2; // "[ word ]" — no gap before it
+        // An ongoing row keeps the pill only while the 2-cell gap, `● ` and the
+        // whole phase word still fit after it with the 1-cell right pad; the
+        // word outranks the pill, which drops whole rather than truncating.
+        let pill_fits = content_w.saturating_sub(used + pill_w + (2 + word_w) + 1) >= 2;
+        // A resolved row keeps the pill ahead of the age; a pill that fills the
+        // row exactly stays whole, and the trailing pad cell yields first.
+        let pill_stays_whole = if active {
+            pill_fits
+        } else {
+            used + pill_w <= content_w
+        };
+        if pill_stays_whole {
+            line2.extend([
+                Span::styled("[ ", with_bg(theme::dim())),
+                Span::styled(
+                    iword,
+                    with_bg(Style::default().fg(icolor).add_modifier(Modifier::BOLD)),
+                ),
+                Span::styled(" ]", with_bg(theme::dim())),
+            ]);
+            used += pill_w;
+        } else if !active {
+            // The 4 bracket cells come off the word's budget; the trailing pad
+            // cell yields first, as it does for the age.
+            let budget = content_w.saturating_sub(used + 4);
+            if let Some((cut, cut_w)) =
+                truncate_keeping_a_grapheme(&iword, grapheme_cells(&iword), budget)
+            {
+                used += 4 + cut_w;
+                line2.extend([
+                    Span::styled("[ ", with_bg(theme::dim())),
+                    Span::styled(
+                        cut,
+                        with_bg(Style::default().fg(icolor).add_modifier(Modifier::BOLD)),
+                    ),
+                    Span::styled(" ]", with_bg(theme::dim())),
+                ]);
+            }
+        }
     }
 
-    if incident.is_active() {
-        // Ongoing → semantic dot in place of the age, 1-char right padding.
-        let dot_color = phase_text_color(&incident.phase);
-        let dot = "●";
-        let dot_w = dot.chars().count();
-        // 1-char right pad so pad_to leaves a trailing space when possible.
-        if used + 2 + dot_w <= content_w {
-            let gap = content_w - used - dot_w - 1;
+    if let Some(word) = word {
+        // The gutter and any kept pill are already in `used`; a 2-cell floor
+        // (the 1-cell gap and the 1-cell right pad) and `● ` come off the phase
+        // word's budget.
+        let budget = content_w.saturating_sub(used + 4);
+        let dot = Span::styled(
+            "●",
+            with_bg(
+                Style::default()
+                    .fg(phase_text_color(&incident.phase))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+        if let Some((cut, cut_w)) = truncate_keeping_a_grapheme(&word, word_w, budget) {
+            let gap = content_w.saturating_sub(used + (2 + cut_w) + 1);
             line2.push(Span::styled(" ".repeat(gap), with_bg(Style::default())));
-            line2.push(Span::styled(
-                dot,
-                with_bg(Style::default().fg(dot_color).add_modifier(Modifier::BOLD)),
-            ));
+            line2.push(dot);
+            line2.push(Span::styled(" ", with_bg(Style::default())));
+            line2.push(Span::styled(cut, with_bg(theme::dim())));
+        } else {
+            // Not even one word cell fits: the bare dot, never a lone ellipsis.
+            let gap = content_w.saturating_sub(used + 2);
+            if gap > 0 {
+                line2.push(Span::styled(" ".repeat(gap), with_bg(Style::default())));
+                line2.push(dot);
+            }
         }
     } else {
         let age = relative_age(incident.started_ms);
-        let age_w = age.chars().count();
+        let age_w = grapheme_cells(&age);
         if used + 2 + age_w <= content_w {
-            let gap = content_w - used - age_w - 1;
+            let gap = content_w.saturating_sub(used + age_w + 1);
             line2.push(Span::styled(" ".repeat(gap), with_bg(Style::default())));
             line2.push(Span::styled(age, with_bg(theme::faint())));
         }
@@ -209,10 +275,24 @@ fn incident_rows(
     vec![Line::from(line1), Line::from(line2)]
 }
 
+/// `truncate` to `budget` cells, unless the cut keeps no grapheme of `value`:
+/// `truncate` spends a cell on `…`, so a cut that is only `…` is punctuation
+/// without the thing it truncates.
+fn truncate_keeping_a_grapheme(
+    value: &str,
+    value_w: usize,
+    budget: usize,
+) -> Option<(String, usize)> {
+    let cut = truncate(value, budget);
+    let cut_w = grapheme_cells(&cut);
+    let keeps_a_grapheme = cut_w > 0 && (value_w <= budget || cut != "…");
+    keeps_a_grapheme.then_some((cut, cut_w))
+}
+
 /// Pad a span list with tinted filler so the `BG_HOVER` tint spans the full
 /// content width (the ratatui filler-tint gotcha).
 fn pad_to(spans: &mut Vec<Span<'static>>, content_w: usize, tint: Option<ratatui::style::Color>) {
-    let used: usize = spans.iter().map(Span::width).sum();
+    let used: usize = spans.iter().map(|span| grapheme_cells(&span.content)).sum();
     let pad = content_w.saturating_sub(used);
     if pad > 0 {
         let style = match tint {

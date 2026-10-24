@@ -656,7 +656,11 @@ fn a_three_line_status_viewport_shows_only_whole_incidents() {
     term.draw(|f| super::draw(f, &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(rows[4].contains("incident-11"), "selected title is visible");
-    assert!(rows[5].contains("[ minor ]"), "selected phase is visible");
+    assert_eq!(
+        rows[5].chars().take(22).collect::<String>(),
+        "│        ● monitoring ",
+        "selected phase line is visible"
+    );
     assert!(!rows[6].contains("incident-"), "no orphan title at bottom");
     assert_eq!(app.status.selector.offset.get(), 22);
     assert_eq!(
@@ -673,7 +677,11 @@ fn a_three_line_status_viewport_shows_only_whole_incidents() {
     term.draw(|f| super::draw(f, &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(rows[4].contains("incident-00"), "first title is reachable");
-    assert!(rows[5].contains("[ minor ]"), "first phase is visible");
+    assert_eq!(
+        rows[5].chars().take(22).collect::<String>(),
+        "│        ● monitoring ",
+        "first phase line is visible"
+    );
     assert!(
         !rows[6].contains("incident-"),
         "bottom stays whole at the top"
