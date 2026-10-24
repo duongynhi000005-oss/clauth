@@ -1412,9 +1412,7 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
         let readings = match reset_in.map(|secs| crate::usage::UsageInfo {
             five_hour: Some(crate::usage::UsageWindow {
                 utilization: 0.0,
-                resets_at: Some(crate::usage::epoch_secs_to_iso(
-                    crate::usage::now_epoch_secs() + secs,
-                )),
+                resets_at: Some(crate::testutil::countdown_reset_in(secs)),
             }),
             ..Default::default()
         }) {
@@ -1462,7 +1460,7 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
 
     // Gate and own reset tie: either estimate reads the same value.
     assert_eq!(
-        lines_of(true, Some(8880), slot(Some(8880)))[0],
+        lines_of(true, Some(8880), slot(Some(8910)))[0],
         row("usage auto-start in 2h 28m")
     );
 

@@ -2331,11 +2331,23 @@ pub(crate) fn bar_reset_in(
     secs_in_future: i64,
 ) -> crate::providers::UsageBar {
     crate::providers::UsageBar {
-        resets_at: Some(crate::usage::epoch_secs_to_iso(
-            crate::usage::now_epoch_secs() + secs_in_future,
-        )),
+        resets_at: Some(reset_in(secs_in_future)),
         ..bar(label, pct)
     }
+}
+
+/// ISO reset `secs` in the future, exactly — for a fixture whose expectation
+/// depends on the exact instant (elapsed or remaining time).
+pub(crate) fn reset_in(secs: i64) -> String {
+    crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + secs)
+}
+
+/// ISO reset `secs` in the future, nudged 30 s into its minute so a floored
+/// countdown keeps its text when a clock second ticks between the fixture and
+/// the draw. A span under 5 min renders seconds, which no offset stabilises.
+pub(crate) fn countdown_reset_in(secs: i64) -> String {
+    let mid_bucket = if secs >= 300 && secs % 60 == 0 { 30 } else { 0 };
+    reset_in(secs + mid_bucket)
 }
 
 /// The walk fixture reviewer A's r3 probe used: `act` and `ok` are OAuth

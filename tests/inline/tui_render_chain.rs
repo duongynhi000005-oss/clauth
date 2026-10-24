@@ -8,21 +8,17 @@ fn snap_with_usage(mut s: ReadingsSnapshot, name: &str, u: UsageInfo) -> Reading
     s
 }
 use crate::profile::{AppState, Profile, ProfileName};
-use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+use crate::testutil::countdown_reset_in;
+use crate::usage::{UsageInfo, UsageWindow, now_epoch_secs};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::collections::BTreeMap;
-
-/// ISO reset `secs` in the future.
-fn reset_in(secs: i64) -> String {
-    epoch_secs_to_iso(now_epoch_secs() + secs)
-}
 
 fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, ReadingsSnapshot) {
     let usage = UsageInfo {
         five_hour: Some(UsageWindow {
             utilization: util,
-            resets_at: Some(reset_in(reset_secs)),
+            resets_at: Some(countdown_reset_in(reset_secs)),
         }),
         ..UsageInfo::default()
     };
@@ -763,13 +759,13 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
         if let Some(u) = p_readings.usage.get_mut("a") {
             u.seven_day = Some(UsageWindow {
                 utilization: 40.0,
-                resets_at: Some(reset_in(5 * 86_400)),
+                resets_at: Some(countdown_reset_in(5 * 86_400)),
             });
             u.weekly_scoped = vec![crate::usage::ScopedWindow {
                 label: "7d fable".to_string(),
                 window: UsageWindow {
                     utilization: 100.0,
-                    resets_at: Some(reset_in(5 * 86_400)),
+                    resets_at: Some(countdown_reset_in(5 * 86_400)),
                 },
             }];
         }
@@ -1523,19 +1519,10 @@ fn blocked_member_shows_the_worst_reason_pill() {
     )
     .0;
     let pill = line_text(&lines[0]);
-    assert!(pill.contains('['), "renders as a status pill: {pill:?}");
-    assert!(
-        pill.contains("5h 97%"),
-        "names the 5h block with %: {pill:?}"
+    assert_eq!(
+        pill, "status          [ 5h 97% ]  2h 0m",
+        "worst-reason pill with its trailing reset countdown"
     );
-    // Tolerant on the exact bucket: the fixture's `now` and `blocked_reason`'s
-    // `now` can straddle a whole second (7200 → "1h 59m"), so assert only that a
-    // countdown suffix trails the pill, not its value.
-    assert!(
-        pill.contains("[ 5h 97% ]  "),
-        "carries the reset countdown as a trailing suffix: {pill:?}"
-    );
-    assert!(!pill.contains('·'), "no middle-dot separator: {pill:?}");
 }
 
 // A switch-grade kick-rejected member — headroom, but the messages limiter won't
@@ -1543,7 +1530,7 @@ fn blocked_member_shows_the_worst_reason_pill() {
 #[test]
 fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
     let (cfg, readings) = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
-    let until = now_epoch_secs() + 7200;
+    let until = now_epoch_secs() + 7230;
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
@@ -1558,15 +1545,12 @@ fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
     .0;
     let pill = line_text(&lines[0]);
     // Bare pill + a faint countdown suffix OUTSIDE the brackets (no `·`), the
-    // same shape the Usage-tab kick pill renders. The exact bucket stays tolerant
-    // since the two `now` reads (fixture vs `blocked_reason`) can straddle a whole
-    // second. The exact `lifts_in` value is range-checked in the
-    // `blocked_reason_kick_*` unit test instead.
-    assert!(
-        pill.contains("[ claude code blocked ]  "),
-        "renders the kick pill with a trailing lift countdown: {pill:?}"
+    // same shape the Usage-tab kick pill renders. The lift sits 30 s into its
+    // minute so the floored countdown holds across a clock tick.
+    assert_eq!(
+        pill, "status          [ claude code blocked ]  2h 0m",
+        "kick pill with its trailing lift countdown"
     );
-    assert!(!pill.contains('·'), "no middle-dot separator: {pill:?}");
 }
 
 // The canceled pill reads the short shared label, not the old verbose
@@ -4090,13 +4074,13 @@ fn p1_scoped_app(label: &str) -> App {
     if let Some(u) = readings.usage.get_mut("alpha") {
         u.seven_day = Some(UsageWindow {
             utilization: 10.0,
-            resets_at: Some(reset_in(5 * 86_400)),
+            resets_at: Some(countdown_reset_in(5 * 86_400)),
         });
         u.weekly_scoped = vec![crate::usage::ScopedWindow {
             label: label.to_string(),
             window: UsageWindow {
                 utilization: 73.42,
-                resets_at: Some(reset_in(5 * 86_400)),
+                resets_at: Some(countdown_reset_in(5 * 86_400)),
             },
         }];
     }

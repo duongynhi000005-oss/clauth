@@ -847,10 +847,7 @@ fn wrap_off_disabled_stays_put() {
 // member that resumes soonest, valid only when EVERY member is currently
 // exhausted.
 
-/// ISO reset `secs` in the future.
-fn reset_in(secs: i64) -> String {
-    epoch_secs_to_iso(now_epoch_secs() + secs)
-}
+use crate::testutil::reset_in;
 
 #[test]
 fn soonest_resume_empty_chain_is_none() {

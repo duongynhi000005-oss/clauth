@@ -3990,11 +3990,11 @@ fn overview_reset_column_never_loses_ground_to_the_clock_setting() {
     let info = crate::usage::UsageInfo {
         five_hour: Some(crate::usage::UsageWindow {
             utilization: 40.0,
-            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600)),
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600 + 1800)),
         }),
         seven_day: Some(crate::usage::UsageWindow {
             utilization: 60.0,
-            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400)),
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400 + 43200)),
         }),
         ..Default::default()
     };
@@ -4009,7 +4009,7 @@ fn overview_reset_column_never_loses_ground_to_the_clock_setting() {
     app.tab = Tab::Overview;
 
     // The reset cell is whatever sits in parens after a bar's `%`, so this counts
-    // it in every shape — `(3h 0m)`, `(22:50)`, `(thu 19:50)`, `(3h 0m · 22:50)`.
+    // it in every shape — `(3h 30m)`, `(22:50)`, `(thu 19:50)`, `(3h 30m · 22:50)`.
     let reset_cell = regex::Regex::new(r"% \([^)]+\)").expect("valid pattern");
     let stamped = regex::Regex::new(r"· \d\d:\d\d\)").expect("valid pattern");
 

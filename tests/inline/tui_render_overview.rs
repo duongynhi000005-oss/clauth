@@ -8,7 +8,8 @@ use ratatui::style::Modifier;
 
 use crate::fallback::BlockedReason;
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, ProfileName};
-use crate::usage::{FetchLeg, FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
+use crate::testutil::{countdown_reset_in, reset_in};
+use crate::usage::{FetchLeg, FetchStatus, UsageInfo};
 use std::collections::BTreeMap;
 
 /// Build a `ReadingsSnapshot` seed the render helpers read, keyed by name.
@@ -23,11 +24,6 @@ fn snap_with_stats(
 ) -> ReadingsSnapshot {
     s.third_party.insert(name.to_string(), st);
     s
-}
-
-/// ISO reset `secs` in the future.
-fn reset_in(secs: i64) -> String {
-    epoch_secs_to_iso(now_epoch_secs() + secs)
 }
 
 /// A slow burner whose reset lands well before it would top out reads as a
@@ -407,7 +403,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
     let usage = UsageInfo {
         five_hour: Some(UsageWindow {
             utilization: util,
-            resets_at: Some(reset_in(reset_secs)),
+            resets_at: Some(countdown_reset_in(reset_secs)),
         }),
         ..UsageInfo::default()
     };
@@ -1715,7 +1711,7 @@ fn a_narrow_pane_hiding_the_7d_column_leaves_a_7d_only_row_unmarked() {
     let seven_only = UsageInfo {
         seven_day: Some(UsageWindow {
             utilization: 30.0,
-            resets_at: Some(reset_in(3 * 86_400)),
+            resets_at: Some(countdown_reset_in(3 * 86_400)),
         }),
         ..UsageInfo::default()
     };
@@ -2351,7 +2347,7 @@ fn live_cell_stays_under_header_when_7d_reset_is_two_digit_hours() {
         // 37200s = 10h 20m → `humanize_duration` emits the 7-char form.
         usage.seven_day = Some(UsageWindow {
             utilization: 95.0,
-            resets_at: Some(reset_in(37_200)),
+            resets_at: Some(countdown_reset_in(37_200)),
         });
     }
     let (config, readings) = config_with(vec![(p, p_readings)], Some("main"), vec![]);
