@@ -695,7 +695,7 @@ fn an_unmeasured_chain_member_is_marked_on_the_overview_chain_row() {
 // ── overview row state cues ──────────────────────────────────────────────
 
 /// Marker column: a broken login (×) outranks both the bell (!) and the
-/// active dot (●) — usage alerts are moot until re-login.
+/// active mark (✻) — usage alerts are moot until re-login.
 #[test]
 fn broken_login_marker_outranks_bell_and_active() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -710,7 +710,7 @@ fn broken_login_marker_outranks_bell_and_active() {
     let text = line_text(&line);
     assert!(text.contains('×'), "broken login renders ×: {text}");
     assert!(!text.contains('!'), "bell yields to ×: {text}");
-    assert!(!text.contains('●'), "active dot yields to ×: {text}");
+    assert!(!text.contains('✻'), "active mark yields to ×: {text}");
     let marker = line.spans.iter().find(|s| s.content == "×").unwrap();
     assert_eq!(marker.style.fg, theme::danger().fg);
 }
@@ -730,7 +730,7 @@ fn bell_marker_shows_when_login_is_fine() {
     assert!(!text.contains('×'), "{text}");
 }
 
-/// A dead / mis-filled long-lived token (⊘) outranks bell (!) and active (●):
+/// A dead / mis-filled long-lived token (⊘) outranks bell (!) and active (✻):
 /// the next switch would sign sessions out, so it beats a usage alert.
 #[test]
 fn token_danger_marker_outranks_bell_and_active() {
@@ -747,13 +747,13 @@ fn token_danger_marker_outranks_bell_and_active() {
     let text = line_text(&line);
     assert!(text.contains('⊘'), "mis-filled token renders ⊘: {text}");
     assert!(!text.contains('!'), "bell yields to ⊘: {text}");
-    assert!(!text.contains('●'), "active dot yields to ⊘: {text}");
+    assert!(!text.contains('✻'), "active mark yields to ⊘: {text}");
     let marker = line.spans.iter().find(|s| s.content == "⊘").unwrap();
     assert_eq!(marker.style.fg, theme::danger().fg);
 }
 
 /// A canceled subscription (⊖) is dead-first: the org 403s every request, so it
-/// outranks the broken-login ×, the token ⊘, the bell !, and the active ● all at
+/// outranks the broken-login ×, the token ⊘, the bell !, and the active ✻ all at
 /// once (matching the Fallback ladder where `Canceled` beats `AuthBroken`). The
 /// auth_broken + bell + active fixture proves the canceled arm fires FIRST — if it
 /// yielded, the × would show instead. `⊖` is shared with `Disabled` and split on
@@ -780,7 +780,7 @@ fn canceled_marker_is_dead_first() {
     assert!(text.contains('⊖'), "canceled renders ⊖: {text}");
     assert!(!text.contains('×'), "broken login yields to ⊖: {text}");
     assert!(!text.contains('!'), "bell yields to ⊖: {text}");
-    assert!(!text.contains('●'), "active dot yields to ⊖: {text}");
+    assert!(!text.contains('✻'), "active mark yields to ⊖: {text}");
     let marker = line.spans.iter().find(|s| s.content == "⊖").unwrap();
     assert_eq!(marker.style.fg, theme::danger().fg);
 }
@@ -2296,9 +2296,10 @@ fn live_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
 
 /// The column answers "how many `clauth start` sessions are on this account",
 /// with `⇄` marking that at least one of them can be moved by the chain. It is
-/// DISTINCT from the leading `●`, which marks the one profile a bare `claude`
-/// authenticates as — an account can carry either, both, or neither. That split
-/// is why the header reads `live`: `active` is the `●` sense app-wide.
+/// DISTINCT from the leading active mark (✻), which names the one profile a bare
+/// `claude` authenticates as — an account can carry either, both, or neither.
+/// That split is why the header reads `live`: `active` is the mark's sense
+/// app-wide.
 #[test]
 fn the_live_column_counts_live_sessions_and_marks_chain_followers() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -4062,8 +4063,8 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
     );
     assert_eq!(
         live_text[..name_col + 3].iter().collect::<String>(),
-        "    cx2",
-        "a live chain keeps the blank marker cell"
+        "  ⏣ cx2",
+        "the active account's codex mark takes the marker cell"
     );
     let glyph = broken
         .spans
@@ -4075,6 +4076,28 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
         theme::danger().fg,
         "the broken glyph carries the same danger hue as the claude marker"
     );
+
+    // The dead credential outranks the active mark: an account that is both
+    // active and quarantined keeps its `×`.
+    let active_broken = render_codex_row(
+        &CodexRow {
+            active: true,
+            ..rows[0].clone()
+        },
+        &widths,
+        false,
+    );
+    let text = line_text(&active_broken);
+    assert!(
+        !text.contains('⏣'),
+        "a quarantined chain hides the codex mark: {text}"
+    );
+    let glyph = active_broken
+        .spans
+        .iter()
+        .find(|s| s.content.as_ref() == "×")
+        .expect("an active quarantined row keeps its broken glyph");
+    assert_eq!(glyph.style.fg, theme::danger().fg);
 }
 
 /// The 7d cell text, padding included, under the `7d` header; empty when the
@@ -4216,10 +4239,10 @@ fn peak_profile(name: &str) -> (Profile, ReadingsSnapshot) {
     (p, p_readings)
 }
 
-/// An active profile on peak hours keeps its `●` — the active dot outranks
+/// An active profile on peak hours keeps its `✻` — the active mark outranks
 /// the peak marker, so `▲` never takes its slot.
 #[test]
-fn active_dot_outranks_the_peak_marker() {
+fn active_mark_outranks_the_peak_marker() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let (config, readings) = config_with(vec![peak_profile("a")], Some("a"), vec![]);
@@ -4228,12 +4251,12 @@ fn active_dot_outranks_the_peak_marker() {
     let widths = OverviewWidths::new(80, &app, &readings);
     let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let text = line_text(&line);
-    assert!(text.contains('●'), "active peak row keeps ●: {text}");
+    assert!(text.contains('✻'), "active peak row keeps ✻: {text}");
     assert!(
         !text.contains('▲'),
-        "the dot outranks the peak marker: {text}"
+        "the mark outranks the peak marker: {text}"
     );
-    let marker = line.spans.iter().find(|s| s.content == "●").unwrap();
+    let marker = line.spans.iter().find(|s| s.content == "✻").unwrap();
     assert_eq!(marker.style.fg, Some(theme::accent_2_color()));
 }
 
@@ -4255,8 +4278,8 @@ fn peak_marker_renders_on_inactive_rows() {
     let text = line_text(&line);
     assert!(text.contains('▲'), "inactive peak row renders ▲: {text}");
     assert!(
-        !text.contains('●'),
-        "no active dot on the inactive row: {text}"
+        !text.contains('✻'),
+        "no active mark on the inactive row: {text}"
     );
     let marker = line.spans.iter().find(|s| s.content == "▲").unwrap();
     assert_eq!(marker.style.fg, theme::warning().fg);
@@ -4286,9 +4309,9 @@ fn disabled_peak_row_dims_the_marker() {
 }
 
 /// A profile whose window is never active (off-peak by fixture) keeps its
-/// `●` and renders no `▲` — off-peak is the resting state and stays clean.
+/// `✻` and renders no `▲` — off-peak is the resting state and stays clean.
 #[test]
-fn off_peak_row_keeps_the_active_dot() {
+fn off_peak_row_keeps_the_active_mark() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     // An empty window ("12:00"–"12:00") is active at no hour.
@@ -4299,7 +4322,7 @@ fn off_peak_row_keeps_the_active_dot() {
     let text = line_text(&render_overview_row(
         &app, 0, &widths, false, true, &readings,
     ));
-    assert!(text.contains('●'), "off-peak active row keeps ●: {text}");
+    assert!(text.contains('✻'), "off-peak active row keeps ✻: {text}");
     assert!(!text.contains('▲'), "no peak marker off-peak: {text}");
 }
 
@@ -4335,7 +4358,7 @@ fn no_table_no_peak_marker() {
         &app, 0, &widths, false, true, &readings,
     ));
     assert!(!text.contains('▲'), "no table, no marker: {text}");
-    assert!(text.contains('●'), "the active dot is untouched: {text}");
+    assert!(text.contains('✻'), "the active mark is untouched: {text}");
 }
 
 // ── the accounts scrollbar measures every row the panel renders ───────────────
@@ -5334,7 +5357,7 @@ fn a_hybrids_overview_bar_shows_the_provider_percentage() {
     let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let text = line_text(&line);
     assert_eq!(
-        text, "  ● h             API                [█░░░░░░░░░] 10%       —              ",
+        text, "  ✻ h             API                [█░░░░░░░░░] 10%       —              ",
         "the hybrid's Overview row renders the provider percentage"
     );
 }
@@ -5907,4 +5930,431 @@ fn the_overview_row_never_exceeds_the_pane_in_any_reset_mode() {
             }
         }
     }
+}
+
+// ── active-account marks ─────────────────────────────────────────────────────
+
+/// A tps snapshot stamped now whose only account `name` consumes `rate`.
+fn burning_snapshot(name: &str, rate: f64) -> crate::tps::Snapshot {
+    let stamp =
+        chrono::DateTime::from_timestamp_millis(i64::try_from(crate::usage::now_ms()).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string();
+    let figures = crate::tps::Figures {
+        live: crate::tps::Figure {
+            rate,
+            speed: Some(40.0),
+        },
+        ..crate::tps::Figures::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        total: figures,
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert(name.into(), figures);
+    snap
+}
+
+const CLAUDE_WORKING_FRAMES: [&str; 6] = ["·", "✢", "*", "✶", "✻", "✽"];
+
+#[test]
+fn the_active_claude_row_rests_on_the_claude_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let text = line_text(&line);
+    assert!(!text.contains('●'), "the active dot is gone: {text}");
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| s.content == "✻")
+        .unwrap_or_else(|| panic!("an idle active claude row carries `✻`: {text}"));
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+
+    // Only a FRESH snapshot with a positive rate moves the mark. `0` at T=0
+    // would draw the cycle's first frame, so a mutant keyed on the snapshot's
+    // presence or on `speed` reds here instead of resting on `✻`.
+    app.tps = Some(snapshot_stamped_at(0, "a", 0.0));
+    app.tps_now_override = Some(0);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    assert!(
+        line.spans.iter().any(|s| s.content == "✻"),
+        "a fresh rate of 0 spends nothing: {}",
+        line_text(&line)
+    );
+
+    // A stale snapshot cannot claim spending either; its T=30 s frame is `·`.
+    app.tps = Some(snapshot_stamped_at(0, "a", 120.0));
+    app.tps_now_override = Some(crate::tps::STALE_AFTER_MS + 1);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    assert!(
+        line.spans.iter().any(|s| s.content == "✻"),
+        "a stale snapshot rests on `✻`: {}",
+        line_text(&line)
+    );
+}
+
+#[test]
+fn the_active_claude_row_animates_while_its_account_burns_tokens() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.tps = Some(snapshot_stamped_at(0, "a", 120.0));
+    // 448 ms snaps to itself and lands on index 2 (`*`), two frames from the
+    // rest glyph at index 4, so a mark that never moves reds here.
+    app.tps_now_override = Some(448);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let text = line_text(&line);
+    assert!(!text.contains('●'), "the active dot is gone: {text}");
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref()))
+        .unwrap_or_else(|| panic!("a burning active claude row draws a working frame: {text}"));
+    assert_ne!(
+        mark.content.as_ref(),
+        "✻",
+        "a burning account's mark moves off the rest glyph: {text}"
+    );
+    assert_eq!(
+        mark.content.as_ref(),
+        "*",
+        "448 ms into the cycle is its third frame: {text}"
+    );
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+}
+
+#[test]
+fn an_inactive_claude_row_draws_no_active_mark_while_its_account_burns() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(
+        vec![
+            profile("a", 80.0, 10.0, 3600),
+            profile("b", 80.0, 10.0, 3600),
+        ],
+        Some("a"),
+        vec![],
+    );
+    let mut app = App::new(config);
+    app.tps = Some(burning_snapshot("b", 120.0));
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 1, &widths, false, true, &readings);
+    let text = line_text(&line);
+    assert!(
+        !line
+            .spans
+            .iter()
+            .any(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref()) || s.content == "●"),
+        "only the active account carries the mark: {text}"
+    );
+}
+
+#[test]
+fn the_active_codex_row_carries_the_codex_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let row = CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: true,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    };
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_codex_row(&row, &widths, false);
+    let text = line_text(&line);
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| s.content == "⏣")
+        .unwrap_or_else(|| panic!("the active codex row carries `⏣`: {text}"));
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+    let inactive = render_codex_row(
+        &CodexRow {
+            active: false,
+            ..row
+        },
+        &widths,
+        false,
+    );
+    assert!(
+        !line_text(&inactive).contains('⏣'),
+        "an inactive codex row carries no mark: {}",
+        line_text(&inactive)
+    );
+}
+
+#[test]
+fn a_switching_rows_spinner_turns_orange() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![polled("a", 80.0, 10.0, 3600)], None, vec![]);
+    let app = App::new(config);
+    crate::usage::mark_activity(
+        &app.activity,
+        &ProfileName::from("a"),
+        crate::usage::ProfileActivity::Switching,
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let spinner = line
+        .spans
+        .iter()
+        .find(|s| {
+            crate::spinner::SPINNER_FRAMES
+                .iter()
+                .any(|f| s.content.contains(f))
+        })
+        .unwrap_or_else(|| panic!("a switching row spins: {}", line_text(&line)));
+    assert_eq!(spinner.style.fg, Some(theme::accent_2_color()));
+}
+
+/// A tps snapshot generated at an explicit epoch millisecond, so a test can
+/// pin the shared tps clock and still have the snapshot read fresh.
+fn snapshot_stamped_at(stamp_ms: i64, name: &str, rate: f64) -> crate::tps::Snapshot {
+    let stamp = chrono::DateTime::from_timestamp_millis(stamp_ms)
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+        .to_string();
+    let figures = crate::tps::Figures {
+        live: crate::tps::Figure {
+            rate,
+            speed: Some(40.0),
+        },
+        ..crate::tps::Figures::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        total: figures,
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert(name.into(), figures);
+    snap
+}
+
+#[test]
+fn the_active_shunt_row_carries_the_gateway_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.shunt_mark.names = vec!["a".to_string()];
+    // A burning shunt-backed account still shows the static mark: the
+    // membership test outranks the working line.
+    app.tps = Some(burning_snapshot("a", 120.0));
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let text = line_text(&line);
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| s.content == "⥋")
+        .unwrap_or_else(|| panic!("an active shunt-backed row carries `⥋`: {text}"));
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+    assert!(
+        !line
+            .spans
+            .iter()
+            .any(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref())),
+        "the shunt mark is static, never the working line: {text}"
+    );
+}
+
+#[test]
+fn the_working_line_takes_the_ghostty_frames_on_a_ghostty_terminal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.tps_now_override = Some(448);
+    app.tps = Some(snapshot_stamped_at(448, "a", 120.0));
+    let frame = |app: &App| -> Option<String> {
+        let widths = OverviewWidths::new(80, app, &readings);
+        render_overview_row(app, 0, &widths, false, true, &readings)
+            .spans
+            .iter()
+            .find(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref()) || s.content == "✳")
+            .map(|s| s.content.to_string())
+    };
+    assert_eq!(
+        frame(&app).as_deref(),
+        Some("*"),
+        "448 ms into the cycle on a default terminal"
+    );
+    {
+        let _ghostty = crate::testutil::GhosttySandbox::new(true);
+        assert_eq!(
+            frame(&app).as_deref(),
+            Some("✳"),
+            "the same moment on the ghostty set"
+        );
+    }
+    assert_eq!(
+        frame(&app).as_deref(),
+        Some("*"),
+        "the guard puts the default family back"
+    );
+}
+
+/// The store is written by every mint, revoke and rename path (the Setup form,
+/// the Services card, the CLI), so the mark follows the file itself: a write
+/// made off the Services card shows on the next tick with no Services visit.
+#[test]
+fn the_shunt_mark_follows_the_token_store_on_the_next_tick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.bootstrap_started = true;
+    app.tab = crate::tui::app::Tab::Overview;
+    let marked = |app: &App| {
+        let widths = OverviewWidths::new(80, app, &readings);
+        render_overview_row(app, 0, &widths, false, true, &readings)
+            .spans
+            .iter()
+            .any(|s| s.content == "⥋")
+    };
+    assert!(!marked(&app), "no token held: no shunt mark");
+    let store = crate::gateway_tokens::store_path().unwrap();
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    // Every write stamps an explicit instant, so no leg rests on the wall clock
+    // or on the filesystem's mtime granule.
+    let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    std::fs::write(&store, "[tokens]\na = \"t\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base);
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        marked(&app),
+        "a token written off the Services card marks the row on the next tick"
+    );
+    std::fs::write(&store, "[tokens]\nb = \"t\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base + std::time::Duration::from_secs(5));
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        !marked(&app),
+        "a token renamed away from the account drops its mark on the next tick"
+    );
+    // A stamp that moved BACK still re-reads: a clock step back or an
+    // mtime-preserving restore must not leave a stale mark.
+    std::fs::write(&store, "[tokens]\na = \"t\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base);
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        marked(&app),
+        "an older store stamp still re-reads the names"
+    );
+    // A store that disappears drops the cached names.
+    std::fs::remove_file(&store).unwrap();
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        !marked(&app),
+        "a deleted store drops the names on the next tick"
+    );
+    // The same mtime with contents of another length: the length moves the
+    // stamp where the mtime cannot.
+    std::fs::write(&store, "[tokens]\na = \"t\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base);
+    crate::tui::app::on_tick(&mut app);
+    assert!(marked(&app), "the restored store marks the row again");
+    std::fs::write(&store, "[tokens]\nb = \"tok\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base);
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        !marked(&app),
+        "an equal-mtime write of another length re-reads the names"
+    );
+    // The store's own writer renames a fresh file onto the path: on unix that
+    // new inode moves the stamp even at the same mtime and the same length.
+    #[cfg(unix)]
+    {
+        let before = std::fs::metadata(&store).unwrap();
+        let fresh = store.with_extension("tmp");
+        std::fs::write(&fresh, "[tokens]\na = \"tok\"\n").unwrap();
+        crate::testutil::set_mtime(&fresh, base);
+        std::fs::rename(&fresh, &store).unwrap();
+        let after = std::fs::metadata(&store).unwrap();
+        assert_eq!(after.len(), before.len(), "precondition: the same length");
+        assert_eq!(
+            after.modified().unwrap(),
+            before.modified().unwrap(),
+            "precondition: the same mtime"
+        );
+        crate::tui::app::on_tick(&mut app);
+        assert!(
+            marked(&app),
+            "a same-mtime same-length rename onto the store re-reads the names"
+        );
+    }
+}
+
+#[test]
+fn a_burning_rows_mark_advances_with_the_working_clock() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.tps_now_override = Some(0);
+    app.tps = Some(snapshot_stamped_at(0, "a", 120.0));
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let frame_at = |app: &App| {
+        let line = render_overview_row(app, 0, &widths, false, true, &readings);
+        line.spans
+            .iter()
+            .find(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref()))
+            .map(|s| s.content.to_string())
+    };
+    assert_eq!(
+        frame_at(&app).as_deref(),
+        Some("·"),
+        "the cycle starts on its first frame"
+    );
+    app.tps_now_override = Some(640);
+    assert_eq!(
+        frame_at(&app).as_deref(),
+        Some("✻"),
+        "640 ms into the cycle is its eased crest"
+    );
+}
+
+#[test]
+fn the_active_shunt_mark_reads_the_client_token_store_at_startup() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let dir = crate::profile::clauth_dir().expect("the sandbox's clauth dir");
+    std::fs::create_dir_all(&dir).expect("create the clauth dir");
+    std::fs::write(
+        dir.join("gateway-client-tokens.toml"),
+        "[tokens]\na = \"tok\"\n",
+    )
+    .expect("seed the client-token store");
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| s.content == "⥋")
+        .unwrap_or_else(|| {
+            panic!(
+                "construction seeds the shunt mark from the store: {}",
+                line_text(&line)
+            )
+        });
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
 }

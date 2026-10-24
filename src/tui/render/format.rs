@@ -597,7 +597,8 @@ pub(super) fn spinner_frame(tick: u64) -> &'static str {
 pub(super) fn spinner_style(activity: ProfileActivity) -> Style {
     match activity {
         ProfileActivity::Fetching => theme::accent(),
-        ProfileActivity::Refreshing | ProfileActivity::Switching => theme::info(),
+        ProfileActivity::Switching => Style::default().fg(theme::accent_2_color()),
+        ProfileActivity::Refreshing => theme::info(),
         ProfileActivity::Queued | ProfileActivity::Idle => theme::faint(),
     }
 }

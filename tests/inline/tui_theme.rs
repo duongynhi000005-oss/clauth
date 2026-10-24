@@ -138,3 +138,31 @@ fn nearest_index_matches_the_grayscale_surfaces() {
     assert_eq!(super::nearest_index((20, 20, 32)), 234);
     assert_eq!(super::nearest_index((23, 23, 34)), 234);
 }
+
+/// Claude Code's working-line mark: six frames, eased by
+/// `round((1 - cos(2πT/2000)) / 2 · 5)` over a 2 s period, T snapped down to
+/// 64 ms. Expected frames worked by hand from that formula.
+#[test]
+fn the_active_claude_frame_follows_the_eased_two_second_cycle() {
+    let frame = |ms| super::active_claude_frame(ms, false);
+    // T=0: (1-1)/2*5 = 0.
+    assert_eq!(frame(0), "·");
+    // T=63 snaps to 0.
+    assert_eq!(frame(63), "·");
+    // T=250 snaps DOWN to 192: cos(2π·0.096) = 0.823 -> 0.44 -> 0. An unsnapped
+    // or nearest-snapped T lands on index 1 instead, so this pins the direction.
+    assert_eq!(frame(250), "·");
+    // T=640: cos(2π·0.32) = -0.426 -> 3.56 -> 4.
+    assert_eq!(frame(640), "✻");
+    // T=1000 snaps to 960: cos(2π·0.48) = -0.992 -> 4.98 -> 5.
+    assert_eq!(frame(1000), "✽");
+    // T=1216: cos(2π·0.608) = -0.780 -> 4.45 -> 4, on the way back.
+    assert_eq!(frame(1216), "✻");
+    // T=448: cos(2π·0.224) = 0.163 -> 2.09 -> 2, the default terminals' ASCII frame.
+    assert_eq!(frame(448), "*");
+    // T=2000 wraps to the cycle start.
+    assert_eq!(frame(2000), "·");
+    // xterm-ghostty draws its own array: `✳` in place of `*`, `✻` twice at the end.
+    assert_eq!(super::active_claude_frame(448, true), "✳");
+    assert_eq!(super::active_claude_frame(1000, true), "✻");
+}

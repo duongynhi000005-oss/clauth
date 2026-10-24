@@ -1225,10 +1225,10 @@ fn bar_width_for(inner_w: u16, max_trailing: usize) -> usize {
 }
 
 /// The usage bar: `filled` █ cells in `fill`, the rest ░, with an optional `│`
-/// ideal-pace marker at `marker_col`. The marker reads WARNING once the fill has
-/// passed it (usage running ahead of an even spread) and faint while the fill is
-/// still behind it. Drawn over the bar so a wide fill never hides it — the
-/// horizontal twin of `chain::gauge_with_tick`.
+/// ideal-pace marker at `marker_col`. The marker reads DANGER once the fill has
+/// reached its column (usage running ahead of an even spread) and faint while
+/// the fill is still behind it. Drawn over the bar so a wide fill never hides
+/// it — the horizontal twin of `chain::gauge_with_tick`.
 fn bar_spans(
     filled: usize,
     bar_width: usize,
@@ -1249,7 +1249,7 @@ fn bar_spans(
     let mut spans = Vec::with_capacity(4);
     if m < filled {
         spans.extend(run("█", m, fill));
-        spans.push(Span::styled("│".to_string(), theme::warning()));
+        spans.push(Span::styled("│".to_string(), theme::danger()));
         spans.extend(run("█", filled - m - 1, fill));
         spans.extend(run("░", empty, theme::line_strong()));
     } else {

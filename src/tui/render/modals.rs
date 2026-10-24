@@ -2241,9 +2241,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 /// Legend for the 1-cell marks the account surfaces carry, with no key of their
-/// own to document them: the Overview row's leading `●` and `⇄`, the Overview
-/// chain's projected-switch `↲`, every blocked-reason marker on the Fallback
-/// chain, and the Services selector's trailing `f`.
+/// own to document them: the Overview row's leading active marks and `⇄`, the
+/// Overview chain's projected-switch `↲`, every blocked-reason marker on the
+/// Fallback chain, and the Services selector's trailing `f`.
 ///
 /// Each blocked-reason row takes its glyph AND its hue from [`reason_marker`]
 /// itself, so the legend cannot drift from what the chain renders. `⊖` and `⊘`
@@ -2253,11 +2253,12 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// tells its two senses apart.
 fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
     let reason = |r: BlockedReason, desc| (reason_marker(&r), desc);
+    let active =
+        |mark: &'static str| Span::styled(mark, Style::default().fg(theme::accent_2_color()));
     vec![
-        (
-            Span::styled("\u{25cf}", Style::default().fg(theme::accent_2_color())),
-            "the active account",
-        ),
+        (active(theme::active_claude_rest()), "active claude account"),
+        (active(theme::active_codex_mark()), "active codex account"),
+        (active(theme::active_shunt_mark()), "active, via shunt"),
         (
             Span::styled("\u{21c4}", theme::dim()),
             "a live session here follows the fallback chain",

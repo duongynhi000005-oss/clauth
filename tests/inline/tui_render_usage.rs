@@ -5117,3 +5117,56 @@ fn the_usage_footer_offers_notes_on_claude_rows_only() {
     t6_down(&mut app);
     assert!(!footer(&app).contains("note"), "pool row: {}", footer(&app));
 }
+
+#[test]
+fn the_pace_marker_turns_danger_once_the_fill_covers_its_column() {
+    let fill = Style::default().fg(theme::warning_color());
+    let marker = |spans: &[Span<'_>]| {
+        spans
+            .iter()
+            .find(|s| s.content == "│")
+            .map(|s| s.style.fg)
+            .expect("the marker renders")
+    };
+    // 6 of 10 cells filled, marker in column 3: covered, so DANGER over the fill.
+    assert_eq!(
+        marker(&bar_spans(6, 10, fill, Some(3))),
+        Some(theme::danger_color())
+    );
+    // marker in column 6, the first empty cell: not reached, so it stays dim.
+    assert_eq!(
+        marker(&bar_spans(6, 10, fill, Some(6))),
+        Some(theme::text_dim_color())
+    );
+}
+
+#[test]
+fn a_switching_rows_usage_spinner_turns_orange() {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let header = HeaderState {
+        activity: ProfileActivity::Switching,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+        fetches_here: true,
+    };
+    let lines = status_lines(&profile, &header, 120, &ReadingsSnapshot::default());
+    let spinner = lines[0]
+        .spans
+        .iter()
+        .find(|s| {
+            crate::spinner::SPINNER_FRAMES
+                .iter()
+                .any(|f| s.content.contains(f))
+        })
+        .unwrap_or_else(|| {
+            let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+            panic!("a switching row spins: {text}")
+        });
+    assert_eq!(spinner.style.fg, Some(theme::accent_2_color()));
+}

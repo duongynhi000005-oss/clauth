@@ -15,7 +15,7 @@
 #[cfg(test)]
 use std::cell::Cell;
 #[cfg(not(test))]
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -57,9 +57,16 @@ impl Tier {
 #[cfg(not(test))]
 static TIER: AtomicU8 = AtomicU8::new(0);
 
+/// Terminal family holder, paired with [`TIER`]. Claude Code draws a different
+/// working-line set when `TERM` is `xterm-ghostty`, so the choice is made once
+/// at startup rather than per frame.
+#[cfg(not(test))]
+static GHOSTTY: AtomicBool = AtomicBool::new(false);
+
 #[cfg(test)]
 thread_local! {
     static TIER: Cell<u8> = const { Cell::new(0) };
+    static GHOSTTY: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Detect the tier from `$COLORTERM`:
@@ -75,10 +82,36 @@ pub(crate) fn detect() -> Tier {
     }
 }
 
-/// Seed the process tier at startup.
+/// Detect the terminal family Claude Code draws its other working-line set for.
+pub(crate) fn detect_ghostty() -> bool {
+    std::env::var("TERM").is_ok_and(|term| term == "xterm-ghostty")
+}
+
+/// Seed the process tier and terminal family at startup.
 /// Precedence (highest first): explicit override → auto-detect.
 pub(crate) fn init(override_tier: Option<Tier>) {
     set_tier(override_tier.unwrap_or_else(detect));
+    set_ghostty(detect_ghostty());
+}
+
+/// Whether the terminal is the family Claude Code draws its other working-line
+/// set for.
+pub(crate) fn ghostty_marks() -> bool {
+    #[cfg(not(test))]
+    {
+        GHOSTTY.load(Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    {
+        GHOSTTY.with(Cell::get)
+    }
+}
+
+pub(crate) fn set_ghostty(on: bool) {
+    #[cfg(not(test))]
+    GHOSTTY.store(on, Ordering::Relaxed);
+    #[cfg(test)]
+    GHOSTTY.with(|c| c.set(on));
 }
 
 /// Swap the active tier at runtime. The next render reads the new value, so the
@@ -358,6 +391,44 @@ pub(crate) fn toggle_off() -> &'static str {
         Tier::Full => "○─",
         Tier::Compatible => "[off]",
     }
+}
+
+// Claude Code's working-line marks, in its default terminals and in the set it
+// draws when `TERM` is `xterm-ghostty`.
+const CLAUDE_WORKING_FRAMES: [&str; 6] = ["·", "✢", "*", "✶", "✻", "✽"];
+const CLAUDE_WORKING_FRAMES_GHOSTTY: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✻"];
+const CLAUDE_WORKING_PERIOD_MS: u64 = 2_000;
+const CLAUDE_WORKING_SNAP_MS: u64 = 64;
+
+/// The active claude account's mark `elapsed_ms` into its working animation:
+/// six frames over a 2 s period, eased in and out by a cosine.
+pub(crate) fn active_claude_frame(elapsed_ms: u64, ghostty: bool) -> &'static str {
+    let phase =
+        elapsed_ms / CLAUDE_WORKING_SNAP_MS * CLAUDE_WORKING_SNAP_MS % CLAUDE_WORKING_PERIOD_MS;
+    let turn = std::f64::consts::TAU * phase as f64 / CLAUDE_WORKING_PERIOD_MS as f64;
+    let index = ((1.0 - turn.cos()) / 2.0 * 5.0).round() as usize;
+    let frames = if ghostty {
+        &CLAUDE_WORKING_FRAMES_GHOSTTY
+    } else {
+        &CLAUDE_WORKING_FRAMES
+    };
+    frames[index.min(frames.len() - 1)]
+}
+
+/// The mark an active claude account rests on while it spends nothing.
+pub(crate) fn active_claude_rest() -> &'static str {
+    CLAUDE_WORKING_FRAMES[4]
+}
+
+/// The active codex account's mark. Static on both tiers.
+pub(crate) fn active_codex_mark() -> &'static str {
+    "⏣"
+}
+
+/// An active claude account while the client-token store holds a token for it.
+/// Static: only the claude account's own mark moves.
+pub(crate) fn active_shunt_mark() -> &'static str {
+    "⥋"
 }
 
 /// Gutter glyph for a row in edit mode — replaces the `❯` selection caret while

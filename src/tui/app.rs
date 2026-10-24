@@ -3131,6 +3131,30 @@ impl ShuntTokens {
     }
 }
 
+/// The Overview's active mark view of the client-token store: the profile names
+/// the store holds, and the store file's write stamp at the read that produced
+/// them. The mark keys on the store holding a token for the profile, so this
+/// cache follows the file itself rather than the Services record (the card's
+/// own rows go blank with no gateway record adopted; the mark does not).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ShuntMark {
+    pub(crate) names: Vec<String>,
+    stamp: Option<StoreStamp>,
+}
+
+/// The client-token store file's write stamp, from ONE `metadata()` call per
+/// tick. Every store write lands on a fresh inode through an atomic rename, so
+/// on unix the identity moves with each one whatever the mtime granule (two
+/// writes between ticks can still reuse a freed inode number); elsewhere
+/// `(modified, len)` is the residual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoreStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    id: (u64, u64),
+}
+
 /// A `require client tokens` whose first token was minted through the picker:
 /// the require waits for the feed to show a `healthy` pid that is `Some` and
 /// differs from the one read when the add/create job started (the running
@@ -3737,7 +3761,9 @@ pub(crate) struct ServicesState {
     /// the moment focus leaves the remove row.
     pub(crate) shunt_remove_refusal: std::cell::RefCell<Option<ShuntRemoveRefusal>>,
     /// The client-token section's data, read beside the config view on the
-    /// recompute (the render reads this cache, never the store per frame).
+    /// recompute (the render reads this cache, never the store per frame). The
+    /// Overview's active mark keeps its own view ([`App::shunt_mark`]), because
+    /// it has to see the store with no gateway record adopted.
     pub(crate) shunt_tokens: ShuntTokens,
     /// A token remove's refusal (the last-token guard), as `(profile,
     /// sentence)`, rendered on the `└` line under the token row. RefCell so the
@@ -5254,6 +5280,11 @@ pub(crate) struct App {
     pub(crate) tps_rate_width: usize,
     /// Throttle for the per-tick tps cache re-read.
     last_tps_refresh: Instant,
+    /// The Overview active mark's client-token names, with the store stamp they
+    /// were read at: the tick re-reads them only when the store file moves, so
+    /// every writer of the store is covered by the file's own event. Seeded in
+    /// [`App::new`] so the first frame already marks a shunt-backed account.
+    pub(crate) shunt_mark: ShuntMark,
     /// Finished delegate jobs' resolved average speeds, keyed by job id. Filled
     /// on the tick path (never in render) and evicted when a job leaves the
     /// list; a job that has not resolved yet is simply absent and retried with
@@ -5870,6 +5901,7 @@ impl App {
             tps: None,
             tps_rate_width: 0,
             last_tps_refresh: Instant::now(),
+            shunt_mark: ShuntMark::default(),
             delegate_speed_cache: HashMap::new(),
             delegate_speed_retry: HashMap::new(),
             #[cfg(test)]
@@ -5891,6 +5923,9 @@ impl App {
             pool_mutation_tx,
         };
         adopt_shunt_record(&mut app, shunt_record);
+        // Seed the Overview's mark cache from the client-token store before the
+        // first paint; the tick re-reads it only when the store file moves.
+        refresh_shunt_mark(&mut app);
         // Seed the tps cache through the one freshness path the tick uses, so
         // the construction seed and every later poll agree on the width hold.
         app.set_tps(tps);
@@ -14195,15 +14230,63 @@ fn token_read_reason(e: &anyhow::Error) -> String {
     }
 }
 
+/// The client-token store's profile names, in name order: the one reader of
+/// them, so the Services card's token rows and the Overview's active mark
+/// cannot drift apart.
+fn read_client_token_names() -> anyhow::Result<Vec<String>> {
+    Ok(crate::gateway_tokens::ClientTokens::load()?
+        .names()
+        .map(str::to_string)
+        .collect())
+}
+
+/// Re-read the Overview active mark's names when the client-token store file
+/// itself changed since the cached read: the tick compares the store's write
+/// stamp and reads the contents only on a move. Every store write is one atomic
+/// write the tick sees as a new stamp, so the mark follows the file rather than
+/// a list of flows. A read failure leaves no name, so no `⥋` shows.
+fn refresh_shunt_mark(app: &mut App) {
+    let stamp = crate::gateway_tokens::store_path()
+        .ok()
+        .and_then(|path| store_stamp(&path));
+    if stamp == app.shunt_mark.stamp {
+        return;
+    }
+    app.shunt_mark = ShuntMark {
+        names: read_client_token_names().unwrap_or_default(),
+        stamp,
+    };
+}
+
+/// The store file's write stamp; a missing store answers `None`.
+fn store_stamp(path: &std::path::Path) -> Option<StoreStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(StoreStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+        #[cfg(unix)]
+        id: file_id(&meta),
+    })
+}
+
+/// The `(dev, ino)` of a file's metadata, the identity a fresh-inode write
+/// moves.
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
 /// The client-token section's data, read beside the config view: the store's
-/// names and the unmanaged client names (with their source) from
-/// [`crate::gateway::client_auth`]. A store read failure records its sentence
-/// in `error` (no stored rows); a client-auth read failure records its
-/// sentence in `unmanaged_error` (the stored rows stay, the unmanaged rows read
-/// `other clients  not read`). Each keeps the `+ add token` row.
+/// names (through [`read_client_token_names`]) and the unmanaged client names
+/// (with their source) from [`crate::gateway::client_auth`]. A store read
+/// failure records its sentence in `error` (no stored rows); a client-auth read
+/// failure records its sentence in `unmanaged_error` (the stored rows stay, the
+/// unmanaged rows read `other clients  not read`). Each keeps the
+/// `+ add token` row.
 fn read_shunt_tokens(record: &crate::gateway::GatewayRecord) -> ShuntTokens {
-    let stored: Vec<String> = match crate::gateway_tokens::ClientTokens::load() {
-        Ok(tokens) => tokens.names().map(str::to_string).collect(),
+    let stored = match read_client_token_names() {
+        Ok(names) => names,
         Err(e) => {
             return ShuntTokens {
                 error: Some(token_read_reason(&e)),
@@ -26473,6 +26556,7 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_codex_login(app);
     drain_codex_new_login(app);
 
+    refresh_shunt_mark(app);
     if app.reload_if_state_changed() {
         app.clamp_profile_cursor();
         // Setup's `+ new` selection is the trailing row, never an index: a

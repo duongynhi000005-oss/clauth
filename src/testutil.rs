@@ -1421,6 +1421,31 @@ impl Drop for TierSandbox {
     }
 }
 
+/// RAII terminal-family pin, the [`TierSandbox`] shape: forces the ghostty bit
+/// for its lifetime and puts the previous value back on drop (even on panic).
+/// `!Send` for the same reason the tier pin is.
+pub(crate) struct GhosttySandbox {
+    prev: bool,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl GhosttySandbox {
+    pub(crate) fn new(on: bool) -> Self {
+        let prev = crate::tui::theme::ghostty_marks();
+        crate::tui::theme::set_ghostty(on);
+        Self {
+            prev,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for GhosttySandbox {
+    fn drop(&mut self) {
+        crate::tui::theme::set_ghostty(self.prev);
+    }
+}
+
 /// A section header's foreground on `Tier::Full` while focus rests in its
 /// section: `TEXT` (Catppuccin Mocha `text`, `#cdd6f4`). Literal, so a theme
 /// edit cannot move the expectation with it.

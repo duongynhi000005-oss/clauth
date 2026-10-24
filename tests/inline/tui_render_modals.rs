@@ -1032,13 +1032,17 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         .unwrap_or_else(|| panic!("the legend renders:\n{}", rows.join("\n")));
     // The section header, its blank, and one row per mark.
     assert_eq!(
-        rows[head..head + 20].iter().map(slice).collect::<Vec<_>>(),
+        rows[head..head + 24].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "│  GLYPHS                                                                 │"
                 .to_string(),
             "│                                                                         │"
                 .to_string(),
-            "│    ●                   the active account                               │"
+            "│    ✻                   active claude account                            │"
+                .to_string(),
+            "│    ⏣                   active codex account                             │"
+                .to_string(),
+            "│    ⥋                   active, via shunt                                │"
                 .to_string(),
             "│    ⇄                   a live session here follows the fallback chain   │"
                 .to_string(),
@@ -1074,13 +1078,19 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
                 .to_string(),
             "│    f                   has a fix                                        │"
                 .to_string(),
+            "│                                                                         │"
+                .to_string(),
+            "╰─────────────────────────────────────────────────────────────────────────╯"
+                .to_string(),
         ],
     );
 
     // Every mark's own hue, read off the rendered cell. `⊖` and `⊘` each appear
     // twice because they split their senses on hue alone; `×` keeps one color
     // for all three of its senses.
-    let expected: [Color; 18] = [
+    let expected: [Color; 20] = [
+        crate::tui::theme::accent_2_color(),
+        crate::tui::theme::accent_2_color(),
         crate::tui::theme::accent_2_color(),
         crate::tui::theme::text_dim_color(),
         crate::tui::theme::text_faint_color(),
@@ -1101,11 +1111,24 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         crate::tui::theme::accent_color(),
     ];
     // `left + 5`: the modal border, its 2-cell padding, and the row's own
-    // 2-space gutter all sit ahead of the mark.
+    // 2-space gutter all sit ahead of the mark; a mark row has a space right
+    // after it.
     let glyph_x = left + 5;
     let stride = buf.area.width as usize;
-    let got: Vec<Color> = (0..18)
-        .map(|i| buf.content[(head + 2 + i) * stride + glyph_x].fg)
+    let mark_rows: Vec<usize> = (head + 2..head + 23)
+        .filter(|&y| {
+            buf.content[y * stride + glyph_x].symbol() != " "
+                && buf.content[y * stride + glyph_x + 1].symbol() == " "
+        })
+        .collect();
+    assert_eq!(
+        mark_rows.len(),
+        expected.len(),
+        "one rendered row per mark: {mark_rows:?}"
+    );
+    let got: Vec<Color> = mark_rows
+        .iter()
+        .map(|&y| buf.content[y * stride + glyph_x].fg)
         .collect();
     assert_eq!(got, expected.to_vec());
 }
@@ -4402,22 +4425,22 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│                                            ┃ │",
         "│  GLYPHS                                    ┃ │",
         "│                                            ┃ │",
-        "│    ●                   the active account  ┃ │",
+        "│    ✻                   active claude       ┃ │",
+        "│  account                                   ┃ │",
+        "│    ⏣                   active codex account┃ │",
+        "│    ⥋                   active, via shunt   ┃ │",
         "│    ⇄                   a live session here ┃ │",
         "│  follows the fallback chain                ┃ │",
         "│    ↲                   the chain switches  ┃ │",
-        "│  to this account next                      ┃ │",
-        "│    ⊖                   disabled            ┃ │",
-        "│    ⊖                   canceled            ┃ │",
-        "│    ×                   auth broken         ┃ │",
-        "│    ×                   key rejected        ┃ │",
+        "│  to this account next                      ┊ │",
+        "│    ⊖                   disabled            ┊ │",
+        "│    ⊖                   canceled            ┊ │",
+        "│    ×                   auth broken         ┊ │",
+        "│    ×                   key rejected        ┊ │",
         "│    ×                   logged out          ┊ │",
         "│    ⊘                   weekly spent        ┊ │",
         "│    ⧗                   claude code blocked ┊ │",
         "│    $                   extra usage spent   ┊ │",
-        "│    ◔                   5h window spent     ┊ │",
-        "│    ⊘                   one model's week    ┊ │",
-        "│  spent, other models ok                    ┊ │",
         "│                                              │",
         "╰──────────────────────────────────────────────╯",
     ]

@@ -839,7 +839,9 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
 /// One codex account, in the claude columns: name, plan, 5h, 7d, and a
 /// `↺ N` chip while the account holds a banked usage-limit reset (what
 /// `clauth limit-reset` spends). The timer slot stays blank and no live cell
-/// is drawn: the Overview cannot refresh or switch a Codex account.
+/// is drawn: the Overview cannot refresh or switch a Codex account. The
+/// marker cell carries `×` for a quarantined chain and the active account's
+/// `⏣` otherwise.
 fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> Line<'static> {
     let name_style = if row.active {
         theme::accent().bold()
@@ -857,6 +859,11 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> 
         },
         if row.broken {
             Span::styled(theme::dead_credential_glyph(), theme::danger())
+        } else if row.active {
+            Span::styled(
+                theme::active_codex_mark(),
+                Style::default().fg(theme::accent_2_color()),
+            )
         } else {
             Span::raw(" ")
         },
@@ -1037,6 +1044,31 @@ fn peak_live(app: &App, profile: &Profile) -> bool {
     app.peak_state_for(profile).is_some_and(|s| s.peak)
 }
 
+/// The active account's mark: `⥋` while the client-token store holds a token
+/// for the profile, else the claude working line — animating while a fresh tps
+/// snapshot shows the account spending tokens, resting otherwise. The names
+/// come off the [`App::shunt_mark`] cache, which the tick keeps in step with
+/// the store file itself, so no render touches the store.
+fn active_mark(app: &App, profile: &Profile) -> &'static str {
+    if app
+        .shunt_mark
+        .names
+        .iter()
+        .any(|held| held == profile.name.as_str())
+    {
+        return theme::active_shunt_mark();
+    }
+    let burning = app
+        .fresh_tps()
+        .and_then(|snap| snap.accounts.get(profile.name.as_str()))
+        .is_some_and(|figures| figures.live.rate > 0.0);
+    if burning {
+        theme::active_claude_frame(app.tps_now_ms(), theme::ghostty_marks())
+    } else {
+        theme::active_claude_rest()
+    }
+}
+
 fn render_overview_row(
     app: &App,
     idx: usize,
@@ -1136,17 +1168,17 @@ fn render_overview_row(
     let mut spans = vec![cursor];
     // A disabled row flattens every semantic hue to dim — the whole row reads as
     // one inert unit rather than a live row wearing a dim name. The GLYPHS stay:
-    // this row never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/`●`/`▲`
-    // still distinguish themselves without the color.
+    // this row never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/the active
+    // mark/`▲` still distinguish themselves without the color.
     let hue = |s: Style| if disabled { theme::dim() } else { s };
     // Marker precedence: canceled subscription (⊖) > broken login (×) > token
-    // danger (⊘) > bell (!) > active (●) > peak hours (▲). Canceled is
-    // dead-first (the org 403s every request, matching the Fallback ladder
-    // where `Canceled` outranks `AuthBroken`); a dead login makes usage alerts
-    // moot until re-login; a dead / mis-filled long-lived token signs sessions
-    // out on the next switch, so it outranks a bell. The active dot outranks
-    // the peak marker — naming which account a bare `claude` authenticates as
-    // beats a schedule the Usage tab's pricing row already names.
+    // danger (⊘) > bell (!) > active (✻ / its working frame / ⏣ / ⥋) > peak
+    // hours (▲). Canceled is dead-first (the org 403s every request, matching the
+    // Fallback ladder where `Canceled` outranks `AuthBroken`); a dead login makes
+    // usage alerts moot until re-login; a dead / mis-filled long-lived token signs
+    // sessions out on the next switch, so it outranks a bell. The active mark
+    // outranks the peak marker — naming which account a bare `claude`
+    // authenticates as beats a schedule the Usage tab's pricing row already names.
     if crate::fallback::is_canceled_from_info(readings.usage_of(&profile.name)) {
         spans.push(Span::styled("⊖", hue(theme::danger())));
         spans.push(Span::raw(" "));
@@ -1164,13 +1196,13 @@ fn render_overview_row(
         spans.push(Span::raw(" "));
     } else if active {
         spans.push(Span::styled(
-            "●",
+            active_mark(app, profile),
             hue(Style::default().fg(theme::accent_2_color())),
         ));
         spans.push(Span::raw(" "));
     } else if peak_live(app, profile) {
-        // Peak-rate marker, non-active rows only: the active `●` outranks it,
-        // so an active profile on peak hours keeps its dot and the `▲` reads
+        // Peak-rate marker, non-active rows only: the active mark outranks it,
+        // so an active profile on peak hours keeps its mark and the `▲` reads
         // "this other account is on the surcharged rate right now". The
         // pricing row on the Usage tab names the schedule and the flip.
         spans.push(Span::styled("▲", hue(theme::warning())));
@@ -1348,11 +1380,12 @@ fn tps_cell(app: &App, name: &str, width: usize) -> Span<'static> {
 /// this account, with `⇄` when at least one of them follows the fallback chain.
 /// Blank for an account hosting none: a zero count is hidden.
 ///
-/// Distinct from the row's leading `●`, which marks the one profile a bare
-/// `claude` authenticates as; an account can carry either, both, or neither.
-/// That is why the header reads `live` and not `active` — `active` is the `●`
-/// sense app-wide. Already the `TEXT_DIM` tier a disabled row flattens to, so it
-/// needs no `hue` pass of its own.
+/// Distinct from the row's leading active mark (see [`active_mark`]), which
+/// names the one profile a bare `claude` authenticates as; an account can
+/// carry either, both, or neither.
+/// That is why the header reads `live` and not `active` — `active` is the
+/// active mark's sense app-wide. Already the `TEXT_DIM` tier a disabled row
+/// flattens to, so it needs no `hue` pass of its own.
 fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Span<'static> {
     if sessions.sessions == 0 {
         return Span::raw(" ".repeat(width));

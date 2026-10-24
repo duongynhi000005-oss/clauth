@@ -3667,7 +3667,7 @@ fn the_five_hour_bar_sheds_before_clipping_its_figure() {
             27,
             &[
                 "│ ❯   abcdefg…  —         │",
-                "│   ● cjk-日 …   —         │",
+                "│   ✻ cjk-日 …   —         │",
                 "│     emoji-…   —         │",
             ],
         ),
@@ -3675,7 +3675,7 @@ fn the_five_hour_bar_sheds_before_clipping_its_figure() {
             28,
             &[
                 "│ ❯   abcdefg…  —          │",
-                "│   ● cjk-日 …   —          │",
+                "│   ✻ cjk-日 …   —          │",
                 "│     emoji-…   —          │",
             ],
         ),
@@ -3683,7 +3683,7 @@ fn the_five_hour_bar_sheds_before_clipping_its_figure() {
             34,
             &[
                 "│ ❯   abcdefg…  —           12%  │",
-                "│   ● cjk-日 …   —           49%  │",
+                "│   ✻ cjk-日 …   —           49%  │",
                 "│     emoji-…   —           63%  │",
             ],
         ),
@@ -3691,7 +3691,7 @@ fn the_five_hour_bar_sheds_before_clipping_its_figure() {
             45,
             &[
                 "│ ❯   abcdefghij…  —           [█░░░░░] 12% │",
-                "│   ● cjk-日 本 語 …  —           [███░░░] 49% │",
+                "│   ✻ cjk-日 本 語 …  —           [███░░░] 49% │",
                 "│     emoji-🧭 ⚠️ …  —           [████░░] 63% │",
             ],
         ),
@@ -3702,7 +3702,7 @@ fn the_five_hour_bar_sheds_before_clipping_its_figure() {
         let got: Vec<String> = rows
             .iter()
             .filter(|r| {
-                r.starts_with("│ ❯") || r.starts_with("│   ●") || r.starts_with("│     emoji")
+                r.starts_with("│ ❯") || r.starts_with("│   ✻") || r.starts_with("│     emoji")
             })
             .cloned()
             .collect();
@@ -3825,13 +3825,13 @@ fn the_overview_name_column_desktop_rows_measure_by_cells() {
     let rows: Vec<String> = wide.lines().map(|l| l.trim_end().to_string()).collect();
     let got: Vec<String> = rows
         .iter()
-        .filter(|r| r.starts_with("│   ●") || r.starts_with("│     emoji"))
+        .filter(|r| r.starts_with("│   ✻") || r.starts_with("│     emoji"))
         .cloned()
         .collect();
     assert_eq!(
         got,
         vec![
-            "│   ● cjk-日 本 語 ア カ ウ ン ト                       —                        [█████░░░░░] 49%                  [███░░░░░░░] 30%                                    │",
+            "│   ✻ cjk-日 本 語 ア カ ウ ン ト                       —                        [█████░░░░░] 49%                  [███░░░░░░░] 30%                                    │",
             "│     emoji-🧭 ⚠️ -account                        —                        [██████░░░░] 63%                  [████░░░░░░] 40%                                    │",
         ],
         "name column wide rows at 160 cols"
@@ -3868,13 +3868,13 @@ fn the_overview_accounts_wide_name_rows_desktop_replace_the_pre_s9_clip() {
     let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
     let got: Vec<String> = rows
         .iter()
-        .filter(|r| r.starts_with("│   ●"))
+        .filter(|r| r.starts_with("│   ✻"))
         .cloned()
         .collect();
     assert_eq!(
         got,
         vec![
-            "│   ● cjk-日 本 語 ア カ …       —                  [█████░░░░░] 49%       30%      │",
+            "│   ✻ cjk-日 本 語 ア カ …       —                  [█████░░░░░] 49%       30%      │",
         ],
         "accounts cjk wide-name row at 80 cols"
     );
@@ -7757,7 +7757,7 @@ fn a_reading_inserted_into_a_store_shows_in_the_next_draw() {
     assert_eq!(
         rows_with(&after, &["87%"]),
         vec![
-            "│ ❯ ● o              —                       [█████████░] 87% (1h 0m)         —                    │"
+            "│ ❯ ✻ o              —                       [█████████░] 87% (1h 0m)         —                    │"
         ],
         "the very next draw shows the store reading on the account row"
     );
@@ -7857,7 +7857,7 @@ fn overview_readings_keep_two_rounded_decimals_at_every_width() {
             34,
             &[
                 "│ ❯   alpha   —               1% │",
-                "│   ● bravo   —           73.42% │",
+                "│   ✻ bravo   —           73.42% │",
                 "│     charl…  —             100% │",
                 "│     cx-al…  plus            1% │",
                 "│     cx-br…  plus        73.42% │",
@@ -7871,7 +7871,7 @@ fn overview_readings_keep_two_rounded_decimals_at_every_width() {
             45,
             &[
                 "│ ❯   alpha     —           [░░░░░]     1%  │",
-                "│   ● bravo     —           [████░] 73.42%  │",
+                "│   ✻ bravo     —           [████░] 73.42%  │",
                 "│     charlie   —           [█████]   100%  │",
                 "│     cx-alpha  plus            1%          │",
                 "│     cx-bravo  plus        73.42%          │",
@@ -7885,7 +7885,7 @@ fn overview_readings_keep_two_rounded_decimals_at_every_width() {
             80,
             &[
                 "│ ❯   alpha       —                 [░░░░░░░░░░]     1%        1%              │",
-                "│   ● bravo       —                 [███████░░░] 73.42%    73.42%              │",
+                "│   ✻ bravo       —                 [███████░░░] 73.42%    73.42%              │",
                 "│     charlie     —                 [██████████]   100%      100%              │",
                 "│     cx-alpha    plus                  1%                     1%              │",
                 "│     cx-bravo    plus              73.42%                 73.42%              │",
@@ -8276,28 +8276,28 @@ fn the_bare_band_pads_the_no_data_dash_to_the_label_width() {
             34,
             [
                 "│ ❯   alpha   —                — │",
-                "│   ● bravo   —           73.42% │",
+                "│   ✻ bravo   —           73.42% │",
             ],
         ),
         (
             45,
             [
                 "│ ❯   alpha     —                        —  │",
-                "│   ● bravo     —           [████░] 73.42%  │",
+                "│   ✻ bravo     —           [████░] 73.42%  │",
             ],
         ),
         (
             64,
             [
                 "│ ❯   alpha      —                        —   10%              │",
-                "│   ● bravo      —           [████░] 73.42%   10%              │",
+                "│   ✻ bravo      —           [████░] 73.42%   10%              │",
             ],
         ),
         (
             80,
             [
                 "│ ❯   alpha        —                                   —     10%               │",
-                "│   ● bravo        —                 [███████░░░] 73.42%     10%               │",
+                "│   ✻ bravo        —                 [███████░░░] 73.42%     10%               │",
             ],
         ),
     ];
