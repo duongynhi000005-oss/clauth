@@ -1733,12 +1733,14 @@ fn the_header_logo_rests_on_the_clawd_default_pose() {
     }
 }
 
-/// A closed lid inverts: background-coloured glyph over the body colour, the
-/// way claude code paints it. The open eye's background is the app's own, not
-/// a black box over the themed surface. Every cell of every logo row is
-/// pinned, so a kind-to-style regression anywhere in the sprite reds this.
+/// Claude Code paints every cut-out in `clawd_background`, `rgb(0,0,0)` in its
+/// dark and light themes alike (2.1.310 binary): the face's eye span (row 0,
+/// columns 2-7) and the body block under it (row 1, columns 2-6) sit on black,
+/// and a closed lid is a black glyph over the body colour. The arms and feet
+/// keep the app's own surface. Every cell of every logo row is pinned, so a
+/// kind-to-style regression anywhere in the sprite reds this.
 #[test]
-fn the_wink_frame_paints_its_lid_over_the_body_colour() {
+fn the_wink_frame_paints_its_cut_outs_black() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.clawd.play(crate::tui::clawd::Anim::Wink, 0);
@@ -1747,27 +1749,28 @@ fn the_wink_frame_paints_its_lid_over_the_body_colour() {
     let bg = theme::bg();
     let body = theme::accent_2_color();
     let text = theme::text_color();
+    let black = Color::Rgb(0, 0, 0);
     let want = [
         vec![
             styled(" ", body, bg),
             styled("▐", body, bg),
-            styled("▛", body, bg),
-            styled("█", body, bg),
-            styled("█", body, bg),
-            styled("█", body, bg),
-            styled("▂", bg, body),
-            styled("█", body, bg),
+            styled("▛", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("▂", black, body),
+            styled("█", body, black),
             styled(" ", text, bg),
             styled(" ", text, bg),
         ],
         vec![
             styled("▝", body, bg),
             styled("▜", body, bg),
-            styled("█", body, bg),
-            styled("█", body, bg),
-            styled("█", body, bg),
-            styled("█", body, bg),
-            styled("█", body, bg),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
             styled("█", body, bg),
             styled("▀", body, bg),
             styled(" ", text, bg),
@@ -1789,7 +1792,8 @@ fn the_wink_frame_paints_its_lid_over_the_body_colour() {
 }
 
 /// A poof/shadow frame: the shadow marks paint in the source's `inactive`
-/// colour, and every other logo cell in the row is the body colour.
+/// colour, and every other logo cell in the row is the body colour; the
+/// arms-up face keeps the same black cut-outs as the rest pose.
 #[test]
 fn the_coin_hop_shadow_frame_paints_its_marks_inactive_and_the_rest_body() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1803,27 +1807,28 @@ fn the_coin_hop_shadow_frame_paints_its_marks_inactive_and_the_rest_body() {
     let body = theme::accent_2_color();
     let text = theme::text_color();
     let faint = theme::text_faint_color();
+    let black = Color::Rgb(0, 0, 0);
     let want = [
         vec![
             styled("▗", body, bg),
             styled("▟", body, bg),
-            styled("▛", body, bg),
-            styled("█", body, bg),
-            styled("█", body, bg),
-            styled("█", body, bg),
-            styled("▛", body, bg),
-            styled("█", body, bg),
+            styled("▛", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("▛", body, black),
+            styled("█", body, black),
             styled("▄", body, bg),
             styled(" ", text, bg),
         ],
         vec![
             styled(" ", body, bg),
             styled("▜", body, bg),
-            styled("█", body, bg),
-            styled("█", body, bg),
-            styled("█", body, bg),
-            styled("█", body, bg),
-            styled("█", body, bg),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
             styled("█", body, bg),
             styled("▘", body, bg),
             styled(" ", text, bg),
@@ -1846,7 +1851,8 @@ fn the_coin_hop_shadow_frame_paints_its_marks_inactive_and_the_rest_body() {
 
 /// The simplified arm Claude Code falls back to on Apple's Terminal.app: body
 /// edges either side of a body-filled eye band, then the short feet row. The
-/// full arm stays pinned by the rest test above, on the default.
+/// eye glyphs are black over the body colour, like the full arm's closed lids.
+/// The full arm stays pinned by the rest test above, on the default.
 #[test]
 fn the_simplified_sprite_arm_replaces_the_full_one() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1857,28 +1863,29 @@ fn the_simplified_sprite_arm_replaces_the_full_one() {
     let bg = theme::bg();
     let body = theme::accent_2_color();
     let text = theme::text_color();
+    let black = Color::Rgb(0, 0, 0);
     let want = [
         vec![
             styled("▗", body, bg),
-            styled(" ", bg, body),
-            styled("▗", bg, body),
-            styled(" ", bg, body),
-            styled(" ", bg, body),
-            styled(" ", bg, body),
-            styled("▖", bg, body),
-            styled(" ", bg, body),
+            styled(" ", black, body),
+            styled("▗", black, body),
+            styled(" ", black, body),
+            styled(" ", black, body),
+            styled(" ", black, body),
+            styled("▖", black, body),
+            styled(" ", black, body),
             styled("▖", body, bg),
             styled(" ", text, bg),
         ],
         vec![
             styled(" ", text, bg),
-            styled(" ", bg, body),
-            styled(" ", bg, body),
-            styled(" ", bg, body),
-            styled(" ", bg, body),
-            styled(" ", bg, body),
-            styled(" ", bg, body),
-            styled(" ", bg, body),
+            styled(" ", black, body),
+            styled(" ", black, body),
+            styled(" ", black, body),
+            styled(" ", black, body),
+            styled(" ", black, body),
+            styled(" ", black, body),
+            styled(" ", black, body),
             styled(" ", text, bg),
             styled(" ", text, bg),
         ],
@@ -1892,6 +1899,116 @@ fn the_simplified_sprite_arm_replaces_the_full_one() {
             styled("▝", body, bg),
             styled("▝", body, bg),
             styled(" ", text, bg),
+            styled(" ", text, bg),
+        ],
+    ];
+    assert_eq!(styled_logo_rows(&app, 80), want.to_vec());
+}
+
+/// A turned pose cuts its own slice of each row out in black, the way Claude
+/// Code's facing table names it: `right-12` (the turn's first frame) blacks
+/// row 0 columns 2-7 and row 1 columns 2-6, and leaves the feet row on the
+/// app's surface.
+#[test]
+fn the_turned_pose_paints_its_facing_cut_black() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.clawd.play(crate::tui::clawd::Anim::Turn, 0);
+    app.anim_phase_ms = Some(0);
+    use crate::tui::theme;
+    let bg = theme::bg();
+    let body = theme::accent_2_color();
+    let text = theme::text_color();
+    let black = Color::Rgb(0, 0, 0);
+    let want = [
+        vec![
+            styled(" ", body, bg),
+            styled("▐", body, bg),
+            styled("█", body, black),
+            styled("▜", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("▛", body, black),
+            styled("█", body, black),
+            styled(" ", body, bg),
+            styled(" ", text, bg),
+        ],
+        vec![
+            styled("▝", body, bg),
+            styled("▜", body, bg),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, bg),
+            styled("▀", body, bg),
+            styled(" ", text, bg),
+        ],
+        vec![
+            styled(" ", body, bg),
+            styled("▝", body, bg),
+            styled("▝", body, bg),
+            styled(" ", body, bg),
+            styled(" ", body, bg),
+            styled(" ", body, bg),
+            styled("▝", body, bg),
+            styled("▝", body, bg),
+            styled(" ", body, bg),
+            styled(" ", text, bg),
+        ],
+    ];
+    assert_eq!(styled_logo_rows(&app, 80), want.to_vec());
+}
+
+/// On an xterm-256 terminal the cut-outs take palette index 16, the cube's
+/// `rgb(0,0,0)`, never the 16-colour `Black` a terminal theme can repaint.
+#[test]
+fn the_cut_outs_stay_black_on_the_compatible_tier() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.clawd.play(crate::tui::clawd::Anim::Wink, 0);
+    app.anim_phase_ms = Some(0);
+    let bg = Color::Indexed(235);
+    let body = Color::Indexed(173);
+    let text = Color::Indexed(189);
+    let black = Color::Indexed(16);
+    let want = [
+        vec![
+            styled(" ", body, bg),
+            styled("▐", body, bg),
+            styled("▛", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("▂", black, body),
+            styled("█", body, black),
+            styled(" ", text, bg),
+            styled(" ", text, bg),
+        ],
+        vec![
+            styled("▝", body, bg),
+            styled("▜", body, bg),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, black),
+            styled("█", body, bg),
+            styled("▀", body, bg),
+            styled(" ", text, bg),
+        ],
+        vec![
+            styled(" ", body, bg),
+            styled("▝", body, bg),
+            styled("▝", body, bg),
+            styled(" ", body, bg),
+            styled(" ", body, bg),
+            styled(" ", body, bg),
+            styled("▝", body, bg),
+            styled("▝", body, bg),
+            styled(" ", body, bg),
             styled(" ", text, bg),
         ],
     ];

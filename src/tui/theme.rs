@@ -213,6 +213,14 @@ pub(crate) fn accent_color() -> Color {
 pub(crate) fn accent_2_color() -> Color {
     pick(Color::Rgb(217, 119, 87), Color::Indexed(173))
 }
+/// Clawd's `clawd_background` cut-out colour: `rgb(0,0,0)` in the source's dark
+/// and light themes alike (its ansi themes use `ansi:black`). The compatible
+/// tier uses xterm-256 index 16 (the colour cube's black), never 16-colour
+/// `Black`, which a terminal theme can repaint.
+#[inline]
+pub(crate) fn clawd_cutout_color() -> Color {
+    pick(Color::Rgb(0, 0, 0), Color::Indexed(16))
+}
 
 // ── Semantic ──────────────────────────────────────────────────────────────────
 #[inline]
@@ -285,6 +293,7 @@ fn rgb_of(color: Color) -> (u8, u8, u8) {
 fn indexed_rgb(i: u8) -> (u8, u8, u8) {
     match i {
         235 => (30, 30, 46),
+        16 => (0, 0, 0),
         234 => (24, 24, 37),
         233 => (17, 17, 27),
         236 => (40, 40, 56),

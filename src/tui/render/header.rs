@@ -586,8 +586,9 @@ fn cell_style(kind: CellKind) -> Style {
     let body = theme::accent_2_color();
     match kind {
         CellKind::Empty => Style::default(),
-        CellKind::Body | CellKind::FacingBody => Style::default().fg(body),
-        CellKind::Lid => Style::default().fg(theme::bg()).bg(body),
+        CellKind::Body => Style::default().fg(body),
+        CellKind::CutOut => Style::default().fg(body).bg(theme::clawd_cutout_color()),
+        CellKind::Lid => Style::default().fg(theme::clawd_cutout_color()).bg(body),
         CellKind::Inactive => Style::default().fg(theme::text_faint_color()),
     }
 }

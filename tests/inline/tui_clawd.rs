@@ -441,3 +441,39 @@ fn the_simplified_pools_drop_facings_and_rest_pose_openings() {
         .as_slice()
     );
 }
+
+/// Every facing cuts out exactly the column span Claude Code's facing table
+/// names (2.1.310 binary, `eo`, copied by hand as `[from, to)` per row): the
+/// cut-out cells of each row are that span and nothing else, and the feet row
+/// is never cut.
+#[test]
+fn every_facing_cuts_the_span_the_source_table_names() {
+    let table = [
+        (Facing::Right12, (2, 8), (2, 7)),
+        (Facing::Right30, (2, 7), (2, 7)),
+        (Facing::Right55, (3, 7), (3, 7)),
+        (Facing::Right75, (3, 6), (3, 6)),
+        (Facing::Edge, (4, 6), (4, 6)),
+        (Facing::Back105, (3, 6), (3, 6)),
+        (Facing::Back125, (3, 7), (3, 7)),
+        (Facing::Back150, (2, 7), (2, 7)),
+        (Facing::Back, (2, 8), (2, 7)),
+        (Facing::Left75, (3, 6), (3, 6)),
+        (Facing::Left55, (3, 7), (3, 7)),
+        (Facing::Left30, (2, 7), (2, 7)),
+        (Facing::Left12, (2, 8), (2, 7)),
+    ];
+    for (facing, r0, r1) in table {
+        let art = render(&frame(Pose::Facing(facing), Opts::default()), true);
+        for (row, (from, to)) in [(0, r0), (1, r1), (2, (0, 0))] {
+            let cut: Vec<usize> = (0..COLS)
+                .filter(|&col| art[row][col].1 == CellKind::CutOut)
+                .collect();
+            assert_eq!(
+                cut,
+                (from..to).collect::<Vec<usize>>(),
+                "{facing:?} row {row}"
+            );
+        }
+    }
+}

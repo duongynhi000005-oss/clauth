@@ -736,18 +736,20 @@ fn build_anims() -> Anims {
 
 /// One rendered cell: the glyph plus what its colours mean. Only the header
 /// maps kinds to styles, so the sprite tables stay colour-free. A body glyph
-/// and an eye cut-out share [`CellKind::Body`], and a turned pose's body
-/// glyphs and facing cut-outs share [`CellKind::FacingBody`]: the header's
-/// paragraph already paints the app background under every cell, so the
-/// source's `clawd_background` cut-outs are the plain surface here.
+/// and a facing body glyph share [`CellKind::Body`]; the source's
+/// `clawd_background` cut-outs — an open eye span, the row-1 body block and a
+/// facing's slice — are [`CellKind::CutOut`], which the header paints on
+/// black.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CellKind {
     Empty,
     Body,
-    /// Background-coloured glyph on the body — closed lids, winks, and the
-    /// simplified sprite's filled body block.
+    /// Black glyph on the body colour, the reverse of [`CellKind::CutOut`] —
+    /// closed lids, winks, and the simplified sprite's eye band and filled
+    /// body block.
     Lid,
-    FacingBody,
+    /// Body-coloured glyph on the source's `clawd_background` black.
+    CutOut,
     /// Poof and shadow marks, the source's `inactive` colour.
     Inactive,
 }
@@ -808,7 +810,7 @@ fn draw_face(art: &mut Art, eyes: Eyes, arms: Arms, feet: Feet) {
     place(art, 0, 0, arm.r1l, CellKind::Body);
     let mut col = 2;
     for &(glyphs, lid) in eye_spans(eyes) {
-        let kind = if lid { CellKind::Lid } else { CellKind::Body };
+        let kind = if lid { CellKind::Lid } else { CellKind::CutOut };
         for glyph in glyphs.chars() {
             place_cell(art, col, 0, glyph, kind);
             col += 1;
@@ -821,16 +823,40 @@ fn draw_face(art: &mut Art, eyes: Eyes, arms: Arms, feet: Feet) {
         2,
         1,
         "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
-        CellKind::Body,
+        CellKind::CutOut,
     );
     place(art, 7, 1, arm.r2r, CellKind::Body);
     place(art, 0, 2, feet_art(feet), CellKind::Body);
 }
 
 fn draw_facing(art: &mut Art, facing: Facing) {
+    let cut = facing_cut(facing);
     for (row, &glyphs) in facing_rows(facing).iter().enumerate() {
-        place(art, 0, row, glyphs, CellKind::FacingBody);
+        let (from, to) = cut[row];
+        for (col, glyph) in glyphs.chars().enumerate() {
+            let kind = if (from..to).contains(&col) {
+                CellKind::CutOut
+            } else {
+                CellKind::Body
+            };
+            place_cell(art, col, row, glyph, kind);
+        }
     }
+}
+
+/// The `[from, to)` slice of each row a facing cuts out in black
+/// (`clawd_background`), as column indices into the 9-wide row. Row 2 (the
+/// feet) is never cut. The ranges mirror Claude Code's facing table.
+fn facing_cut(facing: Facing) -> [(usize, usize); 3] {
+    use Facing::*;
+    let (r0, r1) = match facing {
+        Right12 | Back | Left12 => ((2, 8), (2, 7)),
+        Right30 | Back150 | Left30 => ((2, 7), (2, 7)),
+        Right55 | Back125 | Left55 => ((3, 7), (3, 7)),
+        Right75 | Back105 | Left75 => ((3, 6), (3, 6)),
+        Edge => ((4, 6), (4, 6)),
+    };
+    [r0, r1, (0, 0)]
 }
 
 fn draw_effects(art: &mut Art, frame: &Frame) {
