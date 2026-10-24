@@ -375,8 +375,10 @@ impl HttpAnswer {
                 while !stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            answer(stream, response.as_bytes());
+                            // Count before replying: the caller moves on once it
+                            // reads the reply, and a count bumped after it lags.
                             hits.fetch_add(1, Ordering::AcqRel);
+                            answer(stream, response.as_bytes());
                         }
                         Err(_) => std::thread::sleep(Duration::from_millis(5)),
                     }
@@ -390,7 +392,7 @@ impl HttpAnswer {
         }
     }
 
-    /// Requests answered so far.
+    /// Connections accepted so far, each counted before its reply is sent.
     pub fn hits(&self) -> usize {
         self.hits.load(Ordering::Acquire)
     }
