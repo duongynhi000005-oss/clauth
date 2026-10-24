@@ -828,7 +828,9 @@ impl FetchLease {
     /// scheduler's tick, so a caller-side flag would miss the other caller's
     /// stand-down and log it never or twice. The edge is decided under the
     /// `held` guard — two concurrent callers still split one transition between
-    /// them — and the line is logged after the guard drops.
+    /// them — and the line is logged after the guard drops, so two callers'
+    /// lines can reach the log in either order: the log's order across threads
+    /// is not the edge order, and `stood_down` alone says which edge came last.
     pub(crate) fn acquire(&self) -> bool {
         let mut held = match self.held.lock() {
             Ok(g) => g,
