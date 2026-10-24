@@ -6742,7 +6742,7 @@ fn runtime_trees_under(profile_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Whether a delete/rename caller offers `--force` as the way past a
-/// supervisor refusal. Delete does — `--force` still stops every verifiable
+/// supervisor refusal. The CLI's delete does — `--force` still stops every verifiable
 /// supervisor and waives the refusal for any supervisor it cannot stop
 /// (unverifiable, or verified but still alive after SIGTERM); rename has no
 /// such flag, so its refusal names only the retry.
@@ -6753,8 +6753,8 @@ pub(crate) enum SupervisorStopGate {
     /// after SIGTERM, spares with no signal or a skipped re-wait).
     Forced,
     /// No `--force`: stop each tree; refuse naming the tree. `offers_force`
-    /// selects the message tail — delete appends the `--force` clause, rename
-    /// (which has no such flag) does not.
+    /// selects the message tail — the CLI's delete appends the `--force`
+    /// clause; rename and the TUI's delete (which have no such flag) do not.
     Refused { offers_force: bool },
 }
 

@@ -4420,6 +4420,50 @@ fn delete_refuses_live_session_unless_forced() {
     );
 }
 
+/// A delete whose caller has no `--force` (the TUI's) refuses a live session
+/// without naming the flag.
+#[test]
+fn a_delete_with_no_force_flag_never_names_it_on_a_live_session() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "busy".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let sessions = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("busy")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
+    pid.lock().expect("lock pid");
+
+    let err = delete_profile_offering(
+        &mut config,
+        &crate::profile::ProfileName::from("busy"),
+        false,
+        false,
+        &rotation_guard("busy"),
+    )
+    .expect_err("a live session must block an unforced delete");
+    assert_eq!(err.to_string(), "'busy' has a live session");
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("busy"))
+            .is_some(),
+        "the refused delete must leave the profile record intact"
+    );
+}
+
 /// A Claude Code background job naming any tree under a profile's dir is a live
 /// session for `delete_profile`'s refusal: `clauth start <p> -- --bg` leaves the
 /// tree under a job the marker flock never sees, and pulling the profile dir out

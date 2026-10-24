@@ -1266,13 +1266,26 @@ pub(crate) fn rename_profile(
     Ok(())
 }
 
-/// `_rotation` is [`rotation_guard_for_mutation`]'s guard for `name`, and
-/// `force` does not waive it: `force` waives the live-session gate below, while
-/// an in-flight rotation is a different hazard that no confirmation makes safe.
+/// The CLI's delete: its live-session and supervisor refusals offer `--force`.
 pub(crate) fn delete_profile(
     config: &mut AppConfig,
     name: &ProfileName,
     force: bool,
+    rotation: &RotationGuard,
+) -> Result<()> {
+    delete_profile_offering(config, name, force, true, rotation)
+}
+
+/// `_rotation` is [`rotation_guard_for_mutation`]'s guard for `name`, and
+/// `force` does not waive it: `force` waives the live-session gate below, while
+/// an in-flight rotation is a different hazard that no confirmation makes safe.
+/// `offers_force` is false for a caller with no `--force` flag (the TUI), so no
+/// refusal names the flag.
+pub(crate) fn delete_profile_offering(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    force: bool,
+    offers_force: bool,
     _rotation: &RotationGuard,
 ) -> Result<()> {
     // The gateway reads the last-token guard needs happen outside the flock.
@@ -1287,7 +1300,10 @@ pub(crate) fn delete_profile(
         // any tree under this profile's dir is a live session for this refusal
         // too — `has_live_session` unions both sources.
         if !force && crate::runtime::has_live_session(name) {
-            bail!("'{name}' has a live session, pass --force to delete it anyway");
+            if offers_force {
+                bail!("'{name}' has a live session, pass --force to delete it anyway");
+            }
+            bail!("'{name}' has a live session");
         }
         // Same discipline: the gateway's last client token refuses here,
         // before anything is removed; `force` waives the session gate alone.
@@ -1309,7 +1325,7 @@ pub(crate) fn delete_profile(
         if force {
             crate::runtime::SupervisorStopGate::Forced
         } else {
-            crate::runtime::SupervisorStopGate::Refused { offers_force: true }
+            crate::runtime::SupervisorStopGate::Refused { offers_force }
         },
     )?;
     with_state_lock(|held| {

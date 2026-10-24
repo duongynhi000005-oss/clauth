@@ -25,7 +25,7 @@ use ratatui::text::Span;
 use crate::actions::{
     CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_into_profile,
     capture_snapshot, classify_env_key, clear_profile_api_key, clear_profile_credentials,
-    create_blank_profile, create_profile_from_login, delete_profile, duplicate_profile,
+    create_blank_profile, create_profile_from_login, delete_profile_offering, duplicate_profile,
     edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset,
     find_matching_oauth_profile, overwrite_captured_profile, rename_profile, reorder_profile,
     rotation_guard_for_mutation, set_chain_order, set_member_threshold, set_wrap_off,
@@ -1435,7 +1435,7 @@ pub(crate) enum ConfirmAction {
     /// held. Confirm, then change the type (dropping the staged login).
     CycleAccountType(NewAccountType),
     /// Delete row on a profile with a live `clauth start` session: the unforced
-    /// guard in `delete_profile` refuses this, so confirm the deauth risk here
+    /// guard in `delete_profile_offering` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
     DeleteLiveSession(String),
     /// Fallback tab `+ add`: the candidate would mix api-key and oauth accounts
@@ -23612,7 +23612,7 @@ fn commit_new_account(app: &mut App) {
 }
 
 fn perform_delete(app: &mut App, name: &ProfileName) {
-    // The unforced guard in `delete_profile` refuses a live-session profile,
+    // The unforced guard in `delete_profile_offering` refuses a live-session profile,
     // which would otherwise dead-end the TUI on a danger toast with no way
     // forward. Confirm the deauth risk instead of attempting (and failing)
     // the unforced delete first.
@@ -23637,7 +23637,8 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
     // Before `app.config()`, for the reason the rename path states.
     let result = rotation_guard_for_mutation(name).and_then(|rotation| {
         let mut cfg = app.config();
-        delete_profile(&mut cfg, name, force, &rotation)
+        // The TUI has no `--force` flag, so no refusal names it.
+        delete_profile_offering(&mut cfg, name, force, false, &rotation)
     });
     match result {
         Ok(()) => {

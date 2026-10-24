@@ -5590,6 +5590,47 @@ fn perform_delete_without_live_session_deletes_immediately() {
     );
 }
 
+/// A TUI delete refused because a runtime tree's supervisor outlives its stop
+/// names no CLI flag: the TUI has no `--force` to offer.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_tui_delete_refused_on_a_live_supervisor_never_names_a_cli_flag() {
+    use super::perform_delete;
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![Profile::new("quiet".to_string(), None, None)]);
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("quiet")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, true);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+    let _deadline =
+        crate::runtime::SupervisorStopDeadlineGuard::set(std::time::Duration::from_millis(300));
+
+    perform_delete(&mut app, &crate::profile::ProfileName::from("quiet"));
+
+    let bodies: Vec<&String> = app.toasts.iter().map(|t| &t.body).collect();
+    let expected = format!(
+        "delete failed\n'quiet': runtime tree {} still has a background supervisor clauth \
+         cannot stop on this host; retry once it has exited",
+        tree.display()
+    );
+    assert!(
+        bodies.iter().any(|b| **b == expected),
+        "the refusal reads {expected:?}: {bodies:?}"
+    );
+    assert!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("quiet"))
+            .is_some(),
+        "the refused delete keeps the account"
+    );
+}
+
 // ── `disabled` row (per-account disable toggle) ─────────────────────────────
 
 /// Toggling `disabled` persists immediately into the live shared `AppConfig`
