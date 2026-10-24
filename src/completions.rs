@@ -106,6 +106,8 @@ complete -F _clauth clauth
 
 const ZSH_TEMPLATE: &str = r#"#compdef clauth
 _clauth() {
+    local profile_on_line=0
+    (( ${${(@)words[1,CURRENT-1]}[(I)--profile]} + ${${(@)words[CURRENT+1,-1]}[(I)--profile]} != 0 )) && profile_on_line=1
     if (( CURRENT == 2 )); then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
@@ -154,7 +156,7 @@ _clauth() {
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
-    elif (( CURRENT == 4 )) && [[ "${words[2]}" == resume && "${words[3]}" == --profile ]]; then
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == resume && "${words[CURRENT-1]}" == --profile ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
@@ -222,12 +224,12 @@ _clauth() {
         local -a sids
         sids=("${(@f)$(clauth __complete --resumable 2>/dev/null)}")
         _describe 'session' sids
-        [[ "${words[2]}" == resume ]] && _values 'flag' '--profile[resume under this profile instead of prompting]'
+        [[ "${words[2]}" == resume ]] && (( ! profile_on_line )) && _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT == 5 )) && [[ "${words[2]}" == resume && "${words[3]}" == --profile ]]; then
         local -a sids
         sids=("${(@f)$(clauth __complete --resumable 2>/dev/null)}")
         _describe 'session' sids
-    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
+    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]] && (( ! profile_on_line )); then
         _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
         _values 'flag' __CLATHA_LOGIN_FLAGS__
@@ -332,8 +334,9 @@ complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (c
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
-complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
+complete -c clauth -f -n "__fish_seen_subcommand_from resume; and not contains -- --profile (commandline -opc)" -a --profile -d "Resume under this profile instead of prompting"
 complete -c clauth -f -n "__fish_seen_subcommand_from resume; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session
+complete -c clauth -f -n '__fish_seen_subcommand_from resume; and set -l t (commandline -opc); and test "$t[-1]" = --profile' -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from info; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session
 complete -c clauth -f -n 'set -l t (commandline -opc); and test (count $t) -eq 4; and contains -- "$t[2]" resume; and contains -- "$t[3]" --profile' -a "(__clauth_resumable)" -d Session
 __CLATHA_LOGIN_FLAGS__

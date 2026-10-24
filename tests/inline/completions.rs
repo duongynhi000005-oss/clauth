@@ -504,6 +504,156 @@ fn zsh_and_fish_offer_session_ids_only_where_an_id_is_owed() {
     );
 }
 
+/// What `resume` and `info` owe at one TAB: the words before the one being
+/// completed, that word as typed so far, the words after the cursor, then
+/// whether ids, profile names and `--profile` are offered. The value after
+/// `--profile` is a profile wherever the flag sits; an id is owed once, before
+/// or after `--profile <name>`; `--profile` is offered until it is on the line,
+/// and a fully typed `--profile` still completes to itself.
+#[cfg(unix)]
+struct ResumeTab {
+    before: &'static str,
+    typed: &'static str,
+    after: &'static str,
+    ids: bool,
+    profiles: bool,
+    flag: bool,
+}
+
+#[cfg(unix)]
+const fn tab(
+    before: &'static str,
+    typed: &'static str,
+    after: &'static str,
+    [ids, profiles, flag]: [bool; 3],
+) -> ResumeTab {
+    ResumeTab {
+        before,
+        typed,
+        after,
+        ids,
+        profiles,
+        flag,
+    }
+}
+
+#[cfg(unix)]
+const RESUME_TABS: [ResumeTab; 9] = [
+    tab("clauth resume", "", "", [true, false, true]),
+    tab("clauth info", "", "", [true, false, false]),
+    tab("clauth resume --profile", "", "", [false, true, false]),
+    tab("clauth resume --profile work", "", "", [true, false, false]),
+    tab("clauth resume 0b6f --profile", "", "", [false, true, false]),
+    tab("clauth resume 0b6f", "", "", [false, false, true]),
+    tab(
+        "clauth resume --profile work 0b6f",
+        "",
+        "",
+        [false, false, false],
+    ),
+    tab("clauth resume 0b6f", "--profile", "", [false, false, true]),
+    tab("clauth resume", "", "--profile work", [true, false, false]),
+];
+
+/// Whether a shell can run here; skipped with a printed reason where it cannot,
+/// unless `CLAUTH_REQUIRE_SHELL_LINT=1` demands it.
+#[cfg(unix)]
+fn shell_runs(shell: &str) -> bool {
+    if std::process::Command::new(shell)
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        return true;
+    }
+    let strict = std::env::var("CLAUTH_REQUIRE_SHELL_LINT").as_deref() == Ok("1");
+    assert!(
+        !strict,
+        "{shell} is not installed, but CLAUTH_REQUIRE_SHELL_LINT=1 demands it"
+    );
+    println!("skipping: {shell} is not on PATH");
+    false
+}
+
+/// fish offers the `resume` / `info` words by position: what the real fish
+/// completes for the real script, the id and profile shellouts stubbed. A tab
+/// with words after the cursor is left out: `complete -C` completes at the end
+/// of the line only.
+#[cfg(unix)]
+#[test]
+fn fish_offers_resume_words_by_position() {
+    if !shell_runs("fish") {
+        return;
+    }
+    let script = format!(
+        "{}\nfunction __clauth_profiles; echo STUB_PROFILE; end\nfunction __clauth_resumable; echo STUB_ID; end\n",
+        FISH.as_str()
+    );
+    for t in RESUME_TABS.iter().filter(|t| t.after.is_empty()) {
+        let line = format!("{} {}", t.before, t.typed);
+        let out = std::process::Command::new("fish")
+            .args(["-c", &format!("{script}\ncomplete -C {line:?}")])
+            .output()
+            .expect("run fish");
+        let offered = String::from_utf8_lossy(&out.stdout).to_string();
+        let words: Vec<&str> = offered
+            .lines()
+            .filter_map(|l| l.split('\t').next())
+            .collect();
+        assert_eq!(
+            (
+                words.contains(&"STUB_ID"),
+                words.contains(&"STUB_PROFILE"),
+                words.contains(&"--profile")
+            ),
+            (t.ids, t.profiles, t.flag),
+            "fish at `{line}<TAB>` (ids, profiles, --profile): {offered:?}"
+        );
+    }
+}
+
+/// zsh offers the `resume` / `info` words by position: `_clauth` run with the
+/// shellout and the completion functions it calls stubbed to print what they
+/// were handed, the cursor placed through `words` and `CURRENT`.
+#[cfg(unix)]
+#[test]
+fn zsh_offers_resume_words_by_position() {
+    if !shell_runs("zsh") {
+        return;
+    }
+    let stubs = r#"clauth() { case "$*" in "__complete --resumable") print STUB_ID ;; "__complete") print STUB_PROFILE ;; esac }
+_values() { print -r -- "values: $*" }
+_describe() { print -r -- "describe $1: ${(P)2}" }
+"#;
+    for t in &RESUME_TABS {
+        let current = t.before.split(' ').count() + 1;
+        let driver = format!(
+            "{stubs}source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1\n{}\nCLAUTH_ZSH_EOF\nwords=({} \"{}\" {}); CURRENT={current}; _clauth",
+            ZSH.as_str(),
+            t.before,
+            t.typed,
+            t.after
+        );
+        let out = std::process::Command::new("zsh")
+            .args(["-f", "-c", &driver])
+            .output()
+            .expect("run zsh");
+        let offered = String::from_utf8_lossy(&out.stdout).to_string();
+        assert_eq!(
+            (
+                offered.contains("STUB_ID"),
+                offered.contains("STUB_PROFILE"),
+                offered.contains("--profile[")
+            ),
+            (t.ids, t.profiles, t.flag),
+            "zsh at `{} {}<TAB> {}` (ids, profiles, --profile): {offered:?}",
+            t.before,
+            t.typed,
+            t.after
+        );
+    }
+}
+
 /// Building the list opens no transcript: a top-level `<id>.jsonl` that is a
 /// FIFO blocks any reader forever, so a list that opens files never returns,
 /// while one built from filenames offers the FIFO's stem like any other.
@@ -1516,19 +1666,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_s
 #[cfg(unix)]
 #[test]
 fn fish_runs_the_proxy_guard() {
-    if std::process::Command::new("fish")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        let strict = std::env::var("CLAUTH_REQUIRE_SHELL_LINT").as_deref() == Ok("1");
-        assert!(
-            !strict,
-            "fish is not installed, but CLAUTH_REQUIRE_SHELL_LINT=1 demands it"
-        );
-        println!(
-            "skipping: fish is not on PATH, so the proxy guard is pinned by its script text alone"
-        );
+    if !shell_runs("fish") {
         return;
     }
     // Stub the profile shellout so the offer is observable without a built
