@@ -16851,6 +16851,7 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        boot_transport: None,
         is_delegate: false,
         background: false,
         background_hold: false,

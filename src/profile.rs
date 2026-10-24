@@ -1602,7 +1602,7 @@ impl AppConfig {
 /// `default` is the `model` setting; `opus`/`sonnet`/`haiku`/`fable` are the
 /// `ANTHROPIC_DEFAULT_*_MODEL` env overrides; `subagent` is
 /// `CLAUDE_CODE_SUBAGENT_MODEL`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ModelSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default: Option<String>,

@@ -6480,8 +6480,17 @@ fn scan_session_switches(
                         .clone()
                         .unwrap_or_else(|| row.start_profile.clone()),
                 );
-                let start = cfg.find(&ProfileName::from(row.start_profile.clone()))?;
-                let launch = crate::runtime::LaunchTransport::of(start);
+                // The transport this session BOOTED with, not what its start
+                // profile reads now. A row written by this clauth records it
+                // (`boot_transport`); only an older row reconstructs from the
+                // start profile, and that reconstruction keeps the row's own
+                // `?` drop when the profile is gone.
+                let launch = match &row.boot_transport {
+                    Some(transport) => transport.clone(),
+                    None => crate::runtime::LaunchTransport::of(
+                        cfg.find(&ProfileName::from(row.start_profile.clone()))?,
+                    ),
+                };
                 let snapshot =
                     crate::fallback::snapshot_session_chain(&cfg, &member, &launch, &key_rejected)?;
                 let own_inference = cfg
@@ -6713,13 +6722,12 @@ fn scan_session_switches(
         // readable login beside a `config.toml` that no longer parses. The leg
         // therefore re-checks its pick through the SAME gate the executor's
         // install branch runs (`swap_target_precondition`) and steps past any
-        // refusal — one function, so the checks cannot drift. The `launch` they
-        // pass it can: `crate::fallback::snapshot_session_chain`'s doc carries
-        // the residual ("`launch` is reconstructed from the session's
-        // `start_profile` as it reads NOW, while what is live in the child's
-        // `process.env` is what `acquire` was handed — so an operator editing
-        // that profile mid-session moves this view away from the truth"), and
-        // the executor holds the boot snapshot, so the two can still disagree.
+        // refusal — one function, so the checks cannot drift. The `launch` it
+        // passes is the boot transport the row records, so the preference and the
+        // executor judge one value for a session this clauth launched; a row an
+        // older clauth wrote carries no record, and for those the leg
+        // reconstructs the launch from the start profile as it reads now (the
+        // residual `crate::fallback::snapshot_session_chain`'s doc carries).
         // Neither rejection marks the shared skip store: the leg
         // re-checks its pick every tick, so it needs no memory of the rejection,
         // and the daemon keeps its own ruled defer/give-up lines for a member

@@ -24,6 +24,7 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        boot_transport: None,
         is_delegate: false,
         background: false,
         background_hold: false,

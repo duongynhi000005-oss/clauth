@@ -69,6 +69,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::claude::{build_claude_settings_json, create_symlink};
 use crate::claude_jobs::JobTrees;
@@ -3387,9 +3388,15 @@ pub(crate) enum SwapOutcome {
 /// the INTENDED member rather than against a re-read of the current one, because
 /// this snapshot is what is live in the child's `process.env`: `settings.json`
 /// env is applied at startup only.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// The `[env]` map lives here only as a digest: an env VALUE may carry an
+/// inference credential, so the map itself must not travel onto the live-session
+/// row. [`swap_eligible`] compares the candidate's digest against this one, so
+/// the verdict equals a compare of the two maps. The row persists it across
+/// upgrades, so its encoding is a format (see `env_digest`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LaunchTransport {
-    env: std::collections::BTreeMap<String, String>,
+    env_digest: String,
     models: crate::profile::ModelSettings,
     has_api_key: bool,
 }
@@ -3397,11 +3404,39 @@ pub(crate) struct LaunchTransport {
 impl LaunchTransport {
     pub(crate) fn of(profile: &Profile) -> Self {
         Self {
-            env: profile.env.clone(),
+            env_digest: env_digest(&profile.env),
             models: profile.models.clone(),
             has_api_key: profile.api_key.is_some(),
         }
     }
+}
+
+/// The SHA-256 of the sorted `[env]` map, lower-case hex. Each key and value is
+/// length-prefixed (`u64` little-endian byte count then bytes), and the pair
+/// count leads, so a pair split at a different `=` cannot collide:
+/// `{"A": "b=c"}` and `{"A=b": "c"}` digest differently, and reordered inserts
+/// digest identically. The ONE routine both the boot snapshot and
+/// [`swap_eligible`] use — there is deliberately no second digest routine.
+/// The bytes stream into the hasher, so no heap copy of a value is made: a
+/// value may be an inference token.
+///
+/// The value is PERSISTED on the live-session row, and a row outlives a binary
+/// upgrade: a newer daemon judges a session an older build started. Changing
+/// this encoding makes every pre-upgrade row mismatch every member until its
+/// session restarts, so treat it as a format.
+fn env_digest(env: &std::collections::BTreeMap<String, String>) -> String {
+    /// Length-delimited so no two field splits can collide (`ab|c` vs `a|bc`).
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update((env.len() as u64).to_le_bytes());
+    for (key, value) in env {
+        field(&mut hasher, key.as_bytes());
+        field(&mut hasher, value.as_bytes());
+    }
+    hex::encode(<[u8; 32]>::from(hasher.finalize()))
 }
 
 /// Whether `candidate` is a member this session could be swapped onto, judged on
@@ -3411,7 +3446,10 @@ impl LaunchTransport {
 /// PREFERENCE: a candidate the executor refuses is one the walk must step PAST,
 /// or the intent stops changing and the session never reaches the next viable
 /// member (a chain holding a `z.ai` or DeepSeek profile is enough to do it). One
-/// function rather than two so the preference and the gate cannot drift.
+/// function rather than two so the preference and the gate cannot drift. The leg
+/// passes the boot transport its row records — the same snapshot the executor
+/// holds — so for a session this clauth launched they judge one transport; an
+/// older row's reconstruction is the leg's fallback.
 ///
 /// The executor stays the safety gate. What is deliberately NOT here: the
 /// store-exists check (disk IO the daemon would repeat per candidate per tick)
@@ -3440,7 +3478,7 @@ pub(crate) fn swap_eligible(
     if candidate.is_disabled() {
         return Err(SwapRefused::Disabled);
     }
-    if candidate.env != launch.env {
+    if env_digest(&candidate.env) != launch.env_digest {
         return Err(SwapRefused::EnvDiffers);
     }
     if matches!(models, ModelsRule::Equal) && candidate.models != launch.models {
@@ -3467,8 +3505,9 @@ pub(crate) fn swap_eligible(
 ///
 /// Shared with the daemon's per-session decision leg so it steps past EXACTLY
 /// what the executor refuses, rather than a second copy of the gate that drifts
-/// the next time the executor gains a check. Returns the install source path the
-/// caller's [`SwapPlan`] repoints the link at.
+/// the next time the executor gains a check. For a session this clauth launched,
+/// the leg passes the same boot transport the executor holds. Returns the
+/// install source path the caller's [`SwapPlan`] repoints the link at.
 pub(crate) fn swap_target_precondition(
     intended: &ProfileName,
     launch: &LaunchTransport,
@@ -5125,6 +5164,10 @@ impl ProfileRuntime {
                     SessionTree::Background(BackgroundHold::Daemon) => None,
                     _ => Some(canonical.clone()),
                 },
+                // The boot transport the executor snapshots from `fresh` below:
+                // the row's record is the SAME value, so the decision leg judges
+                // members against what the child actually runs.
+                Some(crate::runtime::LaunchTransport::of(&fresh)),
             );
             if let SessionTree::Background(hold) = tree {
                 row.background = true;
@@ -8204,6 +8247,7 @@ impl CodexRuntime {
                 false,
                 crate::live_sessions::Launcher::Own,
                 Some(home.join("auth.json")),
+                None,
             );
             if let Err(e) = crate::live_sessions::register(&row) {
                 logline!("clauth: registering the live codex session failed: {e}");

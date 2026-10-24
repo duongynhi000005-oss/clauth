@@ -1374,11 +1374,13 @@ pub(crate) fn snapshot_chain_from(
 ///   one — the executor stays the safety gate, and the store-exists check and the
 ///   transport/platform refusals are deliberately not re-derived here.
 ///
-/// `launch` is reconstructed from the session's `start_profile` as it reads NOW,
-/// while what is live in the child's `process.env` is what `acquire` was handed —
-/// so an operator editing that profile mid-session moves this view away from the
-/// truth. A wrong guess either way costs a logged refusal or a stay-put, never a
-/// burned chain.
+/// `launch` is the transport the session booted with, read from the row's
+/// `boot_transport` when the row records one. A row an older clauth wrote carries
+/// no record, and for those the leg reconstructs it from the session's
+/// `start_profile` as it reads NOW — while what is live in the child's
+/// `process.env` is what `acquire` was handed, so an operator editing that
+/// profile mid-session moves that reconstruction away from the truth. A wrong
+/// guess either way costs a logged refusal or a stay-put, never a burned chain.
 pub(crate) fn snapshot_session_chain(
     config: &AppConfig,
     member: &ProfileName,

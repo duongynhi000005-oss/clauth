@@ -29,6 +29,7 @@ fn starting_marks_only_a_delegate_row() {
         false,
         Launcher::Own,
         None,
+        None,
     );
     assert!(!own.is_delegate, "a clauth start row is own");
     let delegate = crate::live_sessions::LiveSession::starting(
@@ -38,6 +39,7 @@ fn starting_marks_only_a_delegate_row() {
         false,
         false,
         Launcher::Delegate,
+        None,
         None,
     );
     assert!(
@@ -7880,6 +7882,7 @@ fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
             current_member: None,
             last_swap_at: None,
             launch_store: None,
+            boot_transport: None,
             is_delegate: false,
             background: false,
             background_hold: false,
@@ -8131,6 +8134,7 @@ fn lone_session(
         false,
         Launcher::Own,
         Some(store.to_path_buf()),
+        None,
     );
     crate::live_sessions::register(&row).expect("register row");
     let swap = std::sync::Arc::new(SessionSwap::new(
@@ -8175,6 +8179,7 @@ fn fake_session(
         false,
         Launcher::Own,
         Some(store.to_path_buf()),
+        None,
     );
     crate::live_sessions::register(&row).expect("register row");
     let swap = std::sync::Arc::new(SessionSwap::new(
@@ -8797,6 +8802,113 @@ fn the_precondition_refuses_a_member_whose_transport_differs() {
         assert_eq!(cleared("pre-keyed"), Err(SwapRefused::ApiKeyDiffers));
         assert_eq!(cleared("pre-absent"), Err(SwapRefused::NoCredentialStore));
     });
+}
+
+/// The live-session row records the transport the session booted with: the
+/// one built from the on-disk profile the swap snapshots, so the daemon's leg
+/// and the executor judge members against one value. An `[env]` entry can
+/// carry an inference credential, so the row holds no `[env]` value at all.
+#[test]
+fn acquire_records_the_boot_transport_without_any_env_value() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let mut profile = make_profile("boot-env");
+        profile
+            .env
+            .insert("ANTHROPIC_AUTH_TOKEN".into(), "sk-boot-secret-value".into());
+        profile
+            .env
+            .insert("OTHER_SETTING".into(), "plain-boot-value".into());
+        register_profile(&profile);
+
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+
+        let row = crate::live_sessions::get(rt.session_id()).expect("the session's row");
+        let on_disk = crate::profile::load_profile(&profile.name).expect("load the profile");
+        assert_eq!(row.boot_transport, Some(LaunchTransport::of(&on_disk)));
+
+        let raw = fs::read_to_string(
+            tmp.path()
+                .join(".clauth")
+                .join("live_sessions")
+                .join(format!("{}.json", rt.session_id())),
+        )
+        .expect("read the row file");
+        for value in ["sk-boot-secret-value", "plain-boot-value"] {
+            assert!(
+                !raw.contains(value),
+                "the row must not hold `{value}`:\n{raw}"
+            );
+        }
+        drop(rt);
+    });
+}
+
+/// Two transports are equal exactly when their `[env]` maps are: a pair split
+/// at a different `=` is a different env, and a reordered insert is the same.
+/// The executor refuses `EnvDiffers` on this equality, so a collision here is
+/// a swap into a session whose child never received the target's env.
+#[test]
+fn launch_transports_differ_exactly_when_their_env_maps_do() {
+    let with_env = |pairs: &[(&str, &str)]| {
+        let mut p = make_profile("env-eq");
+        for (k, v) in pairs {
+            p.env.insert((*k).into(), (*v).into());
+        }
+        LaunchTransport::of(&p)
+    };
+    assert_eq!(
+        with_env(&[("A", "1"), ("B", "2")]),
+        with_env(&[("B", "2"), ("A", "1")])
+    );
+    assert_ne!(with_env(&[("A", "b=c")]), with_env(&[("A=b", "c")]));
+    assert_ne!(with_env(&[("AB", "")]), with_env(&[("A", "B")]));
+    assert_ne!(with_env(&[("A", "1"), ("B", "")]), with_env(&[("A", "1")]));
+    assert_ne!(with_env(&[("A", "1")]), with_env(&[]));
+    // A changed VALUE under the same key is a different env: a rotated
+    // `ANTHROPIC_AUTH_TOKEN` or a moved `ANTHROPIC_BASE_URL` never reaches a
+    // running child.
+    assert_ne!(with_env(&[("A", "1")]), with_env(&[("A", "2")]));
+    assert_ne!(with_env(&[("A", "12")]), with_env(&[("A", "21")]));
+}
+
+/// The transport is stored on the live-session row, and a row outlives a
+/// binary upgrade: a daemon on a newer build judges a session an older build
+/// started. So its serialized form is a format. The digests below were
+/// computed outside the crate (Python `hashlib.sha256` over the pair count,
+/// then each key and value, each as a little-endian `u64` byte length followed
+/// by its UTF-8 bytes, in sorted key order). A digest change makes every
+/// running session's row mismatch every member until it restarts; a shape
+/// change makes those rows unreadable, so they drop out of every row reader.
+#[test]
+fn a_launch_transport_serializes_to_a_stable_row_format() {
+    let empty = make_profile("fmt-empty");
+    assert_eq!(
+        serde_json::to_value(LaunchTransport::of(&empty)).expect("serialize"),
+        serde_json::json!({
+            "env_digest": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+            "models": {},
+            "has_api_key": false,
+        })
+    );
+
+    let mut routed = make_profile("fmt-routed");
+    routed.env.insert(
+        "ANTHROPIC_BASE_URL".into(),
+        "https://api.example/anthropic".into(),
+    );
+    routed.env.insert("Z".into(), "ü".into());
+    routed.api_key = Some("k".into());
+    let value = serde_json::to_value(LaunchTransport::of(&routed)).expect("serialize");
+    assert_eq!(
+        value["env_digest"],
+        "0a8287ebfd17c95b416cf2bd16f3bbcdc43fd5ccd6e6d4e8b0321d6014373929"
+    );
+    assert_eq!(value["has_api_key"], true);
+    let back: LaunchTransport = serde_json::from_value(value).expect("round-trip");
+    assert_eq!(back, LaunchTransport::of(&routed));
 }
 
 /// A `credentials.json` that parses but holds no login installs an empty login
@@ -11656,6 +11768,7 @@ fn register_row(profile: &str, sid: &str, launch_store: Option<std::path::PathBu
         current_member: None,
         last_swap_at: None,
         launch_store,
+        boot_transport: None,
         is_delegate: false,
         background: false,
         background_hold: false,
@@ -15150,6 +15263,7 @@ fn a_background_holder_converges_and_refuses_a_cross_account_swap() {
             false,
             Launcher::Own,
             Some(store.to_path_buf()),
+            None,
         );
         // A standing cross-account intent (an older clauth's `switch`, a hand
         // edit): `poll` must refuse it and still converge the own account.

@@ -4201,6 +4201,7 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        boot_transport: None,
         is_delegate: false,
         background: false,
         background_hold: false,
@@ -6425,6 +6426,70 @@ fn a_session_walks_past_a_member_the_executor_would_refuse() {
         (Some("c".to_string()), Some(2)),
         "b has headroom but a different endpoint, so the walk must reach c"
     );
+}
+
+/// `a`'s `[env]` edited mid-session, the edit written to disk the way an
+/// operator's config edit lands, with `b` given the same edit and `c` left as
+/// `a` booted. The child still runs the boot env (`settings.json` env reaches
+/// `process.env` at startup only), and the executor judges against that boot
+/// snapshot: it refuses `b` and takes `c`. So the leg must name `c`.
+fn edit_env_mid_session(config: &crate::profile::ConfigHandle, names: &[&str]) {
+    let mut cfg = config.lock().unwrap();
+    for name in names {
+        let p = cfg
+            .find_mut(&crate::profile::ProfileName::from(*name))
+            .expect("member");
+        p.env.insert("EDITED_MID_SESSION".into(), "1".into());
+        crate::profile::save_profile(p).expect("save the edit");
+    }
+}
+
+#[test]
+fn a_session_decides_off_the_transport_it_booted_with() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    let boot = config
+        .lock()
+        .unwrap()
+        .find(&crate::profile::ProfileName::from("a"))
+        .expect("member a")
+        .clone();
+    let mut row = session_row("4242-0", "a");
+    row.boot_transport = Some(crate::runtime::LaunchTransport::of(&boot));
+    let _marker = register_live_row(&row);
+    edit_env_mid_session(&config, &["a", "b"]);
+
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("c".to_string()), Some(2)),
+        "b matches the edited env the child never received; c matches the boot env"
+    );
+}
+
+/// A row an older clauth wrote carries no boot transport. The leg keeps
+/// deciding for it, off the start profile as it reads now.
+#[test]
+fn a_row_without_a_boot_transport_decides_off_the_start_profile_as_it_reads_now() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    let row = session_row("4242-0", "a");
+    assert!(row.boot_transport.is_none(), "fixture: an older row");
+    let _marker = register_live_row(&row);
+    edit_env_mid_session(&config, &["a", "b"]);
+
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(decision_of("4242-0"), (Some("b".to_string()), Some(1)));
 }
 
 /// B4. `Off` means "sign every account out". A session cannot be left

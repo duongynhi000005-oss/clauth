@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, atomic_write_600, clauth_dir, mkdir_700};
-use crate::runtime::{SessionId, is_session_id};
+use crate::runtime::{LaunchTransport, SessionId, is_session_id};
 
 /// Who launched a session. The end user's own sessions — `clauth start` and
 /// codex — are [`Launcher::Own`]; a one-shot headless run the clauth MCP
@@ -144,6 +144,15 @@ pub(crate) struct LiveSession {
     /// rotation refusal keeps applying to it exactly as it does today.
     #[serde(default)]
     pub(crate) launch_store: Option<PathBuf>,
+    /// The transport the session booted with, recorded on every claude row as the
+    /// exact value the executor snapshots, and `None` on codex rows (codex never
+    /// swaps through this executor). The daemon's per-session decision leg judges
+    /// members against it; a row written by an older clauth carries `None`, and
+    /// the leg reconstructs the transport from the start profile as it reads now.
+    /// Holds a digest of the `[env]` map, never the map itself, so no env VALUE
+    /// (an inference credential may live there) is written to the row.
+    #[serde(default)]
+    pub(crate) boot_transport: Option<LaunchTransport>,
     /// Whether this row is a delegate: a one-shot headless run the clauth MCP
     /// server spawned. Set once at registration and never mutated, so the first
     /// read of the row already carries it — no tally reads a delegate row as an
@@ -172,6 +181,7 @@ pub(crate) struct LiveSession {
 impl LiveSession {
     /// A row for a session starting now. Pid, start time, and cwd are read here
     /// rather than passed in, so every registration reports them the same way.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn starting(
         session_id: &SessionId,
         start_profile: &str,
@@ -180,6 +190,7 @@ impl LiveSession {
         follows_chain: bool,
         launcher: Launcher,
         launch_store: Option<PathBuf>,
+        boot_transport: Option<LaunchTransport>,
     ) -> Self {
         Self {
             session_id: session_id.as_str().to_string(),
@@ -199,6 +210,7 @@ impl LiveSession {
             current_member: None,
             last_swap_at: None,
             launch_store,
+            boot_transport,
             is_delegate: matches!(launcher, Launcher::Delegate),
             background: false,
             background_hold: false,
