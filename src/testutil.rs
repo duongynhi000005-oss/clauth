@@ -2195,15 +2195,21 @@ pub(crate) fn live_session_rows_until(
     }
 }
 
-/// Field 22 of `/proc/<pid>/stat` (the process start time in clock ticks since
-/// boot), parsed after the last `)`, or `None` when the file is unreadable or
-/// the field is missing. The one test-side parse, shared by the fixtures that
-/// seed a record with the process's real start.
+/// The recorded `procStart` spelling the fake supervisor's lock carries: field
+/// 22 of `/proc/<pid>/stat` on linux (clock ticks since boot), and
+/// `asctime(gmtime(pbi_start_tvsec))` on macOS — the same string the runtime's
+/// verify computes, so a seeded lock matches the live pid on either OS.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn proc_start_of(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = stat.rsplit_once(')')?.1;
     Some(rest.split_whitespace().nth(19)?.to_string())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn proc_start_of(pid: u32) -> Option<String> {
+    crate::runtime::proc_bsdinfo(pid)
+        .map(|info| crate::runtime::format_proc_start(info.pbi_start_tvsec))
 }
 
 /// A stateful slow `claude` shim: `--version` and `plugin` probes answer
@@ -2855,6 +2861,219 @@ impl Drop for Owned {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// The libtest path [`FakeSupervisor`] and [`spawn_parked`] re-enter: a
+/// `#[test]` that parks until SIGTERM when the fixture's marker env is present
+/// and returns at once otherwise (the normal suite run). Re-entering the test
+/// binary itself — a linker-signed executable — keeps its environment readable
+/// on macOS, where an Apple platform binary like `/bin/sh` would have it
+/// withheld from the verify read.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const PARK_TEST: &str = "testutil::fake_supervisor_parks_until_sigterm";
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const READY_ENV: &str = "CLAUTH_TEST_FAKE_SUPERVISOR_READY";
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const IGNORE_TERM_ENV: &str = "CLAUTH_TEST_FAKE_SUPERVISOR_IGNORE_TERM";
+
+/// The re-entry target: with the marker env absent this passes instantly (the
+/// normal suite run); with it present the test writes the ready file, then
+/// parks until SIGTERM — installing a no-op SIGTERM handler first when told to
+/// ignore the signal.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn fake_supervisor_parks_until_sigterm() {
+    let Some(ready) = std::env::var_os(READY_ENV) else {
+        return;
+    };
+    if std::env::var_os(IGNORE_TERM_ENV).is_some() {
+        use signal_hook::consts::signal::SIGTERM;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let _ignored = signal_hook::flag::register(SIGTERM, Arc::new(AtomicBool::new(false)))
+            .expect("register the ignore-SIGTERM handler");
+    }
+    std::fs::write(Path::new(&ready), b"").expect("signal readiness");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// Spawn a re-entered copy of the test binary that runs only [`PARK_TEST`],
+/// with `leading` as the argv words before the `--exact` filter (so argv can
+/// pose a supervisor shape or a foreign shape), `CLAUDE_CONFIG_DIR` set, and
+/// the ready path the park test must write before parking.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn reenter_parked(config_dir: &Path, leading: &[&str], ready: &Path) -> Command {
+    // Linux spawns through `/proc/self/exe`, which execs the running inode even
+    // after the test binary is unlinked or rebuilt mid-run (`current_exe()`
+    // then reads `<path> (deleted)` and every later spawn fails ENOENT); macOS
+    // has no such magic path, so it keeps `current_exe()`.
+    #[cfg(target_os = "linux")]
+    let exe = std::path::PathBuf::from("/proc/self/exe");
+    #[cfg(target_os = "macos")]
+    let exe = std::env::current_exe().expect("the test binary");
+    let mut cmd = Command::new(exe);
+    cmd.args(leading)
+        .arg("--exact")
+        .arg(PARK_TEST)
+        .arg("--test-threads=1")
+        .env("CLAUDE_CONFIG_DIR", config_dir)
+        .env(READY_ENV, ready)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// A live re-entered test binary that parks until SIGTERM, with `leading` as
+/// its argv — used to pose a live pid whose argv does NOT hold `daemon run`
+/// while its environment (readable on macOS only for non-platform binaries)
+/// carries the tree's `CLAUDE_CONFIG_DIR`. The caller records its start and
+/// owns its reap; the reaped `Owned` kills and waits on drop.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn spawn_parked(config_dir: &Path, leading: &[&str]) -> Owned {
+    let dir = tempfile::tempdir().expect("parked re-entry dir");
+    let ready = dir.path().join("ready");
+    // The child is owned from the spawn, so a panic during the readiness wait
+    // below still kills and reaps it (the `Owned` Drop) instead of leaking a
+    // forever-parked process.
+    let child = Owned(
+        reenter_parked(config_dir, leading, &ready)
+            .spawn()
+            .expect("spawn the re-entered test binary"),
+    );
+    // Wait for the park test to write the ready file before returning, so the
+    // caller records a pid that is already parked (and the tempdir can drop:
+    // the ready path is no longer needed).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parked re-entry never became ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child
+}
+
+/// A fake supervisor for the pid-stop tests: a re-entered copy of the test
+/// binary run with argv `daemon run` under the chosen `CLAUDE_CONFIG_DIR`,
+/// parked until SIGTERM. The test writes `<tree>/daemon.lock` from the
+/// recorded `pid` + `proc_start` (the live pid's real start, via
+/// [`proc_start_of`]). Killed and reaped on drop, best-effort, never asserts;
+/// the test reaps it first to read its exit status.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct FakeSupervisor {
+    _dir: tempfile::TempDir,
+    pub(crate) child: std::process::Child,
+    pub(crate) pid: u32,
+    pub(crate) proc_start: String,
+}
+
+/// Reaps the child it owns when [`FakeSupervisor::spawn`] panics between the
+/// spawn and the `FakeSupervisor` hand-back (the readiness assert or the
+/// start-time read). Drop never asserts — the reaping is best-effort, exactly
+/// like [`FakeSupervisor`]'s own.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+struct ReapChild(Option<std::process::Child>);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl Drop for ReapChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl FakeSupervisor {
+    pub(crate) fn spawn(config_dir: &Path, ignore_term: bool) -> Self {
+        let dir = tempfile::tempdir().expect("fake supervisor ready dir");
+        let ready = dir.path().join("ready");
+        let mut cmd = reenter_parked(config_dir, &["daemon", "run"], &ready);
+        if ignore_term {
+            cmd.env(IGNORE_TERM_ENV, "1");
+        }
+        let child = cmd.spawn().expect("spawn fake supervisor");
+        // The guard is armed before the first fallible step, so a panic below
+        // reaps the child instead of leaking a forever-looping process.
+        let mut guard = ReapChild(Some(child));
+        let pid = guard.0.as_ref().expect("the child is present").id();
+        // Wait for the park test to write the ready file (and, in the ignore
+        // arm, install the no-op SIGTERM handler) before returning: a SIGTERM
+        // that lands first kills the child and turns the ignore arm into the
+        // exit arm.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake supervisor never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let proc_start = proc_start_of(pid).expect("the fake supervisor's start time");
+        let child = guard.0.take().expect("the child is present");
+        Self {
+            _dir: dir,
+            child,
+            pid,
+            proc_start,
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl Drop for FakeSupervisor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Write `<tree>/daemon.lock` in the supervisor's content-file shape.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn write_daemon_lock(tree: &Path, pid: u32, start: &str) {
+    std::fs::write(
+        tree.join("daemon.lock"),
+        format!("{{\"pid\":{pid},\"procStart\":\"{start}\"}}"),
+    )
+    .expect("write daemon.lock");
+}
+
+/// Write `<tree>/daemon.status.json` in the supervisor's fallback shape.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn write_daemon_status(tree: &Path, pid: u32, start: &str) {
+    std::fs::write(
+        tree.join("daemon.status.json"),
+        format!("{{\"supervisorPid\":{pid},\"supervisorProcStart\":\"{start}\"}}"),
+    )
+    .expect("write daemon.status.json");
+}
+
+/// Wait for a fake supervisor the code under test should have SIGTERMed to
+/// exit, BOUNDED: a red (no SIGTERM came) kills + reaps the child and panics
+/// with an assertion, never hangs the suite on an unbounded `wait`. Returns
+/// the exit status on success, which the caller asserts is SIGTERM.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn reap_bounded(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the fake supervisor was never SIGTERMed within the reap bound");
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(e) => panic!("waiting on the fake supervisor failed: {e}"),
+        }
     }
 }
 

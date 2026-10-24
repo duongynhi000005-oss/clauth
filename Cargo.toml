@@ -148,12 +148,17 @@ strip = true
 [lints.rust]
 # `deny` rather than the fleet default `forbid`, because the sites below are
 # deliberately allowed and `forbid` admits no override at all: signal delivery in
-# `start.rs`; `pid_alive`'s `kill(pid, 0)` in `runtime.rs`; `stderr_file_mode`'s
-# `fcntl`/`fstat` in `daemon/log_rotate.rs`; the inherited signal disposition read
-# in `daemon/gateway.rs`; the test sandbox's env mutation, which Rust 2024
-# made unsafe; and the mod bridge's socket and process reads in `daemon/bridge.rs`
-# (`SO_PEERCRED` on linux; `LOCAL_PEERPID`, `proc_pidinfo` and `proc_pidpath` on
-# macOS).
+# `start.rs`; `pid_alive`'s `kill(pid, 0)` and `signal_and_wait`'s SIGTERM
+# delivery, both in `runtime.rs`; `proc_bsdinfo`'s `proc_pidinfo` read,
+# `macos_proc_args2`'s `sysctl` `KERN_PROCARGS2` read, and the zombie
+# fallback's `sysctl` `KERN_PROC_PID` read, all in `runtime.rs` (the macOS
+# supervisor start-time, argv/env and liveness checks; the `proc_pidinfo` read
+# is shared with the bridge's `parent_pid`); `stderr_file_mode`'s
+# `fcntl`/`fstat` in `daemon/log_rotate.rs`;
+# the inherited signal disposition read in `daemon/gateway.rs`; the test
+# sandbox's env mutation, which Rust 2024 made unsafe; and the mod bridge's
+# socket and process reads in `daemon/bridge.rs` (`SO_PEERCRED` on linux;
+# `LOCAL_PEERPID` and `proc_pidpath` on macOS).
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 

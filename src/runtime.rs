@@ -65,6 +65,8 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -158,7 +160,8 @@ pub(crate) fn link_mode_of(config_dir: Option<&Path>) -> LinkProbe {
 /// way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Isolation {
-    /// Full mirror of `~/.claude/`: the session behaves like the operator's.
+    /// Mirror of `~/.claude/` minus the per-profile and per-supervisor state:
+    /// the session behaves like the operator's.
     Shared,
     /// Credentials injected, but operator memory/plugins/hooks/commands/agents
     /// omitted and settings built from an empty base — no house style leaks.
@@ -2372,6 +2375,42 @@ fn gc_one_pair(runtime: &Path, sessions: &Path, job_trees: &JobTrees) -> Result<
     gc_one_pair_synced(runtime, sessions, || {})
 }
 
+#[cfg(test)]
+type GcRecheckHook = Box<dyn FnMut(&Path, &Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static GC_RECHECK_HOOK: std::cell::RefCell<Option<GcRecheckHook>> =
+        const { std::cell::RefCell::new(None) };
+    static GC_HELD_MARKER: std::cell::RefCell<Option<File>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The GC pin seam: fires between the decide/stop and the re-check hold, so a
+/// test interposes a job/marker/lock file the re-check must re-read. Test-only.
+#[cfg(test)]
+fn on_gc_recheck_hold(runtime: &Path, sessions: &Path) {
+    GC_RECHECK_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(runtime, sessions);
+        }
+    });
+}
+
+#[cfg(test)]
+fn set_gc_recheck_hook(hook: Option<GcRecheckHook>) {
+    GC_RECHECK_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn gc_held_marker_take() -> Option<File> {
+    GC_HELD_MARKER.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
+fn gc_held_marker_set(file: File) {
+    GC_HELD_MARKER.with(|slot| *slot.borrow_mut() = Some(file));
+}
+
 /// [`gc_one_pair`] with the re-mint interleave point exposed for the pin:
 /// `remint_interleave` runs after the collection's state-flock closure and
 /// before the Keychain item's delete — the window in which a concurrently
@@ -2406,21 +2445,73 @@ fn gc_one_pair_synced(
     #[cfg(target_os = "macos")]
     let item_service = tree_keychain_service(runtime);
 
-    let renamed = with_state_lock(|_held| {
-        // An unknown reads as live: this leg runs from the daemon's timer, in a
-        // different process, against every profile, and under `LinkMode::Fake`
-        // the tree it would remove is the one a live sibling is running out of.
+    // Decide under the lock whether the tree is collectible and what its
+    // supervisor needs: no removal, no subprocess, no signal here. The
+    // liveness reads are the same ones the re-check repeats below: an unknown
+    // reads as live (this leg runs from the daemon's timer, in a different
+    // process, against every profile, and under `LinkMode::Fake` the tree it
+    // would remove is the one a live sibling runs out of), and the job store
+    // is re-read because a `clauth start <p> -- --bg` can write its job, exit,
+    // and release its marker after `gc_one_pair`'s snapshot.
+    #[derive(Clone, Copy)]
+    enum Collect {
+        /// No supervisor: collect on the re-check below.
+        Collect,
+        /// Stop the verified supervisor first (in-flight record stamped).
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Stop,
+    }
+    let collect = with_state_lock(|_held| {
         if prune_stale_sessions(sessions).unwrap_or(1) != 0 {
-            return Ok(false);
+            return Ok(None);
         }
-        // The snapshot `gc_one_pair` checked was read before this lock was
-        // taken. A `clauth start <p> -- --bg` can write its job, exit, and
-        // release its marker after the snapshot but before this hold; the stale
-        // snapshot then says unnamed while the marker now reads dead. Re-read
-        // under the lock — marker found free, THEN a fresh store read — the
-        // same order Drop uses, so a named tree (or an unreadable store) is
-        // spared rather than collected.
         if crate::claude_jobs::job_trees().spares(runtime) {
+            return Ok(None);
+        }
+        match supervisor_state(runtime) {
+            SupervisorState::None | SupervisorState::Gone => Ok(Some(Collect::Collect)),
+            SupervisorState::Unverifiable { stale_start } => {
+                announce_supervisor_spare(runtime, stale_start.as_deref());
+                Ok(None)
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            SupervisorState::Ours { .. } => {
+                record_stop_in_flight_locked(runtime)?;
+                Ok(Some(Collect::Stop))
+            }
+        }
+    })?;
+    let Some(collect) = collect else {
+        return Ok(());
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = collect;
+
+    // The stop runs with the lock dropped — no signal, subprocess or wait ever
+    // spans the state flock (the macOS `security` rule). A stop that cannot
+    // confirm the supervisor is gone spares the tree this pass;
+    // `stop_tree_supervisor` logged the outcome.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if matches!(collect, Collect::Stop) && stop_tree_supervisor(runtime) == SupervisorStop::Spare {
+        clear_stop_in_flight(runtime);
+        return Ok(());
+    }
+    #[cfg(test)]
+    on_gc_recheck_hold(runtime, sessions);
+
+    // Re-check under a FRESH lock hold, then collect: between the decide above
+    // and this hold a concurrently starting session can re-mint this same path,
+    // so the removal keys on the world it runs in — markers, the job store AND
+    // the lock file, all re-read fresh — the same shape the macOS Keychain
+    // delete below takes.
+    let renamed = with_state_lock(|_held| {
+        let spares = prune_stale_sessions(sessions).unwrap_or(1) != 0
+            || crate::claude_jobs::job_trees().spares(runtime)
+            || !matches!(
+                supervisor_state(runtime),
+                SupervisorState::None | SupervisorState::Gone
+            );
+        if spares {
             return Ok(false);
         }
         if isolated {
@@ -2453,6 +2544,7 @@ fn gc_one_pair_synced(
         Ok(false)
     })?;
 
+    clear_stop_in_flight(runtime);
     remint_interleave();
 
     // macOS: collect the tree's Keychain item, before the rescue — the
@@ -5060,12 +5152,44 @@ impl ProfileRuntime {
             // marker moves this session aside instead of parking it.
             let mut session = SessionId::mint();
             let mut paths = resolve_tree(name, isolation, tree, &session, mode)?;
+            // One bounded mint loop covers every reason to move off a path: the
+            // marker is claimed (`SID_COLLISION_REMINTS`' original shape), a
+            // supervisor stop is in flight for it, or it holds a live
+            // supervisor the wipe below must not delete. The Fake shared tree
+            // and the background pair keep one runtime path whatever the sid,
+            // so there the stop refuses and the wipe declines.
+            let fixed_runtime = matches!(tree, SessionTree::Background(_))
+                || (mode == LinkMode::Fake && isolation == Isolation::Shared);
             for _ in 0..SID_COLLISION_REMINTS {
-                if !is_session_alive(&paths.pid_file) {
-                    break;
+                // A GC/teardown is between its decide and removal holds for this
+                // path; launching a session whose shared supervisor it is about
+                // to end would be stopped mid-flight.
+                if stop_in_flight(&paths.runtime)? {
+                    if fixed_runtime {
+                        anyhow::bail!(
+                            "clauth is stopping Claude Code's background service in {}; \
+                             retry in a moment",
+                            paths.runtime.display()
+                        );
+                    }
+                    session = SessionId::mint();
+                    paths = resolve_tree(name, isolation, tree, &session, mode)?;
+                    continue;
                 }
-                session = SessionId::mint();
-                paths = resolve_tree(name, isolation, tree, &session, mode)?;
+                if is_session_alive(&paths.pid_file) {
+                    session = SessionId::mint();
+                    paths = resolve_tree(name, isolation, tree, &session, mode)?;
+                    continue;
+                }
+                // A live supervisor at this path must never be wiped; move off
+                // it (a fixed runtime path keeps its supervisor and the wipe
+                // below is declined).
+                if !fixed_runtime && supervisor_may_be_alive(&paths.runtime) {
+                    session = SessionId::mint();
+                    paths = resolve_tree(name, isolation, tree, &session, mode)?;
+                    continue;
+                }
+                break;
             }
             let SessionPaths {
                 runtime,
@@ -5090,10 +5214,15 @@ impl ProfileRuntime {
             // `claude --bg` job names its tree here too (the marker flock never
             // sees the session), so a tree the job store names — or one an
             // unreadable store cannot clear — is skipped as well; the store read
-            // runs only when a stale tree sits at the path.
+            // runs only when a stale tree sits at the path. A tree whose own
+            // supervisor may recreate it is never wiped here (no subprocess, no
+            // signal inside the flock) — the mint loop above moved sid-keyed
+            // layouts onto a fresh path, and a fixed runtime path keeps its
+            // supervisor via the additive build below.
             if active == 0
                 && runtime.symlink_metadata().is_ok()
                 && !crate::claude_jobs::job_trees().spares(runtime)
+                && !supervisor_may_be_alive(runtime)
             {
                 std::fs::remove_dir_all(runtime)
                     .with_context(|| format!("failed to clear {}", runtime.display()))?;
@@ -5454,6 +5583,43 @@ fn set_teardown_timeout_hook(hook: Option<Box<dyn FnMut()>>) {
     TEARDOWN_TIMEOUT_HOOK.with(|h| *h.borrow_mut() = hook);
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+type DropRecheckHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+thread_local! {
+    static DROP_RECHECK_HOOK: std::cell::RefCell<Option<DropRecheckHook>> =
+        const { std::cell::RefCell::new(None) };
+    static DROP_HELD_MARKER: std::cell::RefCell<Option<File>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The teardown pin seam: fires between the stop and the re-check hold, so a
+/// test interposes a job/marker/lock file the re-check must re-read.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn on_drop_recheck_hold(runtime: &Path) {
+    DROP_RECHECK_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(runtime);
+        }
+    });
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn set_drop_recheck_hook(hook: Option<DropRecheckHook>) {
+    DROP_RECHECK_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn drop_held_marker_take() -> Option<File> {
+    DROP_HELD_MARKER.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn drop_held_marker_set(file: File) {
+    DROP_HELD_MARKER.with(|slot| *slot.borrow_mut() = Some(file));
+}
+
 impl Drop for ProfileRuntime {
     fn drop(&mut self) {
         // Before the signal, not after: the watchdog may be mid-tick, and a swap
@@ -5480,13 +5646,16 @@ impl Drop for ProfileRuntime {
             logline!("clauth: final settings.json sync failed: {e}");
         }
 
-        // One hold for the whole teardown. `unregister` takes the state lock
-        // itself, so calling it out here would be a second top-level acquisition
-        // — two 25s-bounded flock waits back to back, with a window between them
-        // where the row is gone but the marker is not. A timed-out acquire is a
-        // wedged peer, not a permissions fault, so the SAME hold is retried
-        // (bounded, via `acquire_state_lock_for_teardown`) rather than split:
-        // the retry re-enters the same flock for the same body.
+        // One hold decides the collection AND, when the tree has no supervisor
+        // to stop, removes it there too — the single-hold shape the flock-count
+        // pin relies on. Only a tree whose supervisor reads `Ours` splits the
+        // body: the verified SIGTERM + wait must run with the lock dropped (a
+        // signal or wait never spans the state flock — the macOS `security`
+        // rule), so its removal moves to a FRESH hold that re-checks liveness,
+        // the job store AND the lock file. `unregister` and the marker release
+        // stay inside the FIRST hold so the row and marker leave together. A
+        // timed-out acquire is a wedged peer, not a permissions fault, so each
+        // hold is retried (bounded, via `acquire_state_lock_for_teardown`).
         // The settings file is per-session (its own sid in the profile dir), so
         // it shares no state with the teardown lock below: remove it even when
         // the flock cannot be taken, so a wedged peer cannot strand it. Skip
@@ -5500,6 +5669,10 @@ impl Drop for ProfileRuntime {
         {
             let _ = std::fs::remove_file(&settings);
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let mut stop = false;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let stop = false;
         match acquire_state_lock_for_teardown() {
             Ok(_guard) => {
                 if let Err(e) = crate::live_sessions::unregister(self.swap.session.as_str()) {
@@ -5524,13 +5697,76 @@ impl Drop for ProfileRuntime {
                     // sessions dir.
                     let job_trees = crate::claude_jobs::job_trees();
                     if !job_trees.spares(&self.swap.runtime) {
-                        let _ = std::fs::remove_dir_all(&self.swap.runtime);
-                        let _ = std::fs::remove_dir(&self.sessions);
+                        match supervisor_state(&self.swap.runtime) {
+                            SupervisorState::None | SupervisorState::Gone => {
+                                let _ = std::fs::remove_dir_all(&self.swap.runtime);
+                                let _ = std::fs::remove_dir(&self.sessions);
+                            }
+                            SupervisorState::Unverifiable { stale_start } => {
+                                announce_supervisor_spare(
+                                    &self.swap.runtime,
+                                    stale_start.as_deref(),
+                                );
+                            }
+                            #[cfg(any(target_os = "linux", target_os = "macos"))]
+                            SupervisorState::Ours { .. } => {
+                                // Stamp before the SIGTERM runs, so an acquire
+                                // that resolves this path refuses or
+                                // re-mints. A failed stamp spares the tree.
+                                match record_stop_in_flight_locked(&self.swap.runtime) {
+                                    Ok(()) => stop = true,
+                                    Err(e) => logline!(
+                                        "clauth: {}: sparing: could not record the stop in flight: {e:#}",
+                                        self.swap.runtime.display()
+                                    ),
+                                }
+                            }
+                        }
                     }
                 }
             }
+            Err(e) => {
+                logline!("clauth: drop cleanup failed: {e}");
+                return;
+            }
+        }
+        if !stop {
+            return;
+        }
+
+        // Stop the tree's supervisor with the lock dropped. A stop that cannot
+        // confirm the supervisor is gone spares the tree; the next GC retries.
+        // `stop_tree_supervisor` logged the outcome.
+        if stop_tree_supervisor(&self.swap.runtime) == SupervisorStop::Spare {
+            clear_stop_in_flight(&self.swap.runtime);
+            return;
+        }
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        on_drop_recheck_hold(&self.swap.runtime);
+
+        // Re-check under a fresh lock hold, then remove: markers, the job store
+        // AND the lock file, all re-read fresh.
+        match acquire_state_lock_for_teardown() {
+            Ok(_guard) => {
+                let spares = prune_stale_sessions(&self.sessions).unwrap_or(1) != 0
+                    || crate::claude_jobs::job_trees().spares(&self.swap.runtime)
+                    || !matches!(
+                        supervisor_state(&self.swap.runtime),
+                        SupervisorState::None | SupervisorState::Gone
+                    );
+                if spares {
+                    // Clear the in-flight record on the spare path too, or
+                    // every acquire of this fixed path (the Fake shared tree,
+                    // the background pair) refuses until it ages out.
+                    clear_stop_in_flight(&self.swap.runtime);
+                    return;
+                }
+                let _ = std::fs::remove_dir_all(&self.swap.runtime);
+                let _ = std::fs::remove_dir(&self.sessions);
+            }
             Err(e) => logline!("clauth: drop cleanup failed: {e}"),
         }
+        clear_stop_in_flight(&self.swap.runtime);
     }
 }
 
@@ -5643,6 +5879,1505 @@ pub(crate) fn claude_command() -> std::process::Command {
 /// quirk, so a second harness cannot re-learn it wrong.
 pub(crate) fn codex_command() -> std::process::Command {
     resolve_cli_command("codex")
+}
+
+/// Wall-clock ceiling for waiting on a SIGTERMed supervisor to exit, chosen
+/// above Claude Code's own 10 s grace (the CLI stop waits that long before it
+/// would SIGKILL; the supervisor exits in ~2 s, measured, and deletes
+/// its lock + status on the way out). A supervisor still alive at this bound
+/// spares the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const SUPERVISOR_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether the tree's own supervisor may be collected past.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SupervisorState {
+    /// Nothing records a supervisor: no `daemon.lock` or `daemon.status.json`
+    /// regular file. A clean shutdown deletes both, so there is nothing to
+    /// stop — collect.
+    None,
+    /// The recorded pid+start no longer names a live process: the supervisor is
+    /// gone — collect.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        allow(
+            dead_code,
+            reason = "only linux and macOS have a positively-dead reading; Windows matches this arm but never constructs it"
+        )
+    )]
+    Gone,
+    /// A live (or unreadable) pid that is not verifiably this tree's own
+    /// supervisor — spare, never signal it. `stale_start` is the recorded
+    /// `procStart` when the pid DID positively read as this tree's supervisor
+    /// (argv `daemon run` + config dir == tree) but its recorded start no
+    /// longer equals the live one — the spare line names it.
+    Unverifiable { stale_start: Option<String> },
+    /// A live process verified as this tree's `claude daemon run` supervisor
+    /// (linux/macOS) — SIGTERM it, then wait.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Ours { pid: u32, start: String },
+}
+
+/// `asctime(gmtime(tvsec))` in the C/POSIX locale — `"%a %b %e %H:%M:%S %Y"`,
+/// day space-padded — the exact string Claude Code's macOS `daemon.lock`
+/// `procStart` and `daemon.status.json` `supervisorProcStart` carry (`pbi_start_tvsec` 1792720759 -> `"Fri Oct 23 01:59:19 2026"`, measured on-device). Pure — no
+/// locale, zone lookup or syscall — so it unit-tests on every target. Gated to
+/// macOS + tests: only the macOS verify and the tests call it.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn format_proc_start(tvsec: u64) -> String {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = (tvsec / 86400) as i64;
+    let secs = (tvsec % 86400) as i64;
+    let (year, month, day) = civil_from_days(days);
+    let weekday = weekday_from_days(days);
+    format!(
+        "{} {} {:>2} {:02}:{:02}:{:02} {}",
+        WEEKDAYS[weekday as usize],
+        MONTHS[(month - 1) as usize],
+        day,
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+        year
+    )
+}
+
+/// The inverse of [`format_proc_start`]: `"Fri Oct 23 01:59:19 2026"` -> epoch
+/// seconds, `None` for anything else. A recorded string that does not parse is
+/// a different format (a future Claude Code change) and reads as unverifiable
+/// rather than as a reused pid. The weekday is checked against the date, so a
+/// corrupted string cannot parse.
+#[cfg(any(target_os = "macos", test))]
+fn parse_proc_start(s: &str) -> Option<u64> {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let b = s.as_bytes();
+    if b.len() != 24
+        || b[3] != b' '
+        || b[7] != b' '
+        || b[10] != b' '
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b' '
+    {
+        return None;
+    }
+    let weekday = WEEKDAYS.iter().position(|w| *w == &s[0..3])?;
+    let month = MONTHS.iter().position(|m| *m == &s[4..7])? as u32 + 1;
+    let day: u32 = s[8..10].trim().parse().ok()?;
+    let hour: i64 = s[11..13].parse().ok()?;
+    let minute: i64 = s[14..16].parse().ok()?;
+    let second: i64 = s[17..19].parse().ok()?;
+    let year: i64 = s[20..24].parse().ok()?;
+    if !(1..=31).contains(&day)
+        || !(0..24).contains(&hour)
+        || !(0..60).contains(&minute)
+        || !(0..60).contains(&second)
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if weekday_from_days(days) as usize != weekday {
+        return None;
+    }
+    let total = days * 86400 + hour * 3600 + minute * 60 + second;
+    u64::try_from(total).ok()
+}
+
+/// The verdict when the live start does not equal the recorded `procStart`
+/// string. When the live pid's argv holds `daemon run` and its
+/// `CLAUDE_CONFIG_DIR` resolves to `tree`, the pid IS this tree's supervisor
+/// (the recorded string was rendered by a build that spells the instant
+/// differently, or in a timezone west of UTC) — spare, never collect. Otherwise
+/// the recorded supervisor is dead and the pid reused: `Gone` only when the
+/// recorded string parses AND the live start is strictly LATER than the
+/// recorded instant — a reused pid always starts later. A string that does not
+/// parse (a future format) or one that parses but is not earlier than the live
+/// start reads `Unverifiable`.
+#[cfg(any(target_os = "macos", test))]
+fn start_mismatch_verdict(
+    live_start_tvsec: u64,
+    recorded: &str,
+    supervisor_matches: bool,
+) -> SupervisorState {
+    if supervisor_matches {
+        return SupervisorState::Unverifiable {
+            stale_start: Some(recorded.to_string()),
+        };
+    }
+    match parse_proc_start(recorded) {
+        Some(recorded) if live_start_tvsec > recorded => SupervisorState::Gone,
+        Some(_) | None => SupervisorState::Unverifiable { stale_start: None },
+    }
+}
+
+/// Days since 1970-01-01 to (year, month, day) — Howard Hinnant's
+/// `civil_from_days`, all-integer, valid over the whole signed range.
+#[cfg(any(target_os = "macos", test))]
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Weekday of `days` since 1970-01-01, 0 = Sunday. 1970-01-01 was a Thursday.
+#[cfg(any(target_os = "macos", test))]
+fn weekday_from_days(days: i64) -> u8 {
+    (days + 4).rem_euclid(7) as u8
+}
+
+/// (year, month, day) to days since 1970-01-01 — Hinnant's `days_from_civil`.
+#[cfg(any(target_os = "macos", test))]
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let mp = (if month > 2 { month - 3 } else { month + 9 }) as u64; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day as u64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// A macOS `KERN_PROCARGS2` buffer parsed into argv and the env tail. Each
+/// argv entry is an owned NUL-terminated byte string; the env tail stays raw
+/// (NUL-separated) so the config-dir comparison reads it the same way linux
+/// reads `/proc/<pid>/environ`.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+struct ProcArgs {
+    argv: Vec<Vec<u8>>,
+    environ: Vec<u8>,
+}
+
+/// The NUL-terminated byte string starting at `offset`: `(bytes, next_offset)`,
+/// `None` when the buffer ends before a NUL.
+#[cfg(any(target_os = "macos", test))]
+fn nul_string_at(buf: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+    let end = offset + buf.get(offset..)?.iter().position(|b| *b == 0)?;
+    Some((&buf[offset..end], end + 1))
+}
+
+/// Parse a `KERN_PROCARGS2` byte buffer: `[int argc][exec path NUL][NUL
+/// padding][argc argv strings NUL][env strings NUL]`, all native-endian. Pure
+/// — no syscall — so it unit-tests on every OS. `None` on a truncated buffer,
+/// an `argc` past the end, or an argv string that never terminates. An empty
+/// `argv[0]` is consumed by the padding skip (it is just a NUL), which shifts
+/// argv by one and then fails closed.
+#[cfg(any(target_os = "macos", test))]
+fn parse_proc_args2(buf: &[u8]) -> Option<ProcArgs> {
+    let argc = i32::from_ne_bytes(buf.get(0..4)?.try_into().ok()?) as usize;
+    let mut offset = 4;
+    // Skip the exec path (NUL-terminated).
+    while *buf.get(offset)? != 0 {
+        offset += 1;
+    }
+    offset += 1;
+    // Skip the NUL padding between the exec path and argv[0].
+    while buf.get(offset) == Some(&0) {
+        offset += 1;
+    }
+    let mut argv = Vec::new();
+    for _ in 0..argc {
+        let (arg, next) = nul_string_at(buf, offset)?;
+        argv.push(arg.to_vec());
+        offset = next;
+    }
+    Some(ProcArgs {
+        argv,
+        environ: buf[offset..].to_vec(),
+    })
+}
+
+/// Whether argv holds `daemon` immediately followed by `run` — the transient
+/// supervisor's argv shape. The one check both the linux `/proc/<pid>/cmdline`
+/// read and the macOS `KERN_PROCARGS2` argv parse use.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn argv_holds_daemon_run(args: &[&[u8]]) -> bool {
+    args.windows(2)
+        .any(|pair| pair == [b"daemon".as_slice(), b"run".as_slice()])
+}
+
+/// Whether NUL-separated env bytes hold `CLAUDE_CONFIG_DIR=<value>` whose
+/// canonical path equals `tree`'s — the one comparison the linux
+/// `/proc/<pid>/environ` read and the macOS `KERN_PROCARGS2` env tail share,
+/// so the two arms cannot drift apart. A missing entry, a non-UTF-8 value, or
+/// a value that does not resolve to `tree` all read false (unverifiable).
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn environ_bytes_config_dir_is(environ: &[u8], tree: &Path) -> bool {
+    let Some(ccd) = environ
+        .split(|b| *b == 0)
+        .find_map(|kv| kv.strip_prefix(b"CLAUDE_CONFIG_DIR="))
+    else {
+        return false;
+    };
+    let Ok(ccd) = std::str::from_utf8(ccd) else {
+        return false;
+    };
+    match (
+        crate::canonical::identity(tree),
+        crate::canonical::identity(Path::new(ccd)),
+    ) {
+        (Ok(tree), Ok(ccd)) => tree == ccd,
+        _ => false,
+    }
+}
+
+/// `daemon.lock`'s `pid` + `procStart`. The lock is a CONTENT file, not a
+/// kernel lock (the supervisor holds zero flocks and no fd on it, measured):
+/// the pid-reuse-safe identity is the `(pid, procStart)` pair.
+#[derive(serde::Deserialize)]
+struct DaemonLock {
+    pid: u32,
+    #[serde(rename = "procStart")]
+    proc_start: String,
+}
+
+/// `daemon.status.json`'s `supervisorPid` + `supervisorProcStart`, the
+/// fallback when the lock is absent (the supervisor deletes both on a clean
+/// shutdown; the roster's `supervisorPid` carries no start time).
+#[derive(serde::Deserialize)]
+struct DaemonStatus {
+    #[serde(rename = "supervisorPid")]
+    supervisor_pid: u32,
+    #[serde(rename = "supervisorProcStart")]
+    supervisor_proc_start: String,
+}
+
+/// Whether a recorded supervisor pid is usable as a `kill` target: it must be
+/// a positive process id that fits `pid_t`. `0` makes `kill(0, …)` probe the
+/// caller's own process group, and a value above `i32::MAX` casts to a
+/// negative pid (`4294967295` -> `kill(-1, …)`, every process the user owns).
+/// Both files are written by another program, so a pid outside `1..=i32::MAX`
+/// is a malformed record — spare as unverifiable, never signal.
+fn supervisor_record_pid_is_valid(pid: u32) -> bool {
+    pid != 0 && pid <= i32::MAX as u32
+}
+
+/// `(pid, proc_start)` from `<tree>/daemon.lock`, falling back to
+/// `<tree>/daemon.status.json`. `Ok(None)`: neither is a regular file.
+/// `Err(())`: a non-regular, non-symlink entry (a directory), a regular
+/// file that failed to parse, or a record whose pid is 0 or above `i32::MAX`
+/// — fail closed, a supervisor may be alive and unverifiable.
+///
+/// A SYMLINK reads as absent: an older clauth build linked the home's
+/// lock/status into the tree, so the supervisor the link names is the HOME
+/// roster's, never this tree's own — the tree collects with no stop, and
+/// `remove_dir_all` unlinks the link, leaving the shared target intact.
+fn read_supervisor_record(tree: &Path) -> Result<Option<(u32, String)>, ()> {
+    let lock = tree.join("daemon.lock");
+    match lock.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_file() => {
+            let body = std::fs::read(&lock).map_err(|_| ())?;
+            let record = serde_json::from_slice::<DaemonLock>(&body).map_err(|_| ())?;
+            if !supervisor_record_pid_is_valid(record.pid) {
+                return Err(());
+            }
+            return Ok(Some((record.pid, record.proc_start)));
+        }
+        Ok(meta) if meta.file_type().is_symlink() => {}
+        Ok(_) => return Err(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(()),
+    }
+    let status = tree.join("daemon.status.json");
+    match status.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_file() => {
+            let body = std::fs::read(&status).map_err(|_| ())?;
+            let record = serde_json::from_slice::<DaemonStatus>(&body).map_err(|_| ())?;
+            if !supervisor_record_pid_is_valid(record.supervisor_pid) {
+                return Err(());
+            }
+            Ok(Some((record.supervisor_pid, record.supervisor_proc_start)))
+        }
+        Ok(meta) if meta.file_type().is_symlink() => Ok(None),
+        Ok(_) => Err(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// What the tree's supervisor files say, before any signal is sent. No
+/// subprocess and no wait — so this is safe inside the state flock (the
+/// acquire's consult runs it there).
+fn supervisor_state(tree: &Path) -> SupervisorState {
+    match read_supervisor_record(tree) {
+        Ok(Some((pid, start))) => verify_supervisor_record(tree, pid, &start),
+        // No lock or status file: the supervisor shut down cleanly (it deletes
+        // both on the way out, measured), so there is no recorded
+        // pid to stop. The roster's `supervisorPid` is NOT a fallback: it
+        // carries no start time, so a stale pid it names could be reused by any
+        // live process and read as an unverifiable supervisor forever.
+        Ok(None) => SupervisorState::None,
+        Err(()) => SupervisorState::Unverifiable { stale_start: None },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_supervisor_record(tree: &Path, pid: u32, start: &str) -> SupervisorState {
+    // kill(0) proves the pid still names a process — live, zombie, or a
+    // hidepid-hidden one — without reading /proc. False means the pid is
+    // positively gone (only that counts as dead, never an unreadable or
+    // hidden `/proc/<pid>/stat`).
+    if !namespaced_keychain_ledger::pid_alive(pid) {
+        return SupervisorState::Gone;
+    }
+    match read_proc_stat(pid) {
+        // SIGTERM landed and the supervisor is dead-but-unreaped: gone.
+        ProcStat::Zombie => SupervisorState::Gone,
+        // The pid is alive (kill 0 above) but its identity cannot be read:
+        // spare, never signal and never collect.
+        ProcStat::Unreadable => SupervisorState::Unverifiable { stale_start: None },
+        ProcStat::Live(actual) if actual == start => {
+            if !supervisor_argv_and_config_dir_match(pid, tree) {
+                return SupervisorState::Unverifiable { stale_start: None };
+            }
+            SupervisorState::Ours {
+                pid,
+                start: start.to_string(),
+            }
+        }
+        // A live process with a different start. Read argv + env first: a pid
+        // whose argv holds `daemon run` and whose config dir is this tree is
+        // this tree's supervisor with a stale recorded start — spare, never
+        // collect a live supervisor it would recreate. Only otherwise is the
+        // recorded supervisor gone and the pid reused — collect, never signal.
+        ProcStat::Live(_) => {
+            if supervisor_argv_and_config_dir_match(pid, tree) {
+                SupervisorState::Unverifiable {
+                    stale_start: Some(start.to_string()),
+                }
+            } else {
+                SupervisorState::Gone
+            }
+        }
+    }
+}
+
+/// The pid's `/proc/<pid>/stat` state for the verify path, where a zombie must
+/// read as GONE (its SIGTERM landed) and an unreadable stat as unverifiable —
+/// two outcomes [`crate::daemon::gateway::process_start_time`] collapses into
+/// one `None`.
+#[cfg(target_os = "linux")]
+enum ProcStat {
+    /// Dead-but-unreaped (state `Z`/`X`/`x`): the process is gone, its
+    /// `/proc` entry lingers only until its parent reaps it.
+    Zombie,
+    /// The stat is present but cannot be read or parsed (hidepid, `EACCES`,
+    /// `EMFILE`, a malformed line): identity unverifiable — spare.
+    Unreadable,
+    /// A live (non-zombie) process with its field-22 start time.
+    Live(String),
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_stat(pid: u32) -> ProcStat {
+    #[cfg(all(test, target_os = "linux"))]
+    if forced_stat_read_failure(pid) {
+        return ProcStat::Unreadable;
+    }
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return ProcStat::Unreadable;
+    };
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return ProcStat::Unreadable;
+    };
+    let mut fields = rest.split_whitespace();
+    match fields.next() {
+        None => return ProcStat::Unreadable,
+        Some("Z" | "X" | "x") => return ProcStat::Zombie,
+        Some(_) => {}
+    }
+    match fields.nth(18) {
+        Some(start) => ProcStat::Live(start.to_string()),
+        None => ProcStat::Unreadable,
+    }
+}
+
+// Test-only seam: force [`read_proc_stat`] to read one pid's `/proc` entry
+// as unreadable, so a test can pose the hidepid/EACCES arm deterministically —
+// a live process's stat is always readable to its parent on this box, so no
+// fixture can produce a genuine unreadable read. The countdown lets a test
+// fail only the POST-signal reads (the verify's first read succeeds, the
+// wait's polls fail), which is what exercises the liveness reader's own
+// `ProcStat::Unreadable` mapping.
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    // (pid, successful reads left before failing): every later read for `pid`
+    // returns `Unreadable`.
+    static FORCED_UNREADABLE_STAT: std::cell::Cell<Option<(u32, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn forced_stat_read_failure(pid: u32) -> bool {
+    FORCED_UNREADABLE_STAT.with(|c| {
+        let Some((armed_pid, reads_left)) = c.get() else {
+            return false;
+        };
+        if armed_pid != pid {
+            return false;
+        }
+        if reads_left == 0 {
+            return true;
+        }
+        c.set(Some((armed_pid, reads_left - 1)));
+        false
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct UnreadableProcStatGuard(Option<(u32, u32)>);
+
+#[cfg(all(test, target_os = "linux"))]
+impl UnreadableProcStatGuard {
+    /// Fail every [`read_proc_stat`] read for `pid` (the verify path's seam).
+    pub(crate) fn set(pid: u32) -> Self {
+        Self::after(pid, 0)
+    }
+
+    /// Fail [`read_proc_stat`] reads for `pid` only after `reads` successful
+    /// reads (the post-SIGTERM liveness seam: the verify's read succeeds, the
+    /// wait's polls fail).
+    pub(crate) fn after(pid: u32, reads: u32) -> Self {
+        let prev = FORCED_UNREADABLE_STAT.with(|c| c.replace(Some((pid, reads))));
+        Self(prev)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for UnreadableProcStatGuard {
+    fn drop(&mut self) {
+        FORCED_UNREADABLE_STAT.with(|c| c.set(self.0));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_supervisor_record(tree: &Path, pid: u32, start: &str) -> SupervisorState {
+    // macOS: `procStart` is `asctime(gmtime(pbi_start_tvsec))` — read the live
+    // pid's `pbi_start_tvsec` via `proc_pidinfo` and compare by equality with
+    // the recorded string, then verify argv + `CLAUDE_CONFIG_DIR` in-process
+    // from `KERN_PROCARGS2`. A start in a format we do not render (a future
+    // Claude Code change), a missing or mismatched config dir, or an unreadable
+    // argv/env buffer is unverifiable -> spare; the same format with a strictly
+    // later live instant is a reused pid -> gone.
+    if !namespaced_keychain_ledger::pid_alive(pid) {
+        return SupervisorState::Gone;
+    }
+    let Some(info) = proc_bsdinfo(pid) else {
+        // Live (kill 0 above) but unreadable through `proc_pidinfo`: fall back
+        // to the sysctl `kinfo_proc` read. Only a sysctl-confirmed zombie or a
+        // pid the sysctl reports absent reads Gone; anything else spares.
+        return match proc_kinfo_liveness(pid) {
+            SupervisorLiveness::Gone => SupervisorState::Gone,
+            SupervisorLiveness::Alive | SupervisorLiveness::Unreadable => {
+                SupervisorState::Unverifiable { stale_start: None }
+            }
+        };
+    };
+    if info.pbi_status == libc::SZOMB {
+        // SIGTERM landed and the supervisor is dead-but-unreaped: gone.
+        return SupervisorState::Gone;
+    }
+    if format_proc_start(info.pbi_start_tvsec) != start {
+        // Read argv + env first: a pid whose argv holds `daemon run` and whose
+        // config dir is this tree is this tree's supervisor (the recorded
+        // string was rendered differently, or in a timezone west of UTC) —
+        // spare, never collect a live supervisor it would recreate.
+        return start_mismatch_verdict(
+            info.pbi_start_tvsec,
+            start,
+            supervisor_argv_and_config_dir_match(pid, tree),
+        );
+    }
+    let Some(args) = macos_proc_args2(pid) else {
+        return SupervisorState::Unverifiable { stale_start: None };
+    };
+    let argv: Vec<&[u8]> = args.argv.iter().map(Vec::as_slice).collect();
+    if !argv_holds_daemon_run(&argv) || !environ_bytes_config_dir_is(&args.environ, tree) {
+        return SupervisorState::Unverifiable { stale_start: None };
+    }
+    SupervisorState::Ours {
+        pid,
+        start: start.to_string(),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn verify_supervisor_record(tree: &Path, pid: u32, start: &str) -> SupervisorState {
+    let _ = (tree, pid, start);
+    // Windows: the supervisor's identity form is unmeasured, so a recorded pid
+    // can never be verified as positively dead — the lock/status record spares,
+    // never collects, and clauth never signals. A tree whose supervisor shut
+    // down cleanly deletes both files, so it still collects via `None`.
+    SupervisorState::Unverifiable { stale_start: None }
+}
+
+/// The live pid's BSD process info, or `None` when the kernel refuses (the pid
+/// is gone or unreadable). The one `proc_pidinfo(PROC_PIDTBSDINFO)` read,
+/// shared by the supervisor verify here and the mod bridge's `parent_pid`.
+#[cfg(target_os = "macos")]
+pub(crate) fn proc_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
+    #[allow(unsafe_code)]
+    // SAFETY: `proc_bsdinfo` is all integers and fixed-size `c_char` arrays, so
+    // the zeroed value is valid and no field is read before `proc_pidinfo`
+    // fills the struct.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    #[allow(unsafe_code)]
+    // SAFETY: `proc_pidinfo` copies the BSD process info for `pid` into `info`,
+    // which we own; the size passed is that struct's.
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut libc::proc_bsdinfo as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+        )
+    };
+    (rc >= std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int).then_some(info)
+}
+
+/// `extern_proc.p_stat`'s `SZOMB` value (`<sys/proc.h>`): a zombie. libc's
+/// Apple `SZOMB` is a `u32`, but `p_stat` is the `char` the `kinfo_proc` read
+/// returns, so the constant lives here as a `u8` so the pure decision
+/// unit-tests on every OS.
+#[cfg(any(target_os = "macos", test))]
+const P_STAT_SZOMB: u8 = 5;
+
+/// The `sysctl([CTL_KERN, KERN_PROC, KERN_PROC_PID, pid])` outcome, split so
+/// the decision over it unit-tests on every OS: `Present(p_stat)` (a pid the
+/// kernel knows, possibly a zombie), `Absent` (no such pid), or `Unreadable`
+/// (the read failed for some other reason).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KinfoProcRead {
+    Present(u8),
+    Absent,
+    Unreadable,
+}
+
+/// Whether a `kinfo_proc` read proves the pid is GONE: only a `SZOMB` zombie
+/// or a pid the sysctl reports absent. Any live non-zombie state and every
+/// other read failure stays unreadable (spare).
+#[cfg(any(target_os = "macos", test))]
+fn kinfo_proc_reads_gone(read: KinfoProcRead) -> bool {
+    match read {
+        KinfoProcRead::Absent => true,
+        KinfoProcRead::Present(P_STAT_SZOMB) => true,
+        KinfoProcRead::Present(_) | KinfoProcRead::Unreadable => false,
+    }
+}
+
+/// The `kinfo_proc` prefix whose only field the supervisor read needs:
+/// `kp_proc.p_stat` at [`P_STAT_OFFSET`]. libc binds no macOS `kinfo_proc`, so
+/// this spells the `extern_proc` fields before `p_stat` (`<sys/proc.h>`:
+/// `[p_un: 16][p_vmspace: 8][p_sigacts: 8][p_flag: 4][p_stat: 1]...`) and
+/// [`P_STAT_OFFSET`] is derived with `offset_of!`, never a bare literal.
+#[cfg(any(target_os = "macos", test))]
+#[repr(C)]
+struct KinfoProcStat {
+    _p_un: [usize; 2],
+    _p_vmspace: usize,
+    _p_sigacts: usize,
+    _p_flag: libc::c_int,
+    p_stat: libc::c_char,
+}
+
+#[cfg(any(target_os = "macos", test))]
+const P_STAT_OFFSET: usize = std::mem::offset_of!(KinfoProcStat, p_stat);
+
+/// Decide the `kinfo_proc` outcome from the second-pass read: `size` is the
+/// byte count that call reported, so the first pass's larger buffer tail is
+/// not part of the read. An empty read (the pid vanished between the sizing
+/// call and the read, so the kernel wrote no entry) is `Absent`; a read
+/// shorter than the `KinfoProcStat` prefix (40 bytes) is `Unreadable`; a
+/// full-enough read reports the `p_stat` byte.
+#[cfg(any(target_os = "macos", test))]
+fn kinfo_proc_second_read(buf: &[u8], size: usize) -> KinfoProcRead {
+    // A reported size past the allocation is not a read of this buffer.
+    let Some(read) = buf.get(..size) else {
+        return KinfoProcRead::Unreadable;
+    };
+    if read.is_empty() {
+        return KinfoProcRead::Absent;
+    }
+    if read.len() < std::mem::size_of::<KinfoProcStat>() {
+        return KinfoProcRead::Unreadable;
+    }
+    read.get(P_STAT_OFFSET)
+        .copied()
+        .map_or(KinfoProcRead::Unreadable, KinfoProcRead::Present)
+}
+
+/// Read `kinfo_proc.kp_proc.p_stat` for `pid` through
+/// `sysctl([CTL_KERN, KERN_PROC, KERN_PROC_PID, pid])` — the read that still
+/// sees a dead-but-unreaped process, where `proc_pidinfo(PROC_PIDTBSDINFO)`
+/// returns no data. The pid vanishing between the sizing call and the read
+/// empties the second result (`Absent`); XNU's `KERN_PROC_PID` handler never
+/// fails with `ESRCH`, and any other failure or a too-short read is
+/// `Unreadable`.
+#[cfg(target_os = "macos")]
+fn proc_kinfo_read(pid: u32) -> KinfoProcRead {
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        pid as libc::c_int,
+    ];
+    let mut size: libc::size_t = 0;
+    #[allow(unsafe_code)]
+    // SAFETY: `mib` is a valid four-element `c_int` array; `sysctl` reads it
+    // and, with a NULL oldp, writes only the required byte count into `size`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return KinfoProcRead::Unreadable;
+    }
+    let mut buf = vec![0u8; size];
+    #[allow(unsafe_code)]
+    // SAFETY: `buf` is a `size`-byte owned allocation and `sysctl` writes at
+    // most `*oldlenp` bytes into it; `mib` is a valid `c_int` array.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return KinfoProcRead::Unreadable;
+    }
+    kinfo_proc_second_read(&buf, size)
+}
+
+/// The liveness verdict for a pid `proc_bsdinfo` could not read but
+/// `pid_alive` still finds — the shared fallback the verify and the liveness
+/// poll run. Only a sysctl-confirmed zombie or an absent pid reads `Gone`.
+#[cfg(target_os = "macos")]
+fn proc_kinfo_liveness(pid: u32) -> SupervisorLiveness {
+    if kinfo_proc_reads_gone(proc_kinfo_read(pid)) {
+        SupervisorLiveness::Gone
+    } else {
+        SupervisorLiveness::Unreadable
+    }
+}
+
+/// The pid's argv + environment read in-process via
+/// `sysctl([CTL_KERN, KERN_PROCARGS2, pid])` — the kernel's NUL-separated
+/// layout, so a space inside an argument or a value cannot fool the parse and
+/// nothing shells out (the same shape linux's `/proc/<pid>/cmdline` + environ
+/// read uses). `None` on an unreadable buffer or a parse failure: unverifiable.
+#[cfg(target_os = "macos")]
+fn macos_proc_args2(pid: u32) -> Option<ProcArgs> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    // First call with a NULL oldp yields the byte size the kernel would write.
+    let mut size: libc::size_t = 0;
+    #[allow(unsafe_code)]
+    // SAFETY: `mib` is a valid three-element `c_int` array; `sysctl` reads it
+    // and writes only `size` (the oldp argument is NULL, so no buffer).
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    #[allow(unsafe_code)]
+    // SAFETY: `buf` is a `size`-byte owned allocation, `sysctl` writes at most
+    // `*oldlenp` bytes into it, and `mib` is a valid `c_int` array.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(size);
+    parse_proc_args2(&buf)
+}
+
+/// Whether the process `pid` holds the transient supervisor's argv AND its
+/// config dir resolves to `tree` — the same two checks the equality arm runs,
+/// factored so the start-mismatch arm can read them first.
+#[cfg(target_os = "macos")]
+fn supervisor_argv_and_config_dir_match(pid: u32, tree: &Path) -> bool {
+    let Some(args) = macos_proc_args2(pid) else {
+        return false;
+    };
+    let argv: Vec<&[u8]> = args.argv.iter().map(Vec::as_slice).collect();
+    argv_holds_daemon_run(&argv) && environ_bytes_config_dir_is(&args.environ, tree)
+}
+
+/// Whether the process `pid`'s cmdline holds `daemon` immediately followed by
+/// `run` — the transient supervisor's argv shape (`claude daemon run --origin
+/// transient`, measured).
+#[cfg(target_os = "linux")]
+fn cmdline_holds_daemon_run(pid: u32) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+    argv_holds_daemon_run(&args)
+}
+
+/// Whether the process `pid`'s `CLAUDE_CONFIG_DIR` resolves to the same
+/// canonical path as `tree` — the supervisor is keyed on its config dir, so a
+/// mismatch is another tree's supervisor.
+#[cfg(target_os = "linux")]
+fn environ_config_dir_is(pid: u32, tree: &Path) -> bool {
+    let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    environ_bytes_config_dir_is(&environ, tree)
+}
+
+/// Whether the process `pid` holds the transient supervisor's argv AND its
+/// config dir resolves to `tree` — the two checks that say the pid is this
+/// tree's supervisor, shared by the equality and start-mismatch verify arms.
+#[cfg(target_os = "linux")]
+fn supervisor_argv_and_config_dir_match(pid: u32, tree: &Path) -> bool {
+    cmdline_holds_daemon_run(pid) && environ_config_dir_is(pid, tree)
+}
+
+/// Whether collecting the tree may proceed past its supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisorStop {
+    Proceed,
+    Spare,
+}
+
+/// Stop the tree's OWN supervisor by the pid its lock/status names, verified
+/// against that pid's start time, argv and config dir — never through the
+/// `claude daemon stop` CLI, which would also stop an installed home service
+/// and every tree it hosts. Runs OUTSIDE the state flock; the callers hold the
+/// decision's `SupervisorState::Ours` from a prior flock hold. A supervisor
+/// that is gone (or never existed) proceeds; anything unverifiable or still
+/// alive at the deadline spares the tree.
+fn stop_tree_supervisor(tree: &Path) -> SupervisorStop {
+    debug_assert!(
+        !crate::lockorder::holds::<crate::lockorder::rank::State>(),
+        "the supervisor stop (SIGTERM + wait) must run outside the state flock"
+    );
+    match supervisor_state(tree) {
+        SupervisorState::None | SupervisorState::Gone => SupervisorStop::Proceed,
+        SupervisorState::Unverifiable { stale_start } => {
+            announce_supervisor_spare(tree, stale_start.as_deref());
+            SupervisorStop::Spare
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        SupervisorState::Ours { pid, start } => {
+            // A supervisor that wedged on a previous pass is spared now without
+            // another SIGTERM + wait; the wedged record ages out after
+            // [`WEDGED_STOP_SKIP_AFTER`], so the stop is retried, not dropped.
+            if wedged_stop_is_fresh(tree, pid, &start) {
+                if supervisor_spare_should_announce(tree) {
+                    logline!(
+                        "clauth: {}: sparing: its supervisor pid {pid} already refused to stop; not re-signalling yet",
+                        tree.display()
+                    );
+                }
+                SupervisorStop::Spare
+            } else {
+                signal_and_wait(tree, pid, &start)
+            }
+        }
+    }
+}
+
+/// Every `runtime*` dir directly under a profile dir, by the strict predicate
+/// [`gc_runtime_trees`] deletes with. A delete/rename removes the whole
+/// profile dir, so it must stop each tree's own supervisor first; the
+/// enumeration shares the delete-shaped predicate so a future
+/// `runtime_state.json` never enters the stop set.
+fn runtime_trees_under(profile_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(profile_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_runtime_dir_name)
+        })
+        .collect()
+}
+
+/// Whether a delete/rename caller offers `--force` as the way past a
+/// supervisor refusal. Delete does — `--force` still stops every verifiable
+/// supervisor and waives the refusal for any supervisor it cannot stop
+/// (unverifiable, or verified but still alive after SIGTERM); rename has no
+/// such flag, so its refusal names only the retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupervisorStopGate {
+    /// `--force` was passed: stop every verifiable supervisor, remove every
+    /// tree anyway (an unverifiable one, or one verified but still alive
+    /// after SIGTERM, spares with no signal or a skipped re-wait).
+    Forced,
+    /// No `--force`: stop each tree; refuse naming the tree. `offers_force`
+    /// selects the message tail — delete appends the `--force` clause, rename
+    /// (which has no such flag) does not.
+    Refused { offers_force: bool },
+}
+
+/// Stop every runtime tree's own supervisor under `profile_dir`, before a
+/// delete/rename removes the whole profile dir. Reuses
+/// [`stop_tree_supervisor`] — the one stop function — and, under
+/// [`SupervisorStopGate::Refused`], refuses with an error naming the tree when
+/// a stop cannot be confirmed (an unverifiable supervisor, one still alive at
+/// the deadline, or one that appeared between the stop and the re-check). The
+/// caller holds the profile's rotation guard, so no acquire can re-mint a path
+/// during the stop; the stop itself runs outside the state flock
+/// (`stop_tree_supervisor`'s own assertion).
+///
+/// [`SupervisorStopGate::Forced`] still runs `stop_tree_supervisor` for every
+/// tree — a verifiable supervisor is SIGTERMed and waited on, and an
+/// unverifiable one spares without a signal — then removes the tree anyway: the
+/// operator said remove it, but a verified stop is never skipped, so a forced
+/// delete of a live linux/macOS supervisor cannot leak it (it would recreate
+/// its config dir bare under the deleted path). The refusal is not stamped into
+/// the in-flight journal: the rotation guard the caller holds keeps an acquire
+/// from re-minting the path during the stop, and a concurrent GC's stop of the
+/// same supervisor is idempotent (the second SIGTERM reads ESRCH).
+pub(crate) fn stop_profile_tree_supervisors(
+    name: &ProfileName,
+    profile_dir: &Path,
+    gate: SupervisorStopGate,
+) -> Result<()> {
+    match gate {
+        SupervisorStopGate::Refused { offers_force } => {
+            for tree in runtime_trees_under(profile_dir) {
+                let stop = stop_tree_supervisor(&tree);
+                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+                on_profile_stop_recheck_hold(&tree);
+                let spare = stop == SupervisorStop::Spare || {
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    {
+                        !supervisor_gone_recheck(&tree)
+                    }
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                    {
+                        false
+                    }
+                };
+                if spare {
+                    let tail = if offers_force {
+                        ", or pass --force to remove it anyway"
+                    } else {
+                        ""
+                    };
+                    anyhow::bail!(
+                        "'{name}': runtime tree {} still has a background supervisor \
+                         clauth cannot stop on this host; retry once it has exited{tail}",
+                        tree.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        SupervisorStopGate::Forced => {
+            for tree in runtime_trees_under(profile_dir) {
+                let _ = stop_tree_supervisor(&tree);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Re-check under a fresh flock hold that the tree's supervisor is gone, the
+/// same shape GC and teardown run between the stop and the removal: a
+/// supervisor that is still there (or reappeared) spares the tree. Fail-closed
+/// — a flock the re-check cannot take reads as a spare.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn supervisor_gone_recheck(tree: &Path) -> bool {
+    with_state_lock(|_held| {
+        Ok(matches!(
+            supervisor_state(tree),
+            SupervisorState::None | SupervisorState::Gone
+        ))
+    })
+    .unwrap_or(false)
+}
+
+/// Test-only seam: fires between the stop and the delete/rename re-check hold,
+/// so a test interposes a supervisor the re-check must re-read. Linux/macOS
+/// only — the tests that pose it need a verifiable supervisor, which Windows
+/// never has.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) type ProfileStopRecheckHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+thread_local! {
+    static PROFILE_STOP_RECHECK_HOOK: std::cell::RefCell<Option<ProfileStopRecheckHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn on_profile_stop_recheck_hold(tree: &Path) {
+    PROFILE_STOP_RECHECK_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(tree);
+        }
+    });
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn set_profile_stop_recheck_hook(hook: Option<ProfileStopRecheckHook>) {
+    PROFILE_STOP_RECHECK_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+/// Test-only seam: fires between the verify and the SIGTERM, so a test can
+/// pose the supervisor exiting in that window — the kill then reads `ESRCH`,
+/// the idempotent-stop case. Linux/macOS only, the same verifiable-supervisor
+/// reason as [`ProfileStopRecheckHook`].
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) type SignalSendHook = Box<dyn FnMut(u32)>;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+thread_local! {
+    static SIGNAL_SEND_HOOK: std::cell::RefCell<Option<SignalSendHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn on_signal_send_hook(pid: u32) {
+    SIGNAL_SEND_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(pid);
+        }
+    });
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn set_signal_send_hook(hook: Option<SignalSendHook>) {
+    SIGNAL_SEND_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+/// Whether the recorded `(pid, start)` still names the supervisor, or is gone
+/// or unreadable. Linux reads field 22 of `/proc/<pid>/stat`; macOS reads the
+/// live `proc_bsdinfo` and renders `format_proc_start` — both in-process, no
+/// subprocess per poll. Only a positively-gone pid (or a different start — the
+/// pid was reused) reads `Gone`; a failed read reads `Unreadable`, never gone.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+enum SupervisorLiveness {
+    /// The recorded supervisor is gone: the pid no longer exists (or is a
+    /// zombie) or its start time differs.
+    Gone,
+    /// The pid is live at the recorded start.
+    Alive,
+    /// The read failed: neither gone nor alive can be asserted.
+    Unreadable,
+}
+
+#[cfg(target_os = "linux")]
+fn supervisor_liveness_at_start(pid: u32, start: &str) -> SupervisorLiveness {
+    if !namespaced_keychain_ledger::pid_alive(pid) {
+        return SupervisorLiveness::Gone;
+    }
+    match read_proc_stat(pid) {
+        ProcStat::Zombie => SupervisorLiveness::Gone,
+        ProcStat::Unreadable => SupervisorLiveness::Unreadable,
+        ProcStat::Live(actual) if actual == start => SupervisorLiveness::Alive,
+        ProcStat::Live(_) => SupervisorLiveness::Gone,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn supervisor_liveness_at_start(pid: u32, start: &str) -> SupervisorLiveness {
+    if !namespaced_keychain_ledger::pid_alive(pid) {
+        return SupervisorLiveness::Gone;
+    }
+    let Some(info) = proc_bsdinfo(pid) else {
+        // Live (kill 0 above) but unreadable through `proc_pidinfo`: fall back
+        // to the sysctl `kinfo_proc` read. Only a sysctl-confirmed zombie or a
+        // pid the sysctl reports absent reads Gone.
+        return proc_kinfo_liveness(pid);
+    };
+    if info.pbi_status == libc::SZOMB {
+        return SupervisorLiveness::Gone;
+    }
+    if format_proc_start(info.pbi_start_tvsec) == start {
+        SupervisorLiveness::Alive
+    } else {
+        SupervisorLiveness::Gone
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[expect(
+    unsafe_code,
+    reason = "signal delivery: SIGTERM to a pid verified as this tree's supervisor"
+)]
+fn signal_and_wait(tree: &Path, pid: u32, start: &str) -> SupervisorStop {
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    on_signal_send_hook(pid);
+    // SAFETY: `pid` was verified as this tree's `claude daemon run` supervisor
+    // just above; SIGTERM asks it to shut down (it exits in ~2 s and
+    // deletes its lock + status on the way out, measured).
+    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if sent != 0 {
+        let e = std::io::Error::last_os_error();
+        // The verified supervisor exited between the verify and the kill (a
+        // concurrent stop landed first, or an idle supervisor shut down there):
+        // that IS the stopped outcome, and the caller's re-check re-reads the
+        // lock file before removing anything, so proceed. Every other errno
+        // keeps the wedged row and spares.
+        if e.raw_os_error() == Some(libc::ESRCH) {
+            return SupervisorStop::Proceed;
+        }
+        record_wedged_stop(tree, pid, start);
+        if supervisor_spare_should_announce(tree) {
+            logline!(
+                "clauth: {}: sparing: could not SIGTERM its supervisor pid {pid}: {e}",
+                tree.display()
+            );
+        }
+        return SupervisorStop::Spare;
+    }
+    let deadline = Instant::now() + supervisor_stop_deadline();
+    let mut seen_alive = false;
+    loop {
+        match supervisor_liveness_at_start(pid, start) {
+            SupervisorLiveness::Gone => return SupervisorStop::Proceed,
+            SupervisorLiveness::Alive => seen_alive = true,
+            SupervisorLiveness::Unreadable => {}
+        }
+        if Instant::now() >= deadline {
+            // The verdict is the WHOLE wait's reading: any poll that saw the
+            // supervisor alive means it wedged (SIGTERM landed and it is still
+            // there), so the wedged row and the "still alive" line only yield
+            // to a wait where no poll ever read it alive — that one records no
+            // wedged row, so a later pass retries the full stop instead of
+            // skipping a supervisor clauth never saw alive.
+            if seen_alive {
+                record_wedged_stop(tree, pid, start);
+                if supervisor_spare_should_announce(tree) {
+                    logline!(
+                        "clauth: {}: sparing: its supervisor pid {pid} is still alive {SUPERVISOR_STOP_TIMEOUT:?} after SIGTERM",
+                        tree.display()
+                    );
+                }
+            } else if supervisor_spare_should_announce(tree) {
+                logline!(
+                    "clauth: {}: sparing: its supervisor pid {pid}'s liveness could not be read for {SUPERVISOR_STOP_TIMEOUT:?} after SIGTERM",
+                    tree.display()
+                );
+            }
+            return SupervisorStop::Spare;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// One spare line per tree per process: a tree spared every pass — a
+/// reused pid, a supervisor that ignores SIGTERM — logs once, not once per GC
+/// tick.
+#[cfg(target_os = "linux")]
+fn supervisor_spare_should_announce(tree: &Path) -> bool {
+    static ANNOUNCED: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    ANNOUNCED
+        .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(tree.to_path_buf())
+}
+
+/// The cross-process spare dedupe's decision, factored off the platform call so
+/// the journal logic unit-tests on every OS: given the already-swept
+/// `spared` rows, whether `key` should announce and the rows with a new
+/// announcement recorded.
+#[cfg(any(not(target_os = "linux"), test))]
+fn spared_announce_decision(
+    spared: &[SparedAnnounceRow],
+    key: &str,
+    now_secs: u64,
+) -> (bool, Vec<SparedAnnounceRow>) {
+    if spared.iter().any(|row| row.tree == key) {
+        return (false, spared.to_vec());
+    }
+    let mut rows = spared.to_vec();
+    rows.push(SparedAnnounceRow {
+        tree: key.to_string(),
+        stamp_secs: now_secs,
+    });
+    (true, rows)
+}
+
+/// Off linux the spare line is the only word a stuck tree ever gets — a tree
+/// spared every pass re-reads the unverifiable record (and, on macOS, an argv
+/// or format mismatch), so the dedupe is on disk, not per process: one line per
+/// tree per [`WEDGED_STOP_SKIP_AFTER`] across the daemon, the TUI and every
+/// `clauth start`. A flock or journal that cannot be read announces.
+#[cfg(not(target_os = "linux"))]
+fn supervisor_spare_should_announce(tree: &Path) -> bool {
+    journal_spare_should_announce(tree)
+}
+
+/// The cross-process spare announcement: the load -> sweep -> push -> save runs
+/// in one state-flock hold, the same shape as [`record_wedged_stop`], so one
+/// process cannot overwrite another's flocked in-flight or wedged rows while it
+/// records the announcement. Factored off the linux per-process latch so the
+/// journal body unit-tests on every OS.
+#[cfg(any(not(target_os = "linux"), test))]
+fn journal_spare_should_announce(tree: &Path) -> bool {
+    let Ok(announce) = with_state_lock(|_held| {
+        let mut stops = load_stops_in_flight()?;
+        sweep_stale_stops(&mut stops);
+        let key = stop_in_flight_key(tree);
+        let (announce, rows) =
+            spared_announce_decision(&stops.spared, &key, stop_in_flight_now_secs());
+        if announce {
+            stops.spared = rows;
+            let _ = save_stops_in_flight(&stops);
+        }
+        Ok(announce)
+    }) else {
+        return true;
+    };
+    announce
+}
+
+fn announce_supervisor_spare(tree: &Path, stale_start: Option<&str>) {
+    if supervisor_spare_should_announce(tree) {
+        match stale_start {
+            Some(stale) => logline!(
+                "clauth: {}: sparing: its supervisor's recorded start {stale:?} is stale (the pid still reads as this tree's supervisor)",
+                tree.display()
+            ),
+            None => logline!(
+                "clauth: {}: sparing: its supervisor could not be verified as this tree's own",
+                tree.display()
+            ),
+        }
+    }
+}
+
+/// The stop's wait deadline, shortable by a test so the ignore-SIGTERM arm
+/// does not sleep the real [`SUPERVISOR_STOP_TIMEOUT`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn supervisor_stop_deadline() -> Duration {
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    {
+        if let Some(d) = SUPERVISOR_STOP_DEADLINE.with(|c| c.get()) {
+            return d;
+        }
+    }
+    SUPERVISOR_STOP_TIMEOUT
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+thread_local! {
+    static SUPERVISOR_STOP_DEADLINE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct SupervisorStopDeadlineGuard(Option<Duration>);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl SupervisorStopDeadlineGuard {
+    pub(crate) fn set(deadline: Duration) -> Self {
+        let prev = SUPERVISOR_STOP_DEADLINE.with(|c| c.replace(Some(deadline)));
+        Self(prev)
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl Drop for SupervisorStopDeadlineGuard {
+    fn drop(&mut self) {
+        SUPERVISOR_STOP_DEADLINE.with(|c| c.set(self.0));
+    }
+}
+
+/// Whether the tree's own supervisor is (or may be) alive and unverifiable —
+/// the acquire consult, run in-flock (pure reads, no signal, no subprocess).
+fn supervisor_may_be_alive(tree: &Path) -> bool {
+    match supervisor_state(tree) {
+        SupervisorState::Unverifiable { .. } => true,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        SupervisorState::Ours { .. } => true,
+        SupervisorState::None | SupervisorState::Gone => false,
+    }
+}
+
+/// A supervisor stop in flight for one runtime tree path. Stamped in the
+/// GC/teardown decide hold before the SIGTERM runs and cleared after the
+/// removal hold, so an acquire that resolves the same path between the two
+/// refuses (the Fake shared tree and the background pair have no other
+/// spelling) or re-mints its sid instead of launching a session whose shared
+/// supervisor the stop is about to end. Persistent — the stop and the acquire run in different
+/// processes. The shape is the macOS keychain in-flight delete's.
+///
+/// The same journal's `wedged` field records a supervisor that ignored
+/// SIGTERM (its pid + start time + when), so no later process re-signals and
+/// re-waits that exact supervisor within [`WEDGED_STOP_SKIP_AFTER`] — a
+/// wedged `--bg` tree costs every `clauth start` 15 s per pass otherwise.
+const STOP_IN_FLIGHT_PATH: &str = "daemon-stops-in-flight.json";
+
+/// A stop's worst-case wall duration (SIGTERM + [`SUPERVISOR_STOP_TIMEOUT`])
+/// plus the removal; a row older than this with no sign of its runner is
+/// crash-stale.
+const STOP_IN_FLIGHT_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// How long a wedged supervisor is skipped before the next stop attempt.
+/// Above [`SUPERVISOR_STOP_TIMEOUT`] by a wide margin, so a supervisor
+/// that wedged once is not re-waited by every entry point's GC sweep.
+const WEDGED_STOP_SKIP_AFTER: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StopsInFlight {
+    stops: Vec<StopInFlightRow>,
+    #[serde(default)]
+    wedged: Vec<WedgedStopRow>,
+    #[serde(default)]
+    spared: Vec<SparedAnnounceRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StopInFlightRow {
+    tree: String,
+    stamp_secs: u64,
+}
+
+/// A supervisor that ignored SIGTERM, recorded so the stop is skipped for
+/// [`WEDGED_STOP_SKIP_AFTER`]. The `(pid, start)` pair is part of the identity:
+/// a NEW supervisor on the same tree (different pid or start) is never skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WedgedStopRow {
+    tree: String,
+    pid: u32,
+    start: String,
+    stamp_secs: u64,
+}
+
+/// A tree whose unverifiable supervisor already logged its spare line, so no
+/// later process re-announces it within [`WEDGED_STOP_SKIP_AFTER`]. Only
+/// the non-linux arm consults it; linux keeps the per-process latch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SparedAnnounceRow {
+    tree: String,
+    stamp_secs: u64,
+}
+
+fn stop_in_flight_path() -> Result<PathBuf> {
+    Ok(clauth_dir()?.join(STOP_IN_FLIGHT_PATH))
+}
+
+fn load_stops_in_flight() -> Result<StopsInFlight> {
+    let path = stop_in_flight_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(body) => match serde_json::from_str::<StopsInFlight>(&body) {
+            Ok(stops) => Ok(stops),
+            // An unparseable journal is logged once and treated as empty,
+            // never propagated into every acquire's gate (the write is an
+            // atomic rename, but a hand edit or a disk fault can still produce
+            // bytes nothing parses). The next record or clear overwrites it.
+            Err(_) => {
+                announce_corrupt_stop_journal_once(&path);
+                Ok(StopsInFlight::default())
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StopsInFlight::default()),
+        Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// One line per process for an unparseable stop journal, however many
+/// acquires consult it.
+fn announce_corrupt_stop_journal_once(path: &Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        logline!(
+            "clauth: treating an unparseable stop journal {} as empty",
+            path.display()
+        );
+    });
+}
+
+fn save_stops_in_flight(stops: &StopsInFlight) -> Result<()> {
+    let path = stop_in_flight_path()?;
+    // `atomic_write_600` already `mkdir_700`s a missing parent and writes the
+    // file 0o600; no `enforce_clauth_perms` walk here — that recursive chmod
+    // of every `~/.clauth` entry ran under the state flock on every stop save,
+    // and this journal is the only file the save touches.
+    let bytes = serde_json::to_vec_pretty(stops)
+        .context("failed to serialize the in-flight-stop record")?;
+    atomic_write_600(&path, bytes).context("failed to persist the in-flight-stop record")
+}
+
+/// Seconds since the UNIX epoch; 0 on a pre-epoch clock (a fresh-looking
+/// record refuses rather than reopening the window).
+fn stop_in_flight_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn sweep_stale_stops(stops: &mut StopsInFlight) {
+    let now = stop_in_flight_now_secs();
+    stops.stops.retain(|row| {
+        row.stamp_secs
+            .saturating_add(STOP_IN_FLIGHT_STALE_AFTER.as_secs())
+            > now
+    });
+    stops.wedged.retain(|row| {
+        row.stamp_secs
+            .saturating_add(WEDGED_STOP_SKIP_AFTER.as_secs())
+            > now
+    });
+    stops.spared.retain(|row| {
+        row.stamp_secs
+            .saturating_add(WEDGED_STOP_SKIP_AFTER.as_secs())
+            > now
+    });
+}
+
+fn stop_in_flight_key(tree: &Path) -> String {
+    crate::canonical::identity(tree)
+        .unwrap_or_else(|_| tree.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Stamp (or re-stamp) the in-flight record for one tree path. The caller
+/// holds the state flock: the stamp and the stop's identity decision share one
+/// hold, so an acquire serialized after it sees the record and one serialized
+/// before it is the supervisor the stop is about to end.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn record_stop_in_flight_locked(tree: &Path) -> Result<()> {
+    let key = stop_in_flight_key(tree);
+    let mut stops = load_stops_in_flight()?;
+    sweep_stale_stops(&mut stops);
+    let now = stop_in_flight_now_secs();
+    match stops.stops.iter_mut().find(|row| row.tree == key) {
+        Some(row) => row.stamp_secs = now,
+        None => stops.stops.push(StopInFlightRow {
+            tree: key,
+            stamp_secs: now,
+        }),
+    }
+    save_stops_in_flight(&stops)
+}
+
+/// Clear the in-flight record after the removal hold, in its own flock hold.
+/// Best-effort: a leftover row ages out via [`STOP_IN_FLIGHT_STALE_AFTER`].
+fn clear_stop_in_flight(tree: &Path) {
+    let _ = with_state_lock(|_held| {
+        let key = stop_in_flight_key(tree);
+        if let Ok(mut stops) = load_stops_in_flight() {
+            let before = stops.stops.len();
+            stops.stops.retain(|row| row.tree != key);
+            if stops.stops.len() != before {
+                let _ = save_stops_in_flight(&stops);
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+}
+
+/// Whether a stop is in flight for this path. Called under the state flock by
+/// acquire; a journal that cannot be READ (permission, a vanished `~/.clauth`)
+/// reads as in-flight (fail closed, like the keychain ledger), while an
+/// unparseable one reads empty (`load_stops_in_flight`).
+fn stop_in_flight(tree: &Path) -> Result<bool> {
+    let key = stop_in_flight_key(tree);
+    let mut stops = load_stops_in_flight()?;
+    sweep_stale_stops(&mut stops);
+    Ok(stops.stops.iter().any(|row| row.tree == key))
+}
+
+/// Whether `(pid, start)` at `tree` is a known-wedged supervisor: a
+/// stop failed for that exact pid + start within [`WEDGED_STOP_SKIP_AFTER`],
+/// so re-signalling it would cost another [`SUPERVISOR_STOP_TIMEOUT`] wait
+/// with no outcome. A new supervisor (different pid or start) is never
+/// skipped. Pure read — no flock, no subprocess, no signal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wedged_stop_is_fresh(tree: &Path, pid: u32, start: &str) -> bool {
+    let Ok(mut stops) = load_stops_in_flight() else {
+        return false;
+    };
+    sweep_stale_stops(&mut stops);
+    let key = stop_in_flight_key(tree);
+    stops
+        .wedged
+        .iter()
+        .any(|row| row.tree == key && row.pid == pid && row.start == start)
+}
+
+/// Record a supervisor that would not stop, in its own flock hold so
+/// two processes cannot lose each other's rows. Best-effort: a failed record
+/// only costs the next process's stop another wait, never a wrong collect.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn record_wedged_stop(tree: &Path, pid: u32, start: &str) {
+    let _ = with_state_lock(|_held| {
+        let key = stop_in_flight_key(tree);
+        let mut stops = load_stops_in_flight()?;
+        sweep_stale_stops(&mut stops);
+        let now = stop_in_flight_now_secs();
+        match stops.wedged.iter_mut().find(|row| row.tree == key) {
+            Some(row) => {
+                row.pid = pid;
+                row.start = start.to_string();
+                row.stamp_secs = now;
+            }
+            None => stops.wedged.push(WedgedStopRow {
+                tree: key,
+                pid,
+                start: start.to_string(),
+                stamp_secs: now,
+            }),
+        }
+        save_stops_in_flight(&stops)
+    });
+}
+
+/// Test seam: whether the in-flight journal records `pid` as a wedged
+/// supervisor, so a test can assert a spare did (or did not) stamp one.
+/// Linux-only: its only caller is the linux `/proc`-stat liveness seam test.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn pid_has_wedged_stop(pid: u32) -> bool {
+    load_stops_in_flight()
+        .map(|stops| stops.wedged.iter().any(|row| row.pid == pid))
+        .unwrap_or(false)
 }
 
 /// Resolve `name` into a spawnable [`Command`](std::process::Command) so an
@@ -5837,12 +7572,16 @@ fn is_session_alive(pid_file: &Path) -> bool {
 ///
 /// Shared vs. per-profile layout:
 /// - **Shared via symlink/copy across all profiles:** every top-level entry
-///   in `~/.claude/` except `settings.json`, `.credentials.json` and `jobs` —
-///   this includes `projects/`, `todos/`, `statsig/`, `sessions/`, `cache/`,
-///   `commands/`, `plugins/`, `tasks/`, `teams/`, `hooks/`, `history.jsonl`,
-///   and similar. Claude Code treats these as user-global state so sharing is
-///   intentional; per-profile isolation would hide project history and
-///   installed commands.
+///   in `~/.claude/` except `settings.json`, `.credentials.json`, `jobs` and
+///   the supervisor's own state (`daemon/`, `daemon.json`, `daemon.lock`,
+///   `daemon.status.json`, `daemon.log`, `daemon.scheduled.status.json`) —
+///   this includes `projects/`,
+///   `todos/`, `statsig/`, `sessions/`, `cache/`, `commands/`, `plugins/`,
+///   `tasks/`, `teams/`, `hooks/`, `history.jsonl`, and similar. Claude Code
+///   treats these as user-global state so sharing is intentional; per-profile
+///   isolation would hide project history and installed commands. The
+///   supervisor state is per-config-dir, so sharing it would hand every tree
+///   one supervisor's roster.
 /// - **Per-profile:** `settings.json` (merged with profile overrides),
 ///   `.credentials.json` (the profile's own OAuth token chain), and
 ///   `.claude.json` (a copy seeded from `~/.claude.json`). Settings are
@@ -5864,6 +7603,38 @@ fn is_session_alive(pid_file: &Path) -> bool {
 /// a departed account's custom `[env]`. Model + endpoint keys are re-derived
 /// per profile in `build_claude_settings_json`, so only custom `[env]` needs
 /// this strip.
+///
+/// Top-level `~/.claude/` names a supervisor keys on its own
+/// `CLAUDE_CONFIG_DIR`: the `daemon/` roster dir and the lock/status/log
+/// siblings beside it, the scheduled worker's `daemon.scheduled.status.json`,
+/// and `daemon.json` — the scheduled tasks and configured workers the
+/// supervisor READS and fires/starts (2.1.308/2.1.309: "The service that runs
+/// background sessions starts the workers listed there", and removing a task
+/// says "the daemon will stop firing it on its next reconcile"). A tree's
+/// transient supervisor reading a linked home `daemon.json` would fire the
+/// home's scheduled tasks and start its workers once per tree. Never
+/// linked, copied or mirrored into a tree — a shared tree carrying any of them
+/// would read and write the home tree's supervisor state, and a linked
+/// `daemon.lock` would point clauth's stop at the home supervisor. Skipping
+/// `daemon.json` also means a task added inside a session lives in
+/// its own tree's `daemon.json`, not the home's: session-created tasks
+/// are tree-local and collected with the tree, the accepted trade for keeping
+/// every tree's transient supervisor from firing the home's tasks. One
+/// predicate, shared by the build walk and the watchdog mirror.
+fn is_daemon_state_name(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(
+            "daemon"
+                | "daemon.json"
+                | "daemon.lock"
+                | "daemon.status.json"
+                | "daemon.log"
+                | "daemon.scheduled.status.json"
+        )
+    )
+}
+
 fn build_runtime_dir_with_active_env(
     runtime: &Path,
     claude_home: &Path,
@@ -5898,6 +7669,7 @@ fn build_runtime_dir_with_active_env(
             // linking host `ensure_store_links` above placed the link, or the
             // entry is unusable and the walk links it as it stands.
             || (mode == LinkMode::Fake && file_name == "jobs")
+            || is_daemon_state_name(&file_name)
         {
             continue;
         }
@@ -7304,7 +9076,10 @@ fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
     let root_key = crate::canonical::identity(claude_home).ok();
     let mut classes = AliasClasses::default();
     for name in union_children(claude_home, runtime) {
-        if name.to_str().is_some_and(|n| skip_top.contains(n)) {
+        // The supervisor's own state never crosses either way: the build walk
+        // skips it, so the mirror must too, or a tick would copy the home
+        // roster into the tree and the tree's roster back out.
+        if name.to_str().is_some_and(|n| skip_top.contains(n)) || is_daemon_state_name(&name) {
             continue;
         }
         merge_path(

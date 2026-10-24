@@ -1177,7 +1177,7 @@ pub(crate) fn rename_profile(
     let token_planned = crate::gateway_tokens::refuse_profile_rename(old.as_str(), new.as_str())?;
     #[cfg(test)]
     crate::gateway_tokens::run_pre_hold_hook(old.as_str());
-    with_state_lock(|held| {
+    with_state_lock(|_held| {
         // Same gate delete and disable carry, same predicate and copy: a live
         // session's runtime tree, markers and env paths all live under this
         // directory, so moving it out from under the child breaks the session
@@ -1185,6 +1185,22 @@ pub(crate) fn rename_profile(
         if crate::runtime::has_live_session(old) {
             bail!("'{old}' has a live session, close it first");
         }
+        Ok(())
+    })?;
+    // Stop every runtime tree's supervisor before the profile dir moves,
+    // with the flock dropped (a signal or wait never spans it). The rotation
+    // guard the caller holds for `old` keeps an acquire from re-minting a path
+    // during the stop. Rename has no `--force` flag, so a refusal names only
+    // the retry.
+    let old_dir = profile_dir(old)?;
+    crate::runtime::stop_profile_tree_supervisors(
+        old,
+        &old_dir,
+        crate::runtime::SupervisorStopGate::Refused {
+            offers_force: false,
+        },
+    )?;
+    with_state_lock(|held| {
         let old_dir = profile_dir(old)?;
         let new_dir = profile_dir(new)?;
         // The name validation above checked the RECORD; a directory can outlive
@@ -1276,33 +1292,48 @@ pub(crate) fn delete_profile(
         // Same discipline: the gateway's last client token refuses here,
         // before anything is removed; `force` waives the session gate alone.
         crate::gateway_tokens::refuse_profile_delete(token.as_ref(), name.as_str(), held)?;
-
-        let was_active = config.is_active(name);
-        // An active API profile's base_url + api_key (and model-tier keys) live in
-        // ~/.claude/settings.json, not the credentials link. Capture its custom
-        // env keys before removal so the unwire below can strip those too.
-        let active_env_keys: Vec<String> = if was_active {
-            config
+        Ok(())
+    })?;
+    // Stop every runtime tree's supervisor before any unwire or removal,
+    // with the flock dropped (a signal or wait never spans it). A tree whose
+    // supervisor cannot be verified or stopped refuses the delete, naming the
+    // tree; the rotation guard held by the caller keeps an acquire from
+    // re-minting a path during the stop. `--force` still stops every verifiable
+    // supervisor and waives the refusal for any supervisor it cannot stop
+    // (unverifiable, or verified but still alive after SIGTERM): the tree is
+    // removed anyway.
+    let dir = profile_dir(name)?;
+    crate::runtime::stop_profile_tree_supervisors(
+        name,
+        &dir,
+        if force {
+            crate::runtime::SupervisorStopGate::Forced
+        } else {
+            crate::runtime::SupervisorStopGate::Refused { offers_force: true }
+        },
+    )?;
+    with_state_lock(|held| {
+        // Unwire the active account from the live credentials link + settings.json
+        // BEFORE the irreversible removal, and AFTER the supervisor stop above:
+        // a refused stop leaves `settings.json`, the credentials link and the
+        // active marker exactly as they were. These are fallible external
+        // writes; a failure here still leaves both the record and the dir intact
+        // and fully retryable, rather than stranding the api key in plaintext
+        // settings.json with the profile record already gone. A blank profile
+        // clears its endpoint/key/model env so the key can't linger and the next
+        // session doesn't route to a dead endpoint.
+        if config.is_active(name) {
+            // An active API profile's base_url + api_key (and model-tier keys)
+            // live in ~/.claude/settings.json, not the credentials link. Capture
+            // its custom env keys before removal so the unwire can strip those too.
+            let active_env_keys: Vec<String> = config
                 .find(name)
                 .map(|p| p.env.keys().cloned().collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Unwire the active account from the live credentials link + settings.json
-        // BEFORE any irreversible local removal. These are fallible external
-        // writes: running them first means a failure leaves both the record and
-        // the dir intact and fully retryable, rather than stranding the api key in
-        // plaintext settings.json with the profile record already gone. A blank
-        // profile clears its endpoint/key/model env so the key can't linger and
-        // the next session doesn't route to a dead endpoint.
-        if was_active {
+                .unwrap_or_default();
             clear_claude_credentials()?;
             let blank = Profile::new(name.to_string(), None, None);
             apply_profile_to_claude_settings(&blank, &active_env_keys)?;
         }
-
         // Dir before state: a failed removal keeps the profile in state so the
         // user can retry; persisting state first would leave an orphan dir.
         let dir = profile_dir(name)?;

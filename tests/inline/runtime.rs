@@ -2821,6 +2821,1097 @@ fn a_shared_build_skips_a_store_that_is_not_a_usable_dir() {
     });
 }
 
+/// Claude Code keys a background supervisor's socket on
+/// its config dir but keeps its roster in whatever `daemon/` resolves to, so a
+/// tree linking `daemon -> ~/.claude/daemon` makes every tree's supervisor share
+/// one roster and adopt the others' sessions (measured: the second of two
+/// concurrent launches lost its session). A shared build, on either transport,
+/// therefore never links or copies `daemon` — nor the lock/status/log the
+/// supervisor keys on its config dir; the tree's own supervisor makes a
+/// private one. Control: a sibling entry (`plugins`) still reaches the tree.
+#[test]
+fn a_shared_build_never_brings_the_daemon_dir_into_the_tree() {
+    for mode in [LinkMode::Real, LinkMode::Fake] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            if mode == LinkMode::Real && !host_poses(tmp.path(), "a linked shared build") {
+                return;
+            }
+            let claude_home = fake_claude_home(tmp.path());
+            fs::create_dir_all(claude_home.join("daemon")).expect("mkdir daemon");
+            fs::write(claude_home.join("daemon").join("roster.json"), b"{}").expect("roster");
+            fs::write(claude_home.join("daemon.json"), b"{}").expect("daemon.json");
+            fs::write(claude_home.join("daemon.lock"), b"{}").expect("daemon.lock");
+            fs::write(claude_home.join("daemon.status.json"), b"{}").expect("daemon.status.json");
+            fs::write(claude_home.join("daemon.log"), b"{}").expect("daemon.log");
+            fs::write(claude_home.join("daemon.scheduled.status.json"), b"{}")
+                .expect("daemon.scheduled.status.json");
+            fs::create_dir_all(claude_home.join("plugins")).expect("mkdir plugins");
+            fs::write(claude_home.join("plugins").join("p.json"), b"{}").expect("plugin");
+            let runtime = tmp.path().join("runtime");
+            fs::create_dir_all(&runtime).expect("mkdir runtime");
+            let profile = make_profile("nodaemonlink");
+            let canonical = tmp.path().join("creds.json");
+
+            build_runtime_dir(
+                &runtime,
+                &claude_home,
+                &profile,
+                &canonical,
+                mode,
+                Isolation::Shared,
+            )
+            .expect("build");
+
+            for name in [
+                "daemon",
+                "daemon.json",
+                "daemon.lock",
+                "daemon.status.json",
+                "daemon.log",
+                "daemon.scheduled.status.json",
+            ] {
+                assert!(
+                    runtime.join(name).symlink_metadata().is_err(),
+                    "{mode:?}: the tree carries no {name} entry"
+                );
+            }
+            assert!(
+                runtime.join("plugins").join("p.json").is_file(),
+                "{mode:?}: the walk still brought a sibling entry in"
+            );
+        });
+    }
+}
+
+/// the watchdog's bidirectional mirror must skip
+/// the supervisor's own state too — a tick must never copy the home
+/// `daemon`/lock/status/log into the tree nor the tree's back out, or the
+/// shared-roster bug survives on the copy transport.
+#[test]
+fn the_mirror_never_carries_the_daemon_state_either_way() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        for (home, tree) in [
+            (claude_home.join("daemon.json"), runtime.join("daemon.json")),
+            (claude_home.join("daemon.lock"), runtime.join("daemon.lock")),
+            (
+                claude_home.join("daemon.status.json"),
+                runtime.join("daemon.status.json"),
+            ),
+            (claude_home.join("daemon.log"), runtime.join("daemon.log")),
+            (
+                claude_home.join("daemon.scheduled.status.json"),
+                runtime.join("daemon.scheduled.status.json"),
+            ),
+        ] {
+            fs::write(&home, b"home").expect("seed home daemon state");
+            fs::write(&tree, b"tree").expect("seed tree daemon state");
+        }
+        fs::create_dir_all(claude_home.join("daemon")).expect("mkdir home daemon");
+        fs::write(claude_home.join("daemon").join("roster.json"), b"home").expect("home roster");
+        fs::create_dir_all(runtime.join("daemon")).expect("mkdir tree daemon");
+        fs::write(runtime.join("daemon").join("roster.json"), b"tree").expect("tree roster");
+
+        mirror_tree(&claude_home, &runtime).expect("mirror");
+
+        for name in [
+            "daemon.json",
+            "daemon.lock",
+            "daemon.status.json",
+            "daemon.log",
+            "daemon.scheduled.status.json",
+        ] {
+            assert_eq!(
+                fs::read_to_string(claude_home.join(name)).expect("home side"),
+                "home",
+                "the mirror never publishes the tree's {name} into ~/.claude"
+            );
+            assert_eq!(
+                fs::read_to_string(runtime.join(name)).expect("tree side"),
+                "tree",
+                "the mirror never copies ~/.claude's {name} into the tree"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(claude_home.join("daemon").join("roster.json"))
+                .expect("home roster"),
+            "home",
+            "the mirror never publishes the tree's roster into ~/.claude/daemon"
+        );
+        assert_eq!(
+            fs::read_to_string(runtime.join("daemon").join("roster.json")).expect("tree roster"),
+            "tree",
+            "the mirror never copies ~/.claude's roster into the tree's daemon/"
+        );
+    });
+}
+
+/// the GC re-check re-reads the job store — a job landing between
+/// the decide and removal holds spares the tree.
+#[test]
+fn gc_recheck_rereads_the_job_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let runtime = profiles.join("crashed").join("runtime-777-0");
+        let sessions = profiles.join("crashed").join("sessions-777-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(sessions.join("777-0"), b"").expect("dead marker");
+
+        set_gc_recheck_hook(Some(Box::new(|runtime, _sessions| {
+            let home = crate::profile::home_dir().expect("home");
+            crate::testutil::write_claude_job(&home, "interposed", runtime);
+        })));
+        gc_one_pair_synced(&runtime, &sessions, || {}).expect("gc");
+        set_gc_recheck_hook(None);
+
+        assert!(runtime.exists(), "a job landing mid-sweep spares the tree");
+    });
+}
+
+/// the GC re-check re-reads the marker — a flock-held marker
+/// landing between the decide and removal holds spares the tree.
+#[test]
+fn gc_recheck_rereads_the_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let runtime = profiles.join("crashed").join("runtime-777-0");
+        let sessions = profiles.join("crashed").join("sessions-777-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(sessions.join("777-0"), b"").expect("dead marker");
+
+        set_gc_recheck_hook(Some(Box::new(|_runtime, sessions| {
+            let file = open_pid_file(&sessions.join("777-0")).expect("open marker");
+            file.lock().expect("flock the marker");
+            gc_held_marker_set(file);
+        })));
+        gc_one_pair_synced(&runtime, &sessions, || {}).expect("gc");
+        set_gc_recheck_hook(None);
+        let _held = gc_held_marker_take();
+
+        assert!(
+            runtime.exists(),
+            "a marker landing mid-sweep spares the tree"
+        );
+    });
+}
+
+/// the GC re-check re-reads the lock file — a supervisor that appeared
+/// between the decide and removal holds (a fresh `daemon.lock` naming a live
+/// pid) spares the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn gc_recheck_rereads_the_lock_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let runtime = profiles.join("crashed").join("runtime-777-0");
+        let sessions = profiles.join("crashed").join("sessions-777-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(sessions.join("777-0"), b"").expect("dead marker");
+
+        let sup = crate::testutil::FakeSupervisor::spawn(&runtime, false);
+        set_gc_recheck_hook(Some(Box::new(move |runtime, _sessions| {
+            crate::testutil::write_daemon_lock(runtime, sup.pid, &sup.proc_start);
+        })));
+        gc_one_pair_synced(&runtime, &sessions, || {}).expect("gc");
+        set_gc_recheck_hook(None);
+
+        assert!(
+            runtime.exists(),
+            "a supervisor landing mid-sweep spares the tree"
+        );
+    });
+}
+
+/// the teardown re-check re-reads the job store — a job landing
+/// between the stop and the removal hold spares the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn drop_recheck_rereads_the_job_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profile = configured_profile("drop-recheck");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let tree = rt.config_dir().to_path_buf();
+        let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+        set_drop_recheck_hook(Some(Box::new(move |runtime| {
+            let home = crate::profile::home_dir().expect("home");
+            crate::testutil::write_claude_job(&home, "interposed", runtime);
+        })));
+        drop(rt);
+        set_drop_recheck_hook(None);
+
+        assert!(tree.exists(), "a job landing mid-teardown spares the tree");
+    });
+}
+
+/// the teardown re-check re-reads the MARKER — a flock-held
+/// marker landing between the stop and the removal hold spares the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn drop_recheck_rereads_the_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profile = configured_profile("drop-marker");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let tree = rt.config_dir().to_path_buf();
+        let sessions = rt.sessions_dir().to_path_buf();
+        let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        let marker = sessions.join("777-0");
+
+        set_drop_recheck_hook(Some(Box::new(move |_runtime| {
+            let file = open_pid_file(&marker).expect("open marker");
+            file.lock().expect("flock the marker");
+            drop_held_marker_set(file);
+        })));
+        drop(rt);
+        set_drop_recheck_hook(None);
+        let _held = drop_held_marker_take();
+
+        assert!(
+            tree.exists(),
+            "a marker landing mid-teardown spares the tree"
+        );
+    });
+}
+
+/// the teardown re-check re-reads the LOCK FILE — a supervisor
+/// that appeared between the stop and the removal hold (a fresh `daemon.lock`
+/// naming a live pid) spares the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn drop_recheck_rereads_the_lock_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profile = configured_profile("drop-lock");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let tree = rt.config_dir().to_path_buf();
+        let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        // A second supervisor lands only in the hook, after the first is
+        // SIGTERMed; its lock is what the re-check must re-read.
+        let landing = crate::testutil::FakeSupervisor::spawn(&tree, false);
+
+        set_drop_recheck_hook(Some(Box::new(move |runtime| {
+            crate::testutil::write_daemon_lock(runtime, landing.pid, &landing.proc_start);
+        })));
+        drop(rt);
+        set_drop_recheck_hook(None);
+
+        assert!(
+            tree.exists(),
+            "a supervisor landing mid-teardown spares the tree"
+        );
+    });
+}
+
+/// a teardown that spares the tree on the re-check (a supervisor
+/// landed after the stop) still clears its in-flight row — without the clear,
+/// every Fake-mode acquire on the profile bails "a supervisor stop is in
+/// flight" until the row ages out.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn teardown_spare_clears_the_in_flight_record() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profile = configured_profile("drop-clear");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            .expect("acquire");
+        let tree = rt.config_dir().to_path_buf();
+        let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        let landing = crate::testutil::FakeSupervisor::spawn(&tree, false);
+
+        set_drop_recheck_hook(Some(Box::new(move |runtime| {
+            crate::testutil::write_daemon_lock(runtime, landing.pid, &landing.proc_start);
+        })));
+        drop(rt);
+        set_drop_recheck_hook(None);
+
+        assert!(tree.exists(), "the re-check spare kept the tree");
+        let key = stop_in_flight_key(&tree);
+        let journal = load_stops_in_flight().expect("journal");
+        assert!(
+            !journal.stops.iter().any(|row| row.tree == key),
+            "the teardown spare cleared the in-flight row: {:?}",
+            journal.stops
+        );
+    });
+}
+
+/// the mirror skip's deterministic arm — a supervisor state file
+/// present on ONE side only never crosses to the missing side. The
+/// both-sides-seeded test ties on mtime inside a clock tick; a missing side
+/// has no mtime to tie, so it reds on every run the skip is removed.
+#[test]
+fn the_mirror_never_copies_the_daemon_state_into_a_missing_side() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::write(claude_home.join("daemon.json"), b"home").expect("seed home daemon.json");
+        fs::write(claude_home.join("daemon.lock"), b"home").expect("seed home lock");
+        fs::write(claude_home.join("daemon.scheduled.status.json"), b"home")
+            .expect("seed home scheduled status");
+        fs::create_dir_all(claude_home.join("daemon")).expect("mkdir home daemon");
+        fs::write(claude_home.join("daemon").join("roster.json"), b"home").expect("home roster");
+
+        mirror_tree(&claude_home, &runtime).expect("mirror");
+
+        assert!(
+            runtime.join("daemon.json").symlink_metadata().is_err(),
+            "the mirror never copies ~/.claude's daemon.json into a missing tree side"
+        );
+        assert!(
+            runtime.join("daemon.lock").symlink_metadata().is_err(),
+            "the mirror never copies ~/.claude's daemon.lock into a missing tree side"
+        );
+        assert!(
+            runtime
+                .join("daemon.scheduled.status.json")
+                .symlink_metadata()
+                .is_err(),
+            "the mirror never copies ~/.claude's daemon.scheduled.status.json into a missing tree side"
+        );
+        assert!(
+            runtime.join("daemon").symlink_metadata().is_err(),
+            "the mirror never copies ~/.claude's daemon/ into a missing tree side"
+        );
+    });
+}
+
+/// acquire consults the in-flight record — a Fake-mode shared
+/// bare tree with a stop in flight refuses the start, instead of launching a
+/// session whose shared supervisor the stop is about to end.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn acquire_refuses_a_shared_tree_with_a_stop_in_flight() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        with_link_mode(LinkMode::Fake, || {
+            let profile = configured_profile("in-flight");
+            let runtime = crate::profile::profile_dir(&profile.name)
+                .expect("profile dir")
+                .join("runtime");
+            crate::profile::mkdir_700(&runtime).expect("mkdir runtime");
+            with_state_lock(|_held| record_stop_in_flight_locked(&runtime)).expect("stamp");
+
+            let err =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .err()
+                    .expect("an in-flight stop must refuse the acquire");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "clauth is stopping Claude Code's background service in {}; retry in a moment",
+                    runtime.display()
+                ),
+                "the refusal names the in-flight stop"
+            );
+        });
+    });
+}
+
+/// The background pair keeps one runtime path whatever the sid, so a `--bg`
+/// launch meeting a stop in flight there refuses instead of handing its job to
+/// the supervisor the stop is about to end.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn acquire_background_refuses_a_stop_in_flight() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        with_link_mode(LinkMode::Real, || {
+            let profile = configured_profile("bg-in-flight");
+            let runtime = crate::profile::profile_dir(&profile.name)
+                .expect("profile dir")
+                .join("runtime-bg");
+            crate::profile::mkdir_700(&runtime).expect("mkdir runtime-bg");
+            with_state_lock(|_held| record_stop_in_flight_locked(&runtime)).expect("stamp");
+
+            let err = ProfileRuntime::acquire_background(
+                &profile.name,
+                BackgroundHold::Launcher,
+                &[],
+                Some("--bg"),
+            )
+            .err()
+            .expect("an in-flight stop must refuse the background acquire");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "clauth is stopping Claude Code's background service in {}; retry in a moment",
+                    runtime.display()
+                ),
+                "the refusal names the in-flight stop"
+            );
+            let markers = crate::profile::profile_dir(&profile.name)
+                .expect("profile dir")
+                .join("sessions-bg");
+            assert!(
+                fs::read_dir(&markers).map_or(true, |mut dir| dir.next().is_none()),
+                "a refused launch leaves no marker in {}",
+                markers.display()
+            );
+        });
+    });
+}
+
+/// acquire declines the wipe of a tree whose own supervisor may
+/// be alive — the additive build keeps the tree and its sentinel, never
+/// `remove_dir_all`s under a live supervisor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn acquire_declines_the_wipe_of_a_tree_whose_supervisor_may_be_alive() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        with_link_mode(LinkMode::Fake, || {
+            let profile = configured_profile("live-sup");
+            let runtime = crate::profile::profile_dir(&profile.name)
+                .expect("profile dir")
+                .join("runtime");
+            crate::profile::mkdir_700(&runtime).expect("mkdir runtime");
+            fs::write(runtime.join("sentinel"), b"keep").expect("sentinel");
+            let sup = crate::testutil::FakeSupervisor::spawn(&runtime, false);
+            crate::testutil::write_daemon_lock(&runtime, sup.pid, &sup.proc_start);
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            assert!(
+                runtime.join("sentinel").exists(),
+                "a live supervisor spares the wipe; the sentinel survives"
+            );
+            drop(rt);
+        });
+    });
+}
+
+/// an unparseable stop journal is logged once and treated as empty —
+/// every acquire still proceeds instead of bailing on the parse error.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_unparseable_stop_journal_reads_empty_and_logs_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        with_link_mode(LinkMode::Fake, || {
+            let profile = configured_profile("corrupt");
+            let runtime = crate::profile::profile_dir(&profile.name)
+                .expect("profile dir")
+                .join("runtime");
+            crate::profile::mkdir_700(&runtime).expect("mkdir runtime");
+            let journal = stop_in_flight_path().expect("journal path");
+            crate::profile::mkdir_700(journal.parent().expect("journal parent"))
+                .expect("mkdir .clauth");
+            fs::write(&journal, b"{ not json").expect("corrupt journal");
+
+            let lines = crate::logline::LogLines::new();
+            let _capture = lines.capture_here();
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("the corrupt journal does not brick the acquire");
+            drop(rt);
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("the corrupt journal does not brick the second acquire");
+            drop(rt);
+            assert_eq!(
+                lines.snapshot(),
+                vec![format!(
+                    "clauth: treating an unparseable stop journal {} as empty",
+                    journal.display()
+                )],
+                "the corrupt journal logged exactly one line"
+            );
+        });
+    });
+}
+
+/// The `procStart` formatter renders `pbi_start_tvsec` as
+/// `asctime(gmtime(...))`. The first two pairs are the mac probe's measured
+/// values; the third (a single-digit day, space-padded `%e`) is hand-computed
+/// via `date -u -d @1791158400` = `Mon Oct  5 00:00:00 2026`, independent of
+/// the code under test.
+#[test]
+fn proc_start_formatter_matches_the_macos_probe() {
+    assert_eq!(format_proc_start(1792720759), "Fri Oct 23 01:59:19 2026");
+    assert_eq!(format_proc_start(1792721082), "Fri Oct 23 02:04:42 2026");
+    assert_eq!(format_proc_start(1791158400), "Mon Oct  5 00:00:00 2026");
+    for tvsec in [1792720759u64, 1792721082, 1791158400] {
+        assert_eq!(
+            parse_proc_start(&format_proc_start(tvsec)),
+            Some(tvsec),
+            "the parser inverts the formatter"
+        );
+    }
+    // A string in another format is unparseable (unverifiable), never a reused pid.
+    assert_eq!(parse_proc_start("2026-10-23T01:59:19Z"), None);
+    assert_eq!(parse_proc_start(""), None);
+    // A well-formed string with the WRONG weekday does not parse: the weekday
+    // guard is the only thing that keeps a corrupted date out of the parsed
+    // instant.
+    assert_eq!(parse_proc_start("Thu Oct 23 01:59:19 2026"), None);
+}
+
+/// a recorded `procStart` that parses but differs from the live start
+/// reads `Gone` only when the live start is strictly LATER (a reused pid);
+/// anything else — a future format, or a parsed instant not earlier than the
+/// live one — reads `Unverifiable` and spares.
+#[test]
+fn start_mismatch_verdict_only_reads_gone_for_a_later_live_start() {
+    let recorded = "Fri Oct 23 01:59:19 2026"; // epoch 1792720759
+    assert_eq!(
+        start_mismatch_verdict(1792720760, recorded, false),
+        SupervisorState::Gone,
+        "a strictly-later live start is a reused pid"
+    );
+    assert_eq!(
+        start_mismatch_verdict(1792720759, recorded, false),
+        SupervisorState::Unverifiable { stale_start: None },
+        "an equal instant is not a mismatch verdict (the caller handles equality)"
+    );
+    assert_eq!(
+        start_mismatch_verdict(1792720758, recorded, false),
+        SupervisorState::Unverifiable { stale_start: None },
+        "an earlier-than-recorded live start spares, never collects"
+    );
+    assert_eq!(
+        start_mismatch_verdict(1792720760, "2026-10-23T01:59:19Z", false),
+        SupervisorState::Unverifiable { stale_start: None },
+        "an unparseable recorded string spares"
+    );
+}
+
+/// a live pid whose argv holds `daemon run` and whose config dir is this tree
+/// IS this tree's supervisor even when the recorded instant differs (a build
+/// that rendered it in a timezone west of UTC) — `Unverifiable` naming the
+/// stale recorded start, never `Gone`.
+#[test]
+fn start_mismatch_verdict_reads_a_matching_supervisor_as_unverifiable() {
+    assert_eq!(
+        start_mismatch_verdict(1792720759, "Thu Oct 22 20:59:19 2026", true),
+        SupervisorState::Unverifiable {
+            stale_start: Some("Thu Oct 22 20:59:19 2026".to_string())
+        },
+        "a matching supervisor spares whatever the start string says"
+    );
+}
+
+/// the zombie-fallback decision: a `kinfo_proc` read proves the pid gone only
+/// when the sysctl reports it absent or a `SZOMB` zombie — any live non-zombie
+/// state and every other read failure stays unreadable (spare). The zombie
+/// value is pinned as the literal `5` from `<sys/proc.h>` (`SZOMB`), never the
+/// code's own constant: a wrong constant would read a STOPPED live supervisor
+/// (`SSTOP` = 4) as gone and this test would stay green.
+#[test]
+fn kinfo_proc_read_decides_gone_only_for_zombie_or_absent() {
+    assert!(
+        kinfo_proc_reads_gone(KinfoProcRead::Absent),
+        "absent reads gone"
+    );
+    assert!(
+        kinfo_proc_reads_gone(KinfoProcRead::Present(5)),
+        "a zombie (SZOMB = 5) reads gone"
+    );
+    assert!(
+        !kinfo_proc_reads_gone(KinfoProcRead::Present(4)),
+        "a stopped live supervisor (SSTOP = 4) must never read gone"
+    );
+    assert!(
+        !kinfo_proc_reads_gone(KinfoProcRead::Present(2)),
+        "a live non-zombie reads unreadable"
+    );
+    assert!(
+        !kinfo_proc_reads_gone(KinfoProcRead::Unreadable),
+        "a failed read reads unreadable"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        u32::from(P_STAT_SZOMB),
+        libc::SZOMB,
+        "the local SZOMB constant matches libc's Apple binding"
+    );
+}
+
+/// the `kinfo_proc` second-read decision: `size` bounds the read, so the
+/// first pass's buffer tail never counts. An empty read (the pid vanished
+/// between the sizing call and the read, so the kernel wrote no entry) is
+/// `Absent`; a read shorter than the `KinfoProcStat` prefix (40 bytes) is
+/// `Unreadable`; a full-enough read reports the `p_stat` byte.
+#[test]
+fn kinfo_proc_second_read_decides_empty_short_and_present() {
+    assert_eq!(
+        kinfo_proc_second_read(&[], 0),
+        KinfoProcRead::Absent,
+        "an empty second read is the pid vanishing, not unreadable"
+    );
+    // A full-sized, zeroed buffer whose second read reported zero bytes is
+    // still the pid vanishing: the first pass's sizing must not turn the
+    // buffer's tail into an entry.
+    let mut full = vec![0u8; std::mem::size_of::<KinfoProcStat>()];
+    assert_eq!(
+        kinfo_proc_second_read(&full, 0),
+        KinfoProcRead::Absent,
+        "a zero-byte second read over a sized buffer is the pid vanishing"
+    );
+    // A read too short to hold the `p_stat` byte (offset 36) is neither empty
+    // nor a whole entry — unreadable, never a guess at `p_stat`.
+    let short = vec![0u8; P_STAT_OFFSET];
+    assert_eq!(
+        kinfo_proc_second_read(&short, short.len()),
+        KinfoProcRead::Unreadable,
+        "a short read holds no p_stat byte"
+    );
+    // The threshold is the whole prefix, not the `p_stat` offset: a read one
+    // byte short of the entry holds `p_stat` and still is not an entry.
+    let mut one_short = vec![0u8; std::mem::size_of::<KinfoProcStat>() - 1];
+    one_short[P_STAT_OFFSET] = 5;
+    assert_eq!(
+        kinfo_proc_second_read(&one_short, one_short.len()),
+        KinfoProcRead::Unreadable,
+        "a read one byte short of the entry is unreadable"
+    );
+    full[P_STAT_OFFSET] = 5;
+    assert_eq!(
+        kinfo_proc_second_read(&full, full.len()),
+        KinfoProcRead::Present(5),
+        "a full read reports the p_stat byte"
+    );
+    assert_eq!(
+        kinfo_proc_second_read(&full, full.len() + 1),
+        KinfoProcRead::Unreadable,
+        "a reported size past the buffer is no read of it"
+    );
+}
+
+/// a live fake supervisor whose recorded `procStart` differs from its live
+/// start but whose argv + env still match this tree spares — `Unverifiable`
+/// naming the stale recorded start, never `Gone` — and the spare line names
+/// that stale start. The recorded string parses and is strictly EARLIER than
+/// the live start on macOS, so dropping the argv/env read there reads `Gone`
+/// and reds this test.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_live_matching_supervisor_with_a_stale_recorded_start_spares() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        // Linux never parses the recorded string in the mismatch arm; any
+        // differing value works. macOS parses it, so it must be strictly
+        // earlier than the live start for the drop-the-read plant to red.
+        #[cfg(target_os = "linux")]
+        let stale = "Thu Oct 22 20:59:19 2026".to_string();
+        #[cfg(target_os = "macos")]
+        let stale = {
+            let live = crate::runtime::proc_bsdinfo(sup.pid)
+                .expect("live start")
+                .pbi_start_tvsec;
+            crate::runtime::format_proc_start(live - 18000)
+        };
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &stale);
+
+        assert_eq!(
+            supervisor_state(&tree),
+            SupervisorState::Unverifiable {
+                stale_start: Some(stale.clone())
+            },
+            "a matching supervisor with a stale recorded start spares, never Gone"
+        );
+
+        let lines = crate::logline::LogLines::new();
+        let _capture = lines.capture_here();
+        assert_eq!(
+            stop_tree_supervisor(&tree),
+            SupervisorStop::Spare,
+            "the stale-start verdict spares the tree"
+        );
+        assert_eq!(
+            lines.snapshot(),
+            vec![format!(
+                "clauth: {}: sparing: its supervisor's recorded start {stale:?} is stale (the pid still reads as this tree's supervisor)",
+                tree.display()
+            )],
+            "the spare line names the stale recorded start"
+        );
+    });
+}
+
+/// A `daemon.lock` recording a pid of `0` or above `i32::MAX` is a malformed
+/// record: `read_supervisor_record` returns `Err` (the corrupt-lock path
+/// spares as unverifiable), so the pid never reaches `pid_alive`'s
+/// `kill(pid, 0)` probe. `kill(0, 0)` probes the caller's own process group,
+/// and a pid above `i32::MAX` casts to a negative pid (`4294967295` ->
+/// `kill(-1, 0)`, every process the user owns). The stop then spares the tree
+/// with no signal. The linux verify would also spare a bogus pid as
+/// unreadable, so the boundary read is the red the plant targets.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_bogus_lock_pid_is_a_malformed_record_that_never_signals() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        let start = "Thu Oct 22 20:59:19 2026";
+
+        for pid in [0u32, i32::MAX as u32 + 1, u32::MAX] {
+            crate::testutil::write_daemon_lock(&tree, pid, start);
+            assert_eq!(
+                read_supervisor_record(&tree),
+                Err(()),
+                "a lock pid of {pid} is a malformed record, never a signal target"
+            );
+        }
+
+        // The malformed record spares with no signal: the corrupt-lock path
+        // returns `Unverifiable`, which the stop path spares without reaching
+        // the kill.
+        crate::testutil::write_daemon_lock(&tree, u32::MAX, start);
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let fired = fired.clone();
+            crate::runtime::set_signal_send_hook(Some(Box::new(move |_| {
+                fired.set(fired.get() + 1);
+            })));
+        }
+        assert_eq!(
+            stop_tree_supervisor(&tree),
+            SupervisorStop::Spare,
+            "a bogus lock pid spares the tree"
+        );
+        crate::runtime::set_signal_send_hook(None);
+        assert_eq!(fired.get(), 0, "no signal reached the bogus pid");
+    });
+}
+
+/// The `daemon.status.json` fallback is the same trust boundary as
+/// `daemon.lock`: a status pid of `0` (the caller's own process group) or
+/// above `i32::MAX` (a negative pid: `4294967295` -> `kill(-1, 0)`) is a
+/// malformed record and reads `Err`, so the stop spares the tree with no
+/// signal. The control row proves the reader really parses the status file
+/// rather than ignoring it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_bogus_status_pid_is_a_malformed_record_too() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        let start = "Thu Oct 22 20:59:19 2026";
+
+        for pid in [0u32, i32::MAX as u32 + 1, u32::MAX] {
+            crate::testutil::write_daemon_status(&tree, pid, start);
+            assert_eq!(
+                read_supervisor_record(&tree),
+                Err(()),
+                "a status pid of {pid} is a malformed record, never a signal target"
+            );
+        }
+
+        crate::testutil::write_daemon_status(&tree, u32::MAX, start);
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let fired = fired.clone();
+            crate::runtime::set_signal_send_hook(Some(Box::new(move |_| {
+                fired.set(fired.get() + 1);
+            })));
+        }
+        assert_eq!(
+            stop_tree_supervisor(&tree),
+            SupervisorStop::Spare,
+            "a bogus status pid spares the tree"
+        );
+        crate::runtime::set_signal_send_hook(None);
+        assert_eq!(fired.get(), 0, "no signal reached the bogus pid");
+
+        crate::testutil::write_daemon_status(&tree, 4242, start);
+        assert_eq!(
+            read_supervisor_record(&tree),
+            Ok(Some((4242, start.to_string()))),
+            "the control row parses the status file"
+        );
+    });
+}
+
+/// Both pid edges of the boundary are ACCEPTED, from the lock and from the
+/// status fallback: `1` and `i32::MAX` are positive pids that fit `pid_t`, so
+/// a record naming one must read as this tree's supervisor instead of
+/// sparing it as malformed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_accepted_pid_edges_read_from_both_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let tree = tmp.path().join("tree");
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    let start = "Thu Oct 22 20:59:19 2026";
+
+    for pid in [1u32, i32::MAX as u32] {
+        crate::testutil::write_daemon_lock(&tree, pid, start);
+        assert_eq!(
+            read_supervisor_record(&tree),
+            Ok(Some((pid, start.to_string()))),
+            "a lock pid of {pid} is a valid kill target"
+        );
+        fs::remove_file(tree.join("daemon.lock")).expect("remove daemon.lock");
+
+        crate::testutil::write_daemon_status(&tree, pid, start);
+        assert_eq!(
+            read_supervisor_record(&tree),
+            Ok(Some((pid, start.to_string()))),
+            "a status pid of {pid} is a valid kill target"
+        );
+        fs::remove_file(tree.join("daemon.status.json")).expect("remove daemon.status.json");
+    }
+}
+
+/// the macOS `KERN_PROCARGS2` parser — `[int argc][exec path NUL][NUL
+/// padding][argc argv NUL][env NUL]` — parses argv and env out of hand-built
+/// buffers on every OS, and the argv/env checks see what the verify needs.
+#[test]
+fn parse_proc_args2_parses_the_macos_layout() {
+    let tree = tempfile::tempdir().expect("tempdir");
+    let tree_path = tree.path().to_path_buf();
+    let args2_buffer = |argc: i32, argv: &[&[u8]], environ: &[&[u8]]| -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&argc.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/claude");
+        buf.push(0);
+        buf.extend_from_slice(&[0, 0, 0]); // NUL padding to the argv boundary
+        for arg in argv {
+            buf.extend_from_slice(arg);
+            buf.push(0);
+        }
+        for entry in environ {
+            buf.extend_from_slice(entry);
+            buf.push(0);
+        }
+        buf
+    };
+
+    // argv hit (argv holds `daemon run`) + env hit (CLAUDE_CONFIG_DIR resolves
+    // to the tree).
+    let ccd = format!("CLAUDE_CONFIG_DIR={}", tree_path.display());
+    let buf = args2_buffer(
+        4,
+        &[b"/bin/claude", b"daemon", b"run", b"--origin"],
+        &[ccd.as_bytes()],
+    );
+    let args = parse_proc_args2(&buf).expect("a well-formed buffer parses");
+    let argv: Vec<&[u8]> = args.argv.iter().map(Vec::as_slice).collect();
+    assert!(argv_holds_daemon_run(&argv), "argv hit: daemon run found");
+    assert!(
+        environ_bytes_config_dir_is(&args.environ, &tree_path),
+        "env hit: config dir matches the tree"
+    );
+
+    // env miss: no CLAUDE_CONFIG_DIR entry -> false.
+    let miss = args2_buffer(2, &[b"/bin/claude", b"daemon"], &[b"PATH=/usr/bin"]);
+    let args = parse_proc_args2(&miss).expect("the miss buffer parses");
+    assert!(
+        !environ_bytes_config_dir_is(&args.environ, &tree_path),
+        "env miss reads false"
+    );
+
+    // Truncated buffer: argc names two argv strings but the second never
+    // terminates.
+    let mut truncated = args2_buffer(2, &[b"/bin/claude", b"daemon"], &[]);
+    truncated.pop(); // drop the final NUL
+    assert_eq!(
+        parse_proc_args2(&truncated),
+        None,
+        "a truncated argv string does not parse"
+    );
+
+    // argc past the end: argc names more strings than the buffer holds.
+    let past_end = args2_buffer(6, &[b"/bin/claude", b"daemon"], &[]);
+    assert_eq!(
+        parse_proc_args2(&past_end),
+        None,
+        "an argc past the end does not parse"
+    );
+}
+
+/// the cross-process spare dedupe's decision, factored off the
+/// platform call — the same journal logic every OS runs, unit-tested on the
+/// host.
+#[test]
+fn the_spared_announce_decision_dedupes_per_tree() {
+    let (announce, rows) = spared_announce_decision(&[], "tree-a", 1000);
+    assert!(announce, "an unseen tree announces");
+    assert_eq!(
+        rows,
+        vec![SparedAnnounceRow {
+            tree: "tree-a".into(),
+            stamp_secs: 1000
+        }]
+    );
+
+    let (again, rows2) = spared_announce_decision(&rows, "tree-a", 1005);
+    assert!(!again, "the same tree is deduped");
+    assert_eq!(rows2, rows, "a deduped decision adds no row");
+
+    let (other, rows3) = spared_announce_decision(&rows, "tree-b", 1010);
+    assert!(other, "a different tree still announces");
+    assert_eq!(rows3.len(), 2, "the second tree joins the rows");
+}
+
+/// a SIGTERM that fails with `ESRCH` — the verified supervisor exited between
+/// the verify and the kill — proceeds (the delete's re-check re-reads the lock
+/// file before removing), with no wedged row and no "could not SIGTERM" line.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn delete_proceeds_when_the_supervisor_exits_before_the_kill() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let mut config = crate::profile::AppConfig {
+            state: crate::profile::AppState::default(),
+            profiles: Vec::new(),
+        };
+        crate::actions::create_blank_profile(
+            &mut config,
+            "victim".to_string(),
+            None,
+            None,
+            Default::default(),
+        )
+        .expect("create profile");
+        let tree = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("victim")
+            .join("runtime-4242-0");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        let mut sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        let pid = sup.pid;
+
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let fired = fired.clone();
+            crate::runtime::set_signal_send_hook(Some(Box::new(move |hook_pid| {
+                assert_eq!(hook_pid, pid, "the seam fires for the verified pid");
+                fired.set(fired.get() + 1);
+                let _ = sup.child.kill();
+                let _ = sup.child.wait();
+            })));
+        }
+        let lines = crate::logline::LogLines::new();
+        let _capture = lines.capture_here();
+        let name = crate::profile::ProfileName::from("victim");
+        let guard = crate::actions::rotation_guard_for_mutation(&name).expect("rotation guard");
+        crate::actions::delete_profile(&mut config, &name, false, &guard)
+            .expect("the supervisor exiting before the kill lets the delete proceed");
+        drop(guard);
+        crate::runtime::set_signal_send_hook(None);
+
+        assert_eq!(
+            fired.get(),
+            1,
+            "the signal seam fired exactly once (the kill, not a misread Gone)"
+        );
+        assert!(!tree.exists(), "the delete removed the tree");
+        assert!(
+            !lines
+                .snapshot()
+                .iter()
+                .any(|line| line.contains("could not SIGTERM")),
+            "an ESRCH kill is the stopped outcome, never a could-not-SIGTERM spare"
+        );
+        let journal = load_stops_in_flight().expect("journal");
+        assert!(
+            !journal.wedged.iter().any(|row| row.pid == pid),
+            "an ESRCH kill records no wedged row"
+        );
+    });
+}
+
+/// a supervisor recorded as wedged is spared without a second signal
+/// — the stop skip reads the journal and never reaches `signal_and_wait`, so a
+/// `clauth start` on a wedged tree pays no 15 s wait.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_wedged_supervisor_is_not_resignalled() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        let mut sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        record_wedged_stop(&tree, sup.pid, &sup.proc_start);
+
+        assert_eq!(
+            stop_tree_supervisor(&tree),
+            SupervisorStop::Spare,
+            "a wedged supervisor spares without another stop"
+        );
+        assert!(
+            sup.child.try_wait().is_ok_and(|status| status.is_none()),
+            "the wedged supervisor was not re-signalled"
+        );
+    });
+}
+
+/// the cross-process spare announcement's journal body — load -> sweep ->
+/// push -> save in one flock hold — dedupes per tree across calls, the
+/// off-linux announce latch, driven on linux through the same factored fn.
+#[test]
+fn the_journal_spare_announce_dedupes_per_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let tree_a = tmp.path().join("tree-a");
+        fs::create_dir_all(&tree_a).expect("mkdir tree-a");
+        let tree_b = tmp.path().join("tree-b");
+        fs::create_dir_all(&tree_b).expect("mkdir tree-b");
+
+        assert!(
+            journal_spare_should_announce(&tree_a),
+            "an unseen tree announces"
+        );
+        assert!(
+            !journal_spare_should_announce(&tree_a),
+            "the same tree is deduped across calls"
+        );
+        assert!(
+            journal_spare_should_announce(&tree_b),
+            "a different tree still announces"
+        );
+    });
+}
+
 /// A `~/.claude` that refuses new entries (read-only, `EACCES`, `ENOSPC`) must
 /// not refuse a shared start: the store is skipped, as an unusable one is, and
 /// the tree gets no link for it. The base started there — the walk only links

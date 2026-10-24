@@ -11543,3 +11543,792 @@ fn the_cli_capture_lines_are_unchanged() {
         ]
     );
 }
+
+/// deleting a profile first SIGTERMs every runtime tree's own
+/// supervisor, then removes the profile dir — never a removal under a live
+/// supervisor that would recreate the config dir bare.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn delete_profile_stops_a_tree_supervisor_first() {
+    // A per-session tree and the account's background tree.
+    for tree_name in ["runtime-4242-0", "runtime-bg"] {
+        let home = HomeSandbox::new();
+        let mut config = AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        };
+        create_blank_profile(
+            &mut config,
+            "victim".to_string(),
+            None,
+            None,
+            Default::default(),
+        )
+        .expect("create profile");
+        let tree = home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join("victim")
+            .join(tree_name);
+        std::fs::create_dir_all(&tree).expect("mkdir tree");
+        let mut sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+        crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+        let guard = rotation_guard("victim");
+        delete_profile(
+            &mut config,
+            &crate::profile::ProfileName::from("victim"),
+            false,
+            &guard,
+        )
+        .expect("delete");
+        drop(guard);
+
+        let child = &mut sup.child;
+        let status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::testutil::reap_bounded(child)
+        }))
+        .unwrap_or_else(|_| panic!("the delete never SIGTERMed {tree_name}'s supervisor"));
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGTERM),
+            "the delete SIGTERMed {tree_name}'s supervisor"
+        );
+        assert!(
+            !tree.exists(),
+            "the delete removed the profile dir with {tree_name}"
+        );
+    }
+}
+
+/// a supervisor that lands AFTER the stop (between the stop and the
+/// delete's re-check) still refuses the delete — the re-check re-reads the lock
+/// file before anything is removed, the same shape GC and teardown run.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn delete_profile_refuses_when_a_supervisor_lands_after_the_stop() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "victim".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("victim")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    // No supervisor yet: the stop proceeds; the hook poses a live one before
+    // the re-check runs.
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+    crate::runtime::set_profile_stop_recheck_hook(Some(Box::new(move |runtime| {
+        crate::testutil::write_daemon_lock(runtime, sup.pid, &sup.proc_start);
+    })));
+
+    let guard = rotation_guard("victim");
+    let err = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("victim"),
+        false,
+        &guard,
+    )
+    .expect_err("a supervisor landing after the stop must refuse the delete");
+    drop(guard);
+    crate::runtime::set_profile_stop_recheck_hook(None);
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'victim': runtime tree {} still has a background supervisor clauth \
+             cannot stop on this host; retry once it has exited, or pass --force \
+             to remove it anyway",
+            tree.display()
+        ),
+        "the re-check refusal pins the exact message"
+    );
+    assert!(
+        tree.exists(),
+        "the tree is spared while a live supervisor names it"
+    );
+}
+
+/// `--force` waives the refusal for a supervisor clauth cannot
+/// verify, not the verified stop — a forced delete of a tree whose supervisor
+/// IS verifiable still SIGTERMs that supervisor before removing the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn delete_profile_with_force_still_stops_a_verifiable_supervisor() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "victim".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("victim")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let mut sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+    let guard = rotation_guard("victim");
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("victim"),
+        true,
+        &guard,
+    )
+    .expect("forced delete");
+    drop(guard);
+
+    let status = crate::testutil::reap_bounded(&mut sup.child);
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGTERM),
+        "--force still SIGTERMs a verifiable supervisor"
+    );
+    assert!(!tree.exists(), "the forced delete removed the tree");
+}
+
+/// without `--force`, a VERIFIED supervisor that ignored SIGTERM (it
+/// survived the wait) refuses the delete with the exact message — a wedged
+/// verified supervisor is exactly the "clauth cannot stop" case the refusal
+/// names, so `--force` is still the only way past it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn delete_profile_refuses_a_verified_supervisor_that_ignores_sigterm() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "victim".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("victim")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, true);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+    let _deadline =
+        crate::runtime::SupervisorStopDeadlineGuard::set(std::time::Duration::from_millis(300));
+    let guard = rotation_guard("victim");
+    let err = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("victim"),
+        false,
+        &guard,
+    )
+    .expect_err("a verified supervisor that ignores SIGTERM must refuse the delete");
+    drop(guard);
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'victim': runtime tree {} still has a background supervisor clauth \
+             cannot stop on this host; retry once it has exited, or pass --force \
+             to remove it anyway",
+            tree.display()
+        ),
+        "the wedged-supervisor refusal pins the exact message"
+    );
+    assert!(
+        tree.exists(),
+        "the tree is spared while its verified supervisor is still alive"
+    );
+}
+
+/// `--force` is the escape the refusal names — a verified supervisor that
+/// ignored SIGTERM is spared without `--force`, but a forced delete removes
+/// the tree anyway.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn delete_profile_with_force_removes_a_verified_supervisor_that_ignores_sigterm() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "victim".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("victim")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, true);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+    let _deadline =
+        crate::runtime::SupervisorStopDeadlineGuard::set(std::time::Duration::from_millis(300));
+    let guard = rotation_guard("victim");
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("victim"),
+        true,
+        &guard,
+    )
+    .expect("a forced delete removes a wedged verified supervisor's tree");
+    drop(guard);
+
+    assert!(
+        !tree.exists(),
+        "--force removed the tree despite the surviving supervisor"
+    );
+}
+
+/// a liveness read that FAILS during the post-SIGTERM wait must not read as
+/// gone — the delete keeps waiting to the (shortened) deadline, then spares
+/// with the liveness-unreadable line and records no wedged row (clauth never
+/// read the supervisor alive). The `/proc`-stat seam fails only the
+/// post-signal reads (the verify's first read succeeds), so the liveness
+/// reader's own `ProcStat::Unreadable => SupervisorLiveness::Unreadable`
+/// mapping runs. Linux-only: the seam forces a `/proc/<pid>/stat` read, which
+/// macOS replaces with a `proc_bsdinfo` read.
+#[cfg(target_os = "linux")]
+#[test]
+fn delete_profile_spares_a_tree_whose_post_signal_liveness_read_fails() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "victim".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("victim")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, true);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+    let _seam = crate::runtime::UnreadableProcStatGuard::after(sup.pid, 1);
+    let _deadline =
+        crate::runtime::SupervisorStopDeadlineGuard::set(std::time::Duration::from_millis(300));
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let guard = rotation_guard("victim");
+    let err = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("victim"),
+        false,
+        &guard,
+    )
+    .expect_err("a failed post-signal liveness read must refuse the delete");
+    drop(guard);
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'victim': runtime tree {} still has a background supervisor clauth \
+             cannot stop on this host; retry once it has exited, or pass --force \
+             to remove it anyway",
+            tree.display()
+        ),
+        "the refusal pins the exact message"
+    );
+    assert!(
+        tree.exists(),
+        "the tree is spared while its supervisor's liveness cannot be confirmed"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor pid {}'s liveness could not be read for 15s after SIGTERM",
+            tree.display(),
+            sup.pid
+        )],
+        "the failed liveness read keeps waiting and then spares, never reads as gone"
+    );
+    assert!(
+        !crate::runtime::pid_has_wedged_stop(sup.pid),
+        "a failed liveness read records no wedged row (clauth never read it alive)"
+    );
+}
+
+/// a post-SIGTERM wait whose FIRST poll read the supervisor alive, then whose
+/// later polls fail, still reads `Alive` at the deadline — the wedged row and
+/// the "still alive" line, never the liveness-unreadable line. The verdict is
+/// the WHOLE wait's reading, not the last poll. Linux-only: the seam forces a
+/// `/proc/<pid>/stat` read, which macOS replaces with a `proc_bsdinfo` read.
+#[cfg(target_os = "linux")]
+#[test]
+fn delete_wedges_when_any_wait_read_saw_the_supervisor_alive() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "victim".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("victim")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, true);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+    // The verify's read and the wait's first poll succeed (Alive), every later
+    // poll fails: any alive read must still read the wedged `Alive` verdict.
+    let _seam = crate::runtime::UnreadableProcStatGuard::after(sup.pid, 2);
+    let _deadline =
+        crate::runtime::SupervisorStopDeadlineGuard::set(std::time::Duration::from_millis(300));
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let guard = rotation_guard("victim");
+    let err = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("victim"),
+        false,
+        &guard,
+    )
+    .expect_err("a supervisor read alive during the wait must refuse the delete");
+    drop(guard);
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'victim': runtime tree {} still has a background supervisor clauth \
+             cannot stop on this host; retry once it has exited, or pass --force \
+             to remove it anyway",
+            tree.display()
+        ),
+        "the refusal pins the exact message"
+    );
+    assert!(
+        tree.exists(),
+        "the tree is spared while its supervisor was read alive"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor pid {} is still alive 15s after SIGTERM",
+            tree.display(),
+            sup.pid
+        )],
+        "any alive read during the wait reads the wedged still-alive verdict"
+    );
+    assert!(
+        crate::runtime::pid_has_wedged_stop(sup.pid),
+        "any alive read during the wait records the wedged row"
+    );
+}
+
+/// a tree whose supervisor cannot be verified (a live pid with
+/// the recorded start time but argv that is not `daemon run`) refuses the
+/// delete with the exact message — the tree, the host and the `--force` escape
+/// — and the profile dir is left in place.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn delete_profile_refuses_an_unverifiable_supervisor_tree() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "victim".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("victim")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let mut foreign = crate::testutil::Owned(
+        std::process::Command::new("sleep")
+            .args(["100000"])
+            .spawn()
+            .expect("spawn foreign pid"),
+    );
+    let start = crate::testutil::proc_start_of(foreign.0.id()).expect("the live start");
+    crate::testutil::write_daemon_lock(&tree, foreign.0.id(), &start);
+
+    let guard = rotation_guard("victim");
+    let err = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("victim"),
+        false,
+        &guard,
+    )
+    .expect_err("an unverifiable supervisor must refuse the delete");
+    drop(guard);
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'victim': runtime tree {} still has a background supervisor clauth \
+             cannot stop on this host; retry once it has exited, or pass --force \
+             to remove it anyway",
+            tree.display()
+        ),
+        "the refusal pins the exact message"
+    );
+    assert!(
+        tree.exists(),
+        "the tree is spared while its supervisor cannot be verified"
+    );
+    assert!(
+        foreign.0.try_wait().is_ok_and(|status| status.is_none()),
+        "the foreign pid must not be signalled"
+    );
+}
+
+/// a `daemon.lock` that is a SYMLINK (an older clauth tree whose
+/// supervisor used the home roster) names no private supervisor — the delete
+/// removes the tree with no stop and no signal, unlink only.
+#[cfg(unix)]
+#[test]
+fn delete_profile_removes_a_tree_with_a_symlinked_daemon_lock() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "victim".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("victim")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let target = home.home().join("lock-target");
+    std::fs::write(&target, b"{}").expect("the symlink target");
+    std::os::unix::fs::symlink(&target, tree.join("daemon.lock")).expect("symlinked daemon.lock");
+
+    let guard = rotation_guard("victim");
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("victim"),
+        false,
+        &guard,
+    )
+    .expect("a symlinked lock removes with no stop");
+    drop(guard);
+
+    assert!(!tree.exists(), "the delete removed the tree");
+    assert!(
+        target.is_file(),
+        "the symlink target survived the collection"
+    );
+}
+
+/// `--force` removes a tree whose supervisor cannot be verified —
+/// without any stop and without a signal (the escape the refusal names).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn delete_profile_with_force_removes_an_unverifiable_supervisor_tree() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "victim".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("victim")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let mut foreign = crate::testutil::Owned(
+        std::process::Command::new("sleep")
+            .args(["100000"])
+            .spawn()
+            .expect("spawn foreign pid"),
+    );
+    let start = crate::testutil::proc_start_of(foreign.0.id()).expect("the live start");
+    crate::testutil::write_daemon_lock(&tree, foreign.0.id(), &start);
+
+    let guard = rotation_guard("victim");
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("victim"),
+        true,
+        &guard,
+    )
+    .expect("forced delete");
+    drop(guard);
+
+    assert!(!tree.exists(), "the forced delete removed the tree");
+    assert!(
+        foreign.0.try_wait().is_ok_and(|status| status.is_none()),
+        "--force must remove the tree without a signal"
+    );
+}
+
+/// the rename twin of the unverifiable-supervisor refusal, and
+/// its exact message — rename has no `--force`, so its tail stops at the retry.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rename_profile_refuses_an_unverifiable_supervisor_tree() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "old".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("old")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let mut foreign = crate::testutil::Owned(
+        std::process::Command::new("sleep")
+            .args(["100000"])
+            .spawn()
+            .expect("spawn foreign pid"),
+    );
+    let start = crate::testutil::proc_start_of(foreign.0.id()).expect("the live start");
+    crate::testutil::write_daemon_lock(&tree, foreign.0.id(), &start);
+
+    let guard = rotation_guard("old");
+    let err = rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("old"),
+        &crate::profile::ProfileName::from("new"),
+        &guard,
+    )
+    .expect_err("an unverifiable supervisor must refuse the rename");
+    drop(guard);
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'old': runtime tree {} still has a background supervisor clauth \
+             cannot stop on this host; retry once it has exited",
+            tree.display()
+        ),
+        "the rename refusal pins the exact message"
+    );
+    assert!(
+        tree.exists(),
+        "the tree is spared while its supervisor cannot be verified"
+    );
+    assert!(
+        foreign.0.try_wait().is_ok_and(|status| status.is_none()),
+        "the foreign pid must not be signalled"
+    );
+}
+
+/// the stop decision runs BEFORE the unwire — a refused delete of
+/// the ACTIVE api profile leaves settings.json, the credentials link and the
+/// active marker exactly as they were (the refusal posed by a live foreign
+/// pid rather than the now-collecting symlink).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_refused_delete_of_the_active_profile_leaves_it_wired() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "api-acct".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-secret".to_string()),
+        Default::default(),
+    )
+    .expect("create api profile");
+    config.state.active_profile = Some("api-acct".into());
+    let profile = config
+        .find(&crate::profile::ProfileName::from("api-acct"))
+        .expect("profile present")
+        .clone();
+    crate::claude::apply_profile_to_claude_settings(&profile, &[]).expect("seed settings.json");
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("api-acct")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let mut foreign = crate::testutil::Owned(
+        std::process::Command::new("sleep")
+            .args(["100000"])
+            .spawn()
+            .expect("spawn foreign pid"),
+    );
+    let start = crate::testutil::proc_start_of(foreign.0.id()).expect("the live start");
+    crate::testutil::write_daemon_lock(&tree, foreign.0.id(), &start);
+
+    let guard = rotation_guard("api-acct");
+    let res = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("api-acct"),
+        false,
+        &guard,
+    );
+    drop(guard);
+    let after = crate::claude::read_claude_endpoint_config().expect("read endpoint");
+    let still_listed = config
+        .find(&crate::profile::ProfileName::from("api-acct"))
+        .is_some();
+
+    assert!(
+        res.is_err(),
+        "the unverifiable supervisor refused the delete"
+    );
+    assert_eq!(
+        after.api_key.as_deref(),
+        Some("sk-secret"),
+        "the refused delete kept the api key wired"
+    );
+    assert_eq!(
+        after.base_url.as_deref(),
+        Some("https://api.example.com"),
+        "the refused delete kept the endpoint wired"
+    );
+    assert!(still_listed, "the profile is still listed");
+    assert_eq!(
+        config.state.active_profile,
+        Some(crate::profile::ProfileName::from("api-acct")),
+        "the active marker is unchanged"
+    );
+    assert!(
+        foreign.0.try_wait().is_ok_and(|status| status.is_none()),
+        "the foreign pid must not be signalled"
+    );
+}
+
+/// renaming a profile first SIGTERMs every runtime tree's own
+/// supervisor before the dir moves, the delete twin's stop.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rename_profile_stops_a_tree_supervisor_first() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "old".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("old")
+        .join("runtime-4242-0");
+    std::fs::create_dir_all(&tree).expect("mkdir tree");
+    let mut sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+    let guard = rotation_guard("old");
+    rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("old"),
+        &crate::profile::ProfileName::from("new"),
+        &guard,
+    )
+    .expect("rename");
+    drop(guard);
+
+    let status = crate::testutil::reap_bounded(&mut sup.child);
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGTERM),
+        "the rename SIGTERMed the tree's supervisor"
+    );
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join("old")
+            .exists(),
+        "the rename moved the profile dir"
+    );
+}

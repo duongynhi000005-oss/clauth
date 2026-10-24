@@ -2262,3 +2262,722 @@ fn an_overlay_settings_agent_key_is_the_sessions_agent() {
     assert_eq!(demand.agent_without_model.as_deref(), Some("rev"));
     assert!(demand.models.is_empty());
 }
+
+/// The runtime tree a `--bg` launch handed to Claude Code's background
+/// service, as the fake-`claude` shim recorded it.
+#[cfg(unix)]
+fn background_tree(shim: &crate::testutil::FakeClaude) -> std::path::PathBuf {
+    shim.spawns()
+        .iter()
+        .find(|(_, argv)| argv.split(' ').any(|word| word == "--bg"))
+        .map(|(dir, _)| std::path::PathBuf::from(dir))
+        .expect("one background launch")
+}
+
+/// collecting a background tree first
+/// SIGTERMs the tree's OWN supervisor, verified by the pid its `daemon.lock`
+/// records — its recorded start time, `daemon run` argv, and `CLAUDE_CONFIG_DIR`
+/// = the tree — never through the `claude daemon stop` CLI, which would also
+/// stop an installed home service. A tree with no supervisor files collects
+/// with nothing signalled.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn collecting_a_background_tree_stops_its_supervisor_first() {
+    for posed in [true, false] {
+        let sb = crate::testutil::HomeSandbox::new();
+        let claude = sb.home().join(".claude");
+        fs::create_dir_all(&claude).expect("~/.claude");
+        let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+        let shim = crate::testutil::FakeClaude::new(&sb);
+        let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+        fs::create_dir_all(&clauth_dir).expect("clauth dir");
+        fs::write(
+            clauth_dir.join("profiles.toml"),
+            "profiles = [\"wired\", \"spare\"]\n",
+        )
+        .expect("profiles.toml");
+
+        run(
+            &chain_ready_config("wired"),
+            &crate::profile::ProfileName::from("wired"),
+            &["--bg".to_string()],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect("background start");
+        let tree = background_tree(&shim);
+        assert!(tree.is_dir(), "posed: {posed}: the job keeps the tree");
+
+        let supervisor = posed.then(|| crate::testutil::FakeSupervisor::spawn(&tree, false));
+        if let Some(sup) = &supervisor {
+            crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        }
+
+        // `claude rm`: the job dir goes, the supervisor (posed above) stays.
+        for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+            fs::remove_dir_all(job.path()).expect("claude rm");
+        }
+
+        crate::runtime::gc_stale_runtimes();
+
+        // The stop never goes through the `claude` CLI (which the shim would
+        // log); the posed supervisor is SIGTERMed and reaped.
+        let stops: Vec<String> = shim
+            .spawns()
+            .into_iter()
+            .map(|(_, argv)| argv)
+            .filter(|argv| argv.contains("daemon stop"))
+            .collect();
+        assert!(
+            stops.is_empty(),
+            "posed: {posed}: no `claude daemon stop` CLI spawn: {stops:?}"
+        );
+        if let Some(mut sup) = supervisor {
+            let status = crate::testutil::reap_bounded(&mut sup.child);
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(libc::SIGTERM),
+                "posed: {posed}: the supervisor was SIGTERMed exactly"
+            );
+        }
+        assert!(!tree.exists(), "posed: {posed}: the tree was collected");
+    }
+}
+
+/// a `daemon.lock` that is a SYMLINK was linked by an older build to
+/// the shared home's lock, whose supervisor used the home roster — it names no
+/// private supervisor, so the tree collects with no stop and no spare line,
+/// and `remove_dir_all` unlinks the link, leaving the target intact.
+#[cfg(unix)]
+#[test]
+fn collecting_a_tree_with_a_symlinked_daemon_lock_collects_without_a_signal() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    let target = sb.home().join("lock-target");
+    fs::write(&target, b"{}").expect("the symlink target");
+    std::os::unix::fs::symlink(&target, tree.join("daemon.lock")).expect("symlinked daemon.lock");
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::runtime::gc_stale_runtimes();
+
+    let stops: Vec<String> = shim
+        .spawns()
+        .into_iter()
+        .map(|(_, argv)| argv)
+        .filter(|argv| argv.contains("daemon stop"))
+        .collect();
+    assert!(
+        stops.is_empty(),
+        "a symlinked daemon.lock must never stop the shared home roster: {stops:?}"
+    );
+    assert!(!tree.exists(), "the tree was still collected");
+    assert!(
+        target.is_file(),
+        "the symlink target survived the collection"
+    );
+    assert!(
+        lines.snapshot().is_empty(),
+        "a symlinked lock collects with no spare line: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// a `daemon.lock` whose pid was recycled (a live process with a
+/// different field-22 start) means the recorded supervisor is GONE and the pid
+/// is reused — the tree collects and the reused pid is never signalled. The
+/// start-time compare is the guard: removing it would let a reused pid fall
+/// through to the argv/env checks (a `sleep` fails both) and spare the tree.
+/// Linux-only: the reused start is a field-22 `/proc/<pid>/stat` spelling,
+/// which macOS's asctime `procStart` form does not share.
+#[cfg(target_os = "linux")]
+#[test]
+fn collecting_a_tree_whose_lock_names_a_reused_pid_collects_without_a_signal() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    // A live process holding the pid, with the lock recording the WRONG start.
+    let mut reused = crate::testutil::Owned(
+        Command::new("sleep")
+            .args(["100000"])
+            .spawn()
+            .expect("spawn the reused pid"),
+    );
+    crate::testutil::write_daemon_lock(&tree, reused.0.id(), "0");
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        !tree.exists(),
+        "a reused pid means the supervisor is gone; the tree collects"
+    );
+    // The reused `sleep` is untouched: the Gone path never signals.
+    assert!(
+        reused.0.try_wait().is_ok_and(|status| status.is_none()),
+        "the reused pid must not be signalled"
+    );
+}
+
+/// a `daemon.lock` naming a pid that no longer exists is a
+/// crashed supervisor whose tree must COLLECT — `kill(0)` false is the only
+/// positively-dead reading, and dropping that check would fall through to an
+/// unreadable live-process read and spare the tree forever.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn collecting_a_tree_whose_lock_names_a_dead_pid_collects() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    // A real child that has exited and been reaped: the pid is positively gone.
+    let mut dead = Command::new("true").spawn().expect("spawn true");
+    let dead_pid = dead.id();
+    let start = crate::testutil::proc_start_of(dead_pid).expect("the dead pid's live start");
+    let _ = dead.wait();
+    crate::testutil::write_daemon_lock(&tree, dead_pid, &start);
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        !tree.exists(),
+        "a lock naming a dead pid means the supervisor is gone; the tree collects"
+    );
+}
+
+/// a live pid whose `/proc/<pid>/stat` cannot be read (hidepid,
+/// `EACCES`) spares the tree — never signalled, never collected. Posed through
+/// the `UnreadableProcStatGuard` seam, since a parent's own live child's stat
+/// is always readable here. Linux-only: the seam forces a `/proc/<pid>/stat`
+/// read, which macOS replaces with a `proc_bsdinfo` read.
+#[cfg(target_os = "linux")]
+#[test]
+fn collecting_a_tree_whose_supervisor_stat_is_unreadable_spares_it() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    let mut sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let _seam = crate::runtime::UnreadableProcStatGuard::set(sup.pid);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        tree.exists(),
+        "an unreadable stat must spare the tree, never collect it"
+    );
+    assert!(
+        sup.child.try_wait().is_ok_and(|status| status.is_none()),
+        "an unreadable stat must never signal the pid"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor could not be verified as this tree's own",
+            tree.display()
+        )],
+        "the unreadable-stat spare logged exactly one line"
+    );
+}
+
+/// a supervisor whose `CLAUDE_CONFIG_DIR` resolves elsewhere is
+/// another tree's — never signalled, the tree is spared.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn collecting_a_tree_whose_supervisor_config_dir_differs_spares_it() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    let other = sb.home().join("other-tree");
+    fs::create_dir_all(&other).expect("the other tree");
+    let sup = crate::testutil::FakeSupervisor::spawn(&other, false);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        tree.exists(),
+        "a supervisor keyed on another config dir must not be signalled; the tree is spared"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor could not be verified as this tree's own",
+            tree.display()
+        )],
+        "the unverifiable supervisor logged exactly one line"
+    );
+}
+
+/// a verified supervisor that ignores SIGTERM spares the tree at the
+/// deadline, with exactly one log line.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn collecting_a_tree_whose_supervisor_ignores_sigterm_spares_it() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, true);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let _deadline =
+        crate::runtime::SupervisorStopDeadlineGuard::set(std::time::Duration::from_millis(300));
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        tree.exists(),
+        "a supervisor that ignores SIGTERM spares the tree at the deadline"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor pid {} is still alive 15s after SIGTERM",
+            tree.display(),
+            sup.pid
+        )],
+        "the still-alive supervisor logged exactly one line"
+    );
+}
+
+/// a `daemon` SYMLINK was linked by an older build to
+/// the shared `~/.claude/daemon`; it reads as no private supervisor, so the
+/// tree collects with no signal and `remove_dir_all` unlinks the link, leaving
+/// the shared target intact.
+#[cfg(unix)]
+#[test]
+fn collecting_a_tree_with_a_symlinked_daemon_dir_collects_with_no_signal() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    let target = sb.home().join("shared-daemon");
+    fs::create_dir_all(&target).expect("the symlink target");
+    std::os::unix::fs::symlink(&target, tree.join("daemon")).expect("symlinked daemon");
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    crate::runtime::gc_stale_runtimes();
+
+    let stops: Vec<String> = shim
+        .spawns()
+        .into_iter()
+        .map(|(_, argv)| argv)
+        .filter(|argv| argv.contains("daemon stop"))
+        .collect();
+    assert!(
+        stops.is_empty(),
+        "a symlinked daemon must never stop the shared roster: {stops:?}"
+    );
+    assert!(!tree.exists(), "the tree was still collected");
+    assert!(
+        target.is_dir(),
+        "the symlink target survived the collection"
+    );
+}
+
+/// teardown (`Drop`) SIGTERMs a posed
+/// supervisor before it collects the tree — the stop-before-remove order, not
+/// a removal the stop should precede.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn teardown_stops_a_posed_supervisor_before_collecting_the_tree() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let _shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    let config = chain_ready_config("wired");
+    let profile = admit(
+        &config,
+        &crate::profile::ProfileName::from("wired"),
+        Isolation::Shared,
+        false,
+        &[],
+    )
+    .expect("admit");
+    let rt = crate::runtime::ProfileRuntime::acquire(
+        profile,
+        Isolation::Shared,
+        &[],
+        false,
+        crate::live_sessions::Launcher::Own,
+    )
+    .expect("acquire");
+    let tree = rt.config_dir().to_path_buf();
+    let mut sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+    drop(rt);
+
+    let status = crate::testutil::reap_bounded(&mut sup.child);
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGTERM),
+        "the teardown SIGTERMed the tree's supervisor"
+    );
+    assert!(!tree.exists(), "the teardown collected the tree");
+}
+
+/// a supervisor that ignores SIGTERM spares the tree at
+/// the deadline — the Drop twin of the failed-stop spare.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn teardown_spares_a_tree_whose_supervisor_ignores_sigterm() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let _shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    let config = chain_ready_config("wired");
+    let profile = admit(
+        &config,
+        &crate::profile::ProfileName::from("wired"),
+        Isolation::Shared,
+        false,
+        &[],
+    )
+    .expect("admit");
+    let rt = crate::runtime::ProfileRuntime::acquire(
+        profile,
+        Isolation::Shared,
+        &[],
+        false,
+        crate::live_sessions::Launcher::Own,
+    )
+    .expect("acquire");
+    let tree = rt.config_dir().to_path_buf();
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, true);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+    let _deadline =
+        crate::runtime::SupervisorStopDeadlineGuard::set(std::time::Duration::from_millis(300));
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    drop(rt);
+
+    assert!(
+        tree.exists(),
+        "a supervisor that ignores SIGTERM spares the tree at the deadline"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor pid {} is still alive 15s after SIGTERM",
+            tree.display(),
+            sup.pid
+        )],
+        "the still-alive supervisor logged exactly one line"
+    );
+}
+
+/// a live pid with the recorded start time and the
+/// tree's config dir, but argv that does NOT hold `daemon run`, is another
+/// process holding the pid — never signalled, the tree is spared. The argv
+/// guard is the only remaining gate once start and config dir agree, so
+/// removing it would SIGTERM the live pid and collect the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn collecting_a_tree_whose_supervisor_lacks_daemon_run_argv_spares_it() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    // A live process with the right config dir and the recorded (real) start,
+    // but argv that is NOT `daemon run`.
+    let mut foreign = crate::testutil::spawn_parked(&tree, &["not", "a", "supervisor"]);
+    let start = crate::testutil::proc_start_of(foreign.0.id()).expect("the foreign start");
+    crate::testutil::write_daemon_lock(&tree, foreign.0.id(), &start);
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        tree.exists(),
+        "a pid without `daemon run` argv must not be signalled; the tree is spared"
+    );
+    assert!(
+        foreign.0.try_wait().is_ok_and(|status| status.is_none()),
+        "the foreign pid must not be signalled"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor could not be verified as this tree's own",
+            tree.display()
+        )],
+        "the unverifiable supervisor logged exactly one line"
+    );
+}
+
+/// a tree spared every pass logs its spare line ONCE per process
+/// — two GC passes over the same unverifiable tree produce one line, not one
+/// per pass.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_spared_tree_announces_once_across_passes() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    // A live pid with the recorded start time but argv that is not `daemon run`
+    // — unverifiable, spared on every pass. (A symlink no longer spares: it
+    // reads as absent and the tree collects.)
+    let foreign = crate::testutil::Owned(
+        Command::new("sleep")
+            .args(["100000"])
+            .env("CLAUDE_CONFIG_DIR", &tree)
+            .spawn()
+            .expect("spawn foreign pid"),
+    );
+    let start = crate::testutil::proc_start_of(foreign.0.id()).expect("the live start");
+    crate::testutil::write_daemon_lock(&tree, foreign.0.id(), &start);
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::runtime::gc_stale_runtimes();
+    crate::runtime::gc_stale_runtimes();
+
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor could not be verified as this tree's own",
+            tree.display()
+        )],
+        "two passes over one spared tree logged exactly one line"
+    );
+}

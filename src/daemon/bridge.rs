@@ -2713,24 +2713,7 @@ fn is_clauth_launch(pid: u32) -> bool {
 
 #[cfg(target_os = "macos")]
 fn parent_pid(pid: u32) -> Option<u32> {
-    #[allow(unsafe_code)]
-    // SAFETY: `proc_bsdinfo` is all integers and fixed-size `c_char` arrays, so
-    // the zeroed representation is a valid value and no field is read before
-    // `proc_pidinfo` fills the struct.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    #[allow(unsafe_code)]
-    // SAFETY: `proc_pidinfo` copies the BSD process info for `pid` into `info`,
-    // which we own; the size passed is that struct's.
-    let rc = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut libc::proc_bsdinfo as *mut libc::c_void,
-            std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
-        )
-    };
-    (rc >= std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int).then_some(info.pbi_ppid as u32)
+    crate::runtime::proc_bsdinfo(pid).map(|info| info.pbi_ppid)
 }
 
 #[cfg(target_os = "macos")]
