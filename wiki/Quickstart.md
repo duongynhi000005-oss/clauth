@@ -55,7 +55,7 @@ clauth which --json   # plus plan tier, endpoint and live token speed/rate
 clauth list           # account table with cached usage, no network
 ```
 
-`clauth which --json` carries `tps`: `speed` (float or `null`) and `rate` (float) are the profile's live 10 s figures off the token-speed cache, `session` is the same pair for the current Claude Code session when `CLAUDE_CODE_SESSION_ID` names one the cache holds (else `null`), and `age_secs` is the cache's age; `tps` itself is `null` with no cache or one older than 30 s ([Tokens and cost](Tokens-And-Cost#token-speed)).
+`clauth which --json` carries `tps`: `speed` (float or `null`) and `rate` (float) are the profile's live 10 s figures off the token-speed cache, `session` is the same pair for the current Claude Code session when `CLAUDE_CODE_SESSION_ID` names one the cache holds (else `null`), `peaks.today` is the profile's own today peaks off the cache — `speed` `{value, at, account, model}` (the fastest reply) and `rate` `{value, at}` (the busiest 10 s), each omitted when absent — and `age_secs` is the cache's age; `tps` itself is `null` with no cache or one older than 30 s ([Tokens and cost](Tokens-And-Cost#token-speed)).
 
 ## Commands
 
