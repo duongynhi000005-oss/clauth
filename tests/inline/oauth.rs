@@ -8490,3 +8490,29 @@ fn a_misfilled_sidecar_is_described_as_serving_nothing() {
         "nothing: its sidecar is mis-filled and the split is disengaged"
     );
 }
+
+/// The shared token agent bounds the whole call at the two deadlines a waiter
+/// outlasting a refresh adds up (4 s connect + 15 s headers), so a stalled
+/// response body ends at 19 s instead of holding the rotation flock forever.
+#[test]
+fn the_token_agent_bounds_the_whole_call_at_its_deadlines() {
+    let _home = HomeSandbox::new();
+    let timeouts = http_agent().config().timeouts();
+    assert_eq!(timeouts.connect, Some(Duration::from_secs(4)));
+    assert_eq!(timeouts.recv_response, Some(Duration::from_secs(15)));
+    assert_eq!(timeouts.global, Some(Duration::from_secs(19)));
+    assert_eq!(timeouts.global, Some(TOKEN_HTTP_DEADLINES));
+}
+
+#[test]
+fn a_token_agent_fails_a_stalled_body_at_its_whole_call_bound() {
+    let _home = HomeSandbox::new();
+    let bound = Duration::from_millis(200);
+    crate::testutil::assert_stalled_body_fails_at(token_agent(bound), bound);
+}
+
+#[test]
+fn a_token_agent_reads_a_body_served_within_its_bound() {
+    let _home = HomeSandbox::new();
+    crate::testutil::assert_prompt_body_reads(token_agent(Duration::from_millis(200)));
+}

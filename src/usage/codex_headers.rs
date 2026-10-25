@@ -26,23 +26,22 @@ const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 /// change under a running clauth), so it is resolved once.
 static CODEX_USER_AGENT: LazyLock<String> = LazyLock::new(codex_user_agent_now);
 
-/// The agent every WHAM call rides. Same shape as the shared usage agent; the
-/// one delta is `accept("")` — ureq adds `accept: */*` to any request that
+/// The agent every WHAM call rides, at the shared usage agent's whole-call
+/// deadline unless the request sets its own (the reset list and spend do).
+static CODEX_AGENT: LazyLock<ureq::Agent> =
+    LazyLock::new(|| wham_agent(super::fetch::USAGE_HTTP_DEADLINES));
+
+/// The codex WHAM agent with `whole` as its end-to-end bound: the shared usage
+/// config, plus `accept("")` — ureq adds `accept: */*` to any request that
 /// carries no accept of its own, and codex's own client (reqwest with no
 /// content negotiation) sends no `accept` at all. `accept-encoding` keeps
 /// ureq's gzip, which these surfaces have always requested.
-static CODEX_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
-    ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(4)))
-        .timeout_recv_response(Some(Duration::from_secs(8)))
-        .http_status_as_error(false)
-        .accept("")
-        .build()
-        .into()
-});
+pub(crate) fn wham_agent(whole: Duration) -> ureq::Agent {
+    super::fetch::usage_config(whole).accept("").build().into()
+}
 
-/// The codex WHAM agent. Status codes arrive on the `Ok` response — see the
-/// builder comment.
+/// The codex WHAM agent. Status codes arrive on the `Ok` response — see
+/// [`super::fetch::usage_config`].
 pub(crate) fn codex_agent() -> &'static ureq::Agent {
     &CODEX_AGENT
 }

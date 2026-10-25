@@ -1103,18 +1103,44 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
-static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+/// Connect deadline for every call [`AGENT`] makes.
+const USAGE_HTTP_CONNECT_SECS: u64 = 4;
+/// Response-HEADER deadline for the same — the header phase's bound, armed from
+/// the phase's start and stopping once the headers arrive.
+const USAGE_HTTP_RECV_HEADERS_SECS: u64 = 8;
+
+/// The two deadlines a usage-style call carries, added — and the whole call's
+/// bound: [`usage_config`] arms `timeout_global` with this sum, whose upstream
+/// wording is "end-to-end, from DNS lookup to finishing reading the response
+/// body", so the body is held to it too and the sum is a ceiling on such a call
+/// unless the request sets a bound of its own (push does).
+pub(crate) const USAGE_HTTP_DEADLINES: Duration =
+    Duration::from_secs(USAGE_HTTP_CONNECT_SECS + USAGE_HTTP_RECV_HEADERS_SECS);
+
+/// The config a usage-style agent starts from, with `whole` as its end-to-end
+/// bound: the shared shape behind [`usage_agent`], and behind the codex WHAM
+/// agent, whose only delta is `.accept("")`.
+pub(super) fn usage_config(
+    whole: Duration,
+) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
     ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(4)))
-        .timeout_recv_response(Some(Duration::from_secs(8)))
+        .timeout_connect(Some(Duration::from_secs(USAGE_HTTP_CONNECT_SECS)))
+        .timeout_recv_response(Some(Duration::from_secs(USAGE_HTTP_RECV_HEADERS_SECS)))
+        .timeout_global(Some(whole))
         // ureq 3 defaults non-2xx to `Err(Error::StatusCode)`; our callers read
         // the status off the `Ok` response (401 → rotate, 429 → retry-after).
         // Without this flag those branches are unreachable and every HTTP error
         // collapses into `Network`.
         .http_status_as_error(false)
-        .build()
-        .into()
-});
+}
+
+/// A usage-style agent with `whole` as its end-to-end bound — built once for
+/// [`AGENT`], and again at a short bound where a test needs one.
+pub(crate) fn usage_agent(whole: Duration) -> ureq::Agent {
+    usage_config(whole).build().into()
+}
+
+static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| usage_agent(USAGE_HTTP_DEADLINES));
 
 /// Shared HTTP agent for usage-style GETs (also used by `crate::providers`).
 /// Status codes arrive on the `Ok` response — see the builder comment.

@@ -107,6 +107,94 @@ pub(crate) fn read_request_head(sock: &mut std::net::TcpStream) -> Vec<u8> {
     head
 }
 
+/// A loopback stub answering one request with a 200 whose `Content-Length`
+/// promises far more than it sends: with `complete` off it writes the head and
+/// then holds the socket open and silent, a stalled body; with it on it sends
+/// [`BODY_STUB_BODY`] whole. The socket is held until the stub drops (or 60 s
+/// pass), so a stalled read never ends on a FIN.
+pub(crate) struct BodyStub {
+    pub(crate) url: String,
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+/// The body a completing [`BodyStub`] serves.
+pub(crate) const BODY_STUB_BODY: &str = r#"{"ok":true}"#;
+
+pub(crate) fn serve_body_stub(complete: bool) -> BodyStub {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let url = format!("http://{}/", listener.local_addr().expect("local addr"));
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        read_request_head(&mut sock);
+        let reply = if complete {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY_STUB_BODY}",
+                BODY_STUB_BODY.len()
+            )
+        } else {
+            "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n".to_owned()
+        };
+        let _ = std::io::Write::write_all(&mut sock, reply.as_bytes());
+        let _ = held.recv_timeout(std::time::Duration::from_secs(60));
+    });
+    BodyStub {
+        url,
+        _release: release,
+    }
+}
+
+/// Drive one GET through `agent` against a stalled body and pin that ureq's ONE
+/// end-to-end budget ends it: `Timeout::Global`, never a phase bound, after at
+/// least three quarters of `bound` and under 1 s. The read runs on its own
+/// thread under a 2 s wait, so an unbounded body reads as a red, never a hung
+/// suite. `bound` stays under 500 ms so the window holds.
+pub(crate) fn assert_stalled_body_fails_at(agent: ureq::Agent, bound: std::time::Duration) {
+    let stub = serve_body_stub(false);
+    let url = stub.url.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = std::time::Instant::now();
+    std::thread::spawn(move || {
+        let result = agent
+            .get(&url)
+            .call()
+            .and_then(|mut response| response.body_mut().read_to_string());
+        let _ = tx.send(result);
+    });
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("a stalled body must end the call within its whole-call bound");
+    let elapsed = started.elapsed();
+    let err = result.expect_err("a stalled body is an error");
+    assert!(
+        matches!(err, ureq::Error::Timeout(ureq::Timeout::Global)),
+        "a stalled body must trip the one end-to-end budget: {err:?}"
+    );
+    assert!(
+        elapsed >= bound * 3 / 4,
+        "the call waits out its bound, never a shorter one: {elapsed:?} for {bound:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the call ends at its bound, not a longer one: {elapsed:?} for {bound:?}"
+    );
+    drop(stub);
+}
+
+/// Drive one GET through `agent` against a body served whole and pin that it
+/// reads in full under the same whole-call bound.
+pub(crate) fn assert_prompt_body_reads(agent: ureq::Agent) {
+    let stub = serve_body_stub(true);
+    let body = agent
+        .get(&stub.url)
+        .call()
+        .and_then(|mut response| response.body_mut().read_to_string())
+        .expect("a body served at once reads within the bound");
+    assert_eq!(body, BODY_STUB_BODY);
+}
+
 /// RAII home sandbox: acquires `HOME_TEST_LOCK` and redirects `home_dir()` into
 /// a tempdir for its lifetime, clearing the override on drop (even on panic).
 /// Required for any test that writes into the per-profile tree or creates

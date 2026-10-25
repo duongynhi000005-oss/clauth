@@ -319,15 +319,16 @@ fn token_parse_error(e: &serde_json::Error, status: u16, body_len: usize) -> Tok
 /// Connect deadline for every token/kick call [`AGENT`] makes.
 const HTTP_CONNECT_SECS: u64 = 4;
 /// Response-HEADER deadline for the same — the header phase's bound, armed from
-/// the phase's start and stopping once the headers arrive — see
-/// [`TOKEN_HTTP_DEADLINES`] below for what that leaves unbounded.
+/// the phase's start and stopping once the headers arrive.
 const HTTP_RECV_HEADERS_SECS: u64 = 15;
 
-/// The two deadlines a token call carries, added. The sum names the time a
-/// waiter that must OUTLAST a refresh spends, not a ceiling on the call: the
-/// connect and header-receipt phases are bounded, the response BODY and the
-/// whole call are not — reading the constant as an end-to-end ceiling is the
-/// mistake this doc exists to prevent.
+/// The two deadlines a token call carries, added — and the whole call's bound.
+/// [`token_agent`] arms `timeout_global` with this sum, whose upstream wording
+/// is "end-to-end, from DNS lookup to finishing reading the response body", so
+/// the body is held to it too and the sum is a ceiling on a token call.
+/// Measured on 3.4.2 against a 300 ms bound on loopback: a body that never
+/// arrives and bodies trickling one byte every 100, 250, 290 or 600 ms all ended
+/// at 301-304 ms with `Timeout(Global)`, so a slow drip cannot outlast it.
 ///
 /// `timeout_connect` is a true phase bound — upstream's wording is "Max duration
 /// for establishing the connection. For a TLS connection this includes opening
@@ -341,29 +342,29 @@ const HTTP_RECV_HEADERS_SECS: u64 = 15;
 /// armed from the header phase's START, not re-armed per byte (the earlier
 /// 3.4.0 note here claimed a per-byte re-arm; 3.4.2 does not). The same stub
 /// sending complete headers then stalling the body stayed blocked past 3 s,
-/// which is what proves the deadline stops applying at the headers.
+/// which is what proves the deadline stops applying at the headers: without the
+/// end-to-end budget beside it, a stalled body would hang the call.
 ///
-/// The two bounds the call still lacks are `timeout_recv_body` ("Max total
-/// duration for receiving the response body ... not restarted for each read")
-/// and `timeout_global` ("end-to-end, from DNS lookup to finishing reading the
-/// response body"), both left at their `None` default here, as are
-/// `timeout_resolve`, `timeout_send_request` and `timeout_send_body`. So the
-/// response body is unbounded — a token call whose body stalls hangs.
+/// `timeout_recv_body`, `timeout_resolve`, `timeout_send_request` and
+/// `timeout_send_body` stay at their `None` default; the one end-to-end budget
+/// bounds the call across every phase.
 ///
-/// Named rather than left as two literals inside [`AGENT`] because a caller that
-/// must OUTLAST a refresh derives its own deadline from it —
+/// Named rather than left as two literals because a caller that must OUTLAST a
+/// refresh derives its own deadline from it —
 /// [`crate::runtime::ROTATION_LOCK_TIMEOUT`], which waits out a rotation holding
 /// the per-profile flock across this window. Building the agent from the same two
 /// terms is what keeps the two from drifting: retuning either moves the waiter
-/// with it. The unbounded phases are named there too, as legs that constant
-/// cannot cover.
+/// with it.
 pub(crate) const TOKEN_HTTP_DEADLINES: Duration =
     Duration::from_secs(HTTP_CONNECT_SECS + HTTP_RECV_HEADERS_SECS);
 
-static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+/// The token/kick agent with `whole` as its end-to-end bound — built once for
+/// [`AGENT`], and again at a short bound where a test needs one.
+pub(crate) fn token_agent(whole: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(HTTP_CONNECT_SECS)))
         .timeout_recv_response(Some(Duration::from_secs(HTTP_RECV_HEADERS_SECS)))
+        .timeout_global(Some(whole))
         // ureq 3 defaults non-2xx to `Err(Error::StatusCode)`, which `kick`'s
         // error mapping collapsed into `KickError::Other` — making the
         // 401 → rotate-and-retry leg unreachable. With the flag off, `kick`
@@ -372,9 +373,11 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .http_status_as_error(false)
         .build()
         .into()
-});
+}
 
-/// The shared HTTP agent — one connect/recv budget and one
+static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| token_agent(TOKEN_HTTP_DEADLINES));
+
+/// The shared HTTP agent — one connect/header/whole-call budget and one
 /// status-as-value policy for every clauth-side token call, the codex
 /// refresh included.
 pub(crate) fn http_agent() -> &'static ureq::Agent {

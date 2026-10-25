@@ -2816,3 +2816,29 @@ fn login_profile_from_raw_carries_the_probe_plan() {
         "and the email paired with the account it was read for"
     );
 }
+
+/// The shared usage agent (`/usage`, `/profile`, the typed providers) bounds
+/// the whole call at its two phase deadlines (4 s connect + 8 s headers), so a
+/// stalled body ends at 12 s instead of hanging the fetch leg.
+#[test]
+fn the_usage_agent_bounds_the_whole_call_at_its_deadlines() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let timeouts = http_agent().config().timeouts();
+    assert_eq!(timeouts.connect, Some(Duration::from_secs(4)));
+    assert_eq!(timeouts.recv_response, Some(Duration::from_secs(8)));
+    assert_eq!(timeouts.global, Some(Duration::from_secs(12)));
+    assert_eq!(timeouts.global, Some(USAGE_HTTP_DEADLINES));
+}
+
+#[test]
+fn a_usage_agent_fails_a_stalled_body_at_its_whole_call_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let bound = Duration::from_millis(200);
+    crate::testutil::assert_stalled_body_fails_at(usage_agent(bound), bound);
+}
+
+#[test]
+fn a_usage_agent_reads_a_body_served_within_its_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::assert_prompt_body_reads(usage_agent(Duration::from_millis(200)));
+}

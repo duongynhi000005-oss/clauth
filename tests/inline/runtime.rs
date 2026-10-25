@@ -5535,9 +5535,9 @@ fn a_timed_out_rotation_wait_leaves_no_rank_behind() {
 /// token call carries, plus 20 s for a macOS Keychain mirror's two `security`
 /// invocations, plus 20 s for the session-start Keychain seed's shared budget,
 /// plus 10 s for the `.claude.json` seed's healthy sync-lock wait.
-/// The token term bounds no phase of its call — the constant's own
-/// doc carries the measurement — while the keychain terms do bound their legs;
-/// all are what a HEALTHY holder fits inside, which is the floor's whole claim. Moving any term must red this and force the claim to be re-made
+/// The token term bounds its whole call, body included, and the keychain terms
+/// bound their legs; all are what a HEALTHY holder fits inside, which is the
+/// floor's whole claim. Moving any term must red this and force the claim to be re-made
 /// against what that term now bounds.
 #[test]
 fn the_rotation_deadline_outlasts_a_healthy_holders_two_slow_legs() {

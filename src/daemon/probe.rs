@@ -49,8 +49,8 @@ use crate::profile::clauth_dir;
 ///
 /// Neither bound covers a switch tick whose install gate also makes a token
 /// call: `oauth::TOKEN_HTTP_DEADLINES` (19 s) runs outside the tick's window,
-/// so such a tick can take 20 + 19 = 39 s, past both this window and the 30 s
-/// watchdog, and reads amber while it runs.
+/// so such a tick is capped at 20 + 19 = 39 s, still past both this window and
+/// the 30 s watchdog, and reads amber while it runs.
 const DAEMON_STALE_MS: u64 = super::WATCHDOG_DEADLINE.as_millis() as u64 + 5_000;
 
 const _: () = assert!(

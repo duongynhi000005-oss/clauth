@@ -2914,24 +2914,22 @@ pub(crate) struct RotationGuard {
 /// before failing with a [`RotationLockTimeout`].
 ///
 /// It is NOT the sum of every leg a holder can run, and must not be re-derived as
-/// one. Four legs have no bound at all: every phase of the token call except the
-/// connect — header receipt included, which reads bounded and is not
-/// ([`crate::oauth::TOKEN_HTTP_DEADLINES`] carries the measurement) — a
-/// sibling start's recursive `~/.claude` copy inside
-/// [`build_runtime_dir_with_active_env`], the state-flock acquisitions of the
-/// longest holder — `oauth::gate_under_guard`, which takes up to four and whose
-/// count moves with its quarantine branches — and, on macOS, a state flock a peer
-/// is legitimately holding across its own Keychain budget. A sum over legs like
-/// those is a number wearing a proof's clothes.
+/// one. Three legs have no bound at all: a sibling start's recursive `~/.claude`
+/// copy inside [`build_runtime_dir_with_active_env`], the state-flock
+/// acquisitions of the longest holder — `oauth::gate_under_guard`, which takes
+/// up to four and whose count moves with its quarantine branches — and, on
+/// macOS, a state flock a peer is legitimately holding across its own Keychain
+/// budget. A sum over legs like those is a number wearing a proof's clothes.
 ///
 /// So it is derived from the two ends that are fixed.
 ///
 /// The FLOOR is the two legs a HEALTHY holder spends real time in, so an ordinary
 /// rotation is waited out rather than refused:
 /// - [`crate::oauth::TOKEN_HTTP_DEADLINES`] — every rotation makes exactly
-///   one token call, and this is what the two deadlines that call carries add up
-///   to. The floor wants a number a healthy call comfortably fits inside, which
-///   this is; it is not a ceiling, and the constant's own doc says why.
+///   one token call, and `timeout_global` holds that call — body included — to
+///   the sum of the two deadlines it carries. The floor wants a number a healthy
+///   call comfortably fits inside, which this is, and it is a ceiling on the
+///   call itself.
 /// - [`KEYCHAIN_MIRROR_BUDGET`] — a macOS rotation mirrors the new pair into the
 ///   Keychain and may spend that whole budget doing it: the landing arms one
 ///   [`crate::lock::SharedSubprocessBudget`] of it once its state-flock hold
@@ -2956,7 +2954,10 @@ pub(crate) struct RotationGuard {
 /// the rotation persist included) is the flock wait, the store write, then its
 /// mirror under one [`KEYCHAIN_MIRROR_BUDGET`]. An HTTP leg counts by its
 /// deadlines, as the token call does: an identity probe (`/api/oauth/profile`
-/// on the usage agent) by its connect plus header deadlines, 4 + 8 = 12 s.
+/// on the usage agent) by its connect plus header deadlines, 4 + 8 = 12 s, which
+/// each agent's whole-call deadline also holds its body to, so an HTTP term is a
+/// ceiling on its call. A figure below stays a budget of the legs it names, never
+/// a ceiling on the holder: the state-flock waits sit outside every one.
 /// - a rotation (`oauth::rotate_one_inner`, the kick, the vanilla install
 ///   gate): the token call plus its persist's landing,
 ///   `TOKEN_HTTP_DEADLINES + KEYCHAIN_MIRROR_BUDGET` = 39 s;
