@@ -103,7 +103,7 @@ Rows are registered, with a harness tag on the row. They count in the live tally
 | pending switch | `PendingSwitch` `scheduler.rs:163`, `PendingSwitchOff` `:167`; drained `daemon/tick.rs:83` and `:278`, re-queued `:270`, resolved `:109`, applied `:214` |
 | usage fan-out | `TokenEntry` `scheduler.rs:171`, `ThirdPartyEntry` `:188`, `NamedEntry` `:196`; `fn tick` `:2133`, fan-out scope `:2281-2296` |
 | locks | `with_state_lock` `lock.rs:220`, `STATE_LOCK_TIMEOUT` `:44`; ranks `lockorder.rs:63`, `SwapCell = 550` `:150`. A codex-state mutex fits existing ranks; no new rank |
-| config reconcilers | `settings_sync::sync_once` and `claude_json::sync_once` run in the per-session watchdog `runtime.rs:1770/1773` and its Drop `:1848/1851`; `known_paths` `settings_sync.rs:150` and `claude_json.rs:71`, both routed through `shared_runtime_dirs`; `per_profile_env_keys` `settings_sync.rs:180` |
+| config reconcilers | `settings_sync::sync_once` and `claude_json::sync_once_try` run in the per-session watchdog, `claude_json::sync_once` and `settings_sync::sync_once` in its Drop (`runtime.rs`); `known_paths` `settings_sync.rs:150` and `claude_json.rs:71`, both routed through `shared_runtime_dirs`; `per_profile_env_keys` `settings_sync.rs:180` |
 | name validation | `validate_profile_name` `actions.rs:31`; call sites `main.rs:421`, `tui/app.rs:5585,6277,6369,6943` (the last passes an empty `existing` on purpose) |
 | profile CRUD | `save_profile` `profile.rs:1435` (no dir-exists check), `rename_profile` `actions.rs:492-496` (two-sided dir move), `delete_profile` `actions.rs:517` (live gate `:523`, dir removal `:555`, state `:560-561`) |
 | perms walk | `enforce_clauth_perms` `profile.rs:1218`, callers `profile.rs:1525` and `daemon/mod.rs:126` |

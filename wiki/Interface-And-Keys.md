@@ -185,7 +185,7 @@ The `CLIENT TOKENS` group lists the stored tokens: one row per token (the profil
 | Verb | When it appears |
 |------|-----------------|
 | `install plugin` | the plugin reads not installed, installed for this project only, or installed at a version older than this clauth (its `version` line then names both, `0.16.0 (this clauth is 0.17.0)`); installs at user scope, which updates an older install, and turns the plugin on |
-| `wire mcp server` | the `mcpServers` entry is missing, project-local only, or drifted off the current launch line; writes the clauth entry into `~/.claude.json` |
+| `wire mcp server` | the `mcpServers` entry is missing, project-local only, or drifted off the current launch line; writes the clauth entry into `~/.claude.json` and the copy in every shared runtime tree under `~/.clauth/profiles/` (isolated trees excluded), leaving a file that already carries it alone. It refuses with a `wire failed` toast carrying one of three lines: `clauth is syncing Claude Code's config; try again in a moment`, `{path} is being written by Claude Code; try again in a moment`, `{path} does not parse as a JSON object; nothing was changed` |
 
 To install the plugin: select the `plugin` row, press <kbd>f</kbd>, then <kbd>⏎</kbd>, and confirm.
 
