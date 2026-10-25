@@ -1198,7 +1198,7 @@ pub(crate) fn login_summary(creds: &ClaudeCredentials) -> String {
         None => "  plan: will populate on the first usage refresh".to_string(),
     };
     format!(
-        "  refresh sha256: {sha}…\n  scopes: {scopes}\n  access token expires: {expiry}\n{plan}"
+        "  refresh sha256: {sha}...\n  scopes: {scopes}\n  access token expires: {expiry}\n{plan}"
     )
 }
 

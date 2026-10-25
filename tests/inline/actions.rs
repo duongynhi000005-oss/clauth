@@ -7104,7 +7104,7 @@ fn codex_recapture_replaces_the_chain_unless_a_session_holds_it() {
     let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
     pid.lock().expect("lock pid");
     let err = codex_login_capture("cx").expect_err("a live session blocks");
-    assert!(err.to_string().contains("close it first"), "{err}");
+    assert!(err.to_string().contains("Close it first"), "{err}");
     drop(pid);
     std::fs::remove_dir_all(&sessions).expect("clear sessions");
 
@@ -7169,7 +7169,7 @@ fn codex_capture_refusals_name_the_fix() {
     let home = HomeSandbox::new();
 
     let err = codex_login_capture("cx").expect_err("no auth.json refuses");
-    assert!(err.to_string().contains("run `codex login` first"), "{err}");
+    assert!(err.to_string().contains("Run `codex login` first"), "{err}");
 
     for mode in ["keyring", "auto", "ephemeral", "from-the-future"] {
         write_operator_codex(
@@ -7191,8 +7191,17 @@ fn codex_capture_refusals_name_the_fix() {
         Some(r#"{"OPENAI_API_KEY":"sk-x"}"#),
         Some("cli_auth_credentials_store = \"file\"\n"),
     );
+    let operator_auth = home.home().join(".codex").join("auth.json");
     let err = codex_login_capture("cx").expect_err("api-key-only refuses");
-    assert!(err.to_string().contains("no ChatGPT token chain"), "{err}");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{} holds no ChatGPT token chain (an API-key-only setup?). Only a \
+             `codex login` chain can be captured",
+            operator_auth.display()
+        ),
+        "the refusal is pinned whole, so a glyph or a `;` joint cannot ship silently"
+    );
 
     assert!(
         !crate::codex_profiles::CodexState::load()
@@ -7235,8 +7244,12 @@ fn codex_recapture_refuses_a_different_account() {
     std::fs::write(&operator_auth, &other).expect("write other account");
 
     let err = codex_login_capture("cx").expect_err("identity swap refuses");
-    assert!(err.to_string().contains("acc-other"), "{err}");
-    assert!(err.to_string().contains("new profile"), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "'cx' stores ChatGPT account acc, but this login is account acc-other. \
+         Log into a new profile, or delete 'cx' first",
+        "the refusal pins both identities and the fix, whole"
+    );
 
     // A corrupt store is the state re-capture repairs — allowed through.
     std::fs::write(
@@ -11718,8 +11731,8 @@ fn the_cli_capture_lines_are_unchanged() {
         }),
         vec![
             "clauth: captured the operator codex login into codex profile 'cdx'".to_string(),
-            "clauth: /home/u/.codex/auth.json now follows the profile store — your own codex and clauth sessions share one chain".to_string(),
-            "clauth: while it does, `codex login` and `codex logout` reach 'cdx's chain through that link and revoke it server-side — remove the link first if you mean to mint a chain for a different account".to_string(),
+            "clauth: /home/u/.codex/auth.json now follows the profile store. Your own codex and clauth sessions share one chain".to_string(),
+            "clauth: while it does, `codex login` and `codex logout` reach 'cdx's chain through that link and revoke it server-side. Remove the link first if you mean to mint a chain for a different account".to_string(),
         ]
     );
     assert_eq!(
@@ -11731,7 +11744,7 @@ fn the_cli_capture_lines_are_unchanged() {
         }),
         vec![
             "clauth: re-captured the operator codex login into 'cdx'".to_string(),
-            "clauth: could not repoint /home/u/.codex/auth.json (no symlink support?) — it is now a SEPARATE copy of a single-use rotating chain, and the first refresh on either side strands the other. Run codex only through `clauth start cdx` from here on, or `codex login` again for your own use".to_string(),
+            "clauth: could not repoint /home/u/.codex/auth.json (no symlink support?). It is now a SEPARATE copy of a single-use rotating chain, and the first refresh on either side strands the other. Run codex only through `clauth start cdx` from here on, or `codex login` again for your own use".to_string(),
         ]
     );
     assert_eq!(
@@ -11740,7 +11753,7 @@ fn the_cli_capture_lines_are_unchanged() {
             auth_path: path.clone(),
         }),
         vec![
-            "clauth: /home/u/.codex/auth.json already follows codex profile 'cdx' — nothing to capture".to_string(),
+            "clauth: /home/u/.codex/auth.json already follows codex profile 'cdx'. Nothing to capture".to_string(),
         ]
     );
 }

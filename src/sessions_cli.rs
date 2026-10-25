@@ -262,8 +262,8 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
 fn switch_receipt(sid: &str, profile: &str) -> String {
     format!(
         "clauth: pointed session '{sid}' at '{profile}'\n\
-         the switch lands at the session's next request, never before it — \
-         a refused move is logged and the session stays put"
+         the switch lands at the session's next request, never before it. \
+         A refused move is logged and the session stays put"
     )
 }
 
@@ -556,7 +556,7 @@ impl Columns {
 /// assertable without capturing stdout: `now` arrives from the caller, never
 /// a clock read hidden inside. The `updated` cell is the 2026-08-22
 /// prose-stamp ruling's shape — LOCAL wall clock (`YYYY-MM-DD HH:MM:SS`)
-/// paired with its one-unit age, `2026-08-28 14:03:11 · 3h ago`; at 30 days
+/// paired with its one-unit age, `2026-08-28 14:03:11 (3h ago)`; at 30 days
 /// and past the age would repeat the stamp's own date, so the cell prints the
 /// stamp alone. The machine ISO shape lives on in the `--json` row only. The
 /// token total and its cost are blank when the annotation found none — never
@@ -584,15 +584,17 @@ fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime, cols: Columns) ->
     // fallback — a bare stamp reads as local.
     let updated = crate::format::local_stamp(secs).unwrap_or_else(|| "-".to_string());
     // Stamp alone once the age would be a date (the age half is empty); the
-    // age column + ` · ` width stay reserved so the token/cost columns align,
-    // but only while some row carries an age half — an all-stamp-alone listing
-    // keeps the normal column gap instead of a blank age column.
+    // age column and its surrounding parentheses stay reserved so the
+    // token/cost columns align, but only while some row carries an age half;
+    // an all-stamp-alone listing keeps the normal column gap instead of a
+    // blank age column.
     let age = age_half(s, now);
     let stamp_age = if age.is_empty() {
         let reserve = if cols.age > 0 { 3 + cols.age } else { 0 };
         format!("{updated}{}", " ".repeat(reserve))
     } else {
-        format!("{updated} · {age:<age_w$}", age_w = cols.age)
+        let age_cell = format!("({age})");
+        format!("{updated} {age_cell:<w$}", w = cols.age + 2)
     };
     let mut row = format!(
         "  {id:<id_w$}  {profile:<profile_w$}  {stamp_age}{usage}  {preview}",
@@ -611,7 +613,7 @@ fn profile_cell(s: &SessionInfo) -> &str {
     s.last_ran_profile.as_deref().unwrap_or("-")
 }
 
-/// The age half of the `updated · age` cell: the shared one-unit age, empty
+/// The age half of the `updated (age)` cell: the shared one-unit age, empty
 /// once the age reaches the 30-day date arm — the full local stamp already
 /// carries the date, so the cell renders the stamp alone rather than a
 /// duplicate date. The shared formatter spells a non-positive span `just now`

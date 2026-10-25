@@ -1023,7 +1023,7 @@ fn heal_detached_respects_the_saved_update_toggle() {
 /// operator's real binary. The shim-state var is the sentinel a test fake sets.
 #[cfg(unix)]
 #[test]
-#[should_panic(expected = "stage a herdr shim beside a `HERDR_SHIM_STATE` pin")]
+#[should_panic(expected = "Stage a herdr shim beside a `HERDR_SHIM_STATE` pin")]
 fn heal_detached_fails_closed_without_the_shim_sentinel() {
     let home = crate::testutil::HomeSandbox::new();
     reset_heal_throttle_for_test();

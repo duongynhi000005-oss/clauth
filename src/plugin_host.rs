@@ -348,7 +348,7 @@ pub(crate) fn heal_detached() {
     assert!(
         std::env::var_os("CLAUDE_SHIM_STATE").is_some(),
         "heal_detached would spawn the operator's real `claude` and write their \
-         real agentgear tree — stage a `FakeClaude` beside the `HomeSandbox`, or \
+         real agentgear tree. Stage a `FakeClaude` beside the `HomeSandbox`, or \
          call `arm_heal_throttle_for_test` if the heal is not what the test is about"
     );
     // Registered on THIS thread, before the spawn, the way the MCP background

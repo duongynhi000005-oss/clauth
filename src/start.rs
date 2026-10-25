@@ -1471,7 +1471,7 @@ pub(crate) fn run_codex(
     let signal_watcher = SignalWatcher::new()?;
 
     let mut child = command.spawn().with_context(|| {
-        "failed to launch codex — is the `codex` CLI installed and on PATH?".to_string()
+        "failed to launch codex. Is the `codex` CLI installed and on PATH?".to_string()
     })?;
 
     #[cfg(unix)]

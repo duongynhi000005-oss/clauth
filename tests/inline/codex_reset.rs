@@ -267,27 +267,32 @@ fn limit_reset_outcome_lines_say_what_was_spent() {
 /// consume says so only on a 401 — every other failure leaves the outcome open.
 #[test]
 fn limit_reset_failure_lines_separate_nothing_spent_from_unconfirmed() {
-    for err in [
-        ResetCallError::Unauthorized,
-        ResetCallError::Status(503),
-        ResetCallError::Transport,
-        ResetCallError::Parse,
+    let rejected_line = "codex rejected the stored access token for 'work'. The daemon \
+                         refreshes it for a parked account and codex does for the one in use. \
+                         Try again after that. No reset was used";
+    for (err, want) in [
+        (ResetCallError::Unauthorized, rejected_line),
+        (
+            ResetCallError::Status(503),
+            "codex answered the reset list for 'work' with HTTP 503; no reset was used",
+        ),
+        (
+            ResetCallError::Transport,
+            "could not reach codex to list the resets on 'work'; no reset was used",
+        ),
+        (
+            ResetCallError::Parse,
+            "codex answered the reset list for 'work' in a shape clauth does not read; \
+             no reset was used",
+        ),
     ] {
-        let line = list_failure("work", &err);
-        assert!(line.ends_with("no reset was used"), "{err:?}: {line}");
+        assert_eq!(list_failure("work", &err), want, "{err:?}");
     }
-    assert!(list_failure("work", &ResetCallError::Status(503)).contains("HTTP 503"));
-    assert!(
-        list_failure("work", &ResetCallError::Unauthorized)
-            .contains("rejected the stored access token")
-    );
 
-    let rejected = consume_failure("work", &ResetCallError::Unauthorized);
-    assert!(
-        rejected.contains("rejected the stored access token"),
-        "{rejected}"
+    assert_eq!(
+        consume_failure("work", &ResetCallError::Unauthorized),
+        rejected_line
     );
-    assert!(rejected.ends_with("no reset was used"), "{rejected}");
     let transport = consume_failure("work", &ResetCallError::Transport);
     assert!(
         transport.contains("may or may not have gone through"),
@@ -334,14 +339,14 @@ fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
     let prompt = limit_reset_prompt("work", &credits, &dated);
     assert!(
         prompt
-            .starts_with("clauth: use a usage-limit reset on 'work'? usage-limit reset · expires "),
+            .starts_with("clauth: use a usage-limit reset on 'work'? usage-limit reset, expires "),
         "{prompt}"
     );
-    assert!(prompt.contains("· 1 of 2 available."), "{prompt}");
+    assert!(prompt.contains(", 1 of 2 available."), "{prompt}");
     assert!(prompt.contains("cannot be undone"), "{prompt}");
     let titled_prompt = limit_reset_prompt("work", &list_of(vec![titled.clone()], 0), &titled);
     assert!(
-        titled_prompt.contains("Full reset (Weekly + 5 hr) · no expiry · 1 of 1 available."),
+        titled_prompt.contains("Full reset (Weekly + 5 hr), no expiry, 1 of 1 available."),
         "control characters dropped, count floored at one: {titled_prompt}"
     );
 
@@ -352,12 +357,12 @@ fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
     );
     assert_eq!(lines.len(), 3);
     assert!(
-        lines[1].starts_with("    Full reset (Weekly + 5 hr) — available, no expiry, granted "),
+        lines[1].starts_with("    Full reset (Weekly + 5 hr): available, no expiry, granted "),
         "{}",
         lines[1]
     );
     assert!(
-        lines[2].starts_with("  * usage-limit reset — available, expires "),
+        lines[2].starts_with("  * usage-limit reset: available, expires "),
         "{}",
         lines[2]
     );

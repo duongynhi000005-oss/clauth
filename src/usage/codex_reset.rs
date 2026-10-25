@@ -328,7 +328,7 @@ pub(crate) fn limit_reset_prompt(
     credit: &ResetCredit,
 ) -> String {
     format!(
-        "clauth: use a usage-limit reset on '{name}'? {} · {} · 1 of {} available. \
+        "clauth: use a usage-limit reset on '{name}'? {}, {}, 1 of {} available. \
          It reopens the account's usage windows now and cannot be undone.",
         credit.label(),
         expiry(credit),
@@ -358,7 +358,7 @@ pub(crate) fn describe_reset_credits(name: &str, credits: &ResetCredits) -> Vec<
             .map(|g| format!(", granted {}", stamp(g)))
             .unwrap_or_default();
         lines.push(format!(
-            "  {} {} — {}, {}{granted}{}",
+            "  {} {}: {}, {}{granted}{}",
             if marked { "*" } else { " " },
             credit.label(),
             truncate(&status, 20),
@@ -377,8 +377,8 @@ pub(crate) fn no_resets_available(name: &str) -> String {
 /// who does refresh it.
 fn token_rejected(name: &str) -> String {
     format!(
-        "codex rejected the stored access token for '{name}' — the daemon refreshes it \
-         for a parked account and codex does for the one in use; try again after that"
+        "codex rejected the stored access token for '{name}'. The daemon refreshes it \
+         for a parked account and codex does for the one in use. Try again after that"
     )
 }
 
@@ -389,7 +389,7 @@ fn check_list_hint(name: &str) -> String {
 /// A failed GET. Nothing was spent, and every line says so.
 pub(crate) fn list_failure(name: &str, err: &ResetCallError) -> String {
     match err {
-        ResetCallError::Unauthorized => format!("{}; no reset was used", token_rejected(name)),
+        ResetCallError::Unauthorized => format!("{}. No reset was used", token_rejected(name)),
         ResetCallError::Status(status) => format!(
             "codex answered the reset list for '{name}' with HTTP {status}; no reset was used"
         ),
@@ -407,7 +407,7 @@ pub(crate) fn list_failure(name: &str, err: &ResetCallError) -> String {
 /// leaves the outcome open, and the line says to look before retrying.
 pub(crate) fn consume_failure(name: &str, err: &ResetCallError) -> String {
     match err {
-        ResetCallError::Unauthorized => format!("{}; no reset was used", token_rejected(name)),
+        ResetCallError::Unauthorized => format!("{}. No reset was used", token_rejected(name)),
         ResetCallError::Status(status) => format!(
             "codex answered the reset request for '{name}' with HTTP {status}; {}",
             check_list_hint(name)

@@ -1580,9 +1580,13 @@ fn validate_setup_token_accepts_a_mint_and_rejects_bad_pastes() {
         validate_setup_token("sk-ant-short").is_err(),
         "truncated paste"
     );
-    assert!(
-        validate_setup_token(&format!("sk-ant-api03-{}", "z".repeat(48))).is_err(),
-        "an API key must be rejected, not installed as the session bearer",
+    assert_eq!(
+        validate_setup_token(&format!("sk-ant-api03-{}", "z".repeat(48)))
+            .expect_err("an API key must be rejected, not installed as the session bearer")
+            .to_string(),
+        "that looks like an API key (sk-ant-api...), not a `claude setup-token` mint. Installing \
+         it as the session bearer signs sessions out on first use. Capture an API key with \
+         `clauth login <name> --base-url <url> --api-key <key>` instead"
     );
 }
 
@@ -4666,8 +4670,8 @@ fn the_locked_keychain_cause_is_a_hardcoded_literal() {
     assert_eq!(
         SecurityExitClass::InteractionNotAllowed.cause(),
         Some(
-            "the keychain is locked or cannot show a prompt (errSecInteractionNotAllowed); it \
-             clears once the keychain is unlocked — retry once it has"
+            "the keychain is locked or cannot show a prompt (errSecInteractionNotAllowed). It \
+             clears once the keychain is unlocked. Retry once it has"
         )
     );
     assert_eq!(SecurityExitClass::ItemNotFound.cause(), None);

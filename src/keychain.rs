@@ -679,7 +679,7 @@ fn blob_to_merge_with(service: &str, account: &str) -> Option<Value> {
                 Some(raw) => logline!(
                     "clauth: could not read the macOS Keychain login before replacing it ({e:#}). \
                      The MCP server logins it held are replaced by whatever this profile last \
-                     stored, which on macOS is older than the item's own set — their {}",
+                     stored, which on macOS is older than the item's own set. Their {}",
                     quarantine_tail(&quarantine_item_bytes(service, raw))
                 ),
                 None => logline!(
@@ -1197,8 +1197,8 @@ pub(crate) fn census_namespaced_items() {
         Ok(owned) => owned,
         Err(e) => {
             census_log!(
-                "clauth: the Keychain census cannot read its ownership ledger ({e:#}); deleting \
-                 nothing — unreadable ownership must never authorize a delete"
+                "clauth: the Keychain census cannot read its ownership ledger ({e:#}). Deleting \
+                 nothing. Unreadable ownership must never authorize a delete"
             );
             return;
         }
@@ -1207,8 +1207,8 @@ pub(crate) fn census_namespaced_items() {
         Ok(live) => crate::claude::census_orphan_keychain_services(&dump, &live, &owned),
         Err(e) => {
             census_log!(
-                "clauth: the Keychain census cannot derive the live set ({e:#}); deleting nothing \
-                 — an underivable set must never read as every item orphaned"
+                "clauth: the Keychain census cannot derive the live set ({e:#}). Deleting nothing. \
+                 An underivable set must never read as every item orphaned"
             );
             return;
         }
@@ -1672,7 +1672,7 @@ fn sign_out_saving_at(
                 Some(raw) => logline!(
                     "clauth: signed Claude Code out of the macOS Keychain by deleting the item: \
                      it could not be read first ({e:#}), so the MCP server logins stored beside \
-                     the login went with it — their {}",
+                     the login went with it. Their {}",
                     quarantine_tail(&quarantine_item_bytes(service, raw))
                 ),
                 None => logline!(

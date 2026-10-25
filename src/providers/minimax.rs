@@ -180,7 +180,7 @@ fn rows(models: &[ModelRemains]) -> Vec<StatRow> {
         rows.push(StatRow {
             label: m.model_name.clone(),
             value: format!(
-                "{} · {}",
+                "{}, {}",
                 span(interval, pct(m.current_interval_remaining_percent)),
                 span(weekly, pct(m.current_weekly_remaining_percent))
             ),

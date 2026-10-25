@@ -277,8 +277,8 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
 fn warn_paused(path: &Path, reason: &str) -> Option<BTreeSet<String>> {
     if !ENV_KEYS_WARNED.swap(true, Ordering::Relaxed) {
         logline!(
-            "clauth: settings.json sync paused — {} {reason}; \
-             the affected profiles' custom [env] keys are unknown, so no \
+            "clauth: settings.json sync paused: {} {reason}. \
+             The affected profiles' custom [env] keys are unknown, so no \
              settings are synced until it reads cleanly",
             path.display()
         );

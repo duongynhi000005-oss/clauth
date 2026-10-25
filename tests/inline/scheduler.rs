@@ -14518,7 +14518,7 @@ fn claude_rolling_tick_logs_a_login_change_as_deferred() {
         lines.snapshot(),
         vec![
             "clauth: re-stamp for 'cl-moved' deferred: 'cl-moved' login changed during its \
-             refresh and the new login expires soon · retry in a moment"
+             refresh and the new login expires soon. Retry in a moment"
                 .to_string()
         ]
     );

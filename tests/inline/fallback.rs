@@ -10479,7 +10479,7 @@ fn the_start_walk_marks_a_member_clauth_cannot_measure() {
     let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
     assert_eq!(
         crate::format::render_start_walk(&rows, pick),
-        "  blind  ok   ◆ can't read usage\n* work   ok   usage 4m ago",
+        "  blind  ok   can't read usage\n* work   ok   usage 4m ago",
     );
 
     // A real refusal renders only a no-pick walk: `blind` disabled, `work` spent.
@@ -10491,7 +10491,7 @@ fn the_start_walk_marks_a_member_clauth_cannot_measure() {
     assert_eq!(pick, None);
     assert_eq!(
         crate::format::start_refusal(&[], &rows),
-        "--auto found no chain member with headroom\n  blind  disabled   ◆ can't read usage\n  work   5h 100%    usage 4m ago",
+        "--auto found no chain member with headroom\n  blind  disabled   can't read usage\n  work   5h 100%    usage 4m ago",
     );
 }
 

@@ -1341,7 +1341,7 @@ fn a_locked_keychain_write_failure_names_the_cause_and_carries_its_code() {
     assert_eq!(
         err.to_string(),
         "Keychain write failed (security exit 36): the keychain is locked or cannot show a prompt \
-         (errSecInteractionNotAllowed); it clears once the keychain is unlocked — retry once it \
+         (errSecInteractionNotAllowed). It clears once the keychain is unlocked. Retry once it \
          has",
     );
     assert!(
@@ -1443,7 +1443,7 @@ fn a_merge_over_unparseable_bytes_quarantines_them_and_still_writes() {
         "the line keeps its position-only shape: {event}"
     );
     let (_, salvaged) = event
-        .split_once("— their raw bytes are preserved at ")
+        .split_once(". Their raw bytes are preserved at ")
         .expect("the line names where the bytes went");
     let (path_text, _) = salvaged
         .split_once(": the `claudeAiOauth`")
@@ -1626,7 +1626,7 @@ fn a_sign_out_over_unparseable_bytes_quarantines_them_and_still_deletes() {
         "the line keeps its position-only shape: {event}"
     );
     let (_, salvaged) = event
-        .split_once("— their raw bytes are preserved at ")
+        .split_once(". Their raw bytes are preserved at ")
         .expect("the line names where the bytes went");
     let (path_text, _) = salvaged
         .split_once(": the `claudeAiOauth`")

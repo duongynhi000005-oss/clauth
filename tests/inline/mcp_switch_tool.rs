@@ -354,7 +354,7 @@ fn a_login_change_during_the_gates_refresh_reads_as_the_sentence_alone() {
     let prose = text.split("\n\n").next().expect("prose paragraph");
     assert_eq!(
         prose,
-        "'target' login changed during its refresh and the new login expires soon · retry in a \
+        "'target' login changed during its refresh and the new login expires soon. Retry in a \
          moment; active profile `active`: 5h unknown, 7d unknown"
     );
 }

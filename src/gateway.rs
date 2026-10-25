@@ -3367,7 +3367,7 @@ fn maskable_token(token: &str) -> bool {
 /// `value`'s visible stand-in: its first 3 characters and an ellipsis.
 fn mask_stand_in(value: &str) -> String {
     let head: String = value.chars().take(3).collect();
-    format!("{head}…")
+    format!("{head}...")
 }
 
 impl std::fmt::Display for ConfigEditRefusal {

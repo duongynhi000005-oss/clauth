@@ -1318,7 +1318,7 @@ fn drain_pending_switch_defers_a_target_relogged_into_an_expiring_login() {
              refreshed pair"
                 .to_string(),
             "clauth daemon: deferring switch to 'beta': 'beta' login changed during its refresh \
-             and the new login expires soon · retry in a moment"
+             and the new login expires soon. Retry in a moment"
                 .to_string(),
         ]
     );

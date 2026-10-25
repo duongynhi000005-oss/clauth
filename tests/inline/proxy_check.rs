@@ -1718,6 +1718,40 @@ fn numbers_compare_by_value_and_nothing_else_does() {
 }
 
 #[test]
+fn printable_keeps_values_whole_through_the_budget_and_cuts_past_it() {
+    let (admin, key) = secrets();
+    let checker = Checker {
+        base: "http://127.0.0.1:1",
+        expected_service: None,
+        admin: &admin,
+        key: &key,
+        secrets: Vec::new(),
+        control: agent(CONTROL_TIMEOUT),
+        inference: agent(INFERENCE_TIMEOUT),
+        report: Report::default(),
+    };
+
+    assert_eq!(checker.printable("aaaa", 5), "aaaa", "max-1 fits whole");
+    assert_eq!(checker.printable("aaaaa", 5), "aaaaa", "max fits whole");
+    assert_eq!(checker.printable("aaaaaa", 5), "aaaaaa", "max+1 fits whole");
+    assert_eq!(
+        checker.printable("aaaaaaa", 5),
+        "aaa...",
+        "max+2 cuts to max-2 chars + dots"
+    );
+    // Multi-byte chars count once and slice on char boundaries.
+    assert_eq!(checker.printable("ééé", 5), "ééé", "multi-byte fits whole");
+    assert_eq!(
+        checker.printable("ééééééé", 5),
+        "ééé...",
+        "multi-byte cuts whole chars"
+    );
+    // Too small a budget shows dots only, never content.
+    assert_eq!(checker.printable("aaaa", 0), ".", "max 0 shows one dot");
+    assert_eq!(checker.printable("aaaa", 1), "..", "max 1 shows two dots");
+}
+
+#[test]
 fn a_time_must_be_rfc_3339_in_utc() {
     assert!(Kind::Time.admits(&json!("2026-09-29T12:00:00Z")));
     assert!(Kind::Time.admits(&json!("2026-09-29T12:00:00+00:00")));

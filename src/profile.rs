@@ -1427,7 +1427,7 @@ impl AppConfig {
             return None;
         }
         Some(format!(
-            "{} accounts claim {}: {} — the chain returns to whichever of them reads clear first",
+            "{} accounts claim {}: {}. The chain returns to whichever of them reads clear first",
             names.len(),
             day.to_string().to_ascii_lowercase(),
             names.join(", "),
@@ -1469,7 +1469,7 @@ impl AppConfig {
         // uncarried one has quietly fallen back to the flag.
         let tail = match self.day_listers(day, key_rejected).next() {
             Some(carrier) => format!("'{carrier}' carries it"),
-            None => format!("nothing else claims {named}, so `preferred` decides it"),
+            None => format!("Nothing else claims {named}, so `preferred` decides it"),
         };
         let subject = if blocked.len() == 1 {
             "the list on"
@@ -1477,7 +1477,7 @@ impl AppConfig {
             "the lists on"
         };
         Some(format!(
-            "{named}: {subject} {} cannot claim it — {tail}",
+            "{named}: {subject} {} cannot claim it. {tail}",
             blocked.join(", ")
         ))
     }

@@ -809,7 +809,7 @@ pub(crate) fn heal_detached(saved_auto_update: bool) {
     assert!(
         std::env::var_os("HERDR_SHIM_STATE").is_some(),
         "heal_detached would probe the operator's real `herdr` and reinstall \
-         their real plugin — stage a herdr shim beside a `HERDR_SHIM_STATE` pin, or call \
+         their real plugin. Stage a herdr shim beside a `HERDR_SHIM_STATE` pin, or call \
          `arm_heal_throttle_for_test` if the heal is not what the test is about"
     );
     #[cfg(test)]

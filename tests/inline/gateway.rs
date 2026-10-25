@@ -3353,18 +3353,18 @@ fn mask_check_output_hides_env_values_and_key_tokens() {
         // leaves the `sk-` stand-in's 3-char head alone.
         (
             "invalid token: found \"sk-SECRET-value-123\"",
-            "invalid token: found \"sk-…\"",
+            "invalid token: found \"sk-...\"",
         ),
         // A non-key-shaped value appearing twice is masked at both sites.
-        ("plain.secret.v and plain.secret.v", "pla… and pla…"),
+        ("plain.secret.v and plain.secret.v", "pla... and pla..."),
         // Two overlapping values: the longer one wins the match.
-        ("found plain.secret.value", "found pla…"),
+        ("found plain.secret.value", "found pla..."),
         // An `sk-` key NOT in the env: the token pass catches it.
-        ("missing key sk-ant-api03-abcdef", "missing key sk-…"),
+        ("missing key sk-ant-api03-abcdef", "missing key sk-..."),
         // A long hex-ish id (20+ chars, letter + digit).
-        ("id 0123456789abcdef0123456789abcdef", "id 012…"),
+        ("id 0123456789abcdef0123456789abcdef", "id 012..."),
         // A non-`sk-` env value (a path) is masked too.
-        ("home is /home/uwuclxdy today", "home is /ho… today"),
+        ("home is /home/uwuclxdy today", "home is /ho... today"),
         // A normal error line is left untouched.
         ("config error: boom", "config error: boom"),
     ] {

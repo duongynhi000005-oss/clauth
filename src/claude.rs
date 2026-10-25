@@ -269,20 +269,18 @@ pub(crate) fn validate_setup_token(raw: &str) -> Result<String> {
     }
     if !token.starts_with("sk-ant-") {
         anyhow::bail!(
-            "that doesn't look like a `claude setup-token` mint (expected an sk-ant-… value)"
+            "that doesn't look like a `claude setup-token` mint (expected an sk-ant-... value)"
         );
     }
     if token.starts_with("sk-ant-api") {
         anyhow::bail!(
-            "that looks like an API key (sk-ant-api…), not a `claude setup-token` mint. \
-             Installing it as the session bearer signs sessions out on first use; capture an \
+            "that looks like an API key (sk-ant-api...), not a `claude setup-token` mint. \
+             Installing it as the session bearer signs sessions out on first use. Capture an \
              API key with `clauth login <name> --base-url <url> --api-key <key>` instead"
         );
     }
     if token.chars().any(char::is_whitespace) {
-        anyhow::bail!(
-            "the pasted token contains whitespace — looks like a partial or padded paste"
-        );
+        anyhow::bail!("the pasted token contains whitespace, likely a partial or padded paste");
     }
     if token.len() < 40 {
         anyhow::bail!("the pasted token is too short to be a real mint");
@@ -313,7 +311,7 @@ pub(crate) fn validate_oauth_token(token: &str) -> Result<()> {
 fn validate_credential_chars(value: &str, noun: &str) -> Result<()> {
     if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
         anyhow::bail!(
-            "{noun} contains whitespace or control characters — a bad paste or an edited config"
+            "{noun} contains whitespace or control characters, likely a bad paste or an edited config"
         );
     }
     Ok(())
@@ -376,7 +374,7 @@ pub(crate) fn stamp_rolling_token(
     if sidecar_kind_of(&rolled) == SidecarKind::Mint {
         anyhow::bail!(
             "'{name}' usage chain's recorded grant is indistinguishable from a setup-token \
-             mint (no scope beyond the setup pair, no subscription type) · refusing to stamp \
+             mint (no scope beyond the setup pair, no subscription type). Refusing to stamp \
              a rolling bearer that could later be preserved as the static mint. Re-run \
              `clauth login {name}` to record the chain's real grant"
         );
@@ -882,8 +880,8 @@ fn live_backup_bytes(name: &ProfileName, backup: &Path) -> Result<Option<Vec<u8>
         BackupVerdict::LiveMint => Ok(Some(bytes)),
         BackupVerdict::Expired => {
             crate::logline::logline!(
-                "clauth: '{name}' preserved static mint has itself expired — not restoring it; \
-                 re-mint with `clauth login {name} --setup-token`"
+                "clauth: '{name}' preserved static mint has itself expired. Not restoring it. \
+                 Re-mint with `clauth login {name} --setup-token`"
             );
             Ok(None)
         }
@@ -891,8 +889,8 @@ fn live_backup_bytes(name: &ProfileName, backup: &Path) -> Result<Option<Vec<u8>
             quarantine_file_locked(name, backup, "session-token.static.json")?;
             std::fs::remove_file(backup).context("remove quarantined static backup")?;
             crate::logline::logline!(
-                "clauth: '{name}' preserved static backup does not hold a mint — quarantined \
-                 under the profile's quarantine/ dir; re-mint with \
+                "clauth: '{name}' preserved static backup does not hold a mint. Quarantined \
+                 under the profile's quarantine/ dir. Re-mint with \
                  `clauth login {name} --setup-token`"
             );
             Ok(None)
@@ -1806,8 +1804,8 @@ impl SecurityExitClass {
     pub(crate) fn cause(self) -> Option<&'static str> {
         match self {
             SecurityExitClass::InteractionNotAllowed => Some(
-                "the keychain is locked or cannot show a prompt (errSecInteractionNotAllowed); it \
-                 clears once the keychain is unlocked — retry once it has",
+                "the keychain is locked or cannot show a prompt (errSecInteractionNotAllowed). It \
+                 clears once the keychain is unlocked. Retry once it has",
             ),
             SecurityExitClass::ItemNotFound | SecurityExitClass::Unclassified => None,
         }

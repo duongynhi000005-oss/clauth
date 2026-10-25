@@ -1695,21 +1695,21 @@ pub(crate) mod namespaced_keychain_ledger {
             if !crate::claude::is_namespaced_keychain_service(&owner.service) {
                 anyhow::bail!(
                     "the namespaced Keychain ownership ledger names a service the naming rule \
-                     could not produce (`{}`) — refusing to authorize any delete",
+                     could not produce (`{}`). Refusing to authorize any delete",
                     owner.service
                 );
             }
             if let Err(e) = crate::actions::validate_name_chars(owner.profile.as_str()) {
                 anyhow::bail!(
                     "the namespaced Keychain ownership ledger holds an invalid profile name \
-                     (`{}`): {e} — refusing to authorize any delete",
+                     (`{}`): {e}. Refusing to authorize any delete",
                     owner.profile
                 );
             }
             if !is_session_id(&owner.session) {
                 anyhow::bail!(
                     "the namespaced Keychain ownership ledger holds a session id outside the \
-                     minted shape (`{}`) — refusing to authorize any delete",
+                     minted shape (`{}`). Refusing to authorize any delete",
                     owner.session
                 );
             }
@@ -1894,7 +1894,7 @@ pub(crate) mod namespaced_keychain_ledger {
             if !crate::claude::is_namespaced_keychain_service(&row.service) {
                 anyhow::bail!(
                     "the in-flight-delete record names a service the naming rule could not \
-                     produce (`{}`) — refusing to read it as absent",
+                     produce (`{}`). Refusing to read it as absent",
                     row.service
                 );
             }
@@ -1962,7 +1962,7 @@ pub(crate) mod namespaced_keychain_ledger {
             else {
                 anyhow::bail!(
                     "cannot stamp the spawned child (pid {pid}) into the in-flight record for \
-                     {service}: no row exists — a delete child must never run unguarded"
+                     {service}: no row exists. A delete child must never run unguarded"
                 );
             };
             // PID-identity premise: the pid-scoped clear keys on pid equality,
@@ -2091,8 +2091,8 @@ pub(crate) mod namespaced_keychain_ledger {
                 write!(
                     f,
                     "a sweep's delete for the same per-session Keychain item is still in flight \
-                     (`{}`; its `security` child, pid {pid}, is still alive); the write would race \
-                     it — it lands once the delete records its outcome or its record is swept as \
+                     (`{}`, whose `security` child, pid {pid}, is still alive). The write would race \
+                     it. It lands once the delete records its outcome or its record is swept as \
                      stale",
                     self.service,
                 )
@@ -2100,7 +2100,7 @@ pub(crate) mod namespaced_keychain_ledger {
                 write!(
                     f,
                     "a sweep's delete for the same per-session Keychain item is still in flight \
-                     (`{}`, stamped {} s ago); the write would race it — it lands once the delete \
+                     (`{}`, stamped {} s ago). The write would race it. It lands once the delete \
                      records its outcome or its record is swept as stale",
                     self.service,
                     now_secs().saturating_sub(self.stamp_secs),
@@ -2658,8 +2658,8 @@ fn gc_keychain_recheck(
             Ok(in_flight) => Ok(Some(in_flight)),
             Err(e) => {
                 logline!(
-                    "clauth: cannot stamp the in-flight-delete record for {service} ({e:#}); its \
-                     item is not collected — a delete whose in-flight record cannot be persisted \
+                    "clauth: cannot stamp the in-flight-delete record for {service} ({e:#}). Its \
+                     item is not collected. A delete whose in-flight record cannot be persisted \
                      must not run"
                 );
                 Ok(None)
@@ -3119,8 +3119,8 @@ impl std::fmt::Display for RotationLockTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "timed out after {:.0}s taking '{}' rotation lock; a token rotation or another \
-             session start is holding it — retry, or start a different account",
+            "timed out after {:.0}s taking '{}' rotation lock. A token rotation or another \
+             session start is holding it. Retry, or start a different account",
             self.waited.as_secs_f64(),
             self.name,
         )
@@ -3231,8 +3231,8 @@ impl RotationGuard {
             // treating it as the deadline would claim a wait that never happened.
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 anyhow::bail!(
-                    "waiting for {display} ended with no verdict; the thread holding the \
-                     wait died — retry the command"
+                    "waiting for {display} ended with no verdict. The thread holding the \
+                     wait died. Retry the command"
                 )
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -4213,8 +4213,8 @@ impl SessionSwap {
         }
         debug_assert!(
             is_session_alive(&self.launch_marker),
-            "the launch member's marker must still be held after publishing a swap — \
-             marker lifetime must not be shortened, or collect() probing current_member \
+            "the launch member's marker must still be held after publishing a swap. \
+             Marker lifetime must not be shortened, or collect() probing current_member \
              would read an alive session as dead"
         );
     }
@@ -10086,9 +10086,9 @@ impl CodexRuntime {
                 {
                     anyhow::bail!(
                         "'{name}' already has a live {other} codex session, and this host \
-                         cannot symlink — the two would hold SEPARATE copies of one \
+                         cannot symlink. The two would hold SEPARATE copies of one \
                          single-use chain, and the first refresh on either strands the \
-                         other. Close it before starting a {isolation} one"
+                         other. Close the {other} session before starting this one"
                     );
                 }
             }

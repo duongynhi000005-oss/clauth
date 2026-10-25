@@ -395,11 +395,11 @@ fn the_age_tokens_and_cost_columns_widen_to_their_widest_cell() {
     let alpha = lines.iter().find(|l| l.contains("alpha")).unwrap();
     let beta = lines.iter().find(|l| l.contains("beta")).unwrap();
     let alpha_tail = format!(
-        "· 1d ago  {}150  {}$1.05  alpha | alpha",
+        "(1d ago)  {}150  {}$1.05  alpha | alpha",
         " ".repeat(10),
         " ".repeat(4)
     );
-    let beta_tail = "· just now  12345678901  $12345.67  beta | beta".to_string();
+    let beta_tail = "(just now)  12345678901  $12345.67  beta | beta".to_string();
     assert!(alpha.ends_with(&alpha_tail), "{alpha:?}");
     assert!(beta.ends_with(&beta_tail), "{beta:?}");
 }
@@ -434,7 +434,7 @@ fn the_table_stamp_renders_local_wall_clock_with_a_relative_age() {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
     assert!(
-        row.contains(&format!("{local} · 3h ago")),
+        row.contains(&format!("{local} (3h ago)")),
         "the row renders the local stamp paired with its age: {row}"
     );
     assert!(
@@ -477,7 +477,7 @@ fn the_stamp_age_renders_just_now_for_non_positive_ages_and_ago_for_positive() {
     // sub-second-fresh file truncates to.
     let zero = session_row(session, false, updated, Columns::FLOOR);
     assert!(
-        zero.contains("· just now"),
+        zero.contains("(just now)"),
         "zero age renders `just now`: {zero}"
     );
     assert!(!zero.contains("now ago"), "zero age never stutters: {zero}");
@@ -487,7 +487,7 @@ fn the_stamp_age_renders_just_now_for_non_positive_ages_and_ago_for_positive() {
     let behind = updated - Duration::from_secs(60);
     let future = session_row(session, false, behind, Columns::FLOOR);
     assert!(
-        future.contains("· just now"),
+        future.contains("(just now)"),
         "a future mtime renders `just now`: {future}"
     );
     assert!(
@@ -499,7 +499,7 @@ fn the_stamp_age_renders_just_now_for_non_positive_ages_and_ago_for_positive() {
     let ahead = updated + Duration::from_secs(11_520);
     let positive = session_row(session, false, ahead, Columns::FLOOR);
     assert!(
-        positive.contains("· 3h ago"),
+        positive.contains("(3h ago)"),
         "a positive age keeps the one-unit pairing: {positive}"
     );
 }
@@ -531,12 +531,12 @@ fn the_stamp_cell_drops_the_age_half_once_it_would_be_a_date() {
         Columns::FLOOR,
     );
     assert!(
-        twenty_nine.contains(&format!("{local} · 4w ago")),
+        twenty_nine.contains(&format!("{local} (4w ago)")),
         "29 days keeps the pairing: {twenty_nine}"
     );
 
     // 30 days: the age would repeat the stamp's own date, so the cell prints the
-    // stamp alone — no ` · ` separator, no date duplicate.
+    // stamp alone — no `( )` age wrap, no date duplicate.
     let thirty = session_row(
         session,
         false,
@@ -545,14 +545,14 @@ fn the_stamp_cell_drops_the_age_half_once_it_would_be_a_date() {
     );
     assert!(thirty.contains(&local), "the stamp survives: {thirty}");
     assert!(
-        !thirty.contains(" · "),
+        !thirty.contains(" ("),
         "the age half drops once it would be a date: {thirty}"
     );
 }
 
 /// A mixed listing — one 40-day (stamp-alone) session, one 3-hour session —
 /// keeps the stamp-alone row's token, cost and preview columns in the same
-/// cells as the `stamp · age` row's: the age column and ` · ` separator stay
+/// cells as the `stamp (age)` row's: the age column and `( )` wrap stay
 /// reserved even though the old row's age half is empty, so whole-row equality
 /// reds on a reservation that drops any of that width.
 #[test]
@@ -591,12 +591,12 @@ fn the_stamp_alone_row_keeps_its_columns_aligned_with_its_age_sibling() {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
     let expected_young = format!(
-        "  bbbb-2222  {prof}  {stamp} · 3h ago  12345678901  $12345.67  beta | beta",
+        "  bbbb-2222  {prof}  {stamp} (3h ago)  12345678901  $12345.67  beta | beta",
         prof = "-".to_owned() + &" ".repeat(11),
         stamp = young_stamp,
     );
-    // The stamp-alone cell reserves ` · ` (3) + the age column (6), so the old
-    // row's 3-digit token total left-pads 8 into the same 11-cell column.
+    // The stamp-alone cell reserves the `( )` wrap (3) + the age column (6), so
+    // the old row's 3-digit token total left-pads 8 into the same 11-cell column.
     let expected_old = format!(
         "  aaaa-1111  {prof}  {stamp}{reserve}  {tok}150  {cost}$1.05  alpha | alpha",
         prof = "-".to_owned() + &" ".repeat(11),
@@ -690,7 +690,7 @@ fn the_human_row_and_json_disagree_on_the_stamp_shape_by_design() {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
     assert!(
-        human.contains(&format!("{local} · 3h ago")),
+        human.contains(&format!("{local} (3h ago)")),
         "the human row renders the local stamp and its age: {human}"
     );
     assert!(
@@ -1476,7 +1476,7 @@ fn switch_receipt_names_when_the_move_lands() {
     assert_eq!(
         switch_receipt("4242-0", "spare"),
         "clauth: pointed session '4242-0' at 'spare'\nthe switch lands at the session's next \
-         request, never before it — a refused move is logged and the session stays put"
+         request, never before it. A refused move is logged and the session stays put"
     );
 }
 

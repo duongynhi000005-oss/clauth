@@ -724,7 +724,7 @@ fn paired_cell(iso: &str, now: i64) -> String {
     // The shared formatter spells a non-positive span `just now` itself, which
     // reads as-is, never `now ago`.
     format!(
-        "{stamp} · {}",
+        "{stamp} ({})",
         crate::format::spoken_age(age_secs, epoch).unwrap_or_else(|| "-".to_string())
     )
 }

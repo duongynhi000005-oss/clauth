@@ -5299,7 +5299,7 @@ fn a_start_behind_a_wedged_rotation_fails_with_the_bounded_wait() {
         );
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("wedged-rot") && msg.contains("retry"),
+            msg.contains("wedged-rot") && msg.contains("Retry"),
             "the refusal must name the account and the way out, got: {msg}"
         );
         assert!(
@@ -14018,9 +14018,11 @@ fn fake_mode_refuses_the_second_flavor_of_one_profile() {
             Ok(_) => panic!("the second flavor would be a second carrier"),
             Err(e) => e.to_string(),
         };
-        assert!(
-            msg.contains("SEPARATE copies of one single-use chain"),
-            "the refusal names why: {msg}"
+        assert_eq!(
+            msg,
+            "'cx' already has a live shared codex session, and this host cannot symlink. The two \
+             would hold SEPARATE copies of one single-use chain, and the first refresh on either \
+             strands the other. Close the shared session before starting this one"
         );
         // Same flavor is still fine — that IS one home.
         let second =
@@ -15680,6 +15682,28 @@ fn a_corrupt_in_flight_record_refuses_the_write_fail_closed() {
         "a record the naming rule could not produce refuses the write, never reads as absent",
     );
     assert!(format!("{err:#}").contains("not-a-namespaced-service"));
+}
+
+/// The live-pid arm of the in-flight refusal, pinned by equality so the
+/// `whose security child` phrasing and the live pid cannot drift.
+// pid liveness is unix-only (`pid_alive` is false on windows by design).
+#[cfg(unix)]
+#[test]
+fn an_in_flight_delete_with_a_live_child_pins_the_refusal() {
+    let pid = std::process::id();
+    let err = namespaced_keychain_ledger::DeleteInFlight {
+        service: "x".to_string(),
+        stamp_secs: 0,
+        pids: vec![pid],
+    };
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "a sweep's delete for the same per-session Keychain item is still in flight (`x`, \
+             whose `security` child, pid {pid}, is still alive). The write would race it. It \
+             lands once the delete records its outcome or its record is swept as stale"
+        )
+    );
 }
 
 /// The seed's retry mapping: a refusal over an in-flight delete arms the

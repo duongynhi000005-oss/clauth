@@ -1616,6 +1616,27 @@ fn completions_rejects_a_second_value_after_a_shell_name() {
     );
 }
 
+// ── cmd_delete / cmd_switch name the claude half of a both-rosters name ─────
+
+/// The both-rosters collision note, pinned by equality so the `. This` joint
+/// cannot drift back to a semicolon: `delete` and `switch` each name their own
+/// verb, and both name the claude half.
+#[test]
+fn the_delete_collision_note_names_the_claude_half() {
+    assert_eq!(
+        codex_collision_note(&crate::profile::ProfileName::from("work"), "deletes"),
+        "clauth: note: 'work' also names a codex profile. This deletes the CLAUDE one"
+    );
+}
+
+#[test]
+fn the_switch_collision_note_names_the_claude_half() {
+    assert_eq!(
+        codex_collision_note(&crate::profile::ProfileName::from("work"), "switches"),
+        "clauth: note: 'work' also names a codex profile. This switches the CLAUDE one"
+    );
+}
+
 // ── cmd_switch / cmd_start refuse a disabled target ─────────────────────────
 
 mod disabled_target_refusal {
@@ -2595,7 +2616,7 @@ mod oauth_token_helper_tests {
             oauth_token_for_profile("acme", refresher).expect_err("a login change defers the read");
         assert_eq!(
             err.to_string(),
-            "'acme' login changed during its refresh and the new login expires soon · retry in a moment"
+            "'acme' login changed during its refresh and the new login expires soon. Retry in a moment"
         );
     }
 
@@ -3585,7 +3606,7 @@ mod armed_report_copy {
     fn the_clear_copy_names_the_disarm_the_backup_and_both_postscripts() {
         let disarm = clear_disarm_note("acme");
         assert!(
-            disarm.contains("clearing also turns its re-stamping off"),
+            disarm.contains("Clearing also turns its re-stamping off"),
             "{disarm}"
         );
         let backup = clear_backup_note("acme");
@@ -3600,7 +3621,7 @@ mod armed_report_copy {
         let disarmed = clear_disarmed_postscript("acme");
         assert!(disarmed.contains("rolling-token is off"), "{disarmed}");
         assert!(
-            disarmed.contains("nothing re-stamps a sidecar for 'acme' now"),
+            disarmed.contains("Nothing re-stamps a sidecar for 'acme' now"),
             "{disarmed}"
         );
         let swept = clear_backup_postscript("acme");
@@ -5765,7 +5786,7 @@ fn the_claude_only_verbs_refuse_a_codex_name_and_list_the_claude_roster_alone() 
 
     assert_eq!(
         unknown_profile_error(&config, "zz").to_string(),
-        "profile 'zz' not found\navailable: cl1 · codex: cx",
+        "profile 'zz' not found\navailable: cl1, codex: cx",
         "control: the two-roster listing `switch`/`delete`/`start` use is unchanged"
     );
 
@@ -5925,7 +5946,7 @@ fn limit_reset_refuses_a_claude_name_an_unknown_one_and_a_dead_chain_before_any_
     assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
     assert_eq!(
         err.to_string(),
-        "profile 'zz' not found\navailable: cl1 · codex: cx, cy"
+        "profile 'zz' not found\navailable: cl1, codex: cx, cy"
     );
 
     let err = limit_reset_with("cy", false, true, false, &urls, no_prompt).expect_err("no login");
@@ -5994,7 +6015,7 @@ fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
     })
     .expect("a declined prompt is a clean abort");
     assert!(
-        asked.contains("'cx'? Full reset · expires ") && asked.contains("1 of 2 available"),
+        asked.contains("'cx'? Full reset, expires ") && asked.contains("1 of 2 available"),
         "the prompt names the credit it will spend: {asked}"
     );
 

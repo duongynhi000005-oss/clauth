@@ -2277,7 +2277,7 @@ fn a_state_lock_timeout_reads_as_contention_not_permissions() {
     let fault = anyhow::anyhow!("read-only file system").context("write session-token.json");
     let t = sidecar_repair_transient(&crate::profile::ProfileName::from("busy"), &fault);
     assert!(
-        t.text().contains("check permissions on ~/.clauth"),
+        t.text().contains("Check permissions on ~/.clauth"),
         "a genuine filesystem fault keeps the fault copy, got: {}",
         t.text()
     );
@@ -7541,7 +7541,7 @@ fn an_expiring_relogin_during_the_gates_refresh_refuses_for_a_retry() {
 
     assert_eq!(
         gate_verdict(&gate),
-        "'gate-relogin-expiring' login changed during its refresh and the new login expires soon · retry in a moment"
+        "'gate-relogin-expiring' login changed during its refresh and the new login expires soon. Retry in a moment"
     );
     assert_eq!(stored_refresh(name).as_deref(), Some("rt-relogin"));
     assert_eq!(memory_refresh(&config, name).as_deref(), Some("rt-relogin"));
@@ -7798,7 +7798,7 @@ fn the_install_gate_refuses_while_a_live_stage_cannot_land() {
     };
     assert_eq!(
         t.text(),
-        "another clauth process holds ~/.clauth's state lock · 'chain-gate-land-wedge' left \
+        "another clauth process holds ~/.clauth's state lock. 'chain-gate-land-wedge' left \
          unchanged: retry in a moment"
     );
     assert_eq!(stored_refresh(name).as_deref(), Some("rt-old"));

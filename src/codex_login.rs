@@ -256,8 +256,8 @@ fn bind_port_pair(ports: [u16; 2]) -> Result<(TcpListener, u16)> {
         }
     }
     bail!(
-        "codex's login ports ({PRIMARY_PORT} and {FALLBACK_PORT}) are both in use — \
-         close whatever holds them (another codex or clauth login?) and retry"
+        "codex's login ports ({PRIMARY_PORT} and {FALLBACK_PORT}) are both in use. \
+         Close whatever holds them (another codex or clauth login?) and retry"
     )
 }
 

@@ -408,12 +408,9 @@ fn a_passed_over_lister_names_what_became_of_the_day() {
     let notice = cfg
         .day_claim_passed_over(Weekday::Sat, &HashSet::new())
         .expect("a notice");
-    assert!(notice.starts_with("sat:"), "got {notice}");
-    assert!(notice.contains("the list on 'old'"), "got {notice}");
-    assert!(notice.contains("the account is disabled"), "got {notice}");
-    assert!(
-        notice.contains("'work' carries it"),
-        "a carried day still has somebody home, and the notice says who: {notice}"
+    assert_eq!(
+        notice,
+        "sat: the list on 'old' (the account is disabled) cannot claim it. 'work' carries it"
     );
 }
 
@@ -429,8 +426,11 @@ fn a_passed_over_lister_with_no_carrier_names_the_fallback() {
     let notice = cfg
         .day_claim_passed_over(Weekday::Sat, &HashSet::new())
         .expect("a notice");
-    assert!(notice.contains("nothing else claims sat"), "got {notice}");
-    assert!(notice.contains("`preferred` decides it"), "got {notice}");
+    assert_eq!(
+        notice,
+        "sat: the list on 'old' (the account is disabled) cannot claim it. Nothing else claims \
+         sat, so `preferred` decides it"
+    );
 }
 
 // The ordinary case says nothing: every lister could serve, so no line is

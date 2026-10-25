@@ -58,7 +58,7 @@ fn refresh_transient_carries_the_error_in_the_detail() {
 fn refresh_transient_shows_a_login_change_alone() {
     let name = crate::profile::ProfileName::from("moved");
     let change = Transient::new(Cause::LoginChanged("moved".to_string()), Retry::Stated);
-    let sentence = "'moved' login changed during its refresh and the new login expires soon · retry in a moment";
+    let sentence = "'moved' login changed during its refresh and the new login expires soon. Retry in a moment";
     for m in [
         refresh_transient(&name, &change),
         refresh_transient_cli(&name, &change),
@@ -239,7 +239,7 @@ fn every_transient_cause_renders_its_own_copy() {
         },
         Row {
             cause: Cause::SidecarWriteFailed("work".to_string()),
-            bare: "could not write 'work' session token · check permissions on ~/.clauth",
+            bare: "could not write 'work' session token. Check permissions on ~/.clauth",
             names_next_step: true,
         },
         Row {
@@ -268,19 +268,19 @@ fn every_transient_cause_renders_its_own_copy() {
         Row {
             cause: Cause::RollingGrantUnrecorded("work".to_string()),
             bare: "'work' usage chain has no recorded grant beyond the setup-token scopes, \
-                    so a rolling bearer cannot be told from a mint · run `clauth login work` \
+                    so a rolling bearer cannot be told from a mint. Run `clauth login work` \
                     to record the chain's real grant",
             names_next_step: true,
         },
         Row {
             cause: Cause::SidecarMisfilled("work".to_string()),
             bare: "'work' session token holds a rotating pair and no live mint backup exists \
-                    to heal it · re-capture with `clauth login work --setup-token`",
+                    to heal it. Re-capture with `clauth login work --setup-token`",
             names_next_step: true,
         },
         Row {
             cause: Cause::StateLockBusy("work".to_string()),
-            bare: "another clauth process holds ~/.clauth's state lock · 'work' left unchanged",
+            bare: "another clauth process holds ~/.clauth's state lock. 'work' left unchanged",
             names_next_step: false,
         },
         Row {
@@ -290,8 +290,8 @@ fn every_transient_cause_renders_its_own_copy() {
         },
         Row {
             cause: Cause::LoginChanged("work".to_string()),
-            bare: "'work' login changed during its refresh and the new login expires soon · \
-                    retry in a moment",
+            bare: "'work' login changed during its refresh and the new login expires soon. \
+                    Retry in a moment",
             names_next_step: true,
         },
     ] {
@@ -912,7 +912,7 @@ fn the_explain_age_cell_names_why_no_poll_is_coming() {
             &[row(OauthAge::Absent, Some(NoPollReason::CannotMeasure))],
             None
         ),
-        "  m  ok   ◆ can't read usage",
+        "  m  ok   can't read usage",
     );
     assert_eq!(
         render_start_walk(

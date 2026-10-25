@@ -5256,7 +5256,7 @@ fn apply_codex_switch(
                     match stale_home {
                         Some(home) => {
                             logline!(
-                                "clauth: codex auto-switched to '{target}' — restarting codex's app-server daemon so its tasks resume on it"
+                                "clauth: codex auto-switched to '{target}'. Restarting codex's app-server daemon so its tasks resume on it"
                             );
                             crate::codex_daemon::restart_in_background(
                                 home.to_path_buf(),
@@ -5264,7 +5264,7 @@ fn apply_codex_switch(
                             );
                         }
                         None => logline!(
-                            "clauth: codex auto-switched to '{target}' — live at the next codex session"
+                            "clauth: codex auto-switched to '{target}'. Live at the next codex session"
                         ),
                     }
                 }
@@ -5277,7 +5277,7 @@ fn apply_codex_switch(
             }) {
                 logline!("clauth: codex switch-off failed: {e:#}");
             } else {
-                logline!("clauth: every codex account is spent — codex active slot cleared");
+                logline!("clauth: every codex account is spent. Codex active slot cleared");
             }
         }
     }
@@ -7385,9 +7385,7 @@ pub(super) fn claude_rolling_tick(
             if let Ok(mut p) = pacing.lock() {
                 p.retry_after_ms.remove(name.as_str());
             }
-            logline!(
-                "clauth: '{name}' credentials changed under a re-stamp hold — re-checking now"
-            );
+            logline!("clauth: '{name}' credentials changed under a re-stamp hold. Re-checking now");
         }
         if !crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
             continue;

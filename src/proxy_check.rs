@@ -38,10 +38,11 @@ const BODY_LIMIT: u64 = 1 << 20;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 /// An inference answer can wait on the provider (a queued off-peak channel).
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(180);
-/// How much of a quoted value a violation line keeps.
+/// A violation line prints a quoted value in at most `REPR_MAX + 1` chars,
+/// `...` included.
 const REPR_MAX: usize = 80;
-/// What a violation line keeps of the route and the expectation, both built
-/// here but able to carry a proxy-supplied id.
+/// A violation line prints the route and the expectation, both built here but
+/// able to carry a proxy-supplied id, in at most `LINE_MAX + 1` chars.
 const LINE_MAX: usize = 240;
 /// The draft keeps a `/health` body under this many bytes, the daemon probe's
 /// body cap.
@@ -719,13 +720,6 @@ fn escape(text: &str) -> String {
         .collect()
 }
 
-fn cut(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        Some((at, _)) => format!("{}…", &text[..at]),
-        None => text.to_string(),
-    }
-}
-
 /// Two JSON values the contract treats as equal: numbers compare by value, so
 /// a `4.0` sent reads back equal to the `4` a JSON encoder writes for it.
 fn same(a: &Value, b: &Value) -> bool {
@@ -966,7 +960,7 @@ impl Checker<'_> {
                 [s.clone(), quoted[1..quoted.len() - 1].to_string()]
             })
             .fold(text.to_string(), |t, s| t.replace(&s, "<redacted>"));
-        cut(&escape(&redacted), max)
+        crate::format::truncate(&escape(&redacted), max + 1)
     }
 
     fn violation(&mut self, route: &str, expected: String, got: String) {

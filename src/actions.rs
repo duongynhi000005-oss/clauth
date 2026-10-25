@@ -77,7 +77,9 @@ pub(crate) fn validate_foreign_harness_free(name: &str, harness: Harness) -> Res
             .any(|n| n.eq_ignore_ascii_case(name)),
     };
     if held {
-        bail!("'{name}' is a {foreign} profile — profile names span both harnesses, pick another");
+        bail!(
+            "'{name}' is a {foreign} profile. Profile names span both harnesses, so pick another"
+        );
     }
     Ok(())
 }
@@ -1467,14 +1469,14 @@ fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
     let store = crate::profile::profile_subpath(&ProfileName::from(name), "auth.json")?;
     if !store.exists() {
         bail!(
-            "'{name}' has no stored codex login, so {} cannot follow it — log it in \
+            "'{name}' has no stored codex login, so {} cannot follow it. Log it in \
              with `clauth login {name} --codex --browser`",
             slot.display()
         );
     }
     if !adopt_operator_auth_slot(&slot, &store) {
         bail!(
-            "could not repoint {} at '{name}' — the switch was not made",
+            "could not repoint {} at '{name}'. The switch was not made.",
             slot.display()
         );
     }
@@ -1661,7 +1663,7 @@ pub(crate) fn codex_capture_lines(outcome: &CodexCaptureOutcome) -> Vec<String> 
             canonical,
             auth_path,
         } => lines.push(format!(
-            "clauth: {} already follows codex profile '{canonical}' — nothing to capture",
+            "clauth: {} already follows codex profile '{canonical}'. Nothing to capture",
             auth_path.display()
         )),
         CodexCaptureOutcome::Captured {
@@ -1681,15 +1683,15 @@ pub(crate) fn codex_capture_lines(outcome: &CodexCaptureOutcome) -> Vec<String> 
             }
             if *adopted {
                 lines.push(format!(
-                    "clauth: {} now follows the profile store — your own codex and clauth sessions share one chain",
+                    "clauth: {} now follows the profile store. Your own codex and clauth sessions share one chain",
                     auth_path.display()
                 ));
                 lines.push(format!(
-                    "clauth: while it does, `codex login` and `codex logout` reach '{canonical}'s chain through that link and revoke it server-side — remove the link first if you mean to mint a chain for a different account"
+                    "clauth: while it does, `codex login` and `codex logout` reach '{canonical}'s chain through that link and revoke it server-side. Remove the link first if you mean to mint a chain for a different account"
                 ));
             } else {
                 lines.push(format!(
-                    "clauth: could not repoint {} (no symlink support?) — it is now a SEPARATE copy of a single-use rotating chain, and the first refresh on either side strands the other. Run codex only through `clauth start {canonical}` from here on, or `codex login` again for your own use",
+                    "clauth: could not repoint {} (no symlink support?). It is now a SEPARATE copy of a single-use rotating chain, and the first refresh on either side strands the other. Run codex only through `clauth start {canonical}` from here on, or `codex login` again for your own use",
                     auth_path.display()
                 ));
             }
@@ -1717,7 +1719,7 @@ pub(crate) fn codex_login_capture_at(
         if holder.eq_ignore_ascii_case(&trimmed) {
             match mode {
                 CodexLandMode::CreateOnly => {
-                    bail!("codex profile '{holder}' already exists — create under a new name")
+                    bail!("codex profile '{holder}' already exists. Create it under a new name")
                 }
                 _ => {
                     return Ok(CodexCaptureOutcome::AlreadyFollows {
@@ -1734,7 +1736,7 @@ pub(crate) fn codex_login_capture_at(
         // obvious next step would therefore kill the already-captured profile
         // server-side, which no re-login of '{trimmed}' can undo.
         bail!(
-            "{slot} is already captured as codex profile '{holder}' — one chain, one \
+            "{slot} is already captured as codex profile '{holder}': one chain, one \
              profile. That slot is a LINK to '{holder}'s store, and `codex login` \
              revokes whatever it finds there before minting, so running it now would \
              kill '{holder}'s chain for good. Remove the link first (`rm {slot}` \
@@ -1768,7 +1770,7 @@ pub(crate) fn codex_login_capture_at(
     let (canonical, reauth, adopted) = crate::codex_profiles::CodexState::update(|state| {
         let (canonical, reauth) = match (state.canonical_name(&trimmed), mode) {
             (Some(canonical), CodexLandMode::CreateOnly) => {
-                bail!("codex profile '{canonical}' already exists — create under a new name");
+                bail!("codex profile '{canonical}' already exists. Create it under a new name");
             }
             (Some(canonical), _) => (canonical, true),
             (None, CodexLandMode::RequireExisting) => {
@@ -1783,12 +1785,12 @@ pub(crate) fn codex_login_capture_at(
             }
         };
         if canonical != guess {
-            bail!("'{trimmed}' was renamed while the capture prepared — re-run it");
+            bail!("'{trimmed}' was renamed while the capture prepared. Re-run it");
         }
         if crate::runtime::has_live_marker(&ProfileName::from(canonical.as_str())) {
             bail!(
                 "'{canonical}' has a live codex session, which holds the chain this \
-                 capture would replace — close it first"
+                 capture would replace. Close it first"
             );
         }
         if reauth {
@@ -1821,7 +1823,7 @@ fn codex_operator_capture_home() -> Result<std::path::PathBuf> {
         Some(mode) => bail!(
             "the operator codex does not keep its login in auth.json \
              (cli_auth_credentials_store = \"{mode}\" in {}/config.toml), so there is \
-             nothing current to capture there — set it to \"file\", run `codex login`, \
+             nothing current to capture there. Set it to \"file\", run `codex login`, \
              then re-run this capture",
             operator.display()
         ),
@@ -1844,7 +1846,7 @@ fn read_codex_operator_auth(auth_path: &std::path::Path) -> Result<crate::codex_
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             bail!(
-                "no codex login to capture — {} does not exist; run `codex login` first",
+                "no codex login to capture: {} does not exist. Run `codex login` first",
                 auth_path.display()
             )
         }
@@ -1852,14 +1854,14 @@ fn read_codex_operator_auth(auth_path: &std::path::Path) -> Result<crate::codex_
     };
     let parsed = crate::codex_auth::CodexAuth::parse(&raw).with_context(|| {
         format!(
-            "failed to parse {} — codex writes this file in place, so a login caught \
-             mid-write reads half-written; re-run the capture",
+            "failed to parse {}: codex writes this file in place, so a login caught \
+             mid-write reads half-written. Re-run the capture",
             auth_path.display()
         )
     })?;
     if parsed.refresh_token().is_none() {
         bail!(
-            "{} holds no ChatGPT token chain (an API-key-only setup?) — only a \
+            "{} holds no ChatGPT token chain (an API-key-only setup?). Only a \
              `codex login` chain can be captured",
             auth_path.display()
         );
@@ -1908,7 +1910,7 @@ fn refuse_codex_account_swap(canonical: &str, incoming: Option<&str>) -> Result<
     {
         bail!(
             "'{canonical}' stores ChatGPT account {old}, but this login is account \
-             {new} — log into a new profile, or delete '{canonical}' first"
+             {new}. Log into a new profile, or delete '{canonical}' first"
         );
     }
     Ok(())
@@ -2020,7 +2022,7 @@ pub(crate) fn land_codex_login(
     let canonical = crate::codex_profiles::CodexState::update(|state| {
         let (canonical, reauth) = match (state.canonical_name(trimmed), mode) {
             (Some(canonical), CodexLandMode::CreateOnly) => {
-                bail!("codex profile '{canonical}' already exists — create under a new name");
+                bail!("codex profile '{canonical}' already exists. Create it under a new name");
             }
             (Some(canonical), _) => (canonical, true),
             (None, CodexLandMode::RequireExisting) => {
@@ -2032,10 +2034,10 @@ pub(crate) fn land_codex_login(
             }
         };
         if canonical != guess {
-            bail!("'{trimmed}' was renamed while the login ran — re-run it");
+            bail!("'{trimmed}' was renamed while the login ran. Re-run it");
         }
         if crate::runtime::has_live_marker(&ProfileName::from(canonical.as_str())) {
-            bail!("'{canonical}' has a live codex session — close it before re-authenticating");
+            bail!("'{canonical}' has a live codex session. Close it before re-authenticating");
         }
         if reauth {
             refuse_codex_account_swap(&canonical, account_id.as_deref())?;
@@ -2064,7 +2066,7 @@ pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
     if let Some(acc) = outcome.account_id {
         outln!("clauth: ChatGPT account {acc}");
     }
-    outln!("clauth: run it with `clauth start {canonical}` — your own ~/.codex is untouched");
+    outln!("clauth: run it with `clauth start {canonical}`. Your own ~/.codex is untouched");
     Ok(())
 }
 
@@ -2078,7 +2080,7 @@ fn codex_operator_home() -> Result<std::path::PathBuf> {
         let dir = std::path::PathBuf::from(dir);
         if crate::runtime::is_codex_home_path(&dir) {
             bail!(
-                "CODEX_HOME points into a clauth codex session home — run the capture \
+                "CODEX_HOME points into a clauth codex session home. Run the capture \
                  from a shell outside `clauth start`, where ~/.codex (or your own \
                  CODEX_HOME) holds the operator's login"
             );

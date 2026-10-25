@@ -154,7 +154,7 @@ fn the_login_binds_the_seam_ports_in_order_and_refuses_with_both_held() {
     let err = bind_port_pair([p1, p2]).expect_err("both held").to_string();
     assert_eq!(
         err,
-        "codex's login ports (1455 and 1457) are both in use — close whatever holds them \
+        "codex's login ports (1455 and 1457) are both in use. Close whatever holds them \
          (another codex or clauth login?) and retry"
     );
     drop(primary);

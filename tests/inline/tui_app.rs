@@ -15503,7 +15503,7 @@ fn tui_switch_gate_login_change_warns_with_the_sentence_alone() {
         toasts,
         vec![(
             ToastKind::Warning,
-            "'moved' login changed during its refresh and the new login expires soon · retry in a moment"
+            "'moved' login changed during its refresh and the new login expires soon. Retry in a moment"
         )]
     );
 }
@@ -26944,7 +26944,7 @@ fn the_check_output_line_opens_a_masked_modal() {
     let super::Modal::CheckOutput(body) = app.modals.last().expect("a modal opened") else {
         panic!("the check output modal opened, got {:?}", app.modals.last());
     };
-    assert_eq!(body, "config error: sup…");
+    assert_eq!(body, "config error: sup...");
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
@@ -26952,7 +26952,7 @@ fn the_check_output_line_opens_a_masked_modal() {
         .expect("draw");
     let text = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
     assert!(
-        text.contains("sup…"),
+        text.contains("sup..."),
         "the masked stand-in renders:\n{text}"
     );
     assert!(
@@ -27028,7 +27028,7 @@ fn the_held_output_is_masked_against_the_checks_env_not_the_open_env() {
     let super::Modal::CheckOutput(body) = app.modals.last().expect("a modal opened") else {
         panic!("the check output modal opened, got {:?}", app.modals.last());
     };
-    assert_eq!(body, "config error: pla…");
+    assert_eq!(body, "config error: pla...");
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
@@ -27036,7 +27036,7 @@ fn the_held_output_is_masked_against_the_checks_env_not_the_open_env() {
         .expect("draw");
     let text = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
     assert!(
-        text.contains("pla…"),
+        text.contains("pla..."),
         "the masked stand-in renders:\n{text}"
     );
     assert!(
@@ -27171,7 +27171,7 @@ fn a_config_file_reference_is_masked_against_the_files_contents() {
         output.text()
     );
     assert!(
-        output.text().contains("fil…"),
+        output.text().contains("fil..."),
         "the file reference's stand-in renders: {}",
         output.text()
     );
@@ -27228,7 +27228,7 @@ fn a_config_var_reference_is_masked_against_the_checks_inherited_env() {
         output.text()
     );
     assert!(
-        output.text().contains("hun…"),
+        output.text().contains("hun..."),
         "the inherited reference's stand-in renders: {}",
         output.text()
     );

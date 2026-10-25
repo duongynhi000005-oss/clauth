@@ -29,12 +29,12 @@ use super::global_config::reminder_text;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
     DIAG_CREDIT_CAP, DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_LOGGED_OUT,
-    DIAG_MONTHLY_SOFT, DIAG_MONTHLY_SPENT, DIAG_NO_USAGE, DIAG_NO_USAGE_GLYPH,
-    DIAG_OTHER_MODELS_OK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when,
-    cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list, head_cols,
-    help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
-    name_color, pill, place_caret, rail_hint_lines, section_box, section_box_verbatim, select_line,
-    toggle_value, value_caret, wrap_words,
+    DIAG_MONTHLY_SOFT, DIAG_MONTHLY_SPENT, DIAG_NO_USAGE, DIAG_OTHER_MODELS_OK, DIAG_STALE,
+    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when, cycle_row_lines,
+    draw_scrolled_lines_with_footnote, draw_selector_list, head_cols, help_tooltip_lines,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill,
+    place_caret, rail_hint_lines, section_box, section_box_verbatim, select_line, toggle_value,
+    value_caret, wrap_words,
 };
 use super::prose::{cmd, key, mark_commands};
 use crate::fallback::{
@@ -440,6 +440,10 @@ fn draw_chain_detail(
         place_caret(frame, toast_rects, Position::new(cx, cy));
     }
 }
+
+/// The Fallback selector-row mark for a member clauth cannot measure; the help
+/// legend takes its glyph from here.
+const DIAG_NO_USAGE_GLYPH: &str = "◆";
 
 /// 1-cell selector marker for a member's worst blocked reason: color bands the
 /// severity, the glyph shape names the reason (the detail pill spells it out in

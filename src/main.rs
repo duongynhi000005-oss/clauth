@@ -118,7 +118,7 @@ fn claude_roster_part(config: &AppConfig) -> Vec<String> {
 fn profile_not_found_error(name: &str, parts: &[String]) -> anyhow::Error {
     usage_error(format!(
         "profile '{name}' not found\navailable: {}",
-        parts.join(" · ")
+        parts.join(", ")
     ))
 }
 
@@ -750,7 +750,7 @@ fn cmd_start(
                         anyhow::bail!(
                             "--with-fallback is not available on a codex profile: codex reads \
                              auth.json once at start, so a chain lands at the NEXT start, not \
-                             mid-session — start without the flag"
+                             mid-session. Start without the flag"
                         );
                     }
                     // Before `--explain` too, for the reason the claude arm runs
@@ -1298,9 +1298,9 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
     // failing on a 400 is the case that ruling exists for.
     let cli_err = |e: oauth_login::LoginError| anyhow::anyhow!("{}", e.cli_message());
     if reauth {
-        outln!("clauth: re-authenticating existing profile '{target}', opening a browser…");
+        outln!("clauth: re-authenticating existing profile '{target}', opening a browser...");
     } else {
-        outln!("clauth: opening a browser to log in to a new account for '{target}'…");
+        outln!("clauth: opening a browser to log in to a new account for '{target}'...");
     }
     let pending = oauth_login::begin_login().map_err(cli_err)?;
     let links = pending.links().clone();
@@ -1536,7 +1536,7 @@ fn cmd_login_console(config: &mut AppConfig, target: &str, model: Option<&str>) 
     let (site, region) = providers::alibaba::site_and_region(&base_url)
         .context("this profile's endpoint is not an Alibaba Model Studio one")?;
     outln!(
-        "clauth: opening the Alibaba Model Studio console to capture a usage session for '{target}'…"
+        "clauth: opening the Alibaba Model Studio console to capture a usage session for '{target}'..."
     );
     let outcome = alibaba_login::login_with(site, region, print_browser_fallback)?;
     actions::store_console_login(config, &target, outcome.console.clone())?;
@@ -1639,7 +1639,7 @@ fn cmd_login_setup_token(
     };
     let days = (expires_at - crate::usage::now_ms() as i64) / 86_400_000;
     outln!(
-        "clauth: long-lived token installed for '{target}' · assumed to expire in ~{days}d \
+        "clauth: long-lived token installed for '{target}'. It is assumed to expire in ~{days}d \
          (`claude setup-token` mints last about a year)."
     );
     outln!(
@@ -1740,12 +1740,12 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
         if active {
             if claude::has_stored_oauth_login(target) {
                 outln!(
-                    "clauth: '{target}' is active — clearing relinks the live credentials onto \
+                    "clauth: '{target}' is active. Clearing relinks the live credentials onto \
                      its stored OAuth login, and running sessions follow."
                 );
             } else {
                 outln!(
-                    "clauth: '{target}' is active and stores no OAuth login — clearing signs \
+                    "clauth: '{target}' is active and stores no OAuth login. Clearing signs \
                      Claude Code out, leaving '{target}' on its api key, and running sessions \
                      follow."
                 );
@@ -1833,7 +1833,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
             // does not hold would be this line's own lie.
             outln!(
                 "clauth: cleared the long-lived token for '{target}' and signed Claude Code \
-                 out: it stores no login at all now — run `clauth login {target}` before \
+                 out: it stores no login at all now. Run `clauth login {target}` before \
                  switching to it."
             );
         }
@@ -1850,7 +1850,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     } else {
         outln!(
             "clauth: cleared the long-lived token for '{target}'. It stores no login at all \
-             now — run `clauth login {target}` before switching to it."
+             now. Run `clauth login {target}` before switching to it."
         );
     }
     // The backup goes LAST, after the relink: failing between the sidecar
@@ -1861,7 +1861,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     let backup_removed = claude::clear_static_backup(target).with_context(|| {
         format!(
             "the long-lived token for '{target}' is cleared, but the preserved mint at \
-             session-token.static.json remains — remove it by hand, or re-run"
+             session-token.static.json remains. Remove it by hand, or re-run"
         )
     })?;
     for line in clear_postscripts(target, rolling_armed, backup_removed) {
@@ -1890,7 +1890,7 @@ fn clear_postscripts(target: &str, rolling_armed: bool, backup_removed: bool) ->
 /// there is no stdout capture, so the unit pin is on content and a deleted
 /// print orphans the fn into a dead-code error under `-D warnings`.
 fn clear_disarm_note(target: &str) -> String {
-    format!("clauth: '{target}' is on the rolling token — clearing also turns its re-stamping off.")
+    format!("clauth: '{target}' is on the rolling token. Clearing also turns its re-stamping off.")
 }
 
 /// The pre-prompt warning that the preserved mint goes with the clear — the
@@ -1899,7 +1899,7 @@ fn clear_disarm_note(target: &str) -> String {
 /// [`scope_widening_disclosure`].
 fn clear_backup_note(target: &str) -> String {
     format!(
-        "clauth: the preserved mint at session-token.static.json goes with it — \
+        "clauth: the preserved mint at session-token.static.json goes with it. \
          `clauth static-token {target}` will have nothing to restore."
     )
 }
@@ -1908,7 +1908,7 @@ fn clear_backup_note(target: &str) -> String {
 /// disarm half of the report, and the only confirmation the flag actually
 /// moved.
 fn clear_disarmed_postscript(target: &str) -> String {
-    format!("clauth: rolling-token is off · nothing re-stamps a sidecar for '{target}' now.")
+    format!("clauth: rolling-token is off. Nothing re-stamps a sidecar for '{target}' now.")
 }
 
 /// The post-clear statement that the preserved mint is destroyed. UNCONDITIONAL
@@ -1919,9 +1919,16 @@ fn clear_disarmed_postscript(target: &str) -> String {
 /// refuses for the flag.
 fn clear_backup_postscript(target: &str) -> String {
     format!(
-        "clauth: the preserved mint at session-token.static.json is gone · \
+        "clauth: the preserved mint at session-token.static.json is gone. \
          `clauth static-token {target}` has nothing to restore now."
     )
+}
+
+/// The both-rosters note `cmd_delete` and `cmd_switch` print when a name
+/// resolves in the claude roster and the codex roster: claude-first is the
+/// pinned precedence, said out loud rather than resolved silently.
+fn codex_collision_note(canonical: &ProfileName, verb: &str) -> String {
+    format!("clauth: note: '{canonical}' also names a codex profile. This {verb} the CLAUDE one")
 }
 
 /// `clauth delete <name> [--yes] [--force]` — remove a profile and all its
@@ -1944,7 +1951,7 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     // Same collision note as `cmd_switch`, and it matters more here: the verb
     // is destructive, and silence would read as "the only 'foo' is gone".
     if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
-        outln!("clauth: note — '{canonical}' also names a codex profile; deleting the CLAUDE one");
+        outln!("{}", codex_collision_note(&canonical, "deletes"));
     }
     if !confirm_profile_delete(&canonical, yes)? {
         return Ok(());
@@ -2126,11 +2133,9 @@ fn cmd_switch(name: &str) -> Result<()> {
         return Err(unknown_profile_error(&config, name));
     };
     let canonical = ProfileName::from(canonical);
-    // One namespace is enforced at creation, not against hand-edited state:
-    // when both files claim the name, claude-first is the pinned precedence —
-    // said out loud rather than resolved silently.
+    // One namespace is enforced at creation, not against hand-edited state.
     if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
-        outln!("clauth: note — '{canonical}' also names a codex profile; switching the CLAUDE one");
+        outln!("{}", codex_collision_note(&canonical, "switches"));
     }
     refuse_if_disabled(&config, &canonical)?;
     actions::switch_profile_cli(config, &canonical)
@@ -2192,7 +2197,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
             anyhow::bail!("{sentence}");
         }
         anyhow::bail!(
-            "'{canonical}' usage chain is dead · run `clauth login {canonical}` first, \
+            "'{canonical}' usage chain is dead. Run `clauth login {canonical}` first, \
              then re-run"
         );
     }
@@ -2207,7 +2212,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     if !plan_capable {
         outln!(
             "clauth: warning: the usage chain for '{canonical}' is missing the user:profile \
-             scope or a subscriptionType stamp · rolling tokens may not unlock plan-gated \
+             scope or a subscriptionType stamp. Rolling tokens may not unlock plan-gated \
              models. A fresh `clauth login {canonical}` browser sign-in fixes that."
         );
     }
@@ -2284,7 +2289,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
 fn rollback_stranded_warning(canonical: &str, save_err: &anyhow::Error) -> String {
     format!(
         "clauth: warning: could not roll the rolling-token flag back for \
-         '{canonical}' ({save_err:#}) · once ~/.clauth is writable, run \
+         '{canonical}' ({save_err:#}). Once ~/.clauth is writable, run \
          `clauth static-token {canonical}` to clear it"
     )
 }
@@ -2300,11 +2305,11 @@ fn restamp_promise(health: crate::daemon::DaemonHealth) -> &'static str {
         // Best-effort probe: an error reads Absent by design, so the
         // claim is hedged rather than absolute.
         crate::daemon::DaemonHealth::Absent => {
-            "No daemon appears to be running · nothing re-stamps it until \
+            "No daemon appears to be running. Nothing re-stamps it until \
              `clauth daemon` starts."
         }
         crate::daemon::DaemonHealth::Stale => {
-            "A daemon is present but its feed looks stale · check \
+            "A daemon is present but its feed looks stale. Check \
              `clauth daemon --status` or re-stamps may not land."
         }
         crate::daemon::DaemonHealth::Fresh => "The daemon re-stamps it before it expires.",
@@ -2347,7 +2352,7 @@ fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Resul
         // function's contract forbids.
         anyhow::bail!(
             "arming reported success but '{canonical}' has no readable sidecar to verify, \
-             so nothing was confirmed · check permissions on ~/.clauth and re-run"
+             so nothing was confirmed. Check permissions on ~/.clauth and re-run"
         );
     };
     match kind {
@@ -2365,7 +2370,7 @@ fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Resul
         claude::SidecarKind::Mint => {
             outln!(
                 "clauth: '{canonical}' usage chain could not be read just now, so sessions \
-                 stay on the static mint. The flag is set · the daemon re-stamps on its next \
+                 stay on the static mint. The flag is set. The daemon re-stamps on its next \
                  rotation."
             );
         }
@@ -2374,7 +2379,7 @@ fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Resul
             // writer raced a fresh rotating pair back into the sidecar.
             anyhow::bail!(
                 "'{canonical}' sidecar was re-filled with a rotating pair while arming, so \
-                 the split is disengaged and nothing was armed · re-run, and if it repeats \
+                 the split is disengaged and nothing was armed. Re-run, and if it repeats \
                  find what is writing session-token.json"
             );
         }
@@ -2456,7 +2461,7 @@ fn cmd_static_token(name: &str) -> Result<()> {
     let restored = claude::restore_static_mint(&canonical).with_context(|| {
         format!(
             "'{canonical}' is off the rolling token now, but its preserved mint could not \
-             be restored · fix the file problem, then re-run `clauth static-token {canonical}`"
+             be restored. Fix the file problem, then re-run `clauth static-token {canonical}`"
         )
     })?;
     if restored {
@@ -2503,7 +2508,7 @@ fn cmd_static_token(name: &str) -> Result<()> {
                 )
             }
             outln!(
-                "clauth: '{canonical}' is already on its static long-lived mint · the \
+                "clauth: '{canonical}' is already on its static long-lived mint. The \
                  rolling token is off. Nothing to restore."
             );
             Ok(())
@@ -2512,7 +2517,7 @@ fn cmd_static_token(name: &str) -> Result<()> {
             anyhow::bail!(
                 "'{canonical}' is off the rolling token now, but there was no live static \
                  mint to restore.{backup_note} The last rolling bearer serves until it \
-                 expires, and this command is what stopped its re-stamping · capture a \
+                 expires, and this command is what stopped its re-stamping. Capture a \
                  fresh long-lived login with `clauth login {canonical} --setup-token`."
             )
         }
@@ -2525,8 +2530,8 @@ fn cmd_static_token(name: &str) -> Result<()> {
         }
         None => {
             anyhow::bail!(
-                "'{canonical}' has no session-token sidecar and no live preserved mint · \
-                 sessions run on the rotating pair.{backup_note} Capture a long-lived login \
+                "'{canonical}' has no session-token sidecar and no live preserved mint. \
+                 Sessions run on the rotating pair.{backup_note} Capture a long-lived login \
                  with `clauth login {canonical} --setup-token`."
             )
         }

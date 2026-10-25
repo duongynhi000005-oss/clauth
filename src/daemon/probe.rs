@@ -323,7 +323,7 @@ pub(crate) fn claim_singleton_with(
         debug_assert!(
             matches!(claim, Claim::Redundant),
             "only a Redundant reaches the retry: a won claim still owns its flocks here, because \
-             assignment drops the old value AFTER claim_once has already run — the next attempt \
+             assignment drops the old value AFTER claim_once has already run. The next attempt \
              would race its own slot lock and read itself as a foreign holder"
         );
         std::thread::sleep(retry);

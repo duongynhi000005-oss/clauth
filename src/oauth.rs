@@ -3127,7 +3127,7 @@ fn ensure_installable_with(
 pub(crate) fn log_long_lived_token_expiry(name: &crate::profile::ProfileName) {
     logline!(
         "clauth: '{name}' long-lived token has expired (or sits inside Claude \
-         Code's own five-minute refresh window) — re-mint with \
+         Code's own five-minute refresh window). Re-mint with \
          `claude setup-token` (clauth login {name} --setup-token)"
     );
 }
@@ -3174,7 +3174,7 @@ fn vanilla_install_gate(
         Some(crate::claude::SessionTokenStatus::NotLongLived) => {
             logline!(
                 "clauth: '{name}' session-token.json holds a rotating pair (refresh \
-                 token present), not a long-lived mint — ignoring it; re-capture \
+                 token present), not a long-lived mint. Ignoring it. Re-capture \
                  with `clauth login {name} --setup-token`"
             );
         }
@@ -3316,7 +3316,7 @@ fn rolling_install_gate(
             Ok(crate::claude::HealOutcome::NoLiveBackup) => {
                 logline!(
                     "clauth: '{name}' sidecar is mis-filled and no live static backup exists \
-                     to restore — the split stays disengaged; re-capture with \
+                     to restore. The split stays disengaged. Re-capture with \
                      `clauth login {name} --setup-token`"
                 );
                 return match wait {
@@ -3478,7 +3478,7 @@ fn rolling_install_gate(
             // not that coupling.
             if sidecar_live(crate::claude::session_token_status(name)) {
                 logline!(
-                    "clauth: '{name}' usage chain is dead — sessions degrade to {} \
+                    "clauth: '{name}' usage chain is dead. Sessions degrade to {} \
                      (`clauth login {name}` revives the chain and the rolling token)",
                     serving_desc(name)
                 );
@@ -3541,7 +3541,7 @@ pub(crate) fn arm_rolling_token(
         }
         AuthGate::Broken => {
             anyhow::bail!(
-                "'{name}' usage chain is dead · run `clauth login {name}` first, then re-run"
+                "'{name}' usage chain is dead. Run `clauth login {name}` first, then re-run"
             )
         }
         // CLI surface: `text_with_status` is the flavor that names the HTTP
@@ -3764,7 +3764,7 @@ fn serving_desc(name: &ProfileName) -> &'static str {
         // `sidecar_live`, which requires a refresh-less LongLived read), but a
         // mis-fill must never be DESCRIBED as a serving bearer if one arrives.
         Some((crate::claude::SidecarKind::Misfilled, _)) => {
-            "nothing — its sidecar is mis-filled and the split is disengaged"
+            "nothing: its sidecar is mis-filled and the split is disengaged"
         }
         _ => "its last rolling bearer, until that expires",
     }

@@ -859,7 +859,7 @@ pub(crate) fn standby_pass(
                                 clear_plight_warn(name, "corrupt");
                                 logline!(
                                     "clauth: '{name}' codex auth.json read bad for \
-                                     {}s — restored the last-known-good copy",
+                                     {}s. Restored the last-known-good copy",
                                     (now_ms - first_ms) / 1000
                                 );
                                 StandbyOutcome::Restored

@@ -801,7 +801,7 @@ fn a_login_change_during_the_gates_refresh_defers_the_switch() {
     match err {
         SwitchError::Deferred(sentence) => assert_eq!(
             sentence,
-            "'target' login changed during its refresh and the new login expires soon · retry in a moment"
+            "'target' login changed during its refresh and the new login expires soon. Retry in a moment"
         ),
         other => panic!("expected a deferral, got {other:?}"),
     }

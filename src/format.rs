@@ -240,9 +240,7 @@ impl Cause {
             }
             Self::InternalLock => "clauth hit an internal lock error, restart clauth".to_string(),
             Self::SidecarWriteFailed(profile) => {
-                format!(
-                    "could not write '{profile}' session token · check permissions on ~/.clauth"
-                )
+                format!("could not write '{profile}' session token. Check permissions on ~/.clauth")
             }
             Self::LiveSessionOnRotatingChain(profile) => {
                 format!(
@@ -265,19 +263,19 @@ impl Cause {
             Self::RollingGrantUnrecorded(profile) => {
                 format!(
                     "'{profile}' usage chain has no recorded grant beyond the setup-token \
-                     scopes, so a rolling bearer cannot be told from a mint · run \
+                     scopes, so a rolling bearer cannot be told from a mint. Run \
                      `clauth login {profile}` to record the chain's real grant"
                 )
             }
             Self::SidecarMisfilled(profile) => {
                 format!(
                     "'{profile}' session token holds a rotating pair and no live mint backup \
-                     exists to heal it · re-capture with `clauth login {profile} --setup-token`"
+                     exists to heal it. Re-capture with `clauth login {profile} --setup-token`"
                 )
             }
             Self::StateLockBusy(profile) => {
                 format!(
-                    "another clauth process holds ~/.clauth's state lock · '{profile}' left \
+                    "another clauth process holds ~/.clauth's state lock. '{profile}' left \
                      unchanged"
                 )
             }
@@ -292,7 +290,7 @@ impl Cause {
             Self::LoginChanged(profile) => {
                 format!(
                     "'{profile}' login changed during its refresh and the new login expires \
-                     soon · retry in a moment"
+                     soon. Retry in a moment"
                 )
             }
         }
@@ -601,11 +599,13 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    if max == 0 {
-        return String::new();
+    // Three ASCII dots stand in for the ellipsis, so the content budget shrinks
+    // by three to keep the total at `max` columns.
+    if max < 3 {
+        return "...".chars().take(max).collect();
     }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
+    let mut out: String = s.chars().take(max - 3).collect();
+    out.push_str("...");
     out
 }
 
@@ -766,12 +766,6 @@ pub(crate) const DIAG_STALE: &str = "stale data";
 /// one thing.
 pub(crate) const DIAG_NO_USAGE: &str = "can't read usage";
 
-/// The mark preceding [`DIAG_NO_USAGE`] as a state, one source so its two
-/// renderers cannot drift: the CLI's `--explain` age cell and the Fallback
-/// chain's selector-row marker (`chain::reason_marker`), which the help legend
-/// also takes its glyph from.
-pub(crate) const DIAG_NO_USAGE_GLYPH: &str = "◆";
-
 /// A seconds age as the relative ladder (`4m ago`, `2h ago`, `3d ago`), open
 /// ended into weeks. The TUI's `relative_age` (`tui/render/format.rs`) and the
 /// CLI's session/device age cells call [`spoken_age`], which switches to the
@@ -875,9 +869,7 @@ fn start_age_cell(row: &StartCandidate) -> String {
         // the cell names why instead, in the fallback pill's own words where it
         // has them.
         OauthAge::Absent => match row.no_poll {
-            Some(NoPollReason::CannotMeasure) => {
-                format!("{DIAG_NO_USAGE_GLYPH} {DIAG_NO_USAGE}")
-            }
+            Some(NoPollReason::CannotMeasure) => DIAG_NO_USAGE.to_string(),
             Some(NoPollReason::ApiKeyOnly) => "api key, no usage windows".to_string(),
             None => "no usage yet".to_string(),
         },

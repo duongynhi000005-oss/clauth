@@ -165,6 +165,120 @@ fn calls(code: &str, macro_name: &str) -> bool {
     })
 }
 
+/// The CLI prints plain ASCII text: no marks, separators, ellipses or
+/// typographic dashes. Default-deny over every non-ASCII character in code
+/// under `src/`, so a new glyph reds the moment it lands; `clap` renders
+/// `src/cli.rs`'s `///` lines as `--help`, so those count as code there.
+///
+/// Out of scope, each named: the TUI (`src/tui/`) and the MCP server's replies
+/// (`src/mcp/`) keep their own text rules, `src/testutil.rs` is test-only; [`GLYPH_EXEMPT`] lists the other
+/// surfaces outside the CLI's own text (the generated `config.toml` comments,
+/// the codex login browser page, the daemon API's OpenAPI document, which
+/// `daemon --dump-openapi` prints verbatim). [`glyph_allowed`] holds
+/// the two glyph kinds the CLI keeps.
+///
+/// A `\u{...}` escape in a string counts as the character it spells. Limits shared with
+/// `no_bare_print_macro_under_src`: a `//` inside a string literal hides the
+/// rest of its line, and a glyph in a block comment reds. Its own limit: an
+/// escape right after a `'` is read as a char literal and skipped, so a glyph
+/// spelled `'\u{2014}'` and printed through `{}`, or a string spelling a quote
+/// then an escape, passes.
+#[test]
+fn no_glyph_in_cli_text_under_src() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let scanned = crate::testutil::rs_files(&root.join("src"));
+    assert!(
+        scanned.len() > 10,
+        "the scan found {} files under src/ — it is not reading the crate",
+        scanned.len()
+    );
+    let mut offenders = Vec::new();
+    for file in scanned {
+        let rel = file
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel.starts_with("src/tui/") || rel.starts_with("src/mcp/") || rel == "src/testutil.rs" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).unwrap();
+        for (n, line) in text.lines().enumerate() {
+            let help = rel == "src/cli.rs" && line.trim_start().starts_with("///");
+            let code = if help {
+                line
+            } else {
+                line.split("//").next().unwrap_or_default()
+            };
+            let exempt = GLYPH_EXEMPT
+                .iter()
+                .any(|(path, fragment)| rel == *path && line.contains(fragment));
+            if exempt {
+                continue;
+            }
+            if let Some(c) = code
+                .chars()
+                .chain(escaped_chars(code))
+                .find(|&c| !c.is_ascii() && !glyph_allowed(c))
+            {
+                offenders.push(format!("{rel}:{}: {c:?} in {}", n + 1, code.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "{} CLI text line(s) carry a non-ASCII glyph; write them in plain ASCII:\n{}",
+        offenders.len(),
+        offenders.join("\n")
+    );
+}
+
+/// The characters `\u{...}` escapes in `code` spell, skipping any escape right
+/// after a `'`: the char literals under `src/` today are matched or compared,
+/// never printed.
+fn escaped_chars(code: &str) -> impl Iterator<Item = char> + '_ {
+    code.match_indices("\\u{").filter_map(|(at, _)| {
+        if code[..at].ends_with('\'') {
+            return None;
+        }
+        let hex = code[at + 3..].split('}').next()?;
+        char::from_u32(u32::from_str_radix(hex, 16).ok()?)
+    })
+}
+
+/// The glyphs the CLI keeps: the `→` arrow and the stderr spinner's braille
+/// frames.
+fn glyph_allowed(c: char) -> bool {
+    c == '\u{2192}' || ('\u{2800}'..='\u{28FF}').contains(&c)
+}
+
+/// Lines outside the CLI's own text, by file and a fragment of the line: each
+/// codex browser reply is quoted whole, so the CLI errors beside them stay
+/// scanned.
+const GLYPH_EXEMPT: [(&str, &str); 6] = [
+    ("src/profile.rs", "out.push_str(\"# "),
+    (
+        "src/codex_login.rs",
+        "\"waiting for the codex login\u{2026}\"",
+    ),
+    (
+        "src/codex_login.rs",
+        "\"login state mismatch \u{2014} close this and retry\"",
+    ),
+    (
+        "src/codex_login.rs",
+        "\"codex login complete \u{2014} return to your terminal.\"",
+    ),
+    (
+        "src/codex_login.rs",
+        "\"codex login failed \u{2014} return to your terminal\"",
+    ),
+    (
+        "src/daemon/api/events.rs",
+        "description = \"a server-sent-events stream",
+    ),
+];
+
 /// What proves the guard's drop restored the real sink is that a SECOND install
 /// succeeds at all: `capture_here` asserts the slot is free, so a drop that
 /// left the first capture standing panics right there. Emitting into no capture

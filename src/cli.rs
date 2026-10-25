@@ -90,13 +90,13 @@ pub(crate) enum Command {
 
     /// Save the login Claude Code is using now as a new profile
     ///
-    /// Reads the live ~/.claude/.credentials.json — plus whatever endpoint and
-    /// api key Claude Code is running on — and stores it under <name>, with no
+    /// Reads the live ~/.claude/.credentials.json, plus whatever endpoint and
+    /// api key Claude Code is running on, and stores it under <name>, with no
     /// browser flow. This is the way to adopt a login `claude` already minted,
     /// including the one a first account is refused over when the live file
     /// holds a login no profile owns. The first profile becomes the active
     /// account; a later one needs `clauth <name>` to switch to. An existing
-    /// name is refused — re-authenticating one is `clauth login <name>`.
+    /// name is refused. Re-authenticating one is `clauth login <name>`.
     Capture {
         /// Profile to save the current login under.
         profile: String,
@@ -225,7 +225,7 @@ pub(crate) enum Command {
     ///
     /// One row per record in ~/.clauth/jobs/: background runs still going,
     /// blocking runs whose caller is still waiting, finished results nothing
-    /// has collected yet, and runs whose server died. Read-only — stopping one
+    /// has collected yet, and runs whose server died. Read-only: stopping one
     /// is the `monitor` tool's job. An empty store exits 0.
     Jobs {
         /// Emit a stable newest-first JSON array instead of the table. The
@@ -254,8 +254,8 @@ pub(crate) enum Command {
     /// bare `clauth <name>` act under its own verb, repointing the credentials
     /// the global `claude` reads (a codex name moves the codex active marker
     /// instead). Two names address a live session: `clauth switch <sid>
-    /// <profile>` records the profile as the session's intended member — the
-    /// same registry write the fallback chain's decider makes — and installs
+    /// <profile>` records the profile as the session's intended member, the
+    /// same registry write the fallback chain's decider makes, and installs
     /// nothing itself: the session's own executor performs the switch, or
     /// refuses it with a logged reason (a member whose endpoint, key, or
     /// models differ from the launch profile's is refused, exactly as the
@@ -268,7 +268,7 @@ pub(crate) enum Command {
     Switch {
         /// Profile to switch the global account to, or a live session id.
         name: String,
-        /// Profile to point the live session at — its presence is what makes
+        /// Profile to point the live session at. Its presence is what makes
         /// the two-name form the session form.
         profile: Option<String>,
     },
@@ -318,14 +318,14 @@ pub(crate) enum Command {
         /// Also serve the REST API over TLS; bare --listen means 0.0.0.0:8443
         ///
         /// For running the daemon on one machine and a client (clauth-tray) on
-        /// another. TLS comes from this host's lego certificate — from
+        /// another. TLS comes from this host's lego certificate: from
         /// /etc/lego/certificates on macOS and Linux, and from
         /// %AppData%\lego\certificates on Windows, either overridable in
         /// ~/.clauth/tls.json. Every request but a pairing needs a paired
         /// device's token; see `clauth devices`.
         ///
         /// The value-less spelling binds every interface, matching what the
-        /// flag is for — a client on another machine. It is the same exposure
+        /// flag is for: a client on another machine. It is the same exposure
         /// the spelled-out form always had, just less to type; the flag itself
         /// still has to be passed, so nothing listens by accident.
         #[arg(
@@ -342,7 +342,7 @@ pub(crate) enum Command {
         /// no certificate covers, and `tailscale cert` writes a `<name>.crt` and
         /// `<name>.key` with no issuer file and none of lego's naming.
         ///
-        /// Both files are read as PEM. Given these, nothing else is consulted —
+        /// Both files are read as PEM. Given these, nothing else is consulted:
         /// not `hostname -f`, not the directory in ~/.clauth/tls.json, and no
         /// issuer file beside the certificate. Requires --key and --listen.
         #[arg(long, value_name = "PATH", requires = "key", requires = "listen")]
@@ -389,7 +389,7 @@ pub(crate) enum Command {
     ///
     /// The same shape the daemon writes to ~/.clauth/status.json.
     Status {
-        /// Required — status has no other output mode.
+        /// Required: status has no other output mode.
         #[arg(long, required = true)]
         json: bool,
         /// Also list disabled profiles, hidden by default.
@@ -471,7 +471,7 @@ pub(crate) enum Command {
     /// stored key to stdout so the runtime settings.json never holds it. The
     /// command reads, never mints: every call prints the same static key from
     /// `config.toml` until a re-login or the divergence adopt re-captures it,
-    /// so a copied value keeps working across any number of child sessions —
+    /// so a copied value keeps working across any number of child sessions:
     /// it is not single-use.
     #[command(name = "__api-key", hide = true)]
     ApiKey {
@@ -543,12 +543,12 @@ pub(crate) struct StartArgs {
     ///
     /// The session starts on this profile and swaps onto the next chain member
     /// when its window is spent, instead of stopping where the account does. If
-    /// a chain member is today's home account — the `preferred` flag, or a
-    /// `preferred_days` list naming today — the session also returns to it once
+    /// a chain member is today's home account (the `preferred` flag, or a
+    /// `preferred_days` list naming today), the session also returns to it once
     /// it reads clear and fresh again. Needs a running
     /// `clauth daemon` to decide the switches, and a profile that is already a
     /// chain member. Not available with --isolated, on a non-OAuth account,
-    /// or on a Windows host without symlink privilege — each of those is refused
+    /// or on a Windows host without symlink privilege. Each of those is refused
     /// by name at launch.
     #[arg(long, conflicts_with = "isolated")]
     pub(crate) with_fallback: bool,
@@ -613,7 +613,7 @@ impl StartArgs {
     ///
     /// `--auto` leaves no profile to fill, but clap fills positionals in
     /// declaration order and binds the first trailing value to that slot
-    /// anyway — so `clauth start --auto -- -p "hi"` parks `-p` in `profile` and
+    /// anyway, so `clauth start --auto -- -p "hi"` parks `-p` in `profile` and
     /// leaves `claude` a bare `hi`. Folding it back is what makes the `--`
     /// spelling come out whole on the other side.
     pub(crate) fn passthrough(&self) -> Vec<String> {
@@ -649,12 +649,12 @@ pub(crate) struct LoginArgs {
     pub(crate) setup_token: bool,
     /// Create (or re-authenticate) a CODEX profile instead, by adopting the
     /// operator's own `codex login` out of ~/.codex/auth.json. The flag picks
-    /// which state file the profile lives in and appears only on this verb —
-    /// switch, delete, and start resolve bare names against both rosters.
+    /// which state file the profile lives in and appears only on this verb.
+    /// Switch, delete, and start resolve bare names against both rosters.
     #[arg(long, conflicts_with_all = ["base_url", "api_key", "setup_token", "model"])]
     pub(crate) codex: bool,
     /// With --codex: mint a FRESH codex chain via the browser instead of
-    /// adopting ~/.codex — a login clauth alone holds, leaving your own codex
+    /// adopting ~/.codex: a login clauth alone holds, leaving your own codex
     /// untouched. Requires --codex.
     #[arg(long, requires = "codex")]
     pub(crate) browser: bool,
