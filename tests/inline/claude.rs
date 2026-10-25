@@ -1574,11 +1574,18 @@ fn validate_setup_token_accepts_a_mint_and_rejects_bad_pastes() {
     );
     assert!(
         validate_setup_token(&format!("Setup token: {good}")).is_err(),
-        "paste with prompt text has interior whitespace"
+        "paste with prompt text in front fails the prefix check"
     );
     assert!(
         validate_setup_token("sk-ant-short").is_err(),
         "truncated paste"
+    );
+    let split_paste = format!("sk-ant-oat01-{} {}", "x".repeat(24), "x".repeat(24));
+    assert_eq!(
+        validate_setup_token(&split_paste)
+            .expect_err("interior whitespace refuses")
+            .to_string(),
+        "the pasted token contains whitespace, likely a partial or padded paste"
     );
     assert_eq!(
         validate_setup_token(&format!("sk-ant-api03-{}", "z".repeat(48)))

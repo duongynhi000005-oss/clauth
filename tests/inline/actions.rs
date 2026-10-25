@@ -7211,6 +7211,39 @@ fn codex_capture_refusals_name_the_fix() {
     );
 }
 
+/// The TUI's `+ new` create refuses a name the codex roster already holds,
+/// both while the operator slot still follows that profile and once it holds
+/// a fresh login of its own.
+#[test]
+fn a_create_only_capture_refuses_an_existing_codex_name() {
+    let home = HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    let _codex_home = crate::testutil::CodexHomeSandbox::new(&home, &operator);
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    codex_login_capture("cx").expect("first capture");
+    let refusal = "codex profile 'cx' already exists. Create it under a new name";
+
+    let operator_auth = operator.join("auth.json");
+    assert_eq!(
+        std::fs::read_link(&operator_auth).expect("the capture adopted the slot"),
+        profile_dir(&crate::profile::ProfileName::from("cx"))
+            .expect("dir")
+            .join("auth.json"),
+        "the first refusal runs while the slot still follows 'cx'"
+    );
+    let err = codex_login_capture_at("cx", "2026-10-25T00:00:00Z", CodexLandMode::CreateOnly)
+        .err()
+        .expect("the slot still follows 'cx'");
+    assert_eq!(err.to_string(), refusal);
+
+    std::fs::remove_file(&operator_auth).expect("drop link");
+    std::fs::write(&operator_auth, OPERATOR_AUTH).expect("write a fresh login");
+    let err = codex_login_capture_at("cx", "2026-10-25T00:00:00Z", CodexLandMode::CreateOnly)
+        .err()
+        .expect("the roster already holds 'cx'");
+    assert_eq!(err.to_string(), refusal);
+}
+
 /// Cross-harness uniqueness holds at capture, checked under the lock.
 #[test]
 fn codex_capture_refuses_a_claude_held_name() {

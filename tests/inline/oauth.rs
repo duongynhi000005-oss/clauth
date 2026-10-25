@@ -8460,3 +8460,33 @@ fn the_gate_adoption_never_takes_a_spent_store_over_memory() {
 
     assert_eq!(memory_refresh(&handle, name).as_deref(), Some("rt-new"));
 }
+
+/// A sidecar carrying a refresh token is a mis-fill, and the degrade log never
+/// describes it as a serving bearer.
+#[test]
+fn a_misfilled_sidecar_is_described_as_serving_nothing() {
+    let _home = HomeSandbox::new();
+    let name = pn("work");
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::create_dir_all(&dir).expect("create profile dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "rolling-access".to_string(),
+                refresh_token: Some("rolling-refresh".to_string()),
+                expires_at: Some(future_expiry()),
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        })
+        .expect("serialize"),
+    )
+    .expect("write sidecar");
+
+    assert_eq!(
+        serving_desc(&name),
+        "nothing: its sidecar is mis-filled and the split is disengaged"
+    );
+}
