@@ -585,8 +585,8 @@ fn span_w(spans: &[Span<'static>]) -> usize {
 }
 
 /// A row with `left` flush to the start and `right` flush to `width`, the gap
-/// filled with spaces. Alignment + color separate facts, not a `·` middot
-/// (that's reserved for banner/toast prose).
+/// filled with spaces. Alignment + color separate the two facts; `lr` itself
+/// never writes a `·`.
 fn lr(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
     let gap = width.saturating_sub(span_w(&left) + span_w(&right)).max(1);
     let mut spans = left;
@@ -635,12 +635,14 @@ struct DashRects {
 }
 
 /// Two-column reflow gates: enough width for a card column plus a chart column
-/// that still beats the single-column band, enough height for the full card
-/// stack (7+7+7+6 rows) with a usable hour chart below it.
+/// beside it (the chart takes what `CARD_COL_W` leaves), enough
+/// height for the full card stack (7+7+7+6 rows) with a usable hour chart below
+/// it.
 const TWO_COL_MIN_W: u16 = 140;
 const TWO_COL_MIN_H: u16 = 32;
-/// Card (left) column width in the two-column layout.
-const CARD_COL_W: u16 = 56;
+/// Card (left) column width in the two-column layout: 56 inner cells, room for
+/// the today card's speed row with 3-digit speeds and a 5-digit peak rate.
+const CARD_COL_W: u16 = 60;
 
 /// On a big terminal the dashboard reflows to two columns — cards stacked on
 /// the left, the trend + activity charts taking the whole right column, so
@@ -986,7 +988,11 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 inner_w(d.first),
                 count_cache,
                 prices,
-                today_speed_line(app, speed_days.get(&today_date()).copied()),
+                today_speed_line_within(
+                    app,
+                    speed_days.get(&today_date()).copied(),
+                    inner_w(d.first),
+                ),
             );
             card(
                 frame,
@@ -1003,13 +1009,14 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Total stays the lifetime anchor in every period — the scoped window
     // already owns the first card.
     if on_screen(r.total) {
-        let (total_body, total_meta) = total_lines(
+        let (total_body, total_meta) = total_lines_with_peaks(
             stats,
             &speed_days,
             inner_w(d.total),
             inner_h(d.total),
             count_cache,
             prices,
+            app.fresh_tps().map(|s| &s.peaks.ever),
         );
         card(
             frame,
@@ -1326,12 +1333,27 @@ fn merged_speed_days(
     days
 }
 
-/// The today card's `speed` row: `S t/s now · S t/s today`. The `now` figure is
-/// the fresh producer's `total.live.speed`; the `today` figure is the merged
-/// day sum's average (see [`merged_speed_days`]). Renders from the first frame:
-/// before a producer answers, both figures read `—`.
+/// The today card's `speed` row, unbounded: the render tests' form of
+/// [`today_speed_line_within`].
+#[cfg(test)]
 fn today_speed_line(app: &App, today: Option<crate::tps::DaySum>) -> Line<'static> {
-    let now = app.fresh_tps().and_then(|s| s.total.live.speed);
+    today_speed_line_within(app, today, usize::MAX)
+}
+
+/// The today card's `speed` row: `S t/s now · S t/s today`, then today's total
+/// peak RATE (`S tok/s peak`) when the fresh producer holds one. The `now`
+/// figure is the fresh producer's `total.live.speed`; the `today` figure is the
+/// merged day sum's average (see [`merged_speed_days`]). Parts shed whole from
+/// the right to fit the card's `w` columns — the peak first, then `· S t/s
+/// today`; `S t/s now` is the floor. Renders from the first
+/// frame: before a producer answers, both figures read `—` and no peak shows.
+fn today_speed_line_within(
+    app: &App,
+    today: Option<crate::tps::DaySum>,
+    w: usize,
+) -> Line<'static> {
+    let fresh = app.fresh_tps();
+    let now = fresh.and_then(|s| s.total.live.speed);
     let today = today.and_then(crate::tui::app::day_average);
     let figure = |v: Option<f64>| {
         v.map_or_else(
@@ -1344,21 +1366,45 @@ fn today_speed_line(app: &App, today: Option<crate::tps::DaySum>) -> Line<'stati
             },
         )
     };
-    Line::from(vec![
+    let mut spans = vec![
         key("speed"),
         figure(now),
         Span::styled(" now", theme::dim()),
+    ];
+    let mut used = span_w(&spans);
+    let today_part = vec![
         Span::styled(" · ", theme::dim()),
         figure(today),
         Span::styled(" today", theme::dim()),
-    ])
+    ];
+    let today_w = span_w(&today_part);
+    if used + today_w > w {
+        return Line::from(spans);
+    }
+    used += today_w;
+    spans.extend(today_part);
+    let peak = fresh
+        .and_then(|s| s.peaks.today.rate.as_ref())
+        .map(|p| p.value);
+    if let Some(peak) = peak {
+        let part = vec![
+            Span::styled(" · ", theme::dim()),
+            Span::styled(
+                format!("{} tok/s", crate::tps::format_figure(peak)),
+                theme::body(),
+            ),
+            Span::styled(" peak", theme::dim()),
+        ];
+        if used + span_w(&part) <= w {
+            spans.extend(part);
+        }
+    }
+    Line::from(spans)
 }
 
-/// The lifetime TOTAL card: kv rows grouped on the left (the old right-edge
-/// `msgs`/date scatter read as fragments on wide cards), lifetime date range
-/// as the returned title-right meta. `h` is the card's inner rows: the
-/// `cache hit` badge takes its own line only when the rows built here plus one
-/// still fit in it.
+/// The lifetime TOTAL card without a producer's peaks: the render tests' form
+/// of [`total_lines_with_peaks`].
+#[cfg(test)]
 fn total_lines(
     stats: &TokenStats,
     speed_days: &std::collections::BTreeMap<String, crate::tps::DaySum>,
@@ -1366,6 +1412,26 @@ fn total_lines(
     h: usize,
     count_cache: bool,
     prices: Option<&PriceTable>,
+) -> (Vec<Line<'static>>, Option<String>) {
+    total_lines_with_peaks(stats, speed_days, w, h, count_cache, prices, None)
+}
+
+/// The lifetime TOTAL card: kv rows grouped on the left (the old right-edge
+/// `msgs`/date scatter read as fragments on wide cards), lifetime date range
+/// as the returned title-right meta. `h` is the card's inner rows: the
+/// `cache hit` badge takes its own line only when the rows built here plus one
+/// still fit in it. `peaks` is the fresh producer's all-time half: its peak
+/// speed then its peak rate end the `avg speed` row, each whole and only while
+/// `w` holds it; the rate peak sheds before the speed peak and leads when there
+/// is no speed peak.
+fn total_lines_with_peaks(
+    stats: &TokenStats,
+    speed_days: &std::collections::BTreeMap<String, crate::tps::DaySum>,
+    w: usize,
+    h: usize,
+    count_cache: bool,
+    prices: Option<&PriceTable>,
+    peaks: Option<&crate::tps::PeaksHalf>,
 ) -> (Vec<Line<'static>>, Option<String>) {
     let last = stats
         .topped_up_through
@@ -1408,7 +1474,7 @@ fn total_lines(
             gen_ms,
             ..Default::default()
         });
-        tail.push(Line::from(vec![
+        let mut spans = vec![
             key("avg speed"),
             avg.map_or_else(
                 || Span::styled("—", theme::faint()),
@@ -1419,7 +1485,41 @@ fn total_lines(
                     )
                 },
             ),
-        ]));
+        ];
+        let mut used = span_w(&spans);
+        let peak = |value: f64, unit: &'static str| {
+            vec![
+                Span::styled(" · ", theme::dim()),
+                Span::styled(
+                    format!("{} {unit}", crate::tps::format_figure(value)),
+                    theme::body(),
+                ),
+                Span::styled(" peak", theme::dim()),
+            ]
+        };
+        let speed_peak = peaks.and_then(|p| p.speed.as_ref()).map(|p| p.value);
+        let rate_peak = peaks.and_then(|p| p.rate.as_ref()).map(|p| p.value);
+        // Each peak part stands on its own: the rate peak follows a speed peak
+        // that fit, or leads when there is no speed peak. When only one fits,
+        // the rate peak sheds first.
+        let mut rate_allowed = true;
+        if let Some(value) = speed_peak {
+            let part = peak(value, "t/s");
+            let part_w = span_w(&part);
+            rate_allowed = used + part_w <= w;
+            if rate_allowed {
+                used += part_w;
+                spans.extend(part);
+            }
+        }
+        if rate_allowed && let Some(value) = rate_peak {
+            let part = peak(value, "tok/s");
+            let part_w = span_w(&part);
+            if used + part_w <= w {
+                spans.extend(part);
+            }
+        }
+        tail.push(Line::from(spans));
     }
     tail.push(Line::from(vec![
         key("msgs"),

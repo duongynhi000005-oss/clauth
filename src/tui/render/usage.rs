@@ -1312,9 +1312,11 @@ fn header_lines(
 /// response touched; a fresh producer's absent account reads a `0` rate. Speed
 /// is output tokens ÷ generation seconds; rate is output tokens ÷ wall-clock
 /// window length (today = seconds since 00:00 UTC, `0` under a fresh producer
-/// with no day row). Windows shed whole from the right when `inner_w` cannot
-/// hold them; both rows shed to the same window set (the wider rate row
-/// decides).
+/// with no day row). The `speed` row carries a fifth `peak` window — the
+/// account's peak speed today — which shows only after all four shared windows
+/// and only when the row still fits. Windows shed whole from the right when
+/// `inner_w` cannot hold them; both rows shed to the same window set (the wider
+/// rate row decides).
 fn tps_rows(profile: &Profile, app: &App, inner_w: u16) -> Vec<Line<'static>> {
     let name = profile.name.as_str();
     // `fresh` gates every figure: `—` everywhere with no fresh producer. Under
@@ -1361,8 +1363,20 @@ fn tps_rows(profile: &Profile, app: &App, inner_w: u16) -> Vec<Line<'static>> {
         ("today", today_rate),
     ];
     let keep = row_windows("tok/s", &rate_values, inner_w);
+    let peak = fresh
+        .and_then(|s| s.peaks.today.accounts.get(name))
+        .and_then(|group| group.speed.as_ref())
+        .map(|p| p.value);
+    let mut speed_shown = speed_values[..keep].to_vec();
+    if keep == speed_values.len() {
+        let mut with_peak = speed_shown.clone();
+        with_peak.push(("peak", peak));
+        if row_width("t/s", &with_peak) <= inner_w as usize {
+            speed_shown = with_peak;
+        }
+    }
     vec![
-        figure_row("speed", "t/s", &speed_values[..keep]),
+        figure_row("speed", "t/s", &speed_shown),
         figure_row("rate", "tok/s", &rate_values[..keep]),
     ]
 }
@@ -1372,18 +1386,35 @@ fn tps_rows(profile: &Profile, app: &App, inner_w: u16) -> Vec<Line<'static>> {
 fn row_windows(unit: &'static str, values: &[(&'static str, Option<f64>)], inner_w: u16) -> usize {
     let mut used = KEY_W + KEY_GUTTER;
     for (i, (window, value)) in values.iter().enumerate() {
-        let figure = value.map_or_else(
-            || "—".to_owned(),
-            |v| format!("{} {unit}", crate::tps::format_figure(v)),
-        );
-        let sep_w = if i > 0 { " · ".chars().count() } else { 0 };
-        let cell_w = sep_w + Span::raw(*window).width() + 1 + figure.chars().count();
+        let cell_w = window_cell(unit, window, *value, i > 0);
         if i > 0 && used + cell_w > inner_w as usize {
             return i;
         }
         used += cell_w;
     }
     values.len()
+}
+
+/// Total columns of a figure row holding `values` with `unit`.
+fn row_width(unit: &'static str, values: &[(&'static str, Option<f64>)]) -> usize {
+    KEY_W
+        + KEY_GUTTER
+        + values
+            .iter()
+            .enumerate()
+            .map(|(i, (window, value))| window_cell(unit, window, *value, i > 0))
+            .sum::<usize>()
+}
+
+/// The columns one window adds to a figure row: its ` · ` separator (all but
+/// the first), its name, a space and the figure with `unit`.
+fn window_cell(unit: &'static str, window: &str, value: Option<f64>, separated: bool) -> usize {
+    let figure = value.map_or_else(
+        || "—".to_owned(),
+        |v| format!("{} {unit}", crate::tps::format_figure(v)),
+    );
+    let sep_w = if separated { " · ".chars().count() } else { 0 };
+    sep_w + Span::raw(window).width() + 1 + figure.chars().count()
 }
 
 fn figure_row(

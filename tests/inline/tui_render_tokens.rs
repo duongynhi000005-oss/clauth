@@ -2728,3 +2728,306 @@ fn a_two_model_day_merges_each_model_on_its_own_total() {
         "the day merged per model"
     );
 }
+
+// ── tps peaks: the today speed row and the total avg-speed row ───────────
+
+/// The text of the card row holding `needle` in a full dashboard render, cut at
+/// the card's own `│` borders and trimmed.
+fn dashboard_card_row(app: &App, w: u16, h: u16, needle: &str) -> Option<String> {
+    dashboard_card_fit(app, w, h, needle).map(|(text, _)| text)
+}
+
+/// [`dashboard_card_row`] plus the card's text width: the cells between its
+/// `│` borders minus one padding cell on each side.
+fn dashboard_card_fit(app: &App, w: u16, h: u16, needle: &str) -> Option<(String, usize)> {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    rows.iter().find_map(|row| {
+        let at = row.find(needle)?;
+        let chars: Vec<char> = row.chars().collect();
+        let at = row[..at].chars().count();
+        let left = chars[..at].iter().rposition(|c| *c == '│')?;
+        let right = at + chars[at..].iter().position(|c| *c == '│')?;
+        let text = chars[left + 1..right]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string();
+        Some((text, right - left - 1 - 2))
+    })
+}
+
+/// The longest rung of a whole-part ladder that fits `width` cells; the floor
+/// rung when none fits (a row clipped below its floor then fails the compare).
+fn widest_fitting<'a>(ladder: &[&'a str], width: usize) -> &'a str {
+    ladder
+        .iter()
+        .rev()
+        .find(|rung| rung.chars().count() <= width)
+        .copied()
+        .unwrap_or(ladder[0])
+}
+
+/// The Tokens fixture with speed rows (ledger 1800 over 20 s, today's cache
+/// row 900 over 10 s: 90 t/s every way) and a fresh snapshot carrying `peaks`.
+fn tokens_app_with_peaks(peaks: Option<serde_json::Value>) -> App {
+    let mut app = app_with_stats(TokenPeriod::Daily);
+    let mut stats = populated_stats();
+    stats.speed_days.insert(
+        "2026-06-20".to_string(),
+        crate::tps::DaySum {
+            output: 1_800,
+            gen_ms: 20_000,
+            ..Default::default()
+        },
+    );
+    app.token_stats = Some(stats);
+    let mut snap = tps_tokens_snapshot(1_000);
+    if let Some(peaks) = peaks {
+        snap.peaks = serde_json::from_value(peaks).unwrap();
+    }
+    app.set_tps(Some(snap));
+    app
+}
+
+fn peaks_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "today": {
+            "speed": {"value": 412.3, "at": "2026-09-22T21:14:00.000+00:00", "account": "kerry", "model": "claude-opus-4-8"},
+            "rate": {"value": 1803.4, "at": "2026-09-22T21:02:00.000+00:00"}
+        },
+        "ever": {
+            "speed": {"value": 612.0, "at": "2026-09-20T21:14:00.000+00:00", "account": "kerry", "model": "claude-opus-4-8"},
+            "rate": {"value": 3104.2, "at": "2026-09-20T21:02:00.000+00:00"}
+        }
+    })
+}
+
+const DASH_WIDTHS: [u16; 5] = [100, 120, 160, 200, 240];
+
+/// The today card's speed row ends in today's total peak RATE (`peaks.today.rate`),
+/// never the peak speed, and adds no row. A card too narrow for it sheds the
+/// peak part whole: every width reads either the whole row or the row without
+/// its peak, the widest reads the whole row, and once a width shows the peak
+/// every wider one does.
+#[test]
+fn the_today_speed_row_ends_in_todays_peak_rate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = tokens_app_with_peaks(Some(peaks_fixture()));
+    let full = "speed     92 t/s now · 90 t/s today · 1803 tok/s peak";
+    let base = "speed     92 t/s now · 90 t/s today";
+    let mut shown = false;
+    for w in DASH_WIDTHS {
+        let row = dashboard_card_row(&app, w, 40, "t/s now")
+            .unwrap_or_else(|| panic!("{w}x40: no today speed row"));
+        assert!(row == full || row == base, "{w}x40: {row:?}");
+        if shown {
+            assert_eq!(row, full, "{w}x40: a wider card dropped the peak");
+        }
+        shown = row == full;
+    }
+    assert!(shown, "the widest dashboard shows the peak");
+}
+
+/// The total card's `avg speed` row ends in the all-time peak SPEED, then the
+/// all-time peak RATE (`peaks.ever`), units telling them apart. A narrow card
+/// sheds the rate peak first, then the speed peak, each whole.
+#[test]
+fn the_total_avg_speed_row_ends_in_the_all_time_peaks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = tokens_app_with_peaks(Some(peaks_fixture()));
+    let ladder = [
+        "avg speed 90 t/s",
+        "avg speed 90 t/s · 612 t/s peak",
+        "avg speed 90 t/s · 612 t/s peak · 3104 tok/s peak",
+    ];
+    // Every width from the narrow layout up: each width reads the longest
+    // whole-part rung its card's measured text width holds.
+    let mut shed = false;
+    for w in 50..=240u16 {
+        let (row, width) = dashboard_card_fit(&app, w, 40, "avg speed")
+            .unwrap_or_else(|| panic!("{w}x40: no avg speed row"));
+        assert_eq!(
+            row,
+            widest_fitting(&ladder, width),
+            "{w}x40 ({width} cells)"
+        );
+        shed |= row != ladder[2];
+    }
+    assert!(shed, "some width sheds the rate peak");
+    assert_eq!(
+        dashboard_card_row(&app, 240, 40, "avg speed").as_deref(),
+        Some(ladder[2]),
+        "the widest dashboard shows both peaks"
+    );
+
+    // A 6-digit speed peak is wide enough that narrow cards shed it too: the
+    // rate part goes first, then the speed part.
+    let wide = tokens_app_with_peaks(Some(serde_json::json!({
+        "ever": {
+            "speed": {"value": 123456.0, "at": "2026-09-20T21:14:00.000+00:00", "account": "kerry", "model": "claude-opus-4-8"},
+            "rate": {"value": 3104.2, "at": "2026-09-20T21:02:00.000+00:00"}
+        }
+    })));
+    let ladder = [
+        "avg speed 90 t/s",
+        "avg speed 90 t/s · 123456 t/s peak",
+        "avg speed 90 t/s · 123456 t/s peak · 3104 tok/s peak",
+    ];
+    let mut bare = false;
+    for w in 50..=240u16 {
+        let (row, width) = dashboard_card_fit(&wide, w, 40, "avg speed")
+            .unwrap_or_else(|| panic!("{w}x40: no avg speed row"));
+        assert_eq!(
+            row,
+            widest_fitting(&ladder, width),
+            "{w}x40 ({width} cells)"
+        );
+        bare |= row == ladder[0];
+    }
+    assert!(bare, "some width sheds the speed peak too");
+}
+
+/// A rate peak with no speed peak (every response under the 100-token floor)
+/// still shows: each peak part stands on its own.
+#[test]
+fn the_total_row_shows_a_rate_peak_without_a_speed_peak() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = tokens_app_with_peaks(Some(serde_json::json!({
+        "ever": {"rate": {"value": 3104.2, "at": "2026-09-20T21:02:00.000+00:00"}}
+    })));
+    assert_eq!(
+        dashboard_card_row(&app, 240, 40, "avg speed").as_deref(),
+        Some("avg speed 90 t/s · 3104 tok/s peak")
+    );
+}
+
+/// A cache past its freshness window shows no peak anywhere, even when it
+/// carries peaks: every peak read goes through the fresh snapshot.
+#[test]
+fn a_stale_snapshot_shows_no_peak() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = tokens_app_with_peaks(None);
+    let mut snap = tps_tokens_snapshot(10 * 60 * 1000);
+    snap.peaks = serde_json::from_value(peaks_fixture()).unwrap();
+    app.set_tps(Some(snap));
+    assert!(app.fresh_tps().is_none(), "a 10-minute-old cache is stale");
+    assert_eq!(
+        dashboard_card_row(&app, 240, 40, "— now").as_deref(),
+        Some("speed     — now · — today")
+    );
+    assert_eq!(
+        dashboard_card_row(&app, 240, 40, "avg speed").as_deref(),
+        Some("avg speed 90 t/s")
+    );
+}
+
+/// The today card's speed row sheds whole parts from the right (the peak,
+/// then the `today` figure), never clipping a part mid-way, at every width
+/// from the narrow layout up.
+#[test]
+fn the_today_speed_row_sheds_whole_parts_at_every_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = tokens_app_with_peaks(Some(peaks_fixture()));
+    let ladder = [
+        "speed     92 t/s now",
+        "speed     92 t/s now · 90 t/s today",
+        "speed     92 t/s now · 90 t/s today · 1803 tok/s peak",
+    ];
+    for w in 50..=240u16 {
+        let (row, width) = dashboard_card_fit(&app, w, 40, "t/s now")
+            .unwrap_or_else(|| panic!("{w}x40: no today speed row"));
+        assert_eq!(
+            row,
+            widest_fitting(&ladder, width),
+            "{w}x40 ({width} cells)"
+        );
+    }
+}
+
+/// An absent peak adds nothing: a fresh producer with no peaks, and no
+/// producer at all, leave both rows exactly as they read before peaks.
+#[test]
+fn an_absent_peak_leaves_the_speed_rows_unchanged() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = tokens_app_with_peaks(None);
+    assert_eq!(
+        dashboard_card_row(&app, 240, 40, "t/s now").as_deref(),
+        Some("speed     92 t/s now · 90 t/s today")
+    );
+    assert_eq!(
+        dashboard_card_row(&app, 240, 40, "avg speed").as_deref(),
+        Some("avg speed 90 t/s")
+    );
+
+    let mut app = tokens_app_with_peaks(Some(peaks_fixture()));
+    app.set_tps(None);
+    assert_eq!(
+        dashboard_card_row(&app, 240, 40, "— now").as_deref(),
+        Some("speed     — now · — today")
+    );
+    assert_eq!(
+        dashboard_card_row(&app, 240, 40, "avg speed").as_deref(),
+        Some("avg speed 90 t/s")
+    );
+}
+
+/// A later part never shows when an earlier one shed: with a wide speed peak
+/// and a narrow rate peak, a card too narrow for the speed peak reads the bare
+/// row, never the rate peak alone.
+#[test]
+fn the_total_rate_peak_never_shows_past_a_shed_speed_peak() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = tokens_app_with_peaks(Some(serde_json::json!({
+        "ever": {
+            "speed": {"value": 123456.0, "at": "2026-09-20T21:14:00.000+00:00", "account": "kerry", "model": "claude-opus-4-8"},
+            "rate": {"value": 5.0, "at": "2026-09-20T21:02:00.000+00:00"}
+        }
+    })));
+    let ladder = [
+        "avg speed 90 t/s",
+        "avg speed 90 t/s · 123456 t/s peak",
+        "avg speed 90 t/s · 123456 t/s peak · 5.0 tok/s peak",
+    ];
+    // The rows tell a correct shed from a rate-past-a-shed-speed one only on a
+    // card of exactly 33 cells: the rate-alone row (33) fits, the speed rung
+    // (34) does not. The sweep must reach it.
+    let mut telling = false;
+    for w in 50..=240u16 {
+        let (row, width) = dashboard_card_fit(&app, w, 40, "avg speed")
+            .unwrap_or_else(|| panic!("{w}x40: no avg speed row"));
+        assert_eq!(
+            row,
+            widest_fitting(&ladder, width),
+            "{w}x40 ({width} cells)"
+        );
+        telling |= width == 33;
+    }
+    assert!(telling, "no swept width gave the 33-cell card");
+}
+
+/// The today row's peak never shows past a shed `today` part: a wide `today`
+/// figure and a narrow peak, at every text width 20..=60, read the longest
+/// whole prefix.
+#[test]
+fn the_today_peak_never_shows_past_a_shed_today_part() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = tokens_app_with_peaks(Some(serde_json::json!({
+        "today": {"rate": {"value": 5.0, "at": "2026-09-22T21:02:00.000+00:00"}}
+    })));
+    let today = crate::tps::DaySum {
+        output: 123_000,
+        gen_ms: 1_000,
+        ..Default::default()
+    };
+    let ladder = [
+        "speed     92 t/s now",
+        "speed     92 t/s now · 123000 t/s today",
+        "speed     92 t/s now · 123000 t/s today · 5.0 tok/s peak",
+    ];
+    for w in 20..=60usize {
+        let line = super::today_speed_line_within(&app, Some(today), w);
+        assert_eq!(line_text(&line), widest_fitting(&ladder, w), "w={w}");
+    }
+}

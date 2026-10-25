@@ -37176,9 +37176,9 @@ fn dashboard_resize_across_two_column_gate_keeps_the_focused_card() {
     }
     let buf = dash_draw(&app, 160, 40);
     // The two-column layout pins the trend card at the top of the right
-    // column (`CARD_COL_W` = 56), so its top-left corner is a fixed cell.
+    // column (`CARD_COL_W` = 60), so its top-left corner is a fixed cell.
     assert_eq!(
-        buf.cell((56, 3)).unwrap().fg,
+        buf.cell((60, 3)).unwrap().fg,
         crate::tui::theme::line_strong_color(),
         "focus stays on trend across the two-column gate"
     );

@@ -6985,8 +6985,8 @@ fn the_tokens_total_badge_and_top_models_desktop_rows_measure_by_cells() {
     assert_eq!(
         got,
         vec![
-            "│ tokens    0                             0% cache hit ││                                                                                                      │",
-            "│ 日 本 語 モ デ ル  ████████████░░░░░░░░░░░░░░░░░░ 4.30M    ││                                                                                                      │",
+            "│ tokens    0                                 0% cache hit ││                                                                                                  │",
+            "│ 日 本 語 モ デ ル  ████████████░░░░░░░░░░░░░░░░░░ 4.30M        ││                                                                                                  │",
         ],
         "tokens badge + top models at 160 cols"
     );

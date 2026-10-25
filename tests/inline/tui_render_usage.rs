@@ -4627,7 +4627,7 @@ fn the_tps_rows_render_four_windows_and_a_dash_where_absent() {
     assert_eq!(rows.len(), 2);
     assert_eq!(
         tps_line_text(&rows[0]),
-        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today —"
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today — · peak —"
     );
     assert_eq!(
         tps_line_text(&rows[1]),
@@ -4666,7 +4666,7 @@ fn the_tps_rows_render_four_windows_and_a_dash_where_absent() {
     let rows = tps_rows(&profile, &app, 100);
     assert_eq!(
         tps_line_text(&rows[0]),
-        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today 90 t/s"
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today 90 t/s · peak —"
     );
     assert_eq!(
         tps_line_text(&rows[1]),
@@ -4708,7 +4708,7 @@ fn tps_rows_reads_zero_rate_for_a_fresh_producers_absent_account() {
     let rows = tps_rows(&profile, &app, 100);
     assert_eq!(
         tps_line_text(&rows[0]),
-        "speed     live — · 5m — · 1h — · today —",
+        "speed     live — · 5m — · 1h — · today — · peak —",
         "speed stays absent while no response touches its windows"
     );
     assert_eq!(
@@ -4722,7 +4722,7 @@ fn tps_rows_reads_zero_rate_for_a_fresh_producers_absent_account() {
     let rows = tps_rows(&profile, &app, 100);
     assert_eq!(
         tps_line_text(&rows[0]),
-        "speed     live — · 5m — · 1h — · today —"
+        "speed     live — · 5m — · 1h — · today — · peak —"
     );
     assert_eq!(
         tps_line_text(&rows[1]),
@@ -5170,4 +5170,101 @@ fn a_switching_rows_usage_spinner_turns_orange() {
             panic!("a switching row spins: {text}")
         });
     assert_eq!(spinner.style.fg, Some(theme::accent_2_color()));
+}
+
+/// The `speed` row's fifth window is the account's peak speed today (the feed's
+/// `peaks.today.accounts.<name>.speed`); the `rate` row carries no peak. The
+/// peak window sheds first: at 68 columns the rate row's four windows fit (67
+/// cells) but the speed row with its peak (70 cells) does not, so the speed row
+/// keeps `today` and drops `peak` whole.
+#[test]
+fn the_speed_row_ends_in_the_accounts_peak_speed_today() {
+    use crate::profile::{AppConfig, AppState};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = Profile::new("uwuclxdy".to_string(), None, None);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile.clone()],
+    };
+    let mut app = App::new(config);
+    let mut snap = tps_full_snapshot(1_000);
+    snap.peaks = serde_json::from_value(serde_json::json!({
+        "today": {
+            "speed": {"value": 612.0, "at": "2026-09-22T21:14:00.000+00:00", "account": "kerry", "model": "claude-opus-4-8"},
+            "rate": {"value": 1803.4, "at": "2026-09-22T21:02:00.000+00:00"},
+            "accounts": {
+                "uwuclxdy": {
+                    "speed": {"value": 412.3, "at": "2026-09-22T21:10:00.000+00:00", "account": "uwuclxdy", "model": "claude-opus-4-8"},
+                    "rate": {"value": 950.0, "at": "2026-09-22T21:02:00.000+00:00"}
+                }
+            }
+        }
+    }))
+    .unwrap();
+    app.set_tps(Some(snap));
+
+    let rows = tps_rows(&profile, &app, 100);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today — · peak 412 t/s"
+    );
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live 67 tok/s · 5m 61 tok/s · 1h 58 tok/s · today 0 tok/s"
+    );
+
+    let rows = tps_rows(&profile, &app, 68);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today —"
+    );
+    // The speed row with its peak is exactly 70 cells: it fits 70, not 69.
+    assert_eq!(
+        tps_line_text(&tps_rows(&profile, &app, 70)[0]),
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today — · peak 412 t/s"
+    );
+    assert_eq!(
+        tps_line_text(&tps_rows(&profile, &app, 69)[0]),
+        "speed     live 92 t/s · 5m 88 t/s · 1h 84 t/s · today —"
+    );
+    assert_eq!(
+        tps_line_text(&rows[1]),
+        "rate      live 67 tok/s · 5m 61 tok/s · 1h 58 tok/s · today 0 tok/s"
+    );
+}
+
+/// A cache past its freshness window shows no peak, even when it carries one:
+/// the speed row's `peak` window reads `—` like every other window.
+#[test]
+fn a_stale_snapshot_shows_no_usage_peak() {
+    use crate::profile::{AppConfig, AppState};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = Profile::new("uwuclxdy".to_string(), None, None);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile.clone()],
+    };
+    let mut app = App::new(config);
+    let mut snap = tps_full_snapshot(10 * 60 * 1000);
+    snap.peaks = serde_json::from_value(serde_json::json!({
+        "today": {"accounts": {"uwuclxdy": {
+            "speed": {"value": 412.3, "at": "2026-09-22T21:10:00.000+00:00", "account": "uwuclxdy", "model": "claude-opus-4-8"}
+        }}}
+    }))
+    .unwrap();
+    app.set_tps(Some(snap));
+    assert!(app.fresh_tps().is_none(), "a 10-minute-old cache is stale");
+    let rows = tps_rows(&profile, &app, 100);
+    assert_eq!(
+        tps_line_text(&rows[0]),
+        "speed     live — · 5m — · 1h — · today — · peak —"
+    );
 }

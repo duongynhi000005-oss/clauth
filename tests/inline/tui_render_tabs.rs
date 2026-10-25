@@ -45,8 +45,9 @@ fn render_tabs(app: &App, width: u16) -> String {
     crate::testutil::buffer_rows(term.backend().buffer()).concat()
 }
 
-/// The tokens dashboard must separate facts by alignment, never a `·` middot,
-/// and must render the active span (earliest left, latest right).
+/// The tokens dashboard separates facts by alignment, a `·` only between one
+/// row's own parts (the speed rows, the trend caption), and renders the active
+/// span (earliest left, latest right).
 #[test]
 fn tokens_dashboard_uses_alignment_not_middot() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -116,9 +117,11 @@ fn tokens_dashboard_uses_alignment_not_middot() {
         .flat_map(|y| (0..100usize).map(move |x| (x, y)))
         .map(|(x, y)| buf.content[y * 100 + x].symbol().to_owned())
         .collect();
-    // Skip the 3-row header which now has a middot in the gauge area. The today
-    // card's ruled speed row carries the body's one sanctioned `·` between its
-    // two figures; every other fact still separates by alignment.
+    // Skip the 3-row header which now has a middot in the gauge area. The speed
+    // rows (the today card's `speed`, the total card's `avg speed` with its
+    // peaks) separate their parts with `·`; this fixture has no producer
+    // and no speed history, so only the today row's `now · today` shows, and
+    // every other fact still separates by alignment.
     let body: String = text.chars().skip(3 * 100).take(27 * 100).collect();
     let body_sans_speed = body.replace("now · — today", "now — today");
     assert!(
