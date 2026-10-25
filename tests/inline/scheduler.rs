@@ -21418,8 +21418,10 @@ fn an_idle_tick_leaves_the_tps_cache_bytes_alone() {
 }
 
 /// One `.jsonl` whose name is not UTF-8 under a walked store never stops the
-/// tps cache write.
-#[cfg(unix)]
+/// tps cache write. Linux only: APFS refuses to create a non-UTF-8 name
+/// (`EILSEQ`), so macOS CI cannot build the fixture; macOS runs the same
+/// unix walk.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_non_utf8_transcript_name_never_blocks_the_tps_cache_write() {
     use std::os::unix::ffi::OsStrExt;
