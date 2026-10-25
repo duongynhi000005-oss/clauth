@@ -5,6 +5,7 @@
 //! holding the single-fetcher lease produces a [`Snapshot`] into
 //! `~/.clauth/tps_cache.json`; every other surface reads that cache.
 
+use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
@@ -286,11 +287,29 @@ fn ident_of(meta: &std::fs::Metadata) -> FileIdent {
     meta.created().ok()
 }
 
+/// A transcript file's read life: bumps whenever the producer cannot vouch
+/// that the bytes before the old read offset are unchanged. Spend-cap positions
+/// compare only within one life; a delivered 429 line re-read in a new life of
+/// the same path carries its recorded position along, so a latch holding its
+/// uuid is compared against where the line now lies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FileLife(u64);
+
+/// Take the next read life: monotonic for the producer's whole life, so a life
+/// id never needs comparing across files to answer "same life?". Every mint
+/// goes through here, the single writer of the counter.
+fn next_life(counter: &mut u64) -> FileLife {
+    *counter += 1;
+    FileLife(*counter)
+}
+
 /// One transcript file's read state.
 #[derive(Debug, Clone)]
 struct FileEntry {
     /// Bytes consumed (whole lines only).
     offset: u64,
+    /// The read life [`offset`](Self::offset) belongs to.
+    life: FileLife,
     /// The mtime the last store walk saw (the hot-set filter).
     mtime_ms: u64,
     /// The mtime, identity and tail hash at the last read: a file whose
@@ -305,14 +324,28 @@ struct FileEntry {
     /// `None` for the global store.
     runtime: Option<(String, String)>,
     /// Read from byte 0 with the day cutoff at the next tail: a first read, a
-    /// replacement, or a day that turned live again.
+    /// replacement, a day that turned live again, or a cold re-entry of a file
+    /// holding a 429 this producer already delivered.
     reread: bool,
 }
 
-/// The file a read runs over, as its responses record it.
+/// One pass over a file: where it starts, the tail hash that must vouch for the
+/// bytes before the offset it carries, the spend-cap bound it folds with, and
+/// the read life its facts belong to.
+struct ReadPass {
+    start: u64,
+    verify: Option<(u64, [u8; 32])>,
+    facts_through: u64,
+    life: FileLife,
+}
+
+/// The file a read runs over, as its responses and spend-cap facts record it.
 struct ReadCtx {
     rank: Arc<FileRank>,
     session: String,
+    /// The read life this pass folds into: every spend-cap position it reports
+    /// names it, so the scheduler compares positions within one life only.
+    life: FileLife,
 }
 
 /// What [`Producer::read_append`] found.
@@ -323,24 +356,6 @@ enum ReadOutcome {
     Rewritten,
     /// The file could not be read; nothing changed.
     Failed,
-}
-
-/// Which spend-cap fact lines one read delivers, keyed on each line's END
-/// offset in the file. `After(offset)` delivers every fact line whose end is
-/// past `offset`: a read resuming from a consumed offset skips exactly the
-/// lines that ended at or before it. `All` delivers every fact line: a file
-/// that shrank re-reads from byte 0. A hot file's first read passes
-/// `After(0)`; a cold-joined file's first read passes `After(its join
-/// length)`, so its history mints nothing on that read. That history later
-/// delivers through a shrink (`All`), a rescue move (whose copy reads from
-/// byte 0 as a hot file), or a walk miss after the file turned hot: the
-/// re-entered hot entry starts at offset 0 under `After(0)`.
-#[derive(Clone, Copy)]
-enum SpendCapDeliver {
-    /// Every fact line: a file that shrank and re-reads from byte 0.
-    All,
-    /// Fact lines ending after `offset`.
-    After(u64),
 }
 
 /// One attribution timeline entry: the session spends `member` from `since`
@@ -698,28 +713,39 @@ pub(crate) struct Producer {
     /// future day), keyed by message id or `(session, user ts)`: one response
     /// per id however many files or reads carry it.
     responses: HashMap<String, Resp>,
-    /// Conversation id → the latest spend-cap 429 row since the last drain,
-    /// carrying its timestamp and the transcript FILE it came from. The file
-    /// matters: a subagent transcript shares the parent's conversation key
-    /// (`session_key` folds `subagents/` into the parent dir), so a success in
-    /// another file must not clear the parent's 429. An error row still folds
-    /// no tokens; this map is its only effect.
-    spend_cap_429: HashMap<String, SpendCap429Fact>,
-    /// Conversation id → per transcript FILE, the latest successful turn since
-    /// the last drain, so the scheduler can clear a latched 429 once a success
-    /// in the SAME file outruns it — even a success read after the 429 was
-    /// already drained (the drain that latched it and the success that clears
-    /// it are different ticks). Keyed by file, never conversation alone: a
-    /// later success in another file (a subagent) must not overwrite the file
-    /// that recovered.
-    spend_cap_recoveries: HashMap<String, HashMap<PathBuf, u64>>,
-    /// Conversation id → the transcript-line `uuid`s of the spend-cap 429 rows
-    /// already folded this producer life, so a 429 line that comes back — a
-    /// byte-0 re-read, a rewrite, a shrink, a walk miss, a rescue to a new
-    /// path — never re-delivers. A uuid-less 429 falls back to the position
-    /// bound alone. Never pruned: the record lives for the producer's whole
-    /// life.
-    delivered_facts: HashMap<String, HashSet<String>>,
+    /// Conversation id → transcript FILE → that file's later spend-cap 429 row
+    /// since the last drain, carrying its timestamp, its position (the file's
+    /// read life and the line's end offset) and the line's `uuid`. Per file
+    /// first because line order decides within one file life only; the drain
+    /// then hands over the highest stamp across files. The file matters: a
+    /// subagent transcript shares the parent's conversation key (`session_key`
+    /// folds `subagents/` into the parent dir), so a success in another file
+    /// must not clear the parent's 429. An error row still folds no tokens;
+    /// this map is its only effect.
+    spend_cap_429: HashMap<String, HashMap<PathBuf, SpendCap429Fact>>,
+    /// Conversation id → per transcript FILE, the latest successful turn of
+    /// that FILE's current read life, as its position and stamp. Never drained:
+    /// the scheduler pulls it while judging a latched 429, so a success read on
+    /// a scan that could not judge the latch still clears it on the next scan.
+    /// A new life of the file replaces the record, so positions from two lives
+    /// never compare. Keyed by file, never conversation alone: a later success
+    /// in another file (a subagent) must not clear the file that recovered.
+    spend_cap_recoveries: HashMap<String, HashMap<PathBuf, SpendCapRecovery>>,
+    /// Conversation id → line `uuid` → where that line was last read, for
+    /// every 429 line already folded into a 429 fact this producer life, so a
+    /// 429 line that comes back — a byte-0 re-read, a rewrite, a shrink, a
+    /// walk miss — never re-delivers. Its position follows every later read of
+    /// the line in the SAME path, whatever the read's position bound, because
+    /// a latch holding the uuid pulls it before judging a successful turn; a
+    /// read at another path (a rescue copy) never moves it, because a latch
+    /// never moves across transcript files. An undelivered line the bound
+    /// skips is neither recorded nor delivered; a uuid-less 429 falls back to
+    /// the position bound alone. Never pruned: the record lives for the
+    /// producer's whole life.
+    delivered_facts: HashMap<String, HashMap<String, SpendCapPos>>,
+    /// The last [`FileLife`] handed out: producer-wide and monotonic, so a
+    /// life id never needs comparing across files to answer "same life?".
+    next_life: u64,
     /// The live days' sums (today, yesterday, future days), derived from
     /// `responses` whenever they change; never accumulated.
     days: DaySums,
@@ -845,18 +871,52 @@ impl Producer {
         }
     }
 
-    /// Conversation id → the latest spend-cap fact since the last scan,
-    /// consumed once by the scheduler's per-session scan. Draining clears both
-    /// halves, so a line's fact mints at most once per scan; a 429 with a
-    /// `uuid` also mints at most once per producer life, whatever re-read
-    /// brings it back. The scheduler's latch is what makes a 429 survive a
-    /// tick with no moveable target; the scheduler's latch drop is what makes
-    /// a later successful turn clear a 429 it already consumed.
+    /// The spend-cap 429s since the last scan, consumed once by the scheduler's
+    /// per-session scan: a line's fact mints at most once per scan, and a 429
+    /// with a `uuid` at most once per producer life, whatever re-read brings it
+    /// back, while that re-read moves the position a latch pulls. Each
+    /// conversation's pending entry is the one 429 a scan latches: see
+    /// [`pending_winner`]. The scheduler's latch is what makes a 429 survive a
+    /// tick with no moveable target. Successful turns are NOT drained: the
+    /// scheduler pulls [`spend_cap_recovery`](Self::spend_cap_recovery) while
+    /// judging the latch, so no scan can consume one.
     pub(crate) fn drain_spend_cap(&mut self) -> SpendCapDrain {
         SpendCapDrain {
-            pending: std::mem::take(&mut self.spend_cap_429),
-            recoveries: std::mem::take(&mut self.spend_cap_recoveries),
+            pending: std::mem::take(&mut self.spend_cap_429)
+                .into_iter()
+                .filter_map(|(session, files)| {
+                    pending_winner(&files).map(|fact| (session, fact.clone()))
+                })
+                .collect(),
         }
+    }
+
+    /// Where a delivered 429 line lies now, for a latch holding its `uuid`:
+    /// `None` unless this conversation delivered the line and it still sits in
+    /// `path`. The scheduler pulls this before judging a successful turn, so a
+    /// scan that skipped the latch loses nothing.
+    pub(crate) fn spend_cap_position(
+        &self,
+        session: &str,
+        uuid: &str,
+        path: &Path,
+    ) -> Option<(FileLife, u64)> {
+        let position = self.delivered_facts.get(session)?.get(uuid)?;
+        (position.file.as_path() == path).then_some((position.life, position.end))
+    }
+
+    /// The latest successful turn this producer read in `path`'s CURRENT read
+    /// life, for judging a latch on this conversation's 429 in that file: the
+    /// scheduler pulls it on every scan, so a success read on a scan that could
+    /// not judge the latch stays available to the next one. `None` when this
+    /// life of the path holds no success (a new life replaced the record) or
+    /// the path has left the walk (its record is pruned with the entry).
+    pub(crate) fn spend_cap_recovery(
+        &self,
+        session: &str,
+        path: &Path,
+    ) -> Option<SpendCapRecovery> {
+        self.spend_cap_recoveries.get(session)?.get(path).copied()
     }
 
     /// One pass at `now_ms`: tail every transcript store under the home dir,
@@ -1250,8 +1310,11 @@ impl Producer {
     /// Re-walk every transcript store, recording each file's mtime and len. A
     /// NEW file whose mtime predates the cutoff joins at `offset = len` (its
     /// lines cannot be newer than its mtime), so a cold start never reads the
-    /// whole history; a hot new file joins at 0 and is read with the cutoff
-    /// skip. A file that vanished is dropped.
+    /// whole history; a cold re-entry whose path holds a 429 this producer
+    /// already delivered does re-read from byte 0 on its next read, bound at
+    /// that join length, so the line's position follows it into the new life
+    /// and nothing below the join delivers. A hot new file joins at 0 and is
+    /// read with the cutoff skip. A file that vanished is dropped.
     fn discover(&mut self, now_ms: u64) {
         let cutoff = cutoff_ms(now_ms);
         let mut found: HashMap<PathBuf, Walked> = HashMap::new();
@@ -1286,6 +1349,16 @@ impl Producer {
         self.files.retain(|path, _| found.contains_key(path));
         self.last_user
             .retain(|path, _| self.files.contains_key(path));
+        // A path that left the walk loses its success record with its
+        // `FileEntry`: a re-entry is a new life, and positions from the old one
+        // must never compare. A hot re-entry (offset 0) or a cold one whose
+        // path holds a delivered 429 (a byte-0 re-read) rebuilds the record on
+        // its next read; a cold entry with no delivered 429 joins at the file's
+        // length and keeps none until a later success is appended.
+        self.spend_cap_recoveries.retain(|_, by_path| {
+            by_path.retain(|path, _| self.files.contains_key(path));
+            !by_path.is_empty()
+        });
         for (path, w) in found {
             match self.files.entry(path) {
                 Entry::Occupied(mut e) => {
@@ -1293,14 +1366,28 @@ impl Producer {
                 }
                 Entry::Vacant(v) => {
                     let hot = w.mtime_ms >= cutoff;
+                    // A cold entry at a path holding a 429 this producer
+                    // already delivered must read the line again in its new
+                    // life, or a latch holding its uuid keeps comparing
+                    // against the old life and falls back to stamps. The
+                    // re-read starts at byte 0 with the join length as its
+                    // position bound, so the delivered line's position moves
+                    // and nothing below the join delivers; a cold entry with
+                    // no delivered 429 keeps the join-at-length read.
                     let session = session_key(v.key()).unwrap_or_default();
+                    let reread = hot
+                        || self.delivered_facts.get(&session).is_some_and(|delivered| {
+                            delivered.values().any(|pos| pos.file == *v.key())
+                        });
                     let runtime = isolated_sid(v.key());
                     let rank = Arc::new(FileRank {
                         path: v.key().clone(),
                         created: w.created,
                     });
+                    let life = next_life(&mut self.next_life);
                     v.insert(FileEntry {
                         offset: if hot { 0 } else { w.len },
+                        life,
                         mtime_ms: w.mtime_ms,
                         read_mtime: w.mtime_ms,
                         ident: None,
@@ -1308,7 +1395,7 @@ impl Producer {
                         rank,
                         session,
                         runtime,
-                        reread: hot,
+                        reread,
                     });
                 }
             }
@@ -1387,41 +1474,78 @@ impl Producer {
             let Some(e) = self.files.get_mut(&path) else {
                 continue;
             };
+            let mut fresh = false;
             if e.ident.is_some_and(|known| known != ident) {
                 e.rank = Arc::new(FileRank {
                     path: path.clone(),
                     created: meta.created().ok(),
                 });
                 e.reread = true;
+                fresh = true;
             }
             if len < e.offset {
                 e.reread = true;
+                fresh = true;
             }
             if !e.reread && len == e.offset && mtime == e.read_mtime {
                 continue;
             }
-            // The spend-cap bound for this read. A file that shrank re-reads
-            // from byte 0 and delivers every fact line (`All`); any other read
-            // keeps `After(e.offset)`, so only fact lines ending past the bytes
-            // already consumed deliver. A cold-joined file's first read is
+            // The spend-cap bound for this read: a fact line delivers only when
+            // it ends past the bytes already consumed, so this is the old read
+            // offset. A file that shrank re-reads from byte 0 and delivers
+            // every fact line, hence 0. A cold-joined file's first read is
             // bound at its join length, so its history mints nothing on that
-            // read; the same history later delivers through a shrink (`All`),
-            // a rescue move (byte 0 as a hot file), or a walk miss after the
-            // file turned hot (a re-entered hot entry at offset 0 under
-            // `After(0)`). The bound is the position gate every fact line
-            // passes; a 429's line `uuid` is the additional gate that folds a
-            // re-read 429 at most once this producer life.
-            let deliver = if len < e.offset {
-                SpendCapDeliver::All
+            // read; the same history later delivers through a shrink, a rescue
+            // move (byte 0 as a hot file), or a walk miss after the file turned
+            // hot (a re-entered hot entry at offset 0). The bound is the
+            // position gate every fact line passes; a 429's line `uuid` is the
+            // additional gate that folds a re-read 429 at most once this
+            // producer life.
+            let facts_through = if len < e.offset { 0 } else { e.offset };
+            // A re-read from byte 0 keeps the entry's life only when the bytes
+            // before the old offset still hash to the stored tail; the check
+            // carries that offset beside the hash because the read itself
+            // starts at 0. A missing tail vouches for nothing once the file
+            // has consumed bytes.
+            let old_life = e.life;
+            let check = if fresh {
+                None
+            } else if e.reread {
+                match e.tail {
+                    Some(hash) if e.offset > 0 => Some((e.offset, hash)),
+                    Some(_) => None,
+                    None if e.offset > 0 => {
+                        fresh = true;
+                        None
+                    }
+                    None => None,
+                }
             } else {
-                SpendCapDeliver::After(e.offset)
+                e.tail.map(|hash| (e.offset, hash))
             };
-            let verify = (!e.reread).then_some(e.tail).flatten();
             let start = if e.reread { 0 } else { e.offset };
-            let read = match self.read_append(&path, start, verify, deliver, now_ms, floor) {
+            let mut life = if fresh {
+                next_life(&mut self.next_life)
+            } else {
+                old_life
+            };
+            let pass = ReadPass {
+                start,
+                verify: check,
+                facts_through,
+                life,
+            };
+            let read = match self.read_append(&path, pass, now_ms, floor) {
                 ReadOutcome::Read(read) => Some(read),
                 ReadOutcome::Rewritten => {
-                    match self.read_append(&path, 0, None, deliver, now_ms, floor) {
+                    life = next_life(&mut self.next_life);
+                    let retry = ReadPass {
+                        start: 0,
+                        verify: None,
+                        facts_through,
+                        life,
+                    };
+                    match self.read_append(&path, retry, now_ms, floor) {
                         ReadOutcome::Read(read) => Some(read),
                         ReadOutcome::Rewritten | ReadOutcome::Failed => None,
                     }
@@ -1436,27 +1560,27 @@ impl Producer {
                 e.tail = tail;
                 e.read_mtime = mtime;
                 e.ident = Some(ident);
+                e.life = life;
                 e.reread = false;
             }
         }
     }
 
-    /// Read complete lines from `start` and fold them into the response set. A
-    /// `verify` hash must match the up-to-256 bytes before `start` (one read
-    /// covers both), else the file was rewritten and nothing is consumed. A
-    /// read from byte 0 drops assistant lines before `floor`. Only whole
+    /// Read complete lines from [`pass`](ReadPass)'s start and fold them into
+    /// the response set. Its `verify` hash, with the offset it covers up to,
+    /// must match the up-to-256 bytes before that offset (one read covers
+    /// both), else the file was rewritten and nothing is consumed. A read from
+    /// byte 0 drops assistant lines before `floor`. Only whole
     /// (newline-terminated) lines are consumed, so a line torn mid-write is
-    /// re-read on the next tick; the result carries the new offset and the
-    /// hash of the bytes before it.
-    fn read_append(
-        &mut self,
-        path: &Path,
-        start: u64,
-        verify: Option<[u8; 32]>,
-        deliver: SpendCapDeliver,
-        now_ms: u64,
-        floor: u64,
-    ) -> ReadOutcome {
+    /// re-read on the next tick; the result carries the new offset and the hash
+    /// of the bytes before it.
+    fn read_append(&mut self, path: &Path, pass: ReadPass, now_ms: u64, floor: u64) -> ReadOutcome {
+        let ReadPass {
+            start,
+            verify,
+            facts_through,
+            life,
+        } = pass;
         let from = start.saturating_sub(TAIL_BYTES);
         let Ok(mut file) = std::fs::File::open(path) else {
             return ReadOutcome::Failed;
@@ -1470,17 +1594,30 @@ impl Producer {
         }
         // `start - from` never exceeds TAIL_BYTES, so it fits a usize.
         let skip = (start - from) as usize;
-        let (Some(before), Some(body)) = (buf.get(..skip), buf.get(skip..)) else {
+        let Some(body) = buf.get(skip..) else {
             return ReadOutcome::Rewritten;
         };
-        if let Some(want) = verify
-            && tail_hash(before) != want
-        {
-            return ReadOutcome::Rewritten;
+        if let Some((at, want)) = verify {
+            // The checked bytes end at the offset the hash covers. An offset
+            // before this read's own start vouches for nothing the buffer
+            // holds, so the bytes cannot be confirmed unchanged.
+            let (Some(lo), Some(hi)) = (
+                at.saturating_sub(TAIL_BYTES).checked_sub(from),
+                at.checked_sub(from),
+            ) else {
+                return ReadOutcome::Rewritten;
+            };
+            let Some(checked) = buf.get(lo as usize..hi as usize) else {
+                return ReadOutcome::Rewritten;
+            };
+            if tail_hash(checked) != want {
+                return ReadOutcome::Rewritten;
+            }
         }
         let Some(file_ctx) = self.files.get(path).map(|e| ReadCtx {
             rank: Arc::clone(&e.rank),
             session: e.session.clone(),
+            life,
         }) else {
             return ReadOutcome::Failed;
         };
@@ -1489,23 +1626,13 @@ impl Producer {
         }
         self.see_session(&file_ctx.session, now_ms);
         let cutoff = if start == 0 { floor } else { 0 };
-        // The spend-cap bound this read folds with: `All` delivers every fact
-        // line; `After(offset)` skips fact lines ending at or before `offset`.
-        // A cold-joined file's bound is its join length, so a read-back mints
-        // no fact for its history unless the file shrank (`All`); a hot file's
-        // first read is bound at 0, so the position gate passes for every fact
-        // line, and a re-read 429 then still folds on its uuid gate.
-        let facts_through: u64 = match deliver {
-            SpendCapDeliver::All => 0,
-            SpendCapDeliver::After(offset) => offset,
-        };
         let mut consumed = 0usize;
-        // The newest successful turn in THIS file, folded here and written once
-        // per file below: a success in a file is that file's recovery candidate
-        // alone, and writing it line by line would allocate the conversation key
-        // and the path for every assistant line of a cold start's hot-set
-        // re-read.
-        let mut max_success_ts: Option<u64> = None;
+        // The latest-positioned successful turn in THIS file, folded here and
+        // written once per file below: a success in a file is that file's
+        // success record alone, and writing it line by line would allocate the
+        // conversation key and the path for every assistant line of a cold
+        // start's hot-set re-read.
+        let mut max_success: Option<(u64, u64)> = None;
         for seg in body
             .split_inclusive(|&b| b == b'\n')
             .filter(|s| s.last() == Some(&b'\n'))
@@ -1520,20 +1647,37 @@ impl Producer {
                 now_ms,
                 facts_through,
             ) {
-                max_success_ts = Some(max_success_ts.map_or(ts, |latest| latest.max(ts)));
+                max_success = Some(max_success.map_or((end_offset, ts), |(end, latest)| {
+                    (end.max(end_offset), latest.max(ts))
+                }));
             }
         }
-        if let Some(ts) = max_success_ts {
+        if let Some((end, ts)) = max_success {
+            let recovery = SpendCapRecovery { life, end, ts };
             self.spend_cap_recoveries
                 .entry(file_ctx.session.clone())
                 .or_default()
                 .entry(path.to_path_buf())
-                .and_modify(|latest| {
-                    if ts > *latest {
-                        *latest = ts;
+                .and_modify(|held| {
+                    if recovery.life != held.life {
+                        *held = recovery;
+                    } else {
+                        held.end = held.end.max(recovery.end);
+                        held.ts = held.ts.max(recovery.ts);
                     }
                 })
-                .or_insert(ts);
+                .or_insert(recovery);
+        } else if let Some(by_path) = self.spend_cap_recoveries.get_mut(&file_ctx.session) {
+            // This life of the path holds no success of its own, so a record
+            // from an older life is replaced by that absence: only positions
+            // from one life ever compare.
+            let stale = by_path.get(path).is_some_and(|held| held.life != life);
+            if stale {
+                by_path.remove(path);
+                if by_path.is_empty() {
+                    self.spend_cap_recoveries.remove(&file_ctx.session);
+                }
+            }
         }
         let end_in_buf = skip + consumed;
         let tail = buf
@@ -1544,8 +1688,8 @@ impl Producer {
 
     /// One line's effect on the producer's per-line maps. Returns the successful
     /// assistant turn's timestamp (`Some`) so `read_append` can fold the file's
-    /// recovery candidate once, `None` for every other line, a success whose
-    /// position was already delivered included.
+    /// success record once, `None` for every other line, a success this read's
+    /// position bound skips included.
     fn process_line(
         &mut self,
         file: &ReadCtx,
@@ -1558,28 +1702,31 @@ impl Producer {
         let parsed = parse_line(line)?;
         match parsed {
             Parsed::SpendCap429 { ts, uuid } => {
-                if !spend_cap_take(facts_through, end_offset) {
-                    return None;
-                }
-                if !self.spend_cap_429_take(&file.session, uuid) {
-                    return None;
-                }
                 let file_path = file.rank.path.clone();
-                match self.spend_cap_429.get_mut(&file.session) {
-                    Some(latest) if ts >= latest.ts => {
-                        latest.ts = ts;
-                        latest.file = file_path;
+                if !self.spend_cap_429_take(
+                    &file.session,
+                    uuid.as_deref(),
+                    &file_path,
+                    file.life,
+                    end_offset,
+                    spend_cap_take(facts_through, end_offset),
+                ) {
+                    return None;
+                }
+                let fact = SpendCap429Fact {
+                    ts,
+                    file: file_path,
+                    life: file.life,
+                    end: end_offset,
+                    uuid,
+                };
+                let by_file = self.spend_cap_429.entry(file.session.clone()).or_default();
+                if let Some(latest) = by_file.get_mut(&fact.file) {
+                    if fact.supersedes(latest) {
+                        *latest = fact;
                     }
-                    Some(_) => {}
-                    None => {
-                        self.spend_cap_429.insert(
-                            file.session.clone(),
-                            SpendCap429Fact {
-                                ts,
-                                file: file_path,
-                            },
-                        );
-                    }
+                } else {
+                    by_file.insert(fact.file.clone(), fact);
                 }
                 None
             }
@@ -1595,8 +1742,8 @@ impl Producer {
             } => {
                 // A pre-cutoff user line still updates the span start; a pre-cutoff
                 // response is simply not retained. A pre-cutoff success still
-                // delivers its recovery fact unless this read's position bound
-                // already passed it.
+                // feeds its file's success record unless this read's position
+                // bound already passed it.
                 if ts < cutoff_ms {
                     return spend_cap_take(facts_through, end_offset).then_some(ts);
                 }
@@ -1705,15 +1852,14 @@ impl Producer {
                     }
                 }
                 // A success line is never uuid-deduped, so a shrink or a walk
-                // miss that re-reads it under a bound below its end
-                // re-delivers it as the file's recovery candidate. The early
-                // latch drop that can follow is a deliberate limit: the full
-                // form would compare the success's end offset with the latched
-                // 429's within one file life; the scheduler's latch drop
-                // compares timestamps instead, so after a clock step back that
-                // stamps a 429 below an earlier success in this file, the
-                // re-delivered success beats the 429's ts and drops the latch
-                // early.
+                // miss that re-reads it under a bound below its end folds it
+                // into the path's success record again, at the position it now
+                // holds in the file's new life. The scheduler pulls that record
+                // on every scan and drops a latch on it only when it lies after
+                // the latched 429 in that life; when the latched 429 holds no
+                // position in the success's life (a uuid-less 429, or a new
+                // life whose bytes no longer hold the 429's line) it falls back
+                // to comparing stamps.
                 if !spend_cap_take(facts_through, end_offset) {
                     return None;
                 }
@@ -1722,22 +1868,48 @@ impl Producer {
         }
     }
 
-    /// Whether a 429 line should fold: always for a uuid-less line (its
-    /// position bound already gated it), else only when the uuid is new this
-    /// producer life — and the uuid is then recorded, so a later read of the
-    /// same line folds nothing. The record is never pruned.
-    fn spend_cap_429_take(&mut self, session: &str, uuid: Option<String>) -> bool {
+    /// Whether a 429 line should fold a fact now, moving an already-delivered
+    /// line's recorded position on the way. A uuid-less line folds whenever the
+    /// read's position bound passes it. A line whose uuid this conversation
+    /// already delivered never folds again and never re-latches: it only moves
+    /// its recorded position, in the SAME path, whatever the bound, because a
+    /// latch pulls that record before judging a successful turn. A read at
+    /// another path (a rescue copy) leaves it alone: a latch is never moved to
+    /// a different path. An undelivered line is recorded and folds only when
+    /// the bound passes it, so a read that skips history neither delivers nor
+    /// records it. The record is never pruned.
+    fn spend_cap_429_take(
+        &mut self,
+        session: &str,
+        uuid: Option<&str>,
+        path: &Path,
+        life: FileLife,
+        end: u64,
+        within_bound: bool,
+    ) -> bool {
         let Some(uuid) = uuid else {
-            return true;
+            return within_bound;
         };
-        match self.delivered_facts.get_mut(session) {
-            Some(set) => set.insert(uuid),
-            None => self
-                .delivered_facts
-                .entry(session.to_owned())
-                .or_default()
-                .insert(uuid),
+        if let Some(position) = self
+            .delivered_facts
+            .get_mut(session)
+            .and_then(|delivered| delivered.get_mut(uuid))
+        {
+            if position.file.as_path() == path {
+                position.life = life;
+                position.end = end;
+            }
+            return false;
         }
+        if !within_bound {
+            return false;
+        }
+        let positions = match self.delivered_facts.get_mut(session) {
+            Some(positions) => positions,
+            None => self.delivered_facts.entry(session.to_owned()).or_default(),
+        };
+        positions.insert(uuid.to_owned(), SpendCapPos::at(path, life, end));
+        true
     }
 
     /// Note a session at the start of a read of one of its files: remember
@@ -2352,22 +2524,84 @@ enum Parsed {
 /// The `apiError` value the spend-cap 429 branch writes (`error: "rate_limit"`).
 const SPEND_CAP_429_API_ERROR: &str = "model_requires_usage_credits";
 
-/// A spend-cap 429 fact: its row timestamp and the transcript FILE it came
-/// from. The file is what lets a later success in the SAME file clear it while
-/// a subagent's success (a different file, the same conversation key) does not.
+/// A spend-cap 429 fact: its row timestamp, the transcript FILE it came from,
+/// the file life and end offset of its line, and the line's `uuid`. The file is
+/// what lets a later success in the SAME file clear it while a subagent's
+/// success (a different file, the same conversation key) does not; the life
+/// and offset are what let that success be compared to it by line order rather
+/// than stamp; the uuid is what the producer's recorded position is pulled by.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpendCap429Fact {
     pub(crate) ts: u64,
     pub(crate) file: PathBuf,
+    pub(crate) life: FileLife,
+    pub(crate) end: u64,
+    pub(crate) uuid: Option<String>,
 }
 
-/// One drain of the producer's spend-cap facts: the pending 429s keyed by
-/// conversation id, and the successful turns keyed by conversation id then
-/// transcript FILE, both consumed exactly once.
+impl SpendCap429Fact {
+    /// Whether this 429 is the later line of its file: the greater end offset
+    /// when the two sit in one life, else the newer stamp (an equal stamp keeps
+    /// the later read).
+    fn supersedes(&self, other: &Self) -> bool {
+        if self.life == other.life {
+            self.end > other.end
+        } else {
+            self.ts >= other.ts
+        }
+    }
+}
+
+/// Total order over pending 429 facts: the higher stamp wins, ties broken by
+/// path, so the pick never depends on `HashMap` iteration order.
+fn pending_order(a: &SpendCap429Fact, b: &SpendCap429Fact) -> Ordering {
+    a.ts.cmp(&b.ts).then_with(|| a.file.cmp(&b.file))
+}
+
+/// The 429 one conversation's scan latches: each file's later line, then the
+/// highest stamp across files, ties broken by path. A total order, so the same
+/// facts pick the same line whatever order the reads landed in.
+fn pending_winner(facts: &HashMap<PathBuf, SpendCap429Fact>) -> Option<&SpendCap429Fact> {
+    facts.values().max_by(|a, b| pending_order(a, b))
+}
+
+/// Where a delivered 429 line was last read: the transcript file, that file's
+/// read life, and the line's end offset. A latch holding the line's `uuid`
+/// pulls it before judging a successful turn, so the comparison always uses
+/// where the line lies now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpendCapPos {
+    file: PathBuf,
+    life: FileLife,
+    end: u64,
+}
+
+impl SpendCapPos {
+    fn at(path: &Path, life: FileLife, end: u64) -> Self {
+        Self {
+            file: path.to_path_buf(),
+            life,
+            end,
+        }
+    }
+}
+
+/// A file's latest successful turn in its current read life: where its line
+/// ends, and its stamp for the fallback when a latch sits in another life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpendCapRecovery {
+    pub(crate) life: FileLife,
+    pub(crate) end: u64,
+    pub(crate) ts: u64,
+}
+
+/// One drain of the producer's pending spend-cap 429s, keyed by conversation id
+/// (each conversation's one winner across its files), consumed exactly once.
+/// Successful turns are not part of it: the scheduler pulls each file's success
+/// record from the producer instead, so no scan consumes one.
 #[derive(Debug, Default)]
 pub(crate) struct SpendCapDrain {
     pub(crate) pending: HashMap<String, SpendCap429Fact>,
-    pub(crate) recoveries: HashMap<String, HashMap<PathBuf, u64>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -2598,7 +2832,8 @@ fn tail_hash(bytes: &[u8]) -> [u8; 32] {
 /// yes when it ends past `facts_through`, the byte offset this read's bound
 /// skips up to. End offsets strictly increase within one read, so the bound
 /// never needs to advance. The uuid gate in `process_line` is a separate,
-/// additional filter for a 429 line that carries one.
+/// additional filter for a 429 line that carries one; a line that gate dedupes
+/// still moves its recorded position when the bound skips it.
 fn spend_cap_take(facts_through: u64, end: u64) -> bool {
     end > facts_through
 }

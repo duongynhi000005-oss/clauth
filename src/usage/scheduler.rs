@@ -4580,13 +4580,21 @@ fn catch_up_staged_pairs(config: &crate::profile::ConfigHandle) {
 
 /// One latched spend-cap 429: the member the session was on when it was seen,
 /// the row's `started_at` when it landed (so a reused id never re-fires a dead
-/// session's latch), and the 429 fact itself — its timestamp (so a later
-/// successful turn in the same file can outrun it) and the transcript file it
-/// came from (so only a success in THAT file clears it — a subagent's success
-/// must not).
+/// session's latch), the conversation it latched under, and the 429 fact
+/// itself. Its line position (file, file life, end offset) is what a later
+/// success is compared against: only a success in THAT file lying after it in
+/// the same life clears the latch; a success in another file (a subagent) must
+/// not, and a success in another life of the same file falls back to the
+/// stamps. The stored conversation keys the success record and the recorded 429
+/// position the scan pulls, so a scan that cannot read the session record still
+/// judges the latch; a scan that reads it and finds a different conversation
+/// drops the latch instead, the stored one's stint having ended. Its `uuid` is
+/// what the producer's recorded position is pulled by, so a re-read of the line
+/// in a new life moves the position before the comparison.
 struct SpendCapLatchEntry {
     member: String,
     started_at: u64,
+    conv: String,
     fact: crate::tps::SpendCap429Fact,
 }
 
@@ -4613,15 +4621,22 @@ thread_local! {
     static TPS_LAST_WRITE: std::cell::RefCell<(u64, Option<Vec<u8>>)> =
         const { std::cell::RefCell::new((0, None)) };
     /// live session id -> a joined spend-cap 429 the session latched during its
-    /// life, keyed by the row's `session_id` (stable across `/clear`), never the
-    /// conversation id. The entry carries the row's `started_at` and is read
-    /// only while it equals the current row's, so a reused id never re-fires a
-    /// dead session's latch. Cleared by a scan with no live chain row and
-    /// pruned by the next non-empty scan once the session is gone or on another
-    /// member, so the 429 for the old stint never re-fires; dropped when a
-    /// drained successful turn in the same file outruns it. A 429 read with no
-    /// moveable target survives to the tick a target frees — the fact is never
-    /// dropped with its tick.
+    /// life, keyed by the row's `session_id` (which survives a `/clear`, so an
+    /// entry never leaks onto another row), never the conversation id. The
+    /// entry carries the row's `started_at` and is read only while it equals
+    /// the current row's, so a reused id never re-fires a dead session's latch.
+    /// Cleared by a scan with no live chain row and pruned by the next
+    /// non-empty scan once the session is gone or on another member, so the 429
+    /// for the old stint never re-fires. Every scan judges it against the
+    /// conversation it latched under and the producer's success record for the
+    /// latched file, which is never drained, so a scan that cannot judge it
+    /// loses no success. A scan that reads a DIFFERENT conversation on the
+    /// row's own record drops it, and so does a success lying after its line in
+    /// the same file life; when the latched line's pulled position is
+    /// absent (a 429 without a `uuid`) or sits in a different file life than
+    /// the success (a new life whose bytes no longer hold the 429's line), a
+    /// newer stamp does. A 429 read with no moveable target survives to the
+    /// tick a target frees — the fact is never dropped with its tick.
     static SPEND_CAP_LATCH: std::cell::RefCell<HashMap<String, SpendCapLatchEntry>> =
         std::cell::RefCell::new(HashMap::new());
     /// live session id -> the row's `started_at`, set when the session had a
@@ -6287,11 +6302,13 @@ fn scan_session_switches(
     // briefly out of the chain still counts as live, and dropping its mark
     // would walk it back onto a capped member on the next scan.
     let row_ids: HashSet<String> = rows.iter().map(|r| r.session_id.clone()).collect();
-    // The session's own spend-cap facts: conversation ids + 429 timestamps and
-    // files, plus the successful turns, the tps tailer saw since the last scan.
-    // Drained here, before the early return, so a fact for a conversation with
-    // no live chain row is consumed now rather than delivered to a session
-    // that appears later (a resume keeps the conversation id).
+    // The session's own spend-cap 429s: the drain's half the scheduler
+    // consumes, each conversation's one winner. Drained here, before the early
+    // return, so a 429 for a conversation with no live chain row is consumed
+    // now rather than delivered to a session that appears later (a resume keeps
+    // the conversation id). Successful turns are not drained: the scan below
+    // pulls each file's success record from the producer while judging a latch,
+    // so no early return can consume one.
     let drained: crate::tps::SpendCapDrain =
         TPS_PRODUCER.with(|p| p.borrow_mut().drain_spend_cap());
     if rows.is_empty() {
@@ -6304,15 +6321,20 @@ fn scan_session_switches(
     }
 
     // The conversation id each live row joins, read once before the config hold
-    // (the mark insert below and the per-row loop both need it). Built only
-    // when this drain holds a fact to attribute; the common tick pays no
-    // record reads.
+    // (the mark insert below, the new-latch insert, the ambiguity check and the
+    // changed-conversation drop need it). Every row is read when this drain
+    // holds a 429 to attribute; otherwise only a row holding a latch is, so a
+    // tick with neither pays no record reads. A live latch is judged against
+    // the conversation IT stored; this join only says whether the row still
+    // sits in that one.
+    let read_all = !drained.pending.is_empty();
     let mut conv_of: HashMap<String, String> = HashMap::new();
-    if !drained.pending.is_empty() || !drained.recoveries.is_empty() {
-        for row in &rows {
-            if let Some(conv) = session_conversation_id(row) {
-                conv_of.insert(row.session_id.clone(), conv);
-            }
+    for row in &rows {
+        if !read_all && !SPEND_CAP_LATCH.with(|l| l.borrow().contains_key(&row.session_id)) {
+            continue;
+        }
+        if let Some(conv) = session_conversation_id(row) {
+            conv_of.insert(row.session_id.clone(), conv);
         }
     }
     // A conversation with a pending 429 in this drain is ambiguous when any
@@ -6565,11 +6587,7 @@ fn scan_session_switches(
         // timestamp clears the in-flight grace past the session's last swap (no
         // swap means no grace: a fresh session's first 429 latches at once): a
         // request in flight across the hold answers after it, and its 429
-        // belongs to the outgoing member, so the grace lets it age out. A
-        // drained successful turn in the same transcript file newer than the
-        // latched 429 drops the latch — the session recovered — so a 429 read
-        // with no moveable target still lands the move once a target frees, but
-        // never outlives a recovery.
+        // belongs to the outgoing member, so the grace lets it age out.
         let reads_store = reads_member_store(&row, &member);
         if let Some(conv) = conv_of.get(&row.session_id) {
             let latch_after = row.last_swap_at.map_or(row.started_at, |t| {
@@ -6591,6 +6609,7 @@ fn scan_session_switches(
                         SpendCapLatchEntry {
                             member: member.as_str().to_owned(),
                             started_at: row.started_at,
+                            conv: conv.clone(),
                             fact: pending.clone(),
                         },
                     );
@@ -6600,29 +6619,68 @@ fn scan_session_switches(
                         .insert(row.session_id.clone(), row.started_at)
                 });
             }
-            if let Some(recoveries) = drained.recoveries.get(conv) {
-                SPEND_CAP_LATCH.with(|l| {
-                    let mut latches = l.borrow_mut();
-                    // The latch drops on a same-file success whose timestamp
-                    // is strictly newer than the latched 429's — file order is
-                    // not compared. That is a deliberate limit: the full form
-                    // is comparing the success's end offset with the 429's
-                    // within one file life. A clock step back exposes both of
-                    // its sides: a replayed old success (re-delivered by a
-                    // shrink or walk miss) whose ts still beats the 429's
-                    // drops the latch early, and a real recovery appended
-                    // after the 429 but stamped below it leaves the latch
-                    // live, moving the session off a member that works again.
-                    if latches.get(&row.session_id).is_some_and(|latched| {
-                        recoveries
-                            .get(&latched.fact.file)
-                            .is_some_and(|&ts| ts > latched.fact.ts)
-                    }) {
-                        latches.remove(&row.session_id);
+        }
+        // Judge this row's live latch against the conversation it latched under
+        // and the producer's success record for the latched file, whatever this
+        // scan could join: a scan where the session record is unreadable still
+        // runs it, so a success read then drops the latch on this scan rather
+        // than never. A row whose record this scan read and found naming a
+        // DIFFERENT conversation drops the latch outright, before trigger b
+        // reads it: a `/clear` keeps the pid (the row) but starts a new
+        // conversation, so the old conversation's stint ended with its file.
+        SPEND_CAP_LATCH.with(|l| {
+            let mut latches = l.borrow_mut();
+            let changed = latches.get(&row.session_id).is_some_and(|latched| {
+                conv_of
+                    .get(&row.session_id)
+                    .is_some_and(|conv| conv != &latched.conv)
+            });
+            if changed {
+                latches.remove(&row.session_id);
+                return;
+            }
+            let Some(latched) = latches.get_mut(&row.session_id) else {
+                return;
+            };
+            // Pull the latched line's current position before judging: a re-read
+            // in a new life of the same path moved the line, so the success must
+            // be compared against where it lies now, not where it lay when it
+            // latched. The producer keeps the record for its whole life, so a
+            // scan that skipped this block loses nothing. A position at another
+            // path never moves the latch.
+            if let Some(uuid) = latched.fact.uuid.as_deref()
+                && let Some((life, end)) = TPS_PRODUCER.with(|p| {
+                    p.borrow()
+                        .spend_cap_position(&latched.conv, uuid, &latched.fact.file)
+                })
+            {
+                latched.fact.life = life;
+                latched.fact.end = end;
+            }
+            // Line order within one file life decides: a success lies after the
+            // latched 429 when its end offset is greater in the same life.
+            // Stamps never overrule that. Only when the latched line's pulled
+            // position is absent (a 429 without a `uuid`) or sits in a
+            // different file life than the success (a new life whose bytes no
+            // longer hold the 429's line) are the stamps compared; that
+            // residual covers a success whose line order against the 429 the
+            // producer cannot know.
+            let recovered = TPS_PRODUCER
+                .with(|p| {
+                    p.borrow()
+                        .spend_cap_recovery(&latched.conv, &latched.fact.file)
+                })
+                .is_some_and(|recovery| {
+                    if recovery.life == latched.fact.life {
+                        recovery.end > latched.fact.end
+                    } else {
+                        recovery.ts > latched.fact.ts
                     }
                 });
+            if recovered {
+                latches.remove(&row.session_id);
             }
-        }
+        });
         live_latch_members.insert(row.session_id.clone(), member.as_str().to_owned());
         // The latch fires only for the row's current stint: the entry stores the
         // `started_at` it landed under and reads only while that equals the

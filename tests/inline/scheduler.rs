@@ -5304,8 +5304,8 @@ fn an_outgoing_profiles_env_model_does_not_make_an_opus_session_credit_billed() 
 
 // ── spend-cap recovery, home passes and sinks ────────────────────────────────
 
-/// A successful assistant turn at exactly `ms` epoch ms: the recovery half of
-/// a drain.
+/// A successful assistant turn at exactly `ms` epoch ms: the success a latch
+/// judge pulls for its file.
 fn ok_row_at(ms: u64) -> String {
     let ts = chrono::DateTime::from_timestamp_millis(ms as i64)
         .unwrap()
@@ -5320,7 +5320,8 @@ fn ok_row_at(ms: u64) -> String {
     .to_string()
 }
 
-/// A successful assistant turn `ms_ago` old: the recovery half of a drain.
+/// A successful assistant turn `ms_ago` old: the success a latch judge pulls
+/// for its file.
 fn ok_row(ms_ago: u64) -> String {
     ok_row_at(crate::usage::now_ms().saturating_sub(ms_ago))
 }
@@ -5452,54 +5453,652 @@ fn same_file_success_pin(ok_ago: u64, cap_ago: u64) -> (Option<String>, Option<u
     decision_of("4242-0")
 }
 
-/// A drained same-file success drops the latch only when its timestamp is
-/// strictly newer than the latched 429's (`ts > latched.fact.ts`); file order
-/// is not compared. That is a deliberate limit — the full form is comparing
-/// the success's end offset with the 429's within one file life — and a clock
-/// step back exposes both of its sides: a replayed old success whose ts still
-/// beats the 429's drops the latch early, while a real recovery appended after
-/// the 429 but stamped below it leaves the latch live and moves the session
-/// off a member that works again. Neither outcome is "correct". This case pins
-/// the 100 s-older side; the exact-millisecond and 1 ms-older sides sit in the
-/// two tests below, and the 1 ms-newer side (the latch drops) in the third.
+/// A drained same-file success drops the latch only when its line lies after
+/// the latched 429's line in the same file life; the stamps are not compared.
+/// Each pin here writes the success BEFORE the 429, so every one keeps the
+/// latch and the session moves, whatever the success's stamp: 100 s older,
+/// the same millisecond, 1 ms older, and 1 ms newer (a clock step back that
+/// stamped the 429 below the earlier success).
 #[test]
 fn an_older_same_file_success_does_not_drop_the_latched_429() {
     assert_eq!(
         same_file_success_pin(700_000, 600_000),
         (Some("b".to_string()), Some(1)),
-        "a same-file success not strictly newer than the 429 keeps the latch and the session moves"
+        "a success line before the 429 keeps the latch and the session moves"
     );
 }
 
-/// The strictness boundary: a success at the 429's exact millisecond is not
-/// newer than the latch, so the latch stays and the session still moves.
+/// A success line before the 429 stamped at the 429's exact millisecond keeps
+/// the latch: the session still moves.
 #[test]
 fn a_same_millisecond_same_file_success_does_not_drop_the_latched_429() {
     assert_eq!(
         same_file_success_pin(600_000, 600_000),
         (Some("b".to_string()), Some(1)),
-        "a same-millisecond success is not newer than the 429, so the latch stays"
+        "a success line before the 429 keeps the latch"
     );
 }
 
-/// A success 1 ms older than the 429 is not newer either: the latch stays.
+/// A success line before the 429 stamped 1 ms older keeps the latch.
 #[test]
 fn a_one_ms_older_same_file_success_does_not_drop_the_latched_429() {
     assert_eq!(
         same_file_success_pin(600_001, 600_000),
         (Some("b".to_string()), Some(1)),
-        "a 1 ms-older success is not newer than the 429, so the latch stays"
+        "a success line before the 429 keeps the latch"
     );
 }
 
-/// The strictness boundary's other side: a success 1 ms NEWER than the 429 is
-/// strictly newer, so it drops the latch and the session stays on `a`.
+/// A success line before the 429 stamped 1 ms NEWER (the 429 stamped below
+/// it by a clock step back) still lies before the 429 in the file: it keeps
+/// the latch and the session moves.
 #[test]
-fn a_one_ms_newer_same_file_success_drops_the_latched_429() {
+fn an_earlier_success_line_stamped_after_the_429_does_not_drop_the_latch() {
     assert_eq!(
         same_file_success_pin(599_999, 600_000),
+        (Some("b".to_string()), Some(1)),
+        "file order decides: a success line before the 429 keeps the latch whatever its stamp"
+    );
+}
+
+/// The spend-cap 429 row at exactly `ms` epoch ms carrying its transcript line
+/// `uuid`, as Claude Code writes a real one: a re-read of it is deduped.
+fn spend_cap_row_uuid_at(ms: u64, uuid: &str) -> String {
+    let mut row: serde_json::Value = serde_json::from_str(&spend_cap_row_at(ms)).unwrap();
+    row["uuid"] = serde_json::Value::String(uuid.to_owned());
+    row.to_string()
+}
+
+/// A line the tailer ignores (no timestamp), so a test can grow and then
+/// shrink a transcript without adding a fact.
+fn filler_row() -> String {
+    serde_json::json!({"type": "progress", "pad": "filler"}).to_string()
+}
+
+/// The scan with `a` capped and `b` free: a live latch moves the session to
+/// `b`, a dropped one leaves it on `a`.
+fn scan_with_b_free() -> (Option<String>, Option<usize>) {
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    decision_of("4242-0")
+}
+
+/// Whether the order tests' row holds a live spend-cap latch: a "no move"
+/// decision alone reads the same with no latch at all.
+fn order_row_latched() -> bool {
+    super::SPEND_CAP_LATCH.with(|l| l.borrow().contains_key("4242-0"))
+}
+
+/// The scan with both members capped: a latch lands but has no target.
+fn scan_with_no_target() -> (Option<String>, Option<usize>) {
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a", "b"]),
+        &all_fresh(&["a", "b"]),
+    );
+    decision_of("4242-0")
+}
+
+/// A live row on `a` joined to `conv-a` through its child pid.
+fn spend_cap_order_row(home: &crate::testutil::HomeSandbox) -> std::fs::File {
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let marker = register_live_row(&row);
+    seed_session_record(home, "conv-a", child_pid);
+    marker
+}
+
+/// A clock step back between a 429 and the session's next successful turn: the
+/// success line comes AFTER the 429 in the transcript but is stamped 2 s below
+/// it. The session recovered, so one scan over both lines drops the latch and
+/// the session stays on `a`.
+#[test]
+fn a_success_line_after_the_429_stamped_below_it_drops_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    let ok = ok_row_at(now - 602_000);
+    write_conv(&home, "conv-a", &[cap.clone(), ok.clone()]);
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_b_free(),
         (None, None),
-        "a 1 ms-newer success drops the latch and the session stays"
+        "the success line after the 429 is a recovery whatever its stamp"
+    );
+
+    // Positive tail: a 429 line after the success, stamped lower still, does
+    // latch and move the session, so the stay above was a drop, not a 429
+    // that never latched.
+    write_conv(
+        &home,
+        "conv-a",
+        &[cap, ok, spend_cap_row_uuid_at(now - 603_000, "cap-2")],
+    );
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "a 429 line after the success latches"
+    );
+}
+
+/// The same step back across two scans: the 429 latches with no target, then
+/// the success appended after it (stamped 2 s below it) drops the latch, so
+/// the session stays on `a` once `b` frees.
+#[test]
+fn a_later_appended_success_stamped_below_the_latched_429_drops_it() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: no target yet"
+    );
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    let ok = ok_row_at(now - 602_000);
+    write_conv(&home, "conv-a", &[cap.clone(), ok.clone()]);
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success appended after the latched 429 drops the latch"
+    );
+    assert!(!order_row_latched(), "the success dropped the latch");
+
+    // Positive tail: a 429 line appended after the success, stamped lower
+    // still, latches and moves the session.
+    write_conv(
+        &home,
+        "conv-a",
+        &[cap, ok, spend_cap_row_uuid_at(now - 603_000, "cap-2")],
+    );
+    super::tps_producer_tick(now + 2_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "a 429 line after the success latches"
+    );
+}
+
+/// Two 429 lines in one drain, the later line stamped below the earlier one
+/// and a success line between them: the later 429 sits after the success, so
+/// the latch holds and the session moves. A latch that kept the higher-stamped
+/// (earlier) 429 would read the success as after it and drop.
+#[test]
+fn a_later_429_line_stamped_below_an_earlier_one_keeps_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    write_conv(
+        &home,
+        "conv-a",
+        &[
+            spend_cap_row_uuid_at(now - 600_000, "cap-1"),
+            ok_row_at(now - 700_000),
+            spend_cap_row_uuid_at(now - 800_000, "cap-2"),
+        ],
+    );
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "the last 429 line follows the success, so the latch holds"
+    );
+}
+
+/// The mirror case through a shrink: a success, then a 429 stamped below it (a
+/// clock step back) latches with no target. The transcript then shrinks, which
+/// re-reads it from byte 0 and replays the old success; the success lies
+/// before the 429, so the latch holds and the session moves once `b` frees.
+#[test]
+fn a_success_replayed_by_a_shrink_does_not_drop_a_later_429s_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let ok = ok_row_at(now - 500_000);
+    write_conv(&home, "conv-a", std::slice::from_ref(&ok));
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: nothing latched"
+    );
+
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", &[ok.clone(), cap.clone(), filler_row()]);
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: latched, no target"
+    );
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    write_conv(&home, "conv-a", &[ok, cap]);
+    super::tps_producer_tick(now + 2_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "the replayed success lies before the 429, so the latch holds"
+    );
+}
+
+/// The mirror case through a walk miss: the transcript leaves one store walk
+/// and returns, re-entering at byte 0 and replaying the old success that lies
+/// before the latched 429 (stamped below it by a clock step back); the latch
+/// holds and the session moves once `b` frees.
+#[test]
+fn a_success_replayed_by_a_walk_miss_does_not_drop_a_later_429s_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let ok = ok_row_at(now - 500_000);
+    write_conv(&home, "conv-a", std::slice::from_ref(&ok));
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: nothing latched"
+    );
+
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", &[ok, cap]);
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: latched, no target"
+    );
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    let path = home
+        .home()
+        .join(".claude/projects/-home-u-proj/conv-a.jsonl");
+    let away = path.with_extension("away");
+    std::fs::rename(&path, &away).unwrap();
+    super::tps_producer_tick(now + 7_000);
+    std::fs::rename(&away, &path).unwrap();
+    super::tps_producer_tick(now + 13_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "the replayed success lies before the 429, so the latch holds"
+    );
+}
+
+/// A progress line `parse_line` ignores, its pad one repeated character, so a
+/// rewrite can change bytes before the read offset at equal length.
+fn pad_row(c: char) -> String {
+    serde_json::json!({"type": "progress", "pad": c.to_string().repeat(40)}).to_string()
+}
+
+/// A latched uuid 429, then the transcript REPLACED at its path (a new file,
+/// the 429 line kept, longer than the old offset) with a success after the
+/// 429 stamped 2 s below it. The new life still holds the 429's line, so the
+/// success compares by position and drops the latch.
+#[test]
+fn a_success_after_the_429_in_a_replaced_file_drops_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    let path = home
+        .home()
+        .join(".claude/projects/-home-u-proj/conv-a.jsonl");
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, format!("{cap}\n{}\n", ok_row_at(now - 602_000))).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success after the 429 in the replaced file drops the latch"
+    );
+}
+
+/// The same through an in-place rewrite: a byte before the read offset
+/// changes (the tail hash fails, so a new life), the 429 line kept, and a
+/// success after it stamped 2 s below it drops the latch.
+#[test]
+fn a_success_after_the_429_in_a_rewritten_file_drops_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", &[cap.clone(), pad_row('z')]);
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    write_conv(
+        &home,
+        "conv-a",
+        &[cap, pad_row('y'), ok_row_at(now - 602_000)],
+    );
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success after the 429 in the rewritten file drops the latch"
+    );
+}
+
+/// A latched uuid 429 whose transcript turns cold (mtime three days back),
+/// leaves one store walk and re-enters: the cold re-entry is a new life. A
+/// success appended after the 429 but stamped 2 s below it still lies after
+/// the 429's line, so it drops the latch.
+#[test]
+fn a_success_after_the_429_in_a_cold_re_entered_file_drops_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    let path = home
+        .home()
+        .join(".claude/projects/-home-u-proj/conv-a.jsonl");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400),
+    );
+    let away = path.with_extension("away");
+    std::fs::rename(&path, &away).unwrap();
+    super::tps_producer_tick(now + 6_000);
+    std::fs::rename(&away, &path).unwrap();
+    super::tps_producer_tick(now + 12_000);
+    write_conv(&home, "conv-a", &[cap, ok_row_at(now - 602_000)]);
+    super::tps_producer_tick(now + 18_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success after the 429 in the cold re-entered file drops the latch"
+    );
+    assert!(!order_row_latched(), "the success dropped the latch");
+}
+
+/// A latched 429, then a success after it read on a scan that cannot join the
+/// row to its conversation (the session record is gone): the latch was set for
+/// that conversation, so the success still drops it and the session stays on
+/// the member that recovered, that scan and the next.
+#[test]
+fn a_success_read_while_the_session_record_is_unreadable_drops_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    write_conv(&home, "conv-a", &[cap, ok_row_at(now - 500_000)]);
+    let record = home.home().join(".claude/sessions/77777.json");
+    assert!(record.exists(), "control: the fixture's session record");
+    std::fs::remove_file(&record).unwrap();
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success after the latched 429 keeps the session on its member"
+    );
+    assert!(!order_row_latched(), "the success dropped the latch");
+    super::tps_producer_tick(now + 2_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the next scan still leaves the session on its member"
+    );
+}
+
+/// A latched 429, then `/clear`: the row's session record now names a new
+/// conversation. The latch belonged to the old one, so it drops and the
+/// session stays on its member once `b` frees; a 429 in the new conversation
+/// latches again and moves it.
+#[test]
+fn a_new_conversation_on_the_row_drops_the_old_conversations_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    seed_session_record(&home, "conv-b", 77_777);
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the old conversation's latch does not move the session"
+    );
+    assert!(
+        !order_row_latched(),
+        "the new conversation dropped the latch"
+    );
+
+    write_conv(
+        &home,
+        "conv-b",
+        &[spend_cap_row_uuid_at(now - 590_000, "cap-b")],
+    );
+    // Past the 5 s discovery walk, so the new transcript is found.
+    super::tps_producer_tick(now + 6_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "a 429 in the new conversation latches and moves the session"
+    );
+}
+
+/// A latched 429 whose row's session record cannot be read on a scan: an
+/// unreadable record is no new conversation, so the latch holds and the
+/// session moves once `b` frees.
+#[test]
+fn an_unreadable_session_record_keeps_the_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    let record = home.home().join(".claude/sessions/77777.json");
+    assert!(record.exists(), "control: the fixture's session record");
+    std::fs::remove_file(&record).unwrap();
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "an unreadable record keeps the latch and the session moves"
+    );
+}
+
+/// The stamp fallback of the rule above, on its dropping side: a uuid-less 429
+/// latches, then a shrink drops its line and replays a success in a NEW life
+/// of the file. No recorded position can place the 429 there, so the stamps
+/// decide; the replayed success is newer and drops the latch.
+#[test]
+fn a_uuid_less_429_falls_back_to_stamps_when_a_shrink_drops_its_line() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let ok = ok_row_at(now - 500_000);
+    write_conv(&home, "conv-a", std::slice::from_ref(&ok));
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: nothing latched"
+    );
+
+    // A uuid-less 429 appended after the success latches with no target.
+    write_conv(
+        &home,
+        "conv-a",
+        &[ok.clone(), spend_cap_row_at(now - 600_000)],
+    );
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: latched, no target"
+    );
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    // The shrink drops the 429 line and replays the success in a new life.
+    write_conv(&home, "conv-a", &[ok]);
+    super::tps_producer_tick(now + 2_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the replayed success's newer stamp drops the latch"
+    );
+    assert!(
+        !order_row_latched(),
+        "the replayed success dropped the latch"
+    );
+}
+
+/// The stamp fallback's keeping side: the same uuid-less 429 and shrink, with
+/// the replayed success stamped below the 429, so the latch holds and the
+/// session moves once `b` frees.
+#[test]
+fn an_older_replayed_success_keeps_a_uuid_less_429_latch_after_a_shrink() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let ok = ok_row_at(now - 700_000);
+    write_conv(&home, "conv-a", std::slice::from_ref(&ok));
+    super::tps_producer_tick(now);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: nothing latched"
+    );
+
+    write_conv(
+        &home,
+        "conv-a",
+        &[ok.clone(), spend_cap_row_at(now - 600_000)],
+    );
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(
+        scan_with_no_target(),
+        (None, None),
+        "control: latched, no target"
+    );
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    write_conv(&home, "conv-a", &[ok]);
+    super::tps_producer_tick(now + 2_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "the replayed success's older stamp keeps the latch"
+    );
+    assert!(order_row_latched(), "the older stamp kept the latch");
+}
+
+/// A scan that skips the latch block loses nothing: the 429's position lives
+/// in the producer, not in a one-shot drain event. The file shrinks into a new
+/// life while the session record is unreadable (so the scan never joins the
+/// conversation), and a success appended after the 429 in that life still
+/// drops the latch.
+#[test]
+fn a_scan_that_skips_the_latch_loses_no_position() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", &[cap.clone(), filler_row()]);
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    // The shrink re-reads the line in a new life, and this scan never joins
+    // the conversation, so it cannot touch the latch.
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    let record = home.home().join(".claude/sessions/77777.json");
+    std::fs::remove_file(&record).unwrap();
+    super::tps_producer_tick(now + 1_000);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(
+        order_row_latched(),
+        "control: the skipped scan kept the latch"
+    );
+
+    // The record returns and a success lands after the 429 in its new life,
+    // stamped below it: line order still drops the latch.
+    seed_session_record(&home, "conv-a", 77_777);
+    write_conv(&home, "conv-a", &[cap, ok_row_at(now - 602_000)]);
+    super::tps_producer_tick(now + 2_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success after the 429 in its new life drops the latch"
+    );
+    assert!(!order_row_latched(), "the success dropped the latch");
+}
+
+/// One conversation's 429s in two files: each file's later line first, then the
+/// highest stamp across files latches. The main file's later 429 is stamped
+/// below the subagent file's, so the subagent's latches — and the main file's
+/// success after its own 429 cannot clear it (another file).
+#[test]
+fn the_highest_stamp_across_files_latches_its_429() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    // Main file: the higher-stamped 429 first, the later line (lower stamp)
+    // second, then a success after both.
+    write_conv(
+        &home,
+        "conv-a",
+        &[
+            spend_cap_row_uuid_at(now - 500_000, "main-high"),
+            spend_cap_row_uuid_at(now - 700_000, "main-later"),
+            ok_row_at(now - 690_000),
+        ],
+    );
+    // Subagent transcript, same conversation key, middle stamp.
+    write_subagent(
+        &home,
+        "conv-a",
+        &[spend_cap_row_uuid_at(now - 600_000, "sub")],
+    );
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    let latched = super::SPEND_CAP_LATCH.with(|l| {
+        l.borrow()
+            .get("4242-0")
+            .map(|latch| latch.fact.uuid.clone())
+    });
+    assert_eq!(
+        latched,
+        Some(Some("sub".to_owned())),
+        "the highest stamp across files latched, not the main file's later line"
     );
 }
 
@@ -5701,8 +6300,8 @@ fn an_unknown_demand_session_stays_off_its_capped_gate_off_home_after_a_429_move
     );
 }
 
-/// A later subagent success in the same drain must not mask the main loop's
-/// recovery: the recovery half keys by FILE, so the main file's own success
+/// A later subagent success in the same scan must not mask the main loop's
+/// recovery: the success record keys by FILE, so the main file's own success
 /// still clears the main loop's 429 even when a subagent success is newer.
 #[test]
 fn a_later_subagent_success_does_not_mask_the_main_loops_recovery() {
@@ -21615,4 +22214,76 @@ fn the_tps_heartbeat_writes_on_the_first_tick_after_a_step_back() {
         }
     }
     assert!(ageless.is_empty(), "ticks with no cache age: {ageless:?}");
+}
+
+/// A scan that consumes nothing leaves the producer's success for a later
+/// scan: the record lives in the producer, so a scan that returns before
+/// judging any latch loses no success. The scan after it here drives a fresh
+/// config — a production handle stays poisoned once its lock is — and that
+/// scan drops the latch and leaves the recovered session on its member.
+#[test]
+fn a_scan_that_returns_early_keeps_the_success_for_the_next_scan() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    write_conv(&home, "conv-a", &[cap, ok_row_at(now - 500_000)]);
+    super::tps_producer_tick(now + 1_000);
+    // Poison the scan's config lock: the scan returns before the per-row loop,
+    // so nothing reads the success this tick.
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let doomed = Arc::clone(&config);
+    std::thread::spawn(move || {
+        let _held = doomed.lock().expect("lock the config before poisoning it");
+        panic!("poison the config lock");
+    })
+    .join()
+    .expect_err("the planted panic unwinds the thread");
+    scan_sessions(
+        &config,
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert!(
+        order_row_latched(),
+        "the early-returning scan dropped the latch"
+    );
+    assert_eq!(
+        scan_with_b_free(),
+        (None, None),
+        "the success still drops the latch once a scan can judge it"
+    );
+    assert!(!order_row_latched(), "the next scan dropped the latch");
+}
+
+/// A subagent transcript's success must not drop the main loop's latch: the
+/// pulled record is keyed by the latched 429's OWN file, so a newer success in
+/// a subagent file (the same conversation key) leaves the latch live and the
+/// session moves once `b` frees.
+#[test]
+fn a_subagent_success_does_not_drop_the_main_files_latch() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    assert_eq!(scan_with_no_target(), (None, None), "control: no target");
+    assert!(order_row_latched(), "control: the 429 latched");
+
+    // A later line and a newer stamp than the latched 429's, in the subagent
+    // file only: the main file holds no success. The tick is past the walk
+    // interval, so discovery picks the new subagent file up and reads it.
+    write_subagent(&home, "conv-a", &[ok_row_at(now - 500_000)]);
+    super::tps_producer_tick(now + 6_000);
+    assert_eq!(
+        scan_with_b_free(),
+        (Some("b".to_string()), Some(1)),
+        "a subagent's success is another file's and must not drop the latch"
+    );
 }

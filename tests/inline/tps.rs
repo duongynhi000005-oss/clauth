@@ -1338,12 +1338,10 @@ fn a_spend_cap_429_row_adds_no_tokens_and_drains_once() {
         "the spend-cap 429 drains once, keyed by conversation"
     );
     assert_eq!(
-        drained
-            .recoveries
-            .get("cap")
-            .and_then(|by_file| by_file.get(&transcript).copied()),
+        p.spend_cap_recovery("cap", &transcript)
+            .map(|recovery| recovery.ts),
         Some(ms(END)),
-        "the successful turn before the 429 is the recovery half, keyed by file"
+        "the successful turn before the 429 is its file's success record"
     );
     assert!(
         p.drain_spend_cap().pending.is_empty(),
@@ -1380,13 +1378,11 @@ fn a_clock_step_back_re_read_delivers_no_spend_cap_fact_twice() {
         Some(ms(END) + 2_000),
         "the 429 drains once"
     );
+    let success = p.spend_cap_recovery("cap", &transcript);
     assert_eq!(
-        drained
-            .recoveries
-            .get("cap")
-            .and_then(|by_file| by_file.get(&transcript).copied()),
+        success.map(|recovery| recovery.ts),
         Some(ms(END)),
-        "the success is the recovery half"
+        "the success is its file's record"
     );
     // A full-day clock step back lowers the cutoff below `whole_since`, so the
     // hot file re-reads from byte 0.
@@ -1397,10 +1393,10 @@ fn a_clock_step_back_re_read_delivers_no_spend_cap_fact_twice() {
         "the re-read re-delivered the drained 429: {:?}",
         again.pending
     );
-    assert!(
-        again.recoveries.is_empty(),
-        "the re-read re-delivered the drained recovery: {:?}",
-        again.recoveries
+    assert_eq!(
+        p.spend_cap_recovery("cap", &transcript),
+        success,
+        "the byte-0 re-read re-delivered the success"
     );
 }
 
@@ -1429,12 +1425,10 @@ fn a_same_ms_success_then_429_delivers_both_facts() {
         "the same-ms 429 delivers"
     );
     assert_eq!(
-        drained
-            .recoveries
-            .get("same")
-            .and_then(|by_file| by_file.get(&transcript).copied()),
+        p.spend_cap_recovery("same", &transcript)
+            .map(|recovery| recovery.ts),
         Some(t),
-        "the same-ms success is the recovery half"
+        "the same-ms success is its file's record"
     );
 }
 
@@ -1463,12 +1457,10 @@ fn a_429_stamped_below_an_earlier_success_delivers() {
         "the earlier-stamped 429 delivers"
     );
     assert_eq!(
-        drained
-            .recoveries
-            .get("below")
-            .and_then(|by_file| by_file.get(&transcript).copied()),
+        p.spend_cap_recovery("below", &transcript)
+            .map(|recovery| recovery.ts),
         Some(t),
-        "the later success is the recovery half"
+        "the later success is its file's record"
     );
 }
 
@@ -1491,11 +1483,9 @@ fn a_429_appended_after_a_small_clock_step_back_delivers() {
     let mut p = Producer::new();
     p.tick(now);
     let drained = p.drain_spend_cap();
+    let success = p.spend_cap_recovery("stepback", &transcript);
     assert_eq!(
-        drained
-            .recoveries
-            .get("stepback")
-            .and_then(|by_file| by_file.get(&transcript).copied()),
+        success.map(|recovery| recovery.ts),
         Some(t),
         "the first read delivers the success"
     );
@@ -1508,8 +1498,9 @@ fn a_429_appended_after_a_small_clock_step_back_delivers() {
         Some(t - 2_400),
         "the appended 429 delivers despite its earlier stamp"
     );
-    assert!(
-        drained.recoveries.is_empty(),
+    assert_eq!(
+        p.spend_cap_recovery("stepback", &transcript),
+        success,
         "no new success on the second read"
     );
 }
@@ -1535,12 +1526,9 @@ fn a_replaced_file_delivers_its_429() {
     let now = ms(END) + 62_000;
     let mut p = Producer::new();
     p.tick(now);
-    let drained = p.drain_spend_cap();
     assert_eq!(
-        drained
-            .recoveries
-            .get("replaced")
-            .and_then(|by_file| by_file.get(&transcript).copied()),
+        p.spend_cap_recovery("replaced", &transcript)
+            .map(|recovery| recovery.ts),
         Some(t),
         "the first read delivers the success"
     );
@@ -1557,9 +1545,10 @@ fn a_replaced_file_delivers_its_429() {
         Some(t - 10_000),
         "the replacement's 429 delivers"
     );
-    assert!(
-        drained.recoveries.is_empty(),
-        "the replacement holds no success"
+    assert_eq!(
+        p.spend_cap_recovery("replaced", &transcript),
+        None,
+        "the replacement's new life holds no success"
     );
 }
 
@@ -1582,12 +1571,9 @@ fn a_longer_replacement_delivers_no_early_429() {
     let now = ms(END) + 62_000;
     let mut p = Producer::new();
     p.tick(now);
-    let drained = p.drain_spend_cap();
     assert_eq!(
-        drained
-            .recoveries
-            .get("renameover")
-            .and_then(|by_file| by_file.get(&transcript).copied()),
+        p.spend_cap_recovery("renameover", &transcript)
+            .map(|recovery| recovery.ts),
         Some(t),
         "the first read delivers the success"
     );
@@ -1609,9 +1595,10 @@ fn a_longer_replacement_delivers_no_early_429() {
         "a longer replacement's early 429 stays undelivered: {:?}",
         drained.pending
     );
-    assert!(
-        drained.recoveries.is_empty(),
-        "the replacement holds no success"
+    assert_eq!(
+        p.spend_cap_recovery("renameover", &transcript),
+        None,
+        "the replacement's new life holds no success"
     );
 }
 
@@ -1635,12 +1622,9 @@ fn a_straddling_429_on_a_longer_replacement_delivers_once() {
     let now = ms(END) + 62_000;
     let mut p = Producer::new();
     p.tick(now);
-    let drained = p.drain_spend_cap();
     assert_eq!(
-        drained
-            .recoveries
-            .get("straddle")
-            .and_then(|by_file| by_file.get(&transcript).copied()),
+        p.spend_cap_recovery("straddle", &transcript)
+            .map(|recovery| recovery.ts),
         Some(t),
         "the first read delivers the success"
     );
@@ -1662,9 +1646,10 @@ fn a_straddling_429_on_a_longer_replacement_delivers_once() {
         Some(t - 10_000),
         "the straddling 429 delivers once"
     );
-    assert!(
-        drained.recoveries.is_empty(),
-        "the replacement holds no success"
+    assert_eq!(
+        p.spend_cap_recovery("straddle", &transcript),
+        None,
+        "the replacement's new life holds no success"
     );
     // A byte-0 re-read (a clock step back) folds the straddling line again:
     // its end sits at or before the consumed offset, so it must not deliver a
@@ -1678,8 +1663,8 @@ fn a_straddling_429_on_a_longer_replacement_delivers_once() {
     );
 }
 
-/// A hot file's first read delivers a pre-cutoff success as the recovery half:
-/// a pre-cutoff success is still its file's recovery candidate.
+/// A hot file's first read records a pre-cutoff success in its file's record:
+/// a pre-cutoff success still counts as its file's recovery candidate.
 #[test]
 fn a_first_read_delivers_a_pre_cutoff_success_recovery() {
     let home = HomeSandbox::new();
@@ -1703,12 +1688,10 @@ fn a_first_read_delivers_a_pre_cutoff_success_recovery() {
     p.tick(now);
     let drained = p.drain_spend_cap();
     assert_eq!(
-        drained
-            .recoveries
-            .get("p4recov")
-            .and_then(|by_file| by_file.get(&transcript).copied()),
+        p.spend_cap_recovery("p4recov", &transcript)
+            .map(|recovery| recovery.ts),
         Some(success),
-        "a first read delivers a pre-cutoff success as the recovery half"
+        "a first read delivers a pre-cutoff success as its file's record"
     );
     assert_eq!(
         drained.pending.get("p4recov").map(|f| f.ts),
@@ -1736,12 +1719,9 @@ fn a_tail_hash_rewrite_delivers_a_429_after_the_old_offset() {
     let now = ms(END) + 62_000;
     let mut p = Producer::new();
     p.tick(now);
-    let drained = p.drain_spend_cap();
     assert_eq!(
-        drained
-            .recoveries
-            .get("tailhash")
-            .and_then(|by_file| by_file.get(&transcript).copied()),
+        p.spend_cap_recovery("tailhash", &transcript)
+            .map(|recovery| recovery.ts),
         Some(t),
         "the first read delivers the success"
     );
@@ -1756,9 +1736,10 @@ fn a_tail_hash_rewrite_delivers_a_429_after_the_old_offset() {
         Some(cap),
         "the tail-hash re-read delivers the 429 past the old offset"
     );
-    assert!(
-        drained.recoveries.is_empty(),
-        "the rewrite holds no success"
+    assert_eq!(
+        p.spend_cap_recovery("tailhash", &transcript),
+        None,
+        "the rewrite's new life holds no success"
     );
 }
 
@@ -1827,14 +1808,11 @@ fn a_429_appended_after_a_forward_clock_correction_delivers() {
     );
     let mut p = Producer::new();
     p.tick(now);
-    let drained = p.drain_spend_cap();
+    let success = p.spend_cap_recovery("fastclock", &transcript);
     assert_eq!(
-        drained
-            .recoveries
-            .get("fastclock")
-            .and_then(|by_file| by_file.get(&transcript).copied()),
+        success.map(|recovery| recovery.ts),
         Some(success_ts),
-        "the fast-clock success is the recovery half"
+        "the fast-clock success is its file's record"
     );
     append_lines(&transcript, &[spend_cap_429(&iso(t + hour))]);
     p.tick(now - hour);
@@ -1844,8 +1822,9 @@ fn a_429_appended_after_a_forward_clock_correction_delivers() {
         Some(t + hour),
         "the corrected 429 delivers"
     );
-    assert!(
-        drained.recoveries.is_empty(),
+    assert_eq!(
+        p.spend_cap_recovery("fastclock", &transcript),
+        success,
         "no new success on the second read"
     );
 }
@@ -1886,10 +1865,10 @@ fn an_owed_day_read_back_of_a_cold_file_delivers_no_spend_cap_fact() {
         "an owed-day read-back mints no 429 for a file discovery skipped: {:?}",
         drained.pending
     );
-    assert!(
-        drained.recoveries.is_empty(),
-        "an owed-day read-back mints no recovery for a file discovery skipped: {:?}",
-        drained.recoveries
+    assert_eq!(
+        p.spend_cap_recovery("owedcap", &path),
+        None,
+        "an owed-day read-back mints no success record for a file discovery skipped"
     );
 }
 
@@ -1951,6 +1930,124 @@ fn a_cold_joined_file_delivers_its_rebuilt_429_exactly_once() {
         again.pending.is_empty(),
         "the later hot tail re-delivered the drained 429: {:?}",
         again.pending
+    );
+}
+
+/// The cold re-entry's other side: a cold new entry whose path holds no 429
+/// this producer delivered keeps joining at its length, so its history mints
+/// nothing when the file turns hot and the entry's life survives; only a line
+/// past the join delivers.
+#[test]
+fn a_cold_new_entry_without_a_delivered_429_joins_at_its_length() {
+    let home = HomeSandbox::new();
+    let path = global_store(home.home()).join("cold-join.jsonl");
+    let history_cap_ts = ms(END) + 2_000;
+    let history_uuid = format!("429-{}", iso(history_cap_ts));
+    write_lines(
+        &path,
+        &[
+            user(START, "cold-join"),
+            spend_cap_429_uuid(&iso(history_cap_ts)),
+            assistant(&iso(history_cap_ts - 5_000), "cold-join", "msg_cold", 400),
+        ],
+    );
+    crate::testutil::set_mtime(
+        &path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms(END) - 3 * 86_400_000),
+    );
+    let now = ms(END) + 62_000;
+    let mut p = Producer::new();
+    p.tick(now);
+    let joined = file_life(&p, &path).expect("the cold file joined the walk");
+    // Turn the file hot with a line past the join: only that line is read.
+    let later = ms(END) + 4_000;
+    append_lines(&path, &[spend_cap_429_uuid(&iso(later))]);
+    p.tick(now + 10_000);
+    let drained = p.drain_spend_cap();
+    assert_eq!(
+        drained.pending.get("cold-join").map(|f| f.ts),
+        Some(later),
+        "the line past the join delivers"
+    );
+    assert_eq!(
+        p.spend_cap_recovery("cold-join", &path),
+        None,
+        "the cold history replayed a success"
+    );
+    assert_eq!(
+        p.spend_cap_position("cold-join", &history_uuid, &path),
+        None,
+        "the history 429 below the join was never delivered"
+    );
+    assert_eq!(
+        file_life(&p, &path),
+        Some(joined),
+        "the join-at-length read kept the entry's life: no byte-0 re-read"
+    );
+}
+
+/// A 429 already delivered this life at another path in the same conversation
+/// does not make a cold new entry re-read: the predicate is scoped to the
+/// entry's own path, so the entry keeps joining at its length.
+#[test]
+fn a_429_delivered_at_another_path_does_not_make_a_cold_entry_reread() {
+    let home = HomeSandbox::new();
+    // The conversation's 429 is delivered first at a rescue sibling.
+    let other = global_store(home.home()).join("cold-join.rescued-1.jsonl");
+    let other_cap = ms(END) + 1_000;
+    write_lines(
+        &other,
+        &[
+            user(START, "cold-join"),
+            spend_cap_429_uuid(&iso(other_cap)),
+        ],
+    );
+    let now = ms(END) + 62_000;
+    let mut p = Producer::new();
+    p.tick(now);
+    assert_eq!(
+        p.drain_spend_cap().pending.get("cold-join").map(|f| f.ts),
+        Some(other_cap),
+        "the other path's 429 delivered before the cold entry joined"
+    );
+    // The entry's own path holds no delivered 429; its history lies below the
+    // join and a later line sits past it.
+    let path = global_store(home.home()).join("cold-join.jsonl");
+    let history_cap_ts = ms(END) + 2_000;
+    let history_uuid = format!("429-{}", iso(history_cap_ts));
+    write_lines(
+        &path,
+        &[
+            user(START, "cold-join"),
+            spend_cap_429_uuid(&iso(history_cap_ts)),
+            assistant(&iso(history_cap_ts - 5_000), "cold-join", "msg_cold", 400),
+        ],
+    );
+    crate::testutil::set_mtime(
+        &path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms(END) - 3 * 86_400_000),
+    );
+    p.tick(now + 10_000);
+    let joined = file_life(&p, &path).expect("the cold file joined the walk");
+    // Turn the file hot with a line past the join: only that line is read.
+    let later = ms(END) + 4_000;
+    append_lines(&path, &[spend_cap_429_uuid(&iso(later))]);
+    p.tick(now + 20_000);
+    let drained = p.drain_spend_cap();
+    assert_eq!(
+        drained.pending.get("cold-join").map(|f| f.ts),
+        Some(later),
+        "the line past the join delivers"
+    );
+    assert_eq!(
+        p.spend_cap_position("cold-join", &history_uuid, &path),
+        None,
+        "the history 429 below the join was never delivered"
+    );
+    assert_eq!(
+        file_life(&p, &path),
+        Some(joined),
+        "another path's delivered 429 made the cold entry re-read from byte 0"
     );
 }
 
@@ -2065,11 +2162,11 @@ fn an_in_place_rewrite_does_not_redeliver_a_drained_429_it_moved_past_the_offset
     );
 }
 
-/// A shrink re-reads from byte 0 with the `All` bound, so a drained recovery
-/// delivers again: a success line is never uuid-deduped. Re-delivery is
+/// A shrink re-reads from byte 0 with the `All` bound, so a success already in
+/// the record lands in it again, in the file's NEW life. Re-delivery is
 /// allowed, not required; the latch outcome is pinned by
-/// `an_older_same_file_success_does_not_drop_the_latched_429` in the
-/// scheduler tests.
+/// `an_older_same_file_success_does_not_drop_the_latched_429` in the scheduler
+/// tests.
 #[test]
 fn a_shrink_redelivers_a_drained_recovery() {
     let home = HomeSandbox::new();
@@ -2086,22 +2183,27 @@ fn a_shrink_redelivers_a_drained_recovery() {
     let now = ms(END) + 62_000;
     let mut p = Producer::new();
     p.tick(now);
-    let drained = p.drain_spend_cap();
+    let first = p
+        .spend_cap_recovery("s3", &t)
+        .expect("the first read records the success");
     assert_eq!(
-        drained
-            .recoveries
-            .get("s3")
-            .and_then(|m| m.get(&t).copied()),
-        Some(ms(END) + 2_000),
-        "the first read delivers the success as the recovery"
+        first.ts,
+        ms(END) + 2_000,
+        "the first read records the success"
     );
     write_lines(&t, &head);
     p.tick(now + 10_000);
-    let again = p.drain_spend_cap();
+    let again = p
+        .spend_cap_recovery("s3", &t)
+        .expect("the shrink re-reads the success");
     assert_eq!(
-        again.recoveries.get("s3").and_then(|m| m.get(&t).copied()),
-        Some(ms(END) + 2_000),
-        "the shrink re-delivers the drained recovery: successes are not uuid-deduped"
+        again.ts,
+        ms(END) + 2_000,
+        "the shrink re-reads the success: successes are not uuid-deduped"
+    );
+    assert_ne!(
+        again.life, first.life,
+        "the re-read lands in the file's new life"
     );
 }
 
@@ -2136,6 +2238,38 @@ fn a_walk_miss_does_not_redeliver_a_drained_429() {
         again.pending.is_empty(),
         "the walk miss re-delivered the drained 429: {:?}",
         again.pending
+    );
+}
+
+/// A transcript deleted from disk takes its success record out of the walk:
+/// nothing else ever removes that record, so without the walk-miss prune it
+/// would outlive the file for the producer's whole life.
+#[test]
+fn a_walk_miss_drops_the_deleted_paths_success_record() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let t = iso_kerry(home.home()).join("prune.jsonl");
+    write_lines(
+        &t,
+        &[
+            user(START, "prune"),
+            assistant(END, "prune", "msg_prune", 1222),
+        ],
+    );
+    let now = ms(END) + 62_000;
+    let mut p = Producer::new();
+    p.tick(now);
+    assert!(
+        p.spend_cap_recovery("prune", &t).is_some(),
+        "control: the read recorded the success"
+    );
+
+    std::fs::remove_file(&t).unwrap();
+    p.tick(now + DISCOVER_INTERVAL_MS);
+    assert_eq!(
+        p.spend_cap_recovery("prune", &t),
+        None,
+        "the deleted transcript's success record survived its walk miss"
     );
 }
 
@@ -2460,14 +2594,11 @@ fn many_success_lines_leave_the_429_uuid_set_empty() {
     write_lines(&t, &lines);
     let mut p = Producer::new();
     p.tick(ms(END) + 62_000);
-    let drained = p.drain_spend_cap();
     assert_eq!(
-        drained
-            .recoveries
-            .get("succonly")
-            .and_then(|m| m.get(&t).copied()),
+        p.spend_cap_recovery("succonly", &t)
+            .map(|recovery| recovery.ts),
         Some(ms(END) + 4_000),
-        "the newest success is the recovery half"
+        "the newest success is its file's record"
     );
     assert!(
         p.delivered_facts.is_empty(),
@@ -2476,8 +2607,8 @@ fn many_success_lines_leave_the_429_uuid_set_empty() {
     );
 }
 
-/// A hot file whose newest success predates the cutoff delivers its recovery
-/// on the first read, and a shrink re-delivers it: the pre-cutoff success arm
+/// A hot file whose newest success predates the cutoff records it on the first
+/// read, and a shrink re-reads it: the pre-cutoff success arm
 /// folds by position alone, never by uuid. Re-delivery is allowed, not
 /// required; the latch outcome is pinned by
 /// `an_older_same_file_success_does_not_drop_the_latched_429` in the
@@ -2498,25 +2629,25 @@ fn a_shrink_redelivers_a_pre_cutoff_recovery() {
     let now = ms(END) + 62_000;
     let mut p = Producer::new();
     p.tick(now);
-    let drained = p.drain_spend_cap();
+    let first = p
+        .spend_cap_recovery("precuts", &t)
+        .expect("the first read records the pre-cutoff success");
     assert_eq!(
-        drained
-            .recoveries
-            .get("precuts")
-            .and_then(|m| m.get(&t).copied()),
-        Some(success),
-        "the first read delivers the pre-cutoff success as the recovery"
+        first.ts, success,
+        "the first read records the pre-cutoff success"
     );
     write_lines(&t, &head);
     p.tick(now + 10_000);
-    let again = p.drain_spend_cap();
+    let again = p
+        .spend_cap_recovery("precuts", &t)
+        .expect("the shrink re-reads the pre-cutoff success");
     assert_eq!(
-        again
-            .recoveries
-            .get("precuts")
-            .and_then(|m| m.get(&t).copied()),
-        Some(success),
-        "the shrink re-delivers the pre-cutoff recovery: the pre-cutoff arm has no uuid gate"
+        again.ts, success,
+        "the shrink re-reads the pre-cutoff success: the pre-cutoff arm has no uuid gate"
+    );
+    assert_ne!(
+        again.life, first.life,
+        "the re-read lands in the file's new life"
     );
 }
 
@@ -9850,4 +9981,421 @@ fn a_world_readable_corrupt_attribution_file_is_moved_aside_owner_only() {
         0o600,
         "the aside is 0600"
     );
+}
+
+// ── spend-cap line order: the transcript read life ──────────────────────────
+
+/// A timestamp-less progress line with `chars` bytes of filler: a JSON-valid
+/// line `parse_line` ignores, for growing or shrinking a transcript without a
+/// fact line.
+fn progress_pad(chars: usize) -> String {
+    serde_json::json!({"type": "progress", "pad": "z".repeat(chars)}).to_string()
+}
+
+/// The read life the producer holds for `path`.
+fn file_life(p: &Producer, path: &Path) -> Option<FileLife> {
+    p.files.get(path).map(|entry| entry.life)
+}
+
+/// Flip one byte inside the last line's filler, keeping the file's length and
+/// inode: the stored tail hash no longer matches the bytes it covers.
+fn flip_a_pad_byte(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let at = bytes
+        .iter()
+        .position(|&b| b == b'z')
+        .expect("the pad's filler byte");
+    bytes[at] = b'y';
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// `life` names a file's read life; a step-back re-read whose verified bytes
+/// still match keeps it, a re-read over changed bytes starts a new one.
+#[test]
+fn a_verified_step_back_reread_keeps_the_files_life() {
+    let home = HomeSandbox::new();
+    let path = global_store(home.home()).join("life-stepback.jsonl");
+    write_lines(&path, &[user(START, "life-stepback"), progress_pad(120)]);
+    let mut p = Producer::new();
+    let now = ms(END) + 62_000;
+    p.tick(now);
+    let life = file_life(&p, &path).expect("the file joined the walk");
+    let armed = p.whole_since;
+    p.tick(now - DAY_MS);
+    assert_ne!(
+        p.whole_since, armed,
+        "the step back armed a byte-0 re-read of the hot set"
+    );
+    assert_eq!(
+        file_life(&p, &path),
+        Some(life),
+        "the verified re-read keeps the life: the bytes before the old offset still hash to the stored tail"
+    );
+}
+
+/// The other side of the verification: the same step-back re-read over bytes
+/// that no longer hash to the stored tail starts a new life, so no position
+/// from the old life is compared against the new bytes.
+#[test]
+fn a_step_back_reread_over_changed_bytes_starts_a_new_life() {
+    let home = HomeSandbox::new();
+    let path = global_store(home.home()).join("life-changed.jsonl");
+    write_lines(&path, &[user(START, "life-changed"), progress_pad(120)]);
+    let mut p = Producer::new();
+    let now = ms(END) + 62_000;
+    p.tick(now);
+    let life = file_life(&p, &path).expect("the file joined the walk");
+    flip_a_pad_byte(&path);
+    p.tick(now - DAY_MS);
+    assert_ne!(
+        file_life(&p, &path),
+        Some(life),
+        "changed bytes before the old offset start a new life"
+    );
+}
+
+/// A shrink cannot vouch for the bytes past the new length: the next read
+/// starts a new life.
+#[test]
+fn a_shrink_starts_a_new_file_life() {
+    let home = HomeSandbox::new();
+    let path = global_store(home.home()).join("life-shrink.jsonl");
+    write_lines(
+        &path,
+        &[
+            user(START, "life-shrink"),
+            assistant(END, "life-shrink", "msg_shrink", 1222),
+        ],
+    );
+    let mut p = Producer::new();
+    let now = ms(END) + 62_000;
+    p.tick(now);
+    let life = file_life(&p, &path).expect("the file joined the walk");
+    write_lines(&path, &[user(START, "life-shrink")]);
+    p.tick(now + 10_000);
+    assert_ne!(
+        file_life(&p, &path),
+        Some(life),
+        "a shrink starts a new life"
+    );
+}
+
+/// A replacement at the same path is a different file identity even at the
+/// same length: the next read starts a new life.
+#[test]
+fn an_identity_change_starts_a_new_file_life() {
+    let home = HomeSandbox::new();
+    let path = global_store(home.home()).join("life-ident.jsonl");
+    write_lines(
+        &path,
+        &[
+            user(START, "life-ident"),
+            assistant(END, "life-ident", "msg_ident", 1222),
+        ],
+    );
+    let mut p = Producer::new();
+    let now = ms(END) + 62_000;
+    p.tick(now);
+    let life = file_life(&p, &path).expect("the file joined the walk");
+    let same = std::fs::read(&path).unwrap();
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, same).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    p.tick(now + 10_000);
+    assert_ne!(
+        file_life(&p, &path),
+        Some(life),
+        "an identity change starts a new life"
+    );
+}
+
+/// An in-place rewrite that keeps the length growing but changes the bytes
+/// before the old offset reads as rewritten: the retry from byte 0 starts a
+/// new life.
+#[test]
+fn a_rewrite_starts_a_new_file_life() {
+    let home = HomeSandbox::new();
+    let path = global_store(home.home()).join("life-rewrite.jsonl");
+    write_lines(
+        &path,
+        &[
+            user(START, "life-rewrite"),
+            assistant(END, "life-rewrite", "msg_rewrite", 1222),
+        ],
+    );
+    let mut p = Producer::new();
+    let now = ms(END) + 62_000;
+    p.tick(now);
+    let life = file_life(&p, &path).expect("the file joined the walk");
+    write_lines(
+        &path,
+        &[
+            progress_pad(400),
+            user(&iso(ms(END) + 1_000), "life-rewrite"),
+        ],
+    );
+    p.tick(now + 10_000);
+    assert_ne!(
+        file_life(&p, &path),
+        Some(life),
+        "a rewrite starts a new life"
+    );
+}
+
+/// A transcript that leaves one store walk and returns is a new entry: its
+/// read starts a new life.
+#[test]
+fn a_walk_miss_starts_a_new_file_life() {
+    let home = HomeSandbox::new();
+    let path = global_store(home.home()).join("life-walk.jsonl");
+    write_lines(&path, &[user(START, "life-walk"), progress_pad(40)]);
+    let mut p = Producer::new();
+    let now = ms(END) + 62_000;
+    p.tick(now);
+    let life = file_life(&p, &path).expect("the file joined the walk");
+    let away = path.with_extension("away");
+    std::fs::rename(&path, &away).unwrap();
+    p.tick(now + 6_000);
+    std::fs::rename(&away, &path).unwrap();
+    p.tick(now + 12_000);
+    assert_ne!(
+        file_life(&p, &path),
+        Some(life),
+        "a walk miss re-entry starts a new life"
+    );
+}
+
+/// A deduped 429 line re-read in a new life of the same path moves the
+/// position its latch pulls, and never re-latches: the scheduler writes that
+/// position onto the latch holding its uuid before it judges any replayed
+/// success.
+#[test]
+fn a_deduped_429_re_read_in_a_new_life_moves_the_pulled_position_and_mints_no_pending() {
+    let home = HomeSandbox::new();
+    let path = global_store(home.home()).join("life-reloc.jsonl");
+    let cap_ts = ms(END) + 2_000;
+    let uuid = format!("429-{}", iso(cap_ts));
+    let cap = spend_cap_429_uuid(&iso(cap_ts));
+    let head = user(START, "life-reloc");
+    let cap_end = (head.len() + 1 + cap.len() + 1) as u64;
+    write_lines(&path, &[head.clone(), cap.clone(), progress_pad(20)]);
+    let mut p = Producer::new();
+    let now = ms(END) + 62_000;
+    p.tick(now);
+    assert_eq!(
+        p.drain_spend_cap().pending.get("life-reloc").map(|f| f.ts),
+        Some(cap_ts),
+        "the 429 delivers once"
+    );
+    let life = file_life(&p, &path).expect("the file joined the walk");
+    write_lines(&path, &[head, cap]);
+    p.tick(now + 10_000);
+    let new_life = file_life(&p, &path).expect("the file stayed in the walk");
+    assert_ne!(new_life, life, "the shrink starts a new life");
+    let drained = p.drain_spend_cap();
+    assert!(
+        drained.pending.is_empty(),
+        "the deduped 429 re-latched: {:?}",
+        drained.pending
+    );
+    assert_eq!(
+        p.spend_cap_position("life-reloc", &uuid, &path),
+        Some((new_life, cap_end)),
+        "the delivered line's position follows the read into the new life"
+    );
+}
+
+/// A drained 429 line re-read at another path (a rescue copy) never moves the
+/// position a latch pulls: the producer answers nothing at the new path, and
+/// the line's original record stays where it was, because a latch is never
+/// moved to a different transcript file.
+#[test]
+fn a_rescue_move_moves_no_pulled_position() {
+    let home = HomeSandbox::new();
+    reg(None);
+    let src = iso_kerry(home.home()).join("life-rescue.jsonl");
+    let uuid = format!("429-{}", iso(ms(END)));
+    write_lines(
+        &src,
+        &[
+            user(START, "life-rescue"),
+            spend_cap_429_uuid(&iso(ms(END))),
+        ],
+    );
+    let mut p = Producer::new();
+    let now = ms(END) + 62_000;
+    p.tick(now);
+    assert_eq!(
+        p.drain_spend_cap().pending.get("life-rescue").map(|f| f.ts),
+        Some(ms(END)),
+        "the 429 delivers once"
+    );
+    let dst = global_store(home.home()).join("life-rescue.rescued-1.jsonl");
+    std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    std::fs::rename(&src, &dst).unwrap();
+    p.tick(now + 6_000);
+    assert!(
+        p.drain_spend_cap().pending.is_empty(),
+        "the rescue re-delivered the drained 429"
+    );
+    assert_eq!(
+        p.spend_cap_position("life-rescue", &uuid, &dst),
+        None,
+        "a rescue copy must not move a latch to its new path"
+    );
+    assert!(
+        p.spend_cap_position("life-rescue", &uuid, &src).is_some(),
+        "the rescue copy left the original line's record alone"
+    );
+}
+
+/// A read whose position bound skips an already-delivered 429 line still moves
+/// that line's recorded position: the rewrite retry reads from byte 0 under the
+/// old offset, and the latch pulls the line's new-life position while its own
+/// delivery stays deduped.
+#[test]
+fn a_bound_skipped_reread_moves_a_delivered_429s_position() {
+    let home = HomeSandbox::new();
+    let path = global_store(home.home()).join("life-bound.jsonl");
+    let cap_ts = ms(END) + 2_000;
+    let uuid = format!("429-{}", iso(cap_ts));
+    let cap = spend_cap_429_uuid(&iso(cap_ts));
+    let head = user(START, "life-bound");
+    let cap_end = (head.len() + 1 + cap.len() + 1) as u64;
+    write_lines(&path, &[head.clone(), cap.clone(), progress_pad(20)]);
+    let mut p = Producer::new();
+    let now = ms(END) + 62_000;
+    p.tick(now);
+    assert_eq!(
+        p.drain_spend_cap().pending.get("life-bound").map(|f| f.ts),
+        Some(cap_ts),
+        "the 429 delivers once"
+    );
+    let life = file_life(&p, &path).expect("the file joined the walk");
+    // Grow the file while changing bytes before the old offset: the tail hash
+    // fails, and the byte-0 retry keeps the old offset as its bound, which
+    // skips the 429 line.
+    write_lines(
+        &path,
+        &[
+            head,
+            cap,
+            progress_pad(20),
+            assistant(&iso(ms(END) + 3_000), "life-bound", "msg_bound", 400),
+        ],
+    );
+    let mut bytes = std::fs::read(&path).unwrap();
+    let at = bytes
+        .iter()
+        .position(|&b| b == b'z')
+        .expect("the pad's filler byte");
+    bytes[at] = b'y';
+    std::fs::write(&path, bytes).unwrap();
+    p.tick(now + 10_000);
+    let new_life = file_life(&p, &path).expect("the file stayed in the walk");
+    assert_ne!(new_life, life, "the rewrite starts a new life");
+    assert_eq!(
+        p.spend_cap_position("life-bound", &uuid, &path),
+        Some((new_life, cap_end)),
+        "the bound that skips the line still moves its recorded position"
+    );
+}
+
+/// The other side: a bound that skips a 429 line this conversation never
+/// delivered records nothing, so the line stays available to a later read that
+/// passes the bound (here a shrink). Recording it would suppress a real 429.
+#[test]
+fn a_bound_skipped_undelivered_429_is_not_recorded_and_later_delivers() {
+    let home = HomeSandbox::new();
+    let path = global_store(home.home()).join("life-skip.jsonl");
+    let cap_ts = ms(END) + 2_000;
+    let uuid = format!("429-{}", iso(cap_ts));
+    let cap = spend_cap_429_uuid(&iso(cap_ts));
+    let head = user(START, "life-skip");
+    write_lines(&path, &[head.clone(), progress_pad(600)]);
+    let mut p = Producer::new();
+    let now = ms(END) + 62_000;
+    p.tick(now);
+    assert!(
+        p.drain_spend_cap().pending.is_empty(),
+        "the first read carries no 429"
+    );
+    let old = std::fs::metadata(&path).unwrap().len();
+    // Rewrite to [user, 429, pad] longer than the old offset: the rewrite
+    // retry reads from byte 0 under that offset and skips the 429 line.
+    write_lines(&path, &[head, cap.clone(), progress_pad(600)]);
+    assert!(
+        std::fs::metadata(&path).unwrap().len() > old,
+        "the rewrite keeps the old offset as the bound"
+    );
+    p.tick(now + 10_000);
+    assert_eq!(
+        p.spend_cap_position("life-skip", &uuid, &path),
+        None,
+        "a line the bound skipped was never delivered, so nothing is recorded"
+    );
+    let drained = p.drain_spend_cap();
+    assert!(
+        drained.pending.is_empty(),
+        "a line the bound skipped does not deliver: {:?}",
+        drained.pending
+    );
+    // A shrink re-reads from byte 0 with no bound: the line delivers now.
+    write_lines(&path, &[cap]);
+    p.tick(now + 20_000);
+    assert_eq!(
+        p.drain_spend_cap().pending.get("life-skip").map(|f| f.ts),
+        Some(cap_ts),
+        "the skipped line still delivers once a read passes the bound"
+    );
+}
+
+/// One conversation's pending 429s are kept per transcript file, and the drain
+/// hands over each file's later line before it picks across files: the highest
+/// stamp wins, ties broken by path. A total order, so the same facts pick the
+/// same 429 whatever order the reads inserted the files in.
+#[test]
+fn two_files_429s_pick_the_same_429_in_either_insertion_order() {
+    let fact = |file: &str, ts: u64, uuid: &str| SpendCap429Fact {
+        ts,
+        file: PathBuf::from(file),
+        life: FileLife(1),
+        end: 0,
+        uuid: Some(uuid.to_owned()),
+    };
+    let x = fact("/p/x.jsonl", 10, "x");
+    let y = fact("/p/y.jsonl", 5, "y");
+    for order in [[&x, &y], [&y, &x]] {
+        let mut files: std::collections::HashMap<PathBuf, SpendCap429Fact> =
+            std::collections::HashMap::new();
+        for f in order {
+            files.insert(f.file.clone(), f.clone());
+        }
+        assert_eq!(
+            pending_winner(&files).and_then(|f| f.uuid.as_deref()),
+            Some("x"),
+            "the higher stamp wins in either insertion order"
+        );
+    }
+    let a = fact("/p/a.jsonl", 5, "a");
+    let b = fact("/p/b.jsonl", 5, "b");
+    // The comparator itself, in both argument orders: a removed path tie-break
+    // answers `Equal` here on every run, whatever the map order.
+    assert_eq!(pending_order(&a, &b), std::cmp::Ordering::Less);
+    assert_eq!(pending_order(&b, &a), std::cmp::Ordering::Greater);
+    // Each fresh map gets its own `RandomState`, so a tie-break-less pick
+    // follows a whole map's iteration order: over 64 maps a removed path
+    // tie-break survives with probability at most 2^-64. This half pins the
+    // pick, so a `pending_winner` that skips the comparator still reds.
+    for _ in 0..64 {
+        let mut files: std::collections::HashMap<PathBuf, SpendCap429Fact> =
+            std::collections::HashMap::new();
+        files.insert(a.file.clone(), a.clone());
+        files.insert(b.file.clone(), b.clone());
+        assert_eq!(
+            pending_winner(&files).and_then(|f| f.uuid.as_deref()),
+            Some("b"),
+            "an equal stamp breaks by path"
+        );
+    }
 }
