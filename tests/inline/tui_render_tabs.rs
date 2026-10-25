@@ -94,6 +94,7 @@ fn tokens_dashboard_uses_alignment_not_middot() {
         last_computed_date: Some("2026-06-09".into()),
         topped_up_through: Some("2026-06-15".into()),
         speed_days: Default::default(),
+        speed_cells: Default::default(),
         today: Some(DaySummary {
             date: "2026-06-15".into(),
             input: 12_300_000,
@@ -163,6 +164,7 @@ fn count_cache_toggle_switches_token_basis() {
         last_computed_date: None,
         topped_up_through: None,
         speed_days: Default::default(),
+        speed_cells: Default::default(),
         today: Some(DaySummary {
             date: "2026-06-15".into(),
             input: 10_000_000,

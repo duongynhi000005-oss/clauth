@@ -760,8 +760,9 @@ pub(crate) struct StatusBody {
     /// additive-tolerant of an older writer.
     #[serde(default)]
     pub(crate) proxies: Vec<ProxySlot>,
-    /// Additive: the lease holder's tps cache republished minus its `days`
-    /// (which the ledger owns), plus `age_secs`. `None` = no producer cache.
+    /// Additive: the lease holder's tps cache figures and `peaks`, plus
+    /// `age_secs` ([`TpsSlot`] names every field it carries; the cache's day
+    /// sums and producer state stay out). `None` = no producer cache.
     /// `default` so a reader stays additive-tolerant of an older writer.
     #[serde(default)]
     pub(crate) tps: Option<TpsSlot>,
@@ -774,8 +775,9 @@ pub(crate) struct StatusBody {
     pub(crate) profiles: Vec<ProfileEntry>,
 }
 
-/// The status feed's tps slot: the producer's cache minus `days`, plus the
-/// cache's age in whole seconds.
+/// The status feed's tps slot: the producer's cache figures and `peaks`, plus
+/// the cache's age in whole seconds. Every field is named here, so a cache
+/// field (day sums, producer-only state) reaches the feed only by being added.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct TpsSlot {
     pub(crate) version: u16,
@@ -784,6 +786,8 @@ pub(crate) struct TpsSlot {
     pub(crate) accounts: BTreeMap<String, crate::tps::Figures>,
     pub(crate) sessions: BTreeMap<String, TpsSession>,
     pub(crate) age_secs: u64,
+    /// Additive: the cache's `peaks` republished as is.
+    pub(crate) peaks: crate::tps::Peaks,
 }
 
 /// One session's figures in the tps slot. Flattened-out (no serde flatten) so
@@ -797,10 +801,10 @@ pub(crate) struct TpsSession {
     pub(crate) h1: crate::tps::Figure,
 }
 
-/// The cache minus `days`, plus `age_secs`; `None` when no cache exists or it
-/// does not parse. A cache older than [`crate::tps::STALE_AFTER_MS`] still
-/// republishes here — the feed is a fact, not a liveness gate (that gate is
-/// `which --json`'s).
+/// The cache's figures and `peaks`, plus `age_secs`; `None` when no cache
+/// exists or it does not parse. A cache older than
+/// [`crate::tps::STALE_AFTER_MS`] still republishes here — the feed is a fact,
+/// not a liveness gate (that gate is `which --json`'s).
 fn tps_slot() -> Option<TpsSlot> {
     let snap = crate::tps::load_cache()?;
     let age_ms = snap.age_ms(now_ms())?;
@@ -826,6 +830,7 @@ fn tps_slot() -> Option<TpsSlot> {
         accounts: snap.accounts,
         sessions,
         age_secs: age_ms / 1000,
+        peaks: snap.peaks,
     })
 }
 

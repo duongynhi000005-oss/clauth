@@ -10124,14 +10124,16 @@ fn a_finished_jobs_speed_reads_the_cache_and_evicts_gone_ids() {
     assert_eq!(
         crate::tui::app::day_average(crate::tps::DaySum {
             output: 900,
-            gen_ms: 10_000
+            gen_ms: 10_000,
+            ..Default::default()
         }),
         Some(90.0)
     );
     assert_eq!(
         crate::tui::app::day_average(crate::tps::DaySum {
             output: 900,
-            gen_ms: 0
+            gen_ms: 0,
+            ..Default::default()
         }),
         None
     );

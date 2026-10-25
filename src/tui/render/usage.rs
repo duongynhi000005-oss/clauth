@@ -1333,6 +1333,7 @@ fn tps_rows(profile: &Profile, app: &App, inner_w: u16) -> Vec<Line<'static>> {
                 .fold(crate::tps::DaySum::default(), |acc, d| crate::tps::DaySum {
                     output: acc.output + d.output,
                     gen_ms: acc.gen_ms + d.gen_ms,
+                    ..Default::default()
                 })
         });
     let secs_since_midnight = (app.tps_now_ms() % 86_400_000) as f64 / 1000.0;

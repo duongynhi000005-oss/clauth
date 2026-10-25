@@ -2445,25 +2445,70 @@ pub(crate) fn read_validated_handle(
 }
 
 pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    atomic_write_with(path, |f| {
+        use std::io::Write;
+        f.write_all(content.as_ref())
+    })
+}
+
+/// [`atomic_write`] with the content written by `write` into the temp file
+/// once it is open. The temp is removed when `write` or the rename fails.
+pub(crate) fn atomic_write_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = tmp_sibling(path);
-    std::fs::write(&tmp, content)?;
-    match std::fs::rename(&tmp, path) {
+    let f = std::fs::File::create(&tmp)?;
+    publish_temp(&tmp, path, f, write)
+}
+
+/// Write the open temp `f` at `tmp` by `write`, close it and rename it onto
+/// `path`; the temp is removed when either step fails, so a failing writer
+/// never leaves one behind (each temp name is used once).
+fn publish_temp(
+    tmp: &Path,
+    path: &Path,
+    mut f: std::fs::File,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let written = write(&mut f);
+    drop(f);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e);
+    }
+    match std::fs::rename(tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(tmp);
             Err(e)
         }
     }
 }
 
 /// Like [`atomic_write`] but creates the temp file with mode 0o600 (Unix only)
-/// so the file is never world-readable even for the instant before the rename.
-/// On non-Unix this is identical to [`atomic_write`].
+/// so the file is never world-readable even for the instant before the rename,
+/// and a stale temp at its name is removed first, so the mode is applied at
+/// creation.
 pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    atomic_write_600_with(path, |f| {
+        use std::io::Write;
+        f.write_all(content.as_ref())
+    })
+}
+
+/// [`atomic_write_600`] with the content written by `write` into the temp
+/// file once it is open, so a writer refused at the temp's creation (a
+/// read-only or unwritable dir) never pays for building the content. The
+/// temp is removed when `write` or the rename fails.
+pub(crate) fn atomic_write_600_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
         // A 0o600 file under a world-readable dir still leaks via the dir entry;
@@ -2479,25 +2524,17 @@ pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::i
         std::fs::remove_file(&tmp)?;
     }
     #[cfg(unix)]
-    {
-        use std::io::Write;
+    let f = {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(content.as_ref())?;
-    }
+            .open(&tmp)?
+    };
     #[cfg(not(unix))]
-    std::fs::write(&tmp, content)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    let f = std::fs::File::create(&tmp)?;
+    publish_temp(&tmp, path, f, write)
 }
 
 /// Create `path` as a directory (recursively) with mode 0o700 on Unix,

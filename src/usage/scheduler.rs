@@ -4645,8 +4645,11 @@ thread_local! {
 /// `~/.clauth/tps_cache.json` (0600, the producer's own file — it never writes
 /// the daemon-owned `status.json`). The whole snapshot is rewritten only when
 /// its content apart from `generated_at` changed; otherwise it is refreshed
-/// every 10 s so a reader's staleness gate (`STALE_AFTER_MS` = 30 s) never
-/// trips on a merely-idle producer.
+/// every 10 s (at once after a clock step back) so a reader's staleness gate
+/// (`STALE_AFTER_MS` = 30 s) never trips on a merely-idle producer. The
+/// producer's attribution timeline and owed-day list land in their own files
+/// inside the tick; the cache is output only, so it publishes even while a
+/// timeline save is pending.
 fn tps_producer_tick(now_ms: u64) {
     let snap = TPS_PRODUCER.with(|p| p.borrow_mut().tick(now_ms));
     let Ok(dir) = crate::profile::clauth_dir() else {
@@ -4655,15 +4658,19 @@ fn tps_producer_tick(now_ms: u64) {
     let mut body = snap.clone();
     body.generated_at = String::new();
     let Ok(slow_bytes) = serde_json::to_vec(&body) else {
+        logline!("clauth: failed to serialize tps_cache.json for the change check");
         return;
     };
     let Ok(bytes) = serde_json::to_vec(&snap) else {
+        logline!("clauth: failed to serialize tps_cache.json");
         return;
     };
     let write = TPS_LAST_WRITE.with(|c| {
         let c = c.borrow();
         let changed = c.1.as_deref() != Some(slow_bytes.as_slice());
-        changed || now_ms.saturating_sub(c.0) >= 10_000
+        // A clock reading before the last write (a step back) is due at
+        // once, so the cache's `generated_at` never stays ahead of the clock.
+        changed || now_ms < c.0 || now_ms - c.0 >= 10_000
     });
     if !write {
         return;
@@ -4671,8 +4678,7 @@ fn tps_producer_tick(now_ms: u64) {
     if let Err(e) = crate::profile::atomic_write_600(&dir.join(crate::tps::TPS_CACHE_FILE), &bytes)
     {
         logline!("clauth: failed to publish tps_cache.json: {e}");
-        // Do not advance the stamp: the next tick retries the write, and the
-        // restart watermark must only ever cover a cache that is actually on disk.
+        // Do not advance the stamp: the next tick retries the write.
         return;
     }
     TPS_LAST_WRITE.with(|c| {
@@ -6597,6 +6603,16 @@ fn scan_session_switches(
             if let Some(recoveries) = drained.recoveries.get(conv) {
                 SPEND_CAP_LATCH.with(|l| {
                     let mut latches = l.borrow_mut();
+                    // The latch drops on a same-file success whose timestamp
+                    // is strictly newer than the latched 429's — file order is
+                    // not compared. That is a deliberate limit: the full form
+                    // is comparing the success's end offset with the 429's
+                    // within one file life. A clock step back exposes both of
+                    // its sides: a replayed old success (re-delivered by a
+                    // shrink or walk miss) whose ts still beats the 429's
+                    // drops the latch early, and a real recovery appended
+                    // after the 429 but stamped below it leaves the latch
+                    // live, moving the session off a member that works again.
                     if latches.get(&row.session_id).is_some_and(|latched| {
                         recoveries
                             .get(&latched.fact.file)

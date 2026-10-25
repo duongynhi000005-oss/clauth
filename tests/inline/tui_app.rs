@@ -41970,6 +41970,7 @@ fn tps_day(
                 crate::tps::DaySum {
                     output: 1,
                     gen_ms: 1_000,
+                    ..Default::default()
                 },
             )]),
         )]),

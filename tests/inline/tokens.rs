@@ -448,6 +448,7 @@ fn cache_hit_ratio_math() {
         last_computed_date: None,
         topped_up_through: None,
         speed_days: Default::default(),
+        speed_cells: Default::default(),
         today: None,
     };
     // cache_read / (cache_read + cache_create + input) = 500 / 2000 = 0.25
@@ -473,6 +474,7 @@ fn cache_hit_ratio_zero_denominator() {
         last_computed_date: None,
         topped_up_through: None,
         speed_days: Default::default(),
+        speed_cells: Default::default(),
         today: None,
     };
     assert_eq!(stats.cache_hit_ratio(), 0.0);

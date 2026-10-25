@@ -3174,6 +3174,7 @@ fn build_status_republishes_the_tps_cache_as_an_additive_slot() {
             crate::tps::DaySum {
                 output: 1222,
                 gen_ms: 13_597,
+                ..Default::default()
             },
         );
     let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
@@ -3362,4 +3363,117 @@ fn build_status_publishes_the_credit_cap_without_amounts() {
             "no dollar amount reaches the feed: {amount}"
         );
     }
+}
+
+/// The `peaks` object fixture, shared by value across the feed tests.
+fn peaks_fixture() -> serde_json::Value {
+    let pair = |speed: f64, rate: f64| {
+        serde_json::json!({
+            "speed": {"value": speed, "at": "2026-10-19T21:14:03.120+00:00", "account": "kerry", "model": "claude-opus-5-5"},
+            "rate": {"value": rate, "at": "2026-10-19T21:02:10.000+00:00"},
+        })
+    };
+    let half = |speed: f64, rate: f64| {
+        let mut h = pair(speed, rate);
+        h["accounts"] = serde_json::json!({"kerry": pair(speed, rate - 1.0)});
+        h["models"] = serde_json::json!({"claude-opus-5-5": pair(speed, rate - 2.0)});
+        h
+    };
+    serde_json::json!({"today": half(412.3, 1803.0), "ever": half(612.0, 3104.0)})
+}
+
+/// `status.json`'s `tps` slot republishes the cache's `peaks` as is.
+#[test]
+fn the_tps_slot_republishes_the_caches_peaks() {
+    let home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let mut cache = serde_json::to_value(crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: chrono::DateTime::from_timestamp_millis(i64::try_from(now).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string(),
+        ..crate::tps::Snapshot::default()
+    })
+    .unwrap();
+    cache["peaks"] = peaks_fixture();
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+    let slot = serde_json::to_value(tps_slot().expect("a fresh cache yields a slot")).unwrap();
+    assert_eq!(slot["peaks"], peaks_fixture(), "slot: {slot}");
+}
+
+/// The `TpsSlot` OpenAPI schema and a populated serialized slot agree key for
+/// key (the `peaks` object included): the walk would red on a wire/schema
+/// drift the value-only feed tests cannot see.
+#[test]
+fn the_tps_slot_schema_agrees_with_a_populated_slot() {
+    let home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let mut cache = serde_json::to_value(crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: chrono::DateTime::from_timestamp_millis(i64::try_from(now).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string(),
+        ..crate::tps::Snapshot::default()
+    })
+    .unwrap();
+    cache["peaks"] = peaks_fixture();
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+    let slot = tps_slot().expect("a fresh cache yields a slot");
+    let value = serde_json::to_value(&slot).unwrap();
+    schema_agrees_with_type::<TpsSlot>(&value);
+}
+
+/// The producer's attribution timeline is producer-only state in its own
+/// file: it never reaches the `status.json` `tps` slot nor the full body
+/// `GET /api/v1/status` serves (both are this one body).
+#[test]
+fn the_status_body_never_publishes_the_tps_attribution_timeline() {
+    let home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    let now = crate::usage::now_ms();
+    let snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: chrono::DateTime::from_timestamp_millis(i64::try_from(now).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string(),
+        ..crate::tps::Snapshot::default()
+    };
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+    // The timeline lives in its own file, never in the cache the feed reads.
+    std::fs::write(
+        home.home()
+            .join(".clauth")
+            .join(crate::tps::TPS_ATTRIBUTION_FILE),
+        r#"{"version":1,"entries":[{"session":"s","since":0,"member":"work","pos":null}]}"#,
+    )
+    .unwrap();
+
+    let slot = serde_json::to_value(tps_slot().expect("a fresh cache yields a slot")).unwrap();
+    assert!(
+        slot.get("entries").is_none(),
+        "the slot hides the timeline: {slot}"
+    );
+
+    let body = status_value(&config, 300_000, None, false);
+    assert!(
+        body.get("entries").is_none(),
+        "the body hides the timeline: {body}"
+    );
+    assert!(
+        body["tps"].get("entries").is_none(),
+        "the tps slot hides the timeline: {}",
+        body["tps"]
+    );
 }

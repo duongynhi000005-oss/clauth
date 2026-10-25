@@ -4804,11 +4804,8 @@ fn seed_live_session_record(home: &crate::testutil::HomeSandbox, conv: &str, chi
     }
 }
 
-/// The measured spend-cap 429 row: `timestamp`, `isApiErrorMessage`, `error`,
-/// `apiError`, `message.model == "<synthetic>"`. `ms_ago` ages the fact so a
-/// stale-row test can age it out.
-fn spend_cap_row(ms_ago: u64) -> String {
-    let ms = crate::usage::now_ms().saturating_sub(ms_ago);
+/// The measured spend-cap 429 row at exactly `ms` epoch ms.
+fn spend_cap_row_at(ms: u64) -> String {
     let ts = chrono::DateTime::from_timestamp_millis(ms as i64)
         .unwrap()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -4822,6 +4819,13 @@ fn spend_cap_row(ms_ago: u64) -> String {
         "message": {"model": "<synthetic>", "role": "assistant"},
     })
     .to_string()
+}
+
+/// The measured spend-cap 429 row: `timestamp`, `isApiErrorMessage`, `error`,
+/// `apiError`, `message.model == "<synthetic>"`. `ms_ago` ages the fact so a
+/// stale-row test can age it out.
+fn spend_cap_row(ms_ago: u64) -> String {
+    spend_cap_row_at(crate::usage::now_ms().saturating_sub(ms_ago))
 }
 
 /// A transcript holding the spend-cap 429 row (conversation id = its stem).
@@ -5300,9 +5304,9 @@ fn an_outgoing_profiles_env_model_does_not_make_an_opus_session_credit_billed() 
 
 // ── spend-cap recovery, home passes and sinks ────────────────────────────────
 
-/// A successful assistant turn `ms_ago` old: the recovery half of a drain.
-fn ok_row(ms_ago: u64) -> String {
-    let ms = crate::usage::now_ms().saturating_sub(ms_ago);
+/// A successful assistant turn at exactly `ms` epoch ms: the recovery half of
+/// a drain.
+fn ok_row_at(ms: u64) -> String {
     let ts = chrono::DateTime::from_timestamp_millis(ms as i64)
         .unwrap()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -5314,6 +5318,11 @@ fn ok_row(ms_ago: u64) -> String {
             "usage": {"input_tokens": 10, "output_tokens": 500}},
     })
     .to_string()
+}
+
+/// A successful assistant turn `ms_ago` old: the recovery half of a drain.
+fn ok_row(ms_ago: u64) -> String {
+    ok_row_at(crate::usage::now_ms().saturating_sub(ms_ago))
 }
 
 /// (Re)write one conversation transcript from whole lines, so a test can append
@@ -5413,6 +5422,84 @@ fn a_latched_429_is_cleared_by_a_later_successful_turn() {
         decision_of("4242-0"),
         (None, None),
         "the session recovered on `a`; the latch must not outlive that"
+    );
+}
+
+/// One pin scenario: a success and a 429 in the same file, the success stamped
+/// `ok_ago` ms ago and the 429 `cap_ago` ms ago, both built from one clock
+/// snapshot so the relative offset is exact. Returns the scan's decision.
+fn same_file_success_pin(ok_ago: u64, cap_ago: u64) -> (Option<String>, Option<usize>) {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let mut row = session_row("4242-0", "a");
+    row.claude_pid = Some(child_pid);
+    let _marker = register_live_row(&row);
+
+    seed_session_record(&home, "conv-a", child_pid);
+    write_conv(
+        &home,
+        "conv-a",
+        &[ok_row_at(now - ok_ago), spend_cap_row_at(now - cap_ago)],
+    );
+    tail_transcripts();
+
+    scan_sessions(
+        &session_config_models(&["a", "b"], &[], &[]),
+        &credit_store(&["a", "b"], &["a"]),
+        &all_fresh(&["a", "b"]),
+    );
+    decision_of("4242-0")
+}
+
+/// A drained same-file success drops the latch only when its timestamp is
+/// strictly newer than the latched 429's (`ts > latched.fact.ts`); file order
+/// is not compared. That is a deliberate limit — the full form is comparing
+/// the success's end offset with the 429's within one file life — and a clock
+/// step back exposes both of its sides: a replayed old success whose ts still
+/// beats the 429's drops the latch early, while a real recovery appended after
+/// the 429 but stamped below it leaves the latch live and moves the session
+/// off a member that works again. Neither outcome is "correct". This case pins
+/// the 100 s-older side; the exact-millisecond and 1 ms-older sides sit in the
+/// two tests below, and the 1 ms-newer side (the latch drops) in the third.
+#[test]
+fn an_older_same_file_success_does_not_drop_the_latched_429() {
+    assert_eq!(
+        same_file_success_pin(700_000, 600_000),
+        (Some("b".to_string()), Some(1)),
+        "a same-file success not strictly newer than the 429 keeps the latch and the session moves"
+    );
+}
+
+/// The strictness boundary: a success at the 429's exact millisecond is not
+/// newer than the latch, so the latch stays and the session still moves.
+#[test]
+fn a_same_millisecond_same_file_success_does_not_drop_the_latched_429() {
+    assert_eq!(
+        same_file_success_pin(600_000, 600_000),
+        (Some("b".to_string()), Some(1)),
+        "a same-millisecond success is not newer than the 429, so the latch stays"
+    );
+}
+
+/// A success 1 ms older than the 429 is not newer either: the latch stays.
+#[test]
+fn a_one_ms_older_same_file_success_does_not_drop_the_latched_429() {
+    assert_eq!(
+        same_file_success_pin(600_001, 600_000),
+        (Some("b".to_string()), Some(1)),
+        "a 1 ms-older success is not newer than the 429, so the latch stays"
+    );
+}
+
+/// The strictness boundary's other side: a success 1 ms NEWER than the 429 is
+/// strictly newer, so it drops the latch and the session stays on `a`.
+#[test]
+fn a_one_ms_newer_same_file_success_drops_the_latched_429() {
+    assert_eq!(
+        same_file_success_pin(599_999, 600_000),
+        (None, None),
+        "a 1 ms-newer success drops the latch and the session stays"
     );
 }
 
@@ -21309,4 +21396,221 @@ fn an_instance_beside_a_lease_holder_logs_its_stand_down_once() {
         "an instance whose UI thread asked for the lease first still logs one \
          stand-down, then one acquire"
     );
+}
+
+/// The producer leg rewrites `tps_cache.json` only on a content change or the
+/// 10 s heartbeat: an idle tick 1 s later leaves the bytes alone even though
+/// its `generated_at` moved with the clock.
+#[test]
+fn an_idle_tick_leaves_the_tps_cache_bytes_alone() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".clauth")).unwrap();
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    let t0 = 1_790_110_000_000u64;
+    super::tps_producer_tick(t0);
+    let first = std::fs::read(&path).unwrap();
+    super::tps_producer_tick(t0 + 1_000);
+    let idle = std::fs::read(&path).unwrap();
+    super::tps_producer_tick(t0 + 10_000);
+    let heartbeat = std::fs::read(&path).unwrap();
+    assert_eq!(first, idle, "an idle tick rewrote tps_cache.json");
+    assert_ne!(idle, heartbeat, "the 10 s heartbeat did not rewrite");
+}
+
+/// One `.jsonl` whose name is not UTF-8 under a walked store never stops the
+/// tps cache write.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_transcript_name_never_blocks_the_tps_cache_write() {
+    use std::os::unix::ffi::OsStrExt;
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".clauth")).unwrap();
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    let dir = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ok.jsonl"), "").unwrap();
+    let t0 = crate::usage::now_ms();
+    super::tps_producer_tick(t0);
+    assert!(path.exists(), "control: the cache is written");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(dir.join(std::ffi::OsStr::from_bytes(b"caf\xe9.jsonl")), "").unwrap();
+    super::tps_producer_tick(t0 + 6_000);
+    super::tps_producer_tick(t0 + 17_000);
+    assert!(
+        path.exists(),
+        "a non-UTF-8 transcript name blocked the write"
+    );
+}
+
+/// The attribution timeline lives in its own 0600 file, never in the cache
+/// every reader parses.
+#[cfg(unix)]
+#[test]
+fn the_attribution_timeline_lives_in_its_own_file_never_in_the_tps_cache() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".clauth")).unwrap();
+    let dir = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t0 = crate::usage::now_ms();
+    let stamp = |ms: u64| {
+        chrono::DateTime::from_timestamp_millis(i64::try_from(ms).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+    let u = serde_json::json!({"type": "user", "timestamp": stamp(t0 - 120_000), "message": {"role": "user", "content": "go"}});
+    let a = serde_json::json!({"type": "assistant", "timestamp": stamp(t0 - 100_000), "message": {"id": "m0", "model": "claude-opus-5-5", "role": "assistant", "usage": {"output_tokens": 500}}});
+    std::fs::write(dir.join("a.jsonl"), format!("{u}\n{a}\n")).unwrap();
+    super::tps_producer_tick(t0);
+    let cache: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE)).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        cache.get("entries").is_none(),
+        "the cache carries the timeline"
+    );
+    let timeline = home
+        .home()
+        .join(".clauth")
+        .join(crate::tps::TPS_ATTRIBUTION_FILE);
+    let meta = std::fs::metadata(&timeline).expect("tps_attribution.json written");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    let body: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&timeline).unwrap()).unwrap();
+    assert_eq!(body["version"], serde_json::json!(1));
+    assert_eq!(
+        body["entries"][0]["session"],
+        serde_json::json!("a"),
+        "the session seeded at first sight: {body}"
+    );
+}
+
+/// While the attribution timeline cannot be saved (a directory sits at its
+/// path), the producer leg still publishes `tps_cache.json` (output only): a
+/// new session's 300 shows in the cache (500 + 300) at once.
+#[test]
+fn a_pending_attribution_save_still_publishes_the_cache() {
+    let home = crate::testutil::HomeSandbox::new();
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth).unwrap();
+    let timeline = clauth.join(crate::tps::TPS_ATTRIBUTION_FILE);
+    let cache = clauth.join(crate::tps::TPS_CACHE_FILE);
+    let dir = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t0 = crate::usage::now_ms();
+    let stamp = |ms: u64| {
+        chrono::DateTime::from_timestamp_millis(i64::try_from(ms).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+    let transcript = |id: &str, out: u64| {
+        let u = serde_json::json!({"type": "user", "timestamp": stamp(t0 - 120_000), "message": {"role": "user", "content": "go"}});
+        let a = serde_json::json!({"type": "assistant", "timestamp": stamp(t0 - 100_000), "message": {"id": id, "model": "claude-opus-5-5", "role": "assistant", "usage": {"output_tokens": out}}});
+        format!("{u}\n{a}\n")
+    };
+    // Every cell's output across every day of the cache's `days`.
+    let output = |path: &std::path::Path| -> u64 {
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        body["days"]
+            .as_object()
+            .into_iter()
+            .flat_map(|d| d.values())
+            .filter_map(|accounts| accounts.as_object())
+            .flat_map(|a| a.values())
+            .filter_map(|models| models.as_object())
+            .flat_map(|m| m.values())
+            .map(|cell| cell["output"].as_u64().unwrap_or(0))
+            .sum()
+    };
+    std::fs::write(dir.join("a.jsonl"), transcript("m0", 500)).unwrap();
+    super::tps_producer_tick(t0);
+    assert_eq!(output(&cache), 500, "control: the first cache");
+    std::fs::remove_file(&timeline).unwrap();
+    std::fs::create_dir_all(timeline.join("blocker")).unwrap();
+    std::fs::write(dir.join("b.jsonl"), transcript("m1", 300)).unwrap();
+    super::tps_producer_tick(t0 + 6_000);
+    assert_eq!(
+        output(&cache),
+        800,
+        "a pending attribution save withheld the cache"
+    );
+    std::fs::remove_dir_all(&timeline).unwrap();
+    super::tps_producer_tick(t0 + 7_000);
+    assert!(timeline.is_file(), "the timeline landed");
+}
+
+/// While every speed-ledger save fails (a directory at its path), the day that
+/// left the window stays held and the same from tick to tick, so idle ticks
+/// inside the 10 s heartbeat never rewrite `tps_cache.json`.
+#[test]
+fn idle_ticks_never_rewrite_the_cache_while_a_ledger_save_keeps_failing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth).unwrap();
+    let cache = clauth.join(crate::tps::TPS_CACHE_FILE);
+    let ledger = clauth.join("token_speed.json");
+    let dir = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t0 = crate::usage::now_ms();
+    let stamp = |ms: u64, fmt: &str| {
+        chrono::DateTime::from_timestamp_millis(i64::try_from(ms).unwrap())
+            .unwrap()
+            .format(fmt)
+            .to_string()
+    };
+    let iso = |ms: u64| stamp(ms, "%Y-%m-%dT%H:%M:%S%.3fZ");
+    let u = serde_json::json!({"type": "user", "timestamp": iso(t0 - 120_000), "message": {"role": "user", "content": "go"}});
+    let a = serde_json::json!({"type": "assistant", "timestamp": iso(t0 - 100_000), "message": {"id": "m0", "model": "claude-opus-5-5", "role": "assistant", "usage": {"output_tokens": 500}}});
+    std::fs::write(dir.join("a.jsonl"), format!("{u}\n{a}\n")).unwrap();
+    super::tps_producer_tick(t0);
+    if ledger.is_file() {
+        std::fs::remove_file(&ledger).unwrap();
+    }
+    std::fs::create_dir_all(ledger.join("blocker")).unwrap();
+    let left = t0 + 2 * 86_400_000;
+    super::tps_producer_tick(left);
+    let written = std::fs::read_to_string(&cache).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&written).unwrap();
+    let day = stamp(t0 - 100_000, "%Y-%m-%d");
+    assert_eq!(
+        body["days"][&day]["*"]["claude-opus-5-5"]["output"], 500,
+        "control: the day is held while its fold fails: {body}"
+    );
+    for s in 1..=3 {
+        super::tps_producer_tick(left + s * 1_000);
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            written,
+            "the idle tick at +{s} s rewrote the cache"
+        );
+    }
+}
+
+/// A 15 min clock step back while idle: the heartbeat writes on the first tick
+/// after the step, so the cache's `generated_at` never stays ahead of the clock
+/// and every reader keeps an age (the `tps` slot stays published).
+#[test]
+fn the_tps_heartbeat_writes_on_the_first_tick_after_a_step_back() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".clauth")).unwrap();
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    let t0 = crate::usage::now_ms();
+    super::tps_producer_tick(t0);
+    super::tps_producer_tick(t0 + 11_000);
+    let back = t0 + 11_000 - 15 * 60_000;
+    let mut ageless = Vec::new();
+    for k in 0..60u64 {
+        let t = back + k * 1_000;
+        super::tps_producer_tick(t);
+        let snap: crate::tps::Snapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if snap.age_ms(t).is_none() {
+            ageless.push(k);
+        }
+    }
+    assert!(ageless.is_empty(), "ticks with no cache age: {ageless:?}");
 }

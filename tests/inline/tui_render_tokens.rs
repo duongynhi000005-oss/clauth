@@ -1909,6 +1909,7 @@ fn tps_tokens_snapshot(age_ms: u64) -> crate::tps::Snapshot {
                 crate::tps::DaySum {
                     output: 900,
                     gen_ms: 10_000,
+                    ..Default::default()
                 },
             )]),
         )]),
@@ -1932,6 +1933,7 @@ fn the_today_card_speed_row_reads_now_and_today() {
         Some(crate::tps::DaySum {
             output: 900,
             gen_ms: 10_000,
+            ..Default::default()
         }),
     );
     assert_eq!(line_text(&line), "speed     92 t/s now · 90 t/s today");
@@ -1964,6 +1966,7 @@ fn the_total_card_avg_speed_reads_the_ledger_speed_rows() {
         crate::tps::DaySum {
             output: 1_800,
             gen_ms: 20_000,
+            ..Default::default()
         },
     );
     let (lines, _meta) = total_lines(&stats, &stats.speed_days, 40, 5, false, None);
@@ -2008,6 +2011,7 @@ fn the_total_cache_hit_badge_takes_its_own_line_only_when_the_card_has_a_row_for
         crate::tps::DaySum {
             output: 1_800,
             gen_ms: 20_000,
+            ..Default::default()
         },
     );
     let plain = populated_stats();
@@ -2086,6 +2090,7 @@ fn the_rendered_total_card_never_clips_msgs_for_the_badge() {
         crate::tps::DaySum {
             output: 1_800,
             gen_ms: 20_000,
+            ..Default::default()
         },
     );
     for (w, h, badge) in [(34, 60, false), (60, 40, false), (140, 40, true)] {
@@ -2131,6 +2136,7 @@ fn strip_stats() -> TokenStats {
         crate::tps::DaySum {
             output: 900,
             gen_ms: 10_000,
+            ..Default::default()
         },
     );
     stats
@@ -2212,6 +2218,7 @@ fn the_dashboard_shows_the_speed_rows_when_the_cards_grew() {
         crate::tps::DaySum {
             output: 1_800,
             gen_ms: 20_000,
+            ..Default::default()
         },
     );
     app.token_stats = Some(stats);
@@ -2248,6 +2255,7 @@ fn the_merged_day_sums_include_the_unattributed_star_account() {
                 crate::tps::DaySum {
                     output: 100,
                     gen_ms: 10_000,
+                    ..Default::default()
                 },
             )]),
         );
@@ -2263,6 +2271,7 @@ fn the_merged_day_sums_include_the_unattributed_star_account() {
         crate::tps::DaySum {
             output: 1_000,
             gen_ms: 20_000,
+            ..Default::default()
         },
         "(900 + 100) over (10 s + 10 s), the `*` row included"
     );
@@ -2297,6 +2306,7 @@ fn the_weekly_trend_strip_folds_days_into_their_bucket() {
             crate::tps::DaySum {
                 output,
                 gen_ms: 10_000,
+                ..Default::default()
             },
         );
     }
@@ -2340,6 +2350,7 @@ fn the_tokens_surfaces_merge_the_cache_days_over_the_ledger() {
         crate::tps::DaySum {
             output: 900,
             gen_ms: 10_000,
+            ..Default::default()
         },
     );
     let mut snap = tps_tokens_snapshot(1_000);
@@ -2353,6 +2364,7 @@ fn the_tokens_surfaces_merge_the_cache_days_over_the_ledger() {
                 crate::tps::DaySum {
                     output: 1_800,
                     gen_ms: 20_000,
+                    ..Default::default()
                 },
             )]),
         )]),
@@ -2366,6 +2378,7 @@ fn the_tokens_surfaces_merge_the_cache_days_over_the_ledger() {
                 crate::tps::DaySum {
                     output: 200,
                     gen_ms: 20_000,
+                    ..Default::default()
                 },
             )]),
         )]),
@@ -2396,9 +2409,9 @@ fn the_tokens_surfaces_merge_the_cache_days_over_the_ledger() {
     );
 }
 
-/// A date in both the ledger and the cache reads the LEDGER's sum: the folded,
-/// finalized day wins over a cache the producer has not yet dropped. Guards the
-/// `or_insert_with` merge against a cache-wins `insert` regression.
+/// A date in both the ledger and the cache reads the LEDGER's sum when it is
+/// the larger: the folded day wins over a smaller cache copy. Guards the
+/// keep-larger merge against a cache-wins `insert` regression.
 #[test]
 fn the_merged_day_sums_let_the_ledger_win_on_a_shared_date() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -2412,6 +2425,7 @@ fn the_merged_day_sums_let_the_ledger_win_on_a_shared_date() {
         crate::tps::DaySum {
             output: 900,
             gen_ms: 10_000,
+            ..Default::default()
         },
     );
     let mut snap = tps_tokens_snapshot(1_000);
@@ -2425,6 +2439,7 @@ fn the_merged_day_sums_let_the_ledger_win_on_a_shared_date() {
                 crate::tps::DaySum {
                     output: 50,
                     gen_ms: 10_000,
+                    ..Default::default()
                 },
             )]),
         )]),
@@ -2437,6 +2452,7 @@ fn the_merged_day_sums_let_the_ledger_win_on_a_shared_date() {
         Some(&crate::tps::DaySum {
             output: 900,
             gen_ms: 10_000,
+            ..Default::default()
         }),
         "the ledger's finalized day wins over the cache's day"
     );
@@ -2498,5 +2514,217 @@ fn the_today_card_puts_speed_above_the_in_out_split() {
     assert_eq!(
         today_card_rows(&app, 120, 40),
         ["idle so far today", "speed     92 t/s now · 90 t/s today"]
+    );
+}
+
+/// A day both the ledger and a fresh cache hold (an early fold, or a day
+/// folded when it stopped being today) reads the larger of the two: the
+/// cache's whole today (6000 over 60 s) beats the ledger's early part (2000
+/// over 40 s), and the today card reads 100 t/s.
+#[test]
+fn a_day_in_both_the_ledger_and_the_cache_reads_the_larger() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    let today = crate::tokens::today_date();
+    let cell = |output: u64, gen_ms: u64| crate::tps::DaySum {
+        output,
+        gen_ms,
+        ..Default::default()
+    };
+    let mut stats = TokenStats::default();
+    stats.speed_days.insert(today.clone(), cell(2000, 40_000));
+    let mut snap = tps_tokens_snapshot(1_000);
+    snap.days.clear();
+    snap.days.insert(
+        today.clone(),
+        std::collections::BTreeMap::from([(
+            "kerry".to_string(),
+            std::collections::BTreeMap::from([("opus".to_string(), cell(6000, 60_000))]),
+        )]),
+    );
+    app.set_tps(Some(snap));
+
+    let merged = super::merged_speed_days(&stats, &app);
+    assert_eq!(
+        merged.get(&today),
+        Some(&cell(6000, 60_000)),
+        "merged today"
+    );
+    assert_eq!(
+        line_text(&super::today_speed_line(&app, merged.get(&today).copied())),
+        "speed     92 t/s now · 100 t/s today",
+        "the today card"
+    );
+}
+
+/// A day the ledger holds as kerry 1000/10 s + mommy 500/5 s (a swapped
+/// session's day, folded once it left the window) and a fresh cache holds as
+/// kerry 1500/15 s alone (the same responses read under one member after a
+/// clock step back) merges per model total, the way the fold stores it: the
+/// cache's 1500/15 s ties the ledger's and replaces its split, so the day reads
+/// 1500/15 s, never kerry 1500 + mommy 500 = 2000/20 s. The ledger reaches the
+/// tab through the tokens worker.
+#[test]
+fn a_day_in_the_ledger_and_the_cache_merges_per_model_total() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    let clauth = sb.home().join(".clauth");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::create_dir_all(&clauth).unwrap();
+    std::fs::write(claude.join("stats-cache.json"), "{}").unwrap();
+    std::fs::write(
+        clauth.join("token_speed.json"),
+        r#"{"version":2,"days":{"2026-06-01":{
+            "kerry":{"opus":{"output":1000,"gen_ms":10000}},
+            "mommy":{"opus":{"output":500,"gen_ms":5000}}}}}"#,
+    )
+    .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
+    crate::tokens::spawn(tx, refresh_rx, claude, Some(clauth));
+    let stats = loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(crate::tokens::TokensEvent::Loaded(stats)) => break *stats,
+            Ok(crate::tokens::TokensEvent::Failed) => panic!("the tokens worker failed"),
+            Ok(_) => {}
+            Err(e) => panic!("no Loaded event from the tokens worker: {e}"),
+        }
+    };
+    drop(refresh_tx);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    let mut snap = tps_tokens_snapshot(1_000);
+    snap.days.clear();
+    snap.days.insert(
+        "2026-06-01".to_string(),
+        std::collections::BTreeMap::from([(
+            "kerry".to_string(),
+            std::collections::BTreeMap::from([(
+                "opus".to_string(),
+                crate::tps::DaySum {
+                    output: 1500,
+                    gen_ms: 15_000,
+                    ..Default::default()
+                },
+            )]),
+        )]),
+    );
+    app.set_tps(Some(snap));
+
+    let merged = super::merged_speed_days(&stats, &app);
+    assert_eq!(
+        merged.get("2026-06-01"),
+        Some(&crate::tps::DaySum {
+            output: 1500,
+            gen_ms: 15_000,
+            ..Default::default()
+        }),
+        "the day merged per model total"
+    );
+}
+
+/// One day's speed cells, each `(account, model, output, gen_ms)`.
+fn day_cells(
+    cells: &[(&str, &str, u64, u64)],
+) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, crate::tps::DaySum>> {
+    let mut out = std::collections::BTreeMap::new();
+    for &(account, model, output, gen_ms) in cells {
+        out.entry(account.to_string())
+            .or_insert_with(std::collections::BTreeMap::new)
+            .insert(
+                model.to_string(),
+                crate::tps::DaySum {
+                    output,
+                    gen_ms,
+                    ..Default::default()
+                },
+            );
+    }
+    out
+}
+
+/// The merged 2026-06-01 of a ledger holding `ledger` (whose day total is
+/// `ledger_day`, `(output, gen_ms)`) and a fresh cache holding `cache`.
+fn merged_shared_day(
+    ledger: &[(&str, &str, u64, u64)],
+    ledger_day: (u64, u64),
+    cache: &[(&str, &str, u64, u64)],
+) -> Option<crate::tps::DaySum> {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    let mut stats = TokenStats::default();
+    stats
+        .speed_cells
+        .insert("2026-06-01".to_string(), day_cells(ledger));
+    stats.speed_days.insert(
+        "2026-06-01".to_string(),
+        crate::tps::DaySum {
+            output: ledger_day.0,
+            gen_ms: ledger_day.1,
+            ..Default::default()
+        },
+    );
+    let mut snap = tps_tokens_snapshot(1_000);
+    snap.days.clear();
+    snap.days.insert("2026-06-01".to_string(), day_cells(cache));
+    app.set_tps(Some(snap));
+    super::merged_speed_days(&stats, &app)
+        .get("2026-06-01")
+        .copied()
+}
+
+/// A day the ledger holds early (kerry 1000/10 s, folded while the day was
+/// still running) and the fresh cache holds grown (kerry 1500/15 s) reads the
+/// cache's larger model total.
+#[test]
+fn a_day_the_cache_grew_past_the_ledger_reads_the_cache_model_total() {
+    assert_eq!(
+        merged_shared_day(
+            &[("kerry", "opus", 1000, 10_000)],
+            (1000, 10_000),
+            &[("kerry", "opus", 1500, 15_000)],
+        ),
+        Some(crate::tps::DaySum {
+            output: 1500,
+            gen_ms: 15_000,
+            ..Default::default()
+        }),
+        "the cache's grown day"
+    );
+}
+
+/// Each model merges on its own total: the ledger holds kerry opus 1200/12 s
+/// and sonnet 500/5 s (1700/17 s), the cache kerry opus 1000/10 s (a lost
+/// transcript) and mommy sonnet 600/6 s (a swap). Opus keeps the ledger's
+/// 1200/12 s, sonnet takes the cache's 600/6 s: 1800/18 s, never the larger
+/// day total 1700/17 s.
+#[test]
+fn a_two_model_day_merges_each_model_on_its_own_total() {
+    assert_eq!(
+        merged_shared_day(
+            &[
+                ("kerry", "opus", 1200, 12_000),
+                ("kerry", "sonnet", 500, 5_000),
+            ],
+            (1700, 17_000),
+            &[
+                ("kerry", "opus", 1000, 10_000),
+                ("mommy", "sonnet", 600, 6_000),
+            ],
+        ),
+        Some(crate::tps::DaySum {
+            output: 1800,
+            gen_ms: 18_000,
+            ..Default::default()
+        }),
+        "the day merged per model"
     );
 }

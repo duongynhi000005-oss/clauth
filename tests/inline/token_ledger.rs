@@ -924,16 +924,24 @@ fn a_pre_migration_ledger_loads_and_speed_rows_fold_into_their_own_file() {
             .or_default()
             .insert(
                 "claude-opus-5-5".into(),
-                crate::tps::DaySum { output, gen_ms },
+                crate::tps::DaySum {
+                    output,
+                    gen_ms,
+                    ..Default::default()
+                },
             );
     }
     let mut speed = SpeedLedger::load(&dir);
-    assert!(speed.record(&days, "2026-10-15"), "a finalized day folds");
-    assert!(
-        !speed.record(&days, "2026-10-15"),
+    assert_eq!(
+        speed.fold(&dir, &days, &BTreeMap::new(), "2026-10-15"),
+        FoldOutcome::Saved,
+        "a finalized day folds"
+    );
+    assert_eq!(
+        speed.fold(&dir, &days, &BTreeMap::new(), "2026-10-15"),
+        FoldOutcome::Unchanged,
         "a second fold is a no-op"
     );
-    speed.save(&dir);
 
     assert_eq!(
         std::fs::read_to_string(dir.join("token_ledger.json")).unwrap(),
@@ -944,7 +952,7 @@ fn a_pre_migration_ledger_loads_and_speed_rows_fold_into_their_own_file() {
         serde_json::from_slice(&std::fs::read(dir.join("token_speed.json")).unwrap()).unwrap();
     assert_eq!(
         raw,
-        serde_json::json!({"version": 1, "days": {"2026-10-14": {
+        serde_json::json!({"version": 2, "days": {"2026-10-14": {
             "*": {"claude-opus-5-5": {"output": 300, "gen_ms": 4000}},
             "kerry": {"claude-opus-5-5": {"output": 1222, "gen_ms": 13597}},
         }}}),
@@ -954,7 +962,8 @@ fn a_pre_migration_ledger_loads_and_speed_rows_fold_into_their_own_file() {
         SpeedLedger::load(&dir).days["2026-10-14"]["kerry"]["claude-opus-5-5"],
         crate::tps::DaySum {
             output: 1222,
-            gen_ms: 13_597
+            gen_ms: 13_597,
+            ..Default::default()
         },
         "the speed ledger loads back"
     );
@@ -980,10 +989,14 @@ fn an_unparsable_speed_ledger_is_renamed_aside_not_saved_over() {
             crate::tps::DaySum {
                 output: 1,
                 gen_ms: 2,
+                ..Default::default()
             },
         );
-    assert!(l.record(&days, "2026-09-21"));
-    assert!(l.save(&dir), "the fresh save succeeds");
+    assert_eq!(
+        l.fold(&dir, &days, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved,
+        "the fresh save succeeds"
+    );
 
     let aside = std::fs::read_dir(&dir)
         .unwrap()
@@ -1021,9 +1034,14 @@ fn an_unreadable_speed_ledger_is_never_saved_over() {
             crate::tps::DaySum {
                 output: 1,
                 gen_ms: 2,
+                ..Default::default()
             },
         );
-    assert!(l.record(&days, "2026-09-21"));
+    assert_eq!(
+        l.fold(&dir, &days, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Unsaved,
+        "a fold never lands over an unreadable file"
+    );
     assert!(!l.save(&dir), "never saved over an unreadable file");
     assert!(
         dir.join("token_speed.json").is_dir(),
@@ -1051,10 +1069,13 @@ fn a_corrupt_speed_ledger_is_renamed_aside_exactly_once() {
             crate::tps::DaySum {
                 output: 1,
                 gen_ms: 2,
+                ..Default::default()
             },
         );
-    assert!(l.record(&days, "2026-09-21"));
-    assert!(l.save(&dir));
+    assert_eq!(
+        l.fold(&dir, &days, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
     assert!(l.save(&dir), "the second save needs no rename");
 
     let asides: Vec<_> = std::fs::read_dir(&dir)
@@ -1072,4 +1093,291 @@ fn a_corrupt_speed_ledger_is_renamed_aside_exactly_once() {
             .mode();
         assert_eq!(mode & 0o777, 0o600, "the aside is 0600");
     }
+}
+
+/// A v1 `token_speed.json` (no `speed` on any cell, no `rate_peaks` key) loads
+/// with every peak absent and is saved back as version 2, keeping its day
+/// sums byte-for-byte.
+#[test]
+fn a_v1_speed_ledger_loads_and_saves_back_as_v2() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("token_speed.json"),
+        r#"{"version":1,"days":{"2026-10-14":{"kerry":{"claude-opus-5-5":{"output":1222,"gen_ms":13597}}}}}"#,
+    )
+    .unwrap();
+
+    let mut speed = SpeedLedger::load(&dir);
+    assert_eq!(
+        speed.days["2026-10-14"]["kerry"]["claude-opus-5-5"],
+        crate::tps::DaySum {
+            output: 1222,
+            gen_ms: 13_597,
+            ..Default::default()
+        },
+        "the v1 cell loads"
+    );
+    assert!(
+        speed.days["2026-10-14"]["kerry"]["claude-opus-5-5"]
+            .speed
+            .is_none(),
+        "a v1 cell has no peak"
+    );
+    assert!(speed.rate_peaks.is_empty(), "a v1 file has no rate peaks");
+    assert!(speed.save(&dir), "the v1 file is saved back");
+
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("token_speed.json")).unwrap()).unwrap();
+    assert_eq!(raw["version"], 2, "saved as v2: {raw}");
+    assert_eq!(
+        raw["days"]["2026-10-14"]["kerry"]["claude-opus-5-5"]["output"], 1222,
+        "the sums survive: {raw}"
+    );
+    assert!(raw.get("rate_peaks").is_none(), "no rate peaks yet: {raw}");
+}
+
+/// A version 3 speed ledger reads as newer (3 > 2): never saved over, never
+/// retry-reloaded, and its days are left untouched on disk.
+#[test]
+fn a_newer_speed_ledger_is_never_saved_over() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("token_speed.json"), r#"{"version":3,"days":{}}"#).unwrap();
+
+    let mut speed = SpeedLedger::load(&dir);
+    assert!(speed.newer(), "v3 is newer than v2");
+    assert!(speed.unusable(), "a newer ledger is never saved over");
+    assert!(!speed.save(&dir), "save refuses a newer ledger");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("token_speed.json")).unwrap(),
+        r#"{"version":3,"days":{}}"#,
+        "the newer file is untouched"
+    );
+}
+
+/// A fold refused at its temp file (an unwritable `.clauth`) builds none of
+/// the ledger's content and leaves the ledger as it was; the same fold lands
+/// once the dir is writable, building it once. The count sees only
+/// `SpeedLedger::content`: a serialize or clone of the ledger's days or rate
+/// peaks outside it, before the temp opens, goes unseen.
+#[test]
+fn a_fold_refused_at_its_temp_file_builds_no_content() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut l = SpeedLedger::load(&dir);
+    let mut days = crate::tps::DaySums::new();
+    days.entry("2026-09-20".to_owned())
+        .or_default()
+        .entry("kerry".to_owned())
+        .or_default()
+        .insert(
+            "claude-opus-5-5".to_owned(),
+            crate::tps::DaySum {
+                output: 1,
+                gen_ms: 2,
+                ..Default::default()
+            },
+        );
+    let unwritable = crate::testutil::UnwritableDir::new(&dir);
+    let before = serializations::taken();
+    for _ in 0..3 {
+        assert_eq!(
+            l.fold(&dir, &days, &BTreeMap::new(), "2026-09-21"),
+            FoldOutcome::Unsaved
+        );
+    }
+    assert_eq!(
+        serializations::taken() - before,
+        0,
+        "a refused fold built the ledger's content"
+    );
+    assert!(l.days.is_empty(), "a refused fold left the ledger merged");
+    drop(unwritable);
+    assert_eq!(
+        l.fold(&dir, &days, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    assert_eq!(serializations::taken() - before, 1);
+    assert_eq!(SpeedLedger::load(&dir).days, days, "the landed fold");
+}
+
+/// A speed cell on one model: `(account, output, gen_ms, peak)`, the peak as
+/// `(value, at)`.
+type SpeedCell<'a> = (&'a str, u64, u64, Option<(f64, u64)>);
+
+/// One day of [`SpeedCell`]s.
+fn speed_day(date: &str, cells: &[SpeedCell<'_>]) -> crate::tps::DaySums {
+    let mut days = crate::tps::DaySums::new();
+    for &(account, output, gen_ms, peak) in cells {
+        days.entry(date.to_owned())
+            .or_default()
+            .entry(account.to_owned())
+            .or_default()
+            .insert(
+                "claude-opus-5-5".to_owned(),
+                crate::tps::DaySum {
+                    output,
+                    gen_ms,
+                    speed: peak.map(|(value, at)| crate::tps::PeakAt { value, at }),
+                },
+            );
+    }
+    days
+}
+
+/// A save failing after its temp opens (a directory at `token_speed.json`
+/// refuses the rename) builds its content once: every retry of the same
+/// content only writes it again, the plain save and a fold asking in turn
+/// each keeping their own. A fold of other days builds anew; the retry that
+/// lands writes the kept bytes, and the next save, of the changed ledger,
+/// builds again. The count sees only `SpeedLedger::content`: a serialize or
+/// clone of the ledger's days or rate peaks outside it goes unseen.
+#[test]
+fn a_save_failing_after_its_temp_opens_builds_no_content_until_the_ledger_changes() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut l = SpeedLedger::load(&dir);
+    let first = speed_day("2026-09-19", &[("kerry", 100, 1_000, None)]);
+    assert_eq!(
+        l.fold(&dir, &first, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    let target = dir.join("token_speed.json");
+    std::fs::remove_file(&target).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("keep"), b"x").unwrap();
+    let second = speed_day("2026-09-20", &[("kerry", 7, 70, None)]);
+    let before = serializations::taken();
+    for _ in 0..3 {
+        assert!(!l.save(&dir), "the rename onto a directory fails");
+        assert_eq!(
+            l.fold(&dir, &second, &BTreeMap::new(), "2026-09-21"),
+            FoldOutcome::Unsaved
+        );
+    }
+    assert_eq!(
+        serializations::taken() - before,
+        2,
+        "a retry of the same content rebuilt it"
+    );
+    let third = speed_day("2026-09-20", &[("kerry", 9, 90, None)]);
+    for _ in 0..2 {
+        assert_eq!(
+            l.fold(&dir, &third, &BTreeMap::new(), "2026-09-21"),
+            FoldOutcome::Unsaved
+        );
+    }
+    assert_eq!(
+        serializations::taken() - before,
+        3,
+        "a fold of other days builds its content once"
+    );
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["token_speed.json"], "a temp stayed behind");
+    std::fs::remove_dir_all(&target).unwrap();
+    assert_eq!(
+        l.fold(&dir, &third, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    assert_eq!(
+        serializations::taken() - before,
+        3,
+        "the landing retry rebuilt the kept content"
+    );
+    let mut landed = first;
+    landed.extend(third);
+    assert_eq!(SpeedLedger::load(&dir).days, landed, "the landed fold");
+    assert!(l.save(&dir));
+    assert_eq!(
+        serializations::taken() - before,
+        4,
+        "a save of the changed ledger builds its content"
+    );
+}
+
+/// A refold whose model total ties the stored one takes the new account split
+/// whole (a swap moved the day's responses from kerry to mommy): the day stays
+/// 1000/10 s, never kerry 1000 + mommy 1000, and kerry's faster stored peak
+/// stays on a cell with no sums. A later smaller total (a transcript lost)
+/// leaves the stored split as it is, while its faster peak still lands.
+#[test]
+fn a_refold_takes_the_larger_model_total_with_its_split_and_keeps_every_peak() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = "2026-09-19";
+    let mut l = SpeedLedger::load(&dir);
+    let stored = speed_day(d, &[("kerry", 1000, 10_000, Some((50.0, 1)))]);
+    assert_eq!(
+        l.fold(&dir, &stored, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    let moved = speed_day(d, &[("mommy", 1000, 10_000, Some((40.0, 2)))]);
+    assert_eq!(
+        l.fold(&dir, &moved, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    assert_eq!(
+        SpeedLedger::load(&dir).days,
+        speed_day(
+            d,
+            &[
+                ("kerry", 0, 0, Some((50.0, 1))),
+                ("mommy", 1000, 10_000, Some((40.0, 2))),
+            ]
+        ),
+        "the tied total's split replaced the stored one"
+    );
+    let smaller = speed_day(d, &[("kerry", 600, 6_000, Some((70.0, 3)))]);
+    assert_eq!(
+        l.fold(&dir, &smaller, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    assert_eq!(
+        SpeedLedger::load(&dir).days,
+        speed_day(
+            d,
+            &[
+                ("kerry", 0, 0, Some((70.0, 3))),
+                ("mommy", 1000, 10_000, Some((40.0, 2))),
+            ]
+        ),
+        "a smaller total keeps the stored split, the faster peak lands"
+    );
+}
+
+/// Model totals compare `(output, gen_ms)` in order: a refold with the stored
+/// output (1000) over a shorter span (8 s against 10 s) is the smaller total,
+/// so the stored kerry split stays and the fold changes nothing.
+#[test]
+fn a_refold_with_equal_output_and_a_shorter_span_keeps_the_stored_split() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = "2026-09-19";
+    let mut l = SpeedLedger::load(&dir);
+    let stored = speed_day(d, &[("kerry", 1000, 10_000, None)]);
+    assert_eq!(
+        l.fold(&dir, &stored, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    let shorter = speed_day(d, &[("mommy", 1000, 8_000, None)]);
+    assert_eq!(
+        l.fold(&dir, &shorter, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Unchanged,
+        "the shorter span refolded the day"
+    );
+    assert_eq!(
+        SpeedLedger::load(&dir).days,
+        speed_day(d, &[("kerry", 1000, 10_000, None)]),
+        "the stored split stays"
+    );
 }

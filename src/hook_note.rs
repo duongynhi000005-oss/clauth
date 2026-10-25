@@ -615,11 +615,23 @@ pub(crate) fn told_account(session_id: &str) -> Option<String> {
 /// [`told_account`]: a bare id only, `None` when no record exists or the
 /// record never attributed an account, which the sweep then covers.
 pub(crate) fn resolved_account(session_id: &str) -> Option<String> {
+    resolved_account_at(session_id).map(|(account, _)| account)
+}
+
+/// [`resolved_account`] with the instant the resolution was taken (epoch ms,
+/// `None` when the record carries no stamp): the tps attribution timeline's
+/// stamp for a change the hook observed.
+pub(crate) fn resolved_account_at(session_id: &str) -> Option<(String, Option<u64>)> {
     if !is_bare_id(session_id) {
         return None;
     }
     let path = record_path(session_id, None).ok()?;
-    load_record(&path)?.resolved
+    let record = load_record(&path)?;
+    let at = record
+        .resolved_at
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| u64::try_from(d.as_millis()).ok());
+    Some((record.resolved?, at))
 }
 
 /// Whether a conversation's MAIN-scope record last fired within

@@ -492,6 +492,9 @@ pub(crate) struct TokenStats {
     /// The ledger's tps speed rows summed per finalized day across accounts
     /// and models: date → (output, gen_ms). Avg speed = output ÷ seconds.
     pub(crate) speed_days: std::collections::BTreeMap<String, crate::tps::DaySum>,
+    /// The same ledger days per (account, model) cell, so a day the producer's
+    /// cache also holds merges per model, as the fold stores it.
+    pub(crate) speed_cells: crate::tps::DaySums,
 }
 
 impl TokenStats {
@@ -799,6 +802,7 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
         last_computed_date: wire.last_computed_date.clone(),
         topped_up_through: None,
         speed_days: Default::default(),
+        speed_cells: Default::default(),
         today: None,
     };
 
@@ -1745,6 +1749,12 @@ fn persist_ledger(
     }
 }
 
+/// The speed ledger's days onto `base`: summed per date, and per cell.
+fn apply_speed_ledger(base: &mut TokenStats, speed: crate::token_ledger::SpeedLedger) {
+    base.speed_days = speed.speed_days();
+    base.speed_cells = speed.days;
+}
+
 // ── Background thread ─────────────────────────────────────────────────────────
 
 /// Events emitted by the background loader thread.
@@ -1793,14 +1803,14 @@ pub(crate) fn spawn(
             // Fold durably-recorded days (past the frozen base, before the
             // transcript horizon) into the base so they survive transcript pruning.
             let mut ledger = clauth_dir.as_deref().map(crate::token_ledger::Ledger::load);
-            let speed_days = clauth_dir
+            let speed = clauth_dir
                 .as_deref()
-                .map(|d| crate::token_ledger::SpeedLedger::load(d).speed_days())
+                .map(crate::token_ledger::SpeedLedger::load)
                 .unwrap_or_default();
             if let Some(l) = &ledger {
                 l.apply_to_base(&mut base, lcd.as_deref());
             }
-            base.speed_days = speed_days;
+            apply_speed_ledger(&mut base, speed);
             // Phase 1 — instant lifetime/model data (stats-cache + ledger), no
             // transcript IO.
             let _ = tx.send(TokensEvent::Base(Box::new(base.clone())));
@@ -1833,7 +1843,7 @@ pub(crate) fn spawn(
                 });
                 // Re-read the producer's latest folds so the Loaded event
                 // carries the fresh day sums.
-                base.speed_days = crate::token_ledger::SpeedLedger::load(dir).speed_days();
+                apply_speed_ledger(&mut base, crate::token_ledger::SpeedLedger::load(dir));
             }
             let _ = tx.send(TokensEvent::Loaded(Box::new(base)));
         };

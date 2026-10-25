@@ -1750,8 +1750,8 @@ fn free_rescued_sibling(target: &Path) -> std::io::Result<PathBuf> {
     let ext = target.extension().and_then(|e| e.to_str());
     for n in 0u32..u32::MAX {
         let candidate = dir.join(match ext {
-            Some(ext) => format!("{stem}.rescued-{n}.{ext}"),
-            None => format!("{stem}.rescued-{n}"),
+            Some(ext) => format!("{stem}{RESCUED_TAG}{n}.{ext}"),
+            None => format!("{stem}{RESCUED_TAG}{n}"),
         });
         if !candidate.exists() {
             return Ok(candidate);
@@ -1761,6 +1761,31 @@ fn free_rescued_sibling(target: &Path) -> std::io::Result<PathBuf> {
         std::io::ErrorKind::AlreadyExists,
         format!("no free rescued sibling for {}", target.display()),
     ))
+}
+
+/// The infix [`free_rescued_sibling`] puts between a rescued file's stem and
+/// its number.
+const RESCUED_TAG: &str = ".rescued-";
+
+/// The file name a rescue renamed into `name` (`<stem>.rescued-<n>[.<ext>]`
+/// back to `<stem>[.<ext>]`), `None` when `name` is not a rescued sibling.
+pub(crate) fn rescued_source_name(name: &str) -> Option<String> {
+    let (stem, rest) = name.rsplit_once(RESCUED_TAG)?;
+    let (n, ext) = match rest.split_once('.') {
+        Some((n, ext)) => (n, Some(ext)),
+        None => (rest, None),
+    };
+    if stem.is_empty()
+        || n.is_empty()
+        || !n.bytes().all(|b| b.is_ascii_digit())
+        || ext.is_some_and(|e| e.contains('.'))
+    {
+        return None;
+    }
+    Some(match ext {
+        Some(ext) => format!("{stem}.{ext}"),
+        None => stem.to_owned(),
+    })
 }
 
 #[cfg(test)]

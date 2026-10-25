@@ -4646,6 +4646,7 @@ fn the_tps_rows_render_four_windows_and_a_dash_where_absent() {
                 crate::tps::DaySum {
                     output: 900,
                     gen_ms: 10_000,
+                    ..Default::default()
                 },
             )]),
         )]),

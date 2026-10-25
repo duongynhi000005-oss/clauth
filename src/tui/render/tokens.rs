@@ -1275,30 +1275,52 @@ fn today_lines(
     ]
 }
 
-/// The Tokens tab's per-day speed sums: the speed ledger's finalized days
-/// (`stats.speed_days`), plus the fresh producer cache's `days` — today and
-/// yesterday, which the producer folds into the ledger only once a day is older
-/// than yesterday — for every date the ledger lacks. Each cache day sums over
-/// every account (the reserved unattributed `*` included) and model. A stale
-/// cache contributes nothing, so only the ledger's days survive, matching
-/// "never show a figure clauth did not read". One merge, used by the trend
-/// strip, its footer, the TOTAL `avg speed` and the today card.
+/// The Tokens tab's per-day speed sums: the speed ledger's folded days
+/// (`stats.speed_days`) merged with the fresh producer cache's `days` (the live
+/// days, derived whole, plus any day whose fold is still held). A date both
+/// hold merges by the fold's own refold rule ([`crate::tps::refold_day`]: per
+/// model the larger total across accounts wins), then sums: the ledger can
+/// hold a day early (a fast clock moves it out of the window) while the
+/// cache's copy keeps growing, and a model either side lacks still counts. A
+/// date whose ledger cells the stats do not
+/// carry keeps the larger day total. Each day sums over every account (the
+/// reserved unattributed `*` included) and model. A stale cache contributes
+/// nothing, so only the ledger's days survive, matching "never show a figure
+/// clauth did not read". One merge, used by the trend strip, its footer, the
+/// TOTAL `avg speed` and the today card.
 fn merged_speed_days(
     stats: &TokenStats,
     app: &App,
 ) -> std::collections::BTreeMap<String, crate::tps::DaySum> {
+    let sum = |accounts: &std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, crate::tps::DaySum>,
+    >| {
+        accounts.values().flat_map(|models| models.values()).fold(
+            crate::tps::DaySum::default(),
+            |acc, d| crate::tps::DaySum {
+                output: acc.output.saturating_add(d.output),
+                gen_ms: acc.gen_ms.saturating_add(d.gen_ms),
+                ..Default::default()
+            },
+        )
+    };
     let mut days = stats.speed_days.clone();
     if let Some(snap) = app.fresh_tps() {
         for (date, accounts) in &snap.days {
-            days.entry(date.clone()).or_insert_with(|| {
-                accounts.values().flat_map(|models| models.values()).fold(
-                    crate::tps::DaySum::default(),
-                    |acc, d| crate::tps::DaySum {
-                        output: acc.output.saturating_add(d.output),
-                        gen_ms: acc.gen_ms.saturating_add(d.gen_ms),
-                    },
-                )
-            });
+            match stats.speed_cells.get(date) {
+                Some(cells) => {
+                    let mut cells = cells.clone();
+                    crate::tps::refold_day(&mut cells, accounts);
+                    days.insert(date.clone(), sum(&cells));
+                }
+                None => {
+                    crate::tps::keep_larger_cell(
+                        days.entry(date.clone()).or_default(),
+                        &sum(accounts),
+                    );
+                }
+            }
         }
     }
     days
@@ -1381,7 +1403,11 @@ fn total_lines(
         let (output, gen_ms) = speed_days
             .values()
             .fold((0u64, 0u64), |(o, g), d| (o + d.output, g + d.gen_ms));
-        let avg = crate::tui::app::day_average(crate::tps::DaySum { output, gen_ms });
+        let avg = crate::tui::app::day_average(crate::tps::DaySum {
+            output,
+            gen_ms,
+            ..Default::default()
+        });
         tail.push(Line::from(vec![
             key("avg speed"),
             avg.map_or_else(
@@ -1563,6 +1589,7 @@ fn trend_lines(
     if let Some(avg) = crate::tui::app::day_average(crate::tps::DaySum {
         output: out,
         gen_ms: gen_total,
+        ..Default::default()
     }) {
         let suffix = Span::styled(
             format!(" · avg {} t/s", crate::tps::format_figure(avg)),

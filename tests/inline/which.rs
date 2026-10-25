@@ -1774,3 +1774,76 @@ fn json_tps_reads_the_session_row_when_the_env_names_one() {
     assert_eq!(v["tps"]["session"]["speed"], 33.0);
     assert_eq!(v["tps"]["session"]["rate"], 50.0);
 }
+
+/// `which --json` carries the resolved profile's own peaks for today as
+/// `tps.peaks.today` (the cache's `peaks.today.accounts[<profile>]`), so an
+/// all-time half can join beside it.
+#[test]
+fn json_tps_carries_the_profiles_peaks_today() {
+    let home = HomeSandbox::new();
+    let config = config_with(vec![blank_profile("cl")], Some("cl"));
+    let resolved = resolved_cl();
+    write_tps_cache_at(&home, crate::usage::now_ms(), 1_000, "cl", false);
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    let mut cache: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let pair = serde_json::json!({
+        "speed": {"value": 412.3, "at": "2026-10-19T21:14:03.120+00:00", "account": "cl", "model": "claude-opus-5-5"},
+        "rate": {"value": 1803.0, "at": "2026-10-19T21:02:10.000+00:00"},
+    });
+    cache["peaks"] = serde_json::json!({
+        "today": {"accounts": {"cl": pair.clone(), "other": {"rate": {"value": 9.0, "at": "2026-10-19T20:00:00.000+00:00"}}}, "models": {}},
+        "ever": {"accounts": {}, "models": {}},
+    });
+    std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+    let v = json_view(&config, Some(&resolved));
+    assert_eq!(
+        v["tps"]["peaks"],
+        serde_json::json!({"today": pair}),
+        "tps: {}",
+        v["tps"]
+    );
+
+    // A profile with no peak today reads an empty `today`, never `null`.
+    let none = config_with(vec![blank_profile("idle")], Some("idle"));
+    let idle = ("idle".to_owned(), Source::CredentialLessActive);
+    let v = json_view(&none, Some(&idle));
+    assert_eq!(
+        v["tps"]["peaks"],
+        serde_json::json!({"today": {}}),
+        "tps: {}",
+        v["tps"]
+    );
+}
+
+/// The producer's attribution timeline is producer-only state in its own
+/// file: `which --json`'s tps view never carries it.
+#[test]
+fn json_tps_never_publishes_the_attribution_timeline() {
+    let home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: chrono::DateTime::from_timestamp_millis(i64::try_from(now).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string(),
+        ..crate::tps::Snapshot::default()
+    };
+    let path = home.home().join(".clauth").join(crate::tps::TPS_CACHE_FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+    // The timeline lives in its own file, never in the cache the view reads.
+    std::fs::write(
+        home.home()
+            .join(".clauth")
+            .join(crate::tps::TPS_ATTRIBUTION_FILE),
+        r#"{"version":1,"entries":[{"session":"s","since":0,"member":"cl","pos":null}]}"#,
+    )
+    .unwrap();
+    let v = tps_view_at(Some("cl"), now);
+    assert!(
+        v.get("entries").is_none() && v.get("attribution").is_none(),
+        "which --json hides the timeline: {v}"
+    );
+}

@@ -5250,3 +5250,49 @@ fn read_json_file_names_the_line_for_a_file_torn_after_a_newline() {
         "the parse error must not ride as a source: {err:?}"
     );
 }
+
+/// A content writer that fails inside the open temp leaves no temp behind and
+/// the target as it was.
+#[test]
+fn a_failing_content_writer_leaves_no_temp_and_the_target_untouched() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f.json");
+    std::fs::write(&path, b"old").unwrap();
+    let err = atomic_write_600_with(&path, |f| {
+        std::io::Write::write_all(f, b"partial")?;
+        Err(std::io::Error::other("full"))
+    })
+    .unwrap_err();
+    assert_eq!(err.to_string(), "full");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old");
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["f.json"], "a temp stayed behind");
+}
+
+/// The same for the plain writer behind [`atomic_write`]: a failing content
+/// writer passes its error through, keeps the target and leaves no temp.
+#[test]
+fn a_failing_plain_content_writer_leaves_no_temp_and_the_target_untouched() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("settings.json");
+    std::fs::write(&path, b"old").unwrap();
+    let err = atomic_write_with(&path, |f| {
+        std::io::Write::write_all(f, b"partial")?;
+        Err(std::io::Error::other("full"))
+    })
+    .unwrap_err();
+    assert_eq!(err.to_string(), "full");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old");
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["settings.json"], "a temp stayed behind");
+}

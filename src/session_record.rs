@@ -49,10 +49,11 @@ pub(crate) fn lenient_string<'de, D: serde::Deserializer<'de>>(
 
 /// A well-formed JSON string as itself, any other shape as `None`; a token
 /// serde_json refuses (an out-of-range number, a lone-surrogate escape) fails
-/// the parse. The one lenient element reader shared by [`lenient_string`] and
-/// the job store's `respawnFlags` decoder. A nested sequence or map drains
-/// itself element by element through [`serde::de::IgnoredAny`], which
-/// serde_json skips iteratively and outside its recursion limit.
+/// the parse. The one lenient element reader shared by [`lenient_string`], the
+/// job store's `respawnFlags` decoder, and the tps spend-cap 429 reader. A
+/// nested sequence or map drains itself element by element through
+/// [`serde::de::IgnoredAny`], which serde_json skips iteratively and outside
+/// its recursion limit.
 pub(crate) struct LenientString(pub(crate) Option<String>);
 
 impl<'de> serde::Deserialize<'de> for LenientString {

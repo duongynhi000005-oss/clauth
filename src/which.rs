@@ -587,7 +587,8 @@ fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_j
 /// cache only (no self-tail): `null` with no cache or one older than
 /// [`crate::tps::STALE_AFTER_MS`]. `speed`/`rate` are the profile's live
 /// figures; `session` is the current Claude Code session's live figures when
-/// `CLAUDE_CODE_SESSION_ID` names one in the cache.
+/// `CLAUDE_CODE_SESSION_ID` names one in the cache; `peaks.today` is the
+/// profile's own today peaks from the cache's `peaks.today.accounts`.
 fn tps_view(profile: Option<&str>) -> serde_json::Value {
     tps_view_at(profile, crate::usage::now_ms())
 }
@@ -604,6 +605,7 @@ fn tps_view_at(profile: Option<&str>, now_ms: u64) -> serde_json::Value {
         return serde_json::Value::Null;
     }
     let figures = profile.and_then(|name| snap.accounts.get(name));
+    let peaks = profile.and_then(|name| snap.peaks.today.accounts.get(name));
     let session = std::env::var("CLAUDE_CODE_SESSION_ID")
         .ok()
         .and_then(|sid| snap.sessions.get(&sid))
@@ -617,6 +619,7 @@ fn tps_view_at(profile: Option<&str>, now_ms: u64) -> serde_json::Value {
         "speed": figures.and_then(|f| f.live.speed),
         "rate": figures.map_or(0.0, |f| f.live.rate),
         "session": session,
+        "peaks": serde_json::json!({"today": peaks.cloned().unwrap_or_default()}),
         "age_secs": age_ms / 1000,
     })
 }
