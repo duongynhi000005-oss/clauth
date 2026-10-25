@@ -67,6 +67,11 @@ impl super::Daemon {
         }
         self.reconcile_background_holds();
         self.write_status();
+        // Honour a strip the switch-time strip deferred (its sync lock was held)
+        // with no live `clauth start` wrapper to reconcile it. Try-once: never
+        // parks this tick behind a held sync lock, and no ranked lock is held
+        // here, so entering the JsonSync rank is legal.
+        crate::claude_json::try_honor_pending_strip();
         // Converge a broken plugin registration in the background. The gate is two
         // registry reads inline and a needed heal runs detached (throttled inside
         // `heal_detached`), so this never blocks the run loop.
@@ -475,6 +480,13 @@ impl super::Daemon {
         };
         match result {
             Ok((fp, returning, changed)) => {
+                // Strip AFTER the flock: the strip try-onces the .claude.json
+                // sync lock, ranked OUTSIDE the state flock, so it must never
+                // run under the hold above, and a strip it cannot take is
+                // deferred to the next reconcile (never a tick wait).
+                if changed {
+                    crate::claude_json::strip_home_oauth_account();
+                }
                 self.rebuild_tokens();
                 // Adopt the post-write fingerprint and run the compare, which
                 // drains the switch's own forgets first, so the compare is a
@@ -599,6 +611,9 @@ impl super::Daemon {
         };
         match result {
             Ok((fp, changed)) => {
+                if changed {
+                    crate::claude_json::strip_home_oauth_account();
+                }
                 self.rebuild_tokens();
                 // Adopt the post-write fingerprint and run the compare.
                 self.rebaseline_and_forget(fp);

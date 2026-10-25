@@ -191,6 +191,25 @@ pub(crate) mod rank {
         /// Move an `expire_profile_ttl` back inside a `with_state_lock` and this
         /// asserts.
         ProfileTtl = 450;
+        /// `claude_json::JsonSyncLock` (the `.claude.json` merge flock, at
+        /// `~/.clauth/.claude-json-sync.lock`). Serializes the carried-rank
+        /// merge across every wrapper process so N live `clauth start`
+        /// sessions reconciling one `$HOME/.claude.json` event do not all read
+        /// the stale members and each rewrite every copy. A true leaf — nothing
+        /// is acquired while it is held — ranked OUTSIDE `State` (500) for the
+        /// same reason `ProfileTtl` is: the hold does N reads, parses and
+        /// writes of MB-sized files, and a cross-process flock is a
+        /// serialization point nothing should hold across that IO. Its takers
+        /// are the watchdog's config leg (try-once, no ranked lock held),
+        /// `ProfileRuntime::drop` (wait, no ranked lock held), the switch
+        /// paths' `strip_home_oauth_account` (try-once, taken AFTER both
+        /// `Config` and `State` are released and gated on the switch actually
+        /// moving the active profile, so the strip never runs under `State`),
+        /// the Services-tab wire (try-once), and the runtime seed (wait, taken
+        /// OUTSIDE the state flock: `JsonSync` (480) ranks OUTSIDE `State`
+        /// (500), taken with no state flock held, so the seed's record write
+        /// cannot run under `with_state_lock`).
+        JsonSync = 480;
         /// `with_state_lock` (cross-process state flock). Inner of `config`.
         State = 500;
         /// `hook_note::ScopeLock` (the per-scope record flock). A true leaf —

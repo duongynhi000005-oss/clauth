@@ -2944,6 +2944,11 @@ pub(crate) struct RotationGuard {
 ///   per-config-dir Keychain item under this same lock (past the state flock,
 ///   before the guard drops), spending one shared budget on the item write.
 ///   Same non-waste reasoning off macOS as the mirror term.
+/// - [`crate::claude_json::SEED_SYNC_LOCK_BUDGET`] — a `clauth start` seeds
+///   the runtime `.claude.json` copy under this same lock (past the state
+///   flock, before the guard drops), waiting up to this healthy-merge budget
+///   for `JsonSyncLock`. Spelled here for the same reason as the mirror and
+///   seed terms: the deadline derivation is one number on every host.
 ///
 /// Each guard holder's own legs, on the terms above. Every budget below is armed
 /// past every state-flock wait before the `security` calls it bounds, so
@@ -2961,13 +2966,15 @@ pub(crate) struct RotationGuard {
 ///   with no account id cached, and the live one), then the token call, then
 ///   either the persist's landing or, on a failed refresh, a second adopt whose
 ///   probes the memo answers save a live token that moved meanwhile: 24 + 19 +
-///   20 = 63 s, past this deadline; 12 + 19 + 20 = 51 s with the account id
+///   20 = 63 s; 12 + 19 + 20 = 51 s with the account id
 ///   cached;
 /// - [`ProfileRuntime::acquire`]: the landing's budget, the macOS seed
 ///   carry's item read at `keychain::SECURITY_TIMEOUT`, then the seed write's
-///   own [`SESSION_SEED_BUDGET`] = 20 + 10 + 20 = 50 s; a seed signing out a
-///   login-less store's item instead carries nothing and runs its sign-out
-///   under that same [`SESSION_SEED_BUDGET`], 20 + 20 = 40 s;
+///   own [`SESSION_SEED_BUDGET`], then the `.claude.json` seed's sync-lock
+///   wait ([`crate::claude_json::SEED_SYNC_LOCK_BUDGET`]) =
+///   20 + 10 + 20 + 10 = 60 s; a seed signing out a login-less store's item
+///   instead carries nothing and runs its sign-out under that same
+///   [`SESSION_SEED_BUDGET`], 20 + 20 + 10 = 50 s;
 /// - `SessionSwap::swap_to` onto another member: the landing's budget, the
 ///   macOS carry's item read at `keychain::SECURITY_TIMEOUT`, then one
 ///   [`KEYCHAIN_MIRROR_BUDGET`] over the item write or sign-out =
@@ -2978,7 +2985,7 @@ pub(crate) struct RotationGuard {
 ///   the sign-out = 10 + 20 = 30 s;
 /// - `oauth::rolling_install_gate` (the rolling arm, the re-stamp leg, a
 ///   rolling switch target): the stage landing's budget, the token call, then
-///   the refresh persist's landing budget = 59 s, this deadline exactly;
+///   the refresh persist's landing budget = 59 s;
 /// - the force-link holders (`static-token` clear and restore, the TUI's clear,
 ///   the start-time rolling arm), the install gate's lander and the catch-up:
 ///   the landing's budget = 20 s, plus a relink's own state-flock hold, which
@@ -3008,7 +3015,8 @@ pub(crate) struct RotationGuard {
 /// quietly shortening the deadline it was meant to lengthen.
 pub(crate) const ROTATION_LOCK_TIMEOUT: Duration = crate::oauth::TOKEN_HTTP_DEADLINES
     .saturating_add(KEYCHAIN_MIRROR_BUDGET)
-    .saturating_add(SESSION_SEED_BUDGET);
+    .saturating_add(SESSION_SEED_BUDGET)
+    .saturating_add(crate::claude_json::SEED_SYNC_LOCK_BUDGET);
 
 /// What a macOS landing's Keychain mirror is budgeted for under the rotation
 /// lock: two `security` invocations at `keychain::SECURITY_TIMEOUT` each. A
@@ -5303,6 +5311,19 @@ impl ProfileRuntime {
             stamp_window_closing(&paths, &session);
             Ok::<_, anyhow::Error>((session, paths, file, mode, fresh, store_notes))
         })?;
+        // The `.claude.json` seed records its write under `JsonSyncLock`, whose
+        // rank (480) sits OUTSIDE `State` (500): it cannot run inside the
+        // state-flock hold above without a rank inversion. Seeding here — past
+        // the flock, still before the session launches — keeps the copy's
+        // carried rank recorded.
+        // A failed seed fails the start, so a started row is never left behind
+        // by a seed that could not write a copy: the row and the marker this
+        // start registered are released before the error propagates.
+        if let Err(e) = seed_claude_json(&paths.runtime, &claude_home) {
+            let _ = crate::live_sessions::unregister(session.as_str());
+            let _ = std::fs::remove_file(&paths.pid_file);
+            return Err(e);
+        }
         // macOS: the Keychain half of the tree build. Before the guard drops,
         // so a rotation queued behind it cannot land between the build and the
         // item write — see `seed_session_keychain_item`.
@@ -5391,7 +5412,10 @@ impl ProfileRuntime {
         }
         impl crate::watchdog::Reconcile for WatchdogLegs {
             fn config(&self) {
-                if let Err(e) = crate::claude_json::sync_once() {
+                // Try-once: a peer mid-merge must not park the credential leg
+                // and swap poll on the same loop iteration. A skipped pass
+                // retries on the next event or the 30 s fallback tick.
+                if let Err(e) = crate::claude_json::sync_once_try() {
                     logline!("clauth: .claude.json sync failed: {e}");
                 }
                 if let Err(e) = crate::settings_sync::sync_once() {
@@ -7702,8 +7726,6 @@ fn build_runtime_dir_with_active_env(
     let creds_link = runtime.join(".credentials.json");
     reconcile_credentials(&creds_link, canonical, mode)?;
 
-    seed_claude_json(runtime, claude_home)?;
-
     Ok(store_notes)
 }
 
@@ -7798,7 +7820,7 @@ fn build_runtime_dir(
     mode: LinkMode,
     isolation: Isolation,
 ) -> Result<Vec<String>> {
-    build_runtime_dir_with_active_env(
+    let store_notes = build_runtime_dir_with_active_env(
         runtime,
         claude_home,
         profile,
@@ -7806,7 +7828,9 @@ fn build_runtime_dir(
         mode,
         isolation,
         &[],
-    )
+    )?;
+    seed_claude_json(runtime, claude_home)?;
+    Ok(store_notes)
 }
 
 /// Remove top-level symlinks in the runtime whose target no longer resolves
@@ -7943,20 +7967,40 @@ fn is_owner_only(path: &Path) -> bool {
 /// identity and won't re-derive it from the token on a normal startup, so a
 /// shared symlink leaks one account's identity into another. The background
 /// syncer (`crate::claude_json`) keeps the non-per-profile fields converged
-/// across all copies (latest write wins). A freshly seeded copy strips the
-/// global file's `oauthAccount` (issue #17: a raw copy is born carrying
-/// whichever account was active at seed time, wrong for every profile but the
-/// active one) so this profile starts identity-less and Claude Code re-derives
-/// it from THIS profile's own credentials on first boot; that boot (or the
-/// next OAuth login) writes the correct identity, which the syncer then
-/// preserves as this copy's own per-profile field.
+/// across all copies (the winner is the member whose bytes carry the newest
+/// Claude Code write). A freshly seeded copy strips the global file's
+/// `oauthAccount` (issue #17: a raw copy is born carrying whichever account was
+/// active at seed time, wrong for every profile but the active one) so this
+/// profile starts identity-less and Claude Code re-derives it from THIS
+/// profile's own credentials on first boot; that boot (or the next OAuth login)
+/// writes the correct identity, which the syncer then preserves as this copy's
+/// own per-profile field.
 ///
 /// Seeds from the global file when this profile has no real copy yet, or
-/// migrates the old shared symlink (pre-per-profile behavior) to a copy.
-/// `atomic_write_600` renames over the path, replacing a symlink in one step —
-/// no window where a sibling session sees the file missing — at owner-only mode
-/// (the seed carries the account's `oauthAccount` billing/identity caches).
-/// Existing real copies keep their own identity and synced shared fields.
+/// migrates the old shared symlink (pre-per-profile behavior) to a copy. The
+/// copy is written at owner-only mode (the seed carries the account's
+/// `oauthAccount` billing/identity caches), replacing a symlink in one step —
+/// no window where a sibling session sees the file missing. Existing real
+/// copies keep their own identity and synced shared fields.
+///
+/// The write is recorded under [`crate::claude_json::JsonSyncLock`] with the
+/// carried rank of the bytes it was built from (home's own rank via
+/// [`crate::jsonsync::carried_rank_of`]): the mtime of the Claude Code write
+/// those bytes carry, so the seed echoes that write's rank. The copy's mtime
+/// is stamped at the floor stamp ([`crate::jsonsync::FLOOR_STAMP_SECS`], below
+/// every Claude Code write) — the same stamp the unrecorded seed uses — so a
+/// recorded seed whose record write fails (fail-open, logged) ranks below every
+/// Claude Code write instead of reverting a sibling's newer write on its own
+/// fresh mtime; the record entry is taken from the temp handle after the stamp,
+/// so it still matches. The seed must run OUTSIDE the
+/// state flock (`JsonSync` (480) ranks OUTSIDE `State` (500), taken with no
+/// state flock held), which is why the caller seeds after the flock release.
+/// A seed that cannot take the lock within
+/// [`crate::claude_json::SEED_SYNC_LOCK_BUDGET`] (or resolve the record path)
+/// still seeds — a session must start — and stamps the copy's mtime at the
+/// floor stamp likewise, so an unrecorded seed never outranks a sibling's newer
+/// write: the copy holds only home's bytes, which home keeps at its own rank,
+/// so it never needs to win a pass.
 fn seed_claude_json(runtime: &Path, claude_home: &Path) -> Result<()> {
     let Some(home) = claude_home.parent() else {
         return Ok(());
@@ -7966,29 +8010,115 @@ fn seed_claude_json(runtime: &Path, claude_home: &Path) -> Result<()> {
     let is_symlink = dst
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink());
-    if (is_symlink || !dst.exists())
-        && let Ok(bytes) = std::fs::read(&global)
-    {
-        let bytes = strip_oauth_account_on_seed(bytes);
-        atomic_write_600(&dst, &bytes)
-            .with_context(|| format!("failed to seed {}", dst.display()))?;
+    if !(is_symlink || !dst.exists()) {
+        return Ok(());
     }
-    Ok(())
+    let Some(record) = crate::claude_json::written_record_path() else {
+        // Residual: no record path — seed unrecorded, stamped at the floor.
+        return seed_unrecorded(&global, &dst);
+    };
+    #[cfg(test)]
+    run_seed_pre_lock_hook();
+    let Ok(_lock) = crate::claude_json::JsonSyncLock::acquire_with_timeout(
+        crate::claude_json::SEED_SYNC_LOCK_BUDGET,
+    ) else {
+        // Residual: the lock could not be taken within the healthy budget —
+        // seed unrecorded, stamped at the floor.
+        return seed_unrecorded(&global, &dst);
+    };
+    // Stat and read home under the lock: the bytes and their carried rank are
+    // home's as they stand under the lock, so a merge holding the lock cannot
+    // replace home's record entry between the read and the rank. A missing,
+    // unreadable or unstatable home has nothing to seed.
+    let Some((home_mtime, home_size, home_bytes)) = read_home_for_seed(&global) else {
+        return Ok(());
+    };
+    let bytes = strip_oauth_account_on_seed(&home_bytes);
+    let carried_rank =
+        crate::jsonsync::carried_rank_of(&record, &global, home_mtime, home_size, &home_bytes);
+    crate::jsonsync::write_copy_and_record(
+        Some(&record),
+        &dst,
+        &bytes,
+        carried_rank,
+        true,
+        Some(crate::jsonsync::floor_stamp()),
+    )
+    .with_context(|| format!("failed to seed {}", dst.display()))
+}
+
+/// Test-only seam right before the seed takes the sync lock, where a merge
+/// rewriting home lands deterministically. Armed only while the arming test
+/// holds a `HomeSandbox`, so `HOME_TEST_LOCK` serializes it.
+#[cfg(test)]
+static SEED_PRE_LOCK_HOOK: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+/// Arm or clear [`SEED_PRE_LOCK_HOOK`]. Test-only.
+#[cfg(test)]
+pub(crate) fn set_seed_pre_lock_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
+    *SEED_PRE_LOCK_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = hook.map(std::sync::Arc::from);
+}
+
+/// Run the armed [`SEED_PRE_LOCK_HOOK`] outside its slot lock.
+#[cfg(test)]
+fn run_seed_pre_lock_hook() {
+    let hook = SEED_PRE_LOCK_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Read home's `.claude.json` stat + size + bytes together, so the carried rank
+/// matches the bytes the seed was built from. `None` for a missing, unreadable
+/// or unstatable home.
+fn read_home_for_seed(global: &Path) -> Option<(SystemTime, u64, Vec<u8>)> {
+    let meta = std::fs::metadata(global).ok()?;
+    let mtime = meta.modified().ok()?;
+    let bytes = std::fs::read(global).ok()?;
+    Some((mtime, meta.len(), bytes))
+}
+
+/// Seed the runtime copy unrecorded when the record path is absent or the sync
+/// lock could not be taken within the healthy budget (a session must start):
+/// read home best-effort and write the stripped copy stamped at the floor
+/// stamp, below every Claude Code write — exactly as the wire's created home.
+/// The copy holds only home's bytes, which home keeps at its own rank, so it
+/// never needs to win a pass; the floor stamp ranks it below every Claude Code
+/// write without reading home's rank without the lock.
+fn seed_unrecorded(global: &Path, dst: &Path) -> Result<()> {
+    let Some((_mtime, _size, home_bytes)) = read_home_for_seed(global) else {
+        return Ok(()); // nothing to seed
+    };
+    let bytes = strip_oauth_account_on_seed(&home_bytes);
+    crate::jsonsync::write_copy_and_record(
+        None,
+        dst,
+        &bytes,
+        (0, 0),
+        true,
+        Some(crate::jsonsync::floor_stamp()),
+    )
+    .with_context(|| format!("failed to seed {}", dst.display()))
 }
 
 /// Remove `oauthAccount` from freshly seeded `.claude.json` bytes. A no-op
 /// (returns the bytes unchanged) when the key is already absent or the source
 /// doesn't parse as a JSON object, so the common case stays a plain byte copy.
-fn strip_oauth_account_on_seed(bytes: Vec<u8>) -> Vec<u8> {
-    let Ok(serde_json::Value::Object(mut obj)) =
-        serde_json::from_slice::<serde_json::Value>(&bytes)
+fn strip_oauth_account_on_seed(bytes: &[u8]) -> Vec<u8> {
+    let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_slice::<serde_json::Value>(bytes)
     else {
-        return bytes;
+        return bytes.to_vec();
     };
     if obj.remove("oauthAccount").is_none() {
-        return bytes;
+        return bytes.to_vec();
     }
-    serde_json::to_vec_pretty(&serde_json::Value::Object(obj)).unwrap_or(bytes)
+    serde_json::to_vec_pretty(&serde_json::Value::Object(obj)).unwrap_or_else(|_| bytes.to_vec())
 }
 
 fn materialize_entry(src: &Path, dst: &Path, mode: LinkMode) -> Result<()> {

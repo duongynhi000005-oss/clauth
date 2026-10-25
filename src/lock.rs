@@ -514,7 +514,16 @@ impl StateLock {
                 .context("failed to open clauth state lock file")?;
             // On timeout `guard` drops here, releasing THREAD_LOCK with the slot
             // still `None` and DEPTH still 0 — a clean unwind, no rank entered.
-            if let Err(e) = lock_file_with_timeout(&file, timeout) {
+            if let Err(e) = lock_file_with_timeout(
+                &file,
+                timeout,
+                |waited| {
+                    let timed_out = StateLockTimeout { waited };
+                    logline!("clauth: {timed_out}");
+                    anyhow::Error::new(timed_out)
+                },
+                "failed to acquire clauth state lock",
+            ) {
                 if e.downcast_ref::<StateLockTimeout>().is_some()
                     && let Some(flag) = timed_out
                 {
@@ -555,9 +564,15 @@ impl StateLock {
 
 /// Take the exclusive advisory flock on `file`, re-polling every
 /// [`LOCK_POLL_INTERVAL`] until it is free or `timeout` elapses. A `WouldBlock`
-/// past the deadline returns [`StateLockTimeout`] (logged once so a wedge is
-/// diagnosable); a real IO error propagates as-is.
-pub(crate) fn lock_file_with_timeout(file: &File, timeout: Duration) -> Result<()> {
+/// past the deadline returns the caller-built timeout error (the state flock
+/// builds and logs a [`StateLockTimeout`]; the `.claude.json` sync lock builds
+/// its own); a real IO error propagates as-is under `io_context`.
+pub(crate) fn lock_file_with_timeout(
+    file: &File,
+    timeout: Duration,
+    timeout_error: impl FnOnce(Duration) -> anyhow::Error,
+    io_context: &'static str,
+) -> Result<()> {
     #[cfg(test)]
     flock_wait_park::park_if_armed();
     let deadline = Instant::now() + timeout;
@@ -567,14 +582,12 @@ pub(crate) fn lock_file_with_timeout(file: &File, timeout: Duration) -> Result<(
             Err(std::fs::TryLockError::WouldBlock) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    let timed_out = StateLockTimeout { waited: timeout };
-                    logline!("clauth: {timed_out}");
-                    return Err(anyhow::Error::new(timed_out));
+                    return Err(timeout_error(timeout));
                 }
                 std::thread::sleep(LOCK_POLL_INTERVAL.min(deadline - now));
             }
             Err(std::fs::TryLockError::Error(e)) => {
-                return Err(e).context("failed to acquire clauth state lock");
+                return Err(e).context(io_context);
             }
         }
     }

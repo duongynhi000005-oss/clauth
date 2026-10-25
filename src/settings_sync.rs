@@ -9,7 +9,8 @@
 //!
 //! This module reconciles the same member set the credentials watchdog already
 //! ticks: the operator's `~/.claude/settings.json` plus every SHARED profile
-//! runtime copy. Newest parseable copy wins for the shared fields; each member
+//! runtime copy. The highest-ranked member — each ranks by the mtime of the
+//! Claude Code write its bytes carry — wins for the shared fields; each member
 //! keeps its own per-profile fields ([`key_role`]). The merge machinery is
 //! [`crate::jsonsync`], shared with the `.claude.json` reconciler.
 //!
@@ -38,7 +39,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -80,9 +80,9 @@ const PER_PROFILE_TOP_FIELDS: &[&str] = &[
     "model",
 ];
 
-/// Newest mtime from the last [`sync_once`] that did work; the key for
+/// The stat snapshot from the last [`sync_once`] that did work; the key for
 /// [`crate::jsonsync::run_with_cache`]'s fast path.
-static LAST_SYNCED: Mutex<Option<SystemTime>> = Mutex::new(None);
+static LAST_SYNCED: Mutex<Option<Vec<crate::jsonsync::MemberSnapshot>>> = Mutex::new(None);
 
 /// Latch for [`warn_paused`], so the pause is reported once rather than on every
 /// watchdog tick. Cleared by the next clean [`per_profile_env_keys`] read.
@@ -286,12 +286,17 @@ fn warn_paused(path: &Path, reason: &str) -> Option<BTreeSet<String>> {
     None
 }
 
-/// Reconcile every known `settings.json` once, behind the `LAST_SYNCED` mtime
+/// Reconcile every known `settings.json` once, behind the `LAST_SYNCED` stat
 /// fast path in [`crate::jsonsync::run_with_cache`].
 pub(crate) fn sync_once() -> Result<()> {
     let paths = known_paths()?;
     crate::jsonsync::run_with_cache(&LAST_SYNCED, &paths, || sync_members(&paths))
 }
+
+/// The written-copy record for `settings.json`, persisted under the same state
+/// flock the merge holds in [`sync_members`] — clauth's own echoes never
+/// outrank a real Claude Code write.
+const SETTINGS_SYNC_WRITTEN_FILENAME: &str = ".settings-sync-written.json";
 
 /// Merge the members under the cross-process state flock. Returns whether the
 /// merge ran (`false` = paused on an unreadable `config.toml`).
@@ -318,11 +323,12 @@ pub(crate) fn sync_once() -> Result<()> {
 /// `settings.json` reads, parses, and writes.
 fn sync_members(paths: &[PathBuf]) -> Result<bool> {
     let operator_file = claude_dir()?.join("settings.json");
+    let record = clauth_dir()?.join(SETTINGS_SYNC_WRITTEN_FILENAME);
     with_state_lock(|_held| {
         let Some(custom_env) = per_profile_env_keys() else {
             return Ok(false);
         };
-        crate::jsonsync::sync_paths(paths, Some(&operator_file), |path| {
+        crate::jsonsync::sync_paths(paths, Some(&operator_file), Some(&record), |path| {
             key_role(path, &custom_env)
         })?;
         Ok(true)

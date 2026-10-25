@@ -5894,25 +5894,20 @@ fn write_home_claude_json_with_identity() {
     .expect("write home .claude.json");
 }
 
-/// `finish_switch` is the shared convergence point for the manual CLI, TUI,
-/// MCP `switch`, and fallback switch paths (all four route through
-/// `switch_profile`/`switch_profile_reconciled`/`switch_profile_discard`,
-/// which call it under the state lock) — asserting on it directly pins the
-/// behaviour for all of them at once.
+/// Every switch path deletes the stale `oauthAccount` block. The strip runs in
+/// the switch WRAPPERS after the state flock (gated on the switch actually
+/// moving the active profile): it takes the `.claude.json` sync lock, ranked
+/// OUTSIDE the state flock, so it must never run under the flock. Driving the
+/// wrapper — not `finish_switch`, which no longer strips — pins the behaviour.
 #[test]
-fn finish_switch_deletes_stale_oauth_account_block() {
+fn a_switch_deletes_the_stale_oauth_account_block() {
     let _home = HomeSandbox::new();
     write_home_claude_json_with_identity();
+    let config = two_profiles_active_on_one();
 
-    let mut config = acct_config();
-    crate::lock::with_state_lock(|held| {
-        finish_switch(
-            &mut config,
-            &crate::profile::ProfileName::from("acct"),
-            held,
-        )
-    })
-    .expect("finish_switch");
+    through_handle(config, |h| {
+        switch_profile(h, &"two".into()).expect("switch");
+    });
 
     let after: serde_json::Value =
         serde_json::from_slice(&std::fs::read(home_claude_json_path()).unwrap()).unwrap();
@@ -5960,6 +5955,168 @@ fn switch_off_also_deletes_stale_oauth_account_block() {
         "no active account remains, so the stale identity block must be gone too"
     );
     assert_eq!(after["numStartups"], serde_json::json!(7));
+}
+
+/// The REST/MCP Discard branch (`switch_profile_discard`) force-links without
+/// capturing the diverged live login; it reaches the strip through its own
+/// wrapper, so the outgoing identity block is dropped there too. Deleting that
+/// one strip call must red this test and not any sibling.
+#[test]
+fn switch_profile_discard_also_deletes_stale_oauth_account_block() {
+    let _home = HomeSandbox::new();
+    write_home_claude_json_with_identity();
+    let config = two_profiles_active_on_one();
+
+    through_handle(config, |h| {
+        switch_profile_discard(h, &"two".into()).expect("discard switch");
+    });
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home_claude_json_path()).unwrap()).unwrap();
+    assert!(
+        after.get("oauthAccount").is_none(),
+        "the discard path must strip the outgoing identity block too"
+    );
+}
+
+/// The REST/MCP Overwrite branch (`switch_profile_reconciled`) snapshots the
+/// live login into the outgoing profile then relinks; its own wrapper strips the
+/// identity block after the flock, gated on the switch actually moving.
+#[test]
+fn switch_profile_reconciled_also_deletes_stale_oauth_account_block() {
+    let _home = HomeSandbox::new();
+    write_home_claude_json_with_identity();
+    let config = two_profiles_active_on_one();
+
+    through_handle(config, |h| {
+        switch_profile_reconciled(h, &"two".into()).expect("reconciled switch");
+    });
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home_claude_json_path()).unwrap()).unwrap();
+    assert!(
+        after.get("oauthAccount").is_none(),
+        "the reconciled path must strip the outgoing identity block too"
+    );
+}
+
+/// The TUI startup one-shot (`fallback::auto_switch_if_needed`) strips the
+/// outgoing identity block through its own post-flock site. Deleting that one
+/// call must red this test and not the manual-switch tests.
+#[test]
+fn auto_switch_if_needed_also_deletes_stale_oauth_account_block() {
+    use crate::fallback::SwitchAction;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = HomeSandbox::new();
+    write_home_claude_json_with_identity();
+
+    let mut usage_map = HashMap::new();
+    let mut mk = |name: &str, access: &str, util: f64, resets_at: i64| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some(format!("{access}-refresh")),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        usage_map.insert(
+            name.to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: util,
+                    resets_at: Some(epoch_secs_to_iso(resets_at)),
+                }),
+                ..Default::default()
+            },
+        );
+        crate::profile::save_profile(&p).expect("save profile");
+        p
+    };
+    let a = mk("a", "a-access", 100.0, now_epoch_secs() - 3600);
+    let b = mk("b", "b-access", 10.0, now_epoch_secs() + 3600);
+
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(a.credentials.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            auth_broken: vec!["a".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    let stores = one_shot_stores(&config, &usage_map);
+    let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
+    assert_eq!(action, Some(SwitchAction::To("b".to_string())));
+    assert!(config.is_active(&crate::profile::ProfileName::from("b")));
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home_claude_json_path()).unwrap()).unwrap();
+    assert!(
+        after.get("oauthAccount").is_none(),
+        "the startup one-shot must strip the outgoing identity block after its switch"
+    );
+}
+
+/// A committed switch never fails on the identity strip. With the sync lock
+/// held (a wedged peer), the strip defers, the switch still succeeds, and the
+/// status republish still runs — only the strip is best-effort. The deferred
+/// strip then lands on the next reconcile.
+#[test]
+fn a_switch_with_a_held_sync_lock_still_succeeds_and_republishes() {
+    let _home = HomeSandbox::new();
+    write_home_claude_json_with_identity();
+    let config = two_profiles_active_on_one();
+
+    let lock_dir = crate::profile::clauth_dir().unwrap();
+    crate::profile::mkdir_700(&lock_dir).unwrap();
+    let holder = crate::profile::open_state_file(&lock_dir.join(".claude-json-sync.lock")).unwrap();
+    holder.lock().unwrap();
+
+    let (config, ()) = through_handle(config, |h| {
+        switch_profile(h, &"two".into()).expect("a held sync lock must not fail the switch");
+    });
+
+    assert!(
+        config.is_active(&"two".into()),
+        "the switch moved the active profile despite the held strip lock"
+    );
+    let feed = std::fs::read(lock_dir.join("status.json")).expect("the republish ran");
+    let body: serde_json::Value = serde_json::from_slice(&feed).unwrap();
+    assert_eq!(body["active_profile"], "two");
+
+    // The strip was deferred, not applied: home still carries the stale block.
+    let still: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home_claude_json_path()).unwrap()).unwrap();
+    assert!(
+        still.get("oauthAccount").is_some(),
+        "a held lock defers the strip rather than failing the switch"
+    );
+
+    drop(holder);
+    crate::claude_json::sync_once().expect("reconcile honours the deferred strip");
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home_claude_json_path()).unwrap()).unwrap();
+    assert!(
+        after.get("oauthAccount").is_none(),
+        "the deferred strip lands on the next reconcile"
+    );
 }
 
 /// `switch_off` on a DIVERGED live file: the foreign `/login` is dropped, never

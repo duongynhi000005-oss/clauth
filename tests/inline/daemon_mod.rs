@@ -982,6 +982,142 @@ fn a_member_given_up_as_unreadable_is_passed_over_until_its_store_reads_again() 
     assert_eq!(active_of(&daemon).as_deref(), Some("alpha"));
 }
 
+/// The daemon switch drain strips the outgoing identity block through its own
+/// post-flock site. Deleting that one call must red this test and not the
+/// manual-switch tests.
+#[test]
+fn drain_pending_switch_strips_the_outgoing_oauth_account() {
+    let _home = HomeSandbox::new();
+    let home_json = crate::profile::home_dir().unwrap().join(".claude.json");
+    std::fs::write(
+        &home_json,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "oauthAccount": {"emailAddress": "stale@x"},
+            "numStartups": 7,
+        }))
+        .unwrap(),
+    )
+    .expect("write home .claude.json");
+
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "the switch executed"
+    );
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&home_json).unwrap()).unwrap();
+    assert!(
+        after.get("oauthAccount").is_none(),
+        "the daemon switch drain must strip the outgoing identity block"
+    );
+}
+
+/// The daemon wrap-off drain strips the outgoing identity block through its own
+/// post-flock site. Deleting that one call must red this test and not the
+/// switch drain's.
+#[test]
+fn drain_pending_switch_off_strips_the_outgoing_oauth_account() {
+    let _home = HomeSandbox::new();
+    let home_json = crate::profile::home_dir().unwrap().join(".claude.json");
+    std::fs::write(
+        &home_json,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "oauthAccount": {"emailAddress": "stale@x"},
+            "numStartups": 7,
+        }))
+        .unwrap(),
+    )
+    .expect("write home .claude.json");
+
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    *daemon
+        .pending_switch_off
+        .lock()
+        .expect("pending_switch_off") = true;
+    daemon.drain_pending_switch_off();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        None,
+        "the wrap-off turned everything off"
+    );
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&home_json).unwrap()).unwrap();
+    assert!(
+        after.get("oauthAccount").is_none(),
+        "the daemon wrap-off drain must strip the outgoing identity block"
+    );
+}
+
+/// The daemon tick honours a pending strip with no `clauth start` wrapper
+/// running — a deferral lands while the daemon runs. Try-once, never waits: the
+/// tick is the wrapper-free retry path.
+#[test]
+fn tick_honours_a_pending_strip_with_no_wrapper_running() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+
+    let home_json = crate::profile::home_dir().unwrap().join(".claude.json");
+    std::fs::create_dir_all(home_json.parent().unwrap()).unwrap();
+    std::fs::write(
+        &home_json,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "oauthAccount": {"emailAddress": "stale@x"},
+            "numStartups": 7,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // The durable marker a deferred strip left.
+    let clauth = clauth_dir().unwrap();
+    std::fs::create_dir_all(&clauth).unwrap();
+    std::fs::write(clauth.join(".oauth-strip-pending"), b"stamp").unwrap();
+
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    daemon.tick();
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&home_json).unwrap()).unwrap();
+    assert!(
+        after.get("oauthAccount").is_none(),
+        "the daemon tick must honour a pending strip with no wrapper running"
+    );
+    assert!(
+        !clauth.join(".oauth-strip-pending").exists(),
+        "the honoured marker must clear"
+    );
+}
+
 /// A change site the daemon tick runs — the adopt of a first login during a
 /// switch — forgets the displaced OAuth reading right after the switch's locks
 /// drop, the same call the TUI makes.

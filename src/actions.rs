@@ -258,10 +258,25 @@ fn switch_profile_synced(
     let mut guard = config.lock().expect("config mutex poisoned");
     let changed = switch_profile_locked(&mut guard, name)?;
     drop(guard);
+    strip_stale_identity_after_switch(changed);
     if changed {
         crate::daemon::publish_status_with(config, before_commit);
     }
     Ok(())
+}
+
+/// issue #17: after a switch that moved the active profile (or switched off),
+/// drop the outgoing account's cached identity so Claude Code re-derives it
+/// from the relinked credentials. Runs AFTER the state flock, gated on `changed`
+/// so only a switch that actually proceeded strips: the strip try-onces the
+/// `.claude.json` sync lock, ranked OUTSIDE `State`, so it must never run under
+/// the flock, and a strip that cannot take the lock is deferred to the next
+/// reconcile rather than failing the switch. A no-op switch (already active)
+/// never reaches this.
+fn strip_stale_identity_after_switch(changed: bool) {
+    if changed {
+        crate::claude_json::strip_home_oauth_account();
+    }
 }
 
 /// [`switch_profile`]'s locked body: the caller holds the config guard and
@@ -338,6 +353,7 @@ pub(crate) fn switch_profile_discard(config: &ConfigHandle, target: &ProfileName
         Ok(true)
     })?;
     drop(guard);
+    strip_stale_identity_after_switch(changed);
     if changed {
         crate::daemon::publish_status(config);
     }
@@ -367,6 +383,7 @@ pub(crate) fn switch_profile_reconciled(config: &ConfigHandle, name: &ProfileNam
         Ok((true, outgoing, oauth_changed))
     })?;
     drop(guard);
+    strip_stale_identity_after_switch(changed);
     if changed {
         // The reconcile captured a live login that may be a DIFFERENT account:
         // expire the outgoing profile's `/profile` clock (ranked below the flock,
@@ -659,6 +676,7 @@ pub(crate) fn switch_off(config: &ConfigHandle) -> Result<()> {
     let mut guard = config.lock().expect("config mutex poisoned");
     let changed = switch_off_locked(&mut guard)?;
     drop(guard);
+    strip_stale_identity_after_switch(changed);
     if changed {
         crate::daemon::publish_status(config);
     }
@@ -675,9 +693,9 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
         }
         snapshot_active_credentials(config)?;
         clear_claude_credentials()?;
-        // No active account left to show; issue #17 applies here too — a
-        // stale identity block is just as wrong once creds are cleared.
-        crate::claude_json::strip_home_oauth_account()?;
+        // No active account left to show; issue #17 applies here too — the
+        // stale identity block is stripped by the callers (after the flock) via
+        // `strip_stale_identity_after_switch`.
         config.state.set_active(None, held);
         // Same fresh-state rule as `finish_switch`: only the active marker is
         // this leg's change, so write it onto the current on-disk state rather
@@ -725,10 +743,10 @@ fn finish_switch(config: &mut AppConfig, name: &ProfileName, held: &StateLockHel
     let prev_env_keys = outgoing_env_keys(config);
     let profile = config.find(name).context("profile not found")?;
     apply_profile_to_claude_settings(profile, &prev_env_keys)?;
-    // issue #17: drop the outgoing account's cached identity so Claude Code
-    // re-derives it from the just-relinked credentials instead of showing
-    // the wrong account until its next `/login`.
-    crate::claude_json::strip_home_oauth_account()?;
+    // The issue #17 strip runs AFTER this fn, at the caller
+    // (`strip_stale_identity_after_switch`, gated on `changed`), so it takes the
+    // .claude.json sync lock (ranked outside the state flock) rather than
+    // running under the flock here.
     config.state.set_active(Some(name.clone()), held);
     // Fresh state, not the whole in-memory list: a daemon drain may hold a
     // config older than a concurrent CLI delete/rename/login, and re-serializing

@@ -3293,6 +3293,10 @@ pub(crate) fn auto_switch_if_needed(
     })?;
     drop(guard);
     if changed {
+        // Strip AFTER the flock: the strip try-onces the .claude.json sync
+        // lock, ranked OUTSIDE the state flock, so it must never run under the
+        // hold, and a strip it cannot take is deferred to the next reconcile.
+        crate::claude_json::strip_home_oauth_account();
         crate::daemon::publish_status(config);
     }
     Ok(action)

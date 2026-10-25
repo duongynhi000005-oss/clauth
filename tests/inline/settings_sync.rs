@@ -1,7 +1,7 @@
 use super::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
 
@@ -813,5 +813,112 @@ fn a_torn_config_toml_pause_warning_names_the_position_and_never_the_secret() {
             .iter()
             .all(|line| !line.contains("sk-c2probe-NOTAKEY")),
         "the api key must never reach the log: {snapshot:?}"
+    );
+}
+
+/// The same mtime tie on the shared writer: a Claude Code write to the base
+/// `settings.json` landing within one timestamp tick of clauth's copy write ties
+/// the copy on mtime, and the tie must never go to clauth's own echo. The hook
+/// stamps the base with the copy's mtime, so the tie holds on any filesystem.
+#[test]
+fn a_claude_code_write_tying_a_copy_write_on_mtime_wins_the_next_pass() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p1 = runtime_path(home.home(), "p1");
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(10));
+    write_json(&p1, &json!({"theme": "dark", "env": {}}), t(5));
+
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    crate::jsonsync::set_post_write_hook(Some(Box::new({
+        let base = base.clone();
+        let p1 = p1.clone();
+        let fired = std::sync::Arc::clone(&fired);
+        move || {
+            if fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 0 {
+                return;
+            }
+            let copy_mtime = fs::metadata(&p1)
+                .expect("copy metadata")
+                .modified()
+                .expect("copy mtime");
+            write_json(
+                &base,
+                &json!({"theme": "solarized", "ccNewKey": true, "env": {}}),
+                copy_mtime,
+            );
+        }
+    })));
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            crate::jsonsync::set_post_write_hook(None);
+        }
+    }
+    let _hook_guard = HookGuard;
+
+    sync();
+    crate::jsonsync::set_post_write_hook(None);
+
+    assert_eq!(
+        fired.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "precondition: clauth wrote the copy exactly once"
+    );
+    assert_eq!(
+        fs::metadata(&base)
+            .expect("meta")
+            .modified()
+            .expect("mtime"),
+        fs::metadata(&p1).expect("meta").modified().expect("mtime"),
+        "precondition: the base's write and the copy tie on mtime"
+    );
+
+    sync();
+    assert_eq!(
+        read_json(&base),
+        json!({"theme": "solarized", "ccNewKey": true, "env": {}}),
+        "the Claude Code write survives the tie"
+    );
+    assert_eq!(
+        read_json(&p1),
+        json!({"theme": "solarized", "ccNewKey": true, "env": {}}),
+        "the copy converges on the Claude Code write"
+    );
+}
+
+/// The settings written-copy record is owner-only and holds no member
+/// bytes — only path, mtime (secs + nanos), size, and digest.
+#[cfg(unix)]
+#[test]
+fn the_settings_record_is_owner_only_and_holds_no_member_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p1 = runtime_path(home.home(), "p1");
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    write_json(&p1, &json!({"theme": "dark", "env": {}}), t(10));
+
+    sync();
+
+    let record = home.home().join(".clauth/.settings-sync-written.json");
+    let meta = fs::metadata(&record).expect("the record exists");
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o600,
+        "the settings record is owner-only"
+    );
+
+    let text = String::from_utf8(fs::read(&record).expect("read")).expect("utf-8");
+    assert!(
+        !text.contains("theme"),
+        "the settings record holds no member bytes"
+    );
+
+    let entries: Vec<Value> = serde_json::from_str(&text).expect("record parses");
+    assert_eq!(entries.len(), 1, "one copy was written (the base)");
+    assert_eq!(
+        entries[0]["path"],
+        json!(base.to_string_lossy().into_owned())
     );
 }

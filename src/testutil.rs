@@ -144,6 +144,9 @@ impl HomeSandbox {
         crate::pricing::set_fetch_timeout_override(None);
         crate::status::set_fetch_timeout_override(None);
         crate::mcp::jobs::reset_marker_registration_for_test();
+        crate::claude_json::set_json_sync_lock_timeout_override(None);
+        crate::claude_json::reset_last_synced();
+        crate::claude_json::reset_pending_strip_state();
         let tmp = tempfile::tempdir().expect("create home sandbox");
         let home = tmp.path().to_path_buf();
         crate::profile::set_home_override(home.clone());
@@ -225,6 +228,9 @@ impl Drop for HomeSandbox {
         crate::pricing::set_fetch_timeout_override(None);
         crate::status::set_fetch_timeout_override(None);
         crate::mcp::jobs::reset_marker_registration_for_test();
+        crate::claude_json::set_json_sync_lock_timeout_override(None);
+        crate::claude_json::reset_last_synced();
+        crate::claude_json::reset_pending_strip_state();
         // Restore the user's own value, after the joins above for the same
         // reason the home override is cleared there: a still-running worker that
         // sees it back resolves outside the sandbox.
@@ -1892,6 +1898,17 @@ pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
         }
     };
     file.set_modified(when).expect("set_modified");
+}
+
+/// Disarm [`crate::jsonsync::set_stamp_error_hook`] when the arming test
+/// returns or panics, so a forced stamp failure cannot leak into a later test's
+/// writer. Both modules that arm the seam share this one guard.
+pub(crate) struct StampErrorHookGuard;
+
+impl Drop for StampErrorHookGuard {
+    fn drop(&mut self) {
+        crate::jsonsync::set_stamp_error_hook(false);
+    }
 }
 
 /// `ERROR_SHARING_VIOLATION`. `std::io::ErrorKind` maps it to `Uncategorized`,

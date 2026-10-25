@@ -736,9 +736,13 @@ fn the_store_stamp_releases_the_scope_lock_before_the_state_flock() {
         // scope lock first; the mutated code still holds it here.
         std::thread::sleep(std::time::Duration::from_millis(500));
         let file = crate::profile::open_state_file(&records_lock_thread).expect("open scope lock");
-        let scope_free =
-            crate::lock::lock_file_with_timeout(&file, std::time::Duration::from_millis(1_000))
-                .is_ok();
+        let scope_free = crate::lock::lock_file_with_timeout(
+            &file,
+            std::time::Duration::from_millis(1_000),
+            |_| anyhow::anyhow!("scope lock held"),
+            "failed to acquire the scope lock",
+        )
+        .is_ok();
         probe_tx.send(scope_free).expect("signal probe");
         drop(held);
     });

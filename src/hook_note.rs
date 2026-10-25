@@ -919,7 +919,18 @@ impl ScopeLock {
             let dir = records_dir().ok()?;
             crate::profile::mkdir_700(&dir).ok()?;
             let file = crate::profile::open_state_file(&dir.join(".lock")).ok()?;
-            if let Err(e) = crate::lock::lock_file_with_timeout(&file, wait) {
+            if let Err(e) = crate::lock::lock_file_with_timeout(
+                &file,
+                wait,
+                |waited| {
+                    anyhow::anyhow!(
+                        "timed out after {:.0}s acquiring the scope lock; another clauth \
+                         process or thread holds ~/.clauth/conversations/.lock",
+                        waited.as_secs_f64()
+                    )
+                },
+                "failed to acquire the scope lock",
+            ) {
                 // Never swallowed: proceeding unlocked is duplicate notes
                 // coming back, and without this the only diagnostic that
                 // exists is discarded and the degradation is silent.

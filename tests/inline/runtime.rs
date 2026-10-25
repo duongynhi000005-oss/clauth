@@ -5529,11 +5529,12 @@ fn a_timed_out_rotation_wait_leaves_no_rank_behind() {
     });
 }
 
-/// The FLOOR, pinned as a LITERAL rather than re-derived from the three constants it
+/// The FLOOR, pinned as a LITERAL rather than re-derived from the four constants it
 /// adds: an assertion keyed on those tracks any re-tune silently, and this number
 /// is a claim about how long a healthy holder spends — 19 s of the two deadlines a
 /// token call carries, plus 20 s for a macOS Keychain mirror's two `security`
-/// invocations, plus 20 s for the session-start Keychain seed's shared budget.
+/// invocations, plus 20 s for the session-start Keychain seed's shared budget,
+/// plus 10 s for the `.claude.json` seed's healthy sync-lock wait.
 /// The token term bounds no phase of its call — the constant's own
 /// doc carries the measurement — while the keychain terms do bound their legs;
 /// all are what a HEALTHY holder fits inside, which is the floor's whole claim. Moving any term must red this and force the claim to be re-made
@@ -5542,9 +5543,10 @@ fn a_timed_out_rotation_wait_leaves_no_rank_behind() {
 fn the_rotation_deadline_outlasts_a_healthy_holders_two_slow_legs() {
     assert_eq!(
         crate::runtime::ROTATION_LOCK_TIMEOUT,
-        Duration::from_secs(59),
+        Duration::from_secs(69),
         "the session-start wait must outlast a healthy rotation's token call, its \
-         macOS Keychain mirror, and a macOS session-start Keychain seed"
+         macOS Keychain mirror, a macOS session-start Keychain seed, and the \
+         `.claude.json` seed's healthy sync-lock wait"
     );
 }
 
@@ -16426,4 +16428,626 @@ fn a_background_holder_converges_and_refuses_a_cross_account_swap() {
         );
         assert_eq!(swap.member(), "fixed-a", "the refusal moved nothing");
     });
+}
+
+/// A fresh session's seed copies home's bytes into a new runtime tree while a
+/// sibling runtime copy holds a newer Claude Code write no pass has propagated
+/// yet: the seed's copy is stamped at the floor, so it cannot outrank that
+/// write, and the next pass keeps it and the new copy converges on it.
+#[test]
+fn a_fresh_seed_never_outranks_a_siblings_unpropagated_write() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let global = h.join(".claude.json");
+    let r1 = seed_test_runtime(&h, "p1", "runtime-4242-0").join(".claude.json");
+    let r2dir = seed_test_runtime(&h, "p2", "runtime-4242-1");
+    fs::create_dir_all(r1.parent().expect("has parent")).expect("mkdir");
+    fs::create_dir_all(&r2dir).expect("mkdir");
+    fs::create_dir_all(h.join(".claude")).expect("mkdir");
+    let write = |p: &std::path::Path, v: serde_json::Value| {
+        fs::write(p, serde_json::to_vec_pretty(&v).expect("serialize")).expect("write");
+    };
+    write(
+        &global,
+        serde_json::json!({"numStartups": 2, "oauthAccount": {"emailAddress": "g@x"}}),
+    );
+    write(
+        &r1,
+        serde_json::json!({"numStartups": 3, "ccR1": true, "oauthAccount": {"emailAddress": "r1@x"}}),
+    );
+    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
+    set_mtime(&global, t(10));
+    set_mtime(&r1, t(20));
+
+    seed_claude_json(&r2dir, &h.join(".claude")).expect("seed");
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let read = |p: &std::path::Path| {
+        serde_json::from_slice::<serde_json::Value>(&fs::read(p).expect("read")).expect("parse")
+    };
+    assert_eq!(
+        read(&r1),
+        serde_json::json!({"numStartups": 3, "ccR1": true, "oauthAccount": {"emailAddress": "r1@x"}}),
+        "the sibling keeps its Claude Code write"
+    );
+    let r2 = read(&r2dir.join(".claude.json"));
+    assert_eq!(
+        r2["numStartups"],
+        serde_json::json!(3),
+        "the seed converges on it"
+    );
+    assert_eq!(
+        r2["ccR1"],
+        serde_json::json!(true),
+        "the seed converges on it"
+    );
+    assert_eq!(
+        read(&global)["ccR1"],
+        serde_json::json!(true),
+        "home converges on it"
+    );
+}
+
+fn seed_test_runtime(home: &std::path::Path, profile: &str, runtime: &str) -> std::path::PathBuf {
+    home.join(".clauth")
+        .join("profiles")
+        .join(profile)
+        .join(runtime)
+}
+
+fn seed_test_doc(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).expect("read")).expect("parse")
+}
+
+/// Home made into clauth's echo of a runtime write at t10 (the first pass), and
+/// a sibling holding a newer unpropagated Claude Code write at t20. Returns
+/// `(global, r1, r2, r3dir)`; `r3dir` is the tree the seed under test fills.
+fn seed_from_echo_home(
+    h: &std::path::Path,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let global = h.join(".claude.json");
+    let r1 = seed_test_runtime(h, "p1", "runtime-4242-0").join(".claude.json");
+    let r2 = seed_test_runtime(h, "p2", "runtime-4242-1").join(".claude.json");
+    let r3dir = seed_test_runtime(h, "p3", "runtime-4242-2");
+    fs::create_dir_all(r1.parent().expect("has parent")).expect("mkdir");
+    fs::create_dir_all(r2.parent().expect("has parent")).expect("mkdir");
+    fs::create_dir_all(&r3dir).expect("mkdir");
+    fs::create_dir_all(h.join(".claude")).expect("mkdir");
+    let write = |p: &std::path::Path, v: serde_json::Value| {
+        fs::write(p, serde_json::to_vec_pretty(&v).expect("serialize")).expect("write");
+    };
+    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
+    write(&global, serde_json::json!({"numStartups": 1}));
+    write(&r1, serde_json::json!({"numStartups": 2, "ccR1": true}));
+    set_mtime(&global, t(5));
+    set_mtime(&r1, t(10));
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("first pass makes home an echo");
+    write(&r2, serde_json::json!({"numStartups": 3, "ccR2": true}));
+    set_mtime(&r2, t(20));
+    (global, r1, r2, r3dir)
+}
+
+fn assert_every_copy_keeps_the_siblings_write(copies: &[(&str, &std::path::Path)]) {
+    for (name, path) in copies {
+        let doc = seed_test_doc(path);
+        assert_eq!(
+            doc["ccR2"],
+            serde_json::json!(true),
+            "{name} keeps the sibling's Claude Code write"
+        );
+        assert_eq!(
+            doc["numStartups"],
+            serde_json::json!(3),
+            "{name} keeps the sibling's Claude Code write"
+        );
+    }
+}
+
+/// Home is clauth's own echo (a fresh mtime carrying a t10 write) when a new
+/// tree is seeded: the seed carries home's rank of t10, never home's fresh
+/// mtime, so a sibling's unpropagated t20 write still wins the next pass.
+#[test]
+fn a_seed_from_an_echo_home_never_outranks_a_siblings_newer_write() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let (global, r1, r2, r3dir) = seed_from_echo_home(&h);
+
+    seed_claude_json(&r3dir, &h.join(".claude")).expect("seed");
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let r3 = r3dir.join(".claude.json");
+    assert_every_copy_keeps_the_siblings_write(&[
+        ("home", &global),
+        ("r1", &r1),
+        ("r2", &r2),
+        ("the seeded copy", &r3),
+    ]);
+}
+
+struct SeedPreLockHookGuard;
+
+impl Drop for SeedPreLockHookGuard {
+    fn drop(&mut self) {
+        crate::runtime::set_seed_pre_lock_hook(None);
+    }
+}
+
+/// A merge that rewrites home just before the seed takes the sync lock is the
+/// home the seed copies: the seed reads home's bytes and rank under the lock,
+/// so the seeded copy never carries a rank newer than the write its bytes hold.
+#[test]
+fn a_seed_waiting_on_a_merge_reads_home_after_it() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let (global, r1, r2, r3dir) = seed_from_echo_home(&h);
+
+    crate::runtime::set_seed_pre_lock_hook(Some(Box::new(|| {
+        let paths = crate::claude_json::known_paths().expect("paths");
+        crate::claude_json::merge_paths(&paths).expect("a merge right before the seed's lock");
+    })));
+    let guard = SeedPreLockHookGuard;
+    seed_claude_json(&r3dir, &h.join(".claude")).expect("seed");
+    drop(guard);
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let r3 = r3dir.join(".claude.json");
+    assert_every_copy_keeps_the_siblings_write(&[
+        ("home", &global),
+        ("r1", &r1),
+        ("r2", &r2),
+        ("the seeded copy", &r3),
+    ]);
+}
+
+/// A tree path spelled with a doubled separator names the same copy the sync
+/// lists: the seed's record entry still matches it, so the next pass reads the
+/// copy as the echo of home's carried rank, never as a file of its own.
+#[test]
+fn a_seed_into_a_differently_spelled_path_still_matches_its_record() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let (global, r1, r2, r3dir) = seed_from_echo_home(&h);
+    let sep = std::path::MAIN_SEPARATOR;
+    let doubled = std::path::PathBuf::from(format!(
+        "{}{sep}{sep}{}",
+        r3dir.parent().expect("has parent").display(),
+        r3dir.file_name().expect("has name").to_string_lossy()
+    ));
+    assert_eq!(doubled, r3dir, "the two spellings name one path");
+
+    seed_claude_json(&doubled, &h.join(".claude")).expect("seed");
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let r3 = r3dir.join(".claude.json");
+    assert_every_copy_keeps_the_siblings_write(&[
+        ("home", &global),
+        ("r1", &r1),
+        ("r2", &r2),
+        ("the seeded copy", &r3),
+    ]);
+}
+
+/// A seed holding the sync lock records the copy it wrote: one entry naming the
+/// seeded copy (a doubled-separator spelling of its tree included) at the copy's
+/// own mtime and size, carrying the rank of the t10 Claude Code write home
+/// echoes, so the next merge reads the copy as an echo of that write.
+#[test]
+fn a_seed_records_its_copy_at_homes_carried_rank() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let (_global, _r1, _r2, r3dir) = seed_from_echo_home(&h);
+    let sep = std::path::MAIN_SEPARATOR;
+    let doubled = std::path::PathBuf::from(format!(
+        "{}{sep}{sep}{}",
+        r3dir.parent().expect("has parent").display(),
+        r3dir.file_name().expect("has name").to_string_lossy()
+    ));
+
+    seed_claude_json(&doubled, &h.join(".claude")).expect("seed");
+
+    let r3 = r3dir.join(".claude.json");
+    let meta = fs::metadata(&r3).expect("the seeded copy");
+    let since = meta
+        .modified()
+        .expect("mtime")
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("after the epoch");
+    let record = crate::claude_json::written_record_path().expect("record path");
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(&record).expect("read the record"))
+            .expect("parse the record");
+    let named: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| {
+            e["path"]
+                .as_str()
+                .is_some_and(|p| std::path::Path::new(p) == r3)
+        })
+        .collect();
+    assert_eq!(named.len(), 1, "one record entry names the seeded copy");
+    let entry = named[0];
+    assert_eq!(entry["size"], serde_json::json!(meta.len()), "its size");
+    assert_eq!(
+        entry["mtime_secs"],
+        serde_json::json!(since.as_secs()),
+        "its mtime"
+    );
+    assert_eq!(
+        entry["mtime_nanos"],
+        serde_json::json!(since.subsec_nanos()),
+        "its mtime"
+    );
+    assert_eq!(
+        entry["rank_secs"],
+        serde_json::json!(1_700_000_010_i64),
+        "the rank of the write home echoes"
+    );
+    assert_eq!(entry["rank_nanos"], serde_json::json!(0), "that rank");
+}
+
+/// Every seed stamps its copy at 1980-01-02T00:00:00Z, recorded or not: below
+/// every Claude Code write, and inside the date range FAT and exFAT store.
+#[test]
+fn every_seed_stamps_its_copy_at_the_fat_floor() {
+    // 3653 days from 1970-01-01 to 1980-01-02 (two leap days, 1972 and 1976).
+    let floor = SystemTime::UNIX_EPOCH + Duration::from_secs(3_653 * 86_400);
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let (_global, _r1, _r2, r3dir) = seed_from_echo_home(&h);
+
+    seed_claude_json(&r3dir, &h.join(".claude")).expect("recorded seed");
+    let recorded = fs::metadata(r3dir.join(".claude.json"))
+        .expect("the recorded seed's copy")
+        .modified()
+        .expect("mtime");
+    assert_eq!(recorded, floor, "the recorded seed's stamp");
+
+    let r4dir = seed_test_runtime(&h, "p4", "runtime-4242-3");
+    fs::create_dir_all(&r4dir).expect("mkdir");
+    let lock = h.join(".clauth").join(".claude-json-sync.lock");
+    let _ = fs::remove_file(&lock);
+    fs::create_dir_all(&lock).expect("a directory where the lock file goes");
+    seed_claude_json(&r4dir, &h.join(".claude")).expect("unrecorded seed");
+    fs::remove_dir(&lock).expect("clear the lock stand-in");
+    let unrecorded = fs::metadata(r4dir.join(".claude.json"))
+        .expect("the unrecorded seed's copy")
+        .modified()
+        .expect("mtime");
+    assert_eq!(unrecorded, floor, "the unrecorded seed's stamp");
+}
+
+/// Holds the [`crate::testutil::UnwritableDir`] the seed's pre-lock seam arms,
+/// so the seam (a `Fn`, not `FnOnce`) can arm it and the test can restore it
+/// after the acquire fails.
+static SEED_FAIL_GUARD: std::sync::Mutex<Option<crate::testutil::UnwritableDir>> =
+    std::sync::Mutex::new(None);
+
+/// An unrecorded seed (the sync lock could not be opened) writes only home's
+/// bytes and stamps its copy at the floor, so a sibling's newer unpropagated
+/// write wins the next pass instead of being overwritten by the seed.
+#[test]
+fn an_unrecorded_seed_never_outranks_a_siblings_newer_write() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let global = h.join(".claude.json");
+    let r1 = seed_test_runtime(&h, "p1", "runtime-4242-0").join(".claude.json");
+    let r2dir = seed_test_runtime(&h, "p2", "runtime-4242-1");
+    fs::create_dir_all(r1.parent().expect("has parent")).expect("mkdir");
+    fs::create_dir_all(&r2dir).expect("mkdir");
+    fs::create_dir_all(h.join(".claude")).expect("mkdir");
+    let write = |p: &std::path::Path, v: serde_json::Value| {
+        fs::write(p, serde_json::to_vec_pretty(&v).expect("serialize")).expect("write");
+    };
+    write(
+        &global,
+        serde_json::json!({"numStartups": 2, "oauthAccount": {"emailAddress": "g@x"}}),
+    );
+    write(
+        &r1,
+        serde_json::json!({"numStartups": 3, "ccR1": true, "oauthAccount": {"emailAddress": "r1@x"}}),
+    );
+    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
+    set_mtime(&global, t(10));
+    set_mtime(&r1, t(20));
+    // A directory where the sync-lock file goes makes the seed's lock open fail,
+    // so the seed runs unrecorded — the path the unrecorded-seed mtime covers.
+    let lock = h.join(".clauth").join(".claude-json-sync.lock");
+    fs::create_dir_all(&lock).expect("a directory where the lock file goes");
+
+    seed_claude_json(&r2dir, &h.join(".claude")).expect("seed");
+    fs::remove_dir(&lock).expect("clear the lock stand-in");
+
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let read = |p: &std::path::Path| {
+        serde_json::from_slice::<serde_json::Value>(&fs::read(p).expect("read")).expect("parse")
+    };
+    assert_eq!(
+        read(&r1),
+        serde_json::json!({"numStartups": 3, "ccR1": true, "oauthAccount": {"emailAddress": "r1@x"}}),
+        "the sibling keeps its Claude Code write"
+    );
+    for (name, path) in [
+        ("home", &global),
+        ("the seeded copy", &r2dir.join(".claude.json")),
+    ] {
+        let doc = read(path);
+        assert_eq!(
+            doc["numStartups"],
+            serde_json::json!(3),
+            "{name} converges on the sibling's write"
+        );
+        assert_eq!(
+            doc["ccR1"],
+            serde_json::json!(true),
+            "{name} converges on the sibling's write"
+        );
+    }
+}
+
+/// A failed seed (the runtime dir refuses the seed's write) fails the start and
+/// leaves no live row and no marker: the start's own registration is released,
+/// not left half-done. Forced Fake transport so the runtime path is the fixed
+/// bare stem the seed's pre-lock seam can make unwritable.
+#[test]
+fn a_failed_seed_fails_the_start_without_a_live_row_or_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            fs::write(tmp.path().join(".claude.json"), b"{\"numStartups\": 2}")
+                .expect("write global .claude.json");
+            let profile = configured_profile("seedfail");
+            let runtime = tmp
+                .path()
+                .join(".clauth")
+                .join("profiles")
+                .join("seedfail")
+                .join("runtime");
+
+            *SEED_FAIL_GUARD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            crate::runtime::set_seed_pre_lock_hook(Some(Box::new(move || {
+                *SEED_FAIL_GUARD
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(crate::testutil::UnwritableDir::new(&runtime));
+            })));
+            let _hook_guard = SeedPreLockHookGuard;
+
+            let err =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .err()
+                    .expect("a failed seed must fail the start");
+            *SEED_FAIL_GUARD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            drop(_hook_guard);
+
+            assert!(
+                format!("{err:#}").contains("failed to seed"),
+                "the start names the seed failure, got: {err:#}"
+            );
+            assert!(
+                crate::live_sessions::list().is_empty(),
+                "a failed seed leaves no live row"
+            );
+            let profile_root = tmp.path().join(".clauth").join("profiles").join("seedfail");
+            let markers: usize = std::fs::read_dir(&profile_root)
+                .expect("read profile root")
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n == "sessions" || n.starts_with("sessions-"))
+                })
+                .map(|e| std::fs::read_dir(e.path()).map(|d| d.count()).unwrap_or(0))
+                .sum();
+            assert_eq!(markers, 0, "a failed seed leaves no marker");
+        });
+    });
+}
+
+/// A seed whose back-date stamp the filesystem refuses (the seam forces it)
+/// fails the start exactly as any failed seed: no live row, no marker, and no
+/// staged temp beside the copy. A refused stamp is a failed write, never a
+/// clamp to a fresh mtime that would outrank a sibling's newer Claude Code
+/// write.
+#[test]
+fn a_seed_whose_stamp_fails_fails_the_start_without_a_live_row_or_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            fs::write(tmp.path().join(".claude.json"), b"{\"numStartups\": 2}")
+                .expect("write global .claude.json");
+            let profile = configured_profile("seedstampfail");
+
+            crate::jsonsync::set_stamp_error_hook(true);
+            let _hook_guard = crate::testutil::StampErrorHookGuard;
+
+            let err =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .err()
+                    .expect("a seed whose stamp fails must fail the start");
+            drop(_hook_guard);
+
+            let profile_root = tmp
+                .path()
+                .join(".clauth")
+                .join("profiles")
+                .join("seedstampfail");
+            assert_eq!(
+                format!("{err:#}"),
+                format!(
+                    "failed to seed {}: test-forced stamp failure",
+                    profile_root.join("runtime").join(".claude.json").display()
+                ),
+                "the start names only the failed seed"
+            );
+            assert!(
+                crate::live_sessions::list().is_empty(),
+                "a failed seed leaves no live row"
+            );
+            let markers: usize = std::fs::read_dir(&profile_root)
+                .expect("read profile root")
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n == "sessions" || n.starts_with("sessions-"))
+                })
+                .map(|e| std::fs::read_dir(e.path()).map(|d| d.count()).unwrap_or(0))
+                .sum();
+            assert_eq!(markers, 0, "a failed seed leaves no marker");
+            let runtime_dir = profile_root.join("runtime");
+            let temps = std::fs::read_dir(&runtime_dir)
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .filter(|e| {
+                            e.file_name()
+                                .to_str()
+                                .is_some_and(|n| n.contains(".claude.json.tmp."))
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            assert_eq!(temps, 0, "a failed seed stamp leaves no staged temp");
+        });
+    });
+}
+
+/// An unrecorded seed that lands while a merge has rewritten home but not yet
+/// persisted its record never outranks a sibling's newer Claude Code write:
+/// the seeded copy only holds home's bytes, so it never needs to win a pass.
+#[test]
+fn an_unrecorded_seed_during_a_merge_never_outranks_a_siblings_write() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let global = h.join(".claude.json");
+    let r1 = seed_test_runtime(&h, "p1", "runtime-4242-0").join(".claude.json");
+    let r2 = seed_test_runtime(&h, "p2", "runtime-4242-1").join(".claude.json");
+    let r4 = seed_test_runtime(&h, "p4", "runtime-4242-3").join(".claude.json");
+    let r3dir = seed_test_runtime(&h, "p3", "runtime-4242-2");
+    for p in [&r1, &r2, &r4] {
+        fs::create_dir_all(p.parent().expect("has parent")).expect("mkdir");
+    }
+    fs::create_dir_all(&r3dir).expect("mkdir");
+    fs::create_dir_all(h.join(".claude")).expect("mkdir");
+    let write = |p: &std::path::Path, v: serde_json::Value| {
+        fs::write(p, serde_json::to_vec_pretty(&v).expect("serialize")).expect("write");
+    };
+    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
+    write(&global, serde_json::json!({"numStartups": 1}));
+    write(&r1, serde_json::json!({"numStartups": 2}));
+    write(&r2, serde_json::json!({"numStartups": 3, "ccR2": true}));
+    write(&r4, serde_json::json!({"numStartups": 1}));
+    set_mtime(&global, t(5));
+    set_mtime(&r1, t(10));
+    set_mtime(&r2, t(20));
+    set_mtime(&r4, t(3));
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("a merge makes home an echo of r2");
+
+    write(
+        &r4,
+        serde_json::json!({"numStartups": 9, "ccR2": true, "ccR4": true}),
+    );
+    set_mtime(&r4, t(30));
+
+    // Mid-merge: home already rewritten, the record not yet persisted, and the
+    // seed's lock unavailable, so it seeds unrecorded.
+    let record = crate::claude_json::written_record_path().expect("record path");
+    let parked = h.join("record-parked");
+    fs::rename(&record, &parked).expect("park the record");
+    let lock = h.join(".clauth").join(".claude-json-sync.lock");
+    let _ = fs::remove_file(&lock);
+    fs::create_dir_all(&lock).expect("a directory where the lock file goes");
+    seed_claude_json(&r3dir, &h.join(".claude")).expect("seed");
+    fs::remove_dir(&lock).expect("clear the lock stand-in");
+    fs::rename(&parked, &record).expect("the merge persists its record");
+
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let r3 = r3dir.join(".claude.json");
+    for (name, path) in [
+        ("home", &global),
+        ("r1", &r1),
+        ("r2", &r2),
+        ("r4", &r4),
+        ("the seeded copy", &r3),
+    ] {
+        let doc = seed_test_doc(path);
+        assert_eq!(
+            doc["ccR4"],
+            serde_json::json!(true),
+            "{name} keeps the sibling's Claude Code write"
+        );
+        assert_eq!(
+            doc["numStartups"],
+            serde_json::json!(9),
+            "{name} keeps the sibling's Claude Code write"
+        );
+    }
+}
+
+/// A seed that takes the lock but cannot persist its record never outranks a
+/// sibling's newer Claude Code write: the seeded copy holds only home's bytes,
+/// so it never needs to win a pass, recorded or not.
+#[test]
+fn a_seed_whose_record_write_fails_never_outranks_a_siblings_write() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let global = h.join(".claude.json");
+    let r1 = seed_test_runtime(&h, "p1", "runtime-4242-0").join(".claude.json");
+    let r2 = seed_test_runtime(&h, "p2", "runtime-4242-1").join(".claude.json");
+    let r3dir = seed_test_runtime(&h, "p3", "runtime-4242-2");
+    for p in [&r1, &r2] {
+        fs::create_dir_all(p.parent().expect("has parent")).expect("mkdir");
+    }
+    fs::create_dir_all(&r3dir).expect("mkdir");
+    fs::create_dir_all(h.join(".claude")).expect("mkdir");
+    let write = |p: &std::path::Path, v: serde_json::Value| {
+        fs::write(p, serde_json::to_vec_pretty(&v).expect("serialize")).expect("write");
+    };
+    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + s);
+    write(&global, serde_json::json!({"numStartups": 1}));
+    write(&r1, serde_json::json!({"numStartups": 2}));
+    set_mtime(&global, t(5));
+    set_mtime(&r1, t(10));
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("a pass creates the lock and the record");
+    write(&r2, serde_json::json!({"numStartups": 3, "ccR2": true}));
+    set_mtime(&r2, t(20));
+
+    {
+        // The lock file exists, so the seed still takes the lock; the record's
+        // temp file cannot be created, so its record write fails.
+        let _clauth = crate::testutil::UnwritableDir::new(&h.join(".clauth"));
+        seed_claude_json(&r3dir, &h.join(".claude")).expect("seed");
+    }
+
+    crate::claude_json::reset_last_synced();
+    crate::claude_json::sync_once().expect("next pass");
+
+    let r3 = r3dir.join(".claude.json");
+    assert_every_copy_keeps_the_siblings_write(&[
+        ("home", &global),
+        ("r1", &r1),
+        ("r2", &r2),
+        ("the seeded copy", &r3),
+    ]);
 }
