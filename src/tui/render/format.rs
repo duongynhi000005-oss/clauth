@@ -46,6 +46,23 @@ pub(super) fn prefix_in_cells(value: &str, budget: usize) -> (String, usize) {
     (out, used)
 }
 
+/// Drop each trailing grapheme whose base character is `…`, so a cut that kept
+/// an ellipsis (with a combining mark or not) never doubles it with the
+/// always-on `…`. Walks the same `styled_graphemes` source as
+/// [`prefix_in_cells`], whose output feeds it, so no grapheme is re-segmented;
+/// the kept symbols are re-concatenated, never indexed back into the raw
+/// string, so a control grapheme the walk drops cannot shift the cut.
+pub(super) fn trim_trailing_ellipsis_graphemes(name: &str) -> String {
+    let mut graphemes: Vec<String> = Span::raw(name)
+        .styled_graphemes(Style::default())
+        .map(|g| g.symbol.to_owned())
+        .collect();
+    while graphemes.last().is_some_and(|g| g.starts_with('\u{2026}')) {
+        graphemes.pop();
+    }
+    graphemes.join("")
+}
+
 /// The graphemes of `value` in reverse order, joined (control graphemes
 /// dropped, matching the renderer).
 fn reversed_graphemes(value: &str) -> String {

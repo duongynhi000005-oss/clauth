@@ -2173,6 +2173,59 @@ fn the_save_cue_cuts_a_name_to_one_ellipsis() {
     check_cue(&app, "abc\u{2026}", 34);
 }
 
+/// A cut that keeps a `…` carrying a combining mark trims that whole
+/// grapheme, so the cue still ends in exactly one `…`.
+#[test]
+fn the_save_cue_trims_a_kept_ellipsis_grapheme_whole() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.shunt_save = Some(cue_save(ShuntSaveKey::Remove(ShuntEntryKey::Upstream {
+        name: "abcd\u{2026}\u{301}qqqq\u{2026}".into(),
+        occurrence: 0,
+    })));
+    app.exit_wait = true;
+    check_cue(&app, "abcd", 34);
+}
+
+/// A name holding a prose marker code point shows it escaped, and the cells
+/// after it keep the cue's own message style instead of a key's.
+#[test]
+fn the_save_cue_escapes_a_prose_marker_in_a_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.shunt_save = Some(cue_save(ShuntSaveKey::Remove(ShuntEntryKey::Upstream {
+        name: "x\u{E000}y".into(),
+        occurrence: 0,
+    })));
+    app.exit_wait = true;
+    check_cue(&app, "x\\u{e000}y", 80);
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("backend");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("draw");
+    let buf = term.backend().buffer();
+    let row = &crate::testutil::buffer_rows(buf)[23];
+    let col = row
+        .chars()
+        .position(|c| c == 'y')
+        .expect("the name's `y` on the cue row");
+    let cell = &buf[(col as u16, 23)];
+    assert_eq!(
+        (
+            cell.fg,
+            cell.modifier.contains(ratatui::style::Modifier::BOLD)
+        ),
+        (crate::tui::theme::text_dim_color(), false),
+        "the cell after the escaped marker keeps the message style"
+    );
+}
+
 /// A route remove whose config view is unreadable names the kind word
 /// `route`, never `route N` (no card row reads that way).
 #[test]

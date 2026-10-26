@@ -18,7 +18,9 @@ use super::super::app::{
     pane_state, token_model_count,
 };
 use super::super::theme;
-use super::format::{grapheme_cells, prefix_in_cells, spinner_frame, truncate};
+use super::format::{
+    grapheme_cells, prefix_in_cells, spinner_frame, trim_trailing_ellipsis_graphemes, truncate,
+};
 use super::prose;
 use super::services::{field_label, route_label};
 
@@ -138,7 +140,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // dismiss it. It outranks any stored alert.
     if app.exit_wait || app.loss_pending == Some(LossWarningTarget::Quit) {
         let msg = save_cue(&saving_row_name(app), area.width);
-        draw_alert(frame, area, "i ", theme::info(), &msg);
+        draw_alert(frame, area, SAVE_CUE_LEADER, theme::info(), &msg);
         return;
     }
 
@@ -1121,25 +1123,28 @@ fn entry_display_name(app: &App, key: &ShuntEntryKey) -> String {
     }
 }
 
+/// The info leader the save cue and its width measurement share, so the two
+/// can't drift apart.
+const SAVE_CUE_LEADER: &str = "i ";
+
 /// The save cue's message: `saving {row}… · ⌃c ⌃c quit now`, the row name cut
 /// (grapheme-safe, one `…`) so the leader and `· ⌃c ⌃c quit now` stay whole
-/// down to the width floor. The `⌃c ⌃c` run is one key span. The name's budget
-/// is the cells the copy itself spends around it — the `i ` leader plus the
-/// same message with an empty name, measured — so a copy edit re-derives the
-/// cut instead of drifting a hand-counted fixed.
+/// down to the width floor. The `⌃c ⌃c` run is one key span. One closure holds
+/// the copy, measured with an empty name to set the name's budget and rendered
+/// with the cut name, so the measurement and the message cannot drift.
 fn save_cue(row: &str, width: u16) -> String {
     let key = prose::key("\u{2303}c \u{2303}c");
-    let fixed = grapheme_cells("i ")
-        + grapheme_cells(&prose::plain(&format!("saving \u{2026} · {key} quit now")));
+    let cue = |name: &str| format!("saving {name}\u{2026} · {key} quit now");
+    let fixed = grapheme_cells(SAVE_CUE_LEADER) + grapheme_cells(&prose::plain(&cue("")));
     let budget = (width as usize).saturating_sub(fixed);
     let mut name = prefix_in_cells(row, budget).0;
     // A cut that stops right after a `…` inside the name would double it with
     // the always-on `…`; trim a kept trailing `…` only when the cut dropped
     // something, so an uncut name keeps its own characters.
     if grapheme_cells(&name) < grapheme_cells(row) {
-        name = name.trim_end_matches('\u{2026}').to_string();
+        name = trim_trailing_ellipsis_graphemes(&name);
     }
-    format!("saving {name}\u{2026} · {key} quit now")
+    cue(&name)
 }
 
 /// Render a footer alert in place of the hint bar: a semantic leader glyph

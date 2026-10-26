@@ -1054,6 +1054,24 @@ fn toast_app(kind: crate::tui::app::ToastKind, body: String) -> App {
     app
 }
 
+/// A toast detail naming a prose marker code point (a failure's escaped
+/// error text) shows it escaped, and the text after it stays plain detail.
+#[test]
+fn a_toast_escapes_a_prose_marker_in_its_detail() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{ToastKind, escape_control};
+    let app = toast_app(
+        ToastKind::Danger,
+        format!("save failed\n{}", escape_control("x\u{E000}y z")),
+    );
+    let (_, rows) = toast_rows(&app);
+    assert_eq!(
+        rows,
+        vec!["┃ save failed".to_string(), "┃ x\\u{e000}y z".to_string()],
+        "the marker renders escaped"
+    );
+}
+
 /// The column a toast whose widest shown row is `content` cells wide starts
 /// at: the stack ends 2 cells in from the 80-cell frame, and the toast is
 /// `┃ ` + content + 1 pad cell.

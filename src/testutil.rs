@@ -1276,6 +1276,45 @@ esac
 exit 0
 "#;
 
+/// The fake `claude` for the install-failure producer pin: every command the
+/// install lifecycle runs succeeds, except `plugin install`, which prints a
+/// prose marker to stderr and exits nonzero so the lifecycle error carries the
+/// marker into the `install failed` toast.
+#[cfg(unix)]
+const FAKE_CLAUDE_FAILING_SHIM: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CLAUDE_SHIM_LOG"
+printf '%s\t%s\n' "${CLAUDE_CONFIG_DIR-}" "$*" >> "$CLAUDE_SHIM_LOG.spawns"
+case "$1" in
+  --version)
+    echo "2.1.220 (Claude Code)"
+    ;;
+  plugin)
+    case "$2" in
+      list)
+        if [ "$3" = "--json" ]; then
+          echo '[]'
+        fi
+        ;;
+      marketplace)
+        case "$3" in
+          list)
+            echo '[]'
+            ;;
+          add)
+            printf '%s\n' "$4" > "$CLAUDE_SHIM_MKT_STATE"
+            ;;
+        esac
+        ;;
+      install)
+        printf 'boom\356\200\200\n' >&2
+        exit 7
+        ;;
+    esac
+    ;;
+esac
+exit 0
+"#;
+
 /// A stateful fake `claude` on a PATH prefix, plus the hermetic env pins the
 /// agentgear lifecycle needs (home, data dir, runtime dir, the shim's own
 /// vars). It
@@ -1306,21 +1345,28 @@ impl<'a> FakeClaude<'a> {
     /// own PATH.
     pub(crate) fn new(home: &'a HomeSandbox) -> Self {
         let prev_path = std::env::var_os("PATH").expect("PATH is set");
-        Self::stage(home, &prev_path, true)
+        Self::stage(home, &prev_path, Some(FAKE_CLAUDE_SHIM))
     }
 
     /// The same pins with a claude-free PATH (empty shim dir + a minimal
     /// tail), so agentgear's claude backend is undetected and the lifecycle
     /// converges to `NoOp` without spawning anything.
     pub(crate) fn new_without_claude(home: &'a HomeSandbox) -> Self {
-        Self::stage(home, std::ffi::OsStr::new("/usr/bin:/bin"), false)
+        Self::stage(home, std::ffi::OsStr::new("/usr/bin:/bin"), None)
+    }
+
+    /// The success pins with a shim whose `plugin install` fails, so the
+    /// install failure's own error carries the marker into the toast.
+    pub(crate) fn new_failing_install(home: &'a HomeSandbox) -> Self {
+        let prev_path = std::env::var_os("PATH").expect("PATH is set");
+        Self::stage(home, &prev_path, Some(FAKE_CLAUDE_FAILING_SHIM))
     }
 
     #[expect(
         unsafe_code,
         reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
     )]
-    fn stage(home: &'a HomeSandbox, path_tail: &std::ffi::OsStr, with_shim: bool) -> Self {
+    fn stage(home: &'a HomeSandbox, path_tail: &std::ffi::OsStr, shim: Option<&str>) -> Self {
         let tmp = tempfile::tempdir_in(home.home()).expect("shim dir");
         let data = tmp.path().join("data");
         let run = tmp.path().join("run");
@@ -1328,17 +1374,19 @@ impl<'a> FakeClaude<'a> {
         for dir in [&data, &run, &tree] {
             std::fs::create_dir_all(dir).expect("create dir");
         }
-        if with_shim {
-            let shim = tmp.path().join("claude");
+        if let Some(shim) = shim {
+            let shim_path = tmp.path().join("claude");
             std::fs::write(
-                &shim,
-                FAKE_CLAUDE_SHIM.replace("@VERSION@", env!("CARGO_PKG_VERSION")),
+                &shim_path,
+                shim.replace("@VERSION@", env!("CARGO_PKG_VERSION")),
             )
             .expect("write shim");
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&shim).expect("shim meta").permissions();
+            let mut perms = std::fs::metadata(&shim_path)
+                .expect("shim meta")
+                .permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&shim, perms).expect("chmod shim");
+            std::fs::set_permissions(&shim_path, perms).expect("chmod shim");
         }
 
         let pin = |key: &str, value: &std::path::Path| {

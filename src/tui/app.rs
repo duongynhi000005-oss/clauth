@@ -9667,7 +9667,10 @@ fn commit_note(app: &mut App) -> bool {
         }
         Err(e) => {
             app.note_editor = Some(editor);
-            app.toast(ToastKind::Danger, format!("couldn't save the note: {e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("couldn't save the note: {}", escape_control(&e.to_string())),
+            );
             false
         }
     }
@@ -11502,6 +11505,14 @@ fn stderr_display_lines(text: &str) -> Vec<String> {
     strip_ansi_csi(text).lines().map(escape_control).collect()
 }
 
+/// A danger toast body over a multi-line diagnostic: `title` on its own line,
+/// then each line of `diagnostic` ANSI-stripped and control-escaped, the lines
+/// kept apart with `\n` so the toast splits them into rows. Shared by the
+/// herdr heal and the plugin install failure toasts.
+fn diagnostic_toast_body(title: &str, diagnostic: &str) -> String {
+    format!("{title}\n{}", stderr_display_lines(diagnostic).join("\n"))
+}
+
 /// Strip ANSI CSI sequences (`ESC [ params/intermediates final`, params in
 /// `0x20..=0x3F`, final in `0x40..=0x7E`) from `text`, so the modal shows
 /// text, not terminal escape bytes. Any byte outside those ranges before the
@@ -11970,7 +11981,10 @@ fn commit_herdr_tag_edit(app: &mut App) -> bool {
         save_app_state(&cfg.state)
     };
     if let Err(e) = saved {
-        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        );
         return false;
     }
     app.rebaseline_and_forget(reload_fingerprint());
@@ -12063,7 +12077,7 @@ pub(crate) fn herdr_check(
 ) -> Check {
     let mut detail = Vec::new();
     let herdr_line = match &probe.version {
-        Some(version) => format!("herdr: {version}"),
+        Some(version) => format!("herdr: {}", escape_control(version)),
         None => "herdr: unknown".to_string(),
     };
 
@@ -12076,7 +12090,7 @@ pub(crate) fn herdr_check(
     let error_line = probe
         .error
         .as_ref()
-        .map(|error| format!("  {}", prose::mark_commands(error)));
+        .map(|error| format!("  {}", prose::mark_commands(&escape_control(error))));
     if error_line.is_some() {
         danger = true;
     }
@@ -12089,7 +12103,7 @@ pub(crate) fn herdr_check(
             danger = true;
         }
         if local && let Some(root) = &entry.plugin_root {
-            detail.push(format!("root: {root}"));
+            detail.push(format!("root: {}", escape_control(root)));
         }
         if !entry.enabled {
             warn = true;
@@ -12100,7 +12114,7 @@ pub(crate) fn herdr_check(
             detail.push("plugin: installed (github)".to_string());
         }
         for warning in &entry.warnings {
-            detail.push(format!("  {warning}"));
+            detail.push(format!("  {}", escape_control(warning)));
         }
         detail.push(herdr_line);
         detail.extend(error_line);
@@ -12108,7 +12122,7 @@ pub(crate) fn herdr_check(
             warn = true;
             detail.push(format!(
                 "plugin needs herdr {} or newer",
-                entry.min_herdr_version.as_deref().unwrap_or("unknown")
+                escape_control(entry.min_herdr_version.as_deref().unwrap_or("unknown"))
             ));
         }
 
@@ -12121,7 +12135,7 @@ pub(crate) fn herdr_check(
             }
             Some(c) => {
                 match &c.bound_key {
-                    Some(key) => detail.push(format!("key: {key}")),
+                    Some(key) => detail.push(format!("key: {}", escape_control(key))),
                     None => {
                         warn = true;
                         detail.push("key: not bound".to_string());
@@ -13047,6 +13061,10 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
         }
         ShuntActionOutcome::TokenRemoveRefused { profile, sentence } => {
             app.services.shunt_save = None;
+            // The sentence can carry config text off shunt's files, so it is
+            // escaped once, before the arms split: the stored `└` line and the
+            // toast take the same value.
+            let sentence = escape_control(&sentence);
             // The refusal sits on the `└` line under the token row only while
             // that row is on the focused card — the Services tab, the detail
             // pane, the `shunt` row, and the focus still on the token row.
@@ -13058,10 +13076,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                     .shunt_token_refusal
                     .replace(Some((profile, sentence)));
             } else {
-                app.toast(
-                    ToastKind::Danger,
-                    format!("remove failed\n{}", escape_control(&sentence)),
-                );
+                app.toast(ToastKind::Danger, format!("remove failed\n{sentence}"));
             }
         }
         ShuntActionOutcome::TokenRemoveFailed { error } => {
@@ -16635,14 +16650,17 @@ fn run_admin_edit(
     }
 }
 
-/// Every slot string the detail renders goes through here. A control character
-/// or a bidi formatting character is spelled as its visible `\u{…}` form so an
-/// untrusted string off the feed or the record can neither inject into the
-/// terminal nor reorder a line; every other character passes through unchanged.
+/// Escapes an untrusted value for a detail line or toast slot: a control
+/// character, a bidi formatting character, or a prose marker code point is
+/// spelled as its visible `\u{…}` form so an untrusted string off the feed, a
+/// tool's stdout or stderr, or a record read off another program's file can
+/// neither inject into the terminal, reorder a line, nor style the cells after
+/// it; every other character passes through unchanged. Applied at the producer
+/// where the untrusted value enters the copy.
 pub(crate) fn escape_control(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_control() || crate::jobs_cli::reorders_display(c) {
+            if c.is_control() || crate::jobs_cli::reorders_display(c) || prose::is_marker(c) {
                 c.escape_default().to_string()
             } else {
                 c.to_string()
@@ -16733,31 +16751,37 @@ fn plugin_check(
                 .version
                 .as_deref()
                 .is_some_and(|installed| crate::update::is_newer(this_version, installed));
-        detail.push(format!("installed: yes ({})", scope.unwrap_or("?")));
+        detail.push(format!(
+            "installed: yes ({})",
+            escape_control(scope.unwrap_or("?"))
+        ));
         if let Some(version) = &record.version {
             detail.push(if outdated {
-                format!("version: {version} ({OUTDATED_PLUGIN_MARK} {this_version})")
+                format!(
+                    "version: {} ({OUTDATED_PLUGIN_MARK} {this_version})",
+                    escape_control(version)
+                )
             } else {
-                format!("version: {version}")
+                format!("version: {}", escape_control(version))
             });
         }
         if let Some(sha) = &record.git_commit_sha {
             detail.push(format!(
                 "commit: {}",
-                sha.chars().take(7).collect::<String>()
+                escape_control(&sha.chars().take(7).collect::<String>())
             ));
         }
         if let Some(at) = &record.installed_at {
             detail.push(format!(
                 "installed at: {}",
-                at.split('T').next().unwrap_or(at)
+                escape_control(at.split('T').next().unwrap_or(at))
             ));
         }
         if let Some(project) = &record.project_path {
-            detail.push(format!("project: {project}"));
+            detail.push(format!("project: {}", escape_control(project)));
         }
         if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
-            detail.push(format!("marketplace: {repo}"));
+            detail.push(format!("marketplace: {}", escape_control(repo)));
         }
         if outdated {
             let line = detail.len();
@@ -16791,7 +16815,7 @@ fn plugin_check(
             }
         ));
         if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
-            detail.push(format!("marketplace: {repo}"));
+            detail.push(format!("marketplace: {}", escape_control(repo)));
         }
         detail.push("installs at user scope".to_string());
         let line = detail.len();
@@ -16874,7 +16898,7 @@ fn plugin_check(
     // Claude Code version, then clauth on PATH + the data dir.
     detail.push(String::new());
     match &cc_version {
-        Some(Some(version)) => detail.push(format!("claude: {version}")),
+        Some(Some(version)) => detail.push(format!("claude: {}", escape_control(version))),
         Some(None) => {
             detail.push("claude: not found".to_string());
             detail.push("claude --version failed or claude is not on PATH".to_string());
@@ -18051,7 +18075,10 @@ fn commit_refresh_interval_edit(app: &mut App) -> bool {
         save_app_state(&cfg.state)
     };
     if let Err(e) = saved {
-        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        );
         return false;
     }
     app.rebaseline_and_forget(reload_fingerprint());
@@ -18110,7 +18137,10 @@ fn commit_context_nudge_edit(app: &mut App) -> bool {
         save_app_state(&cfg.state)
     };
     if let Err(e) = saved {
-        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        );
         return false;
     }
     app.rebaseline_and_forget(reload_fingerprint());
@@ -18194,7 +18224,10 @@ fn commit_weekly_threshold_edit(app: &mut App) -> bool {
         save_app_state(&cfg.state)
     };
     if let Err(e) = saved {
-        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        );
         return false;
     }
     app.rebaseline_and_forget(reload_fingerprint());
@@ -18668,7 +18701,10 @@ fn write_weekly_override(app: &mut App, name: &ProfileName, value: Option<f64>) 
         }
     };
     if let Some(e) = save_err {
-        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        );
         false
     } else {
         true
@@ -18708,7 +18744,10 @@ fn write_max_spend(app: &mut App, name: &ProfileName, value: f64) -> bool {
         }
     };
     if let Some(e) = save_err {
-        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        );
         false
     } else {
         true
@@ -18948,7 +18987,10 @@ fn write_threshold(app: &mut App, name: &ProfileName, value: f64) -> bool {
     {
         return true;
     }
-    app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+    app.toast(
+        ToastKind::Danger,
+        format!("save failed\n{}", escape_control(&e.to_string())),
+    );
     false
 }
 
@@ -19027,7 +19069,10 @@ fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
     };
     match failed {
         None => app.refresh_tokens(),
-        Some(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+        Some(e) => app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        ),
     }
 }
 
@@ -19109,7 +19154,10 @@ fn toggle_last_resort(app: &mut App) {
             }
             app.refresh_tokens();
         }
-        Outcome::SaveFailed(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+        Outcome::SaveFailed(e) => app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        ),
     }
 }
 
@@ -19184,7 +19232,10 @@ fn toggle_preferred(app: &mut App) {
             }
             app.refresh_tokens();
         }
-        Outcome::SaveFailed(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+        Outcome::SaveFailed(e) => app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        ),
     }
 }
 
@@ -24307,7 +24358,10 @@ fn toggle_auto_start(app: &mut App, name: &ProfileName) {
             app.refresh_tokens();
         }
         Outcome::SaveFailed(e) => {
-            app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("save failed\n{}", escape_control(&e.to_string())),
+            );
         }
     }
 }
@@ -25116,7 +25170,10 @@ fn store_rebind_digest(app: &mut App, digest: &str) {
             let mut cfg = app.config();
             cfg.state.preset_binds_offered = Some(digest.to_string());
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&e.to_string())),
+        ),
     }
 }
 
@@ -25229,11 +25286,17 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
             // lie, so the notes surface verbatim.
             app.toast(
                 ToastKind::Warning,
-                format!("herdr's config needs attention\n{}", notes.join("\n")),
+                format!(
+                    "herdr's config needs attention\n{}",
+                    stderr_display_lines(&notes.join("\n")).join("\n")
+                ),
             );
             recompute_services_checks(app, false, ShuntRefresh::Keep);
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("herdr config fix failed\n{e}")),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            diagnostic_toast_body("herdr config fix failed", &e.to_string()),
+        ),
     }
 }
 
@@ -25327,7 +25390,10 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                         format!("saved the login into '{name}', now active"),
                     );
                 }
-                Err(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+                Err(e) => app.toast(
+                    ToastKind::Danger,
+                    format!("save failed\n{}", escape_control(&e.to_string())),
+                ),
             }
         }
         ConfirmAction::Switch(name) => {
@@ -25446,7 +25512,10 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 // Reflect the fresh install in the rows without a version probe.
                 recompute_services_checks(app, false, ShuntRefresh::Keep);
             }
-            Err(e) => app.toast(ToastKind::Danger, format!("install failed\n{e}")),
+            Err(e) => app.toast(
+                ToastKind::Danger,
+                diagnostic_toast_body("install failed", &e.to_string()),
+            ),
         },
         ConfirmAction::BlankCredentials(name) => {
             let name = ProfileName::from(name);
@@ -26158,7 +26227,10 @@ fn apply_status_incidents(
             };
             if app.tab == Tab::Status {
                 let title = truncate(&incident.title, 40);
-                app.toast(severity, format!("new incident: {title}"));
+                app.toast(
+                    severity,
+                    format!("new incident: {}", escape_control(&title)),
+                );
             } else {
                 app.set_tab_activity(Tab::Status, severity);
             }

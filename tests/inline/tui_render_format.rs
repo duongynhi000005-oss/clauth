@@ -99,6 +99,19 @@ fn middle_truncate_budgets_display_cells_for_cjk() {
     );
 }
 
+// ── trailing-ellipsis grapheme trim ──────────────────────────────────────
+
+/// `trim_trailing_ellipsis_graphemes` re-concatenates the graphemes the render
+/// walk keeps, so a control grapheme the walk drops never shifts a byte cut:
+/// `"a\u{1}b…"` keeps `b`, `"\u{1}é…"` keeps `é`, and a plain name only loses
+/// its trailing `…`.
+#[test]
+fn trim_trailing_ellipsis_keeps_control_free_graphemes_whole() {
+    assert_eq!(trim_trailing_ellipsis_graphemes("a\u{1}b…"), "ab");
+    assert_eq!(trim_trailing_ellipsis_graphemes("\u{1}é…"), "é");
+    assert_eq!(trim_trailing_ellipsis_graphemes("abc…"), "abc");
+}
+
 /// A 2-cell glyph that does not fit the content budget leaves the `…` inside
 /// the column and the pad absorbs the straddle, so `fixed` renders exactly
 /// `width` cells.

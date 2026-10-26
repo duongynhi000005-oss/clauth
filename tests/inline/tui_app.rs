@@ -2052,6 +2052,32 @@ fn the_install_fix_warns_when_claude_is_missing() {
     );
 }
 
+/// Driving `run_confirm_action(ConfirmAction::InstallPlugin)` over a fake
+/// `claude` whose `plugin install` prints a prose marker to stderr and exits
+/// nonzero: the toast pins the escaped marker, so dropping the escape at the
+/// producer restyles the rows again. Unix-only: the fake `claude` is a shell
+/// shim.
+#[cfg(unix)]
+#[test]
+fn the_install_failure_toast_escapes_a_marker_in_the_claude_stderr() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = crate::testutil::ConfigDirSandbox::new(&home, &config);
+    let _fake = crate::testutil::FakeClaude::new_failing_install(&home);
+
+    let mut app = bare_app();
+    super::run_confirm_action(&mut app, super::ConfirmAction::InstallPlugin);
+
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some(
+            "install failed\nclaude: \u{E001}claude plugin install clauth@clauth --scope user\u{E002} failed with exit 7:\nboom\\u{e000}"
+        ),
+        "the install failure toast spells the marker in claude's stderr"
+    );
+}
+
 #[test]
 fn config_rows_login_and_delete_creds_visibility() {
     use super::{ConfigRow, config_rows};
@@ -19032,6 +19058,172 @@ fn herdr_check_danger_on_registry_error() {
     );
 }
 
+/// A herdr row built off an untrusted probe — the version, a registry warning,
+/// the bound key, the probe error, and a local entry's plugin root each
+/// carrying a prose marker — shows every marker spelled `\u{…}`, so none of
+/// them can style the cells after it.
+#[test]
+fn the_herdr_row_escapes_markers_in_untrusted_fields() {
+    let mut entry = herdr_entry(true, None, vec!["x\u{E000}y z"]);
+    entry.source_kind = Some("local".into());
+    entry.plugin_root = Some("/p\u{E001}lugins".into());
+    let check = super::herdr_check(
+        &herdr_probe(Some("0.8\u{E001}.0"), Some(entry), Some("e\u{E002}rr")),
+        Some(&herdr_config(
+            true,
+            Some("pre\u{E000}fix+a"),
+            SidebarState::Templated,
+        )),
+    );
+    assert!(check.detail.iter().any(|l| l == "herdr: 0.8\\u{e001}.0"));
+    assert!(check.detail.iter().any(|l| l == "  x\\u{e000}y z"));
+    assert!(check.detail.iter().any(|l| l == "key: pre\\u{e000}fix+a"));
+    assert!(check.detail.iter().any(|l| l == "  e\\u{e002}rr"));
+    assert!(
+        check.detail.iter().any(|l| l == "root: /p\\u{e001}lugins"),
+        "the local entry's plugin root shows the marker escaped: {:?}",
+        check.detail
+    );
+}
+
+/// A plugin row whose registry record carries a prose marker in a field read
+/// off `installed_plugins.json` shows it spelled `\u{…}`, so a planted marker
+/// can never style the cells after it.
+#[test]
+fn the_plugin_row_escapes_markers_in_fields_read_off_the_registry() {
+    use crate::plugin_probe::McpProbe;
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("plugins")
+        .join("installed_plugins.json");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let record = serde_json::json!({
+        "scope": "user",
+        "version": "1.2\u{E000}.3",
+        "gitCommitSha": "abc\u{E000}defgh",
+    });
+    let body = serde_json::json!({ "plugins": { "clauth@clauth": [record] } });
+    std::fs::write(&path, serde_json::to_vec(&body).expect("serialize")).expect("write");
+
+    let check = super::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Ok),
+    );
+    assert!(
+        check.detail.iter().any(|l| l == "commit: abc\\u{e000}def"),
+        "the registry commit field shows the marker escaped: {:?}",
+        check.detail
+    );
+    assert!(
+        check.detail.iter().any(|l| l == "version: 1.2\\u{e000}.3"),
+        "the registry version field shows the marker escaped: {:?}",
+        check.detail
+    );
+}
+
+/// A field-refusal toast (`show_field_refusal`) shows a marker in the error
+/// text spelled `\u{…}`, so it never styles the toast rows.
+#[test]
+fn the_field_refusal_toast_escapes_a_marker_in_the_error() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::show_field_refusal(
+        &mut app,
+        &super::ShuntFieldKey::Bind,
+        &anyhow::anyhow!("x\u{E000}y"),
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("save failed\nx\\u{e000}y"),
+        "the error's marker renders escaped in the toast body"
+    );
+}
+
+/// An incident toast driven through the real status feed pipeline shows a
+/// marker in the feed title spelled `\u{…}`, so it never styles the toast rows.
+#[test]
+fn the_incident_toast_escapes_a_marker_in_the_feed_title() {
+    use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = super::Tab::Status;
+
+    let incident = |id: &str, title: &str| Incident {
+        id: id.into(),
+        title: title.into(),
+        link: String::new(),
+        phase: UpdatePhase::Monitoring,
+        impact: Impact::Minor,
+        started_ms: 1_780_740_881_000,
+        resolved_ms: None,
+        components: Vec::new(),
+        updates: vec![IncidentUpdate {
+            phase: UpdatePhase::Monitoring,
+            at_ms: 1_780_741_000_000,
+            text: String::new(),
+            transitions: Vec::new(),
+        }],
+    };
+
+    // Seed the "already seen" state so the next fetch reads as a NEW incident,
+    // never the initial load (which does not toast).
+    super::apply_status_incidents(&mut app, vec![incident("a", "old")], 1, false, false);
+    super::apply_status_incidents(&mut app, vec![incident("b", "x\u{E000}y")], 2, false, false);
+
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("new incident: x\\u{e000}y"),
+        "the feed title's marker renders escaped in the incident toast"
+    );
+}
+
+/// The `herdr config fix failed` toast body over a two-line, ANSI-bearing
+/// diagnostic keeps each line its own toast row, strips the ANSI, and spells a
+/// prose marker `\u{…}` so it can never style the toast rows.
+#[test]
+fn the_herdr_fix_failed_toast_escapes_each_diagnostic_line() {
+    let body = super::diagnostic_toast_body(
+        "herdr config fix failed",
+        "line \u{1b}[31mone\u{E000}\nline two\u{E001}",
+    );
+    assert_eq!(
+        body,
+        "herdr config fix failed\nline one\\u{e000}\nline two\\u{e001}"
+    );
+}
+
+/// Driving `run_herdr_heal`'s error arm end to end: a herdr config path whose
+/// directory name holds a prose marker, created as a directory so the read
+/// fails, names the path in the `cannot read herdr's config at …` context and
+/// the toast spells the marker `\u{…}`. Holds on every OS because reading a
+/// directory is a non-`NotFound` failure on all three (unix "Is a directory",
+/// windows "Access is denied").
+#[test]
+fn the_herdr_heal_toast_escapes_a_marker_in_the_config_path() {
+    let home = crate::testutil::HomeSandbox::new();
+    let marker_dir = home.home().join("heal\u{E000}");
+    std::fs::create_dir_all(&marker_dir).expect("create marker dir");
+    let mut app = bare_app();
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::HealHerdrConfig(marker_dir.clone()),
+    );
+    let expected = format!(
+        "herdr config fix failed\ncannot read herdr's config at {} (encoding or permissions); fix it before clauth edits it",
+        marker_dir
+            .display()
+            .to_string()
+            .replace('\u{E000}', "\\u{e000}")
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some(expected.as_str()),
+        "the heal failure toast spells the marker in the path"
+    );
+}
+
 #[test]
 fn herdr_check_warns_without_fix_when_not_installed() {
     let check = super::herdr_check(
@@ -30232,6 +30424,37 @@ fn one_save_at_a_time_across_a_field_save_a_save_kind_and_a_remove() {
     assert_eq!(rig.config_text(), RIG_TEXT, "nothing written");
 }
 
+/// A route remove whose route left the file since its row rendered names the
+/// kind word `route`, never `route N`: the editor view reads, and holds no
+/// route at that position.
+#[cfg(unix)]
+#[test]
+fn the_save_cue_names_a_route_that_left_the_file_route() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    assert!(
+        super::config_view(&rig.app).is_some_and(|view| view.routes.is_empty()),
+        "the editor view reads a config with no routes"
+    );
+    rig.app.services.shunt_save = Some(super::ShuntSave {
+        key: super::ShuntSaveKey::Remove(super::ShuntEntryKey::Route(3)),
+        started: std::time::Instant::now(),
+        value: None,
+        entry: None,
+    });
+    rig.app.exit_wait = true;
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &rig.app))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert_eq!(
+        rows[23].trim_end(),
+        " i saving route\u{2026} · \u{2303}c \u{2303}c quit now",
+        "the cue names the kind word"
+    );
+}
+
 #[cfg(unix)]
 const RIG_TEXT: &str =
     "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n";
@@ -34116,6 +34339,60 @@ fn the_last_token_refusal_lands_on_the_line_while_its_row_is_in_view() {
         rows.iter()
             .any(|r| r.contains("cannot remove the last client token")),
         "the refusal renders on the `└` line:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// A token-remove refusal whose sentence names the tokens-env variable (the
+/// `UnmanagedUnparsed` arm interpolates `variable`) shows a marker in that
+/// variable escaped on the stored `└` line, so it can never style the cells
+/// after it.
+#[test]
+fn the_token_remove_refusal_escapes_a_marker_in_the_variable() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let record = adopt_token_record(&home, TOKEN_CONFIG, "");
+    crate::gateway_tokens::add_client_token(&record, "alice").unwrap();
+    let mut app = token_app(Vec::new());
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "shunt")
+        .expect("the shunt check");
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Token("alice".into())));
+
+    let sentence = crate::gateway_tokens::ClientTokenRefusal::UnmanagedUnparsed {
+        op: Some("cannot remove the last client token".to_string()),
+        variable: "A\u{E000}B".to_string(),
+        source: crate::gateway_tokens::BaseSource::EnvFile(std::path::PathBuf::from(
+            "/tmp/tokens.env",
+        )),
+    }
+    .to_string();
+
+    super::handle_shunt_action_outcome(
+        &mut app,
+        super::ShuntActionOutcome::TokenRemoveRefused {
+            profile: "alice".to_string(),
+            sentence,
+        },
+    );
+
+    let refusal = app.services.shunt_token_refusal.borrow().clone();
+    assert_eq!(
+        refusal.as_ref().map(|(_, s)| s.as_str()),
+        Some(
+            "cannot remove the last client token: the gateway's env file /tmp/tokens.env holds a A\\u{e000}B value shunt cannot parse, and shunt refuses to start on it; fix that value first"
+        ),
+        "the refusal stores the variable's marker escaped by equality"
+    );
+    let rows = shunt_config_rows(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("holds a A\\u{e000}B value")),
+        "the escaped spelling renders on the `└` line:\n{}",
         rows.join("\n")
     );
 }

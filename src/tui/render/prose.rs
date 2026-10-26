@@ -19,6 +19,14 @@ const KEY_OPEN: char = '\u{E000}';
 const CMD_OPEN: char = '\u{E001}';
 const CLOSE: char = '\u{E002}';
 
+/// Whether `ch` is one of the marker code points ([`KEY_OPEN`], [`CMD_OPEN`],
+/// [`CLOSE`]): a copy source must escape it before the string reaches any
+/// tokenizer entry in this module, so an untrusted string cannot style the
+/// cells after it or drop a character.
+pub(crate) fn is_marker(ch: char) -> bool {
+    matches!(ch, KEY_OPEN | CMD_OPEN | CLOSE)
+}
+
 /// [`key`] for `&'static` copy built with `concat!`; spells the markers out
 /// because `concat!` takes literals only.
 macro_rules! key_lit {
