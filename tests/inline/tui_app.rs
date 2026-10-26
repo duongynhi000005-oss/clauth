@@ -276,6 +276,7 @@ fn rotate_across_a_login_change(
         &crate::profile::ProfileName::from(name),
         &app.refetch_queue,
         &app.activity,
+        None,
         &app.op_sender,
     );
     super::drain_op_results(&mut app);
@@ -49737,6 +49738,612 @@ fn a_stored_alert_does_not_replace_the_save_cue_during_the_exit_wait() {
         "the stored armed prompt replaced the save cue"
     );
     rig.drain();
+}
+
+// ── GH #132: a quit waits on token spends only ────────────────────────────────
+
+/// A quit right after launch finds the startup refresh's `Queued` markers and
+/// in-flight usage reads — the OAuth leg and a third-party provider alike. None
+/// spends a refresh token, so none holds the quit: the quit lands at once and
+/// `shutdown` returns without waiting out its bound.
+#[test]
+fn a_quit_over_a_usage_read_exits_without_waiting() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    for (name, activity) in [
+        ("work", ProfileActivity::Queued),
+        ("spare", ProfileActivity::Fetching),
+    ] {
+        crate::usage::mark_activity(
+            &app.activity,
+            &crate::profile::ProfileName::from(name),
+            activity,
+        );
+    }
+    crate::usage::mark_fetch_activity(
+        &app.activity,
+        &crate::usage::FetchLeg::ThirdParty.key(crate::profile::ProfileName::from("provider")),
+        ProfileActivity::Fetching,
+    );
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.quit && !app.exit_wait,
+        "a usage read held the quit: quit={} exit_wait={}",
+        app.quit,
+        app.exit_wait
+    );
+    let start = std::time::Instant::now();
+    super::shutdown(&mut app).expect("shutdown");
+    let took = start.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(500),
+        "shutdown waited {took:?} on usage reads"
+    );
+}
+
+/// A quit while an account spends its refresh token (`Refreshing`: a rotation;
+/// `Switching`: the switch gate, which can refresh too) enters the exit wait
+/// instead of exiting: dying between the token endpoint's answer and the stage
+/// write loses the minted pair. The footer's save cue names the account, and
+/// the tick after the spend lands exits.
+#[test]
+fn a_quit_over_a_token_spend_holds_until_it_lands() {
+    for spend in [ProfileActivity::Refreshing, ProfileActivity::Switching] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = bare_app();
+        let work = crate::profile::ProfileName::from("work");
+        crate::usage::mark_activity(&app.activity, &work, spend);
+        super::handle_key(&mut app, ctrl_c());
+        super::handle_key(&mut app, ctrl_c());
+        assert!(
+            app.exit_wait && !app.quit,
+            "{spend:?}: the quit did not wait on the spend: quit={} exit_wait={}",
+            app.quit,
+            app.exit_wait
+        );
+        assert_eq!(
+            footer_row(&app, 80, 24).trim_end(),
+            " i saving work… · ⌃c ⌃c quit now",
+            "{spend:?}: the save cue does not name the spending account"
+        );
+        super::on_tick(&mut app);
+        assert!(
+            !app.quit,
+            "{spend:?}: a tick exited while the spend still runs"
+        );
+        crate::usage::clear_activity(&app.activity, &work);
+        super::on_tick(&mut app);
+        assert!(app.quit, "{spend:?}: the landed spend did not exit");
+    }
+}
+
+/// The exit wait's escape holds for a token spend too: a second quit exits at
+/// once, the spend still running.
+#[test]
+fn a_second_quit_during_a_token_spend_wait_exits_at_once() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let work = crate::profile::ProfileName::from("work");
+    crate::usage::mark_activity(&app.activity, &work, ProfileActivity::Refreshing);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.exit_wait && !app.quit,
+        "precondition: the first quit waits on the spend"
+    );
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(app.quit, "the second quit did not exit at once");
+}
+
+/// `shutdown`'s own bounded wait stays as the backstop for an exit that skips
+/// the exit wait (a second quit, or a quit while a checking save holds it): it
+/// still waits for a running spend to land, so narrowing it to spends never
+/// narrows it to nothing.
+#[test]
+fn shutdown_still_waits_for_a_running_token_spend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let work = crate::profile::ProfileName::from("work");
+    crate::usage::mark_activity(&app.activity, &work, ProfileActivity::Refreshing);
+    let activity = Arc::clone(&app.activity);
+    let lands = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        crate::usage::clear_activity(&activity, &work);
+    });
+    let start = std::time::Instant::now();
+    super::shutdown(&mut app).expect("shutdown");
+    let took = start.elapsed();
+    lands.join().expect("the spend's clearer");
+    assert!(
+        took >= std::time::Duration::from_millis(250),
+        "shutdown returned after {took:?}, before the spend landed"
+    );
+}
+
+/// A quit over a switch gate with a modal open must still drain the answered
+/// gate: the `Switching` marker is what holds the exit wait, and only the drain
+/// clears it.
+#[test]
+fn a_switch_gate_drains_during_the_exit_wait_under_a_modal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let work = crate::profile::ProfileName::from("work");
+    crate::usage::mark_activity(&app.activity, &work, ProfileActivity::Switching);
+    app.switch_gate_tx
+        .send(super::SwitchGateResult {
+            name: work.clone(),
+            gate: crate::oauth::AuthGate::Broken,
+        })
+        .expect("queue");
+    app.open_modal(super::Modal::Help);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.exit_wait && !app.quit,
+        "precondition: the quit waits on the gate under the modal"
+    );
+    for _ in 0..10 {
+        super::on_tick(&mut app);
+    }
+    assert!(
+        app.quit,
+        "the answered gate must drain under the modal so the exit wait resolves"
+    );
+}
+
+/// `shutdown`'s poll drains answered switch gates each iteration, so a gate
+/// that already landed its pair never costs the backstop's bound.
+#[test]
+fn shutdown_returns_at_once_over_an_answered_switch_gate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let work = crate::profile::ProfileName::from("work");
+    crate::usage::mark_activity(&app.activity, &work, ProfileActivity::Switching);
+    app.switch_gate_tx
+        .send(super::SwitchGateResult {
+            name: work,
+            gate: crate::oauth::AuthGate::Broken,
+        })
+        .expect("queue");
+    let start = std::time::Instant::now();
+    super::shutdown(&mut app).expect("shutdown");
+    let took = start.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(500),
+        "an answered gate must not cost the bound: shutdown took {took:?}"
+    );
+}
+
+/// The exit wait stores the shutdown flag, so the scheduler stops ticking and
+/// the spend gate refuses fresh spends while the wait runs.
+#[test]
+fn the_exit_wait_stores_the_shutdown_flag() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let work = crate::profile::ProfileName::from("work");
+    crate::usage::mark_activity(&app.activity, &work, ProfileActivity::Refreshing);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.exit_wait && !app.quit,
+        "precondition: the quit waits on the spend"
+    );
+    assert!(
+        app.shutting_down.load(std::sync::atomic::Ordering::SeqCst),
+        "the exit wait must store the shutdown flag"
+    );
+}
+
+/// A `BootstrapDone` landing during the exit wait runs no startup auto-switch
+/// and no relink: the active account stays put and no switch toast fires after
+/// the user quit.
+#[test]
+fn a_bootstrap_done_during_the_exit_wait_runs_no_startup_switch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let mk = |name: &str, preferred: bool| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds_ra(&format!("rt-{name}"), &format!("at-{name}")));
+        p.preferred = preferred;
+        save_profile(&p).expect("save profile");
+        p
+    };
+    let worker = mk("worker", false);
+    let home = mk("home", true);
+    write_live_creds(worker.credentials.as_ref().expect("worker creds"));
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("worker".into()),
+            profiles: vec!["worker".into(), "home".into()],
+            fallback_chain: vec!["worker".into(), "home".into()],
+            ..AppState::default()
+        },
+        profiles: vec![worker, home],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let mut app = App::new(config);
+    {
+        let mut store = app.usage_store.lock().expect("usage_store");
+        store.insert(
+            "worker".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(40.0)),
+                ..UsageInfo::default()
+            },
+        );
+        store.insert(
+            "home".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(10.0)),
+                ..UsageInfo::default()
+            },
+        );
+        let mut status = app.usage_status.lock().expect("usage_status");
+        status.insert("worker".to_string(), FetchStatus::Fresh);
+        status.insert("home".to_string(), FetchStatus::Fresh);
+    }
+    // A user-started spend in flight, then the quit.
+    crate::usage::mark_activity(
+        &app.activity,
+        &crate::profile::ProfileName::from("busy"),
+        ProfileActivity::Refreshing,
+    );
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.exit_wait && !app.quit,
+        "precondition: the quit waits on the spend"
+    );
+    // The bootstrap worker that was running at the quit finishes now.
+    app.startup_sender
+        .send(super::StartupSignal::BootstrapDone)
+        .expect("send");
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("worker"),
+        "the bootstrap relinked the active account during the exit wait"
+    );
+    let toasts = toast_bodies(&app);
+    assert!(
+        !toasts
+            .iter()
+            .any(|t| t.contains("preferred account") || t.contains("auto-switched")),
+        "the bootstrap toasted a startup switch during the exit wait: {toasts:?}"
+    );
+}
+
+/// Confirming a rotate-one raises `Refreshing` on the UI thread BEFORE the
+/// worker spawns, so a quit decided before the worker runs still enters the
+/// exit wait. The worker is parked at a test seam before it can clear the
+/// slot, so the quit's read is deterministic.
+#[test]
+fn a_rotate_one_confirmed_then_quit_before_the_worker_runs_enters_the_exit_wait() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let (parked_rx, release_tx) = super::arm_rotate_worker_hold();
+    struct Release(std::sync::mpsc::Sender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+            super::disarm_rotate_worker_hold();
+        }
+    }
+    let release = Release(release_tx);
+
+    super::run_confirm_action(&mut app, super::ConfirmAction::RotateOne("work".into()));
+    // The worker parks at the gate before touching `rotate_one`; prove it
+    // reached the gate (a join, not a clock poll), then quit.
+    parked_rx
+        .recv()
+        .expect("the rotate worker parks at the gate");
+
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.exit_wait && !app.quit,
+        "the quit must wait on the spend raised by the confirm: quit={} exit_wait={}",
+        app.quit,
+        app.exit_wait
+    );
+
+    drop(release);
+    super::join_test_workers();
+}
+
+/// Confirming a rotate-all stamps every candidate `Refreshing` on the UI
+/// thread BEFORE the worker spawns, so a quit decided before the worker runs
+/// still enters the exit wait. The worker is parked at a test seam before it
+/// can clear the slots, so the quit's read is deterministic.
+#[test]
+fn a_rotate_all_confirmed_then_quit_before_the_worker_runs_enters_the_exit_wait() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config =
+        crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from("work"));
+    let mut app = bare_app();
+    app.config = Arc::clone(&config);
+    let (parked_rx, release_tx) = super::arm_rotate_worker_hold();
+    struct Release(std::sync::mpsc::Sender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+            super::disarm_rotate_worker_hold();
+        }
+    }
+    let release = Release(release_tx);
+
+    super::run_confirm_action(&mut app, super::ConfirmAction::RotateAll);
+    // The worker parks at the gate before touching `refresh_all`; prove it
+    // reached the gate (a join, not a clock poll), then quit.
+    parked_rx
+        .recv()
+        .expect("the rotate-all worker parks at the gate");
+
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.exit_wait && !app.quit,
+        "the quit must wait on the spend raised by the confirm: quit={} exit_wait={}",
+        app.quit,
+        app.exit_wait
+    );
+
+    drop(release);
+    super::join_test_workers();
+}
+
+/// A rotate worker released after the quit must not spend the refresh token:
+/// the UI-thread stamp can be retired by another owner of the same slot (the
+/// scheduler's end_rotation, the switch drain), and a quit in that gap exits at
+/// once — so the worker's own marker raise goes through the shutdown gate. The
+/// worker is parked at a test seam while the quit lands, then released.
+#[test]
+fn a_rotate_one_worker_released_after_a_quit_sends_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config =
+        crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from("work"));
+    let (base, server) = crate::testutil::serve_endpoints(1, |_, _| {
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut app = bare_app();
+    app.config = Arc::clone(&config);
+    let (parked_rx, release_tx) = super::arm_rotate_worker_hold();
+    struct Release(std::sync::mpsc::Sender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+            super::disarm_rotate_worker_hold();
+        }
+    }
+    let release = Release(release_tx);
+
+    super::run_confirm_action(&mut app, super::ConfirmAction::RotateOne("work".into()));
+    parked_rx
+        .recv()
+        .expect("the rotate worker parks at the gate");
+
+    // Another owner of the same slot retires the marker before the quit.
+    crate::usage::clear_activity(&app.activity, &crate::profile::ProfileName::from("work"));
+
+    // The quit exits at once (no spend in flight) and sets the shutdown flag.
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.quit && !app.exit_wait,
+        "precondition: the cleared slot must let the quit exit at once: quit={} exit_wait={}",
+        app.quit,
+        app.exit_wait
+    );
+
+    drop(release);
+    super::join_test_workers();
+    drop(endpoints);
+    #[allow(clippy::expect_used, reason = "test")]
+    let seen = server.join().expect("listener");
+    assert!(
+        !seen.iter().any(|p| p == "/v1/oauth/token"),
+        "the worker must not spend the token after the quit: {seen:?}"
+    );
+}
+
+/// A rotate worker that panics must still clear the slot its caller pre-stamped
+/// on the UI thread, or the exit wait strands on a spend that will never land.
+/// `spawn_worker` catches the unwind; the drop guard in `rotate_one` retires
+/// the marker.
+#[test]
+fn a_panicking_rotate_worker_clears_its_slot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config =
+        crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from("work"));
+    // Poison the config mutex the worker locks: the panic `rotate_one_inner`
+    // hits on its config read, and this is the only way a mutex is poisoned.
+    let poisoner = Arc::clone(&config);
+    std::thread::spawn(move || {
+        let _held = poisoner.lock();
+        panic!("deliberate: poison the config mutex");
+    })
+    .join()
+    .expect_err("precondition: the poisoning thread panics");
+
+    let mut app = bare_app();
+    app.config = Arc::clone(&config);
+    super::run_confirm_action(&mut app, super::ConfirmAction::RotateOne("work".into()));
+    super::join_test_workers();
+
+    assert!(
+        !crate::usage::token_spend_in_flight(&app.activity),
+        "the panicking worker must clear the Refreshing slot its caller raised"
+    );
+}
+
+/// A pending switch-off does not drain during the exit wait: the guard keeps
+/// the wrap-off from turning accounts off after the user quit.
+#[test]
+fn an_exit_wait_drains_no_pending_switch_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let work = crate::profile::ProfileName::from("work");
+    crate::usage::mark_activity(&app.activity, &work, ProfileActivity::Refreshing);
+    *app.pending_switch_off.lock().expect("flag") = true;
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.exit_wait && !app.quit,
+        "precondition: the quit waits on the spend"
+    );
+    super::on_tick(&mut app);
+    assert!(
+        *app.pending_switch_off.lock().expect("flag"),
+        "the exit wait must not drain the pending switch-off"
+    );
+}
+
+/// The exit wait spawns no bootstrap: the guard keeps the scheduler and the
+/// startup auto-switch from starting after the user quit.
+#[test]
+fn an_exit_wait_spawns_no_bootstrap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.reconcile_done = true;
+    let work = crate::profile::ProfileName::from("work");
+    crate::usage::mark_activity(&app.activity, &work, ProfileActivity::Refreshing);
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.exit_wait && !app.quit,
+        "precondition: the quit waits on the spend"
+    );
+    super::on_tick(&mut app);
+    assert!(
+        !app.bootstrap_started,
+        "the exit wait must not spawn the bootstrap"
+    );
+}
+
+/// An auto-switch decision queued during the exit wait starts no gate: the
+/// dispatch loop bails while the exit waits, so the queued relink is dropped
+/// instead of firing after the user quit.
+#[test]
+fn an_auto_switch_queued_during_the_exit_wait_starts_no_gate() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp", "oauth"]);
+    let tp = Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    save_profile(&tp).expect("save tp");
+    let oauth = stored_oauth_profile("oauth", far_future());
+    let state = AppState {
+        active_profile: Some(ProfileName::from("tp")),
+        profiles: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        fallback_chain: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![tp, oauth],
+    });
+    app.bootstrap_started = true;
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "oauth".to_string(),
+            key_rejected_cause: None,
+        });
+
+    crate::usage::mark_activity(
+        &app.activity,
+        &crate::profile::ProfileName::from("work"),
+        ProfileActivity::Refreshing,
+    );
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.exit_wait && !app.quit,
+        "precondition: the quit waits on the spend"
+    );
+
+    super::on_tick(&mut app);
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("tp"),
+        "an exit wait must not dispatch the queued auto-switch"
+    );
+    assert!(
+        !crate::usage::switch_gate_in_flight(&app.activity),
+        "no gate may start during the exit wait"
+    );
+}
+
+/// A panicking switch-gate worker still posts an answer from a drop guard, so
+/// the `Switching` marker never strands the exit wait with no owner to clear it.
+#[test]
+fn a_panicking_switch_gate_worker_still_sends_an_answer() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![stored_oauth_profile("work", already_expired())]);
+    let panics: fn(
+        &str,
+        Option<&str>,
+    )
+        -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> =
+        |_, _| panic!("the gate worker panics");
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::spawn_switch_gate(
+            &mut app,
+            crate::profile::ProfileName::from("work".to_string()),
+            panics,
+        );
+    }));
+    assert!(caught.is_err(), "the panicking gate must unwind");
+    let answer = app
+        .switch_gates
+        .try_recv()
+        .expect("the drop guard must post an answer");
+    assert_eq!(answer.name, crate::profile::ProfileName::from("work"));
+    assert!(
+        matches!(answer.gate, crate::oauth::AuthGate::Transient(_)),
+        "the answer must be a transient retry, not a hang"
+    );
+}
+
+/// The save cue names the smaller account on every frame while two spends run:
+/// `spending_account` breaks the `HashMap`'s unordered tie on the smallest
+/// name, so the cue is stable instead of flapping between frames.
+#[test]
+fn the_save_cue_names_the_smaller_account_when_two_spends_run() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    for name in ["beta", "alpha"] {
+        crate::usage::mark_activity(
+            &app.activity,
+            &crate::profile::ProfileName::from(name),
+            ProfileActivity::Refreshing,
+        );
+    }
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+    assert!(
+        app.exit_wait && !app.quit,
+        "precondition: the quit waits on the spends"
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            footer_row(&app, 80, 24).trim_end(),
+            " i saving alpha… · ⌃c ⌃c quit now",
+            "the cue must name the smaller account on every frame"
+        );
+    }
 }
 
 /// A tick while the exit waits on a running pool remove does not exit; once the

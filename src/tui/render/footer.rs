@@ -1079,9 +1079,10 @@ fn inset_x(area: Rect, pad: u16) -> Rect {
 
 /// The row a running write is about, as the card labels it: a field's label, a
 /// `+ add` kind word, an entry's displayed name, `token`, `client tokens`,
-/// `shunt` for a `shunt_action` job, or a pool account's name. The save cue
-/// names this while the exit waits or a quit is held; the priority order
-/// matches the exit wait's own write predicate (save, then action, then pool).
+/// `shunt` for a `shunt_action` job, a pool account's name, or the account
+/// spending a refresh token. The save cue names this while the exit waits or a
+/// quit is held; the priority order matches the exit wait's own write predicate
+/// (save, then action, then pool, then the spend).
 fn saving_row_name(app: &App) -> String {
     if let Some(save) = &app.services.shunt_save {
         return match &save.key {
@@ -1101,7 +1102,8 @@ fn saving_row_name(app: &App) -> String {
     {
         return escape_control(name.as_str());
     }
-    String::new()
+    crate::usage::spending_account(&app.activity)
+        .map_or_else(String::new, |name| escape_control(&name))
 }
 
 /// An entry's displayed name, as the remove row labels it: the name/id for an

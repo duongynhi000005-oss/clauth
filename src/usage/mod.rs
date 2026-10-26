@@ -67,10 +67,12 @@ pub(crate) use scheduler::{
     current_key_rejected_names, decision_fresh_any, display_activity, end_rotation,
     fill_chain_snapshot_stores, is_idle, is_stuck_rate_limited, is_stuck_streak,
     kick_block_switch_grade, mark_activity, mark_fetch_activity, polled_third_party_names,
-    profile_credential_fingerprint, queued_switch_away_is_stale, read_skipped_unreadable,
-    reading_is_polled, rotation_into_fetch, selected_activity, selected_next_refresh,
-    spawn_refresher, switch_gate_in_flight, switch_grade_kick_blocked_from_cache,
-    switch_grade_kick_lifts, third_party_credentialed, usage_cache_clock_of, usage_poll_pair,
+    profile_credential_fingerprint, queued_switch_away_is_stale,
+    raise_refreshing_unless_shutting_down, read_skipped_unreadable, reading_is_polled,
+    rotation_into_fetch, selected_activity, selected_next_refresh, spawn_refresher,
+    spending_account, switch_gate_in_flight, switch_grade_kick_blocked_from_cache,
+    switch_grade_kick_lifts, third_party_credentialed, token_spend_in_flight, usage_cache_clock_of,
+    usage_poll_pair,
 };
 // The queue's history-pair classifier stays module-private — reached by
 // `usage::auto_start_queue`'s own tests through `super::` — while the gap arithmetic is

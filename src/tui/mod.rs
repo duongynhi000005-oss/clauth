@@ -8,7 +8,6 @@ pub(crate) mod theme;
 
 pub(crate) use clawd::full_sprite;
 
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -52,9 +51,6 @@ fn run_loop(
     let mut last_tick = Instant::now();
 
     while !application.quit {
-        if application.shutting_down.load(Ordering::SeqCst) {
-            application.quit = true;
-        }
         terminal.draw(|frame| render::draw(frame, &application))?;
         let size = terminal.size()?;
         // Update compact + width-floor state each frame so the banner appears as

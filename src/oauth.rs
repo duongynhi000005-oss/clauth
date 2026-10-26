@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -766,7 +767,10 @@ impl KickResult {
 /// Each recovery step is paced by [`ROTATION_STEP_DELAY_MS`] (kick → rotate →
 /// retry kick → caller's usage re-fetch); none of the sleeps holds the rotation
 /// lock. `activity` (the scheduler's store) drives the spinner; the CLI passes
-/// `None`.
+/// `None`. When `activity` is `Some`, `shutting_down` gates the marker raise
+/// through [`crate::usage::raise_refreshing_unless_shutting_down`]; a `None`
+/// flag (the CLI, or any caller without the flag plumbed) keeps the ungated
+/// base behaviour.
 pub(crate) fn auto_start_kick(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
@@ -774,6 +778,7 @@ pub(crate) fn auto_start_kick(
     refresh_token: Option<&str>,
     access_expires_at: Option<i64>,
     activity: Option<&ActivityStore>,
+    shutting_down: Option<&std::sync::atomic::AtomicBool>,
 ) -> KickResult {
     let first_rl = match kick(access_token) {
         Ok(()) => {
@@ -844,8 +849,19 @@ pub(crate) fn auto_start_kick(
 
     // Refresh spinner during the round trip, then back to Fetching for the retry
     // kick + the caller's fetch (the kick runs inside the scheduler's fetch leg).
-    if let Some(activity) = activity {
-        mark_activity(activity, name, ProfileActivity::Refreshing);
+    match (activity, shutting_down) {
+        (Some(activity), Some(shutting_down)) => {
+            if !crate::usage::raise_refreshing_unless_shutting_down(activity, name, shutting_down) {
+                // The shutdown flag is set: a spend that started now could die
+                // between the token endpoint's answer and its stage write, so
+                // bail unrotated — no token sent, no marker raised.
+                return KickResult::not_opened_with(first_rl);
+            }
+        }
+        (Some(activity), None) => {
+            mark_activity(activity, name, ProfileActivity::Refreshing);
+        }
+        (None, _) => {}
     }
     let refreshed = settle_refresh_answer(
         config,
@@ -1157,16 +1173,24 @@ fn dead_chain_detail(config: &crate::profile::ConfigHandle, name: &ProfileName) 
 /// the same `.credentials.json` this writes, so it picks the new pair up on its
 /// next request rather than racing for the chain.
 ///
+/// When `activity` is `Some` and `shutting_down` is `Some`, the marker raise
+/// goes through [`crate::usage::raise_refreshing_unless_shutting_down`]: a
+/// shutdown flag already set refuses the raise and the leg returns
+/// [`RotateOutcome::Persisted(false)`] with nothing sent, staged, spent or
+/// quarantined. A `None` flag keeps the ungated base behaviour.
+///
 /// HTTP/persist leg emits one `OpResult` and clears the
 /// activity slot. Returns [`RotateOutcome::GuardUnavailable`] without emitting an
 /// `OpResult` when the lock can't be acquired (slot never pre-stamped here;
-/// `refresh_all` pre-stamps and clears it). The no-refresh-token leg, and a
+/// the TUI confirm pre-stamps on the UI thread and this worker clears it). The
+/// no-refresh-token leg, and a
 /// spent token whose store already holds a newer login (adopted, nothing
 /// sent), return [`RotateOutcome::Persisted(false)`] silently.
 fn rotate_one_inner(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     activity: Option<&ActivityStore>,
+    shutting_down: Option<&AtomicBool>,
     sender: &OpResultSender,
 ) -> RotateOutcome {
     let Ok(rotation_guard) = RotationGuard::acquire(name) else {
@@ -1196,7 +1220,21 @@ fn rotate_one_inner(
                 // observe this profile as Idle between the credential read and
                 // the HTTP call. Lock order (AppConfig → state → leaf) is preserved:
                 // activity is a leaf mutex acquired inside with_state_lock.
-                mark_activity(activity, name, ProfileActivity::Refreshing);
+                match shutting_down {
+                    Some(shutting_down) => {
+                        if !crate::usage::raise_refreshing_unless_shutting_down(
+                            activity,
+                            name,
+                            shutting_down,
+                        ) {
+                            // The shutdown flag is set: a spend started now could
+                            // die mid-exchange, so bail with nothing sent, staged,
+                            // spent or quarantined.
+                            return Ok(None);
+                        }
+                    }
+                    None => mark_activity(activity, name, ProfileActivity::Refreshing),
+                }
             }
             Ok(Some((rt, scopes)))
         })
@@ -1309,8 +1347,7 @@ pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(Profi
 /// Mirrors what Claude Code does silently on launch — minus the kick.
 ///
 /// Profiles without a stored refresh token are skipped. Network/revocation
-/// failures are swallowed per-profile; cached state stays put. `force`
-/// bypasses only the diverged-active guard.
+/// failures are swallowed per-profile; cached state stays put.
 ///
 /// Returns the names whose rotation succeeded so the caller can target
 /// follow-up work (re-fetch, kick) at the same set, and pushes each onto
@@ -1320,29 +1357,25 @@ pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(Profi
 /// their HTTP calls, never holding the config mutex across the network. Each
 /// worker emits one `OpResult` on `sender` the moment its HTTP completes, so the
 /// spinner clears in arrival order, not when the slowest sibling finishes.
+///
+/// `snapshots` is the pre-computed candidate list ([`rotation_candidates`]);
+/// the caller stamps each candidate `Refreshing` on the UI thread before
+/// spawning, so a quit decided before the worker runs still sees the spend.
+/// Each worker clears its own slot when it emits its `OpResult`.
+///
+/// `shutting_down`, when `Some`, gates each worker's marker raise through
+/// [`crate::usage::raise_refreshing_unless_shutting_down`]; a `None` flag keeps
+/// the ungated base behaviour.
 pub(crate) fn refresh_all(
     config: &crate::profile::ConfigHandle,
-    force: bool,
+    snapshots: Vec<(ProfileName, String)>,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
+    shutting_down: Option<Arc<AtomicBool>>,
     sender: &OpResultSender,
 ) -> Vec<String> {
-    let snapshots = {
-        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-        let cfg = config.lock().expect("config mutex poisoned");
-        rotation_candidates(&cfg, force)
-    };
-
     if snapshots.is_empty() {
         return Vec::new();
-    }
-
-    // Stamp every candidate Refreshing before the fan-out so the overview row
-    // shows a refresh spinner for the entire window. Each worker clears its
-    // own slot when it emits its OpResult so the spinner drops as soon as
-    // that profile's HTTP returns, not when the slowest sibling does.
-    for (name, _) in &snapshots {
-        mark_activity(activity, name, ProfileActivity::Refreshing);
     }
 
     // Pair each handle with the name so the join loop can clear the activity
@@ -1353,12 +1386,19 @@ pub(crate) fn refresh_all(
             let config = Arc::clone(config);
             let activity = Arc::clone(activity);
             let sender = sender.clone();
+            let shutting_down = shutting_down.clone();
             let name_for_handle = name.clone();
             let h = std::thread::spawn(move || {
                 // Holds the per-profile RotationGuard across the HTTP window so
                 // an external `clauth start <name>` cannot double-spend this
                 // single-use token mid-rotation.
-                let outcome = rotate_one_inner(&config, &name, Some(&activity), &sender);
+                let outcome = rotate_one_inner(
+                    &config,
+                    &name,
+                    Some(&activity),
+                    shutting_down.as_deref(),
+                    &sender,
+                );
                 (name, outcome)
             });
             (name_for_handle, h)
@@ -1404,20 +1444,38 @@ pub(crate) fn refresh_all(
 /// across the HTTP window. On success the profile is pushed onto `refetch` so
 /// the next tick re-fetches its usage. Returns `true` when a new pair
 /// persisted.
+///
+/// `shutting_down`, when `Some`, gates the worker's marker raise through
+/// [`crate::usage::raise_refreshing_unless_shutting_down`]; a `None` flag keeps
+/// the ungated base behaviour. The caller stamps `Refreshing` on the UI thread
+/// before spawning; this worker is the slot's owner and clears it on every
+/// path out below, a `rotate_one_inner` panic included.
 pub(crate) fn rotate_one(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
+    shutting_down: Option<&AtomicBool>,
     sender: &OpResultSender,
 ) -> bool {
-    // Pre-stamp so the row shows a refresh spinner for the whole HTTP window;
-    // rotate_one_inner clears the slot when it emits its OpResult.
-    mark_activity(activity, name, ProfileActivity::Refreshing);
-    let persisted = match rotate_one_inner(config, name, Some(activity), sender) {
+    // Clear the caller's pre-stamp on every exit, a `rotate_one_inner` panic
+    // included: `spawn_worker` catches the unwind, and a stranded `Refreshing`
+    // marker would hold the exit wait for nothing.
+    struct RotateSlotGuard<'a> {
+        activity: &'a ActivityStore,
+        name: &'a ProfileName,
+    }
+    impl Drop for RotateSlotGuard<'_> {
+        fn drop(&mut self) {
+            clear_activity(self.activity, self.name);
+        }
+    }
+    let _guard = RotateSlotGuard { activity, name };
+
+    let persisted = match rotate_one_inner(config, name, Some(activity), shutting_down, sender) {
         RotateOutcome::Persisted(true) => true,
-        // Guard-fail never emits an OpResult; surface the failure + clear, exactly
-        // as refresh_all's join loop does for an unavailable guard.
+        // Guard-fail never emits an OpResult; surface the failure. The guard
+        // clears the caller's stamp on drop.
         RotateOutcome::GuardUnavailable => {
             let _ = sender.send(OpResult {
                 name: name.to_string(),
@@ -1426,15 +1484,11 @@ pub(crate) fn rotate_one(
                     rotation_lock_unavailable(name).text()
                 )),
             });
-            clear_activity(activity, name);
             false
         }
-        // Persist/skip legs already emitted + cleared; clearing the pre-stamp again
-        // is idempotent and covers the no-refresh-token early return.
-        RotateOutcome::Persisted(false) => {
-            clear_activity(activity, name);
-            false
-        }
+        // Persist/skip legs already emitted + cleared; the guard clears the
+        // caller's stamp on drop.
+        RotateOutcome::Persisted(false) => false,
     };
     if persisted && let Ok(mut q) = refetch.lock() {
         q.insert(name.to_string());
@@ -1478,6 +1532,7 @@ pub(crate) fn prime_window(config: &crate::profile::ConfigHandle, name: &Profile
         &access_token,
         refresh_token.as_deref(),
         expires_at,
+        None,
         None,
     );
     if let Some(rl) = kicked.blocked {

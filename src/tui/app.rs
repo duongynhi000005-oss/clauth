@@ -73,7 +73,7 @@ use crate::usage::{
     any_busy, apply_pending_forgets, bootstrap_fetch, bootstrap_third_party, clear_activity,
     collect_oauth_seed_names, collect_third_party_entries, collect_third_party_seed_names,
     collect_tokens, is_idle, mark_activity, now_ms, spawn_refresher, switch_gate_in_flight,
-    windows_maxed,
+    token_spend_in_flight, windows_maxed,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -5161,9 +5161,9 @@ pub(crate) struct App {
     /// Tick counter; advances the activity spinner frame each `on_tick`.
     pub(crate) tick_count: u64,
     pub(crate) quit: bool,
-    /// The quit is decided but the exit waits for a running shunt-card write:
-    /// the screen keeps drawing and the tick exits the moment no write runs. A
-    /// second quit during the wait exits at once.
+    /// The quit is decided but the exit waits for a running write (a shunt-card
+    /// write or a token spend): the screen keeps drawing and the tick exits the
+    /// moment no write runs. A second quit during the wait exits at once.
     pub(crate) exit_wait: bool,
     /// The armed 2-step quit: the key that armed it, `None` when disarmed. A
     /// second press of the SAME key confirms; the other quit key re-arms as
@@ -6458,6 +6458,13 @@ impl App {
     /// UI-thread tail of bootstrap: rebuilds token snapshot, starts scheduler,
     /// applies usage, runs startup auto-switch. No HTTP.
     fn finish_bootstrap(&mut self) {
+        // An exit wait starts no new write: a `BootstrapDone` that lands during
+        // the wait must not relink credentials or run the startup auto-switch
+        // after the user quit. The worker's `BootstrapDoneGuard` clears
+        // `bootstrap_active` before it posts this signal, so nothing waits on it.
+        if self.exit_wait {
+            return;
+        }
         self.refresh_tokens();
         self.start_scheduler();
         self.apply_usage();
@@ -8164,7 +8171,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 && app.codex_login.is_none()
     );
 
-    // The quit is decided and the exit waits for the running shunt-card writes:
+    // The quit is decided and the exit waits for the running writes:
     // only a top-level `q` gets past here (`⌃c` is handled above), everything
     // else only disarms an armed quit — an edit typed now would die with the exit.
     if app.exit_wait && !(reads_arm && !has_sub_focus(app)) {
@@ -8889,6 +8896,15 @@ fn in_flight_shunt_card_write(app: &App) -> bool {
         || app.pool_mutation_kind == Some(PoolMutationKind::Remove)
 }
 
+/// A running write the exit waits for, the one predicate both the quit's
+/// decision (`quit_or_wait`) and its resolution (`on_tick`) call so the two
+/// cannot drift: any shunt-card write, or an account between a refresh token's
+/// request and its stage write. Dying inside that window loses the minted pair,
+/// so a quit over it waits instead of exiting. A usage read never holds a quit.
+fn in_flight_exit_write(app: &App) -> bool {
+    in_flight_shunt_card_write(app) || token_spend_in_flight(&app.activity)
+}
+
 /// A switch the user asked for: disarm it, warn over changed work, hold on an
 /// in-flight shunt save, else perform it. `target == app.tab` (a jump to the
 /// active tab) does nothing.
@@ -8949,14 +8965,20 @@ fn request_quit(app: &mut App) {
 }
 
 /// The one place a quit is decided: a field or `+ add` save in flight holds the
-/// quit (a refusal re-runs the gate over the red item); any other running
-/// shunt-card write enters the exit wait (the exit waits until the write
-/// finishes, whatever its outcome); otherwise it quits at once.
+/// quit (a refusal re-runs the gate over the red item); any other running write
+/// enters the exit wait (the exit waits until the write finishes, whatever its
+/// outcome) — a shunt-card write, or a token spend, which must land its minted
+/// pair before the process dies; otherwise it quits at once.
 fn quit_or_wait(app: &mut App) {
     if in_flight_shunt_edit_save(app) {
         app.loss_pending = Some(LossWarningTarget::Quit);
-    } else if in_flight_shunt_card_write(app) {
+    } else if in_flight_exit_write(app) {
         app.exit_wait = true;
+        // Stop the scheduler and refuse new spends while the exit waits: the
+        // wait resolves when the running write lands, and a spend that starts
+        // during it would either extend it or die mid-exchange after the tick
+        // that decided the quit.
+        app.shutting_down.store(true, Ordering::SeqCst);
     } else {
         app.quit = true;
         app.shutting_down.store(true, Ordering::SeqCst);
@@ -17066,8 +17088,35 @@ where
     let config = Arc::clone(&app.config);
     let sender = app.switch_gate_tx.clone();
     let gate = move || {
+        // Posts a `Transient` answer on drop if the gate panicked before its own
+        // send, so a crashed worker never strands the `Switching` marker (and
+        // the exit wait that polls it). Mirrors `BootstrapDoneGuard`.
+        struct SwitchGateAnswerGuard {
+            name: ProfileName,
+            sender: std::sync::mpsc::Sender<SwitchGateResult>,
+            sent: bool,
+        }
+        impl Drop for SwitchGateAnswerGuard {
+            fn drop(&mut self) {
+                if !self.sent {
+                    let _ = self.sender.send(SwitchGateResult {
+                        name: self.name.clone(),
+                        gate: oauth::AuthGate::Transient(crate::format::Transient::new(
+                            crate::format::Cause::InternalLock,
+                            crate::format::Retry::Stated,
+                        )),
+                    });
+                }
+            }
+        }
+        let mut answer = SwitchGateAnswerGuard {
+            name: name.clone(),
+            sender,
+            sent: false,
+        };
         let gate = oauth::ensure_installable(&config, &name, refresher);
-        let _ = sender.send(SwitchGateResult { name, gate });
+        let _ = answer.sender.send(SwitchGateResult { name, gate });
+        answer.sent = true;
     };
     if cfg!(test) {
         gate()
@@ -25426,12 +25475,34 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 );
                 return;
             }
+            // Stamp every candidate `Refreshing` on the UI thread BEFORE the
+            // worker spawns, so a quit decided before the worker runs still
+            // sees the spend and enters the exit wait. The worker's workers
+            // clear their own slot (via `rotate_one_inner`), so the UI thread
+            // is not an owner of any slot it raised.
+            let snapshots = {
+                let cfg = App::lock_config(&app.config);
+                oauth::rotation_candidates(&cfg, true)
+            };
+            for (name, _) in &snapshots {
+                mark_activity(&app.activity, name, ProfileActivity::Refreshing);
+            }
             let config = Arc::clone(&app.config);
             let refetch = Arc::clone(&app.refetch_queue);
             let activity = Arc::clone(&app.activity);
+            let shutting_down = Arc::clone(&app.shutting_down);
             let sender = app.op_sender.clone();
             spawn_worker(move || {
-                let _ = oauth::refresh_all(&config, true, &refetch, &activity, &sender);
+                #[cfg(test)]
+                rotate_worker_gate();
+                let _ = oauth::refresh_all(
+                    &config,
+                    snapshots,
+                    &refetch,
+                    &activity,
+                    Some(shutting_down),
+                    &sender,
+                );
             });
             app.toast(ToastKind::Info, "rotating all tokens");
         }
@@ -25454,13 +25525,30 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // live session's own refresh, so unlike RotateAll this doesn't need the
             // global any_busy gate — an unacquirable guard surfaces as a Danger
             // toast (contention blocks inside `acquire`, it never lands there).
+            //
+            // Stamp on the UI thread BEFORE the worker spawns so a quit decided
+            // before the worker runs still sees this spend. Residual (accepted):
+            // the marker now spans the worker's blocking `RotationGuard::acquire`
+            // wait, so a quit over a rotate parked behind a foreign holder waits
+            // it out; ⌃c ⌃c still exits.
+            mark_activity(&app.activity, &name, ProfileActivity::Refreshing);
             let config = Arc::clone(&app.config);
             let refetch = Arc::clone(&app.refetch_queue);
             let activity = Arc::clone(&app.activity);
+            let shutting_down = Arc::clone(&app.shutting_down);
             let sender = app.op_sender.clone();
             let target = name.clone();
             spawn_worker(move || {
-                oauth::rotate_one(&config, &target, &refetch, &activity, &sender);
+                #[cfg(test)]
+                rotate_worker_gate();
+                oauth::rotate_one(
+                    &config,
+                    &target,
+                    &refetch,
+                    &activity,
+                    Some(shutting_down.as_ref()),
+                    &sender,
+                );
             });
             app.toast(ToastKind::Info, format!("rotating '{name}'"));
         }
@@ -26656,6 +26744,12 @@ pub(crate) fn on_tick(app: &mut App) {
         .map(|mut g| g.drain().collect())
         .unwrap_or_default();
     for decision in auto_switch_targets {
+        // An exit wait starts no new write: a queued auto-switch would spawn a
+        // gate (and could relink credentials) after the user quit. The
+        // decisions were drained above and drop with the process.
+        if app.exit_wait {
+            break;
+        }
         let name = ProfileName::from(decision.target.clone());
         if switch_gate_in_flight(&app.activity) || !is_idle(&app.activity, &name) {
             continue;
@@ -26746,10 +26840,10 @@ pub(crate) fn on_tick(app: &mut App) {
     update_banner(app);
     app.prune_toasts();
 
-    // The quit is decided and the exit waits for the running shunt-card writes:
-    // resolve here, after every drain, so the tick that drains the last write is
-    // the one that exits.
-    if app.exit_wait && !in_flight_shunt_card_write(app) {
+    // The quit is decided and the exit waits for the running writes (a
+    // shunt-card write or a token spend): resolve here, after every drain, so
+    // the tick that drains the last write is the one that exits.
+    if app.exit_wait && !in_flight_exit_write(app) {
         app.quit = true;
         app.shutting_down.store(true, Ordering::SeqCst);
     }
@@ -27373,9 +27467,10 @@ fn blocking_modal_open(app: &App) -> bool {
 /// mark, then relink (`Ready`/`Refreshed`) or refuse with the login hint
 /// (`Broken`) / a retry hint (`Transient`). Mirrors `drain_pending_switch_off`'s
 /// modal guard — completion can raise the Divergence prompt, which must not
-/// stack under an open modal.
+/// stack under an open modal — except during the exit wait, which must drain
+/// the answered gate's `Switching` marker or the quit strands on it.
 fn drain_switch_gates(app: &mut App) {
-    if blocking_modal_open(app) {
+    if blocking_modal_open(app) && !app.exit_wait {
         return;
     }
     while let Ok(SwitchGateResult { name, gate }) = app.switch_gates.try_recv() {
@@ -27406,6 +27501,9 @@ fn drain_switch_gates(app: &mut App) {
 /// may raise a Divergence prompt; consuming the flag while one is open would
 /// let the scheduler re-set it and stack duplicates.
 fn drain_pending_switch_off(app: &mut App) {
+    if app.exit_wait {
+        return;
+    }
     if blocking_modal_open(app) {
         return;
     }
@@ -27439,6 +27537,11 @@ fn drain_startup_signals(app: &mut App) {
 
 /// Spawn bootstrap once reconcile is done and no modal is open.
 fn maybe_spawn_bootstrap(app: &mut App) {
+    // The exit wait starts no new write: spawning the bootstrap would start the
+    // scheduler, which could raise a fresh spend after the user quit.
+    if app.exit_wait {
+        return;
+    }
     // The startup re-bind confirm never blocks bootstrap: usage seeding, the
     // scheduler and the startup auto-switch must run even while the confirm
     // waits on a key. Every other modal keeps the pre-diff gate.
@@ -27748,6 +27851,47 @@ pub(crate) fn detach_test_workers() {
     drop(handles);
 }
 
+/// Test seam for the rotate workers [`run_confirm_action`] spawns: when a test
+/// arms the hold, each spawned rotate worker sends on the parked channel and
+/// blocks on the release channel BEFORE touching `rotate_one`/`refresh_all`, so
+/// "confirm, then quit before the worker runs" is driven deterministically. The
+/// parked send lands before the block, so the test's `recv` is a join, never a
+/// clock poll.
+#[cfg(test)]
+static ROTATE_WORKER_HOLD: std::sync::Mutex<
+    Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn arm_rotate_worker_hold()
+-> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    if let Ok(mut hold) = ROTATE_WORKER_HOLD.lock() {
+        *hold = Some((parked_tx, release_rx));
+    }
+    (parked_rx, release_tx)
+}
+
+#[cfg(test)]
+pub(crate) fn disarm_rotate_worker_hold() {
+    if let Ok(mut hold) = ROTATE_WORKER_HOLD.lock() {
+        *hold = None;
+    }
+}
+
+#[cfg(test)]
+fn rotate_worker_gate() {
+    let hold = ROTATE_WORKER_HOLD
+        .lock()
+        .map(|mut h| h.take())
+        .unwrap_or_default();
+    if let Some((parked_tx, release_rx)) = hold {
+        let _ = parked_tx.send(());
+        let _ = release_rx.recv();
+    }
+}
+
 /// Spawn a background worker, catching panics so a single thread crash never
 /// takes down the process. Callers clone only the Arcs their closure needs.
 fn spawn_worker<F>(f: F)
@@ -27769,11 +27913,25 @@ where
 
 /// Snapshot active credentials and detach the symlink. After shutdown, external
 /// writes to `.credentials.json` land in the standalone file, not the profile.
+///
+/// The bounded wait covers only a running token spend, as the backstop for an
+/// exit that skipped the exit wait (a second quit, or a quit while a checking
+/// save holds it): a process that dies between the token endpoint's answer and
+/// the stage write loses the minted pair. A usage read, a queued fetch or a
+/// third-party leg may be abandoned, so none of them delays the exit.
 pub(crate) fn shutdown(app: &mut App) -> Result<()> {
     app.shutting_down.store(true, Ordering::SeqCst);
     let wait_start = Instant::now();
     while wait_start.elapsed() < Duration::from_millis(2000) {
-        if !any_busy(&app.activity) {
+        // Drain answered switch gates each iteration without relinking: the
+        // gate already landed its pair (staged/landed), and relinking during
+        // shutdown would re-point credentials after the user quit. Clearing the
+        // marker is what frees the spend wait — an answered gate that stays
+        // queued would otherwise burn the whole bound.
+        while let Ok(SwitchGateResult { name, .. }) = app.switch_gates.try_recv() {
+            clear_activity(&app.activity, &name);
+        }
+        if !token_spend_in_flight(&app.activity) {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));

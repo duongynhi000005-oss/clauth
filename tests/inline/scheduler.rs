@@ -13470,7 +13470,14 @@ fn a_401_under_a_live_session_rotates_and_retries() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -13540,6 +13547,7 @@ fn auto_start_kick_rotates_under_a_live_session() {
         Some("rt-old"),
         None,
         None,
+        None,
     );
     let seen = server.join().expect("listener");
 
@@ -13605,7 +13613,14 @@ fn a_401_under_a_live_session_does_not_rotate_on_macos() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -13663,6 +13678,7 @@ fn auto_start_kick_does_not_rotate_under_a_live_session_on_macos() {
         Some("rt-old"),
         None,
         None,
+        None,
     );
     let seen = server.join().expect("listener");
 
@@ -13717,7 +13733,14 @@ fn a_flagged_profile_skips_the_dead_refresh_but_keeps_the_401_probe() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -13730,6 +13753,207 @@ fn a_flagged_profile_skips_the_dead_refresh_but_keeps_the_401_probe() {
     );
     assert_eq!(outcome.status, super::FetchStatus::Cached);
     assert_eq!(outcome.rotated, None, "nothing may be rotated");
+}
+
+/// A refresh refused by the shutdown flag sends nothing: the leg walks through
+/// the 401 and the pre-spend checks, then the flag gate at the marker site
+/// bails unrotated before the token endpoint. `max` sits above the happy path
+/// (usage + the identity probe) so a leaked token POST is RECORDED, never
+/// refused a socket.
+#[test]
+fn a_shutting_down_refresh_refuses_without_sending_or_marking() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-shutting-down";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let shutting_down = std::sync::atomic::AtomicBool::new(true);
+
+    let outcome =
+        super::fetch_with_rotation(&config, &entry, None, &refetch, &activity, &shutting_down);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a shutting-down refresh must not spend the token: {seen:?}"
+    );
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+    assert!(
+        !super::token_spend_in_flight(&activity),
+        "the refusal must leave no spend marker"
+    );
+}
+
+/// The kick's spend site refuses the same way: a 401 kick walks to the marker
+/// site, the flag gate refuses, and the token endpoint is never reached.
+#[test]
+fn a_shutting_down_kick_refuses_without_sending_or_marking() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "kick-shutting-down";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let shutting_down = std::sync::atomic::AtomicBool::new(true);
+
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some(&activity),
+        Some(&shutting_down),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a shutting-down kick must not spend the token: {seen:?}"
+    );
+    assert_eq!(result.rotated, None, "nothing may be rotated");
+    assert!(
+        activity.lock().unwrap().get(name).is_none(),
+        "the refusal must leave no marker"
+    );
+}
+
+/// The admitted direction of the flag gate: a clear flag raises `Refreshing`,
+/// which is exactly what `shutdown`'s poll reads; a set flag refuses and leaves
+/// the store empty.
+#[test]
+fn the_shutdown_flag_gate_admits_or_refuses_a_spend() {
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("work");
+    let flag = std::sync::atomic::AtomicBool::new(false);
+
+    assert!(
+        super::raise_refreshing_unless_shutting_down(&activity, &name, &flag),
+        "an unset flag must admit the spend"
+    );
+    assert!(
+        super::token_spend_in_flight(&activity),
+        "the admitted spend must be visible to shutdown's poll"
+    );
+    super::clear_activity(&activity, &name);
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        !super::raise_refreshing_unless_shutting_down(&activity, &name, &flag),
+        "a set flag must refuse the spend"
+    );
+    assert!(
+        activity.lock().unwrap().get(name.as_str()).is_none(),
+        "the refusal must leave no marker"
+    );
+}
+
+/// A poisoned activity store fails open: with no shutdown in flight the spend
+/// still proceeds (nothing can be raised), and only a set flag refuses it.
+#[test]
+fn a_poisoned_activity_store_fails_open_unless_shutting_down() {
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("work");
+    // Poison the store the way it happens in production: a thread panics while
+    // holding the lock, so every later `lock()` returns the poison error.
+    let poisoner = Arc::clone(&activity);
+    let _ = std::thread::spawn(move || {
+        let _held = poisoner.lock();
+        panic!("deliberate: poison the activity store");
+    })
+    .join();
+
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        super::raise_refreshing_unless_shutting_down(&activity, &name, &flag),
+        "a poisoned store with no shutdown in flight must still admit the spend"
+    );
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        !super::raise_refreshing_unless_shutting_down(&activity, &name, &flag),
+        "a poisoned store with the shutdown flag set must refuse"
+    );
+}
+
+/// The flag read and the `Refreshing` raise happen under ONE activity-store
+/// lock hold: a flag stored while the helper is parked on the store is still
+/// seen, so the spend refuses. A helper that loads the flag before locking
+/// reopens the check-then-exit interleaving this one-hold shape closes.
+#[test]
+fn the_flag_read_and_raise_share_one_lock_hold() {
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("work");
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let held = activity.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let store = Arc::clone(&activity);
+        let flag_for_worker = Arc::clone(&flag);
+        scope.spawn(move || {
+            let _ = tx.send(super::raise_refreshing_unless_shutting_down(
+                &store,
+                &name,
+                &flag_for_worker,
+            ));
+        });
+        // Let the spawned thread run until it is parked on the held store. The
+        // store is held, so the helper cannot return; once the thread is
+        // scheduled it reaches `store.lock()` (this shape) or reads the flag
+        // and then blocks on the store (the two-hold mutant). A short sleep is
+        // the wait — 100 ms dwarfs thread-start latency, and the flag store
+        // below must land while the thread is parked for the one-hold property
+        // to refuse.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(held);
+    });
+    let admitted = rx.recv().expect("the helper's answer");
+    assert!(
+        !admitted,
+        "the one-hold helper must refuse when the flag lands while it is blocked on the store"
+    );
 }
 
 /// The flagged-profile skip must take the `bail_unrotated` shape, never an
@@ -13791,7 +14015,14 @@ fn a_flagged_profile_still_gets_its_live_usage_poll_on_the_proactive_arm() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -13862,7 +14093,14 @@ fn a_flagged_non_active_profile_carries_a_moved_disk_pair_without_a_refresh() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -13936,7 +14174,14 @@ fn a_flagged_non_active_profile_with_an_unchanged_pair_still_bails_without_a_ref
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -14025,7 +14270,14 @@ fn a_live_session_blocking_rotation_still_carries_a_moved_disk_pair() {
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
     crate::runtime::set_rotation_blocked_override(Some(true));
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     crate::runtime::set_rotation_blocked_override(None);
     let seen = server.join().expect("listener");
 
@@ -14102,7 +14354,14 @@ fn a_live_session_blocking_rotation_with_an_unchanged_pair_still_bails() {
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
     crate::runtime::set_rotation_blocked_override(Some(true));
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     crate::runtime::set_rotation_blocked_override(None);
     let seen = server.join().expect("listener");
 
@@ -14174,7 +14433,14 @@ fn a_disarmed_refusal_keeps_the_carry_outcome_on_the_unblocked_path() {
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
     crate::runtime::set_rotation_blocked_override(Some(false));
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     crate::runtime::set_rotation_blocked_override(None);
     let seen = server.join().expect("listener");
 
@@ -14258,7 +14524,14 @@ fn a_tokenless_profile_bails_before_the_carry_runs() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -14455,6 +14728,7 @@ fn a_429_on_a_clock_expired_token_rotates_and_repulls_the_plan() {
         Some(active_pro_plan()),
         &refetch,
         &activity,
+        &std::sync::atomic::AtomicBool::new(false),
     );
     let seen = server.join().expect("listener");
 
@@ -14527,7 +14801,14 @@ fn a_rate_limited_retry_keeps_the_pair_and_never_enqueues_a_refetch() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -14586,7 +14867,14 @@ fn a_failed_retry_keeps_the_pair_and_queues_a_refetch() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -14644,7 +14932,14 @@ fn an_unacquirable_rotation_guard_bails_without_spending_the_chain() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -14697,7 +14992,14 @@ fn a_rotation_carries_its_pair_back_when_the_persist_fails() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -14781,7 +15083,14 @@ fn a_fresher_live_mirror_is_adopted_before_any_refresh_is_spent() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -14847,7 +15156,14 @@ fn an_adopt_after_a_rejected_refresh_keeps_the_profile_out_of_quarantine() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -18119,7 +18435,14 @@ fn a_flock_wedged_rotation_persist_leaves_a_stage_the_next_load_reads() {
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     crate::lock::set_state_lock_timeout_override(None);
     let seen = server.join().expect("listener");
     drop(held_rx.try_recv().expect("the token call took the flock"));
@@ -18168,7 +18491,14 @@ fn drained_tokens(
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
     super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, |e| {
-        super::fetch_with_rotation(config, &e, None, &refetch, &activity)
+        super::fetch_with_rotation(
+            config,
+            &e,
+            None,
+            &refetch,
+            &activity,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
     });
     state.tokens.lock().unwrap().clone()
 }
@@ -18326,7 +18656,14 @@ fn wedge_a_fetch_rotation(
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
-    let outcome = super::fetch_with_rotation(config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     crate::lock::set_state_lock_timeout_override(None);
     drop(held_rx.try_recv().expect("the token call took the flock"));
     assert!(
@@ -18442,8 +18779,15 @@ fn a_second_process_holding_the_spent_token_sends_the_staged_one() {
     ));
     let _ = wedge_a_fetch_rotation(&config, name, &held_rx);
 
-    let _ =
-        crate::oauth::auto_start_kick(&peer, &chain_pn(name), "at-old", Some("rt-old"), None, None);
+    let _ = crate::oauth::auto_start_kick(
+        &peer,
+        &chain_pn(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        None,
+        None,
+    );
     let seen = server.join().expect("listener");
 
     let sent: Vec<String> = seen
@@ -18795,7 +19139,14 @@ fn a_live_stage_expiring_later_holds_off_the_proactive_rotation() {
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let seen = server.join().expect("listener");
 
     assert_eq!(

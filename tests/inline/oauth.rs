@@ -208,6 +208,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         &config,
         &crate::profile::ProfileName::from("test-rotate-one-no-rt"),
         Some(&activity),
+        None,
         &tx,
     );
 
@@ -2832,6 +2833,7 @@ fn a_captured_window_exhaustion_429_carries_the_limiters_rejection() {
         Some("rt-old"),
         Some(expires_at),
         None,
+        None,
     );
     let seen: Vec<String> = server
         .join()
@@ -3076,6 +3078,7 @@ fn rotate_one_inner_rotates_under_a_live_session() {
         &config,
         &crate::profile::ProfileName::from(name),
         Some(&activity),
+        None,
         &tx,
     );
     let seen = server.join().expect("listener");
@@ -3119,6 +3122,7 @@ fn rotate_one_inner_does_not_rotate_under_a_live_session_on_macos() {
         &config,
         &crate::profile::ProfileName::from(name),
         Some(&activity),
+        None,
         &tx,
     );
     let seen = server.join().expect("listener");
@@ -3169,6 +3173,7 @@ fn rotate_one_inner_skips_under_a_forced_live_session() {
         &config,
         &crate::profile::ProfileName::from(name),
         Some(&activity),
+        None,
         &tx,
     );
     crate::runtime::set_rotation_blocked_override(None);
@@ -3227,6 +3232,7 @@ fn the_kick_reserves_the_shared_anthropic_request_slot() {
         Some("rt-old"),
         None,
         None,
+        None,
     );
     let seen = server.join().expect("listener");
 
@@ -3270,6 +3276,7 @@ fn a_kick_rotation_carries_its_pair_back_when_the_persist_fails() {
         &crate::profile::ProfileName::from(name),
         "at-old",
         Some("rt-old"),
+        None,
         None,
         None,
     );
@@ -3486,6 +3493,7 @@ fn the_unavailable_lock_has_one_spelling_across_both_legs() {
             &crate::profile::ProfileName::from(name),
             &refetch,
             &activity,
+            None,
             &tx
         ),
         "an unacquirable lock persists nothing"
@@ -3557,7 +3565,13 @@ fn an_unparseable_2xx_tells_the_operator_to_wait() {
     let (tx, rx) = mpsc::channel();
     let cfg = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
 
-    rotate_one_inner(&cfg, &crate::profile::ProfileName::from(name), None, &tx);
+    rotate_one_inner(
+        &cfg,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
     #[allow(clippy::expect_used, reason = "test")]
     let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
     let msg = match outcome {
@@ -3654,6 +3668,7 @@ fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
         &dead_cfg,
         &crate::profile::ProfileName::from(dead),
         None,
+        None,
         &tx,
     );
     #[allow(clippy::expect_used, reason = "test")]
@@ -3682,6 +3697,7 @@ fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
     rotate_one_inner(
         &flaky_cfg,
         &crate::profile::ProfileName::from(flaky),
+        None,
         None,
         &tx,
     );
@@ -3753,7 +3769,13 @@ fn rotate_names_the_api_key_command_for_a_keyless_third_party_profile() {
     crate::profile::save_app_state(&config.state).expect("save app state");
     let cfg: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(config));
 
-    rotate_one_inner(&cfg, &crate::profile::ProfileName::from(name), None, &tx);
+    rotate_one_inner(
+        &cfg,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
     #[allow(clippy::expect_used, reason = "test")]
     let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
     let msg = match outcome {
@@ -3814,7 +3836,13 @@ fn rotate_names_the_split_state_for_a_keyed_third_party_profile() {
     crate::profile::save_app_state(&config.state).expect("save app state");
     let cfg: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(config));
 
-    rotate_one_inner(&cfg, &crate::profile::ProfileName::from(name), None, &tx);
+    rotate_one_inner(
+        &cfg,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
     #[allow(clippy::expect_used, reason = "test")]
     let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
     let msg = match outcome {
@@ -4191,6 +4219,7 @@ fn auto_start_kick_does_not_rotate_under_a_forced_live_session() {
         &crate::profile::ProfileName::from(name),
         "at-old",
         Some("rt-old"),
+        None,
         None,
         None,
     );
@@ -6869,7 +6898,13 @@ fn a_rotate_persist_refuses_a_foreign_login_over_a_live_stage() {
     write_store_pair(name, "at-foreign", "rt-foreign");
     let (tx, _rx) = mpsc::channel();
 
-    let result = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let result = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
     let seen = server.join().expect("listener");
 
     assert_eq!(
@@ -6915,6 +6950,7 @@ fn a_kick_persist_refuses_a_foreign_login_over_a_live_stage() {
         &crate::profile::ProfileName::from(name),
         "at-old",
         Some("rt-old"),
+        None,
         None,
         None,
     );
@@ -6974,7 +7010,13 @@ fn a_relogin_during_a_rotation_survives_the_rotations_persist() {
     let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     let (tx, _rx) = mpsc::channel();
 
-    let _ = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let _ = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
     let seen = server.join().expect("listener");
 
     assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
@@ -7007,7 +7049,13 @@ fn a_logout_during_a_rotation_stays_logged_out() {
     let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     let (tx, _rx) = mpsc::channel();
 
-    let _ = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let _ = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
     let seen = server.join().expect("listener");
 
     assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
@@ -7070,7 +7118,13 @@ fn a_reconciled_switch_during_a_rotation_keeps_its_snapshot() {
     .expect("write the diverged live login");
     let (tx, _rx) = mpsc::channel();
 
-    let result = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let result = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
     let seen = server.join().expect("listener");
 
     assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
@@ -7117,8 +7171,20 @@ fn a_transient_refresh_answer_records_nothing() {
     let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     let (tx, _rx) = mpsc::channel();
 
-    let first = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
-    let second = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let first = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
+    let second = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
     let seen = server.join().expect("listener");
 
     assert!(matches!(first, RotateOutcome::Persisted(false)));
@@ -7159,7 +7225,13 @@ fn a_confirmed_invalid_grant_records_the_token_it_judged() {
     let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     let (tx, _rx) = mpsc::channel();
 
-    let _ = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let _ = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
     let seen = server.join().expect("listener");
 
     assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
@@ -7225,7 +7297,13 @@ fn a_rotation_of_a_deleted_profile_recreates_no_profile_dir() {
     crate::profile::save_app_state(&state).expect("save state");
     let (tx, _rx) = mpsc::channel();
 
-    let _ = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let _ = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
     let seen = server.join().expect("listener");
 
     assert_eq!(
@@ -7255,7 +7333,13 @@ fn a_rotation_keeps_the_stores_mcp_logins() {
     .expect("write the store");
     let (tx, _rx) = mpsc::channel();
 
-    let result = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let result = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
     let seen = server.join().expect("listener");
 
     assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
@@ -7287,7 +7371,13 @@ fn a_landed_rotation_moves_the_reload_fingerprint() {
     let before = crate::profile::reload_fingerprint();
     let (tx, _rx) = mpsc::channel();
 
-    let result = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let result = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        None,
+        None,
+        &tx,
+    );
     let seen = server.join().expect("listener");
 
     assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
@@ -7379,10 +7469,10 @@ fn a_rotate_after_a_wedged_persist_spends_the_staged_token() {
     let (tx, _rx) = mpsc::channel();
 
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
-    let first = rotate_one_inner(&config, &pn(name), None, &tx);
+    let first = rotate_one_inner(&config, &pn(name), None, None, &tx);
     crate::lock::set_state_lock_timeout_override(None);
     drop(held_rx.try_recv().expect("the token call took the flock"));
-    let second = rotate_one_inner(&config, &pn(name), None, &tx);
+    let second = rotate_one_inner(&config, &pn(name), None, None, &tx);
     let seen = server.join().expect("listener");
 
     assert!(matches!(first, RotateOutcome::Persisted(false)));
@@ -7428,7 +7518,7 @@ fn a_rotate_after_a_wedged_gate_persist_spends_the_staged_token() {
         "a wedged persist is no install"
     );
     let (tx, _rx) = mpsc::channel();
-    let _ = rotate_one_inner(&config, &pn(name), None, &tx);
+    let _ = rotate_one_inner(&config, &pn(name), None, None, &tx);
     let seen = server.join().expect("listener");
 
     assert_eq!(sent_refresh_tokens(&seen), vec!["rt-new".to_string()]);
@@ -7658,14 +7748,14 @@ fn a_spent_token_with_nothing_staged_quarantines_without_a_resend() {
     let (tx, _rx) = mpsc::channel();
 
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
-    let _ = rotate_one_inner(&config, &pn(name), None, &tx);
+    let _ = rotate_one_inner(&config, &pn(name), None, None, &tx);
     crate::lock::set_state_lock_timeout_override(None);
     drop(held_rx.try_recv().expect("the token call took the flock"));
     let fresh: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(
         crate::profile::load_config().expect("fresh load"),
     ));
     assert_eq!(memory_refresh(&fresh, name).as_deref(), Some("rt-old"));
-    let _ = rotate_one_inner(&fresh, &pn(name), None, &tx);
+    let _ = rotate_one_inner(&fresh, &pn(name), None, None, &tx);
     let seen = server.join().expect("listener");
 
     assert_eq!(
@@ -7690,8 +7780,8 @@ fn a_token_judged_invalid_is_never_sent_again() {
     let config = crate::testutil::rotation_fixture_config(&pn(name));
     let (tx, rx) = mpsc::channel();
 
-    let _ = rotate_one_inner(&config, &pn(name), None, &tx);
-    let _ = rotate_one_inner(&config, &pn(name), None, &tx);
+    let _ = rotate_one_inner(&config, &pn(name), None, None, &tx);
+    let _ = rotate_one_inner(&config, &pn(name), None, None, &tx);
     let seen = server.join().expect("listener");
 
     assert_eq!(sent_refresh_tokens(&seen), vec!["rt-old".to_string()]);
@@ -7718,7 +7808,7 @@ fn a_spent_token_adopts_an_unspent_store_without_sending() {
     write_store_pair(name, "at-foreign", "rt-foreign");
     let (tx, rx) = mpsc::channel();
 
-    let outcome = rotate_one_inner(&config, &pn(name), None, &tx);
+    let outcome = rotate_one_inner(&config, &pn(name), None, None, &tx);
 
     crate::testutil::assert_nothing_sent(&listener);
     assert!(matches!(outcome, RotateOutcome::Persisted(false)));
@@ -7763,7 +7853,7 @@ fn an_unreadable_spent_record_skips_the_manual_rotate() {
     std::fs::create_dir(spent_record_path(name)).expect("block the record");
     let (tx, rx) = mpsc::channel();
 
-    let outcome = rotate_one_inner(&config, &pn(name), None, &tx);
+    let outcome = rotate_one_inner(&config, &pn(name), None, None, &tx);
 
     crate::testutil::assert_nothing_sent(&listener);
     assert!(matches!(outcome, RotateOutcome::Persisted(false)));
@@ -7874,7 +7964,7 @@ fn a_store_write_failure_keeps_the_stage_and_moves_memory_to_the_minted_pair() {
     let (tx, _rx) = mpsc::channel();
 
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_secs(20)));
-    let outcome = rotate_one_inner(&config, &pn(name), None, &tx);
+    let outcome = rotate_one_inner(&config, &pn(name), None, None, &tx);
     crate::lock::set_state_lock_timeout_override(None);
     squatter.join().expect("squatter");
     let seen = server.join().expect("listener");
@@ -8107,12 +8197,12 @@ fn a_split_profiles_persist_judges_the_chain_in_credentials_json() {
     let sidecar_before = std::fs::read(&sidecar).expect("sidecar");
     let (tx, _rx) = mpsc::channel();
 
-    let own = rotate_one_inner(&config, &pn(name), None, &tx);
+    let own = rotate_one_inner(&config, &pn(name), None, None, &tx);
     assert!(matches!(own, RotateOutcome::Persisted(true)));
     assert_eq!(stored_refresh(name).as_deref(), Some("rt-new"));
 
     write_store_pair(name, "at-foreign", "rt-foreign");
-    let foreign = rotate_one_inner(&config, &pn(name), None, &tx);
+    let foreign = rotate_one_inner(&config, &pn(name), None, None, &tx);
     let seen = server.join().expect("listener");
 
     assert_eq!(seen.len(), 2);
@@ -8170,7 +8260,7 @@ fn a_capture_of_a_recorded_pair_keeps_the_record_and_its_spend_quarantines_unsen
     ));
     assert_eq!(memory_refresh(&fresh, name).as_deref(), Some("rt-old"));
     let (tx, _rx) = mpsc::channel();
-    let _ = rotate_one_inner(&fresh, &pn(name), None, &tx);
+    let _ = rotate_one_inner(&fresh, &pn(name), None, None, &tx);
 
     crate::testutil::assert_nothing_sent(&listener);
     assert!(is_flagged(&fresh, name), "the consumed pair quarantines");
@@ -8198,7 +8288,7 @@ fn a_minted_pair_over_an_unreadable_store_keeps_memorys_login_block() {
     std::fs::write(store_path(name), "not json").expect("corrupt the store");
     let (tx, _rx) = mpsc::channel();
 
-    let outcome = rotate_one_inner(&config, &pn(name), None, &tx);
+    let outcome = rotate_one_inner(&config, &pn(name), None, None, &tx);
     let seen = server.join().expect("listener");
 
     assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);

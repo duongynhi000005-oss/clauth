@@ -650,6 +650,44 @@ pub(crate) fn mark_activity(store: &ActivityStore, name: &ProfileName, activity:
     }
 }
 
+/// Raise `Refreshing` for `name` unless the shutdown flag is set, read and
+/// raised under ONE activity-store lock hold. `shutdown` stores the flag
+/// (SeqCst) before it polls the same store, so a spend either sees the flag
+/// (and refuses) or is seen by the poll (its marker is already raised) — never
+/// both, never neither. Returns false and raises nothing on a refusal (the flag
+/// set); true once the marker is raised.
+///
+/// A poisoned store fails open: it can raise no marker, but the spend still
+/// proceeds unmarked (the base behaviour — the spinner is skipped, not the
+/// rotation) unless the flag is set. The poison is logged once per process.
+pub(crate) fn raise_refreshing_unless_shutting_down(
+    store: &ActivityStore,
+    name: &ProfileName,
+    shutting_down: &AtomicBool,
+) -> bool {
+    let mut states = match store.lock() {
+        Ok(states) => states,
+        Err(_) => {
+            log_activity_store_poison_once();
+            return !shutting_down.load(Ordering::SeqCst);
+        }
+    };
+    if shutting_down.load(Ordering::SeqCst) {
+        return false;
+    }
+    states.entry(name.to_string()).or_default().account = Some(ProfileActivity::Refreshing);
+    true
+}
+
+/// Whether an activity-store poison has already been logged this process.
+static ACTIVITY_STORE_POISON_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn log_activity_store_poison_once() {
+    if !ACTIVITY_STORE_POISON_LOGGED.swap(true, Ordering::Relaxed) {
+        logline!("clauth: activity store poisoned; a refresh proceeds without a quit marker");
+    }
+}
+
 /// Hand the rotation owner's account-wide marker to the OAuth leg under one
 /// hold. Atomic on purpose: between two separate writes `partition_due` reads
 /// the profile as idle and re-admits it while the rotation's own fetch is still
@@ -746,13 +784,56 @@ pub(crate) fn any_busy(store: &ActivityStore) -> bool {
     }
 }
 
+/// Whether the account slot marks a refresh-token spend. `Refreshing` and
+/// `Switching` bracket the token exchange through the stage write, and their
+/// owners retire them only once the minted pair has been staged.
+fn is_token_spend(state: &ProfileActivityState) -> bool {
+    matches!(
+        state.account,
+        Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
+    )
+}
+
+/// One lock-and-scan behind the account-slot queries. Poison fails closed.
+fn any_account_marker(
+    store: &ActivityStore,
+    predicate: impl Fn(&ProfileActivityState) -> bool,
+) -> bool {
+    match store.lock() {
+        Ok(states) => states.values().any(predicate),
+        Err(_) => true,
+    }
+}
+
 /// True iff any profile's switch gate is in flight. Poison fails closed.
 pub(crate) fn switch_gate_in_flight(store: &ActivityStore) -> bool {
+    any_account_marker(store, |state| {
+        matches!(state.account, Some(ProfileActivity::Switching))
+    })
+}
+
+/// True while one of the two claude spends a quit waits on runs: an account's
+/// `Refreshing` marker (the scheduler's rotation leg) or its `Switching` marker
+/// (the switch gate, which can refresh too). Dying inside that window loses the
+/// minted pair, and the spent token quarantines on its resend. Poison fails
+/// closed: a poisoned store cannot prove no spend runs, and exiting mid-spend
+/// is worse than `shutdown`'s 2 s wait.
+pub(crate) fn token_spend_in_flight(store: &ActivityStore) -> bool {
+    any_account_marker(store, is_token_spend)
+}
+
+/// The account a running token spend belongs to, if any, for the save cue. Ties
+/// break on the smallest name: a `HashMap` has no order of its own, and the cue
+/// must name the same account on consecutive frames. Poison names none.
+pub(crate) fn spending_account(store: &ActivityStore) -> Option<String> {
     match store.lock() {
         Ok(states) => states
-            .values()
-            .any(|state| matches!(state.account, Some(ProfileActivity::Switching))),
-        Err(_) => true,
+            .iter()
+            .filter(|(_, state)| is_token_spend(state))
+            .map(|(name, _)| name.as_str())
+            .min()
+            .map(str::to_owned),
+        Err(_) => None,
     }
 }
 
@@ -1098,6 +1179,7 @@ fn fetch_with_rotation(
     prev_plan: Option<PlanInfo>,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
+    shutting_down: &AtomicBool,
 ) -> FetchOutcome {
     let name = &entry.name;
     let access_token = entry.access_token.as_str();
@@ -1311,7 +1393,12 @@ fn fetch_with_rotation(
         }
     };
     let rt = rt.as_str();
-    mark_activity(activity, name, ProfileActivity::Refreshing);
+    if !raise_refreshing_unless_shutting_down(activity, name, shutting_down) {
+        // The shutdown flag is set: a spend that started now could die between
+        // the token endpoint's answer and its stage write, so bail unrotated —
+        // no token sent, no marker raised, no streak or quarantine.
+        return bail_unrotated(&mut profile_fetch);
+    }
     // `refresh_result` (not `refresh`) so the RefreshError variant survives — the
     // poll needs to tell a dead token (quarantine) from a transient blip (retry).
     let rotation = crate::oauth::settle_refresh_answer(
@@ -2347,6 +2434,8 @@ fn run_fetch(
         auto_start_queue,
         interval_ms,
         None,
+        // The test-only wrapper drives no shutdown, so the flag is always clear.
+        &std::sync::atomic::AtomicBool::new(false),
     )
 }
 
@@ -2368,6 +2457,7 @@ fn run_fetch_flagged(
     auto_start_queue: &crate::usage::AutoStartQueueState,
     interval_ms: u64,
     timed_out: Option<&AtomicBool>,
+    shutting_down: &AtomicBool,
 ) -> FetchOutcome {
     // The spawn epoch, captured at the tick's partition on the entry, so the
     // kick leg's memory writes gate on the same value the landing's section 2
@@ -2410,6 +2500,7 @@ fn run_fetch_flagged(
                 entry.refresh_token.as_deref(),
                 entry.access_expires_at,
                 Some(activity),
+                Some(shutting_down),
             );
             // The kick leg's writes obey the landing's two-part gate: the durable
             // block (`kick_block.json`, section 1) and the queue-open history
@@ -2548,7 +2639,8 @@ fn run_fetch_flagged(
         .ok()
         .and_then(|m| m.get(entry.name.as_str()).and_then(|i| i.plan.clone()));
 
-    let mut outcome = fetch_with_rotation(config, &entry, prev_plan, refetch, activity);
+    let mut outcome =
+        fetch_with_rotation(config, &entry, prev_plan, refetch, activity, shutting_down);
     // The fetch's own rotation (if any) supersedes the kick's; otherwise carry
     // the kick's rotated pair back so the tick still syncs the spent chain.
     if outcome.rotated.is_none() {
@@ -3701,6 +3793,7 @@ fn fetch_oauth_due(
             &state.auto_start_queue,
             interval_ms,
             timed_out,
+            &state.shutting_down,
         )
     });
 }
