@@ -286,7 +286,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   jobs/<id>.json.delivered # exactly-once delivery ledger after collection
   keychain-deletes-in-flight.json # macOS namespaced-item deletes in progress
   live_bare/<pid>          # one marker per live bare `claude` session
-  live_sessions/<sid>.json # one row per live `clauth start` session
+  live_sessions/<sid>.json # one row per live session clauth launched (start, delegate, background)
   mcp_live/<pid>           # one marker per live `clauth mcp` server, so its delegate jobs read dead once it exits
   presets/<name>.json      # endpoint + model presets you saved
   rotation-locks/<name>.lock  # one OAuth-rotation lock per account

@@ -78,8 +78,8 @@ clauth list           # account table with cached usage, no network
 | `clauth which` | `--json` | print the profile owning the loaded credentials; inside a `clauth start` codex session, that codex profile |
 | `clauth list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches; codex accounts follow in their own `CODEX` section, which `--all` leaves alone |
 | `clauth jobs` | `--json` | what the delegates are doing: account, elapsed, last output, live runs first; `--json` also carries each run's `session_id`, the handle `delegate({session_id})` takes after a crash, and whether the run was isolated, which is what decides whether that id is a handle at all |
-| `clauth switch <name>` / `clauth switch <sid> <profile>` | | one name switches the global account (the bare `clauth <name>` form, deprecated); two names move a live session, picked up at its next request — a background session (`-- --bg`) is refused: it stays on its account |
-| `clauth sessions` | `--json`, `--tokens` | list Claude Code sessions, newest first |
+| `clauth switch <name>` / `clauth switch <sid> <profile>` | | one name switches the global account (the bare `clauth <name>` form, deprecated); two names move a live session (its `<sid>` from `clauth sessions --live`), picked up at its next request — a background session (`-- --bg`) or a codex session is refused: it stays on its account |
+| `clauth sessions` | `--json`, `--tokens`, `--live` | list Claude Code sessions, newest first; `--live` lists only the running clauth sessions, with the id `clauth switch` takes |
 | `clauth resume <id\|latest>` | `--profile <name>` | resume a session under a chosen account |
 | `clauth info <id\|latest>` | | print a session's resume command, workspace, and storage path |
 | `clauth daemon` | `--status`, `--standby`, `--replace`, `--no-standby`, `--listen [ADDR:PORT]`, `--cert <path>`, `--key <path>`, `--dump-openapi` | run the refresh + auto-switch loop with no TUI |
