@@ -1460,6 +1460,117 @@ impl Drop for FakeClaude<'_> {
     }
 }
 
+/// Drive a real install through the same host the Services tab calls, then
+/// write the registry files CC writes that the fake CLI does not, in CC's
+/// measured shapes: `known_marketplaces.json` (a directory source at the
+/// agentgear pointer carrying an `installLocation`), the `settings.json`
+/// `enabledPlugins["clauth@clauth"] = true` enable bit, and the top-level
+/// `version: 2` the shim's `installed_plugins.json` omits. agentgear's marker
+/// is stamped by the install itself, never written here by hand.
+///
+/// Fails loudly when the process cwd's `.claude/settings{,.local}.json` sets
+/// `enabledPlugins["clauth@clauth"]` or does not parse, because the classifier
+/// reads those layers first and the cwd is process-global (named in the
+/// message), so it cannot be sandboxed per test.
+#[cfg(unix)]
+pub(crate) fn healthy_install(config: &Path) {
+    refuse_cwd_settings_layer();
+    assert!(
+        matches!(
+            crate::plugin_host::install().expect("install"),
+            agentgear::Outcome::Installed
+        ),
+        "the fixture install must land"
+    );
+    let pointer = agentgear::current_pointer("clauth", "claude").expect("pointer");
+    let registered = pointer.to_string_lossy().into_owned();
+    let plugins_dir = config.join("plugins");
+    std::fs::create_dir_all(&plugins_dir).expect("plugins dir");
+    std::fs::write(
+        plugins_dir.join("known_marketplaces.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "clauth": {
+                "source": {"source": "directory", "path": registered},
+                "installLocation": registered,
+                "lastUpdated": "2026-10-26T00:00:00.000Z"
+            }
+        }))
+        .expect("seed json"),
+    )
+    .expect("seed known_marketplaces.json");
+
+    // The shim writes this on `plugin install` but omits the top-level
+    // `version: 2` the classifier requires; add it in place, keeping the
+    // shim's own row (whose installPath resolves to its live install tree).
+    let installed_path = plugins_dir.join("installed_plugins.json");
+    let mut installed: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&installed_path).expect("the shim wrote installed_plugins.json"),
+    )
+    .expect("the shim's registry parses");
+    installed["version"] = serde_json::json!(2);
+    std::fs::write(
+        &installed_path,
+        serde_json::to_vec_pretty(&installed).expect("seed json"),
+    )
+    .expect("seed installed_plugins.json");
+
+    // Install flips the enable bit; the shim never writes settings.json.
+    std::fs::write(
+        config.join("settings.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "enabledPlugins": {"clauth@clauth": true}
+        }))
+        .expect("seed json"),
+    )
+    .expect("seed settings.json");
+}
+
+/// Fail loudly when the process cwd's `.claude/settings{,.local}.json` carries
+/// an `enabledPlugins["clauth@clauth"]` entry or does not parse: agentgear's
+/// classifier reads those layers first, so a checkout with a local disable (or
+/// a torn settings file) silently flips every healthy-install verdict. The cwd
+/// is process-global, so it cannot be sandboxed per test — this is the loud
+/// guard, and the message names the residual.
+#[cfg(unix)]
+fn refuse_cwd_settings_layer() {
+    let cwd = std::env::current_dir().expect("process cwd");
+    for name in ["settings.json", "settings.local.json"] {
+        let path = cwd.join(".claude").join(name);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!(
+                "{} cannot be read ({e}); a healthy-install fixture reads the \
+                 process cwd's .claude settings layer first, and agentgear reads \
+                 an unreadable layer as needing a heal, so the test cannot be \
+                 hermetic while that file is unreadable",
+                path.display()
+            ),
+        };
+        let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(e) => panic!(
+                "{} does not parse as JSON ({e}); a healthy-install fixture reads \
+                 the process cwd's .claude settings layer first, so the test \
+                 cannot be hermetic while that file is torn",
+                path.display()
+            ),
+        };
+        if value
+            .get("enabledPlugins")
+            .and_then(|plugins| plugins.get("clauth@clauth"))
+            .is_some()
+        {
+            panic!(
+                "{} sets enabledPlugins[\"clauth@clauth\"]; a healthy-install \
+                 fixture reads the process cwd's .claude settings layer first, so \
+                 the test cannot be hermetic while that entry is present",
+                path.display()
+            );
+        }
+    }
+}
+
 /// RAII `CODEX_HOME` override — [`ConfigDirSandbox`]'s codex twin, same lock
 /// discipline, same restore-on-drop.
 pub(crate) struct CodexHomeSandbox<'a> {

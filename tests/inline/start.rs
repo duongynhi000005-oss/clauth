@@ -657,36 +657,11 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
     .expect("profiles.toml");
     let config = chain_ready_config("wired");
 
-    // Healthy: the gate reads the seeded registry, sees the materialized
-    // pointer with its manifest, and the heal stays out of the launch.
-    let expected = crate::plugin_host::expected_pointer().expect("pointer");
-    std::fs::create_dir_all(expected.join(".claude-plugin")).expect("pointer tree");
-    std::fs::write(
-        expected.join(".claude-plugin").join("marketplace.json"),
-        "{}",
-    )
-    .expect("manifest");
-    let path = expected.to_string_lossy().into_owned();
-    let marketplaces = serde_json::json!({
-        "clauth": {"source": {"source": "directory", "path": path}, "installLocation": path, "lastUpdated": "2026-08-26T00:00:00.000Z"}
-    });
-    let plugins = serde_json::json!({
-        "version": 2,
-        "plugins": {"clauth@clauth": [{"scope": "user", "installPath": path, "version": "0.14.1"}]}
-    });
-    let plugins_dir = claude.join("plugins");
-    std::fs::create_dir_all(&plugins_dir).expect("plugins dir");
-    for (name, value) in [
-        ("known_marketplaces.json", &marketplaces),
-        ("installed_plugins.json", &plugins),
-    ] {
-        std::fs::write(
-            plugins_dir.join(name),
-            serde_json::to_vec_pretty(value).expect("seed json"),
-        )
-        .expect("seed registry");
-    }
+    // Healthy: the shared fixture drives a real install and seeds the registry
+    // files CC writes that the fake CLI does not.
+    crate::testutil::healthy_install(&claude);
 
+    let baseline = fake.log();
     run(
         &config,
         &crate::profile::ProfileName::from("wired"),
@@ -697,15 +672,20 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
         None,
     )
     .expect("healthy start");
+    let after = fake.log();
+    let grown = after
+        .strip_prefix(baseline.as_str())
+        .expect("the shim log only appends");
     assert!(
-        !fake.log().contains("plugin"),
-        "a healthy start must spawn no claude plugin calls, got:\n{}",
-        fake.log()
+        !grown.contains("plugin"),
+        "a healthy start must spawn no claude plugin calls, got:\n{grown}"
     );
 
     // Broken: the marketplace registration vanishes, and the next start heals
     // it through the lifecycle before claude launches.
+    let plugins_dir = claude.join("plugins");
     std::fs::remove_file(plugins_dir.join("known_marketplaces.json")).expect("remove registry");
+    let baseline = fake.log();
     run(
         &config,
         &crate::profile::ProfileName::from("wired"),
@@ -716,10 +696,11 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
         None,
     )
     .expect("broken start");
+    let after = fake.log();
+    let grown = after.strip_prefix(baseline.as_str()).unwrap_or_default();
     assert!(
-        fake.log().contains("plugin list --json"),
-        "a broken registration must heal at start, got:\n{}",
-        fake.log()
+        grown.contains("plugin list --json"),
+        "a broken registration must heal at start, got:\n{grown}"
     );
 }
 

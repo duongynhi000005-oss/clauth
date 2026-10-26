@@ -145,6 +145,7 @@ fn resolve_or_bail(config: &AppConfig, name: &str, verb: &str) -> Result<Profile
 }
 
 fn main() {
+    crate::plugin_host::record_self_exe_at_start();
     // `Error::exit` prints help/version to stdout and exits 0, and any real
     // parse error to stderr and exits 2 — which is already the usage-error half
     // of the exit contract [`exit_code`] owns for the rest.

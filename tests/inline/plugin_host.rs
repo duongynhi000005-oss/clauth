@@ -1,11 +1,9 @@
-//! Inline tests for `plugin_host`. No environment needed: these pin the
-//! compile-time wiring (derive metadata, the embedded tree), the committed
-//! SessionStart hook that points at `clauth self-heal`, the PostToolUse
-//! await-job hook's matcher and wake summary, and the `clauth start`
-//! pre-flight gate's registry shapes. The lifecycle itself (the real `claude`
-//! CLI as transaction boundary) is pinned hermetically by the fake-claude
-//! install test in `tui_app.rs` and exercised for real in the scratch-profile
-//! verifies.
+//! Inline tests for `plugin_host`: the host wiring and its self-heal behind
+//! the spawn-free pre-check. The registry shapes the pre-check reads are
+//! pinned by agentgear's own unit tests, and the lifecycle itself (the real
+//! `claude` CLI as transaction boundary) is pinned hermetically by the
+//! fake-claude install test in `tui_app.rs` and exercised for real in the
+//! scratch-profile verifies.
 
 use super::ClauthPlugin;
 use agentgear::PluginHost;
@@ -219,209 +217,682 @@ fn self_heal_says_nothing_when_healthy_and_reports_changes() {
     let _ = &fake;
 }
 
-// ── the start pre-flight gate ─────────────────────────────────────────────
+// ── the spawn-free pre-check gate ─────────────────────────────────────────
 
-/// One gate fixture: the env harness comes up FIRST (so `expected_pointer`
-/// resolves inside the sandbox), the seed closure builds the registry pair
-/// against the sandbox's config dir and pointer, then the verdict runs. The
-/// gate itself never spawns; the shim is never called.
+/// The hook's spawn-free contract: two hook runs in a row on a healthy install
+/// spawn no `claude` at all. The install's own spawns are the baseline; the
+/// hook runs must add nothing to the shim log.
 #[cfg(unix)]
-fn gate_verdict(
-    seed: impl FnOnce(&std::path::Path, &std::path::Path) -> (serde_json::Value, serde_json::Value),
-) -> bool {
+#[test]
+fn self_heal_spawns_no_claude_on_a_healthy_registration() {
     use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
 
     let home = HomeSandbox::new();
-    let claude = home.home().join(".claude-config");
-    std::fs::create_dir_all(&claude).expect("config dir");
-    let _config = ConfigDirSandbox::new(&home, &claude);
-    let _fake = FakeClaude::new(&home);
-    let expected = super::expected_pointer().expect("pointer");
-    let (marketplaces, plugins) = seed(&claude, &expected);
-    let dir = claude.join("plugins");
-    std::fs::create_dir_all(&dir).expect("plugins dir");
-    for (name, value) in [
-        ("known_marketplaces.json", &marketplaces),
-        ("installed_plugins.json", &plugins),
-    ] {
-        std::fs::write(
-            dir.join(name),
-            serde_json::to_vec_pretty(value).expect("seed json"),
-        )
-        .expect("seed registry");
-    }
-    super::preflight_gate()
-}
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let fake = FakeClaude::new(&home);
+    crate::testutil::healthy_install(&config);
+    let baseline = fake.log();
 
-/// The healthy pair: a directory-source `clauth` entry registered exactly at
-/// the materialized pointer (created on disk, manifest included) plus a
-/// user-scope plugin entry whose files resolve. Every shape test below breaks
-/// exactly one half of this and keeps the other.
-#[cfg(unix)]
-fn healthy_registry(
-    _claude: &std::path::Path,
-    expected: &std::path::Path,
-) -> (serde_json::Value, serde_json::Value) {
-    std::fs::create_dir_all(expected.join(".claude-plugin")).expect("pointer tree");
-    std::fs::write(
-        expected.join(".claude-plugin").join("marketplace.json"),
-        "{}",
-    )
-    .expect("manifest");
-    let path = expected.to_string_lossy().into_owned();
-    (
-        serde_json::json!({
-            "clauth": {
-                "source": {"source": "directory", "path": path},
-                "installLocation": path,
-                "lastUpdated": "2026-08-26T00:00:00.000Z"
-            }
-        }),
-        serde_json::json!({
-            "version": 2,
-            "plugins": {"clauth@clauth": [{"scope": "user", "installPath": path, "version": "0.14.1"}]}
-        }),
-    )
-}
-
-/// The decision's own pin: a healthy registration costs a start no heal, which
-/// is what keeps the pre-flight spawn-free on the common path.
-#[cfg(unix)]
-#[test]
-fn preflight_gate_stays_shut_on_a_healthy_registration() {
-    let verdict = gate_verdict(healthy_registry);
-    assert!(
-        !verdict,
-        "a registration at the materialized pointer with its manifest present must not heal"
+    super::self_heal().expect("first hook run");
+    super::self_heal().expect("second hook run");
+    assert_eq!(
+        fake.log(),
+        baseline,
+        "a healthy registration must spawn no claude from the hook"
     );
 }
 
-/// Every shape the gate exists to catch, one break at a time from the healthy
-/// twin: marketplace absent, github-sourced, path diverged, path missing,
-/// manifest deleted, plugin installPath dead, plugin entry carrying load errors.
-/// Each is the deadlock half of the migration — the plugin then loads 0 hooks
-/// and the hook-side heal never fires.
+/// The other half of the spawn-free pin: a hook run on a registration the
+/// pre-check flags still heals, so a hook that never heals at all cannot pass
+/// the spawn-free pin above. A dead installPath is the shape: the entry
+/// survives a per-session config dir's collection, its `installPath` dies, and
+/// only the heal rewrites it.
 #[cfg(unix)]
 #[test]
-fn preflight_gate_fires_on_every_broken_or_divergent_shape() {
-    let broken = tempfile::tempdir().expect("tempdir");
-    let broken_path = broken.path().join("registered");
-    std::fs::create_dir_all(broken_path.join(".claude-plugin")).expect("broken dir");
-    let broken_path = broken_path.to_string_lossy().into_owned();
-    let healthy_plugins =
-        |claude: &std::path::Path, expected: &std::path::Path| healthy_registry(claude, expected).1;
-    let healthy_mkt =
-        |claude: &std::path::Path, expected: &std::path::Path| healthy_registry(claude, expected).0;
-    type Seed =
-        Box<dyn Fn(&std::path::Path, &std::path::Path) -> (serde_json::Value, serde_json::Value)>;
-    let cases: Vec<(&str, Seed)> = vec![
-        (
-            "marketplace entry absent",
-            Box::new(move |claude, expected| {
-                (serde_json::json!({}), healthy_plugins(claude, expected))
-            }),
-        ),
-        (
-            "marketplace entry github-sourced",
-            Box::new(move |claude, expected| {
-                (
-                    serde_json::json!({"clauth": {"source": {"source": "github", "repo": "uwuclxdy/clauth"}}}),
-                    healthy_plugins(claude, expected),
-                )
-            }),
-        ),
-        (
-            "marketplace path diverged from the pointer",
-            Box::new(move |claude, expected| {
-                (
-                    serde_json::json!({"clauth": {"source": {"source": "directory", "path": "/old/checkout/plugins"}}}),
-                    healthy_plugins(claude, expected),
-                )
-            }),
-        ),
-        (
-            "marketplace path missing",
-            Box::new(move |claude, expected| {
-                (
-                    serde_json::json!({"clauth": {"source": {"source": "directory"}}}),
-                    healthy_plugins(claude, expected),
-                )
-            }),
-        ),
-        (
-            "marketplace manifest deleted",
-            Box::new(move |claude, expected| {
-                (
-                    serde_json::json!({"clauth": {"source": {"source": "directory", "path": broken_path.clone()}}}),
-                    healthy_plugins(claude, expected),
-                )
-            }),
-        ),
-        (
-            "plugin entry installPath dead",
-            Box::new(move |claude, expected| {
-                (
-                    healthy_mkt(claude, expected),
-                    serde_json::json!({"version": 2, "plugins": {"clauth@clauth": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}}),
-                )
-            }),
-        ),
-        (
-            "plugin entry carries load errors",
-            Box::new(move |claude, expected| {
-                let healthy_mkt = healthy_mkt(claude, expected);
-                let healthy_path = healthy_mkt["clauth"]["source"]["path"]
-                    .as_str()
-                    .expect("path")
-                    .to_string();
-                (
-                    healthy_mkt,
-                    serde_json::json!({
-                        "version": 2,
-                        "plugins": {"clauth@clauth": [{"scope": "user", "installPath": healthy_path, "errors": ["Marketplace clauth failed to load: cache-miss"]}]}
-                    }),
-                )
-            }),
-        ),
-    ];
-    for (name, seed) in cases {
-        assert!(gate_verdict(seed), "{name} must trip the gate");
-    }
+fn self_heal_still_heals_a_broken_registration() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let fake = FakeClaude::new(&home);
+    crate::testutil::healthy_install(&config);
+
+    let installed_path = config.join("plugins").join("installed_plugins.json");
+    let mut installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&installed_path).expect("read registry"))
+            .expect("registry parses");
+    installed["plugins"]["clauth@clauth"][0]["installPath"] =
+        serde_json::json!("/gone/runtime/plugins/cache");
+    std::fs::write(
+        &installed_path,
+        serde_json::to_vec_pretty(&installed).expect("seed json"),
+    )
+    .expect("seed broken registry");
+    let baseline = fake.log();
+
+    super::self_heal().expect("hook run");
+    let after = fake.log();
+    let grown = after.strip_prefix(baseline.as_str()).unwrap_or_default();
+    assert!(
+        grown.contains("plugin list --json"),
+        "a broken registration must reach the heal's `claude plugin` calls, got:\n{grown}"
+    );
 }
 
-/// A project-scope entry never trips the gate: the heal is user-scope and
-/// cannot fix it, so counting it would churn one heal per start for nothing.
+/// A re-point failure must not skip the heal: the installPath convergence leg
+/// runs beside the heal, so a registry the re-point cannot read still reaches
+/// the heal (the pre-check reads the unparseable registry as "cannot tell" and
+/// heals conservatively), and the re-point error still surfaces from the hook.
 #[cfg(unix)]
 #[test]
-fn preflight_gate_ignores_project_scope_entries() {
-    let verdict = gate_verdict(|claude, expected| {
-        let (marketplaces, _) = healthy_registry(claude, expected);
-        let plugins = serde_json::json!({
-            "version": 2,
-            "plugins": {"clauth@clauth": [{"scope": "project", "installPath": "/gone/runtime/plugins/cache"}]}
-        });
-        (marketplaces, plugins)
-    });
+fn self_heal_still_heals_past_a_repoint_error() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    std::fs::create_dir_all(&claude).expect("~/.claude");
+    let _config = ConfigDirSandbox::new(&home, &claude);
+    let fake = FakeClaude::new(&home);
+    crate::testutil::healthy_install(&claude);
+
+    // Both legs read the one config dir here: the re-point leg fails on the
+    // non-UTF-8 bytes, and the pre-check reads them as "cannot tell" (heal).
+    let installed_path = claude.join("plugins").join("installed_plugins.json");
+    std::fs::write(&installed_path, [0xff, 0xfe, 0xfd]).expect("corrupt registry");
+    let baseline = fake.log();
+
+    let result = super::self_heal();
+    let after = fake.log();
+    let grown = after.strip_prefix(baseline.as_str()).unwrap_or_default();
     assert!(
-        !verdict,
-        "a dead project entry is not the user-scope heal's job"
+        grown.contains("plugin list --json"),
+        "the heal must still run past a re-point error, got:\n{grown}"
+    );
+    let err = result.expect_err("the re-point error still surfaces from the hook");
+    assert!(
+        format!("{err:#}").starts_with(&format!("reading {}: not utf-8", installed_path.display())),
+        "the error is the re-point read, not a heal error, got: {err:#}"
+    );
+}
+
+/// A box that never installed the plugin (no registry, no marker) spawns
+/// nothing from the hook: the pre-check reads Clean, so the hook stays quiet.
+#[cfg(unix)]
+#[test]
+fn self_heal_spawns_nothing_on_a_never_installed_box() {
+    use crate::testutil::{FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    let fake = FakeClaude::new(&home);
+
+    super::self_heal().expect("hook run");
+    super::self_heal().expect("second hook run");
+    assert!(
+        fake.log().is_empty(),
+        "a never-installed box must spawn no claude from the hook, got:\n{}",
+        fake.log()
+    );
+}
+
+/// The stand-down must not fire when this process's own executable is unchanged
+/// since it started: a flagged registration still heals. The seam pins the
+/// recorded path, the file is left unchanged, and the decision stats it for
+/// real — so the comparison reads "unchanged".
+#[cfg(unix)]
+#[test]
+fn self_heal_heals_when_this_process_is_unchanged() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let fake = FakeClaude::new(&home);
+    crate::testutil::healthy_install(&config);
+
+    // Pin the recorded path and leave the file in place, so the decision's
+    // real stat reads "unchanged".
+    let self_exe = crate::testutil::write_shim(home.home(), "self-exe", "exit 0");
+    let _self = super::SelfExeOverride::pin(Some(self_exe.as_path()));
+
+    // Break the registration so the gate fires, then the hook must heal.
+    let installed_path = config.join("plugins").join("installed_plugins.json");
+    let mut installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&installed_path).expect("read registry"))
+            .expect("registry parses");
+    installed["plugins"]["clauth@clauth"][0]["installPath"] =
+        serde_json::json!("/gone/runtime/plugins/cache");
+    std::fs::write(
+        &installed_path,
+        serde_json::to_vec_pretty(&installed).expect("seed json"),
+    )
+    .expect("seed broken registry");
+    let baseline = fake.log();
+
+    super::self_heal().expect("hook run");
+    let after = fake.log();
+    let grown = after.strip_prefix(baseline.as_str()).unwrap_or_default();
+    assert!(
+        grown.contains("plugin list --json"),
+        "an unchanged self image must still heal a flagged registry, got:\n{grown}"
+    );
+}
+
+/// The stand-down: when this process's own executable was replaced since it
+/// started, the hook skips the heal (no `claude` spawn) and says so once per
+/// process, naming the recorded path. "Replaced" is a real rename-replace of
+/// the recorded file — a new file written beside it, then `rename` over it — so
+/// the decision's real stat sees a new inode.
+#[cfg(unix)]
+#[test]
+fn self_heal_stands_down_when_this_process_was_replaced() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    super::reset_stand_down_report_for_test();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let fake = FakeClaude::new(&home);
+    crate::testutil::healthy_install(&config);
+
+    // Pin the recorded path, then replace the file at that path with a new
+    // inode: write a new file beside it and `rename` it over.
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = super::SelfExeOverride::pin(Some(recorded.as_path()));
+    let replacement =
+        crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+    std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+
+    // Break the registration so the gate would fire; the stand-down must win.
+    let installed_path = config.join("plugins").join("installed_plugins.json");
+    let mut installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&installed_path).expect("read registry"))
+            .expect("registry parses");
+    installed["plugins"]["clauth@clauth"][0]["installPath"] =
+        serde_json::json!("/gone/runtime/plugins/cache");
+    std::fs::write(
+        &installed_path,
+        serde_json::to_vec_pretty(&installed).expect("seed json"),
+    )
+    .expect("seed broken registry");
+    let baseline = fake.log();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    super::self_heal().expect("hook run");
+    super::self_heal().expect("second hook run");
+
+    assert_eq!(
+        fake.log(),
+        baseline,
+        "a replaced self image must spawn no claude from the hook"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        [format!(
+            "clauth: skipping the plugin heal: this process's executable {} was \
+             replaced or removed since it started; the current binary converges the plugin \
+             registration",
+            recorded.display()
+        )],
+        "the stand-down is said once per process, naming the recorded path"
+    );
+}
+
+/// Drive the hook once after `replace` changes the recorded file, and assert
+/// it stood down: no `claude` spawn, and the one stand-down line naming the
+/// recorded path. `replace` gets the recorded path and the sandbox home.
+#[cfg(unix)]
+fn assert_hook_stands_down_after(replace: impl FnOnce(&std::path::Path, &std::path::Path)) {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    super::reset_stand_down_report_for_test();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let fake = FakeClaude::new(&home);
+    crate::testutil::healthy_install(&config);
+
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = super::SelfExeOverride::pin(Some(recorded.as_path()));
+    replace(&recorded, home.home());
+
+    // Break the registration so the gate would fire; the stand-down must win.
+    let installed_path = config.join("plugins").join("installed_plugins.json");
+    let mut installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&installed_path).expect("read registry"))
+            .expect("registry parses");
+    installed["plugins"]["clauth@clauth"][0]["installPath"] =
+        serde_json::json!("/gone/runtime/plugins/cache");
+    std::fs::write(
+        &installed_path,
+        serde_json::to_vec_pretty(&installed).expect("seed json"),
+    )
+    .expect("seed broken registry");
+    let baseline = fake.log();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    super::self_heal().expect("hook run");
+
+    assert_eq!(
+        fake.log(),
+        baseline,
+        "a replaced self image must spawn no claude from the hook"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        [format!(
+            "clauth: skipping the plugin heal: this process's executable {} was \
+             replaced or removed since it started; the current binary converges the plugin \
+             registration",
+            recorded.display()
+        )]
+    );
+}
+
+/// A same-size file carrying the recorded file's mtime, renamed over it, is
+/// still a replacement: only the new inode tells it apart.
+#[cfg(unix)]
+#[test]
+fn self_heal_stands_down_when_a_same_size_same_mtime_file_is_renamed_over_it() {
+    assert_hook_stands_down_after(|recorded, home| {
+        let mtime = std::fs::metadata(recorded)
+            .and_then(|meta| meta.modified())
+            .expect("recorded mtime");
+        // Same length as the recorded "exit 0" body.
+        let replacement = crate::testutil::write_shim(home, "self-exe-same-size", "exit 1");
+        crate::testutil::set_mtime(&replacement, mtime);
+        std::fs::rename(&replacement, recorded).expect("rename-replace the recorded file");
+    });
+}
+
+/// An in-place rewrite (the same inode, as `cp new <installed>` does on macOS)
+/// of the same length is a replacement: only the moved mtime tells it apart.
+#[cfg(unix)]
+#[test]
+fn self_heal_stands_down_when_its_file_is_rewritten_in_place() {
+    assert_hook_stands_down_after(|recorded, _home| {
+        let mtime = std::fs::metadata(recorded)
+            .and_then(|meta| meta.modified())
+            .expect("recorded mtime");
+        std::fs::write(recorded, "#!/bin/sh\nexit 1\n").expect("rewrite in place");
+        crate::testutil::set_mtime(recorded, mtime + std::time::Duration::from_secs(60));
+    });
+}
+
+/// An in-place rewrite of the same length inside the same second is still a
+/// replacement: `cp` onto the installed binary right after an install moves
+/// the mtime by less than a second. Needs a temp filesystem storing mtimes at
+/// 1 ms or finer (ext4, APFS); on a whole-second one the rewrite is invisible
+/// to the product too, and this test reds.
+#[cfg(unix)]
+#[test]
+fn self_heal_stands_down_when_its_file_is_rewritten_in_place_within_the_second() {
+    assert_hook_stands_down_after(|recorded, _home| {
+        let mtime = std::fs::metadata(recorded)
+            .and_then(|meta| meta.modified())
+            .expect("recorded mtime");
+        let since_epoch = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("mtime after the epoch");
+        // Land in the recorded mtime's own second but off its sub-second
+        // part, so only a reading finer than whole seconds sees the move.
+        let offset = if since_epoch.subsec_millis() == 1 {
+            2
+        } else {
+            1
+        };
+        let same_second = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(since_epoch.as_secs())
+            + std::time::Duration::from_millis(offset);
+        std::fs::write(recorded, "#!/bin/sh\nexit 1\n").expect("rewrite in place");
+        crate::testutil::set_mtime(recorded, same_second);
+    });
+}
+
+/// An in-place rewrite that keeps the recorded mtime is a replacement when its
+/// length moved: only the length tells it apart.
+#[cfg(unix)]
+#[test]
+fn self_heal_stands_down_when_its_file_grows_in_place_under_the_same_mtime() {
+    assert_hook_stands_down_after(|recorded, _home| {
+        let mtime = std::fs::metadata(recorded)
+            .and_then(|meta| meta.modified())
+            .expect("recorded mtime");
+        std::fs::write(recorded, "#!/bin/sh\nexit 0 # grown\n").expect("rewrite in place");
+        crate::testutil::set_mtime(recorded, mtime);
+    });
+}
+
+/// The stand-down also fires when the recorded path is gone: the hook skips
+/// the heal and says so, naming the recorded path. The decision's real stat of
+/// a deleted file reads "gone".
+#[cfg(unix)]
+#[test]
+fn self_heal_stands_down_when_this_process_is_gone() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    super::reset_stand_down_report_for_test();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let fake = FakeClaude::new(&home);
+    crate::testutil::healthy_install(&config);
+
+    // Pin the recorded path, then delete the file at that path.
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = super::SelfExeOverride::pin(Some(recorded.as_path()));
+    std::fs::remove_file(&recorded).expect("delete the recorded file");
+
+    // Break the registration so the gate would fire; the stand-down must win.
+    let installed_path = config.join("plugins").join("installed_plugins.json");
+    let mut installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&installed_path).expect("read registry"))
+            .expect("registry parses");
+    installed["plugins"]["clauth@clauth"][0]["installPath"] =
+        serde_json::json!("/gone/runtime/plugins/cache");
+    std::fs::write(
+        &installed_path,
+        serde_json::to_vec_pretty(&installed).expect("seed json"),
+    )
+    .expect("seed broken registry");
+    let baseline = fake.log();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    super::self_heal().expect("hook run");
+
+    assert_eq!(
+        fake.log(),
+        baseline,
+        "a gone self image must spawn no claude from the hook"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        [format!(
+            "clauth: skipping the plugin heal: this process's executable {} was \
+             replaced or removed since it started; the current binary converges the plugin \
+             registration",
+            recorded.display()
+        )],
+        "a gone self image stands down, naming the recorded path"
+    );
+}
+
+/// Recording this process's executable failed at start, so the stand-down
+/// fails open and a flagged registration still heals, the fail-open note said
+/// once per process.
+#[cfg(unix)]
+#[test]
+fn self_heal_heals_when_the_recording_failed() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    super::reset_record_failure_report_for_test();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let fake = FakeClaude::new(&home);
+    crate::testutil::healthy_install(&config);
+
+    // `None` recorded poses "recording failed at start".
+    let _self = super::SelfExeOverride::pin(None);
+
+    let installed_path = config.join("plugins").join("installed_plugins.json");
+    let mut installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&installed_path).expect("read registry"))
+            .expect("registry parses");
+    installed["plugins"]["clauth@clauth"][0]["installPath"] =
+        serde_json::json!("/gone/runtime/plugins/cache");
+    std::fs::write(
+        &installed_path,
+        serde_json::to_vec_pretty(&installed).expect("seed json"),
+    )
+    .expect("seed broken registry");
+    let baseline = fake.log();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    super::self_heal().expect("hook run");
+    super::self_heal().expect("second hook run");
+    let after = fake.log();
+    let grown = after.strip_prefix(baseline.as_str()).unwrap_or_default();
+    assert!(
+        grown.contains("plugin list --json"),
+        "a failed recording must still heal a flagged registry, got:\n{grown}"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        [
+            "clauth: could not record this process's executable at start; the \
+          plugin heal runs without the replaced-image stand-down"
+        ],
+        "the fail-open note is said once, naming what the heal runs without"
+    );
+}
+
+/// The production identity read, exercised explicitly through the seam: this
+/// test binary's own image is unchanged, so the hook heals a flagged
+/// registration through the real record-and-compare path. The mutant that
+/// inverts the decision's replaced arm reds here. This test reads the real
+/// process record by design, so it reds if the test binary is rebuilt in
+/// place while it runs (a second `cargo` run in the same build dir); the
+/// seam-pinned heal tests do not.
+#[cfg(unix)]
+#[test]
+fn self_heal_heals_through_the_production_read_when_this_process_is_unchanged() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    let _production = super::SelfExeOverride::production();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let fake = FakeClaude::new(&home);
+    crate::testutil::healthy_install(&config);
+
+    let installed_path = config.join("plugins").join("installed_plugins.json");
+    let mut installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&installed_path).expect("read registry"))
+            .expect("registry parses");
+    installed["plugins"]["clauth@clauth"][0]["installPath"] =
+        serde_json::json!("/gone/runtime/plugins/cache");
+    std::fs::write(
+        &installed_path,
+        serde_json::to_vec_pretty(&installed).expect("seed json"),
+    )
+    .expect("seed broken registry");
+    let baseline = fake.log();
+
+    super::self_heal().expect("hook run");
+    let after = fake.log();
+    let grown = after.strip_prefix(baseline.as_str()).unwrap_or_default();
+    assert!(
+        grown.contains("plugin list --json"),
+        "the production read must see this test binary unchanged and heal, got:\n{grown}"
+    );
+}
+
+/// The detached leg's copy of the stand-down: a replaced self image makes
+/// `heal_detached` skip the heal even when the gate fires, and says so once,
+/// naming the recorded path. "Replaced" is a real rename-replace of the
+/// recorded file.
+#[cfg(unix)]
+#[test]
+fn heal_detached_stands_down_when_this_process_was_replaced() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox, join_background_tasks};
+
+    let home = HomeSandbox::new();
+    super::reset_stand_down_report_for_test();
+    super::reset_heal_throttle_for_test();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let fake = FakeClaude::new(&home);
+    crate::testutil::healthy_install(&config);
+
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = super::SelfExeOverride::pin(Some(recorded.as_path()));
+    let replacement =
+        crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+    std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+
+    let installed_path = config.join("plugins").join("installed_plugins.json");
+    let mut installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&installed_path).expect("read registry"))
+            .expect("registry parses");
+    installed["plugins"]["clauth@clauth"][0]["installPath"] =
+        serde_json::json!("/gone/runtime/plugins/cache");
+    std::fs::write(
+        &installed_path,
+        serde_json::to_vec_pretty(&installed).expect("seed json"),
+    )
+    .expect("seed broken registry");
+    let baseline = fake.log();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    super::heal_detached();
+    join_background_tasks();
+    assert_eq!(
+        fake.log(),
+        baseline,
+        "a replaced self image must make the detached heal skip the spawn"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        [format!(
+            "clauth: skipping the plugin heal: this process's executable {} was \
+             replaced or removed since it started; the current binary converges the plugin \
+             registration",
+            recorded.display()
+        )],
+        "the detached stand-down is said once, naming the recorded path"
+    );
+}
+
+/// A box that holds only another plugin's registration (no clauth row, no
+/// clauth marketplace entry, no marker) reads Clean: the gate stays shut and
+/// the hook spawns nothing. This pins agentgear's `installed_entry` answering
+/// the asked-for plugin, never a neighbouring row.
+#[cfg(unix)]
+#[test]
+fn self_heal_stays_clean_when_only_another_plugin_is_registered() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let fake = FakeClaude::new(&home);
+
+    // No install: seed only another plugin's user row and marketplace entry.
+    let plugins_dir = config.join("plugins");
+    std::fs::create_dir_all(&plugins_dir).expect("plugins dir");
+    std::fs::write(
+        plugins_dir.join("known_marketplaces.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "other": {
+                "source": {"source": "directory", "path": "/nowhere/other"},
+                "installLocation": "/nowhere/other",
+                "lastUpdated": "2026-10-26T00:00:00.000Z"
+            }
+        }))
+        .expect("seed json"),
+    )
+    .expect("seed known_marketplaces.json");
+    std::fs::write(
+        plugins_dir.join("installed_plugins.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 2,
+            "plugins": {
+                "other@other": [{"scope": "user", "installPath": "/nowhere/other/plugins/cache"}]
+            }
+        }))
+        .expect("seed json"),
+    )
+    .expect("seed installed_plugins.json");
+
+    assert!(
+        !super::preflight_gate(),
+        "a registry holding only another plugin must read Clean"
+    );
+    let baseline = fake.log();
+    super::self_heal().expect("hook run");
+    assert_eq!(
+        fake.log(),
+        baseline,
+        "only another plugin registered must spawn nothing from the hook"
+    );
+}
+
+/// The decision's own pin: a healthy registration costs a heal caller nothing —
+/// the pre-check reads Clean and the heal stays out.
+#[cfg(unix)]
+#[test]
+fn preflight_gate_stays_shut_on_a_healthy_registration() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let _fake = FakeClaude::new(&home);
+    crate::testutil::healthy_install(&config);
+    assert!(
+        !super::preflight_gate(),
+        "a registration at the materialized pointer with its manifest and marker present must not heal"
+    );
+}
+
+/// A binary upgrade leaves the registered plugin one version behind; only the
+/// heal moves CC onto the new tree, so the pre-check must read that stale
+/// version as Needed.
+#[cfg(unix)]
+#[test]
+fn preflight_gate_heals_a_plugin_registered_at_an_older_version() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let _fake = FakeClaude::new(&home);
+    crate::testutil::healthy_install(&config);
+
+    let installed_path = config.join("plugins").join("installed_plugins.json");
+    let mut installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&installed_path).expect("read registry"))
+            .expect("registry parses");
+    installed["plugins"]["clauth@clauth"][0]["version"] = serde_json::json!("0.0.1");
+    std::fs::write(
+        &installed_path,
+        serde_json::to_vec_pretty(&installed).expect("seed json"),
+    )
+    .expect("seed stale registry");
+    assert!(
+        super::preflight_gate(),
+        "a registration older than this binary's plugin must heal"
     );
 }
 
 /// ABSENT registry files are the never-installed box, not "cannot tell": a
 /// config dir that has never held a plugin has no `plugins/` directory at all,
-/// so a gate keyed only on "parses, names nothing" would heal for exactly the
-/// population the carve-out exists for. agentgear converges nothing there (no
-/// marker, no entry), so the spawn buys a session-boot cost and no repair.
+/// so the pre-check reads Clean (no entry, no marker) and spawns nothing.
 #[cfg(unix)]
 #[test]
 fn preflight_gate_stays_shut_when_the_registry_files_are_absent() {
-    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+    use crate::testutil::{FakeClaude, HomeSandbox};
 
     let home = HomeSandbox::new();
-    let claude = home.home().join(".claude-config");
-    std::fs::create_dir_all(&claude).expect("config dir");
-    let _config = ConfigDirSandbox::new(&home, &claude);
     let _fake = FakeClaude::new(&home);
     assert!(
         !super::preflight_gate(),
@@ -429,51 +900,9 @@ fn preflight_gate_stays_shut_when_the_registry_files_are_absent() {
     );
 }
 
-/// UNREADABLE is the other verdict and keeps healing: a truncated or
-/// permission-denied registry says only that this pass cannot tell, and the heal
-/// is idempotent. The pair is what makes the absent case above safe to carve out.
-#[cfg(unix)]
-#[test]
-fn preflight_gate_heals_when_a_registry_file_is_unparseable() {
-    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
-
-    let home = HomeSandbox::new();
-    let claude = home.home().join(".claude-config");
-    std::fs::create_dir_all(&claude).expect("config dir");
-    let _config = ConfigDirSandbox::new(&home, &claude);
-    let _fake = FakeClaude::new(&home);
-    let dir = claude.join("plugins");
-    std::fs::create_dir_all(&dir).expect("plugins dir");
-    std::fs::write(dir.join("known_marketplaces.json"), "{\"clauth\":").expect("truncated");
-    std::fs::write(dir.join("installed_plugins.json"), "{}").expect("installed");
-    assert!(
-        super::preflight_gate(),
-        "a registry file this pass cannot parse must heal, conservatively"
-    );
-}
-
 // ── the detached heal ──────────────────────────────────────────────────────
 
-/// The migration's own first-run gate: a box that never installed the plugin
-/// (both registry files parse, neither names `clauth`) must read "nothing to
-/// heal", not "heal". A false positive here makes every `clauth mcp` boot and
-/// daemon tick spawn `claude plugin list --json` for nothing.
-#[cfg(unix)]
-#[test]
-fn preflight_gate_stays_shut_when_nothing_of_ours_is_registered() {
-    let verdict = gate_verdict(|_claude, _expected| {
-        (
-            serde_json::json!({"other": {"source": {"source": "github", "repo": "x/y"}}}),
-            serde_json::json!({"version": 2, "plugins": {"other@other": [{"scope": "user"}]}}),
-        )
-    });
-    assert!(
-        !verdict,
-        "no clauth marketplace + no clauth@clauth row must not heal"
-    );
-}
-
-/// The detached heal's "only when the gate says heal" half: a healthy
+/// The detached heal's "only when the pre-check says heal" half: a healthy
 /// registration makes `heal_detached()` a no-op that spawns no `claude`. This is
 /// the shape `clauth mcp` and the daemon hit on a working box.
 #[cfg(unix)]
@@ -490,26 +919,14 @@ fn heal_detached_skips_when_the_gate_says_healthy() {
     std::fs::create_dir_all(&config).expect("config dir");
     let _config = ConfigDirSandbox::new(&home, &config);
     let fake = FakeClaude::new(&home);
-
-    let expected = super::expected_pointer().expect("pointer");
-    let (marketplaces, plugins) = healthy_registry(&config, &expected);
-    let dir = config.join("plugins");
-    std::fs::create_dir_all(&dir).expect("plugins dir");
-    for (name, value) in [
-        ("known_marketplaces.json", &marketplaces),
-        ("installed_plugins.json", &plugins),
-    ] {
-        std::fs::write(
-            dir.join(name),
-            serde_json::to_vec_pretty(value).expect("seed json"),
-        )
-        .expect("seed registry");
-    }
+    crate::testutil::healthy_install(&config);
+    let baseline = fake.log();
 
     super::heal_detached();
     join_background_tasks();
-    assert!(
-        fake.log().is_empty(),
+    assert_eq!(
+        fake.log(),
+        baseline,
         "a healthy registration must spawn no claude, got:\n{}",
         fake.log()
     );

@@ -6149,8 +6149,9 @@ fn startup() -> Option<std::fs::File> {
     }
     jobs::gc(now_ms());
     // Converge a broken plugin registration without ever blocking the stdio
-    // handshake: the gate is two registry reads inline, and a needed heal runs
-    // on its own thread (throttled inside `heal_detached`), never on stdout.
+    // handshake: the gate is agentgear's spawn-free pre-check (file reads, no
+    // `claude` spawn), and a needed heal runs on its own thread (throttled
+    // inside `heal_detached`), never on stdout.
     //
     // Not under the Services tab's boot probe, which spawns a real `clauth mcp`
     // and kills it within seconds: a heal started there is a mutating lifecycle

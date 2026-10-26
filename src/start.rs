@@ -890,10 +890,11 @@ pub(crate) fn run(
     // The plugin-migration pre-flight: heal a broken or divergent clauth
     // marketplace registration before the session launches, so the session loads
     // its hooks and MCP. A healthy registration costs this nothing — the gate is
-    // two registry-file reads and spawns no `claude`. Best-effort: a failed heal
-    // is logged, never fails the start. `claude` the binary (not just the plugin
-    // CLI) needs to be on PATH anyway for the spawn below to succeed, and an
-    // uninstalled plugin heals to a one-read no-op.
+    // agentgear's spawn-free pre-check (file reads, no `claude` spawn).
+    // Best-effort: a failed heal is logged, never fails the start. `claude` the
+    // binary (not just the plugin CLI) needs to be on PATH anyway for the spawn
+    // below to succeed, and an uninstalled plugin clears its stale marker
+    // once, then reads Clean.
     crate::plugin_host::preflight();
 
     // Strip the outgoing profile's custom env from the inherited base so a

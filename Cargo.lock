@@ -10,9 +10,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agentgear"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "773c81a11f35a3842caf3403c9993f3d0d1d9d672d9fb3c4454080c04dfa040f"
+checksum = "ce1ef0eb25ce67cf4d706dea8bf67236bac27937c41e2075882e11e832d01b97"
 dependencies = [
  "agentgear-derive",
  "brotli",
@@ -30,9 +30,9 @@ dependencies = [
 
 [[package]]
 name = "agentgear-derive"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d41224cc1e599031fb55ba3603c0f3cf16b6ab42c20e138e943097e6b18424b"
+checksum = "bb1155487cdf35f0972d52bafab4563d01f547571aadb8ef1e815562df0bc8f6"
 dependencies = [
  "proc-macro2",
  "quote",

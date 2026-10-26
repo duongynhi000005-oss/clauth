@@ -72,9 +72,10 @@ impl super::Daemon {
         // parks this tick behind a held sync lock, and no ranked lock is held
         // here, so entering the JsonSync rank is legal.
         crate::claude_json::try_honor_pending_strip();
-        // Converge a broken plugin registration in the background. The gate is two
-        // registry reads inline and a needed heal runs detached (throttled inside
-        // `heal_detached`), so this never blocks the run loop.
+        // Converge a broken plugin registration in the background. The gate is
+        // agentgear's spawn-free pre-check (file reads, no `claude` spawn), and a
+        // needed heal runs detached (throttled inside `heal_detached`), so this
+        // never blocks the run loop.
         crate::plugin_host::heal_detached();
         // Same shape for the herdr plugin: update a stale install in the
         // background, throttled inside its own `heal_detached`. Its saved
