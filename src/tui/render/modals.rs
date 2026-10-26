@@ -18,7 +18,7 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::chain::reason_marker;
-use super::format::{spinner_frame, truncate};
+use super::format::{grapheme_cells, spinner_frame, truncate};
 use super::overview::switch_mark;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_CREDIT_CAP_LEGEND, DIAG_DISABLED,
@@ -696,20 +696,38 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
 /// unit it belongs to.
 type Flat = (String, usize, Style, Option<usize>);
 
+/// The cells a line draws, summed per grapheme: a whole-string measure folds a
+/// lam-alef cluster to one cell and the buffer draws it as two, so a line that
+/// only looks like it fits would overrun its row.
+fn line_cells(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| grapheme_cells(span.content.as_ref()))
+        .sum()
+}
+
 /// [`chunk_line`] over a line carrying marked units ([`prose::marked`]): a
 /// grapheme inside a unit range only breaks where the unit does, so a key or
-/// command that fits a row stays on one. Punctuation pressed against a unit is
-/// placed beside it, never measured with it: the leading glue stays where it
-/// fits, the unit takes a row it fits, and the trailing glue opens the next
-/// row when it cannot ride the unit's. A unit wider than the row still breaks
-/// at its own spaces, then by grapheme like prose.
+/// command that fits a row stays on one, and units joined by punctuation wrap
+/// as one run from the first marked grapheme to the last. Punctuation pressed
+/// against a unit is placed beside it, never measured with it: the leading
+/// glue stays where it fits, the unit takes a row it fits, and the trailing
+/// glue rides the unit's row when it fits there, else opens the next row
+/// whole. A unit wider than the row breaks at its own spaces, then by grapheme
+/// like prose, while glue pressed against its first or last word takes a row
+/// of its own when that word fits one but the two together do not.
 fn chunk_line_units(
     line: Line<'_>,
     w: usize,
     units: &[std::ops::Range<usize>],
 ) -> Vec<Line<'static>> {
     let line = normalize_tabs(&line);
-    if w == 0 || line.width() <= w {
+    let fits = if units.is_empty() {
+        line.width() <= w
+    } else {
+        line_cells(&line) <= w
+    };
+    if w == 0 || fits {
         return vec![line];
     }
 
@@ -753,8 +771,31 @@ fn chunk_line_units(
     enum Atom {
         Space(Vec<Flat>),
         Word(Vec<Flat>),
-        /// A marked run that fits a row: placed whole, never cell-split.
+        /// A marked run that fits a row, or a piece of one cut at a join:
+        /// placed whole, never cell-split unless wider than the row.
         Unit(Vec<Flat>),
+        /// Punctuation joining two marked runs inside a run wider than a row:
+        /// it rides the word before it or takes a row of its own, never the
+        /// word after it.
+        Glue(Vec<Flat>),
+    }
+
+    impl Atom {
+        fn flat(&self) -> &[Flat] {
+            match self {
+                Self::Space(flat) | Self::Word(flat) | Self::Unit(flat) | Self::Glue(flat) => flat,
+            }
+        }
+
+        fn flat_mut(&mut self) -> &mut Vec<Flat> {
+            match self {
+                Self::Space(flat) | Self::Word(flat) | Self::Unit(flat) | Self::Glue(flat) => flat,
+            }
+        }
+
+        fn width(&self) -> usize {
+            self.flat().iter().map(|g| g.1).sum()
+        }
     }
     let mut atoms: Vec<Atom> = Vec::new();
     let mut idx = 0;
@@ -775,14 +816,20 @@ fn chunk_line_units(
     // A word wider than a row is cut at the edges of its marked run when the
     // run alone fits a row: punctuation pressed against a command is placed
     // beside it, never measured with it. A run wider than a row still breaks
-    // at its own spaces like prose.
+    // at its own spaces like prose, except that two runs meeting inside it
+    // part where they meet, the punctuation between them riding the word
+    // before it, and the word at either edge sheds the glue pressed against it
+    // when that word fits a row but the two together do not, so the word is
+    // never cut for the glue.
     let mut split: Vec<Atom> = Vec::with_capacity(atoms.len());
     for atom in atoms {
         match atom {
             Atom::Word(word) if word.iter().map(|g| g.1).sum::<usize>() > w => {
-                if let Some((start, end)) = unit_bounds(&word)
-                    && word[start..end].iter().map(|g| g.1).sum::<usize>() <= w
-                {
+                let Some((start, end)) = unit_bounds(&word) else {
+                    split.push(Atom::Word(word));
+                    continue;
+                };
+                if word[start..end].iter().map(|g| g.1).sum::<usize>() <= w {
                     if start > 0 {
                         split.push(Atom::Word(word[..start].to_vec()));
                     }
@@ -792,35 +839,129 @@ fn chunk_line_units(
                     }
                     continue;
                 }
-                if !word.iter().any(|g| g.3.is_some() && is_break_space(&g.0)) {
-                    split.push(Atom::Word(word));
-                    continue;
-                }
+                let mut unit: Vec<Atom> = Vec::new();
                 let mut run: Vec<Flat> = Vec::new();
                 let mut spacey = None;
-                for g in word {
+                for g in &word[start..end] {
                     let now = is_break_space(&g.0);
                     if spacey.is_some_and(|last| last != now) {
                         let done = std::mem::take(&mut run);
-                        split.push(if spacey == Some(true) {
+                        unit.push(if spacey == Some(true) {
                             Atom::Space(done)
                         } else {
                             Atom::Word(done)
                         });
                     }
                     spacey = Some(now);
-                    run.push(g);
+                    run.push(g.clone());
                 }
                 if !run.is_empty() {
-                    split.push(if spacey == Some(true) {
+                    unit.push(if spacey == Some(true) {
                         Atom::Space(run)
                     } else {
                         Atom::Word(run)
                     });
                 }
+                let mut pieces = split_joins(unit);
+                let lead = &word[..start];
+                if !lead.is_empty() {
+                    let lead_w = lead.iter().map(|g| g.1).sum::<usize>();
+                    let first_w = pieces.first().map_or(0, Atom::width);
+                    if first_w > 0 && lead_w + first_w > w && first_w <= w {
+                        pieces.insert(0, Atom::Unit(lead.to_vec()));
+                    } else if let Some(first) = pieces
+                        .first_mut()
+                        .filter(|piece| matches!(piece, Atom::Word(_) | Atom::Unit(_)))
+                    {
+                        let rest = std::mem::take(first.flat_mut());
+                        let mut fused = lead.to_vec();
+                        fused.extend(rest);
+                        *first.flat_mut() = fused;
+                    } else {
+                        // The run starts with whitespace: the pressed glue
+                        // cannot join it, so it keeps a piece of its own.
+                        pieces.insert(0, Atom::Unit(lead.to_vec()));
+                    }
+                }
+                let trail = &word[end..];
+                if !trail.is_empty() {
+                    let mut tail = None;
+                    match pieces.last_mut() {
+                        Some(Atom::Word(last) | Atom::Unit(last)) => {
+                            let last_w = last.iter().map(|g| g.1).sum::<usize>();
+                            let trail_w = trail.iter().map(|g| g.1).sum::<usize>();
+                            if last_w > 0 && last_w + trail_w > w && last_w <= w {
+                                tail = Some(trail.to_vec());
+                            } else {
+                                last.extend_from_slice(trail);
+                            }
+                        }
+                        _ => tail = Some(trail.to_vec()),
+                    }
+                    if let Some(tail) = tail {
+                        pieces.push(Atom::Unit(tail));
+                    }
+                }
+                split.extend(pieces);
             }
             other => split.push(other),
         }
+    }
+
+    // A run wider than a row parts where two marked runs meet: the punctuation
+    // between them stays with the word before it, and two runs pressed together
+    // part at their edge.
+    fn split_joins(atoms: Vec<Atom>) -> Vec<Atom> {
+        let mut out: Vec<Atom> = Vec::with_capacity(atoms.len());
+        for atom in atoms {
+            let Atom::Word(word) = atom else {
+                out.push(atom);
+                continue;
+            };
+            let mut piece: Vec<Flat> = Vec::new();
+            for (i, g) in word.iter().enumerate() {
+                if i > 0 && begins_join(&word, i) && !piece.is_empty() {
+                    let glue = if word[i - 1].3.is_none() {
+                        piece.iter().rev().take_while(|g| g.3.is_none()).count()
+                    } else {
+                        0
+                    };
+                    if glue == piece.len() {
+                        // The glue is the whole piece: the break space before
+                        // it separates it from the word it rides, and drops
+                        // when it opens a row, so it never carries the word
+                        // after it.
+                        let mut glue = std::mem::take(&mut piece);
+                        if matches!(out.last(), Some(Atom::Space(_)))
+                            && let Some(Atom::Space(space)) = out.pop()
+                        {
+                            let mut fused = space;
+                            fused.append(&mut glue);
+                            glue = fused;
+                        }
+                        out.push(Atom::Glue(glue));
+                    } else if glue > 0 {
+                        let tail = piece.split_off(piece.len() - glue);
+                        out.push(Atom::Unit(std::mem::take(&mut piece)));
+                        out.push(Atom::Glue(tail));
+                    } else {
+                        out.push(Atom::Unit(std::mem::take(&mut piece)));
+                    }
+                }
+                piece.push(g.clone());
+            }
+            if !piece.is_empty() {
+                out.push(Atom::Unit(piece));
+            }
+        }
+        out
+    }
+
+    // Whether the grapheme at `i` begins a marked run inside a word holding two
+    // of them: the marker kind changed there, or the punctuation pressed
+    // between the two runs ends where it starts.
+    fn begins_join(word: &[Flat], i: usize) -> bool {
+        word[i].3.is_some() && word[i - 1].3 != word[i].3
     }
     let mut atoms = split;
     // A leading indent glues to the first word: when the two don't fit one row
@@ -880,28 +1021,91 @@ fn chunk_line_units(
     };
 
     let mut atoms = atoms.into_iter().peekable();
+    let mut after_unit = false;
     while let Some(atom) = atoms.next() {
+        let follows_unit = std::mem::replace(&mut after_unit, false);
         match atom {
             Atom::Word(word) => {
+                let word_w: usize = word.iter().map(|(_, cw, _, _)| *cw).sum();
+                // Glue pressed against a run rides its row when it fits there
+                // and opens the next row whole otherwise: it never straddles
+                // the row end cell by cell.
+                if follows_unit {
+                    if !cur.is_empty() && used + word_w > w {
+                        flush(&mut rows, &mut cur);
+                        used = 0;
+                    }
+                    if word_w <= w {
+                        used += word_w;
+                        cur.extend(word);
+                    } else {
+                        for g in word {
+                            push(g, &mut used, &mut cur, &mut rows);
+                        }
+                    }
+                    continue;
+                }
                 for g in word {
                     push(g, &mut used, &mut cur, &mut rows);
                 }
             }
             Atom::Unit(unit) => {
                 let unit_w: usize = unit.iter().map(|(_, cw, _, _)| *cw).sum();
+                if unit_w > w {
+                    if !cur.is_empty() {
+                        flush(&mut rows, &mut cur);
+                        used = 0;
+                    }
+                    for g in unit {
+                        push(g, &mut used, &mut cur, &mut rows);
+                    }
+                    continue;
+                }
                 if !cur.is_empty() && used + unit_w > w {
                     flush(&mut rows, &mut cur);
                     used = 0;
                 }
                 used += unit_w;
                 cur.extend(unit);
+                after_unit = true;
+            }
+            Atom::Glue(glue) => {
+                let glue_w: usize = glue.iter().map(|(_, cw, _, _)| *cw).sum();
+                // The glue rides the word before it when it fits there; on a
+                // row of its own it ends the row, so it never carries the word
+                // after it. The break space it carries separates the two, and
+                // drops when the glue opens the row itself.
+                if !cur.is_empty() && used + glue_w <= w {
+                    used += glue_w;
+                    cur.extend(glue);
+                    continue;
+                }
+                if !cur.is_empty() {
+                    flush(&mut rows, &mut cur);
+                }
+                used = 0;
+                let start = glue
+                    .iter()
+                    .position(|g| !is_break_space(&g.0))
+                    .unwrap_or(glue.len());
+                for g in glue.into_iter().skip(start) {
+                    push(g, &mut used, &mut cur, &mut rows);
+                }
+                if !cur.is_empty() {
+                    flush(&mut rows, &mut cur);
+                }
+                used = 0;
             }
             Atom::Space(space) => {
                 let sp_w: usize = space.iter().map(|(_, cw, _, _)| *cw).sum();
                 match atoms.peek() {
                     Some(Atom::Word(next) | Atom::Unit(next)) => {
                         let next_w: usize = next.iter().map(|(_, cw, _, _)| *cw).sum();
-                        if used + sp_w + next_w <= w {
+                        // A break at a row start leaves nothing for its run to
+                        // separate: the row already begins with the next word.
+                        if cur.is_empty() && !rows.is_empty() {
+                            used = 0;
+                        } else if used + sp_w + next_w <= w {
                             for g in space {
                                 let gw = g.1;
                                 cur.push(g);
@@ -944,15 +1148,12 @@ fn chunk_line_units(
     rows
 }
 
-/// The first and last grapheme of a word's marked run when the run is one
-/// contiguous range: punctuation pressed against the run sits outside these
-/// bounds.
+/// The first and last grapheme of a word's marked run: punctuation pressed
+/// against the run sits outside these bounds, and prose punctuation joining two
+/// marked runs sits inside them, so the runs wrap as one.
 fn unit_bounds(word: &[Flat]) -> Option<(usize, usize)> {
     let start = word.iter().position(|g| g.3.is_some())?;
     let end = word.iter().rposition(|g| g.3.is_some())? + 1;
-    if word[start..end].iter().any(|g| g.3.is_none()) {
-        return None;
-    }
     Some((start, end))
 }
 

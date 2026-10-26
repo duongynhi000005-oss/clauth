@@ -485,3 +485,31 @@ fn wrap_collapses_whitespace_inside_a_fitting_command() {
         ]]
     );
 }
+
+fn row_texts(text: &str, width: usize) -> Vec<String> {
+    wrap(text, width, dim())
+        .into_iter()
+        .map(|line| line.iter().map(|span| span.content.as_ref()).collect())
+        .collect()
+}
+
+/// A command whose own text ends in whitespace keeps one space before prose
+/// pressed against its closing marker: the two words never fuse on screen.
+#[test]
+fn a_command_ending_in_whitespace_keeps_a_space_before_glued_prose() {
+    assert_eq!(
+        row_texts(&format!("run {}x", cmd("clauth login ")), 40),
+        vec!["run clauth login x"]
+    );
+    assert_eq!(
+        row_texts(&format!("run {}x", cmd("clauth login\t")), 40),
+        vec!["run clauth login x"]
+    );
+}
+
+/// A command holding only whitespace draws nothing and adds no blank cell
+/// between the prose words around it.
+#[test]
+fn a_whitespace_only_command_adds_no_blank_cell() {
+    assert_eq!(row_texts(&format!("a {} b", cmd("  ")), 40), vec!["a b"]);
+}

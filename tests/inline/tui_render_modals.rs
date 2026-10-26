@@ -5578,3 +5578,574 @@ fn a_control_char_before_a_command_does_not_shift_its_unit() {
         .collect();
     assert_eq!(rows, vec!["xy QA QB", "cc"]);
 }
+
+/// The rows one marked line wraps to at `w`, through the prose wrapper and
+/// the modal body wrapper: the two must agree on every unit placement.
+fn prose_and_modal_rows(text: &str, w: usize) -> (Vec<String>, Vec<String>) {
+    let prose_rows = prose::wrap(text, w, Style::default())
+        .into_iter()
+        .map(|line| line.iter().map(|span| span.content.as_ref()).collect())
+        .collect();
+    let (spans, units) = prose::marked(text, Style::default()).into_parts();
+    let modal_rows = chunk_line_units(Line::from(spans), w, &units)
+        .iter()
+        .map(line_text)
+        .collect();
+    (prose_rows, modal_rows)
+}
+
+/// Punctuation glued after a command moves as a whole: it rides the
+/// command's row when it fits there, else opens the next row, never split
+/// cell by cell.
+#[test]
+fn trailing_glue_after_a_command_moves_whole() {
+    let text = format!("ab {}).", prose::cmd("QA QB"));
+    let want = vec!["ab", "QA QB", ")."];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 6);
+    assert_eq!(prose_rows, want, "prose");
+    assert_eq!(modal_rows, want, "modal");
+}
+
+/// Two marked units joined by punctuation wrap as one run, from the first
+/// marked character to the last, so a run that fits a row never splits at a
+/// space inside it.
+#[test]
+fn units_glued_by_punctuation_wrap_as_one_run() {
+    let text = format!("x ({}/{})", prose::cmd("QA QB"), prose::key("KB"));
+    let want = vec!["x (", "QA QB/KB", ")"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 8);
+    assert_eq!(prose_rows, want, "prose");
+    assert_eq!(modal_rows, want, "modal");
+}
+
+/// A command wider than the row breaks at its own spaces, and punctuation
+/// glued to its first or last word takes a row of its own when the word fits
+/// a row but not beside the glue: the word is never cut mid-word for it.
+#[test]
+fn glue_beside_an_over_wide_command_never_cuts_its_word() {
+    for (text, w, want) in [
+        (
+            format!("({})", prose::cmd("REGION ZONE")),
+            6,
+            vec!["(", "REGION", "ZONE)"],
+        ),
+        (
+            format!("x ({})", prose::cmd("REGION ZONE")),
+            6,
+            vec!["x (", "REGION", "ZONE)"],
+        ),
+        (
+            format!("{}).", prose::cmd("ZONE REGION")),
+            7,
+            vec!["ZONE", "REGION", ")."],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// Glue wider than a row cannot ride the unit's row: it opens a row of its own
+/// and only then splits by cell, the same way in both wrappers, never cutting
+/// the command's word.
+#[test]
+fn glue_wider_than_a_row_splits_after_opening_a_row() {
+    let text = format!("{}))))))", prose::cmd("QA"));
+    let want = vec!["QA", "))))", "))"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 4);
+    assert_eq!(prose_rows, want, "prose");
+    assert_eq!(modal_rows, want, "modal");
+}
+
+/// A wide glue glyph is measured by its cells, so the last command word stays
+/// whole beside it while the leading glue still takes its own row.
+#[test]
+fn a_wide_glyph_glue_never_cuts_the_command_word() {
+    let text = format!("({}\u{6f22}", prose::cmd("REGION ZONE"));
+    let want = vec!["(", "REGION", "ZONE\u{6f22}"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 6);
+    assert_eq!(prose_rows, want, "prose");
+    assert_eq!(modal_rows, want, "modal");
+}
+
+/// An edge word that fills the row together with its glue keeps it: the two
+/// fit, so neither the glue nor the word takes a row of its own.
+#[test]
+fn an_exact_fit_edge_keeps_the_glue_with_its_word() {
+    let text = format!("({})", prose::cmd("REGION ZONE"));
+    let want = vec!["(REGION", "ZONE)"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 7);
+    assert_eq!(prose_rows, want, "prose");
+    assert_eq!(modal_rows, want, "modal");
+}
+
+/// Glue after a unit that fills its row whole opens the next row: it never
+/// straddles the row end cell by cell.
+#[test]
+fn glue_after_a_full_width_unit_opens_the_next_row() {
+    let text = format!("x {})", prose::cmd("ABCD"));
+    let want = vec!["x", "ABCD", ")"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 4);
+    assert_eq!(prose_rows, want, "prose");
+    assert_eq!(modal_rows, want, "modal");
+}
+
+/// Row texts as the buffer draws them: a control character takes no cell and
+/// never reaches the screen.
+fn drawn(rows: Vec<String>) -> Vec<String> {
+    rows.into_iter()
+        .map(|row| row.chars().filter(|c| !c.is_control()).collect())
+        .collect()
+}
+
+/// Both wrappers measure a marked run the way the buffer draws it, so a
+/// control character inside a command never tears glue off a row it fits.
+#[test]
+fn a_control_char_inside_a_command_never_moves_its_glue() {
+    let ab = prose::key("A\u{1b}B");
+    for (text, w, want) in [
+        (
+            format!("({})", prose::cmd("REG\u{1b}ION ZONE")),
+            7,
+            vec!["(REGION", "ZONE)"],
+        ),
+        (format!("{ab}{ab}({ab}))))"), 8, vec!["ABAB(AB", "))))"]),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(drawn(prose_rows), want, "prose at {w}: {text:?}");
+        assert_eq!(drawn(modal_rows), want, "modal at {w}: {text:?}");
+    }
+}
+
+/// No row either wrapper produces is wider than the row budget, measured as
+/// the buffer draws it, and both wrappers lay the same text out the same way.
+#[test]
+fn marked_rows_never_overrun_and_both_wrappers_agree() {
+    let cells = super::super::format::grapheme_cells;
+    for (text, w) in [
+        (format!("({})", prose::cmd("لالالا ZONE")), 6),
+        (format!("({})", prose::cmd("REG\u{1b}ION ZONE")), 7),
+        (
+            format!("x {}\u{1f469}\u{200d}\u{1f4bb})", prose::cmd("QA QB")),
+            6,
+        ),
+        (
+            format!("{}({})", prose::key("漢字"), prose::cmd("REGION ZONE")),
+            6,
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        for row in prose_rows.iter().chain(modal_rows.iter()) {
+            assert!(cells(row) <= w, "{row:?} overruns {w} cells for {text:?}");
+        }
+        assert_eq!(
+            drawn(prose_rows),
+            drawn(modal_rows),
+            "prose vs modal at {w}: {text:?}"
+        );
+    }
+}
+
+/// A whitespace-only command between two words keeps one space between them,
+/// never fusing the words, and adds no second blank cell beside prose
+/// whitespace.
+#[test]
+fn a_whitespace_only_command_between_words_keeps_one_space() {
+    for (text, want) in [
+        (format!("a{}b", prose::cmd("  ")), vec!["a b"]),
+        (format!("a{})b", prose::cmd(" ")), vec!["a )b"]),
+        (format!("a {} b", prose::cmd("  ")), vec!["a b"]),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 40);
+        assert_eq!(prose_rows, want, "prose: {text:?}");
+        assert_eq!(modal_rows, want, "modal: {text:?}");
+    }
+}
+
+/// Whitespace at a marked run's edge is never a second separator: beside
+/// prose whitespace or a whitespace-only neighbour it adds no blank cell, and
+/// with nothing before it, it is the one space between the words.
+#[test]
+fn a_marked_runs_edge_whitespace_never_doubles_a_space() {
+    for (text, want) in [
+        (
+            format!("a {}{} b", prose::cmd("  "), prose::key("KB")),
+            vec!["a KB b"],
+        ),
+        (format!("a {}x", prose::cmd(" clauth")), vec!["a clauthx"]),
+        (format!("a{} x", prose::cmd(" clauth")), vec!["a clauth x"]),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 40);
+        assert_eq!(prose_rows, want, "prose: {text:?}");
+        assert_eq!(modal_rows, want, "modal: {text:?}");
+    }
+}
+
+/// The modal collapses whitespace inside a marked run exactly as prose does,
+/// so a run that fits a row never splits on a doubled space and draws no
+/// blank cells; a tab is one space and a non-breaking space stays data.
+#[test]
+fn both_wrappers_collapse_whitespace_inside_a_marked_run() {
+    for (text, w, want) in [
+        (prose::key("QA  QB"), 5, vec!["QA QB"]),
+        (
+            format!("{}))))", prose::key(" QA QB")),
+            5,
+            vec!["QA QB", "))))"],
+        ),
+        (
+            format!("x {}){}", prose::key("  "), prose::cmd("REGION")),
+            6,
+            vec!["x )", "REGION"],
+        ),
+        (
+            format!("n {}", prose::cmd("a\u{a0}b")),
+            40,
+            vec!["n a\u{a0}b"],
+        ),
+        (prose::key("A\tB"), 40, vec!["A B"]),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// Punctuation joining two marked runs inside a run too wide for a row rides
+/// the word before it; when that word fits a row but not with the glue, the
+/// glue takes a row of its own. Two runs pressed together with nothing between
+/// them part at their edge. A command word that fits a row is never cut.
+#[test]
+fn joining_glue_inside_an_over_wide_run_rides_the_word_before_it() {
+    for (text, w, want) in [
+        (
+            format!("{};{}", prose::cmd("QA login"), prose::cmd("ZONE QB")),
+            7,
+            vec!["QA", "login;", "ZONE QB"],
+        ),
+        (
+            format!("{}/{}", prose::cmd("QA login"), prose::key("ZONE")),
+            7,
+            vec!["QA", "login/", "ZONE"],
+        ),
+        (
+            format!("{};{}", prose::cmd("QA login"), prose::cmd("ZONE QB")),
+            5,
+            vec!["QA", "login", ";", "ZONE", "QB"],
+        ),
+        (
+            format!("{}{}", prose::cmd("QA login"), prose::key("ZONE")),
+            7,
+            vec!["QA", "login", "ZONE"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// Glue wider than a row hard-splits before the command takes a row of its
+/// own, and a command word wider than the row keeps its glue and splits by
+/// grapheme with it.
+#[test]
+fn edge_glue_guards_hold_at_their_boundaries() {
+    for (text, w, want) in [
+        (
+            format!("((((((({}", prose::cmd("REGION ZONE")),
+            6,
+            vec!["((((((", "(", "REGION", "ZONE"],
+        ),
+        (
+            format!("({})", prose::cmd("REGIONXX ZONE")),
+            6,
+            vec!["(REGIO", "NXX", "ZONE)"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// A control character draws no cell, so glue holding one never moves a cut:
+/// it stays on the word it fits beside at either edge of a run, and where
+/// punctuation joins two runs it rides the word before it.
+#[test]
+fn a_control_char_in_glue_never_shifts_the_cut() {
+    for (text, w, want) in [
+        (
+            format!("\u{1b}({})", prose::cmd("REGION ZONE")),
+            7,
+            vec!["(REGION", "ZONE)"],
+        ),
+        (
+            format!("{})\u{1b}", prose::cmd("REGION ZONE")),
+            7,
+            vec!["REGION", "ZONE)"],
+        ),
+        (
+            format!("{};\u{1b}{}", prose::cmd("QA"), prose::cmd("ZONE")),
+            6,
+            vec!["QA;", "ZONE"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(drawn(prose_rows), want, "prose at {w}: {text:?}");
+        assert_eq!(drawn(modal_rows), want, "modal at {w}: {text:?}");
+    }
+}
+
+/// A lam-alef cluster draws two cells per grapheme, so a command word holding
+/// one stays whole and the glue pressed against it takes a row of its own.
+#[test]
+fn a_lam_alef_cluster_never_lets_a_row_overrun() {
+    let word = "\u{644}\u{627}\u{644}\u{627}\u{644}\u{627}";
+    let text = format!("({})", prose::cmd(&format!("{word} ZONE")));
+    let want = vec!["(", word, "ZONE)"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 6);
+    assert_eq!(prose_rows, want, "prose: {text:?}");
+    assert_eq!(modal_rows, want, "modal: {text:?}");
+}
+
+/// A ZWJ emoji glued after a command is one grapheme, so it opens the next row
+/// whole together with the punctuation after it.
+#[test]
+fn a_zwj_glyph_glue_moves_whole() {
+    let text = format!("x {}\u{1f469}\u{200d}\u{1f4bb})", prose::cmd("QA QB"));
+    let want = vec!["x", "QA QB", "\u{1f469}\u{200d}\u{1f4bb})"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 6);
+    assert_eq!(prose_rows, want, "prose: {text:?}");
+    assert_eq!(modal_rows, want, "modal: {text:?}");
+}
+
+/// A non-breaking space inside a command is data: it never breaks the word and
+/// never collapses, even when the run is wider than the row.
+#[test]
+fn a_non_breaking_space_inside_a_command_is_never_a_break() {
+    let text = format!("({})", prose::cmd("A\u{a0}B C"));
+    let want = vec!["(A\u{a0}B", "C)"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 4);
+    assert_eq!(prose_rows, want, "prose: {text:?}");
+    assert_eq!(modal_rows, want, "modal: {text:?}");
+}
+
+/// A leading indent is dropped before a marked run that cannot share its row,
+/// and the run still breaks only at its own space.
+#[test]
+fn an_indent_before_an_over_wide_run_drops() {
+    let text = format!("  {}", prose::cmd("REGION ZONE"));
+    let want = vec!["REGION", "ZONE"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 6);
+    assert_eq!(prose_rows, want, "prose: {text:?}");
+    assert_eq!(modal_rows, want, "modal: {text:?}");
+}
+
+/// Whitespace a run carries at its end drops at line end, so the rendered
+/// cells paste as the command.
+#[test]
+fn trailing_unit_whitespace_at_line_end_drops() {
+    let text = format!("run {}", prose::cmd("clauth login "));
+    let want = vec!["run clauth login"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 40);
+    assert_eq!(prose_rows, want, "prose: {text:?}");
+    assert_eq!(modal_rows, want, "modal: {text:?}");
+}
+
+/// A tab inside a key is one ordinary space in both wrappers, never a break
+/// point or a zero-width gap, and the words around it stay apart.
+#[test]
+fn a_tab_inside_a_key_is_one_space() {
+    let text = format!("x {} y", prose::key("A\tB"));
+    let want = vec!["x A B y"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 40);
+    assert_eq!(prose_rows, want, "prose: {text:?}");
+    assert_eq!(modal_rows, want, "modal: {text:?}");
+}
+
+/// Glue that fills the row together with its word keeps it at both edges and
+/// at a join between two runs, where the glue rides the word before it; when
+/// the two overrun the row together, the glue takes a row of its own.
+#[test]
+fn an_exact_fit_glue_keeps_its_word_at_each_edge_and_a_join() {
+    for (text, w, want) in [
+        (
+            format!("({})", prose::cmd("REGION ZONE")),
+            7,
+            vec!["(REGION", "ZONE)"],
+        ),
+        (
+            format!("{})", prose::cmd("ZONE REGION")),
+            7,
+            vec!["ZONE", "REGION)"],
+        ),
+        (
+            format!("{};{}", prose::cmd("AA"), prose::cmd("QQ")),
+            3,
+            vec!["AA;", "QQ"],
+        ),
+        (
+            format!("{};{}", prose::cmd("Q AB"), prose::cmd("CD")),
+            5,
+            vec!["Q AB;", "CD"],
+        ),
+        (
+            format!("{};{}", prose::cmd("Q AB"), prose::cmd("CD")),
+            4,
+            vec!["Q AB", ";", "CD"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// Settling a marked run's whitespace touches the run alone: a modal line
+/// keeps its leading indent, its prose double spaces, its trailing prose
+/// spaces and its non-breaking glue exactly as written.
+#[test]
+fn settling_a_marked_run_leaves_the_modal_prose_whitespace_alone() {
+    let rows = |text: &str, w: usize| -> Vec<String> {
+        let (spans, units) = prose::marked(text, Style::default()).into_parts();
+        chunk_line_units(Line::from(spans), w, &units)
+            .iter()
+            .map(line_text)
+            .collect()
+    };
+    for (text, w, want) in [
+        (
+            format!("  see {} now", prose::cmd("clauth login")),
+            40,
+            vec!["  see clauth login now"],
+        ),
+        (
+            format!("  see {} now", prose::cmd("clauth  login")),
+            40,
+            vec!["  see clauth login now"],
+        ),
+        (format!("a  {}", prose::cmd("QA QB")), 40, vec!["a  QA QB"]),
+        (format!("{}  ", prose::cmd("QA QB")), 40, vec!["QA QB  "]),
+        (
+            format!("x ab\u{a0}cd {}", prose::cmd("QA QB")),
+            5,
+            vec!["x", "ab\u{a0}cd", "QA QB"],
+        ),
+    ] {
+        assert_eq!(rows(&text, w), want, "modal at {w}: {text:?}");
+    }
+}
+
+/// Joining glue after a command's kept trailing space is still glue: it rides
+/// the row before it or takes its own, never carrying the next command's word.
+#[test]
+fn joining_glue_after_a_trailing_space_never_carries_the_next_word() {
+    for (w, want) in [
+        (6, vec!["QA", "login", ";", "ZONE", "QB"]),
+        (7, vec!["QA", "login ;", "ZONE QB"]),
+    ] {
+        let text = format!("{};{}", prose::cmd("QA login "), prose::cmd("ZONE QB"));
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// Two marked runs of the same kind pressed together part at their own edge
+/// inside a run too wide for the row, exactly as a command and a key do.
+#[test]
+fn same_kind_runs_pressed_together_part_at_their_edge() {
+    for (text, w, want) in [
+        (
+            format!("{}{}", prose::cmd("QA login"), prose::cmd("ZONE")),
+            7,
+            vec!["QA", "login", "ZONE"],
+        ),
+        (
+            format!("{}{}", prose::key("QA"), prose::key("ZONE")),
+            5,
+            vec!["QA", "ZONE"],
+        ),
+        (
+            format!("{}{}", prose::key("QA"), prose::key("ZONE")),
+            6,
+            vec!["QAZONE"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// Three runs pressed together keep every opener's edge: two same-kind
+/// boundaries in one run part where each meets, not only the kind change.
+#[test]
+fn three_pressed_runs_part_at_each_opener() {
+    let text = format!(
+        "{}{}{}",
+        prose::cmd("QA"),
+        prose::cmd("ZONE"),
+        prose::cmd("KB")
+    );
+    let want = vec!["QA", "ZONE", "KB"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 5);
+    assert_eq!(prose_rows, want, "prose: {text:?}");
+    assert_eq!(modal_rows, want, "modal: {text:?}");
+}
+
+/// A tab a marked run keeps before joining glue is the separator the glue
+/// rides or opens a row with, never a word it carries along.
+#[test]
+fn joining_glue_after_a_tab_never_carries_the_next_word() {
+    for (w, want) in [
+        (6, vec!["QA", "login", ";", "ZONE", "QB"]),
+        (7, vec!["QA", "login ;", "ZONE QB"]),
+    ] {
+        let text = format!("{};{}", prose::cmd("QA login\t"), prose::cmd("ZONE QB"));
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// Glue wider than the row, after a kept space, opens its own row and ends it:
+/// it splits by cell if it must, never carrying the next run's word.
+#[test]
+fn glue_wider_than_a_row_after_a_space_never_carries_the_next_word() {
+    for (glue, w, want) in [
+        (";;", 3, vec!["QA", ";;", "Z"]),
+        (";;;", 2, vec!["QA", ";;", ";", "Z"]),
+    ] {
+        let text = format!("{}{glue}{}", prose::cmd("QA "), prose::cmd("Z"));
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// Settling a marked run's whitespace leaves a prose tab between two runs as
+/// written, so a modal body's own spacing reaches the screen unchanged.
+#[test]
+fn settling_leaves_a_prose_tab_between_two_runs_as_written() {
+    let text = format!("{}\t{}", prose::cmd("QA QB"), prose::key("KB"));
+    let (spans, _) = prose::marked(&text, Style::default()).into_parts();
+    let kept: String = spans.iter().map(|span| span.content.as_ref()).collect();
+    assert_eq!(kept, "QA QB\tKB");
+}
+
+/// Settling a marked run's whitespace leaves a prose non-breaking space beside
+/// a run as written, so a glued word stays one unbreakable word.
+#[test]
+fn settling_leaves_a_non_breaking_space_beside_a_run_as_written() {
+    let text = format!("ab\u{a0}{}", prose::cmd("QA QB"));
+    let (spans, units) = prose::marked(&text, Style::default()).into_parts();
+    let kept: String = spans.iter().map(|span| span.content.as_ref()).collect();
+    assert_eq!(kept, "ab\u{a0}QA QB");
+    let rows: Vec<String> = chunk_line_units(Line::from(spans), 40, &units)
+        .iter()
+        .map(line_text)
+        .collect();
+    assert_eq!(rows, vec!["ab\u{a0}QA QB"]);
+}
