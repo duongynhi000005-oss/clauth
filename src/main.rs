@@ -2592,20 +2592,16 @@ fn write_api_key<W: std::io::Write>(writer: &mut W, key: &str, what: &str) -> Re
 /// a credential that is whitespace-only is not a credential.
 fn api_key_for_profile(name: &str) -> Result<Option<String>> {
     let name = ProfileName::from(name);
-    // `load_profile` is permissive — a missing `config.toml` reads as the
-    // default profile, so a helper pointing at a typo'd or deleted name would
-    // otherwise return `Ok(None)` indistinguishable from a real no-key
-    // profile. The dir-existence check fails closed with a clearer message
-    // instead; both cases still surface as exit 1 via `cmd_api_key`.
+    // `profile::read_api_key` reads a missing `config.toml` as `Ok(None)`, so
+    // a helper pointing at a typo'd or deleted name would otherwise be
+    // indistinguishable from a real no-key profile. The dir-existence check
+    // fails closed with a clearer message instead; both cases still surface
+    // as exit 1 via `cmd_api_key`.
     if !profile::profile_dir(&name)?.exists() {
         anyhow::bail!("profile '{name}' not found");
     }
-    let profile = profile::load_profile(&name)?;
-    let key = profile
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let stored = profile::read_api_key(&name)?;
+    let key = stored.as_deref().map(str::trim).filter(|s| !s.is_empty());
     // Fail closed on a hand-edited config that poisoned the key with control
     // chars: emitting it verbatim would inject a header, so refuse to print.
     if let Some(k) = key {

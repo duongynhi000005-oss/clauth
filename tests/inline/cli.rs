@@ -2134,7 +2134,7 @@ mod api_key_helper_tests {
     use crate::testutil::HomeSandbox;
 
     /// Write a profile to the sandboxed home with the given api_key (or none),
-    /// then save it so `load_profile` can read it back the way the helper does.
+    /// then save it so the helper's reader finds it.
     fn save_profile_with_key(name: &str, api_key: Option<&str>) {
         let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
         profile.api_key = api_key.map(str::to_string);
@@ -2149,12 +2149,12 @@ mod api_key_helper_tests {
     }
 
     /// `api_key_for_profile` returns the stored key verbatim for a profile that
-    /// has one — the load path CC's helper relies on each request.
+    /// has one — the read CC's `apiKeyHelper` relies on.
     #[test]
     fn api_key_for_profile_returns_stored_key() {
         let _home = HomeSandbox::new();
         save_profile_with_key("acme", Some("sk-test-12345"));
-        let key = api_key_for_profile("acme").expect("load_profile");
+        let key = api_key_for_profile("acme").expect("read key");
         assert_eq!(key.as_deref(), Some("sk-test-12345"));
     }
 
@@ -2167,7 +2167,7 @@ mod api_key_helper_tests {
     fn api_key_for_profile_is_static_across_calls() {
         let _home = HomeSandbox::new();
         save_profile_with_key("acme", Some("sk-test-12345"));
-        let first = api_key_for_profile("acme").expect("load_profile");
+        let first = api_key_for_profile("acme").expect("read key");
         let second = api_key_for_profile("acme").expect("reload");
         assert_eq!(
             first, second,
@@ -2183,7 +2183,7 @@ mod api_key_helper_tests {
     fn api_key_for_profile_none_when_profile_has_no_key() {
         let _home = HomeSandbox::new();
         save_profile_with_key("oauth-profile", None);
-        let key = api_key_for_profile("oauth-profile").expect("load_profile");
+        let key = api_key_for_profile("oauth-profile").expect("read key");
         assert!(
             key.is_none(),
             "a profile with no api_key must yield Ok(None), not a blank Some"
@@ -2212,8 +2212,190 @@ mod api_key_helper_tests {
     fn api_key_for_profile_treats_blank_key_as_absent() {
         let _home = HomeSandbox::new();
         save_profile_with_key("blank", Some("   "));
-        let key = api_key_for_profile("blank").expect("load_profile");
+        let key = api_key_for_profile("blank").expect("read key");
         assert!(key.is_none(), "a whitespace-only key must read as None");
+    }
+
+    /// The key lives in `config.toml` alone, so a torn `credentials.json`
+    /// beside it must not cost the account its key: the helper is the only
+    /// way Claude Code gets one.
+    #[test]
+    fn api_key_for_profile_reads_the_key_beside_a_torn_credentials_file() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        std::fs::write(
+            dir.join("credentials.json"),
+            "{\"claudeAiOauth\": {\"accessToken\": ",
+        )
+        .expect("write torn credentials");
+        let key =
+            api_key_for_profile("acme").expect("a torn credentials.json is not the key's store");
+        assert_eq!(key.as_deref(), Some("sk-test-12345"));
+        dispatch_api_key("acme").expect("the helper exits 0 beside a torn credentials.json");
+    }
+
+    /// The store the key lives in failing to parse still fails closed: the
+    /// helper prints nothing and names that file.
+    #[test]
+    fn api_key_for_profile_err_for_an_unparseable_config() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            "api_key = \"sk-test-12345\"\nbase_url = [",
+        )
+        .expect("write torn config");
+        let err = api_key_for_profile("acme").expect_err("a torn config.toml fails closed");
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to parse acme/config.toml at line 2, column 13",
+            "the error names config.toml and the position"
+        );
+    }
+
+    /// A `config.toml` the helper cannot open fails closed naming it.
+    #[test]
+    fn api_key_for_profile_err_for_an_unreadable_config() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let config = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir")
+            .join("config.toml");
+        if std::fs::metadata(&config).expect("stat").uid() == 0 {
+            eprintln!("SKIPPING: running as root, which can read any file");
+            return;
+        }
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        let result = api_key_for_profile("acme");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod back");
+        let err = result.expect_err("an unreadable config.toml fails closed");
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to read acme/config.toml: Permission denied (os error 13)"
+        );
+    }
+
+    /// A key carrying a control char would reach Claude Code as a header
+    /// value: the helper refuses it instead of printing it.
+    #[test]
+    fn api_key_for_profile_refuses_a_key_with_control_chars() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            "api_key = \"sk-test\\r\\nX-Injected: y\"\n",
+        )
+        .expect("write poisoned config");
+        let err = api_key_for_profile("acme").expect_err("a poisoned key is refused");
+        assert_eq!(
+            format!("{err:#}"),
+            "api key contains whitespace or control characters, likely a bad paste or an \
+             edited config"
+        );
+    }
+
+    /// A legacy `credentials.json.pending` that a full profile load would land
+    /// as `credentials.json` stays where it is: the helper writes no
+    /// credential store. `load_profile`'s other write, the `config.toml`
+    /// rewrite, and the state flock both take are pinned by
+    /// `api_key_for_profile_never_rewrites_config_toml` and
+    /// `api_key_for_profile_never_waits_on_the_state_flock`.
+    #[test]
+    fn api_key_for_profile_lands_no_pending_credentials() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        let pending = dir.join("credentials.json.pending");
+        let staged = "{\"claudeAiOauth\": {\"accessToken\": \"at-pending\", \
+                      \"refreshToken\": \"rt-pending\", \"expiresAt\": 4102444800000}}";
+        std::fs::write(&pending, staged).expect("write legacy pending");
+        let key = api_key_for_profile("acme").expect("read key");
+        assert_eq!(key.as_deref(), Some("sk-test-12345"));
+        assert!(
+            !dir.join("credentials.json").exists(),
+            "the helper lands no pending credentials"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pending).expect("pending kept"),
+            staged,
+            "the legacy sidecar keeps its bytes"
+        );
+    }
+
+    /// A `config.toml` whose `[env]` key is valid only quoted is one a full
+    /// profile load rewrites; the helper leaves its bytes alone. The closing
+    /// `load_profile` is the control: once a load stops rewriting this file,
+    /// this test and the flock test below stop binding anything.
+    #[test]
+    fn api_key_for_profile_never_rewrites_config_toml() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let config = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir")
+            .join("config.toml");
+        let raw = "api_key = \"sk-test-12345\"\n\n[env]\n\"A:B\" = \"x\"\n";
+        std::fs::write(&config, raw).expect("write config");
+        let key = api_key_for_profile("acme").expect("read key");
+        assert_eq!(key.as_deref(), Some("sk-test-12345"));
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("re-read config"),
+            raw,
+            "the helper never rewrites config.toml"
+        );
+        let _ = crate::profile::load_profile(&crate::profile::ProfileName::from("acme"));
+        assert_ne!(
+            std::fs::read_to_string(&config).expect("re-read config"),
+            raw,
+            "control: a full profile load still rewrites this fixture"
+        );
+    }
+
+    /// The helper never waits on the state flock: with a peer holding it, a
+    /// read still answers at once rather than after the lock's timeout.
+    #[test]
+    fn api_key_for_profile_never_waits_on_the_state_flock() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let config = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir")
+            .join("config.toml");
+        std::fs::write(
+            &config,
+            "api_key = \"sk-test-12345\"\n\n[env]\n\"A:B\" = \"x\"\n",
+        )
+        .expect("write config");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(
+                crate::profile::clauth_dir()
+                    .expect("clauth dir")
+                    .join(".lock"),
+            )
+            .expect("open the state lock");
+        lock.try_lock().expect("take the state flock");
+        crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_secs(10)));
+        let started = std::time::Instant::now();
+        let key = api_key_for_profile("acme");
+        let waited = started.elapsed();
+        crate::lock::set_state_lock_timeout_override(None);
+        assert_eq!(key.expect("read key").as_deref(), Some("sk-test-12345"));
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the helper waited {waited:?} on a held state flock"
+        );
     }
 
     /// End-to-end through `dispatch`: the helper dispatch arm reaches

@@ -3811,7 +3811,9 @@ struct ProfileSource {
     credentials: Option<ClaudeCredentials>,
 }
 
-fn read_profile_source(name: &ProfileName) -> Result<ProfileSource> {
+/// The `config.toml` half of [`read_profile_source`], split out for a caller
+/// that must not depend on any other file of the profile.
+fn read_profile_config_source(name: &ProfileName) -> Result<(PathBuf, String, ProfileConfig)> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,
@@ -3828,6 +3830,11 @@ fn read_profile_source(name: &ProfileName) -> Result<ProfileSource> {
             )
         })?
     };
+    Ok((config_path, raw_config, config))
+}
+
+fn read_profile_source(name: &ProfileName) -> Result<ProfileSource> {
+    let (config_path, raw_config, config) = read_profile_config_source(name)?;
 
     let cred_path = profile_credentials_path(name)?;
     let credentials = if cred_path.exists() {
@@ -3841,6 +3848,16 @@ fn read_profile_source(name: &ProfileName) -> Result<ProfileSource> {
         config,
         credentials,
     })
+}
+
+/// A profile's stored api_key, off its `config.toml` alone: the key lives
+/// there, so a torn `credentials.json` beside it must never cost the account
+/// its key. No lock and no write, unlike [`load_profile`], since Claude Code's
+/// `apiKeyHelper` calls it. `Ok(None)` when the profile has no api_key (a
+/// missing or blank `config.toml` included); the caller trims and validates.
+pub(crate) fn read_api_key(name: &ProfileName) -> Result<Option<String>> {
+    let (_, _, config) = read_profile_config_source(name)?;
+    Ok(config.api_key)
 }
 
 /// Build the loaded [`Profile`] from parsed [`ProfileSource`], consuming the
