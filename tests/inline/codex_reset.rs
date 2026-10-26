@@ -314,9 +314,245 @@ fn limit_reset_failure_lines_separate_nothing_spent_from_unconfirmed() {
     );
 }
 
+/// An untitled credit's prompt names no credit: the question already says a
+/// usage-limit reset is spent, so the expiry clause opens the next sentence.
+/// A titled credit keeps its title in front.
+#[test]
+fn limit_reset_prompt_opens_on_the_expiry_when_the_credit_has_no_title() {
+    let untitled = credit(
+        "u",
+        "codex_rate_limits",
+        "available",
+        "2026-01-01T00:00:00Z",
+        None,
+    );
+    let mut titled = untitled.clone();
+    titled.id = "t".to_string();
+    titled.title = Some("Full reset".to_string());
+    let credits = list_of(vec![untitled.clone(), titled.clone()], 2);
+
+    assert_eq!(
+        limit_reset_prompt("work", &credits, &untitled),
+        "clauth: use a usage-limit reset on 'work'? No expiry, 1 of 2 available. \
+         It reopens the account's usage windows now and cannot be undone."
+    );
+    assert_eq!(
+        limit_reset_prompt("work", &credits, &titled),
+        "clauth: use a usage-limit reset on 'work'? Full reset, no expiry, 1 of 2 available. \
+         It reopens the account's usage windows now and cannot be undone."
+    );
+}
+
+/// The prompt for one credit, the only one in its list, under a server count
+/// (3) that differs from the list's length, so the "1 of N" figure is pinned
+/// to the server's count and never to the list.
+fn sole_prompt(credit: &ResetCredit) -> String {
+    limit_reset_prompt("work", &list_of(vec![credit.clone()], 3), credit)
+}
+
+/// The `--list` row for one credit, the only one in its list.
+fn sole_list_row(credit: &ResetCredit) -> String {
+    describe_reset_credits("work", &list_of(vec![credit.clone()], 3))[1].clone()
+}
+
+/// A credit whose grant stamp does not parse, so its `--list` row is shown
+/// verbatim and every byte of it can be pinned.
+fn fixed_credit(expires_at: Option<&str>) -> ResetCredit {
+    credit(
+        "a",
+        "codex_rate_limits",
+        "available",
+        "not-a-stamp",
+        expires_at,
+    )
+}
+
+/// What the server sends is shown as sent, minus what would hide or reorder
+/// the confirm line: a lowercase title stays lowercase, a title that is only
+/// blanks and control characters is no title, a long one is capped, and the
+/// bidi controls that reorder a terminal line are dropped.
+#[test]
+fn limit_reset_prompt_shows_the_title_as_sent_minus_what_hides_the_line() {
+    let base = fixed_credit(None);
+    let titled = |title: &str| ResetCredit {
+        title: Some(title.to_string()),
+        ..base.clone()
+    };
+    let tail =
+        ", 1 of 3 available. It reopens the account's usage windows now and cannot be undone.";
+
+    assert_eq!(
+        sole_prompt(&titled("weekly reset")),
+        format!("clauth: use a usage-limit reset on 'work'? weekly reset, no expiry{tail}")
+    );
+
+    let blank = titled(" \u{7} ");
+    assert_eq!(
+        sole_prompt(&blank),
+        format!("clauth: use a usage-limit reset on 'work'? No expiry{tail}")
+    );
+    assert_eq!(
+        sole_list_row(&blank),
+        "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)"
+    );
+
+    let long = titled(&"x".repeat(70));
+    assert_eq!(
+        sole_prompt(&long),
+        format!(
+            "clauth: use a usage-limit reset on 'work'? {}..., no expiry{tail}",
+            "x".repeat(57)
+        )
+    );
+
+    let bidi = titled("Full\u{202e} reset\u{2066}");
+    assert_eq!(
+        sole_prompt(&bidi),
+        format!("clauth: use a usage-limit reset on 'work'? Full reset, no expiry{tail}")
+    );
+    assert_eq!(
+        sole_list_row(&bidi),
+        "  * Full reset: available, no expiry, granted not-a-stamp  (used next)"
+    );
+}
+
+/// A title a terminal draws as nothing is no title, whichever invisible
+/// characters it is made of; one visible character keeps it a title, shown
+/// as sent.
+#[test]
+fn limit_reset_invisible_title_reads_as_untitled() {
+    let titled = |title: &str| ResetCredit {
+        title: Some(title.to_string()),
+        ..fixed_credit(None)
+    };
+    for invisible in [
+        "\u{200b}",
+        "\u{3164}",
+        "\u{feff}\u{2060}",
+        " \u{e0041} \u{ad}",
+    ] {
+        let c = titled(invisible);
+        assert_eq!(
+            sole_prompt(&c),
+            "clauth: use a usage-limit reset on 'work'? No expiry, 1 of 3 available. \
+             It reopens the account's usage windows now and cannot be undone.",
+            "title {invisible:?}"
+        );
+        assert_eq!(
+            sole_list_row(&c),
+            "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)",
+            "title {invisible:?}"
+        );
+    }
+    assert_eq!(
+        sole_prompt(&titled("a\u{200b}")),
+        "clauth: use a usage-limit reset on 'work'? a\u{200b}, no expiry, 1 of 3 available. \
+         It reopens the account's usage windows now and cannot be undone."
+    );
+}
+
+/// Both ends of every `Default_Ignorable_Code_Point` range, typed from Unicode
+/// 18.0.0 `DerivedCoreProperties.txt` rather than from the code: each one
+/// alone, as a title, reads untitled.
+#[test]
+fn limit_reset_every_ignorable_range_end_reads_as_untitled() {
+    let ranges: [(u32, u32); 17] = [
+        (0x00AD, 0x00AD),
+        (0x034F, 0x034F),
+        (0x061C, 0x061C),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180F),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x206F),
+        (0x3164, 0x3164),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xFFF0, 0xFFF8),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0000, 0xE0FFF),
+    ];
+    for (lo, hi) in ranges {
+        for cp in [lo, hi] {
+            let ch = char::from_u32(cp).expect("a scalar value");
+            let c = ResetCredit {
+                title: Some(ch.to_string()),
+                ..fixed_credit(None)
+            };
+            assert_eq!(
+                sole_prompt(&c),
+                "clauth: use a usage-limit reset on 'work'? No expiry, 1 of 3 available. \
+                 It reopens the account's usage windows now and cannot be undone.",
+                "U+{cp:04X}"
+            );
+        }
+    }
+}
+
+/// A `--list` row drops a status or a grant stamp that shows nothing instead
+/// of printing an empty clause; the codex body that sends neither (a credit
+/// with only an id) still lists.
+#[test]
+fn limit_reset_list_row_drops_a_status_or_grant_that_shows_nothing() {
+    for blank in ["", "   ", "\u{7}", "\u{200b}"] {
+        let no_status = credit("c", "codex_rate_limits", blank, "not-a-stamp", None);
+        assert_eq!(
+            describe_reset_credits("work", &list_of(vec![no_status], 0))[1],
+            "    usage-limit reset: no expiry, granted not-a-stamp",
+            "status {blank:?}"
+        );
+        let no_grant = credit("c", "codex_rate_limits", "available", blank, None);
+        assert_eq!(
+            describe_reset_credits("work", &list_of(vec![no_grant], 1))[1],
+            "  * usage-limit reset: available, no expiry  (used next)",
+            "granted_at {blank:?}"
+        );
+    }
+    let sparse: ResetCredits =
+        serde_json::from_str(r#"{"credits": [{"id": "c"}]}"#).expect("a sparse credit parses");
+    assert_eq!(
+        describe_reset_credits("work", &sparse)[1],
+        "    usage-limit reset: no expiry"
+    );
+}
+
+/// An expiry stamp with nothing left to show is no stamp: blank, whitespace,
+/// only characters the terminal filter drops, or only characters a terminal
+/// draws as nothing. Both the confirm and `--list` say there is no expiry
+/// instead of printing an empty clause.
+#[test]
+fn limit_reset_blank_expiry_reads_as_no_expiry() {
+    for blank in [
+        "",
+        "   ",
+        "\u{7}",
+        "\u{202e}",
+        " \u{1b} ",
+        "\u{200b}",
+        "\u{2060} \u{fe0f}",
+        "\u{e0041}",
+    ] {
+        let c = fixed_credit(Some(blank));
+        assert_eq!(
+            sole_prompt(&c),
+            "clauth: use a usage-limit reset on 'work'? No expiry, 1 of 3 available. \
+             It reopens the account's usage windows now and cannot be undone.",
+            "expires_at {blank:?}"
+        );
+        assert_eq!(
+            sole_list_row(&c),
+            "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)",
+            "expires_at {blank:?}"
+        );
+    }
+}
+
 /// The prompt names the credit, its expiry, and "1 of N"; the listing marks
 /// the credit the prompt would name. A missing title falls back to the generic
-/// name, and a count lagging its own list never reads "1 of 0".
+/// name in the listing, and a count lagging its own list never reads "1 of 0".
 #[test]
 fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
     let mut titled = credit(
@@ -338,8 +574,7 @@ fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
 
     let prompt = limit_reset_prompt("work", &credits, &dated);
     assert!(
-        prompt
-            .starts_with("clauth: use a usage-limit reset on 'work'? usage-limit reset, expires "),
+        prompt.starts_with("clauth: use a usage-limit reset on 'work'? Expires "),
         "{prompt}"
     );
     assert!(prompt.contains(", 1 of 2 available."), "{prompt}");
@@ -406,14 +641,15 @@ fn limit_reset_unparseable_stamps_reach_the_terminal_without_control_characters(
     for text in std::iter::once(&prompt).chain(lines.iter()) {
         assert!(!text.chars().any(char::is_control), "{text:?}");
     }
-    assert!(
-        prompt.contains("expires 2026-01-01T00:00:00]52;c;AAAA"),
-        "{prompt}"
+    assert_eq!(
+        prompt,
+        "clauth: use a usage-limit reset on 'work'? Expires 2026-01-01T00:00:00]52;c;AAAA, \
+         1 of 1 available. It reopens the account's usage windows now and cannot be undone."
     );
-    assert!(
-        lines[1].contains("granted 2026-01-01T00:00:00]52;c;AAAA"),
-        "{}",
-        lines[1]
+    assert_eq!(
+        lines[1],
+        "  * usage-limit reset: available, expires 2026-01-01T00:00:00]52;c;AAAA, \
+         granted 2026-01-01T00:00:00]52;c;AAAA  (used next)"
     );
 }
 

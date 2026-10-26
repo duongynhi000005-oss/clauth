@@ -95,16 +95,23 @@ impl ResetCredit {
         self.status == AVAILABLE
     }
 
-    /// The server's title, or the generic name codex's picker falls back to.
-    /// Control characters are dropped: this text reaches a terminal.
-    fn label(&self) -> String {
+    /// The server's title, else `None` when it is absent or, after
+    /// `terminal_safe`, holds nothing a terminal draws: whitespace and
+    /// `Default_Ignorable_Code_Point` characters only. The cap runs here too,
+    /// since this text reaches a terminal.
+    fn shown_title(&self) -> Option<String> {
         let title = terminal_safe(self.title.as_deref().unwrap_or_default());
-        let title = title.trim();
-        if title.is_empty() {
-            "usage-limit reset".to_string()
+        if shows_nothing(&title) {
+            None
         } else {
-            truncate(title, 60)
+            Some(truncate(title.trim(), 60))
         }
+    }
+
+    /// The title, or the generic name codex's picker falls back to.
+    fn label(&self) -> String {
+        self.shown_title()
+            .unwrap_or_else(|| "usage-limit reset".to_string())
     }
 }
 
@@ -299,10 +306,47 @@ fn uuid_v4_from(mut bytes: [u8; 16]) -> String {
 // One spelling per outcome. A script can read the first stdout line as the
 // success summary and a failure off stderr.
 
-/// Server text with its control characters dropped: it reaches a terminal,
-/// where an escape sequence could retitle it or hide the confirm line.
+/// Server text with its control and bidi formatting characters dropped: it
+/// reaches a terminal, where an escape sequence could retitle it or hide the
+/// confirm line, and a bidi override could reorder the line to read as
+/// something it is not.
 fn terminal_safe(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    s.chars()
+        .filter(|c| !c.is_control() && !crate::jobs_cli::reorders_display(*c))
+        .collect()
+}
+
+/// `Unicode 18.0.0` `DerivedCoreProperties.txt`: the
+/// `Default_Ignorable_Code_Point` ranges, characters a terminal draws no glyph
+/// for. Some of them, the Hangul fillers included, still occupy a blank cell.
+fn draws_nothing(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Whether `text` holds nothing a terminal draws: whitespace and
+/// `Default_Ignorable_Code_Point` characters only. Callers pass `terminal_safe`
+/// output.
+fn shows_nothing(text: &str) -> bool {
+    text.chars().all(|c| c.is_whitespace() || draws_nothing(c))
 }
 
 /// An RFC 3339 stamp as local wall-clock time, or the raw text (made
@@ -316,22 +360,37 @@ fn stamp(raw: &str) -> String {
 
 fn expiry(credit: &ResetCredit) -> String {
     match credit.expires_at.as_deref() {
-        Some(raw) => format!("expires {}", stamp(raw)),
-        None => "no expiry".to_string(),
+        Some(raw) if !shows_nothing(&terminal_safe(raw)) => {
+            format!("expires {}", stamp(raw))
+        }
+        Some(_) | None => "no expiry".to_string(),
+    }
+}
+
+/// Raise a clause's first letter so it can open a sentence.
+fn capitalize(clause: &str) -> String {
+    let mut chars = clause.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
 /// The `[y/N]` question, without the `[y/N]` (the caller's prompt adds it).
+/// An untitled credit opens on its expiry alone: the question already says a
+/// usage-limit reset is what gets spent.
 pub(crate) fn limit_reset_prompt(
     name: &str,
     credits: &ResetCredits,
     credit: &ResetCredit,
 ) -> String {
+    let subject = match credit.shown_title() {
+        Some(title) => format!("{title}, {}", expiry(credit)),
+        None => capitalize(&expiry(credit)),
+    };
     format!(
-        "clauth: use a usage-limit reset on '{name}'? {}, {}, 1 of {} available. \
+        "clauth: use a usage-limit reset on '{name}'? {subject}, 1 of {} available. \
          It reopens the account's usage windows now and cannot be undone.",
-        credit.label(),
-        expiry(credit),
         credits.stated_count()
     )
 }
@@ -352,16 +411,21 @@ pub(crate) fn describe_reset_credits(name: &str, credits: &ResetCredits) -> Vec<
     for credit in &credits.credits {
         let marked = next == Some(credit.id.as_str());
         let status = terminal_safe(&credit.status);
-        let granted = credit
-            .granted_at
-            .as_deref()
-            .map(|g| format!(", granted {}", stamp(g)))
-            .unwrap_or_default();
+        let status_clause = if shows_nothing(&status) {
+            String::new()
+        } else {
+            format!("{}, ", truncate(&status, 20))
+        };
+        let granted = match credit.granted_at.as_deref() {
+            Some(raw) if !shows_nothing(&terminal_safe(raw)) => {
+                format!(", granted {}", stamp(raw))
+            }
+            Some(_) | None => String::new(),
+        };
         lines.push(format!(
-            "  {} {}: {}, {}{granted}{}",
+            "  {} {}: {status_clause}{}{granted}{}",
             if marked { "*" } else { " " },
             credit.label(),
-            truncate(&status, 20),
             expiry(credit),
             if marked { "  (used next)" } else { "" },
         ));
