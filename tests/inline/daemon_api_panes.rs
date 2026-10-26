@@ -157,6 +157,7 @@ fn register_fixture_rows() {
             is_delegate: false,
             background: false,
             background_hold: false,
+            visited_members: vec![],
         },
         LiveSession {
             session_id: "1128637-0".to_string(),
@@ -182,6 +183,7 @@ fn register_fixture_rows() {
             is_delegate: false,
             background: false,
             background_hold: false,
+            visited_members: vec![],
         },
     ];
     for row in rows {
@@ -213,6 +215,7 @@ fn register_delegate_row() {
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     })
     .expect("register the delegate row");
 }
@@ -241,6 +244,7 @@ fn register_orphan_row() {
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     })
     .expect("register the orphan row");
 }
@@ -271,6 +275,7 @@ fn register_stale_tag_row() {
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     })
     .expect("register the stale-tag row");
 }
@@ -553,6 +558,7 @@ fn a_recycled_pid_keeps_only_the_newest_row() {
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     })
     .expect("register the stale pid row");
     let ctx = ctx(fixture_probe());
@@ -604,6 +610,7 @@ fn a_wrapper_launched_clauth_start_is_the_panes_session() {
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     })
     .expect("register the wrapper session");
     let list = r#"{"id":"cli:pane:list","result":{"panes":[{"agent_status":"idle","cwd":"/home/user/repos/app","focused":false,"pane_id":"wX:pX","tab_id":"wX:tX","workspace_id":"wX"}]}}"#;
@@ -660,6 +667,7 @@ fn a_pane_with_no_foreground_job_keeps_its_row_beside_a_joined_pane() {
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     })
     .expect("register the member row");
     let list = r#"{"id":"cli:pane:list","result":{"panes":[{"agent_status":"idle","cwd":"/home/user/repos/rs/clauth","focused":false,"pane_id":"wM:pM","tab_id":"wM:tM","workspace_id":"wM"},{"agent_status":"idle","cwd":"/home/user/repos/shell","focused":false,"pane_id":"wE:pE","tab_id":"wE:tE","workspace_id":"wE"}]}}"#;
@@ -766,6 +774,7 @@ fn sessions_for(row_pid: u32, info: &'static str) -> serde_json::Value {
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     })
     .expect("register the row");
     let list = r#"{"id":"cli:pane:list","result":{"panes":[{"agent_status":"idle","cwd":"/home/user/repos/app","focused":false,"pane_id":"wK:pK","tab_id":"wK:tK","workspace_id":"wK"}]}}"#;

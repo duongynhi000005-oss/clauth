@@ -1215,6 +1215,7 @@ fn registry_row(sid: &str, profile: &str, harness: crate::harness::Harness) {
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     };
     crate::live_sessions::register(&row).expect("register row");
 }
@@ -1346,6 +1347,7 @@ fn switch_refuses_a_background_session_row() {
             is_delegate: false,
             background: true,
             background_hold: hold,
+            visited_members: vec![],
         };
         crate::live_sessions::register(&row).expect("register row");
         let sessions = crate::profile::profile_dir(&crate::profile::ProfileName::from("work"))
@@ -1586,6 +1588,7 @@ fn live_fixture_row(sid: &str, profile: &str, ago_secs: u64) -> crate::live_sess
         credit_leave: false,
         credit_leave_aware: false,
         current_member: None,
+        visited_members: vec![],
         last_swap_at: None,
         launch_store: None,
         boot_transport: None,
@@ -1625,7 +1628,8 @@ fn seed_cc_record(sb: &HomeSandbox, pid: u32, transcript: &str) {
 /// - `300-1` codex
 /// - `400-0` delegate, joined on its re-keyed `pid`
 /// - `500-0` background
-/// - `600-0` dead (no marker), `700-0` the daemon's background hold, `800-0` torn
+/// - `600-0` dead (no marker), `700-0` the daemon's hold on the account's fixed
+///   background tree, `800-0` torn
 fn seed_live_roster(sb: &HomeSandbox) -> Vec<std::fs::File> {
     let mut held = Vec::new();
 
@@ -1661,6 +1665,7 @@ fn seed_live_roster(sb: &HomeSandbox) -> Vec<std::fs::File> {
     crate::live_sessions::register(&live_fixture_row("600-0", "cld1", 30)).expect("dead row");
 
     let mut hold = live_fixture_row("700-0", "cld1", 30);
+    hold.background = true;
     hold.background_hold = true;
     held.push(register_live(&hold, "cld1"));
 
@@ -1689,6 +1694,29 @@ fn live_rows_keep_only_the_running_sessions() {
         .collect();
     sids.sort();
     assert_eq!(sids, ["100-0", "200-0", "300-1", "400-0", "500-0"]);
+}
+
+/// A `--with-fallback` background session the daemon adopted is a session
+/// following the chain, which `clauth switch <sid>` moves, so the roster lists
+/// it: the daemon's hold on it is not the account's fixed background tree.
+#[test]
+fn live_rows_list_an_adopted_with_fallback_session() {
+    let _sb = HomeSandbox::new();
+    let mut adopted = live_fixture_row("900-0", "cld1", 30);
+    adopted.follows_chain = true;
+    adopted.background_hold = true;
+    let _held = register_live(&adopted, "cld1");
+    let mut fixed = live_fixture_row("950-0", "cld1", 30);
+    fixed.background = true;
+    fixed.background_hold = true;
+    let _fixed = register_live(&fixed, "cld1");
+
+    let sids: Vec<String> = crate::live_sessions::live_rows()
+        .expect("the registry lists")
+        .into_iter()
+        .map(|row| row.session_id)
+        .collect();
+    assert_eq!(sids, ["900-0"]);
 }
 
 /// One line per live session, newest first: sid, account (`start → current`

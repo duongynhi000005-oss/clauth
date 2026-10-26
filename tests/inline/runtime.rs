@@ -8979,6 +8979,7 @@ fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
             is_delegate: false,
             background: false,
             background_hold: false,
+            visited_members: vec![],
         };
         crate::live_sessions::register(&dead).expect("register dead");
         dead.session_id = "6001-1".into();
@@ -12892,6 +12893,7 @@ fn register_row(profile: &str, sid: &str, launch_store: Option<std::path::PathBu
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     })
     .expect("register row");
 }
@@ -17209,4 +17211,59 @@ fn a_seed_whose_record_write_fails_never_outranks_a_siblings_write() {
         ("r2", &r2),
         ("the seeded copy", &r3),
     ]);
+}
+
+/// An adoption re-reads the member inside the state flock and refuses when it
+/// moved off the account the rotation guard was taken for, rather than holding
+/// the session under the wrong member's lock.
+#[test]
+fn an_adoption_bails_when_the_member_moves_while_the_rotation_lock_waits() {
+    let sb = HomeSandbox::new();
+    std::fs::create_dir_all(sb.home().join(".claude")).expect("~/.claude");
+    let sid = "4242-0";
+    let mut row = crate::testutil::live_row(sid, "wfl");
+    row.current_member = Some("wfl".to_string());
+    crate::live_sessions::register(&row).expect("register the handed-off row");
+    crate::runtime::set_adopt_reread_hook(Some(Box::new(move || {
+        crate::live_sessions::update_as_session(sid, |fields| fields.set_current_member("wfs"))
+            .expect("flip the member");
+    })));
+
+    let refused = crate::runtime::ProfileRuntime::acquire_adopted(sid, &[]);
+    crate::runtime::set_adopt_reread_hook(None);
+
+    let err = refused
+        .err()
+        .expect("the member moved during the wait, so the adoption must refuse");
+    assert_eq!(
+        err.to_string(),
+        "the session moved accounts while the adoption waited; retrying"
+    );
+}
+
+/// A GC pass re-reads the job store before reaping a dead chain row, so a job
+/// record landing after the pass-start snapshot keeps the hand-off record.
+#[test]
+fn a_gc_pass_spares_a_chain_row_whose_job_lands_after_its_snapshot() {
+    let sb = HomeSandbox::new();
+    let home = sb.home().to_path_buf();
+    let wfl = crate::profile::ProfileName::from("wfl");
+    let profile = crate::profile::profile_dir(&wfl).expect("profile dir");
+    let sid = "4242-0";
+    let tree = profile.join(format!("runtime-{sid}"));
+    std::fs::create_dir_all(&tree).expect("tree");
+    std::fs::create_dir_all(profile.join(format!("sessions-{sid}"))).expect("sessions dir");
+    crate::live_sessions::register(&crate::testutil::live_row(sid, "wfl")).expect("register");
+    let tree_for_job = tree.clone();
+    crate::runtime::set_gc_rows_reread_hook(Some(Box::new(move || {
+        crate::testutil::write_claude_job_in(&home, "b6a1c0d6", &tree_for_job, "working", None);
+    })));
+
+    crate::runtime::gc_live_session_rows();
+    crate::runtime::set_gc_rows_reread_hook(None);
+
+    assert!(
+        crate::live_sessions::get(sid).is_some(),
+        "the job re-read spares the handed-off row"
+    );
 }

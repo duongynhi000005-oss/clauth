@@ -208,6 +208,21 @@ impl JobTrees {
         }
     }
 
+    /// Whether an UNFINISHED job names `tree` — the subset of
+    /// [`JobTrees::names`] that still blocks a macOS rotation — or the tree's
+    /// own store is unreadable (fail closed). Distinct from
+    /// [`JobTrees::spares`], which covers a LIVE job of any state, and from
+    /// [`JobTrees::names`], which covers any live job.
+    pub(crate) fn unfinished_names(&self, tree: &Path) -> bool {
+        match self {
+            JobTrees::Unreadable { .. } => true,
+            JobTrees::Named(sets) if sets.unfinished.is_empty() && sets.unreadable.is_empty() => {
+                false
+            }
+            JobTrees::Named(sets) => named_or_affected(tree, &sets.unfinished, &sets.unreadable),
+        }
+    }
+
     /// The set of job ids whose record names `tree`, from any store that names
     /// it (the global store or the tree's own `jobs/`). Empty when no job names
     /// it or the store is unreadable. Distinct from [`JobTrees::names`]: two

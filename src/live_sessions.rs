@@ -120,6 +120,21 @@ pub(crate) struct LiveSession {
     /// Session-owned: the member this session's credential link resolves to.
     #[serde(default)]
     pub(crate) current_member: Option<String>,
+    /// Session-owned: every member the session has run on, in visit order, the
+    /// launch member first. Seeded by [`LiveSession::starting`] with the launch
+    /// member. The swap executor appends the incoming member in its own row
+    /// update before the link moves, then relinks the tree at that member's
+    /// store, and only then writes [`current_member`](Self::current_member) in
+    /// a second row update whose failure is logged and not raised. A swap that
+    /// dies between the two updates, or whose `current_member` write fails,
+    /// leaves this list naming a member `current_member` does not.
+    /// The live Claude Code child keeps every refresh token it was ever handed,
+    /// so a handed-off row keeps EVERY member in this list live, not only the
+    /// one it runs on now. `serde(default)` is the upgrade gate (a row written
+    /// by a clauth that predates the field reads empty), and an empty list
+    /// serializes absent so such a row round-trips byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) visited_members: Vec<String>,
     /// Session-owned: when this session last executed a swap.
     #[serde(default)]
     pub(crate) last_swap_at: Option<u64>,
@@ -170,12 +185,14 @@ pub(crate) struct LiveSession {
     /// per-session row, which is what it was.
     #[serde(default)]
     pub(crate) background: bool,
-    /// Whether this row is the DAEMON's hold of that pair, as opposed to a
-    /// `clauth start <p> -- --bg` launcher's. The daemon holds the tree exactly
-    /// while a Claude Code job names it, so the macOS rotation gate's marker
-    /// term skips it and the job term decides the tree; a launcher's marker
-    /// during its launch is not skipped. Implies [`Self::background`];
-    /// `serde(default)` is the upgrade gate.
+    /// Whether this row is the DAEMON's hold of a tree it adopted — the fixed
+    /// background pair, or a handed-off `--with-fallback` per-launch tree — as
+    /// opposed to a `clauth start` launcher's row. The daemon holds a tree
+    /// exactly while a Claude Code job names it, so the macOS rotation gate's
+    /// marker term skips it and the job term decides the tree; the pid joins
+    /// skip it because the hold is not a pane's process. An adopted per-launch
+    /// row keeps `background` false, so it still resolves its per-session tree
+    /// and stays switchable. `serde(default)` is the upgrade gate.
     #[serde(default)]
     pub(crate) background_hold: bool,
 }
@@ -232,6 +249,7 @@ impl LiveSession {
             is_delegate: matches!(launcher, Launcher::Delegate),
             background: false,
             background_hold: false,
+            visited_members: vec![start_profile.to_string()],
         }
     }
 
@@ -246,6 +264,17 @@ impl LiveSession {
                 .unwrap_or(&self.start_profile),
         );
         crate::runtime::session_row_is_live(&probe, self.isolated, &self.session_id)
+    }
+
+    /// Whether this row is the daemon's hold of the account's FIXED background
+    /// pair — the tree that exists while a Claude Code job names that account,
+    /// one hold however many jobs, and ends with the last one. It is no `clauth
+    /// start` session, so counting it would put a phantom session on screen and
+    /// in the stop-shunt confirm. An adopted per-launch `--with-fallback` hold
+    /// keeps `background` false and counts as the one real session it is; a
+    /// launcher's own background row carries no hold flag at all.
+    fn is_fixed_background_hold(&self) -> bool {
+        self.background_hold && self.background
     }
 }
 
@@ -274,6 +303,17 @@ pub(crate) struct SessionFields<'a>(&'a mut LiveSession);
 impl SessionFields<'_> {
     pub(crate) fn set_current_member(&mut self, member: impl Into<String>) {
         self.0.current_member = Some(member.into());
+    }
+
+    /// Append a member to the session's visit history, in visit order. A
+    /// re-visit does not duplicate. The swap executor calls this in the same
+    /// update as [`set_current_member`](Self::set_current_member), so the
+    /// history always contains the member the row names.
+    pub(crate) fn record_visited_member(&mut self, member: impl Into<String>) {
+        let member = member.into();
+        if !self.0.visited_members.contains(&member) {
+            self.0.visited_members.push(member);
+        }
     }
 
     /// Record that this session's launcher understands the credit-leave reason.
@@ -375,18 +415,11 @@ impl LiveTally {
     pub(crate) fn collect(config: &AppConfig) -> Self {
         let rows = read_registry();
         let unread = rows.is_none();
-        let mut tally = Self::from_live_rows(rows.unwrap_or_default().into_iter().filter(|row| {
-            // The daemon's hold is not a clauth start session: it exists while a
-            // Claude Code job names the account's fixed tree, one hold however
-            // many jobs, and it ends when the last job does. Counting it would
-            // put a phantom session on screen and in the stop-shunt confirm.
-            // The launcher's own background row HAS no hold flag and still
-            // counts — it is a real launch, for its launch.
-            if row.background_hold {
-                return false;
-            }
-            row.marker_is_held()
-        }));
+        let mut tally = Self::from_live_rows(
+            rows.unwrap_or_default()
+                .into_iter()
+                .filter(|row| !row.is_fixed_background_hold() && row.marker_is_held()),
+        );
         tally.unread = unread;
         tally.add_bare_sessions(config);
         tally
@@ -574,14 +607,16 @@ pub(crate) fn list() -> Vec<LiveSession> {
     read_registry().unwrap_or_default()
 }
 
-/// The running sessions' rows: drop the daemon's background hold and every row
-/// whose marker is no longer held, so a stale row awaiting GC never reads as
-/// live here. `None` when the registry cannot be listed or located, an empty
-/// vec when no row is live.
+/// The running sessions' rows: drop the daemon's hold of the account's fixed
+/// background pair, which stands for no launch session, and every row whose
+/// marker is no longer held, so a stale row awaiting GC never reads as live
+/// here. An adopted per-launch `--with-fallback` hold is a real session and
+/// stays. `None` when the registry cannot be listed or located, an empty vec
+/// when no row is live.
 pub(crate) fn live_rows() -> Option<Vec<LiveSession>> {
     read_registry().map(|rows| {
         rows.into_iter()
-            .filter(|row| !row.background_hold && row.marker_is_held())
+            .filter(|row| !row.is_fixed_background_hold() && row.marker_is_held())
             .collect()
     })
 }

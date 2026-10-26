@@ -28,6 +28,7 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     }
 }
 

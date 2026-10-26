@@ -250,6 +250,7 @@ fn session_stem_completion_lists_registry_stems_only() {
             is_delegate: false,
             background: false,
             background_hold: false,
+            visited_members: vec![],
         };
         crate::live_sessions::register(&row).expect("register row");
     }

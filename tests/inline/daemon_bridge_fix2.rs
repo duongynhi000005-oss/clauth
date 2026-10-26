@@ -312,6 +312,7 @@ fn register_self_row(session_id: &str) {
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     })
     .expect("register");
 }
@@ -417,6 +418,7 @@ fn the_production_resolver_reads_a_background_rows_tree() {
         is_delegate: false,
         background: true,
         background_hold: false,
+        visited_members: vec![],
     })
     .expect("register the launcher row");
     let _launch = crate::daemon::bridge::LaunchOverride::pose(parent);

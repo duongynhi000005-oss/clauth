@@ -2273,10 +2273,6 @@ fn carry_live_extra_into(
     Ok(())
 }
 
-/// Run [`carry_live_extra_into`] for a switch onto `name`, reporting a failure
-/// instead of raising it. Preserving MCP logins is a convenience; completing the
-/// switch is not, so an unwritable profile directory must not strand the
-/// operator on the outgoing account.
 /// Copy [`CARRIED_CREDENTIAL_KEYS`] out of `source` into `name`'s parked store.
 ///
 /// Nothing is written when `source` carries none of them, so an absent parked
@@ -2355,11 +2351,95 @@ pub(crate) fn restore_parked_mcp_logins(name: &ProfileName, store: &Path) {
     }
 }
 
+/// Run [`carry_live_extra_into`] for a switch onto `name`, reporting a failure
+/// instead of raising it. Preserving MCP logins is a convenience; completing the
+/// switch is not, so an unwritable profile directory must not strand the
+/// operator on the outgoing account.
 fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &ProfileName, preserve: bool) {
     if let Err(e) = carry_live_extra_into(link, target, name, preserve) {
         logline!(
             "clauth: switched to '{name}' but could not carry its MCP server logins: {e:#}. \
              Re-authenticate any MCP server that reports a signed-out session"
+        );
+    }
+}
+
+/// Merge [`CARRIED_CREDENTIAL_KEYS`] from the credential at `link` into the store
+/// at `target` before a relink installs it, reporting whether it wrote. The
+/// fresher copy stays per key and per server ([`fresher_copy`]): a key only
+/// `link` holds is added, one it lacks is left as `target` has it, nothing is
+/// deleted, and the login is never touched.
+///
+/// [`carry_live_extra_into`]'s sibling for a live file that is no account's login
+/// (a static token or a logged-out shell a session saved over the link): its MCP
+/// logins belong to no Claude account, so they are kept, but an older copy never
+/// lands over the store's newer one, whose refresh token a peer session may
+/// already have spent. Only the carried keys cross: the file can be a stale
+/// row's copy of another account, and a key that authenticates or names one
+/// beside the store's login would carry that account's identity in.
+///
+/// A no-op when either side is absent or unreadable ([`read_store_for_merge`]),
+/// into a `session-token.json` target with `preserve_non_login_keys` off (every
+/// sidecar writer then rebuilds that file from its token alone), and while a
+/// rotation is staged beside the target ([`crate::profile::rotation_staged_beside`]),
+/// whose staged pair the write would discard.
+///
+/// A carried key lands only as a JSON object: a null or any other value says
+/// nothing about the servers, so it carries nothing. Where both sides hold an
+/// object, the store's copy stays unless the file's is strictly fresher — the
+/// file's expiry later than the store's, or present where the store has none —
+/// since the file sat unheld while peer sessions wrote the store through their
+/// links. A tie, or no expiry on either side, keeps the store's, and a server
+/// only one side holds survives either way.
+fn carry_live_extra_fresher_into(link: &Path, target: &Path, preserve: bool) -> Result<bool> {
+    if !preserve
+        && target
+            .file_name()
+            .is_some_and(|n| n == "session-token.json")
+    {
+        return Ok(false);
+    }
+    let purpose = "this relink goes ahead without the MCP logins the saved login may hold";
+    let (Some(live), Some(mut stored)) = (
+        read_store_for_merge(link, purpose),
+        read_store_for_merge(target, purpose),
+    ) else {
+        return Ok(false);
+    };
+    let (Some(live_obj), Some(stored_obj)) = (live.as_object(), stored.as_object_mut()) else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for key in CARRIED_CREDENTIAL_KEYS {
+        if let Some(value) = live_obj.get(key).filter(|value| value.is_object()) {
+            changed |= merge_fresher_key(stored_obj, key, value, false);
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+    if crate::profile::rotation_staged_beside(target) {
+        let purpose = "the shell's MCP logins were not merged into its store, and the relink that \
+             follows takes the shell's file away";
+        logline!(
+            "clauth: a rotation is staged beside {}, so {purpose}",
+            target.display()
+        );
+        return Ok(false);
+    }
+    atomic_write_600(target, serde_json::to_string_pretty(&stored)?)
+        .context("failed to merge the session's MCP server logins into its store")?;
+    Ok(true)
+}
+
+/// Run [`carry_live_extra_fresher_into`], reporting a failure instead of raising
+/// it: keeping MCP logins is a convenience, and the relink it rides on is not.
+pub(crate) fn carry_live_extra_fresher_best_effort(link: &Path, target: &Path, preserve: bool) {
+    if let Err(e) = carry_live_extra_fresher_into(link, target, preserve) {
+        logline!(
+            "clauth: could not merge the session's MCP server logins into {}: {e:#}. \
+             Re-authenticate any MCP server that reports a signed-out session",
+            target.display()
         );
     }
 }
@@ -2434,16 +2514,41 @@ fn copy_non_login_keys(target: &mut serde_json::Value, source: &serde_json::Valu
         if LOGIN_CREDENTIAL_KEYS.contains(&key.as_str()) {
             continue;
         }
-        let merged = match target.get(key) {
-            Some(held) => fresher_copy(held, value),
-            None => value.clone(),
-        };
-        if target.get(key) != Some(&merged) {
-            target.insert(key.clone(), merged);
-            changed = true;
-        }
+        changed |= merge_fresher_key(target, key, value, true);
     }
     changed
+}
+
+/// Merge one key of `source` into `target`, [`fresher_copy`] deciding where both
+/// hold a copy and `source`'s landing whole where only it does, reporting whether
+/// `target` changed. `source_on_tie` picks the copy that stays where the
+/// expiries tie or neither side carries one; a copy with an expiry still beats
+/// one without, whichever side. `true` for [`copy_non_login_keys`], whose source
+/// is a live file a refresh moves forward, `false` for
+/// [`carry_live_extra_fresher_into`], whose file sat unheld while peer sessions
+/// wrote the store.
+fn merge_fresher_key(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+    source_on_tie: bool,
+) -> bool {
+    let merged = match target.get(key) {
+        Some(held) => {
+            let (held, source) = if source_on_tie {
+                (held, value)
+            } else {
+                (value, held)
+            };
+            fresher_copy(held, source)
+        }
+        None => value.clone(),
+    };
+    if target.get(key) == Some(&merged) {
+        return false;
+    }
+    target.insert(key.to_string(), merged);
+    true
 }
 
 /// What stays of a key both sides hold: `held`, the target's copy, and
@@ -2696,7 +2801,22 @@ pub(crate) fn sync_live_extra_after_rotation(name: &ProfileName, previous_login:
 /// keeping a design login is a convenience, and completing the relink, switch
 /// or rotation it rides on is not.
 pub(crate) fn sync_live_extra_best_effort(link: &Path, store: &Path) {
-    if let Err(e) = sync_live_extra_into(link, store) {
+    sync_live_extra_matching_best_effort(link, store, None);
+}
+
+/// [`sync_live_extra_best_effort`] with the live login it must match: `None`
+/// for the store's own (the plain [`sync_live_extra_into`]), `Some` for the
+/// login an adoption's relink found replaced in the store, its only `Some`
+/// caller (rule 2's older login). One log text serves both. The `match` is a
+/// reachability constraint, not dispatch: the rotation path keeps its own
+/// message ([`sync_live_extra_after_rotation`]), so its `None` arm is the one
+/// way the binary still reaches [`sync_live_extra_into`].
+pub(crate) fn sync_live_extra_matching_best_effort(link: &Path, store: &Path, login: Option<&str>) {
+    let synced = match login {
+        Some(login) => sync_live_extra_matching(link, store, Some(login)),
+        None => sync_live_extra_into(link, store),
+    };
+    if let Err(e) = synced {
         logline!(
             "clauth: could not save the live credential's non-login keys into {}: {e:#}. A design \
              login or MCP login made since the last relink may need signing in again",

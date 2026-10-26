@@ -1217,6 +1217,7 @@ fn an_own_endpoint_capped_accounts_row_carries_no_credit_cap_flag() {
     }
     let config = crate::profile::load_config().expect("load config");
     let jobs = crate::claude_jobs::job_trees();
+    let handed_off = crate::runtime::handed_off_live_members(&jobs);
     let now = 1_700_000_000_000;
     let row = |n: &crate::profile::ProfileName| {
         profile_row(
@@ -1224,6 +1225,7 @@ fn an_own_endpoint_capped_accounts_row_carries_no_credit_cap_flag() {
             &config,
             now,
             &jobs,
+            &handed_off,
         )
     };
     assert_eq!(

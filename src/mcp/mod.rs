@@ -15,7 +15,7 @@ mod herdr_report;
 pub(crate) mod jobs;
 mod render;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -225,6 +225,7 @@ fn profile_row(
     config: &AppConfig,
     now: i64,
     jobs: &crate::claude_jobs::JobTrees,
+    handed_off: &HashSet<String>,
 ) -> serde_json::Value {
     let name = &p.name;
     // One read of this account's own cache, feeding the one carrier its figures
@@ -253,7 +254,7 @@ fn profile_row(
     // Both of these are absent unless they say something. Emitted
     // unconditionally they were 39% of a 27-profile response, nearly all of it
     // `false` and rows carrying no warning.
-    if crate::runtime::has_live_session_in(name, jobs) {
+    if crate::runtime::has_live_session_in(name, jobs, handed_off) {
         row["has_live_session"] = serde_json::json!(true);
     }
     let warnings = throughput_warnings(name, now);
@@ -999,6 +1000,7 @@ named, one it cannot place, or an agent run with no model named."
         };
 
         let jobs = crate::claude_jobs::job_trees();
+        let handed_off = crate::runtime::handed_off_live_members(&jobs);
         let profiles: Vec<serde_json::Value> = config
             .profiles
             .iter()
@@ -1007,7 +1009,7 @@ named, one it cannot place, or an agent run with no model named."
                     .as_ref()
                     .is_none_or(|w| w.iter().any(|n| n == p.name.as_str()))
             })
-            .map(|p| profile_row(p, &config, now, &jobs))
+            .map(|p| profile_row(p, &config, now, &jobs, &handed_off))
             .collect();
 
         let payload = serde_json::json!({ "profiles": profiles });
@@ -1025,12 +1027,9 @@ named, one it cannot place, or an agent run with no model named."
         if let Some((name, source)) = resolved.as_ref()
             && let Some(p) = config.find(&ProfileName::from(name.clone()))
         {
-            let mut row = profile_row(
-                p,
-                config,
-                now_epoch_secs(),
-                &crate::claude_jobs::job_trees(),
-            );
+            let jobs = crate::claude_jobs::job_trees();
+            let handed_off = crate::runtime::handed_off_live_members(&jobs);
+            let mut row = profile_row(p, config, now_epoch_secs(), &jobs, &handed_off);
             row["source"] = serde_json::json!(source.as_str());
             rows.push(row);
         }

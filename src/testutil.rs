@@ -1238,9 +1238,11 @@ fi
 # Like the real background launch: the job service takes the session, the
 # launch returns at once, and the job record names the config dir it reads.
 # The record is written through that config dir, as Claude Code writes it.
+# A `/background` prompt stands in for a foreground session moved to the
+# background from its terminal, which leaves the launcher the same record.
 for arg in "$@"; do
   case "$arg" in
-    --bg|--background)
+    --bg|--background|/background)
       : "${CLAUDE_CONFIG_DIR:?}"
       job="$CLAUDE_CONFIG_DIR/jobs/fakebg$$"
       mkdir -p "$job"
@@ -2099,6 +2101,7 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     }
 }
 

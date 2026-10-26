@@ -2182,6 +2182,7 @@ fn an_armed_session_silences_the_reader_before_any_read() {
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     })
     .expect("row");
 

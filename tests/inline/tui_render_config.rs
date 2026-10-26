@@ -946,6 +946,7 @@ fn a_job_under_one_profile_reads_live_only_that_profiles_snapshot() {
     });
     // Refresh the per-tick job snapshot the way poll_live_sessions does.
     app.job_trees = crate::claude_jobs::job_trees();
+    app.handed_off = crate::runtime::handed_off_live_members(&app.job_trees);
 
     app.profile_cursor.set(0);
     assert!(

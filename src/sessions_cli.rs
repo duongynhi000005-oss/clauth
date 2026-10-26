@@ -243,6 +243,24 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
     // The shared liveness probe: a row whose flock is gone is a stale row
     // awaiting GC, not a session to move.
     if !row.marker_is_held() {
+        // A handed-off chain session has no live marker (its launcher or a
+        // previous daemon released it): it waits for the next daemon, not a
+        // report that it stopped. The job still naming its tree is what says
+        // the hand-off stands.
+        if row.follows_chain
+            && !row.isolated
+            && crate::runtime::chain_session_tree(
+                &crate::profile::ProfileName::from(row.start_profile.as_str()),
+                &row.session_id,
+            )
+            .ok()
+            .is_some_and(|tree| crate::claude_jobs::job_trees().names(&tree))
+        {
+            anyhow::bail!(
+                "session '{sid}' is a background session no clauth daemon holds yet\n\
+                 it follows the chain once `clauth daemon` runs"
+            );
+        }
         anyhow::bail!(
             "session '{sid}' is no longer running\n\
              its row is reaped by the next `clauth daemon` or `clauth resume`"

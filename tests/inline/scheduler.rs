@@ -4248,6 +4248,7 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     }
 }
 

@@ -91,8 +91,9 @@ impl super::Daemon {
     }
 
     /// Hand this tick's background-tree work to the hold worker: adopt every
-    /// configured account whose `runtime-bg` a Claude Code job names, release
-    /// every hold no job names any more.
+    /// configured account's fixed `runtime-bg` whose tree a Claude Code job
+    /// names, and every handed-off `--with-fallback` per-launch tree a job
+    /// names; release every hold no job names any more.
     ///
     /// This reads the job store and a config snapshot and returns; the blocking
     /// half — the rotation lock, the state flock, the tree build — runs on the

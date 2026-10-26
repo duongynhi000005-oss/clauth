@@ -232,6 +232,13 @@ impl std::fmt::Display for Isolation {
 /// `acquire` with no session ever spawned.
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Set the next minted id's sequence, posing what a recycled pid gives a later
+/// process: its counter starting over at a value an older row already names.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn rewind_session_seq_for_test(seq: u64) {
+    SESSION_SEQ.store(seq, Ordering::Relaxed);
+}
+
 /// How many times `acquire` re-mints a [`SessionId`] whose marker a live holder
 /// already owns. The counter above makes an in-process collision impossible, so
 /// a holder here is always another PROCESS that minted the same `<pid>-<seq>`,
@@ -261,6 +268,13 @@ impl SessionId {
     #[cfg(test)]
     fn for_test(value: &str) -> Self {
         Self(value.to_string())
+    }
+
+    /// Build from an id string already validated through [`is_session_id`].
+    /// Private: only the adoption entry calls it, so no caller can conjure an
+    /// id a session was never acquired under.
+    fn from_validated(value: String) -> Self {
+        Self(value)
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -703,6 +717,14 @@ pub(crate) fn session_sessions_tree(
         .find(|tree| tree.join("sessions").is_dir())
 }
 
+/// The per-session runtime tree a handed-off `--with-fallback` row's job names:
+/// the shared [`LinkMode::Real`] layout, since a chain opt-in only survives on
+/// a host that links (a copy host refuses the launch and the executor refuses a
+/// Fake tree). [`session_runtime_trees`]'s first arm is exactly that layout.
+pub(crate) fn chain_session_tree(start_profile: &ProfileName, session_id: &str) -> Result<PathBuf> {
+    session_runtime_trees(start_profile, false, session_id).map(|trees| trees[0].clone())
+}
+
 /// Whether the session a registry row names is still running. `true` on anything
 /// the probe could not decide, keeping [`is_session_alive`]'s direction: a row
 /// wrongly read as live costs one wasted registry write, while one wrongly read as
@@ -898,17 +920,20 @@ pub(crate) fn has_live_marker(name: &ProfileName) -> bool {
 
 /// True iff the profile has at least one live session, of either flavor and in
 /// ANY of its marker dirs, OR a Claude Code background job names a tree under
-/// its dir. Gates the destructive claude account actions (delete, disable,
-/// rename) everywhere. The macOS rotation gate reads a narrower job term —
-/// UNFINISHED jobs only — through [`rotation_blocked_for`], never this.
+/// its dir, OR a handed-off chain row keeps it live. Gates the destructive
+/// claude account actions (delete, disable, rename) everywhere. The macOS
+/// rotation gate reads a narrower job term — UNFINISHED jobs only — through
+/// [`rotation_blocked_for`], never this.
 ///
-/// Liveness has two sources. A `clauth start` session holds a flock on its
+/// Liveness has three sources. A `clauth start` session holds a flock on its
 /// marker ([`has_live_marker`]); a `clauth start <p> -- --bg` session releases
 /// its marker at once while Claude Code keeps reading its config dir, so a
 /// profile is also live while any job names a tree under its dir
-/// ([`crate::claude_jobs::JobTrees::spares_under`]). The job store is read
-/// only when the marker probe found nothing live, so a live session costs no
-/// store walk.
+/// ([`crate::claude_jobs::JobTrees::spares_under`]); a handed-off chain row
+/// keeps every account in its visit history live, its current member and its
+/// start profile, even before a daemon holds it
+/// ([`handed_off_live_members`]). The job store is read only when the marker
+/// probe found nothing live, so a live session costs no store walk.
 ///
 /// Every unknown reads as LIVE: a false negative pulls an account out from
 /// under a running session or signs it out, while a spurious true costs a
@@ -916,16 +941,71 @@ pub(crate) fn has_live_marker(name: &ProfileName) -> bool {
 /// wrongly deleted account is unrecoverable). Only a dir that is genuinely
 /// absent counts as idle.
 pub(crate) fn has_live_session(name: &ProfileName) -> bool {
-    has_live_marker(name) || job_names_tree_under(name, &crate::claude_jobs::job_trees())
+    has_live_marker(name) || {
+        let jobs = crate::claude_jobs::job_trees();
+        job_names_tree_under(name, &jobs) || handed_off_live_members(&jobs).contains(name.as_str())
+    }
 }
 
 /// [`has_live_session`] against a job store the caller already read, so a
 /// pass-level caller reads the store once and every profile it maps shares that
-/// snapshot (the [`gc_runtime_trees`] precedent). The marker probe is always a
-/// fresh read — the snapshot covers only the job-store walk, the expensive
-/// half, and the `||` keeps that walk lazy when a marker is already live.
-pub(crate) fn has_live_session_in(name: &ProfileName, jobs: &crate::claude_jobs::JobTrees) -> bool {
-    has_live_marker(name) || job_names_tree_under(name, jobs)
+/// snapshot (the [`gc_runtime_trees`] precedent). The handed-off live-member
+/// set is the same shape: computed once per pass and shared, never re-read per
+/// profile. The marker probe is always a fresh read — the snapshot covers only
+/// the job-store walk and the handed-off set, the expensive half, and the `||`
+/// keeps that walk lazy when a marker is already live.
+pub(crate) fn has_live_session_in(
+    name: &ProfileName,
+    jobs: &crate::claude_jobs::JobTrees,
+    handed_off: &HashSet<String>,
+) -> bool {
+    has_live_marker(name) || job_names_tree_under(name, jobs) || handed_off.contains(name.as_str())
+}
+
+/// Every member a handed-off chain row keeps live: its visit history, the
+/// member it runs on now, and the launch member. The history is the complete
+/// record the swap executor writes, but a member can be named by
+/// `current_member` alone — a row written before the history field existed, or
+/// a field view that set the member directly — so the union never drops one.
+fn row_live_members(row: &crate::live_sessions::LiveSession) -> Vec<String> {
+    let mut members = row.visited_members.clone();
+    if let Some(current) = &row.current_member
+        && !members.contains(current)
+    {
+        members.push(current.clone());
+    }
+    if !members.contains(&row.start_profile) {
+        members.push(row.start_profile.clone());
+    }
+    members
+}
+
+/// The members a handed-off chain row keeps live, computed once per pass over
+/// the registry so a caller mapping many profiles does not re-read the whole
+/// registry for each one. A handed-off row records every member the session has
+/// run on (see [`row_live_members`]), and its per-session tree sits under the
+/// START profile's dir, so [`job_names_tree_under`] over a swapped-onto
+/// member's dir never sees it. Fail closed — an unreadable store spares (reads
+/// as naming) like every other job reader, so a handed-off session's account
+/// can never be deleted, renamed or disabled under it.
+pub(crate) fn handed_off_live_members(jobs: &crate::claude_jobs::JobTrees) -> HashSet<String> {
+    crate::live_sessions::list()
+        .into_iter()
+        .filter(|row| row.follows_chain && !row.isolated)
+        .flat_map(|row| {
+            let named = chain_session_tree(
+                &ProfileName::from(row.start_profile.as_str()),
+                &row.session_id,
+            )
+            .ok()
+            .is_some_and(|tree| jobs.spares(&tree));
+            if named {
+                row_live_members(&row)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
 }
 
 /// A Claude Code background job naming any tree under this profile's
@@ -1132,10 +1212,11 @@ pub(crate) enum RotationBlock {
 /// The first term is a marker session holding a rotatable store
 /// ([`has_live_marker`] && [`live_session_holds_rotatable`]); the second is an
 /// UNFINISHED Claude Code background job on a tree that holds a refresh token
-/// ([`job_block`], a fresh job-store walk over
-/// [`crate::claude_jobs::JobTrees::unfinished_under`]). A finished job —
-/// `stopped`/`done`/`failed` — is not mid-task, and a job on a refresh-less
-/// tree has nothing to strand, so both free the chain.
+/// ([`job_block`]: under the profile a job-store walk over
+/// [`crate::claude_jobs::JobTrees::unfinished_under`], and a handed-off
+/// per-launch chain tree attributed by its row's `launch_store`). A finished
+/// job — `stopped`/`done`/`failed` — is not mid-task, and a job on a
+/// refresh-less tree has nothing to strand, so both free the chain.
 ///
 /// The daemon's own background hold is not a marker session here:
 /// [`live_session_holds_rotatable`] skips a row whose `background_hold` is set,
@@ -1183,7 +1264,24 @@ pub(crate) fn rotation_blocked_for(name: &ProfileName) -> bool {
 /// a marker session on one. A tree the read cannot judge (no file, a dangling
 /// link, unparseable bytes) holds. Fail closed: an unreadable job store, or a
 /// profile dir that cannot be resolved, blocks with the store's path named.
+///
+/// The under-the-profile arm cannot see a handed-off per-launch chain tree
+/// correctly: the tree sits under its START profile's dir while the session
+/// runs on the member its row names, so a swap off the start profile leaves
+/// the tree under an account the session no longer reads. The per-launch arm
+/// therefore attributes such a tree by its row's `launch_store` — the store
+/// the session actually reads (on macOS it moves only once the swap's keychain
+/// legs land) — else the tree's link, and blocks `name` only when that store
+/// is one of `name`'s own. A store that is absent, or that no longer resolves,
+/// holds for the accounts the row names and for those only: the member the
+/// session runs on, the account it started on, and the account whose profile
+/// dir the unresolved path points into — the only accounts a rotation of which
+/// could strand it. Any other account's rotation cannot reach this session, so
+/// the gate leaves it to the rest of the terms. The under-profile arm skips
+/// trees a chain row owns so the launch account the session left is never
+/// blocked by its own dir.
 fn job_block(name: &ProfileName) -> Option<RotationBlock> {
+    let jobs = crate::claude_jobs::job_trees();
     let dir = match profile_dir(name) {
         Ok(dir) => dir,
         Err(_) => {
@@ -1192,14 +1290,121 @@ fn job_block(name: &ProfileName) -> Option<RotationBlock> {
             )));
         }
     };
-    let trees = match crate::claude_jobs::job_trees().unfinished_under(&dir) {
+    let trees = match jobs.unfinished_under(&dir) {
         Ok(trees) => trees,
         Err(store) => return Some(RotationBlock::UnreadableJobStore(store)),
     };
-    trees
+    let rows = crate::live_sessions::list();
+    let chain_trees: HashSet<PathBuf> = rows
         .iter()
-        .any(|tree| credential_holds_refresh_token(&tree.join(".credentials.json")))
-        .then_some(RotationBlock::BackgroundJob)
+        .filter(|row| row.follows_chain && !row.isolated)
+        .filter_map(|row| {
+            chain_session_tree(
+                &ProfileName::from(row.start_profile.as_str()),
+                &row.session_id,
+            )
+            .ok()
+            .and_then(|tree| crate::canonical::identity(&tree).ok())
+        })
+        .collect();
+    if trees.iter().any(|tree| {
+        !chain_trees.contains(tree)
+            && credential_holds_refresh_token(&tree.join(".credentials.json"))
+    }) {
+        return Some(RotationBlock::BackgroundJob);
+    }
+    for row in rows {
+        if !row.follows_chain || row.isolated {
+            continue;
+        }
+        let Ok(tree) = chain_session_tree(
+            &ProfileName::from(row.start_profile.as_str()),
+            &row.session_id,
+        ) else {
+            continue;
+        };
+        if !jobs.unfinished_names(&tree) {
+            continue;
+        }
+        // The store the session reads: the row's `launch_store`, else the
+        // tree's credential link. A row with neither, or whose store no longer
+        // resolves, holds for the accounts its row names and no others.
+        let store = row
+            .launch_store
+            .clone()
+            .or_else(|| crate::canonical::identity(tree.join(".credentials.json")).ok());
+        let Some(store) = store else {
+            if row_names_account(&row, name, None) {
+                return Some(RotationBlock::BackgroundJob);
+            }
+            continue;
+        };
+        let Some(own) = store_is_own_of(name, &store) else {
+            if row_names_account(&row, name, Some(&store)) {
+                return Some(RotationBlock::BackgroundJob);
+            }
+            continue;
+        };
+        if own && credential_holds_refresh_token(&store) {
+            return Some(RotationBlock::BackgroundJob);
+        }
+    }
+    None
+}
+
+/// Whether a chain row names `name` among the accounts its unresolved store
+/// can strand: the member the session runs on (`current_member`, else
+/// `start_profile`), the account it started on (its tree lives under that
+/// profile's dir), and — when the row names a store path — the account whose
+/// profile dir holds that path. A rotation of any other account cannot reach
+/// this session, so the gate leaves it to the rest of its terms rather than
+/// refusing a rotation nothing here could strand.
+///
+/// The dirs compare canonicalized, like [`store_is_own_of`], so a via→real
+/// spelling never compares unequal; the raw spelling decides when either side
+/// cannot canonicalize.
+fn row_names_account(
+    row: &crate::live_sessions::LiveSession,
+    name: &ProfileName,
+    store: Option<&Path>,
+) -> bool {
+    if row.start_profile == name.as_str()
+        || row.current_member.as_deref().unwrap_or(&row.start_profile) == name.as_str()
+    {
+        return true;
+    }
+    let Some(parent) = store.and_then(Path::parent) else {
+        return false;
+    };
+    let Ok(dir) = profile_dir(name) else {
+        return false;
+    };
+    if let (Ok(real_parent), Ok(real_dir)) = (
+        crate::canonical::identity(parent),
+        crate::canonical::identity(&dir),
+    ) {
+        return real_parent == real_dir;
+    }
+    parent == dir.as_path()
+}
+
+/// Whether `store` is one of `name`'s own credential stores — the two files a
+/// switch installs from, whichever exists — compared canonicalized like the
+/// adoption's own-stores check, so a via→real spelling never compares unequal.
+/// `None` when `store` does not resolve (deleted, a dangling link): an identity
+/// the gate cannot judge holds.
+fn store_is_own_of(name: &ProfileName, store: &Path) -> Option<bool> {
+    let member_dir = profile_dir(name).ok()?;
+    let store = crate::canonical::identity(store).ok()?;
+    Some(
+        [
+            member_dir.join("credentials.json"),
+            member_dir.join("session-token.json"),
+        ]
+        .into_iter()
+        .filter_map(|own| crate::canonical::identity(own).ok())
+        .any(|own| own == store),
+    )
 }
 
 /// [`rotation_block_for`] with the host passed in, so a Linux test drives the
@@ -2305,20 +2510,107 @@ fn gc_bare_markers() {
 }
 
 /// Drop registry rows whose owning session is gone. A row is dead iff no marker
-/// the session could still hold is flock-held: the attributed member first (a
-/// swapped session runs there), then the launch member. This keeps GC aligned
-/// with [`crate::live_sessions::LiveTally::collect`] — a row can never be alive in
+/// the session could still hold is flock-held — the attributed member first (a
+/// swapped session runs there), then the launch member — and, for a chain row,
+/// no Claude Code job names its per-session tree: that tree is the hand-off
+/// record a later daemon adopts. This keeps GC aligned with
+/// [`crate::live_sessions::LiveTally::collect`] — a row can never be alive in
 /// the tally and dead to GC, which is what would silently reap a live swapped row
 /// after a force-delete of its launch profile. Folded in here rather than given
 /// its own entry point so every existing `gc_stale_runtimes` caller gets it.
 fn gc_live_session_rows() {
+    let jobs = crate::claude_jobs::job_trees();
+    // Test seam: a job record landing after the pass-start snapshot but before
+    // the loop reaches its row must be seen by the re-read below, not reaped
+    // off the stale snapshot. Nothing outside tests sets this.
+    #[cfg(test)]
+    run_gc_rows_reread_hook();
     for row in crate::live_sessions::list() {
-        if !row.marker_is_held()
-            && let Err(e) = crate::live_sessions::unregister(&row.session_id)
+        if row.marker_is_held() {
+            continue;
+        }
+        // A handed-off chain row is the record a daemon later adopts: spare it
+        // while a job names its per-session tree, and fail closed under an
+        // unreadable store (spares reads true) like every other job reader. A
+        // row outside the chain is reaped whatever a job keeps.
+        let chain_tree = (row.follows_chain && !row.isolated)
+            .then(|| {
+                chain_session_tree(
+                    &ProfileName::from(row.start_profile.as_str()),
+                    &row.session_id,
+                )
+            })
+            .and_then(|tree| tree.ok());
+        if chain_tree.as_ref().is_some_and(|tree| jobs.spares(tree)) {
+            continue;
+        }
+        // A launch whose job record landed after the pass-start snapshot and
+        // whose launcher handed off before this loop reached its row is reaped
+        // off a store the snapshot outlived. Re-read before reaping a dead
+        // chain row — rare (a job-less chain row) and cheap, so the hand-off
+        // record is never lost to a stale snapshot.
+        if chain_tree
+            .as_ref()
+            .is_some_and(|tree| crate::claude_jobs::job_trees().spares(tree))
         {
+            continue;
+        }
+        if let Err(e) = crate::live_sessions::unregister(&row.session_id) {
             logline!("clauth: dropping stale live-session row failed: {e}");
         }
     }
+}
+
+/// Test seam for [`gc_live_session_rows`]'s per-row re-read: a hook run once
+/// between the pass-start job snapshot and the row loop, posing a job record
+/// that landed after the snapshot. Test-only.
+#[cfg(test)]
+pub(crate) type GcRowsRereadHook = Box<dyn FnMut()>;
+
+#[cfg(test)]
+thread_local! {
+    static GC_ROWS_REREAD_HOOK: std::cell::RefCell<Option<GcRowsRereadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_gc_rows_reread_hook(hook: Option<GcRowsRereadHook>) {
+    GC_ROWS_REREAD_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_gc_rows_reread_hook() {
+    GC_ROWS_REREAD_HOOK.with(|hook| {
+        if let Some(mut hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+/// Test seam for [`ProfileRuntime::acquire_adopted`]'s member re-check: a hook
+/// run once between the pre-lock member read and the in-flock re-read, posing
+/// a swap that moves the session while the adoption waits. Test-only.
+#[cfg(test)]
+pub(crate) type AdoptRereadHook = Box<dyn FnMut()>;
+
+#[cfg(test)]
+thread_local! {
+    static ADOPT_REREAD_HOOK: std::cell::RefCell<Option<AdoptRereadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_adopt_reread_hook(hook: Option<AdoptRereadHook>) {
+    ADOPT_REREAD_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_adopt_reread_hook() {
+    ADOPT_REREAD_HOOK.with(|hook| {
+        if let Some(mut hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 /// Rescue an isolated runtime root into the global store: the transcripts under
@@ -2993,6 +3285,10 @@ pub(crate) struct RotationGuard {
 ///   probes the memo answers save a live token that moved meanwhile: 24 + 19 +
 ///   20 = 63 s; 12 + 19 + 20 = 51 s with the account id
 ///   cached;
+/// - [`ProfileRuntime::acquire_adopted`]: the stage landing's budget, then the
+///   store write and relink (both sub-millisecond disk work inside the
+///   already-held state flock) =
+///   20 s;
 /// - [`ProfileRuntime::acquire`]: the landing's budget, the macOS seed
 ///   carry's item read at `keychain::SECURITY_TIMEOUT`, then the seed write's
 ///   own [`SESSION_SEED_BUDGET`], then the `.claude.json` seed's sync-lock
@@ -3782,6 +4078,67 @@ struct SwappedMarkers {
     pid_lock: File,
 }
 
+/// One marker an adoption claimed, with its paths' state taken before the
+/// claim touched them: `created_file`/`created_dir` are true only where THIS
+/// attempt made the path, so a rollback never removes a marker another holder
+/// made or a `sessions-<sid>/` dir that stood before the attempt.
+struct AdoptionMarkerPaths {
+    pid_file: PathBuf,
+    sessions: PathBuf,
+    created_file: bool,
+    created_dir: bool,
+}
+
+/// The markers an adoption has claimed while its refusals still run, in claim
+/// order. Dropped uncommitted it takes back exactly what those claims created;
+/// committed, the hold keeps them for the session's life.
+///
+/// The caller declares this guard before the [`SwappedMarkers`] it collects, so
+/// those release their flocks first and the unlink never meets its own handle.
+#[derive(Default)]
+struct AdoptionClaims {
+    made: Vec<AdoptionMarkerPaths>,
+    committed: bool,
+}
+
+impl AdoptionClaims {
+    /// Snapshot a marker's paths before a claim touches them. Pushed ahead of
+    /// the claim, so a claim that fails partway is covered too.
+    fn begin(&mut self, paths: &SessionPaths) {
+        let existed = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+        self.made.push(AdoptionMarkerPaths {
+            pid_file: paths.pid_file.clone(),
+            sessions: paths.sessions.clone(),
+            created_file: !existed(&paths.pid_file),
+            created_dir: !existed(&paths.sessions),
+        });
+    }
+
+    /// The claim sequence finished: the hold owns every marker and the files
+    /// stay.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AdoptionClaims {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for made in self.made.drain(..).rev() {
+            if made.created_file {
+                let _ = std::fs::remove_file(&made.pid_file);
+            }
+            if made.created_dir {
+                // Fails when a sibling has put a marker in it since, which is
+                // exactly when the dir is not this attempt's to remove.
+                let _ = std::fs::remove_dir(&made.sessions);
+            }
+        }
+    }
+}
+
 /// What claiming a member's liveness marker found.
 enum MarkerClaim {
     /// Freshly stamped; hold for the session's life.
@@ -3801,12 +4158,18 @@ enum MarkerClaim {
 /// It makes the swapped-onto member read live to [`has_live_session`], which is
 /// what stops a delete or disable landing on the account this session is now
 /// running as, and on macOS what [`rotation_blocked_for`] reads to refuse a
-/// rotation of it.
+/// rotation of it — for a FOREGROUND session. A per-session tree a daemon
+/// adopts is a background hold: the rotation gate skips a background row's
+/// markers, refuses only the account owning the store the row's `launch_store`
+/// names (its start, current and store-path accounts when that store is absent
+/// or no longer resolves, see [`job_block`]), and so leaves the accounts the
+/// session has moved off rotatable.
+/// The marker still keeps each of them live for delete, disable and rename.
 ///
 /// `None` when the marker is held by something else, so the caller
 /// refuses the swap. A foreign holder means a colliding session id, and marker
 /// ownership is what teardown keys on — unlinking a marker another session minted
-/// would report that session dead while it runs. Callers go through
+/// would report that session dead while it runs. The swap path comes through
 /// [`SessionSwap::claim_markers`], which separates a foreign holder from this
 /// session's own earlier claim first.
 fn stamp_swapped_markers(paths: &SessionPaths) -> Result<Option<SwappedMarkers>> {
@@ -3832,7 +4195,19 @@ struct SwapCell {
     canonical: PathBuf,
     /// Markers stamped by swaps, in visit order. NEVER released mid-session: the
     /// live Claude Code child still holds every refresh token it has been handed
-    /// and nothing can observe when it stops using one.
+    /// and nothing can observe when it stops using one. So for a FOREGROUND
+    /// session every marker here refuses a rotation of its account on macOS
+    /// while the session's store holds a refresh token, through
+    /// [`rotation_blocked_for`]'s marker term.
+    ///
+    /// A per-session tree the daemon adopts is a BACKGROUND hold: that term
+    /// skips every row whose `background_hold` is set, so these markers do no
+    /// rotation work there. The job term decides instead, refusing only the
+    /// account owning the store the row's `launch_store` names (its start,
+    /// current and store-path accounts when that store is absent or no longer
+    /// resolves, see [`job_block`]); the accounts
+    /// the session has moved off stay rotatable. Every marker here still keeps
+    /// its account live for delete, disable and rename.
     held: Vec<SwappedMarkers>,
     /// The last refusal announced, so a stuck `intended_member` states its reason
     /// once instead of once per watchdog tick.
@@ -3932,18 +4307,48 @@ impl SessionSwap {
         canonical: PathBuf,
         paths: &SessionPaths,
     ) -> Self {
+        Self::from_parts(
+            session,
+            isolation,
+            mode,
+            tree,
+            LaunchTransport::of(launch),
+            launch.name.as_str().to_string(),
+            canonical,
+            paths.runtime.clone(),
+            paths.pid_file.clone(),
+            Vec::new(),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one part per SessionSwap field; the split keeps new and the adoption sharing it"
+    )]
+    fn from_parts(
+        session: SessionId,
+        isolation: Isolation,
+        mode: LinkMode,
+        tree: SessionTree,
+        launch: LaunchTransport,
+        member: String,
+        canonical: PathBuf,
+        runtime: PathBuf,
+        marker: PathBuf,
+        held: Vec<SwappedMarkers>,
+    ) -> Self {
         Self {
             session,
             isolation,
             mode,
             tree,
-            runtime: paths.runtime.clone(),
-            launch: LaunchTransport::of(launch),
-            launch_marker: paths.pid_file.clone(),
+            runtime,
+            launch,
+            launch_marker: marker,
             cell: crate::lockorder::RankedMutex::new(SwapCell {
-                member: launch.name.as_str().to_string(),
+                member,
                 canonical,
-                held: Vec::new(),
+                held,
                 last_refusal: None,
             }),
             shutdown: ShutdownFlag::new(),
@@ -4325,6 +4730,19 @@ impl SessionSwap {
             // On macOS the session's store is its per-session Keychain item, and
             // the swap's install replaces it without saving what sat beside the
             // outgoing member's login (`keychain::keychain_install_for_config_dir`).
+            //
+            // The incoming member joins the visit history BEFORE the link moves.
+            // A launcher killed in the window between the two would otherwise
+            // leave the tree reading an account its row names nowhere, idle to
+            // delete, disable and rename. Recording first only over-approximates
+            // — an account named but never linked stays live, the fail-closed
+            // direction — and a row write that cannot land refuses the swap here,
+            // while the tree is still on the outgoing member. `current_member`
+            // keeps its later write point, with the row write that names the
+            // link's new target.
+            crate::live_sessions::update_as_session(self.session.as_str(), |fields| {
+                fields.record_visited_member(plan.member.as_str());
+            })?;
             relink_to_canonical(&link, &plan.store)?;
 
             // Past here the session IS on the new member, so nothing may report
@@ -4839,6 +5257,100 @@ impl SessionSwap {
     }
 }
 
+/// One session's three reconcile legs, as one value the watchdog loop calls
+/// back into.
+struct WatchdogLegs {
+    claude_home: PathBuf,
+    swap: std::sync::Arc<SessionSwap>,
+    /// macOS: the seed's retry target while a classified locked keychain left
+    /// the session's item unwritten — see `retry_seeded_keychain_item`. The
+    /// credential tick recomputes the seed against it: no timer of its own, one
+    /// bounded subprocess budget per attempt, and it drops the moment the store
+    /// stops matching the target or a retry fails on anything other than the
+    /// classified transient.
+    #[cfg(target_os = "macos")]
+    seed_retry: std::sync::Mutex<Option<PathBuf>>,
+}
+
+impl crate::watchdog::Reconcile for WatchdogLegs {
+    fn config(&self) {
+        // Try-once: a peer mid-merge must not park the credential leg and swap
+        // poll on the same loop iteration. A skipped pass retries on the next
+        // event or the 30 s fallback tick.
+        if let Err(e) = crate::claude_json::sync_once_try() {
+            logline!("clauth: .claude.json sync failed: {e}");
+        }
+        if let Err(e) = crate::settings_sync::sync_once() {
+            logline!("clauth: settings.json sync failed: {e}");
+        }
+    }
+    fn credentials(&self) {
+        if let Err(e) = tick(&self.claude_home, &self.swap) {
+            logline!("clauth: watchdog tick failed: {e}");
+        }
+        // After the file reconcile and outside every lock: the retry shells
+        // out, so it must never span the state flock `tick` takes and releases
+        // itself.
+        #[cfg(target_os = "macos")]
+        retry_seeded_keychain_item(&self.swap, &self.seed_retry);
+    }
+    fn swap_poll(&self) {
+        self.swap.poll();
+    }
+    #[cfg(test)]
+    fn tick_driven(&self) {
+        self.swap
+            .tick_reconciles
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Arm this session's fs watcher and spawn its watchdog thread, named for the
+/// account the session runs on. The watcher is armed HERE rather than on the
+/// spawned thread, so that the acquiring call returning IS the barrier proving
+/// the watch is live (arming costs 18-34 ms on macOS; a credential write
+/// landing in the window a spawn-first caller could not see would wait out the
+/// whole 30 s fallback). The returned sender signals the watchdog to exit when
+/// dropped (see [`ProfileRuntime::drop`]).
+#[expect(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
+fn spawn_session_watchdog(
+    claude_home: PathBuf,
+    swap: std::sync::Arc<SessionSwap>,
+    name: &str,
+    #[cfg(target_os = "macos")] seed_retry: Option<PathBuf>,
+) -> Result<(crossbeam_channel::Sender<()>, JoinHandle<()>)> {
+    let (watchdog_tx, watchdog_rx) = crossbeam_channel::bounded::<()>(1);
+    let legs = WatchdogLegs {
+        claude_home: claude_home.clone(),
+        swap: std::sync::Arc::clone(&swap),
+        #[cfg(target_os = "macos")]
+        seed_retry: std::sync::Mutex::new(seed_retry),
+    };
+    let specs = crate::watchdog::watch_specs(
+        swap.runtime.as_path(),
+        swap.canonical().as_path(),
+        &claude_home,
+    );
+    let requested = specs.len();
+    let watcher = crate::watchdog::try_start(&specs, crate::watchdog::PRODUCTION.debounce);
+    let watchdog_handle = thread::Builder::new()
+        .name(format!("clauth-wdog-{name}"))
+        .spawn(move || {
+            // Event-driven reconcile, polling only where events are
+            // unavailable. Exits when the shutdown sender is dropped (see
+            // ProfileRuntime::Drop).
+            crate::watchdog::run_with_watcher(
+                watcher,
+                requested,
+                &watchdog_rx,
+                &crate::watchdog::PRODUCTION,
+                &legs,
+            );
+        })
+        .expect("failed to spawn watchdog thread");
+    Ok((watchdog_tx, watchdog_handle))
+}
+
 /// Live-session guard. On drop: stops the watchdog, runs a final sync
 /// (errors surface to stderr), drops the PID file, and discards this session's
 /// own runtime tree.
@@ -5067,6 +5579,265 @@ impl ProfileRuntime {
         )
     }
 
+    /// Adopt a handed-off `--with-fallback` session into this process's hold:
+    /// the daemon's own [`ProfileRuntime`] for the per-launch tree a Claude
+    /// Code job still names, after the launcher exited and handed the row on.
+    ///
+    /// The row is the hand-off record: the start profile, the member the tree
+    /// last ran on, the boot transport, and every member the session has run
+    /// on all live there, and the adoption keeps them as they are — only the
+    /// row's pid and hold mark change. The markers it claims are the current
+    /// member's own `sessions-<sid>/<sid>` (the launch member's when the
+    /// session never moved) plus every earlier member's, all claimed before the
+    /// row is written, and the sid is never re-minted: a live marker or a stop
+    /// in flight refuses the adoption for a later retry. The job's own
+    /// supervisor lives beside the hold for the job's whole life, so the
+    /// adoption never waits on it.
+    pub(crate) fn acquire_adopted(sid: &str, _stale_env_keys: &[String]) -> Result<Self> {
+        if !is_session_id(sid) {
+            anyhow::bail!("not a session id: {sid:?}");
+        }
+        let session = SessionId::from_validated(sid.to_string());
+        let claude_home = claude_dir()?;
+        if !claude_home.exists() {
+            anyhow::bail!("~/.claude not found; install Claude Code first");
+        }
+
+        // The member the tree runs on decides which rotation lock guards the
+        // adoption and which marker the hold claims. Read once here to pick it;
+        // the authoritative row is re-read inside the state flock below.
+        let member_name = crate::live_sessions::get(sid)
+            .map(|row| {
+                ProfileName::from(row.current_member.as_deref().unwrap_or(&row.start_profile))
+            })
+            .ok_or_else(|| anyhow::anyhow!("no live-session row"))?;
+        // Test seam: the session moves accounts in exactly this window (after
+        // the pre-lock member read, before the in-flock re-read), which the
+        // re-read below must catch. Nothing outside tests sets this.
+        #[cfg(test)]
+        run_adopt_reread_hook();
+        let rotation_guard =
+            RotationGuard::acquire_with_timeout(&member_name, rotation_lock_timeout())?;
+        // A live stage a failed persist left behind lands first, before the
+        // rules read or write the store, or they judge against a store that
+        // lags the chain (the same lander `acquire_tree` runs).
+        crate::oauth::land_stage_for_install(&member_name, &rotation_guard)
+            .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
+
+        let (start_paths, member_paths, pid_lock, mode, member, canonical, launch, held) =
+            with_state_lock(|flock| {
+                let row = crate::live_sessions::get(sid)
+                    .ok_or_else(|| anyhow::anyhow!("no live-session row"))?;
+                if !row.follows_chain || row.isolated {
+                    anyhow::bail!(
+                        "this session did not opt into the fallback chain; refusing to adopt it"
+                    );
+                }
+                let start_profile = ProfileName::from(row.start_profile.as_str());
+                let member =
+                    ProfileName::from(row.current_member.as_deref().unwrap_or(&row.start_profile));
+                // The rotation guard above was taken for the member read BEFORE
+                // the flock. A predecessor hold finishing a swap during this
+                // wait moves the session, so the guard would cover the wrong
+                // account: bail for a retry rather than adopt under it.
+                if member != member_name {
+                    anyhow::bail!("the session moved accounts while the adoption waited; retrying");
+                }
+                // The tree is the start profile's per-session runtime dir; the
+                // marker is the member's. A copy host could not have launched
+                // this session (the launch refuses), but the mode is probed
+                // here so a flip refuses through the same typed path the fixed
+                // pair uses, never as an ordinary adoption failure.
+                let profile_root = profile_dir(&start_profile)?;
+                crate::profile::mkdir_700(&profile_root)
+                    .with_context(|| format!("failed to create {}", profile_root.display()))?;
+                let mode = detect_link_mode(&profile_root)?;
+                if mode == LinkMode::Fake {
+                    return Err(anyhow::Error::new(CopyHostBackgroundRefusal));
+                }
+                let start_paths = resolve_tree(
+                    &start_profile,
+                    Isolation::Shared,
+                    SessionTree::PerSession,
+                    &session,
+                    mode,
+                )?;
+                let member_paths = resolve_tree(
+                    &member,
+                    Isolation::Shared,
+                    SessionTree::PerSession,
+                    &session,
+                    mode,
+                )?;
+                // A GC/teardown is between its decide and removal holds for the
+                // tree: adopting now would hold a tree the sweep is about to
+                // end. The next retry adopts once it settles.
+                if stop_in_flight(&start_paths.runtime)? {
+                    anyhow::bail!(
+                        "clauth is stopping Claude Code's background service in {}; \
+                         retry in a moment",
+                        start_paths.runtime.display()
+                    );
+                }
+                // Markers are claimed before the row write and before the tree
+                // is touched, past the cheap refusals above, so a refused
+                // adoption never rewrites a live session's tree. The live
+                // Claude Code child keeps every refresh token it was ever
+                // handed, so the hold claims the marker of every member the
+                // session has run on, not only the one it runs on now: the
+                // visitors first, then the current member, whose marker is the
+                // hold's own pid file. Each other member's marker joins the
+                // swap cell's `held`, released at teardown like a live swap's.
+                // A member whose profile dir is gone is skipped and logged,
+                // never fatal. A foreign holder on ANY marker refuses the
+                // adoption for a retry, and `claims` then takes back the marker
+                // files and `sessions-<sid>/` dirs this attempt made — a
+                // holder's own file and a dir that stood before the attempt are
+                // left alone, so the refusal leaves no file of its own.
+                let mut claims = AdoptionClaims::default();
+                let mut held: Vec<SwappedMarkers> = Vec::new();
+                let mut history = row_live_members(&row);
+                history.retain(|visited| visited != member.as_str());
+                history.sort();
+                history.dedup();
+                for visited in history {
+                    let visited_name = ProfileName::from(visited.as_str());
+                    let Ok(visited_dir) = profile_dir(&visited_name) else {
+                        logline!(
+                            "clauth: skipping marker for {visited}, whose profile dir \
+                             cannot be resolved"
+                        );
+                        continue;
+                    };
+                    if !visited_dir.is_dir() {
+                        logline!(
+                            "clauth: skipping marker for {visited}, whose profile dir is gone"
+                        );
+                        continue;
+                    }
+                    let visited_paths = resolve_tree(
+                        &visited_name,
+                        Isolation::Shared,
+                        SessionTree::PerSession,
+                        &session,
+                        mode,
+                    )?;
+                    claims.begin(&visited_paths);
+                    match stamp_swapped_markers(&visited_paths)? {
+                        Some(markers) => held.push(markers),
+                        None => {
+                            anyhow::bail!(
+                                "failed to claim session marker {}: another live process \
+                                 holds this session id",
+                                visited_paths.pid_file.display()
+                            );
+                        }
+                    }
+                }
+                claims.begin(&member_paths);
+                let Some(current) = stamp_swapped_markers(&member_paths)? else {
+                    anyhow::bail!(
+                        "failed to claim session marker {}: another live process \
+                         holds this session id",
+                        member_paths.pid_file.display()
+                    );
+                };
+                let pid_lock = current.pid_lock;
+                // The launch read is hoisted above the drain: `load_profile`
+                // can refuse, and a refusal must come before the first store
+                // write or relink.
+                let launch = match row.boot_transport.clone() {
+                    Some(transport) => transport,
+                    None => LaunchTransport::of(&crate::profile::load_profile(&start_profile)?),
+                };
+                // Claude Code saves its login over the tree's credential link
+                // as a regular file between the launcher's exit and this
+                // adoption (or between holds after a daemon outage): `claude
+                // --bg` 2.1.310 re-saves it with one more key about a second
+                // after launch, and a token refresh lands the same way. The
+                // drain runs only after every marker is claimed, so a refused
+                // adoption never rewrites a tree or store it could not hold.
+                let link_path = start_paths.runtime.join(".credentials.json");
+                if !link_path
+                    .symlink_metadata()
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+                {
+                    adopt_saved_login(&link_path, &member, flock)?;
+                }
+                // The tree is the launcher's own: its credential link must
+                // resolve to one of the member's own stores — the
+                // `credentials.json` or the `session-token.json` sidecar — so
+                // the adoption never guesses an account the row does not name.
+                // The swap cell seeds the LINK TARGET, not today's install
+                // source: the convergence leg then moves a link still on the
+                // other store onto the current install source.
+                let link = crate::canonical::identity(&link_path).ok();
+                let member_dir = profile_dir(&member)?;
+                let own_stores = [
+                    crate::canonical::identity(member_dir.join("credentials.json")).ok(),
+                    crate::canonical::identity(member_dir.join("session-token.json")).ok(),
+                ];
+                let canonical = link
+                    .filter(|link| own_stores.iter().flatten().any(|store| store == link))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "the session's credential link does not resolve to {member}'s \
+                             own stores; refusing to adopt it"
+                        )
+                    })?;
+                claims.commit();
+                // Re-register the row under this holder: the handed-off fields
+                // stay; only the pid and the hold mark change.
+                let mut adopted_row = row;
+                adopted_row.pid = std::process::id();
+                adopted_row.background_hold = true;
+                if let Err(e) = crate::live_sessions::register(&adopted_row) {
+                    logline!("clauth: registering the live session failed: {e}");
+                }
+                Ok::<_, anyhow::Error>((
+                    start_paths,
+                    member_paths,
+                    pid_lock,
+                    mode,
+                    member,
+                    canonical,
+                    launch,
+                    held,
+                ))
+            })?;
+        drop(rotation_guard);
+
+        let swap = std::sync::Arc::new(SessionSwap::from_parts(
+            session,
+            Isolation::Shared,
+            mode,
+            SessionTree::PerSession,
+            launch,
+            member.as_str().to_string(),
+            canonical,
+            start_paths.runtime.clone(),
+            member_paths.pid_file.clone(),
+            held,
+        ));
+        let (watchdog_signal, watchdog_handle) = spawn_session_watchdog(
+            claude_home.clone(),
+            std::sync::Arc::clone(&swap),
+            member.as_str(),
+            #[cfg(target_os = "macos")]
+            None,
+        )?;
+        Ok(Self {
+            swap,
+            pid_file: member_paths.pid_file,
+            claude_home,
+            sessions: member_paths.sessions,
+            store_notes: Vec::new(),
+            _pid_lock: pid_lock,
+            watchdog_signal: Some(watchdog_signal),
+            watchdog_handle: Some(watchdog_handle),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn acquire_tree(
         name: &ProfileName,
@@ -5211,6 +5982,15 @@ impl ProfileRuntime {
                     continue;
                 }
                 if is_session_alive(&paths.pid_file) {
+                    session = SessionId::mint();
+                    paths = resolve_tree(name, isolation, tree, &session, mode)?;
+                    continue;
+                }
+                // A registry row outlives its pid once its session is handed
+                // off: a row already naming this id is the hand-off record,
+                // which a fresh acquire must never overwrite. Re-mint rather
+                // than wait, like the marker collision.
+                if crate::live_sessions::get(session.as_str()).is_some() {
                     session = SessionId::mint();
                     paths = resolve_tree(name, isolation, tree, &session, mode)?;
                     continue;
@@ -5425,93 +6205,13 @@ impl ProfileRuntime {
         let SessionPaths {
             sessions, pid_file, ..
         } = paths;
-
-        // This session's three reconcile legs, as one value the watchdog loop
-        // calls back into.
-        struct WatchdogLegs {
-            claude_home: PathBuf,
-            swap: std::sync::Arc<SessionSwap>,
-            /// macOS: the seed's retry target while a classified locked
-            /// keychain left the session's item unwritten — see
-            /// `retry_seeded_keychain_item`. The credential tick recomputes
-            /// the seed against it: no timer of its own, one bounded
-            /// subprocess budget per attempt, and it drops the moment the
-            /// store stops matching the target or a retry fails on anything
-            /// other than the classified transient.
+        let (watchdog_signal, watchdog_handle) = spawn_session_watchdog(
+            claude_home.clone(),
+            std::sync::Arc::clone(&swap),
+            name.as_str(),
             #[cfg(target_os = "macos")]
-            seed_retry: std::sync::Mutex<Option<PathBuf>>,
-        }
-        impl crate::watchdog::Reconcile for WatchdogLegs {
-            fn config(&self) {
-                // Try-once: a peer mid-merge must not park the credential leg
-                // and swap poll on the same loop iteration. A skipped pass
-                // retries on the next event or the 30 s fallback tick.
-                if let Err(e) = crate::claude_json::sync_once_try() {
-                    logline!("clauth: .claude.json sync failed: {e}");
-                }
-                if let Err(e) = crate::settings_sync::sync_once() {
-                    logline!("clauth: settings.json sync failed: {e}");
-                }
-            }
-            fn credentials(&self) {
-                if let Err(e) = tick(&self.claude_home, &self.swap) {
-                    logline!("clauth: watchdog tick failed: {e}");
-                }
-                // After the file reconcile and outside every lock: the retry
-                // shells out, so it must never span the state flock `tick`
-                // takes and releases itself.
-                #[cfg(target_os = "macos")]
-                retry_seeded_keychain_item(&self.swap, &self.seed_retry);
-            }
-            fn swap_poll(&self) {
-                self.swap.poll();
-            }
-            #[cfg(test)]
-            fn tick_driven(&self) {
-                self.swap
-                    .tick_reconciles
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-
-        let (watchdog_tx, watchdog_rx) = crossbeam_channel::bounded::<()>(1);
-        let legs = WatchdogLegs {
-            claude_home: claude_home.clone(),
-            swap: std::sync::Arc::clone(&swap),
-            #[cfg(target_os = "macos")]
-            seed_retry: std::sync::Mutex::new(seed_retry),
-        };
-        // Armed HERE rather than on the spawned thread, so that `acquire`
-        // returning IS the barrier proving the watch is live. Arming costs
-        // 18-34 ms on macOS (FSEvents resolves and registers each directory),
-        // and a caller that spawned first had no way to learn when its watch
-        // went up: a credential write landing in that window produced no event
-        // and waited out the whole 30 s fallback. It is outside the rotation-lock
-        // hold, which the drop above ends at the register-and-stamp window, so a
-        // same-profile peer queued behind this start no longer waits it out.
-        let specs = crate::watchdog::watch_specs(
-            swap.runtime.as_path(),
-            swap.canonical().as_path(),
-            &claude_home,
-        );
-        let requested = specs.len();
-        let watcher = crate::watchdog::try_start(&specs, crate::watchdog::PRODUCTION.debounce);
-        #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
-        let watchdog_handle = thread::Builder::new()
-            .name(format!("clauth-wdog-{name}"))
-            .spawn(move || {
-                // Event-driven reconcile, polling only where events are
-                // unavailable. Exits when the shutdown sender is dropped (see
-                // ProfileRuntime::Drop).
-                crate::watchdog::run_with_watcher(
-                    watcher,
-                    requested,
-                    &watchdog_rx,
-                    &crate::watchdog::PRODUCTION,
-                    &legs,
-                );
-            })
-            .expect("failed to spawn watchdog thread");
+            seed_retry,
+        )?;
 
         Ok(Self {
             swap,
@@ -5520,7 +6220,7 @@ impl ProfileRuntime {
             sessions,
             store_notes,
             _pid_lock: pid_lock,
-            watchdog_signal: Some(watchdog_tx),
+            watchdog_signal: Some(watchdog_signal),
             watchdog_handle: Some(watchdog_handle),
         })
     }
@@ -5725,7 +6425,20 @@ impl Drop for ProfileRuntime {
         let stop = false;
         match acquire_state_lock_for_teardown() {
             Ok(_guard) => {
-                if let Err(e) = crate::live_sessions::unregister(self.swap.session.as_str()) {
+                // A `--with-fallback` session a Claude Code job outlives is
+                // handed on, not ended: its chain row is the record a later
+                // daemon adopts. The launcher's teardown and a daemon hold's
+                // release both reach here, so the same rule hands the row on
+                // again while a job still names the tree, and ends it (row
+                // gone, tree collected) once the job does not.
+                let hand_off = !self.swap.tree.is_background()
+                    && self.swap.isolation == Isolation::Shared
+                    && crate::live_sessions::get(self.swap.session.as_str())
+                        .is_some_and(|row| row.follows_chain)
+                    && crate::claude_jobs::job_trees().spares(&self.swap.runtime);
+                if !hand_off
+                    && let Err(e) = crate::live_sessions::unregister(self.swap.session.as_str())
+                {
                     logline!("clauth: unregistering the live session failed: {e}");
                 }
                 if let Err(e) = std::fs::remove_file(&self.pid_file)
@@ -9120,6 +9833,176 @@ fn relink_to_canonical(link_path: &Path, canonical: &Path) -> Result<()> {
         std::fs::remove_file(link_path)?;
         Ok(())
     }
+}
+
+/// Apply the adoption drain's login rules to a regular-file saved login F
+/// (`link_path`) for `member`, in order; the first that decides acts. C is the
+/// member's `credentials.json` (the rotating store) and T its
+/// `session-token.json` sidecar. Runs inside the state flock with the member's
+/// rotation guard held, after every marker claim succeeded, so any refusal
+/// rolls the claims back.
+///
+///  1. RE-SAVE: F's refresh token equals C's — with a non-blank access token,
+///     write F's login into C through the key-preserving writer, carry F's
+///     non-login keys and relink onto C; with a blank one, write no login,
+///     carry nothing (the carry matches a live login against the store's own,
+///     and a blank access is no login) and relink onto C. Or F is T's current
+///     static token — relink onto T and carry non-login keys, never writing
+///     T's login. A rotation staged beside C takes no login write either, so
+///     the staged pair still reads as newer: only F's in-login extras wait,
+///     its refresh token being C's already, and the carry stands down there
+///     itself.
+///  2. OLDER LOGIN: F's non-blank refresh token is in C's spent record — carry
+///     F's non-login keys into C, relink onto C, write no login. An unreadable
+///     record refuses.
+///  3. STATIC TOKEN OR LOGGED-OUT SHELL: F has no non-blank refresh token and
+///     matches no store — merge F's carried keys (MCP logins) into the member's
+///     install source, only a strictly fresher copy per server winning, then
+///     relink onto it. F's login is written nowhere, and no key that
+///     authenticates or names an account crosses: F can be a stale row's copy
+///     of another account. A store copy newer than F's is never replaced, and
+///     only a strictly fresher one from F lands — its expiry later than the
+///     store's, or present where the store has none — since peer sessions write
+///     the store through their links.
+///  4. NO STORE HOLDS IT: F's non-blank refresh token is neither C's current
+///     login nor in C's spent record — refuse, writing nothing and keeping F
+///     byte for byte.
+fn adopt_saved_login(
+    link_path: &Path,
+    member: &ProfileName,
+    held: &crate::lock::StateLockHeld,
+) -> Result<()> {
+    let f_bytes = std::fs::read(link_path).context("failed to read the session's saved login")?;
+    let Ok(f_creds) = serde_json::from_slice::<ClaudeCredentials>(&f_bytes) else {
+        // A partial write is Claude Code's mid-flight: leave the file alone
+        // until the write completes; the own-stores gate refuses it for now.
+        return Ok(());
+    };
+    let Some(login) = f_creds.claude_ai_oauth.as_ref() else {
+        // No login: leave the file alone; the own-stores gate refuses it.
+        return Ok(());
+    };
+
+    let member_dir = profile_dir(member)?;
+    let c_path = member_dir.join("credentials.json");
+    let c_creds = std::fs::read(&c_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ClaudeCredentials>(&bytes).ok());
+
+    // A blank token is an absent token: an empty refresh makes a static token,
+    // and an empty access is no login to re-save (Claude Code's dead-token wipe
+    // blanks both).
+    let f_access = login.access_token.as_str();
+    let f_refresh = login.refresh_token.as_deref().filter(|r| !r.is_empty());
+
+    // Rule 1: C's current login (same non-blank refresh token, never bytes).
+    if let Some(r) = f_refresh
+        && c_creds.as_ref().and_then(|c| c.refresh_token()) == Some(r)
+    {
+        if f_access.trim().is_empty() {
+            // The logged-out wipe blanks the access token of a login C still
+            // holds. Writing that blank over C's live token would break the
+            // store, and the carry matches a live login against the store's
+            // own — a blank one matches none — so it carries nothing either.
+            relink_to_canonical(link_path, &c_path)?;
+            return Ok(());
+        }
+        if crate::profile::rotation_staged_beside(&c_path) {
+            // Writing C would move it past the staged pair, which the next load
+            // then discards; F's refresh token is C's, so only its extras wait.
+            relink_to_canonical(link_path, &c_path)?;
+            return Ok(());
+        }
+        crate::profile::write_profile_credentials(member, Some(&f_creds), held)?;
+        if crate::claude::preserve_non_login_keys() {
+            crate::claude::sync_live_extra_best_effort(link_path, &c_path);
+        }
+        relink_to_canonical(link_path, &c_path)?;
+        return Ok(());
+    }
+
+    // Rule 1: T's current static token (no refresh, the same token T installs).
+    if f_refresh.is_none()
+        && !f_access.trim().is_empty()
+        && crate::claude::installed_session_token(member).as_deref() == Some(f_access)
+    {
+        let t_path = crate::claude::install_source_path(member)?;
+        if crate::claude::preserve_non_login_keys() {
+            crate::claude::sync_live_extra_best_effort(link_path, &t_path);
+        }
+        relink_to_canonical(link_path, &t_path)?;
+        return Ok(());
+    }
+
+    if f_refresh.is_none() {
+        // Rule 3: a static token or logged-out shell matching no store. Its
+        // login is never written anywhere; the tree relinks to the member's
+        // install source, and a missing one refuses before the relink touches
+        // F. Its carried keys (MCP logins) merge in first, fresher copy
+        // winning: they belong to no Claude account and the file may be their
+        // only home, while a peer session writing the store through its link
+        // may hold the newer copy of one. Only the carried keys cross — F is no
+        // account's login and can be a stale row's copy of another account,
+        // whose design login or device token must not ride in.
+        let install = crate::claude::install_source_path(member)?;
+        guard_relink_target(member, &install)?;
+        crate::claude::carry_live_extra_fresher_best_effort(
+            link_path,
+            &install,
+            crate::claude::preserve_non_login_keys(),
+        );
+        relink_to_canonical(link_path, &install)?;
+        return Ok(());
+    }
+
+    // Rules 2 and 4, judged through the store's spent record.
+    match crate::oauth::session_login_copy(&c_path, &f_creds) {
+        crate::oauth::SessionLoginCopy::Spent => {
+            // Rule 2: an older login. The store it relinks onto must exist
+            // before any carry, or the refused adoption would delete the
+            // session's file through the relink's remove branch.
+            guard_relink_target(member, &c_path)?;
+            if crate::claude::preserve_non_login_keys() {
+                crate::claude::sync_live_extra_matching_best_effort(
+                    link_path,
+                    &c_path,
+                    Some(f_access),
+                );
+            }
+            relink_to_canonical(link_path, &c_path)?;
+            Ok(())
+        }
+        crate::oauth::SessionLoginCopy::Unknown => {
+            anyhow::bail!(
+                "the session's saved login cannot be judged: {member}'s \
+                 spent-token record cannot be read, so the session keeps \
+                 its own copy until the record reads again"
+            );
+        }
+        crate::oauth::SessionLoginCopy::Copyable => {
+            // Rule 4: a refreshed login no store holds. Nothing proves whose
+            // refresh chain it is, so refuse without writing anything.
+            anyhow::bail!(
+                "the session's saved login holds a refresh token none of \
+                 {member}'s stores hold; refusing to adopt it"
+            );
+        }
+    }
+}
+
+/// Refuse before a relink whose target store is gone, so a refused adoption
+/// never reaches [`relink_to_canonical`]'s remove branch and deletes the
+/// session's file. The refusal names the store's file, since the two stores one
+/// member can relink onto are told apart by nothing else in the message.
+fn guard_relink_target(member: &ProfileName, store: &Path) -> Result<()> {
+    if !store.exists() {
+        let file = store
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
+        anyhow::bail!("{member} has no {file} to relink the session onto; refusing to adopt it");
+    }
+    Ok(())
 }
 
 /// Bidirectional mtime mirror between `runtime/.credentials.json` and canonical

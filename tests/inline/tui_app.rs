@@ -16978,6 +16978,7 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
         is_delegate: false,
         background: false,
         background_hold: false,
+        visited_members: vec![],
     };
     crate::live_sessions::register(&row).expect("register row");
     let _marker = crate::runtime::hold_session_row_marker(

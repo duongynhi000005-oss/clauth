@@ -365,6 +365,10 @@ pub(crate) fn build_profile_entries(
     let next_queue_open =
         crate::usage::next_queue_open_secs(queue_anchor, queue_members.len(), interval_ms)
             .and_then(|s| u64::try_from(s.saturating_mul(1000)).ok());
+    // One registry read per pass, shared by every profile's live-session cell —
+    // the same per-pass shape as the job snapshot, so the per-tick feed never
+    // pays profiles × rows registry reads.
+    let handed_off = crate::runtime::handed_off_live_members(jobs);
     config
         .profiles
         .iter()
@@ -612,7 +616,7 @@ pub(crate) fn build_profile_entries(
                 base_url: p.base_url.clone(),
                 tier: tier_label(p),
                 harness: "claude".to_string(),
-                has_live_session: crate::runtime::has_live_session_in(name, jobs),
+                has_live_session: crate::runtime::has_live_session_in(name, jobs, &handed_off),
                 auth_status: auth_status_str(config, p, now as i64).to_string(),
                 fetch_status: fetch_status.map(str::to_string),
                 stale,

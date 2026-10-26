@@ -5810,7 +5810,10 @@ fn tick_until_no_adoption_pending(daemon: &mut Daemon) {
 fn adopted(daemon: &Daemon, name: &str, sessions: &std::path::Path) -> bool {
     let account = crate::profile::ProfileName::from(name);
     let rows = rows_of(name);
-    daemon.background.held.contains_key(&account)
+    daemon
+        .background
+        .held
+        .contains_key(&super::BackgroundKey::Account(account.clone()))
         && crate::runtime::has_live_marker(&account)
         && rows.len() == 1
         && sessions.join(&rows[0].session_id).is_file()
@@ -5977,7 +5980,10 @@ fn the_daemon_never_adopts_a_background_tree_on_a_copy_host() {
     assert!(tree.is_dir(), "the job's tree is left alone");
     tick_until_no_adoption_pending(&mut daemon);
     assert!(
-        daemon.background.copy_host.contains_key(&name),
+        daemon
+            .background
+            .copy_host
+            .contains_key(&super::BackgroundKey::Account(name)),
         "the copy host refused the account before the host links"
     );
     drop(fake_mode);
@@ -6277,23 +6283,23 @@ fn a_lost_background_hold_worker_is_reported_and_stops_the_tick_queueing() {
 #[test]
 fn an_adoption_failure_backs_off_and_logs_once_per_streak() {
     let mut retry = std::collections::HashMap::new();
-    let name = crate::profile::ProfileName::from("bgp");
-    let first = super::note_adoption_failure(&mut retry, &name, "boom", 1_000)
+    let key = super::BackgroundKey::Account(crate::profile::ProfileName::from("bgp"));
+    let first = super::note_adoption_failure(&mut retry, &key, "boom", 1_000)
         .expect("the first failure of a streak is news");
     assert!(
         first.contains("adopting 'bgp' background tree failed"),
         "the line names the account: {first}"
     );
     assert_eq!(
-        retry.get(&name).map(|failure| failure.not_before_ms),
+        retry.get(&key).map(|failure| failure.not_before_ms),
         Some(1_000 + super::adopt_backoff_ms(1))
     );
     assert!(
-        super::note_adoption_failure(&mut retry, &name, "boom", 20_000).is_none(),
+        super::note_adoption_failure(&mut retry, &key, "boom", 20_000).is_none(),
         "an identical failure repeating on the schedule stays silent"
     );
     assert!(
-        super::note_adoption_failure(&mut retry, &name, "different", 40_000).is_some(),
+        super::note_adoption_failure(&mut retry, &key, "different", 40_000).is_some(),
         "a different failure is news"
     );
 }
@@ -6349,7 +6355,9 @@ fn a_failed_release_send_puts_the_runtime_back_under_its_hold() {
     );
 
     let mut holds = super::BackgroundHolds::new();
-    holds.held.insert(name.clone(), runtime);
+    holds
+        .held
+        .insert(super::BackgroundKey::Account(name.clone()), runtime);
     // The worker is gone: its work receiver is closed and its done channel can
     // never report anything, so the tick reaches the release it cannot hand off.
     let (work_tx, work_rx) = crossbeam_channel::unbounded::<super::BackgroundWork>();
@@ -6362,7 +6370,9 @@ fn a_failed_release_send_puts_the_runtime_back_under_its_hold() {
 
     assert!(holds.worker_gone, "the dead worker is detected");
     assert!(
-        holds.held.contains_key(&name),
+        holds
+            .held
+            .contains_key(&super::BackgroundKey::Account(name)),
         "a release that could not be handed off stays under its hold"
     );
     assert!(
@@ -6393,11 +6403,12 @@ fn a_failing_adoption_backs_off_on_the_tick_and_its_streak_clears_with_the_job()
     )
     .expect("corrupt the profile config");
 
+    let key = super::BackgroundKey::Account(name.clone());
     let mut holds = super::BackgroundHolds::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while holds
         .retry
-        .get(&name)
+        .get(&key)
         .is_none_or(|failure| failure.attempts == 0)
     {
         holds.reconcile(vec![name.clone()], Vec::new());
@@ -6408,7 +6419,7 @@ fn a_failing_adoption_backs_off_on_the_tick_and_its_streak_clears_with_the_job()
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
-        holds.retry.get(&name).map(|failure| failure.attempts),
+        holds.retry.get(&key).map(|failure| failure.attempts),
         Some(1),
         "one failing attempt is one failure"
     );
@@ -6416,7 +6427,7 @@ fn a_failing_adoption_backs_off_on_the_tick_and_its_streak_clears_with_the_job()
     // what the next assertion measures.
     holds
         .retry
-        .get_mut(&name)
+        .get_mut(&key)
         .expect("the streak was recorded")
         .not_before_ms = u64::MAX;
 
@@ -6425,7 +6436,7 @@ fn a_failing_adoption_backs_off_on_the_tick_and_its_streak_clears_with_the_job()
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
-        holds.retry.get(&name).map(|failure| failure.attempts),
+        holds.retry.get(&key).map(|failure| failure.attempts),
         Some(1),
         "a tick inside the backoff window does not retry the adoption"
     );
@@ -6433,7 +6444,2721 @@ fn a_failing_adoption_backs_off_on_the_tick_and_its_streak_clears_with_the_job()
     std::fs::remove_dir_all(&job).expect("the job is gone from the store");
     holds.reconcile(vec![name.clone()], Vec::new());
     assert!(
-        !holds.retry.contains_key(&name),
+        !holds.retry.contains_key(&key),
         "a streak whose job has gone must not delay the next adoption"
+    );
+}
+
+// ── the daemon adopts a `--with-fallback` background session ────────
+//
+// Every `--with-fallback` session a Claude Code job outlives is handed to the
+// daemon: an explicit `-- --bg` launch, and a foreground
+// session moved to the background from its terminal. The launch account is
+// `wfl`, the chain `wfl` -> `wfs`.
+
+/// The chain this section launches on: `wfl` -> `wfs`, both OAuth logins with
+/// live tokens, persisted where `acquire` and the swap executor re-read them.
+/// Arms both heal throttles, since every caller ticks a daemon and neither
+/// heal is what these tests are about.
+#[cfg(target_os = "linux")]
+fn with_fallback_chain() -> AppConfig {
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let mut config = persist(
+        vec![
+            profile_with_creds("wfl", "tok-wfl"),
+            profile_with_creds("wfs", "tok-wfs"),
+        ],
+        None,
+        60_000,
+    );
+    config.state.fallback_chain = vec!["wfl".into(), "wfs".into()];
+    save_app_state(&config.state).expect("persist the chain");
+    config
+}
+
+/// The sandbox's `~/.claude`, pinned as the config dir `clauth start` links
+/// its runtime trees' `jobs/` and `projects/` into.
+#[cfg(target_os = "linux")]
+fn with_fallback_claude_home(sb: &HomeSandbox) -> crate::testutil::ConfigDirSandbox<'_> {
+    let claude = sb.home().join(".claude");
+    std::fs::create_dir_all(&claude).expect("~/.claude");
+    crate::testutil::ConfigDirSandbox::new(sb, &claude)
+}
+
+/// What `clauth start wfl --with-fallback <args>` leaves once its launcher
+/// exits, driven through the real start path. The fake `claude` answers both
+/// `--bg` and a `/background` prompt by writing a job record through its
+/// config dir and exiting at once, which is what the launcher sees of either.
+/// A held daemon lock stands in for the running daemon `--with-fallback`
+/// demands, and is released before this returns. Returns the launch's tree and
+/// session id.
+#[cfg(target_os = "linux")]
+fn launch_with_fallback(
+    fake: &crate::testutil::FakeClaude<'_>,
+    config: &AppConfig,
+    arg: &str,
+) -> (std::path::PathBuf, String) {
+    let daemon_lock = crate::daemon::hold_daemon_lock();
+    crate::start::run(
+        config,
+        &crate::profile::ProfileName::from("wfl"),
+        &[arg.to_string()],
+        crate::runtime::Isolation::Shared,
+        None,
+        true,
+        None,
+    )
+    .expect("a --with-fallback start");
+    drop(daemon_lock);
+    let dirs: Vec<String> = fake
+        .spawns()
+        .into_iter()
+        .filter(|(_, argv)| argv.split(' ').any(|word| word == arg))
+        .map(|(dir, _)| dir)
+        .collect();
+    assert_eq!(dirs.len(), 1, "one launch");
+    let tree = std::path::PathBuf::from(&dirs[0]);
+    let sid = tree
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("runtime-"))
+        .expect("a --with-fallback launch runs on its own per-launch tree")
+        .to_string();
+    assert!(tree.is_dir(), "the job keeps the tree past its launcher");
+    (tree, sid)
+}
+
+/// The job record in the sandbox's global store that names `tree`.
+#[cfg(target_os = "linux")]
+fn job_naming(sb: &HomeSandbox, tree: &std::path::Path) -> std::path::PathBuf {
+    let jobs = sb.home().join(".claude").join("jobs");
+    let named: Vec<std::path::PathBuf> = std::fs::read_dir(&jobs)
+        .expect("the launch left a job")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|job| {
+            std::fs::read(job.join("state.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|record| {
+                    record["providerEnv"]["CLAUDE_CONFIG_DIR"]
+                        .as_str()
+                        .map(std::path::PathBuf::from)
+                })
+                .is_some_and(|dir| dir == tree)
+        })
+        .collect();
+    assert_eq!(named.len(), 1, "one job names {}", tree.display());
+    named.into_iter().next().expect("one job")
+}
+
+/// The marker `sid` keeps under `member`'s profile dir.
+#[cfg(target_os = "linux")]
+fn with_fallback_marker(member: &str, sid: &str) -> std::path::PathBuf {
+    crate::profile::profile_dir(&crate::profile::ProfileName::from(member))
+        .expect("profile dir")
+        .join(format!("sessions-{sid}"))
+        .join(sid)
+}
+
+/// Whether `daemon` holds session `sid` running on `member`: the hold is in
+/// the daemon's own map, its row names this pid, still follows the chain, and
+/// a marker of `sid` under `member` is held. The launcher ran in this same
+/// process, so the pid alone proves nothing here; the held marker is what
+/// does, since the launcher's died with its teardown. The map is checked too:
+/// the worker's adoption lands the marker and the row before the tick collects
+/// the runtime, and a daemon dropped in that window leaves the teardown to a
+/// worker that can outlive the test's sandbox.
+#[cfg(target_os = "linux")]
+fn daemon_holds_session(daemon: &Daemon, sid: &str, member: &str) -> bool {
+    daemon
+        .background
+        .held
+        .contains_key(&super::BackgroundKey::Session(sid.to_string()))
+        && crate::live_sessions::get(sid).is_some_and(|row| {
+            row.pid == std::process::id()
+                && row.follows_chain
+                && crate::runtime::session_row_is_live(
+                    &crate::profile::ProfileName::from(member),
+                    false,
+                    sid,
+                )
+        })
+}
+
+/// The store `member`'s credential link resolves to, canonicalized: the
+/// gate's TMPDIR is a symlink, so a raw spelling never compares.
+#[cfg(target_os = "linux")]
+fn member_store_of(member: &str) -> std::path::PathBuf {
+    let store = crate::claude::install_source_path(&crate::profile::ProfileName::from(member))
+        .expect("install source");
+    std::fs::canonicalize(store).expect("the member's store exists")
+}
+
+/// What the tree's `.credentials.json` resolves to, canonicalized.
+#[cfg(target_os = "linux")]
+fn tree_store(tree: &std::path::Path) -> Option<std::path::PathBuf> {
+    std::fs::canonicalize(tree.join(".credentials.json")).ok()
+}
+
+/// A `--with-fallback` background launch hands its session on
+/// instead of ending it. Once the launcher exits, the row of the tree a job
+/// names stays, with its chain opt-in and launch account; only the launcher's
+/// marker is gone, so the row waits for a daemon to hold it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_with_fallback_background_launch_leaves_its_chain_row_for_the_daemon() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+
+    let (_tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+
+    let row = crate::live_sessions::get(&sid).expect("the launcher hands its row on");
+    assert_eq!(row.start_profile, "wfl");
+    assert!(row.follows_chain, "the chain opt-in outlives the launcher");
+    assert!(!row.isolated);
+    assert!(
+        row.boot_transport.is_some(),
+        "the row keeps what the session booted with"
+    );
+    assert!(
+        !crate::runtime::session_row_is_live(
+            &crate::profile::ProfileName::from("wfl"),
+            false,
+            &sid
+        ),
+        "the launcher's marker died with it"
+    );
+}
+
+/// A foreground `--with-fallback` session moved to the
+/// background from its terminal (`/background`, or the exit dialog's "Move to
+/// background and exit") leaves the same hand-off as an explicit `--bg`: the
+/// launcher keys on the job that outlives it, never on its own argv.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_with_fallback_session_moved_to_the_background_is_handed_on_too() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+
+    let (_tree, sid) = launch_with_fallback(&fake, &config, "/background");
+
+    let row = crate::live_sessions::get(&sid).expect("the launcher hands its row on");
+    assert!(row.follows_chain, "the chain opt-in outlives the launcher");
+
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the backgrounded session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+}
+
+/// A GC pass (every clauth process runs one, and a restarted
+/// daemon runs one before anything else) keeps a handed-off chain row while a
+/// job names its tree, and reaps it once the job is gone. A row that never
+/// opted into the chain is reaped as before, whatever a job keeps: a
+/// `/background` out of a plain session only spares its tree.
+#[cfg(target_os = "linux")]
+#[test]
+fn gc_keeps_a_handed_off_chain_row_only_while_a_job_names_its_tree() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+
+    // A plain session's leftover beside it: its own tree, an empty marker
+    // dir, a job naming the tree, and a row that never opted into the chain.
+    let plain_sid = "777001-0";
+    let profile = crate::profile::profile_dir(&crate::profile::ProfileName::from("wfl"))
+        .expect("profile dir");
+    let plain_tree = profile.join(format!("runtime-{plain_sid}"));
+    std::fs::create_dir_all(&plain_tree).expect("plain tree");
+    std::fs::create_dir_all(profile.join(format!("sessions-{plain_sid}")))
+        .expect("plain sessions dir");
+    crate::testutil::write_claude_job_in(sb.home(), "b6a1c0d2", &plain_tree, "working", None);
+    let mut plain = crate::testutil::live_row(plain_sid, "wfl");
+    plain.follows_chain = false;
+    crate::live_sessions::register(&plain).expect("register the plain row");
+
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        crate::live_sessions::get(&sid).is_some(),
+        "a job keeps the handed-off chain row"
+    );
+    assert!(tree.is_dir(), "and its tree");
+    assert!(
+        crate::live_sessions::get(plain_sid).is_none(),
+        "a row outside the chain is reaped whatever a job keeps"
+    );
+    assert!(plain_tree.is_dir(), "its tree is only spared");
+
+    std::fs::remove_dir_all(job_naming(&sb, &tree)).expect("claude rm");
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        crate::live_sessions::get(&sid).is_none(),
+        "with no job left the row is reaped"
+    );
+    assert!(!tree.exists(), "and the tree collected");
+}
+
+/// A daemon that starts after the launcher exited (its boot GC
+/// first) adopts the session in the tree the job names: it holds that launch's
+/// own marker, re-registers the row under its own pid with what the session
+/// booted with unchanged, and builds no other tree.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemon_adopts_a_handed_off_with_fallback_session_in_its_own_tree() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (_tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let launched = crate::live_sessions::get(&sid).expect("the launcher hands its row on");
+
+    crate::runtime::gc_stale_runtimes();
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+
+    let row = crate::live_sessions::get(&sid).expect("the adopted row");
+    assert_eq!(row.start_profile, "wfl");
+    assert_eq!(
+        serde_json::to_value(&row.boot_transport).expect("serialize"),
+        serde_json::to_value(&launched.boot_transport).expect("serialize"),
+        "the adopted row keeps what the session booted with"
+    );
+    assert!(
+        with_fallback_marker("wfl", &sid).is_file(),
+        "the daemon holds the launch's own marker"
+    );
+    let profile = crate::profile::profile_dir(&crate::profile::ProfileName::from("wfl"))
+        .expect("profile dir");
+    let trees: Vec<String> = std::fs::read_dir(&profile)
+        .expect("profile dir")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("runtime"))
+        .collect();
+    assert_eq!(
+        trees,
+        [format!("runtime-{sid}")],
+        "the daemon adopted the job's tree and built no other"
+    );
+}
+
+/// Claude Code saving its login over the tree's link: the link goes, a
+/// regular file holding `bytes` takes its place, written after the store.
+#[cfg(target_os = "linux")]
+fn save_over_link(link: &std::path::Path, bytes: &[u8]) {
+    std::fs::remove_file(link).expect("unlink the tree's link");
+    std::fs::write(link, bytes).expect("Claude Code saves its login over the link");
+    crate::testutil::set_mtime(
+        link,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(5),
+    );
+}
+
+/// `member`'s rotating store, `credentials.json`, whatever the install source.
+#[cfg(target_os = "linux")]
+fn rotating_store(member: &str) -> std::path::PathBuf {
+    crate::profile::profile_dir(&crate::profile::ProfileName::from(member))
+        .expect("profile dir")
+        .join("credentials.json")
+}
+
+/// `member`'s long-lived session-token sidecar.
+#[cfg(target_os = "linux")]
+fn sidecar_store(member: &str) -> std::path::PathBuf {
+    crate::profile::profile_dir(&crate::profile::ProfileName::from(member))
+        .expect("profile dir")
+        .join("session-token.json")
+}
+
+/// The bytes of `store` with one more key on its login: the shape the real
+/// `claude --bg` 2.1.310 re-saves a second after launch.
+#[cfg(target_os = "linux")]
+fn resave_of_store(store: &std::path::Path) -> Vec<u8> {
+    let mut login: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store).expect("the store"))
+            .expect("the store parses");
+    login["claudeAiOauth"]["subscriptionTypeSource"] = serde_json::json!("probe");
+    serde_json::to_vec(&login).expect("serialize")
+}
+
+/// [`resave_of_store`] over `member`'s rotating store.
+#[cfg(target_os = "linux")]
+fn resave_of(member: &str) -> Vec<u8> {
+    resave_of_store(&rotating_store(member))
+}
+
+/// A login Claude Code refreshed itself: tokens no store holds, and an
+/// expiry later than the store's.
+#[cfg(target_os = "linux")]
+fn refreshed_login(access: &str) -> Vec<u8> {
+    let mut creds = oauth_creds(access);
+    if let Some(login) = creds.claude_ai_oauth.as_mut() {
+        login.expires_at = Some(future_expiry() + 3_600_000);
+    }
+    serde_json::to_vec(&creds).expect("serialize")
+}
+
+/// The access token `member`'s rotating store holds.
+#[cfg(target_os = "linux")]
+fn stored_access(member: &str) -> String {
+    let stored: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(rotating_store(member)).expect("the store"))
+            .expect("the store parses");
+    stored.claude_ai_oauth.expect("an OAuth login").access_token
+}
+
+/// Ticks until `daemon` holds `sid` or one adoption attempt for it failed.
+#[cfg(target_os = "linux")]
+fn settle_adoption(daemon: &mut Daemon, sid: &str) {
+    let key = super::BackgroundKey::Session(sid.to_string());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        daemon.tick();
+        if daemon.background.held.contains_key(&key) || daemon.background.retry.contains_key(&key) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no adoption attempt for {sid} settled"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// The error the last failed adoption attempt of `sid` recorded.
+#[cfg(target_os = "linux")]
+fn adoption_error(daemon: &Daemon, sid: &str) -> Option<String> {
+    daemon
+        .background
+        .retry
+        .get(&super::BackgroundKey::Session(sid.to_string()))
+        .map(|failure| failure.error.clone())
+}
+
+/// Whether `daemon`'s own map holds session `sid`.
+#[cfg(target_os = "linux")]
+fn daemon_maps_session(daemon: &Daemon, sid: &str) -> bool {
+    daemon
+        .background
+        .held
+        .contains_key(&super::BackgroundKey::Session(sid.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn is_symlink(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// A three-account chain (`wfl`, `wfs`, `wft`) with a session launched on
+/// `wfl`, held by a first daemon and moved `wfs` -> `wft` -> back to `wfl`,
+/// that daemon then gone. Returns the chain config, tree and session id.
+#[cfg(target_os = "linux")]
+fn session_moved_round_three_accounts(
+    fake: &crate::testutil::FakeClaude<'_>,
+) -> (AppConfig, std::path::PathBuf, String) {
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let mut config = persist(
+        vec![
+            profile_with_creds("wfl", "tok-wfl"),
+            profile_with_creds("wfs", "tok-wfs"),
+            profile_with_creds("wft", "tok-wft"),
+        ],
+        None,
+        60_000,
+    );
+    config.state.fallback_chain = vec!["wfl".into(), "wfs".into(), "wft".into()];
+    save_app_state(&config.state).expect("persist the chain");
+    let (tree, sid) = launch_with_fallback(fake, &config, "--bg");
+    let mut first = daemon_for(config.clone());
+    tick_until(&mut first, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+    for member in ["wfs", "wft", "wfl"] {
+        crate::sessions_cli::run_switch(&sid, member).expect("switch along the chain");
+        let store = member_store_of(member);
+        tick_until(&mut first, "moved the session", |d| {
+            tree_store(&tree).as_ref() == Some(&store) && daemon_holds_session(d, &sid, member)
+        });
+    }
+    drop(first);
+    (config, tree, sid)
+}
+
+/// The refusal a saved refresh no store of `wfl` holds reads as.
+#[cfg(target_os = "linux")]
+const NO_STORE_HOLDS_IT: &str = "the session's saved login holds a refresh token none of wfl's stores hold; refusing to adopt it";
+
+/// The refusal an adoption reads as when a relink would leave `wfl`'s session
+/// pointing at its `credentials.json` and that file is gone.
+#[cfg(target_os = "linux")]
+const NO_STORE_TO_RELINK: &str =
+    "wfl has no credentials.json to relink the session onto; refusing to adopt it";
+
+/// Every credential file of the three chain accounts, by path: the stores,
+/// the session-token sidecars and the spent records, absent ones as `None`.
+#[cfg(target_os = "linux")]
+fn every_credential_file() -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+    ["wfl", "wfs", "wft"]
+        .iter()
+        .flat_map(|member| {
+            let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(*member))
+                .expect("profile dir");
+            ["credentials.json", "session-token.json", "auth.spent.json"].map(|name| dir.join(name))
+        })
+        .map(|path| {
+            let bytes = std::fs::read(&path).ok();
+            (path, bytes)
+        })
+        .collect()
+}
+
+/// Claude Code saves a login it refreshed itself over the tree's link while no
+/// clauth process holds the session: tokens no store holds. Nothing proves
+/// whose refresh chain that is, so the adoption refuses with its own text,
+/// keeps the file byte for byte, and writes no credential file of any
+/// account; the session keeps running on its own login.
+#[cfg(target_os = "linux")]
+fn a_refresh_no_store_holds(moved: bool) {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let (config, tree, sid) = if moved {
+        session_moved_round_three_accounts(&fake)
+    } else {
+        let config = with_fallback_chain();
+        let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+        (config, tree, sid)
+    };
+    let link = tree.join(".credentials.json");
+    let saved = refreshed_login("tok-wfl-cc-refreshed");
+    save_over_link(&link, &saved);
+    let before = every_credential_file();
+
+    let mut daemon = daemon_for(config);
+    settle_adoption(&mut daemon, &sid);
+
+    assert!(!daemon_maps_session(&daemon, &sid), "the adoption refuses");
+    assert!(
+        adoption_error(&daemon, &sid).is_some_and(|e| e.contains(NO_STORE_HOLDS_IT)),
+        "refused as a login no store holds, got {:?}",
+        adoption_error(&daemon, &sid)
+    );
+    assert!(!is_symlink(&link), "the tree keeps its own file");
+    assert_eq!(std::fs::read(&link).expect("the tree's file"), saved);
+    assert_eq!(
+        every_credential_file(),
+        before,
+        "no credential file is written"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_saved_refresh_no_store_holds_is_refused_and_kept() {
+    a_refresh_no_store_holds(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_moved_sessions_own_refresh_is_refused_and_kept() {
+    a_refresh_no_store_holds(true);
+}
+
+/// Retried adoptions of a saved refresh no store holds never ask any account
+/// endpoint: no request leaves the process, whatever the attempt count.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_refresh_asks_no_endpoint() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let (deaf, base) = crate::testutil::deaf_listener();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&sb, &base);
+    save_over_link(
+        &tree.join(".credentials.json"),
+        &refreshed_login("tok-wfl-cc-refreshed"),
+    );
+    drop(config);
+
+    for _ in 0..3 {
+        let refused = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]);
+        assert!(
+            refused
+                .as_ref()
+                .err()
+                .is_some_and(|e| format!("{e:#}").contains(NO_STORE_HOLDS_IT)),
+            "refused as a login no store holds"
+        );
+    }
+
+    crate::testutil::assert_nothing_sent(&deaf);
+}
+
+/// The measured 2.1.310 shape on a session that never moved: the same login
+/// plus one key. The daemon adopts, the tree links back to the store, and
+/// the store's login is unchanged.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemon_adopts_a_session_whose_claude_re_saved_the_same_login() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let access = stored_access("wfl");
+    save_over_link(&tree.join(".credentials.json"), &resave_of("wfl"));
+
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the re-saved session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+
+    assert_eq!(tree_store(&tree), Some(member_store_of("wfl")));
+    assert_eq!(stored_access("wfl"), access, "the store keeps its login");
+}
+
+/// A session that moved onto `wfs` and was held there, re-adopted by a fresh
+/// daemon after Claude Code re-saved wfs's login over the link: the re-save
+/// is wfs's own login, so the adoption lands on wfs and wfl is untouched;
+/// the key Claude Code added inside the login stays in wfs's store.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_moved_session_whose_claude_re_saved_its_login_is_re_adopted_on_its_account() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut first = daemon_for(config.clone());
+    tick_until(&mut first, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+    crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
+    let wfs_store = member_store_of("wfs");
+    tick_until(&mut first, "moved the session onto wfs", |d| {
+        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+    });
+    drop(first);
+    let wfl_before = std::fs::read(rotating_store("wfl")).expect("wfl store");
+    let wfs_access = stored_access("wfs");
+    save_over_link(&tree.join(".credentials.json"), &resave_of("wfs"));
+
+    let mut second = daemon_for(config);
+    tick_until(&mut second, "re-adopted the session on wfs", |d| {
+        daemon_holds_session(d, &sid, "wfs")
+    });
+
+    assert_eq!(tree_store(&tree), Some(wfs_store));
+    assert_eq!(stored_access("wfs"), wfs_access, "wfs keeps its login");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rotating_store("wfs")).expect("wfs store"))
+            .expect("the store parses");
+    assert_eq!(
+        stored["claudeAiOauth"]["subscriptionTypeSource"],
+        serde_json::json!("probe"),
+        "the key Claude Code added inside its login stays"
+    );
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("wfl store"),
+        wfl_before,
+        "wfl is never written"
+    );
+}
+
+/// Claude Code re-saved the store's login, then clauth rotated the store
+/// (the re-saved refresh token is now recorded spent): the file is the
+/// store's own older login, so the adoption lands on the rotated store and
+/// keeps it.
+#[cfg(target_os = "linux")]
+fn rotated_after_re_save(moved: bool) {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let (config, tree, sid) = if moved {
+        session_moved_round_three_accounts(&fake)
+    } else {
+        let config = with_fallback_chain();
+        let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+        (config, tree, sid)
+    };
+    let link = tree.join(".credentials.json");
+    save_over_link(&link, &resave_of("wfl"));
+    let old: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(rotating_store("wfl")).expect("the store"))
+            .expect("the store parses");
+    let old_refresh = old
+        .claude_ai_oauth
+        .and_then(|login| login.refresh_token)
+        .expect("a refresh token");
+    std::fs::write(
+        rotating_store("wfl"),
+        serde_json::to_vec(&oauth_creds("tok-wfl-rotated")).expect("serialize"),
+    )
+    .expect("the rotation lands");
+    std::fs::write(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("wfl"))
+            .expect("profile dir")
+            .join("auth.spent.json"),
+        serde_json::to_vec(&vec![crate::codex_auth::token_fingerprint(&old_refresh)])
+            .expect("serialize"),
+    )
+    .expect("the rotation records the spent token");
+
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the session on the rotated store", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+
+    assert_eq!(
+        stored_access("wfl"),
+        "tok-wfl-rotated",
+        "the store keeps the rotated login"
+    );
+    assert!(
+        is_symlink(&link),
+        "and the tree reads the rotated store again"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_older_re_saved_login_of_a_session_that_never_moved_lands_on_the_rotated_store() {
+    rotated_after_re_save(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_older_re_saved_login_of_a_moved_session_lands_on_the_rotated_store() {
+    rotated_after_re_save(true);
+}
+
+/// A swap recorded `wfs` as visited and moved the link onto it, but its write
+/// of the row's member never landed, so the row still names `wfl`; Claude
+/// Code then saves a refreshed wfs login over the link. No store of wfl holds
+/// it, so the adoption refuses and wfl's store is untouched.
+#[cfg(target_os = "linux")]
+#[test]
+fn another_accounts_saved_refresh_never_lands_in_the_rows_member() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    crate::live_sessions::update_as_session(&sid, |f| f.record_visited_member("wfs"))
+        .expect("the swap records the visit first");
+    save_over_link(
+        &tree.join(".credentials.json"),
+        &refreshed_login("tok-wfs-refreshed"),
+    );
+    let wfl_before = std::fs::read(rotating_store("wfl")).expect("wfl store");
+
+    let mut daemon = daemon_for(config);
+    settle_adoption(&mut daemon, &sid);
+
+    assert!(!daemon_maps_session(&daemon, &sid), "the adoption refuses");
+    assert!(
+        adoption_error(&daemon, &sid).is_some_and(|e| e.contains(NO_STORE_HOLDS_IT)),
+        "refused as a login no store of wfl holds, got {:?}",
+        adoption_error(&daemon, &sid)
+    );
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("wfl store"),
+        wfl_before,
+        "wfl's store never takes a login the row cannot attribute to wfl"
+    );
+}
+
+/// The same lost-write state, with Claude Code re-saving wfs's current login
+/// (the 2.1.310 shape) over the link: still another account's login.
+#[cfg(target_os = "linux")]
+#[test]
+fn another_accounts_re_saved_login_never_lands_in_the_rows_member() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    crate::live_sessions::update_as_session(&sid, |f| f.record_visited_member("wfs"))
+        .expect("the swap records the visit first");
+    save_over_link(&tree.join(".credentials.json"), &resave_of("wfs"));
+    let wfl_before = std::fs::read(rotating_store("wfl")).expect("wfl store");
+
+    let mut daemon = daemon_for(config);
+    settle_adoption(&mut daemon, &sid);
+
+    assert!(!daemon_maps_session(&daemon, &sid), "the adoption refuses");
+    assert!(
+        adoption_error(&daemon, &sid).is_some_and(|e| e.contains(NO_STORE_HOLDS_IT)),
+        "refused as a login no store of wfl holds, got {:?}",
+        adoption_error(&daemon, &sid)
+    );
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("wfl store"),
+        wfl_before,
+        "wfl's store never takes wfs's login"
+    );
+}
+
+/// Launched on a long-lived session token; Claude Code re-saves that token's
+/// login over the link; the user clears the token before any daemon holds the
+/// session. The static token never lands over the rotating pair.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cleared_session_token_never_lands_over_the_rotating_login() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let wfl = crate::profile::ProfileName::from("wfl");
+    crate::testutil::write_long_lived_sidecar(&wfl);
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    assert_eq!(
+        tree_store(&tree),
+        std::fs::canonicalize(sidecar_store("wfl")).ok(),
+        "launched onto the session token"
+    );
+    save_over_link(
+        &tree.join(".credentials.json"),
+        &resave_of_store(&sidecar_store("wfl")),
+    );
+    assert!(
+        crate::claude::clear_session_token(&wfl).expect("clear"),
+        "token removed"
+    );
+    let creds_before = std::fs::read(rotating_store("wfl")).expect("credentials.json");
+
+    let mut daemon = daemon_for(config);
+    settle_adoption(&mut daemon, &sid);
+
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("credentials.json"),
+        creds_before,
+        "the static token never lands over the rotating pair"
+    );
+}
+
+/// A session that never moved; a converge onto a long-lived session token
+/// relinked its tree but the row's `launch_store` write never landed (it
+/// still names `credentials.json`); Claude Code then re-saves the token's
+/// login over the link. The static token never lands over the rotating pair.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stale_launch_store_never_lands_the_session_token_over_the_rotating_login() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let wfl = crate::profile::ProfileName::from("wfl");
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let link = tree.join(".credentials.json");
+    crate::testutil::write_long_lived_sidecar(&wfl);
+    crate::claude::publish_credential_link(&link, &sidecar_store("wfl"))
+        .expect("the converge relinks the tree");
+    save_over_link(&link, &resave_of_store(&sidecar_store("wfl")));
+    let creds_before = std::fs::read(rotating_store("wfl")).expect("credentials.json");
+
+    let mut daemon = daemon_for(config);
+    settle_adoption(&mut daemon, &sid);
+
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("credentials.json"),
+        creds_before,
+        "the static token never lands over the rotating pair"
+    );
+}
+
+/// A refused adoption (another holder keeps a marker of an account the session
+/// ran on) over a tree whose credential file Claude Code re-saved: the tree's
+/// file and every store stay exactly as they were.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_adoption_never_drains_the_trees_saved_login() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let (config, tree, sid) = session_moved_round_three_accounts(&fake);
+    let foreign = with_fallback_marker("wft", &sid);
+    std::fs::create_dir_all(foreign.parent().expect("marker dir")).expect("the holder's dir");
+    let held = crate::runtime::open_pid_file(&foreign).expect("foreign marker");
+    held.lock().expect("another holder keeps wft's marker");
+    let link = tree.join(".credentials.json");
+    let saved = refreshed_login("tok-wfl-refreshed");
+    save_over_link(&link, &saved);
+    let wfl_before = std::fs::read(rotating_store("wfl")).expect("wfl store");
+
+    let mut second = daemon_for(config);
+    settle_adoption(&mut second, &sid);
+
+    assert!(
+        !daemon_maps_session(&second, &sid),
+        "refused on the foreign marker"
+    );
+    assert!(
+        !is_symlink(&link),
+        "a refused adoption leaves the held tree's file in place"
+    );
+    assert_eq!(std::fs::read(&link).expect("the tree's file"), saved);
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("wfl store"),
+        wfl_before,
+        "and writes no store"
+    );
+    drop(held);
+}
+
+/// The same refusal over a pure re-save, which the login checks accept: only
+/// the order (marker claims first) keeps the refused adoption from relinking
+/// a tree another holder keeps.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_adoption_of_a_re_saved_login_keeps_the_trees_file() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let (config, tree, sid) = session_moved_round_three_accounts(&fake);
+    let foreign = with_fallback_marker("wft", &sid);
+    std::fs::create_dir_all(foreign.parent().expect("marker dir")).expect("the holder's dir");
+    let held = crate::runtime::open_pid_file(&foreign).expect("foreign marker");
+    held.lock().expect("another holder keeps wft's marker");
+    let link = tree.join(".credentials.json");
+    let saved = resave_of("wfl");
+    save_over_link(&link, &saved);
+
+    let mut second = daemon_for(config);
+    settle_adoption(&mut second, &sid);
+
+    assert!(!daemon_maps_session(&second, &sid), "refused");
+    assert!(!is_symlink(&link), "a refused adoption leaves the file");
+    assert_eq!(std::fs::read(&link).expect("the tree's file"), saved);
+    drop(held);
+}
+
+/// A session that never moved, its own marker held by another process: the
+/// adoption called directly (the daemon's queue skips a held marker before it
+/// gets this far) refuses on the claim and leaves the re-saved file and the
+/// store alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_adoption_of_a_session_that_never_moved_drains_nothing() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let marker = with_fallback_marker("wfl", &sid);
+    std::fs::create_dir_all(marker.parent().expect("marker dir")).expect("the holder's dir");
+    let held = crate::runtime::open_pid_file(&marker).expect("the session's marker");
+    held.lock()
+        .expect("another holder keeps the session's own marker");
+    let link = tree.join(".credentials.json");
+    let saved = resave_of("wfl");
+    save_over_link(&link, &saved);
+    let wfl_before = std::fs::read(rotating_store("wfl")).expect("wfl store");
+    drop(config);
+
+    let refused = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]);
+
+    assert!(refused.is_err(), "refused on the held marker");
+    assert!(!is_symlink(&link), "the tree keeps its own file");
+    assert_eq!(std::fs::read(&link).expect("the tree's file"), saved);
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("wfl store"),
+        wfl_before,
+        "and writes no store"
+    );
+    drop(held);
+}
+
+/// A spent-token record beside the store that cannot be read: the saved login
+/// cannot be judged, so the adoption refuses on that, names it, and leaves
+/// both copies, never relinking the session away from what may be the
+/// account's only live refresh token.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unjudged_saved_login_keeps_both_copies_and_refuses() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    std::fs::write(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("wfl"))
+            .expect("profile dir")
+            .join("auth.spent.json"),
+        b"{ torn",
+    )
+    .expect("a torn spent record");
+    let link = tree.join(".credentials.json");
+    let saved = refreshed_login("tok-wfl-refreshed");
+    save_over_link(&link, &saved);
+    let wfl_before = std::fs::read(rotating_store("wfl")).expect("wfl store");
+
+    let mut daemon = daemon_for(config);
+    settle_adoption(&mut daemon, &sid);
+
+    assert!(
+        !daemon_maps_session(&daemon, &sid),
+        "no adoption over an unjudged login"
+    );
+    assert!(
+        adoption_error(&daemon, &sid).is_some_and(|e| e.contains("cannot be judged")),
+        "refused by the spent record, not by a later check"
+    );
+    assert_eq!(std::fs::read(&link).expect("the tree's file"), saved);
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("wfl store"),
+        wfl_before,
+        "the store is untouched"
+    );
+}
+
+/// The session launched on wfl's rotating store; a long-lived session token is
+/// armed before any daemon adopts, so today's install source is the sidecar.
+/// Claude Code saved a refresh of the rotating login it read: no store holds
+/// it, so neither the store the session launched on nor the sidecar is
+/// written.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_saved_refresh_writes_neither_store_when_a_session_token_is_armed() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    assert_eq!(
+        tree_store(&tree),
+        std::fs::canonicalize(rotating_store("wfl")).ok(),
+        "launched onto the rotating store"
+    );
+    crate::testutil::write_long_lived_sidecar(&crate::profile::ProfileName::from("wfl"));
+    save_over_link(
+        &tree.join(".credentials.json"),
+        &refreshed_login("tok-wfl-refreshed"),
+    );
+    let before = every_credential_file();
+
+    let mut daemon = daemon_for(config);
+    settle_adoption(&mut daemon, &sid);
+
+    assert!(!daemon_maps_session(&daemon, &sid), "the adoption refuses");
+    assert_eq!(
+        every_credential_file(),
+        before,
+        "no credential file is written"
+    );
+}
+
+/// Claude Code's dead-token wipe (a blank pair, other keys kept) saved over the
+/// link of a session that never moved: no login to protect, so the adoption
+/// holds the session and relinks it onto the store. Peer sessions on the same
+/// store kept writing through their links meanwhile, so the store's MCP logins
+/// are the fresher ones: the shell's older copy never lands over them, and
+/// the store is not written at all.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_logged_out_shell_saved_over_the_link_is_relinked_to_the_store() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let link = tree.join(".credentials.json");
+    save_over_link(
+        &link,
+        br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0},"mcpOAuth":{"srv":{"accessToken":"shell-older","expiresAt":9999999999000}}}"#,
+    );
+    let mut store = stored_json("wfl");
+    store["mcpOAuth"] = serde_json::json!({
+        "srv": {"accessToken": "peer-fresher", "expiresAt": 9_999_999_999_999_i64},
+        "peer-only": {"accessToken": "p", "expiresAt": 9_999_999_999_999_i64},
+    });
+    std::fs::write(
+        rotating_store("wfl"),
+        serde_json::to_vec(&store).expect("serialize"),
+    )
+    .expect("a peer session's MCP logins land in the store");
+    let before = std::fs::read(rotating_store("wfl")).expect("wfl store");
+
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the logged-out session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+
+    assert!(is_symlink(&link), "the shell is relinked onto the store");
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("wfl store"),
+        before,
+        "the store, its peers' MCP logins included, is not written"
+    );
+}
+
+/// A logged-out shell holding MCP logins the store lacks or holds older copies
+/// of: they merge into the store per server, the later expiry winning, while a
+/// server only the store holds stays, the store's login is untouched, and the
+/// shell's design login (account-scoped, so never carried) stays out.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_logged_out_shells_mcp_logins_merge_into_the_store_fresher_wins() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let link = tree.join(".credentials.json");
+    save_over_link(
+        &link,
+        br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0},"mcpOAuth":{"srv":{"accessToken":"shell-fresher","expiresAt":9999999999999},"stale":{"accessToken":"shell-older","expiresAt":9999999990000},"solo":{"accessToken":"shell-only","expiresAt":9999999999999}},"designOauth":{"accessToken":"shell-design","expiresAt":9999999999999}}"#,
+    );
+    let mut store = stored_json("wfl");
+    store["mcpOAuth"] = serde_json::json!({
+        "srv": {"accessToken": "store-older", "expiresAt": 9_999_999_990_000_i64},
+        "stale": {"accessToken": "store-fresher", "expiresAt": 9_999_999_999_999_i64},
+        "peer-only": {"accessToken": "p", "expiresAt": 9_999_999_999_999_i64},
+    });
+    std::fs::write(
+        rotating_store("wfl"),
+        serde_json::to_vec(&store).expect("serialize"),
+    )
+    .expect("a peer session's MCP logins land in the store");
+    let login_before = store["claudeAiOauth"].clone();
+
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the logged-out session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+
+    assert!(is_symlink(&link), "the shell is relinked onto the store");
+    let after = stored_json("wfl");
+    assert_eq!(
+        after["mcpOAuth"],
+        serde_json::json!({
+            "srv": {"accessToken": "shell-fresher", "expiresAt": 9_999_999_999_999_i64},
+            "stale": {"accessToken": "store-fresher", "expiresAt": 9_999_999_999_999_i64},
+            "peer-only": {"accessToken": "p", "expiresAt": 9_999_999_999_999_i64},
+            "solo": {"accessToken": "shell-only", "expiresAt": 9_999_999_999_999_i64},
+        }),
+        "per server, the later expiry wins and every server either side holds stays"
+    );
+    assert_eq!(
+        after["claudeAiOauth"], login_before,
+        "the store's login is untouched"
+    );
+    assert!(
+        after.get("designOauth").is_none(),
+        "the shell's account-scoped design login is never carried"
+    );
+}
+
+/// `member`'s rotating store with `mcp` as its MCP logins.
+#[cfg(target_os = "linux")]
+fn set_store_mcp(member: &str, mcp: serde_json::Value) {
+    let mut store = stored_json(member);
+    store["mcpOAuth"] = mcp;
+    std::fs::write(
+        rotating_store(member),
+        serde_json::to_vec(&store).expect("serialize"),
+    )
+    .expect("the store's MCP logins");
+}
+
+/// A logged-out shell whose MCP block is not a map (null) carries no server,
+/// so every server the store holds stays.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_shell_with_a_null_mcp_block_never_drops_the_stores_servers() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    save_over_link(
+        &tree.join(".credentials.json"),
+        br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0},"mcpOAuth":null}"#,
+    );
+    set_store_mcp(
+        "wfl",
+        serde_json::json!({"peer": {"accessToken": "p", "expiresAt": 9_999_999_999_999_i64}}),
+    );
+    let before = std::fs::read(rotating_store("wfl")).expect("wfl store");
+    drop(config);
+
+    let held = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]).expect("adopted");
+
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("wfl store"),
+        before,
+        "the store keeps every server, and nothing is written"
+    );
+    drop(held);
+}
+
+/// Neither copy of a server's MCP login carries an expiry, so which is fresher
+/// cannot be told: the store's copy, the one peer sessions write, stays.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_expiryless_shell_copy_never_replaces_the_stores() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    save_over_link(
+        &tree.join(".credentials.json"),
+        br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0},"mcpOAuth":{"srv":{"accessToken":"shell-copy","refreshToken":"mrt-shell"},"tie":{"accessToken":"shell-tie","expiresAt":9999999999999}}}"#,
+    );
+    set_store_mcp(
+        "wfl",
+        serde_json::json!({
+            "srv": {"accessToken": "store-copy", "refreshToken": "mrt-store"},
+            "tie": {"accessToken": "store-tie", "expiresAt": 9_999_999_999_999_i64},
+        }),
+    );
+    let before = std::fs::read(rotating_store("wfl")).expect("wfl store");
+    drop(config);
+
+    let held = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]).expect("adopted");
+
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("wfl store"),
+        before,
+        "an expiryless or tied shell copy never lands over the store's"
+    );
+    drop(held);
+}
+
+/// A legacy `credentials.json.pending` rotation (written by a clauth that
+/// predates the staged form, newer than the store) sits beside wfl's store
+/// when Claude Code's re-save of the store's login is adopted: the adoption
+/// never writes the store over it, so a read still resolves the pending login
+/// and its refresh token is the one that gets used next.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_re_save_never_buries_a_legacy_pending_rotation() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let link = tree.join(".credentials.json");
+    save_over_link(&link, &resave_of("wfl"));
+    let now = std::time::SystemTime::now();
+    crate::testutil::set_mtime(
+        &rotating_store("wfl"),
+        now - std::time::Duration::from_secs(120),
+    );
+    let wfl = crate::profile::ProfileName::from("wfl");
+    crate::profile::stage_rotated_credentials(&wfl, &oauth_creds("tok-wfl-pending"))
+        .expect("a legacy pending rotation");
+    crate::testutil::set_mtime(
+        &rotating_store("wfl").with_file_name("credentials.json.pending"),
+        now - std::time::Duration::from_secs(60),
+    );
+    let resolved = |what: &str| {
+        crate::profile::read_profile(&wfl)
+            .expect(what)
+            .credentials
+            .and_then(|creds| creds.claude_ai_oauth)
+            .map(|login| login.access_token)
+    };
+    assert_eq!(
+        resolved("read before").as_deref(),
+        Some("tok-wfl-pending"),
+        "the fixture's pending rotation resolves before the adoption"
+    );
+    drop(config);
+
+    let held = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]).expect("adopted");
+
+    assert_eq!(
+        resolved("read after").as_deref(),
+        Some("tok-wfl-pending"),
+        "the pending rotation still resolves after the adoption"
+    );
+    assert!(is_symlink(&link), "the re-save is relinked onto the store");
+    drop(held);
+}
+
+/// The same legacy pending rotation beside wfl's store when a logged-out
+/// shell carrying an MCP login is adopted: the merge stands down rather than
+/// write the store over the pending pair, and its event line never promises a
+/// retry, since the relink that follows takes the shell's file away.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_shell_merge_stands_down_beside_a_legacy_pending_rotation() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    save_over_link(
+        &tree.join(".credentials.json"),
+        br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0},"mcpOAuth":{"solo":{"accessToken":"shell-only","expiresAt":9999999999999}}}"#,
+    );
+    crate::profile::stage_rotated_credentials(
+        &crate::profile::ProfileName::from("wfl"),
+        &oauth_creds("tok-wfl-pending"),
+    )
+    .expect("a legacy pending rotation");
+    crate::testutil::set_mtime(
+        &rotating_store("wfl").with_file_name("credentials.json.pending"),
+        std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+    );
+    let before = std::fs::read(rotating_store("wfl")).expect("wfl store");
+    drop(config);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let held = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]).expect("adopted");
+
+    drop(capture);
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("wfl store"),
+        before,
+        "the store is not written beside the pending rotation"
+    );
+    let captured = lines.snapshot();
+    assert!(
+        captured
+            .iter()
+            .any(|line| line.contains("a rotation is staged beside")),
+        "the stand-down is reported, got {captured:?}"
+    );
+    assert!(
+        !captured.iter().any(|line| line.contains("retries")),
+        "and promises no retry, got {captured:?}"
+    );
+    drop(held);
+}
+
+/// With `preserve_non_login_keys` off and a long-lived session token as the
+/// install source, a logged-out shell is relinked onto the sidecar and its MCP
+/// logins never land there: every sidecar writer rebuilds that file from its
+/// token alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_shell_merge_never_writes_a_sidecar_with_preservation_off() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    crate::testutil::write_long_lived_sidecar(&crate::profile::ProfileName::from("wfl"));
+    let mut state = crate::profile::load_app_state().expect("state");
+    state.preserve_non_login_keys = false;
+    save_app_state(&state).expect("preservation off");
+    save_over_link(
+        &tree.join(".credentials.json"),
+        br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0},"mcpOAuth":{"solo":{"accessToken":"shell-only","expiresAt":9999999999999}}}"#,
+    );
+    let before = every_credential_file();
+    drop(config);
+
+    let held = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]).expect("adopted");
+
+    assert_eq!(
+        tree_store(&tree),
+        std::fs::canonicalize(sidecar_store("wfl")).ok(),
+        "relinked onto the session token"
+    );
+    assert_eq!(
+        every_credential_file(),
+        before,
+        "no credential file is written"
+    );
+    drop(held);
+}
+
+/// The bytes of `member`'s rotating store, parsed.
+#[cfg(target_os = "linux")]
+fn stored_json(member: &str) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(rotating_store(member)).expect("the store"))
+        .expect("the store parses")
+}
+
+/// An older login of `wfl` (its refresh token recorded spent) saved over the
+/// link with an MCP login the session made: the adoption relinks onto the
+/// store and the MCP login rides into it.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_older_logins_mcp_login_survives_the_relink() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut saved = stored_json("wfl");
+    saved["mcpOAuth"] =
+        serde_json::json!({"srv": {"accessToken": "m", "expiresAt": 9_999_999_999_999_i64}});
+    let old_refresh = saved["claudeAiOauth"]["refreshToken"]
+        .as_str()
+        .expect("a refresh token")
+        .to_string();
+    std::fs::write(
+        rotating_store("wfl"),
+        serde_json::to_vec(&oauth_creds("tok-wfl-rotated")).expect("serialize"),
+    )
+    .expect("the rotation lands");
+    std::fs::write(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("wfl"))
+            .expect("profile dir")
+            .join("auth.spent.json"),
+        serde_json::to_vec(&vec![crate::codex_auth::token_fingerprint(&old_refresh)])
+            .expect("serialize"),
+    )
+    .expect("the rotation records the spent token");
+    let link = tree.join(".credentials.json");
+    save_over_link(&link, &serde_json::to_vec(&saved).expect("serialize"));
+
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the session on the rotated store", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+
+    assert!(is_symlink(&link), "relinked onto the rotated store");
+    let after = stored_json("wfl");
+    assert_eq!(
+        after["claudeAiOauth"]["accessToken"],
+        serde_json::json!("tok-wfl-rotated"),
+        "the store keeps its rotated login"
+    );
+    assert_eq!(
+        after["mcpOAuth"]["srv"]["accessToken"],
+        serde_json::json!("m"),
+        "the older login's MCP login survives the relink"
+    );
+}
+
+/// The store's current login re-saved with a blank access token: nothing to
+/// write, so the adoption holds the session and relinks it onto the store,
+/// whose login stays as it was.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_re_save_with_a_blank_access_token_is_relinked_onto_the_store() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let login_before = stored_json("wfl")["claudeAiOauth"].clone();
+    let mut saved = stored_json("wfl");
+    saved["claudeAiOauth"]["accessToken"] = serde_json::json!("");
+    let link = tree.join(".credentials.json");
+    save_over_link(&link, &serde_json::to_vec(&saved).expect("serialize"));
+
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+
+    assert!(is_symlink(&link), "relinked onto the store");
+    assert_eq!(
+        stored_json("wfl")["claudeAiOauth"],
+        login_before,
+        "the store's login is untouched"
+    );
+}
+
+/// An older login of `wfl` saved over the link after wfl's store is gone:
+/// there is nothing to relink onto, so the adoption refuses with its own
+/// text before it touches the session's file.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_adoption_of_an_older_login_keeps_the_file_when_the_store_is_gone() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let saved = resave_of("wfl");
+    let old_refresh = stored_json("wfl")["claudeAiOauth"]["refreshToken"]
+        .as_str()
+        .expect("a refresh token")
+        .to_string();
+    std::fs::write(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("wfl"))
+            .expect("profile dir")
+            .join("auth.spent.json"),
+        serde_json::to_vec(&vec![crate::codex_auth::token_fingerprint(&old_refresh)])
+            .expect("serialize"),
+    )
+    .expect("the record");
+    std::fs::remove_file(rotating_store("wfl")).expect("the store goes");
+    let link = tree.join(".credentials.json");
+    save_over_link(&link, &saved);
+    drop(config);
+
+    let refused = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]);
+
+    assert!(
+        refused
+            .as_ref()
+            .err()
+            .is_some_and(|e| format!("{e:#}").contains(NO_STORE_TO_RELINK)),
+        "refused as having no store to relink onto, got {:?}",
+        refused.as_ref().err().map(|e| format!("{e:#}"))
+    );
+    assert_eq!(
+        std::fs::read(&link).expect("the tree's file is kept"),
+        saved
+    );
+}
+
+/// A static token saved over the link of a member with no store left: the
+/// adoption refuses with its own text before it touches the session's file.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_static_token_with_no_store_to_relink_onto_keeps_the_file() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    std::fs::remove_file(rotating_store("wfl")).expect("the store goes");
+    let saved = serde_json::to_vec(&serde_json::json!({
+        "claudeAiOauth": {"accessToken": "tok-static", "expiresAt": future_expiry()}
+    }))
+    .expect("serialize");
+    let link = tree.join(".credentials.json");
+    save_over_link(&link, &saved);
+    drop(config);
+
+    let refused = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]);
+
+    assert!(
+        refused
+            .as_ref()
+            .err()
+            .is_some_and(|e| format!("{e:#}").contains(NO_STORE_TO_RELINK)),
+        "refused as having no store to relink onto, got {:?}",
+        refused.as_ref().err().map(|e| format!("{e:#}"))
+    );
+    assert_eq!(
+        std::fs::read(&link).expect("the tree's file is kept"),
+        saved
+    );
+}
+
+/// A rotation staged beside the store (its new login written, the old token
+/// recorded spent, the store not yet replaced) when Claude Code re-saves the
+/// store's pre-rotation login: the stage lands first, so the re-save is
+/// judged as the older login it now is and the store keeps the staged login.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_stage_lands_before_the_adoption_judges_the_store() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let wfl_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("wfl"))
+        .expect("profile dir");
+    let base_refresh = stored_json("wfl")["claudeAiOauth"]["refreshToken"]
+        .as_str()
+        .expect("a refresh token")
+        .to_string();
+    let base = crate::codex_auth::token_fingerprint(&base_refresh);
+    let stage = serde_json::json!({
+        "base": base,
+        "base_access": stored_access("wfl"),
+        "creds": {"claudeAiOauth": {
+            "accessToken": "tok-staged",
+            "refreshToken": "rt-tok-staged",
+            "expiresAt": future_expiry() + 7_200_000,
+        }},
+    });
+    std::fs::write(
+        wfl_dir.join("credentials.json.staged"),
+        serde_json::to_vec(&stage).expect("serialize"),
+    )
+    .expect("the stage");
+    std::fs::write(
+        wfl_dir.join("auth.spent.json"),
+        serde_json::to_vec(&vec![base]).expect("serialize"),
+    )
+    .expect("the spent record");
+    let link = tree.join(".credentials.json");
+    save_over_link(&link, &resave_of("wfl"));
+    drop(config);
+
+    let held = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]).expect("adopted");
+
+    assert_eq!(
+        stored_access("wfl"),
+        "tok-staged",
+        "the stage lands before the rules judge the store"
+    );
+    assert!(
+        is_symlink(&link),
+        "the older re-save is relinked onto the store"
+    );
+    drop(held);
+}
+
+/// A session token saved with a blank refresh token is still a static token:
+/// it never lands over the rotating pair.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_session_token_with_a_blank_refresh_token_never_lands_over_the_rotating_login() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let wfl = crate::profile::ProfileName::from("wfl");
+    crate::testutil::write_long_lived_sidecar(&wfl);
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let token = crate::claude::installed_session_token(&wfl).expect("the sidecar's token");
+    let saved = serde_json::to_vec(&serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": token,
+            "refreshToken": "",
+            "expiresAt": future_expiry() + 7_200_000,
+        }
+    }))
+    .expect("serialize");
+    save_over_link(&tree.join(".credentials.json"), &saved);
+    let creds_before = std::fs::read(rotating_store("wfl")).expect("credentials.json");
+
+    let mut daemon = daemon_for(config);
+    settle_adoption(&mut daemon, &sid);
+
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("credentials.json"),
+        creds_before,
+        "the static token never lands in credentials.json"
+    );
+}
+
+/// The session re-saved the store's login, then the store moved on to a later
+/// login through a path that recorded nothing spent: no record says the
+/// file's login is an older one, so the adoption refuses, keeps the file and
+/// leaves the newer store as it is.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_login_the_store_moved_past_unrecorded_is_refused_and_kept() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let link = tree.join(".credentials.json");
+    let saved = resave_of("wfl");
+    save_over_link(&link, &saved);
+    std::fs::write(rotating_store("wfl"), refreshed_login("tok-wfl-peer"))
+        .expect("a peer's later login lands in the store");
+    let before = every_credential_file();
+
+    let mut daemon = daemon_for(config);
+    settle_adoption(&mut daemon, &sid);
+
+    assert!(!daemon_maps_session(&daemon, &sid), "the adoption refuses");
+    assert!(
+        adoption_error(&daemon, &sid).is_some_and(|e| e.contains(NO_STORE_HOLDS_IT)),
+        "refused as a login no store holds, got {:?}",
+        adoption_error(&daemon, &sid)
+    );
+    assert_eq!(std::fs::read(&link).expect("the tree's file"), saved);
+    assert_eq!(
+        every_credential_file(),
+        before,
+        "no credential file is written"
+    );
+}
+
+/// A re-save from before the store gained a key outside the login (a peer
+/// session's MCP login): the adoption keeps that key in the store.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_re_save_keeps_store_keys_added_since() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    save_over_link(&tree.join(".credentials.json"), &resave_of("wfl"));
+    let mut store: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rotating_store("wfl")).expect("the store"))
+            .expect("the store parses");
+    store["mcpOAuth"] = serde_json::json!({"peer": {"accessToken": "peer-mcp"}});
+    std::fs::write(
+        rotating_store("wfl"),
+        serde_json::to_vec(&store).expect("serialize"),
+    )
+    .expect("a peer's MCP login lands in the store");
+    crate::testutil::set_mtime(
+        &rotating_store("wfl"),
+        std::time::SystemTime::now() + std::time::Duration::from_secs(10),
+    );
+
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the re-saved session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rotating_store("wfl")).expect("the store"))
+            .expect("the store parses");
+    assert_eq!(
+        after["mcpOAuth"]["peer"]["accessToken"],
+        serde_json::json!("peer-mcp"),
+        "the store keeps a key the re-save predates"
+    );
+}
+
+/// Two clauth profiles on one account, neither recording which account it is:
+/// the session last ran on `wfs`, whose store rotated, and Claude Code re-saved
+/// wfs's older login. Nothing of wfl's holds that login, so it never lands in
+/// wfl's store, where the two stores would share one single-use refresh chain.
+#[cfg(target_os = "linux")]
+#[test]
+fn another_profiles_login_on_the_same_account_never_lands() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    crate::live_sessions::update_as_session(&sid, |f| f.record_visited_member("wfs"))
+        .expect("the swap records the visit first");
+    let saved = resave_of("wfs");
+    std::fs::write(rotating_store("wfs"), refreshed_login("tok-wfs-rotated")).expect("wfs rotates");
+    let link = tree.join(".credentials.json");
+    save_over_link(&link, &saved);
+    let before = every_credential_file();
+
+    let mut daemon = daemon_for(config);
+    settle_adoption(&mut daemon, &sid);
+
+    assert!(!daemon_maps_session(&daemon, &sid), "the adoption refuses");
+    assert!(
+        adoption_error(&daemon, &sid).is_some_and(|e| e.contains(NO_STORE_HOLDS_IT)),
+        "refused as a login no store of wfl holds, got {:?}",
+        adoption_error(&daemon, &sid)
+    );
+    assert_eq!(std::fs::read(&link).expect("the tree's file"), saved);
+    assert_eq!(
+        every_credential_file(),
+        before,
+        "wfl's store never takes wfs's chain"
+    );
+}
+
+/// An adopted session follows the chain. A manual
+/// `clauth switch <sid> wfs` is taken (only the fixed `runtime-bg` session is
+/// fixed-account), and the daemon's own watchdog for the session moves the
+/// tree's credential link onto `wfs`, records the move on the row and holds a
+/// marker under `wfs`, the account the session now spends.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_adopted_with_fallback_session_moves_along_the_chain() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+
+    crate::sessions_cli::run_switch(&sid, "wfs").expect("an adopted chain session is switchable");
+
+    let wfs_store = member_store_of("wfs");
+    tick_until(&mut daemon, "moved the session onto wfs", |d| {
+        tree_store(&tree).as_ref() == Some(&wfs_store)
+            && crate::live_sessions::get(&sid)
+                .and_then(|row| row.current_member)
+                .as_deref()
+                == Some("wfs")
+            && daemon_holds_session(d, &sid, "wfs")
+    });
+    assert!(
+        crate::runtime::has_live_marker(&crate::profile::ProfileName::from("wfs")),
+        "the account the session spends now has a live marker"
+    );
+}
+
+/// A launcher that already moved its session before it exited
+/// leaves the tree on that member. The adoption holds the member the session
+/// runs on (its marker under that account, so the account cannot be deleted
+/// or renamed under it) and moves it back on intent.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_adoption_holds_the_member_the_session_last_moved_onto() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    // The launcher's own swap onto `wfs` before it exited: the tree's link on
+    // `wfs`'s store, the row's current member `wfs`.
+    let link = tree.join(".credentials.json");
+    std::fs::remove_file(&link).expect("unlink");
+    std::os::unix::fs::symlink(
+        crate::claude::install_source_path(&crate::profile::ProfileName::from("wfs"))
+            .expect("install source"),
+        &link,
+    )
+    .expect("link onto wfs");
+    crate::live_sessions::update_as_session(&sid, |fields| fields.set_current_member("wfs"))
+        .expect("record the launcher's move");
+
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the session on wfs", |d| {
+        daemon_holds_session(d, &sid, "wfs")
+    });
+    assert!(
+        with_fallback_marker("wfs", &sid).is_file(),
+        "the daemon holds the session's marker under wfs"
+    );
+
+    crate::live_sessions::update_as_daemon(&sid, |fields| fields.set_intended_member("wfl"))
+        .expect("intent back onto wfl");
+    let wfl_store = member_store_of("wfl");
+    tick_until(&mut daemon, "moved the session back onto wfl", |_| {
+        tree_store(&tree).as_ref() == Some(&wfl_store)
+            && crate::live_sessions::get(&sid)
+                .and_then(|row| row.current_member)
+                .as_deref()
+                == Some("wfl")
+    });
+}
+
+/// The tick never waits on the locks an adoption takes. With
+/// the launch account's rotation lock and the state flock held elsewhere, a
+/// tick returns at once and the adoption lands once they free.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tick_never_waits_on_the_locks_a_with_fallback_adoption_takes() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (_tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut daemon = daemon_for(config);
+
+    let (rot_held_tx, rot_held_rx) = std::sync::mpsc::channel();
+    let (rot_release_tx, rot_release_rx) = std::sync::mpsc::channel::<()>();
+    let rotation_holder = std::thread::spawn(move || {
+        let rotation = crate::testutil::hold_rotation_lock("wfl");
+        rot_held_tx.send(()).expect("report the rotation hold");
+        // Released after the tick's 5 s budget even if nothing signals, so a
+        // tick that waits on it returns and the elapsed assertion fails.
+        let _ = rot_release_rx.recv_timeout(Duration::from_secs(6));
+        drop(rotation);
+    });
+    rot_held_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the rotation lock is held");
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let flock_holder = std::thread::spawn(move || {
+        crate::lock::with_state_lock(|_| {
+            held_tx.send(()).expect("report the hold");
+            let _ = release_rx.recv_timeout(Duration::from_secs(6));
+            Ok(())
+        })
+        .expect("hold the state flock");
+    });
+    held_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the state flock is held");
+
+    let started = std::time::Instant::now();
+    daemon.tick();
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the tick waited {took:?} on a lock the adoption needs"
+    );
+
+    release_tx.send(()).expect("release the flock");
+    flock_holder.join().expect("flock holder");
+    rot_release_tx.send(()).expect("release the rotation lock");
+    rotation_holder.join().expect("rotation holder");
+    tick_until(&mut daemon, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+}
+
+/// Once the last job naming the tree is gone (`claude rm`
+/// deletes its job dir), the daemon drops its hold and the session ends: no
+/// row, no watchdog, the tree and its marker dir collected.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_daemon_releases_an_adopted_with_fallback_session_once_its_job_is_removed() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let sessions = with_fallback_marker("wfl", &sid)
+        .parent()
+        .expect("marker dir")
+        .to_path_buf();
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+
+    std::fs::remove_dir_all(job_naming(&sb, &tree)).expect("claude rm");
+    tick_until(&mut daemon, "released the session", |_| {
+        !tree.exists() && !sessions.exists()
+    });
+    assert!(
+        crate::live_sessions::get(&sid).is_none(),
+        "the row went with the hold"
+    );
+    assert_eq!(watchdog_threads("wfl"), 0, "no watchdog is still running");
+    assert_eq!(watchdog_threads("wfs"), 0, "no watchdog is still running");
+}
+
+/// A daemon that stops while a job still names the tree hands
+/// the session on again, and the next daemon (its boot GC first) holds it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fresh_daemon_re_adopts_a_with_fallback_session_its_predecessor_held() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut first = daemon_for(config.clone());
+    tick_until(&mut first, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+
+    drop(first);
+    assert!(tree.is_dir(), "the job keeps the tree past the daemon");
+    assert!(
+        crate::live_sessions::get(&sid).is_some_and(|row| row.follows_chain),
+        "the stopped daemon hands the chain row on"
+    );
+    assert!(
+        !crate::runtime::session_row_is_live(
+            &crate::profile::ProfileName::from("wfl"),
+            false,
+            &sid
+        ),
+        "the old daemon's marker died with it"
+    );
+
+    crate::runtime::gc_stale_runtimes();
+    let mut second = daemon_for(config);
+    tick_until(&mut second, "re-adopted the session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+}
+
+/// A job-named per-session tree is no evidence of a chain
+/// session. A tree a job names with no row (its plain session's teardown
+/// unregistered it), or with a row that never opted into the chain, is spared
+/// and never adopted: the daemon would otherwise start moving a session
+/// nobody opted in across accounts.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_daemon_never_adopts_a_job_named_tree_without_a_chain_row() {
+    let sb = HomeSandbox::new();
+    let config = with_fallback_chain();
+    let profile = crate::profile::profile_dir(&crate::profile::ProfileName::from("wfl"))
+        .expect("profile dir");
+    let mut trees = Vec::new();
+    for (sid, job, row) in [
+        ("777002-0", "b6a1c0d3", false),
+        ("777003-0", "b6a1c0d4", true),
+    ] {
+        let tree = profile.join(format!("runtime-{sid}"));
+        std::fs::create_dir_all(&tree).expect("tree");
+        std::fs::create_dir_all(profile.join(format!("sessions-{sid}"))).expect("sessions dir");
+        // A real session's credential link, so the tree is adoptable in every
+        // respect but the chain row: only that check can keep it unadopted.
+        std::os::unix::fs::symlink(
+            crate::claude::install_source_path(&crate::profile::ProfileName::from("wfl"))
+                .expect("install source"),
+            tree.join(".credentials.json"),
+        )
+        .expect("link the tree's credentials");
+        crate::testutil::write_claude_job_in(sb.home(), job, &tree, "working", None);
+        if row {
+            let mut plain = crate::testutil::live_row(sid, "wfl");
+            plain.follows_chain = false;
+            crate::live_sessions::register(&plain).expect("register the plain row");
+        }
+        trees.push((sid, tree));
+    }
+    let mut daemon = daemon_for(config);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        daemon.tick();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    for (sid, tree) in &trees {
+        assert!(
+            crate::live_sessions::get(sid).is_none_or(|row| row.pid != std::process::id()),
+            "{sid}: the daemon registered no row of its own"
+        );
+        assert!(tree.is_dir(), "{sid}: the tree is spared");
+    }
+    assert!(
+        !crate::runtime::has_live_marker(&crate::profile::ProfileName::from("wfl")),
+        "no marker is held under the account"
+    );
+    assert_eq!(
+        watchdog_threads("wfl"),
+        0,
+        "no watchdog runs for the account"
+    );
+    assert_eq!(
+        daemon.background.adoption_attempts, 0,
+        "no row outside the chain is ever queued, so none retakes the locks on a backoff"
+    );
+}
+
+/// A launcher whose last swap moved the link but never recorded it leaves a
+/// tree whose credential link names another account than the row does. The
+/// daemon cannot tell which account the session spends, so it never adopts
+/// that tree and never touches its link.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_daemon_never_adopts_a_tree_whose_link_names_another_account() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let link = tree.join(".credentials.json");
+    std::fs::remove_file(&link).expect("unlink");
+    let wfs_source = crate::claude::install_source_path(&crate::profile::ProfileName::from("wfs"))
+        .expect("install source");
+    std::os::unix::fs::symlink(&wfs_source, &link).expect("link onto wfs, unrecorded");
+    let mut daemon = daemon_for(config);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        daemon.tick();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert!(
+        !daemon
+            .background
+            .held
+            .contains_key(&super::BackgroundKey::Session(sid.clone())),
+        "the daemon holds no session whose account it cannot tell"
+    );
+    assert_eq!(
+        std::fs::read_link(&link).expect("the link"),
+        wfs_source,
+        "the link stays as the launcher left it"
+    );
+    assert!(
+        !crate::runtime::session_row_is_live(
+            &crate::profile::ProfileName::from("wfl"),
+            false,
+            &sid
+        ) && !crate::runtime::session_row_is_live(
+            &crate::profile::ProfileName::from("wfs"),
+            false,
+            &sid
+        ),
+        "no marker of the session is held"
+    );
+}
+
+/// `clauth switch <sid>` on
+/// a handed-off chain session no daemon holds yet says it waits for a daemon,
+/// never that it stopped. Control: once no job keeps the session, the row is
+/// dead and reads as before.
+#[cfg(target_os = "linux")]
+#[test]
+fn switching_a_handed_off_session_no_daemon_holds_names_the_wait() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+
+    let waiting =
+        crate::sessions_cli::run_switch(&sid, "wfs").expect_err("no daemon holds the session");
+    assert_eq!(
+        waiting.to_string(),
+        format!(
+            "session '{sid}' is a background session no clauth daemon holds yet\n\
+             it follows the chain once `clauth daemon` runs"
+        )
+    );
+
+    std::fs::remove_dir_all(job_naming(&sb, &tree)).expect("claude rm");
+    let dead = crate::sessions_cli::run_switch(&sid, "wfs").expect_err("a dead row");
+    assert_eq!(
+        dead.to_string(),
+        format!(
+            "session '{sid}' is no longer running\n\
+             its row is reaped by the next `clauth daemon` or `clauth resume`"
+        )
+    );
+}
+
+/// Pose the launcher's own swap onto `member` before it exited: the tree's
+/// credential link on `member`'s install source, the row's current member
+/// `member`.
+#[cfg(target_os = "linux")]
+fn pose_launcher_swap(tree: &std::path::Path, sid: &str, member: &str) {
+    let link = tree.join(".credentials.json");
+    std::fs::remove_file(&link).expect("unlink");
+    std::os::unix::fs::symlink(
+        crate::claude::install_source_path(&crate::profile::ProfileName::from(member))
+            .expect("install source"),
+        &link,
+    )
+    .expect("link onto the member");
+    crate::live_sessions::update_as_session(sid, |fields| fields.set_current_member(member))
+        .expect("record the launcher's move");
+}
+
+/// Rewrite the `state` of the job record that names `tree`.
+#[cfg(target_os = "linux")]
+fn set_job_state(sb: &HomeSandbox, tree: &std::path::Path, state: &str) {
+    let record = job_naming(sb, tree).join("state.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).expect("job record")).expect("parse");
+    value["state"] = serde_json::Value::String(state.to_string());
+    std::fs::write(&record, serde_json::to_vec(&value).expect("serialize")).expect("rewrite");
+}
+
+/// A real background job keeps its own Claude Code supervisor running in its
+/// tree for as long as the job lives, so the adoption cannot wait for it to
+/// exit: the daemon holds the session beside its live supervisor and leaves
+/// that supervisor running.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemon_adopts_a_handed_off_session_while_its_jobs_supervisor_runs() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut supervisor = crate::testutil::FakeSupervisor::spawn(&tree, false);
+    crate::testutil::write_daemon_lock(&tree, supervisor.pid, &supervisor.proc_start);
+
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the session beside its supervisor", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+    assert!(
+        matches!(supervisor.child.try_wait(), Ok(None)),
+        "the adoption leaves the job's supervisor running"
+    );
+    drop(daemon);
+}
+
+/// The account a handed-off session runs on stays a live session's account
+/// whether or not a daemon holds it yet, so it cannot be deleted, renamed or
+/// disabled under the session (`has_live_session` gates all three); the
+/// launch account stays live through the job naming its tree. Once the job is
+/// gone and the daemon released the session, neither is live.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_handed_off_session_keeps_the_account_it_runs_on_live() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    pose_launcher_swap(&tree, &sid, "wfs");
+    let wfl = crate::profile::ProfileName::from("wfl");
+    let wfs = crate::profile::ProfileName::from("wfs");
+
+    assert!(
+        crate::runtime::has_live_session(&wfs),
+        "no daemon holds the session yet, and its account is still in use"
+    );
+    assert!(crate::runtime::has_live_session(&wfl));
+
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the session on wfs", |d| {
+        daemon_holds_session(d, &sid, "wfs")
+    });
+    assert!(
+        crate::runtime::has_live_session(&wfs),
+        "the daemon holds the session on wfs"
+    );
+
+    std::fs::remove_dir_all(job_naming(&sb, &tree)).expect("claude rm");
+    tick_until(&mut daemon, "released the session", |_| !tree.exists());
+    assert!(!crate::runtime::has_live_session(&wfs));
+    assert!(!crate::runtime::has_live_session(&wfl));
+}
+
+/// An adopted session is one session on the account it runs on, and the
+/// account surfaces count it: unlike the account's fixed background tree,
+/// which the daemon holds once however many jobs run in it, a per-launch hold
+/// is exactly one session.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_adopted_with_fallback_session_counts_as_a_session_on_its_account() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (_tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut daemon = daemon_for(config.clone());
+    tick_until(&mut daemon, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+
+    let tally = crate::live_sessions::LiveTally::collect(&config);
+    let wfl = tally.member(&crate::profile::ProfileName::from("wfl"));
+    assert_eq!(
+        (wfl.sessions, wfl.following),
+        (1, 1),
+        "one session on wfl, and the chain may move it"
+    );
+}
+
+/// The macOS rotation gate: rotating the account an adopted session runs on
+/// would hand Claude Code's namespaced Keychain item a spent refresh token, so
+/// while the session's job is unfinished the account's rotation is refused,
+/// on the account the session moved onto too. A stopped job frees it, as it
+/// does for every background tree.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_adopted_session_blocks_a_macos_rotation_of_its_account_while_its_job_runs() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+    crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
+    let wfs_store = member_store_of("wfs");
+    tick_until(&mut daemon, "moved the session onto wfs", |d| {
+        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+    });
+    let wfs = crate::profile::ProfileName::from("wfs");
+
+    assert!(
+        crate::runtime::rotation_block_on(&wfs, true).is_some(),
+        "the session's unfinished job blocks rotating the account it runs on"
+    );
+    assert_eq!(
+        crate::runtime::rotation_block_on(&crate::profile::ProfileName::from("wfl"), true),
+        None,
+        "the session left wfl, whose dir its tree still sits in: rotating wfl strands nothing"
+    );
+
+    set_job_state(&sb, &tree, "stopped");
+    assert_eq!(
+        crate::runtime::rotation_block_on(&wfs, true),
+        None,
+        "a stopped job frees the rotation"
+    );
+}
+
+/// The registry rows of handed-off sessions outlive the pid in their id, so a
+/// new session's id never repeats one a row already names: a recycled pid
+/// would otherwise overwrite the hand-off record with a new session's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_new_session_never_takes_the_id_a_handed_off_row_names() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (_tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let handed_off = serde_json::to_value(crate::live_sessions::get(&sid)).expect("serialize");
+
+    let seq = sid
+        .rsplit_once('-')
+        .and_then(|(_, seq)| seq.parse::<u64>().ok())
+        .expect("a <pid>-<seq> id");
+    let daemon_lock = crate::daemon::hold_daemon_lock();
+    crate::runtime::rewind_session_seq_for_test(seq);
+    crate::start::run(
+        &config,
+        &crate::profile::ProfileName::from("wfl"),
+        &["--bg".to_string()],
+        crate::runtime::Isolation::Shared,
+        None,
+        true,
+        None,
+    )
+    .expect("a second --with-fallback start");
+    drop(daemon_lock);
+
+    assert_eq!(
+        serde_json::to_value(crate::live_sessions::get(&sid)).expect("serialize"),
+        handed_off,
+        "the hand-off record is untouched"
+    );
+    let trees: Vec<String> = fake
+        .spawns()
+        .into_iter()
+        .filter(|(_, argv)| argv.split(' ').any(|word| word == "--bg"))
+        .map(|(dir, _)| dir)
+        .collect();
+    assert_eq!(trees.len(), 2, "two launches");
+    assert_ne!(trees[0], trees[1], "the second launch ran on its own tree");
+}
+
+/// A clauth that changed the account's rolling-token setup while the session
+/// was handed off moves the account's install source between its two stores;
+/// the session's link still names the other one. That is the account's own
+/// store, so the daemon adopts the session, and its convergence moves the link
+/// onto the current install source.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_adoption_accepts_a_link_on_the_accounts_other_store_and_converges_it() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let wfl = crate::profile::ProfileName::from("wfl");
+    crate::claude::write_session_token(&wfl, "oat-mint", 0).expect("write the sidecar");
+    let sidecar = member_store_of("wfl");
+    assert_ne!(
+        tree_store(&tree).as_ref(),
+        Some(&sidecar),
+        "the fixture moved the install source off the link"
+    );
+
+    let mut daemon = daemon_for(config);
+    tick_until(
+        &mut daemon,
+        "held the session and converged its link",
+        |d| daemon_holds_session(d, &sid, "wfl") && tree_store(&tree).as_ref() == Some(&sidecar),
+    );
+}
+
+/// An adoption claims the session's marker before it writes anything: with
+/// another holder keeping that marker, it refuses and leaves the tree's
+/// settings and the hand-off row exactly as they were.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_adoption_refused_on_a_held_marker_writes_nothing() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let held = crate::runtime::open_pid_file(&with_fallback_marker("wfl", &sid)).expect("marker");
+    held.lock().expect("another holder keeps the marker");
+    let settings = tree.join("settings.json");
+    std::fs::write(&settings, b"{\"sentinel\":true}").expect("sentinel settings");
+    let before = serde_json::to_value(crate::live_sessions::get(&sid)).expect("serialize");
+
+    let refused = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]);
+
+    assert!(refused.is_err(), "the marker is held elsewhere");
+    assert_eq!(
+        std::fs::read(&settings).expect("settings"),
+        b"{\"sentinel\":true}",
+        "the tree is untouched"
+    );
+    assert_eq!(
+        serde_json::to_value(crate::live_sessions::get(&sid)).expect("serialize"),
+        before,
+        "the row is untouched"
+    );
+    drop(held);
+}
+
+/// The adopted session keeps judging chain members against what it booted
+/// with, never against the launch account's config as edited since: an env
+/// added to `wfl` after the launch must not make `wfs` (still env-equal to
+/// the boot) ineligible.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_adopted_session_judges_swaps_against_what_it_booted_with() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let wfl = crate::profile::ProfileName::from("wfl");
+    let mut edited = crate::profile::read_profile(&wfl).expect("read wfl");
+    edited
+        .env
+        .insert("WFL_EDITED_AFTER_LAUNCH".to_string(), "1".to_string());
+    save_profile(&edited).expect("save the edit");
+
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+    crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
+    let wfs_store = member_store_of("wfs");
+    tick_until(&mut daemon, "moved the session onto wfs", |_| {
+        tree_store(&tree).as_ref() == Some(&wfs_store)
+    });
+}
+
+/// On macOS a move's Keychain write lands after its link and row moves, and
+/// until it does the session still reads the account it left: the row's
+/// `launch_store` names that account's store while the link and the current
+/// member already name the new one. The rotation gate follows `launch_store`,
+/// the store the session reads, so it keeps the left account's rotation
+/// refused and leaves the new one free.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_rotation_gate_follows_the_store_the_session_reads() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+    crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
+    let wfs_store = member_store_of("wfs");
+    tick_until(&mut daemon, "moved the session onto wfs", |d| {
+        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+    });
+    let wfl_store = crate::claude::install_source_path(&crate::profile::ProfileName::from("wfl"))
+        .expect("wfl store");
+    crate::live_sessions::update_as_session(&sid, |fields| fields.set_launch_store(wfl_store))
+        .expect("pose the Keychain write that has not landed");
+
+    assert_eq!(
+        (
+            crate::runtime::rotation_block_on(&crate::profile::ProfileName::from("wfl"), true)
+                .is_some(),
+            crate::runtime::rotation_block_on(&crate::profile::ProfileName::from("wfs"), true)
+                .is_some(),
+        ),
+        (true, false),
+        "(wfl blocked, wfs blocked): the session still reads wfl's store"
+    );
+}
+
+/// A store the session's row names but that no longer exists (a static token
+/// cleared from under it) leaves the gate unable to tell which store the
+/// session reads, so it refuses rotation of the accounts the row names, and
+/// only those: an account the session never ran on rotates as before.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unreadable_session_store_blocks_only_the_accounts_its_row_names() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    save_profile(&profile_with_creds("wfu", "tok-wfu")).expect("an account outside the session");
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+    crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
+    let wfs_store = member_store_of("wfs");
+    tick_until(&mut daemon, "moved the session onto wfs", |d| {
+        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+    });
+    let gone = crate::profile::profile_dir(&crate::profile::ProfileName::from("wfs"))
+        .expect("profile dir")
+        .join("session-token.json");
+    assert!(!gone.exists(), "the fixture's store is absent");
+    crate::live_sessions::update_as_session(&sid, |fields| fields.set_launch_store(gone))
+        .expect("pose a cleared store");
+
+    assert!(
+        crate::runtime::rotation_block_on(&crate::profile::ProfileName::from("wfs"), true)
+            .is_some(),
+        "the account the session runs on stays refused"
+    );
+    assert_eq!(
+        crate::runtime::rotation_block_on(&crate::profile::ProfileName::from("wfu"), true),
+        None,
+        "an account the session never ran on rotates"
+    );
+}
+
+/// A move whose Keychain write never landed leaves the session reading a
+/// third account's store, named only by its `launch_store` path; once that
+/// store is cleared the path no longer resolves, and the account whose dir
+/// holds it is still the one a rotation would strand, so it stays refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unresolved_store_under_a_third_account_blocks_that_account() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    save_profile(&profile_with_creds("wfu", "tok-wfu")).expect("a third account");
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut daemon = daemon_for(config);
+    tick_until(&mut daemon, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+    crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
+    let wfs_store = member_store_of("wfs");
+    tick_until(&mut daemon, "moved the session onto wfs", |d| {
+        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+    });
+    let gone = crate::profile::profile_dir(&crate::profile::ProfileName::from("wfu"))
+        .expect("profile dir")
+        .join("session-token.json");
+    assert!(!gone.exists(), "the fixture's store is absent");
+    crate::live_sessions::update_as_session(&sid, |fields| fields.set_launch_store(gone))
+        .expect("pose an unlanded move onto a cleared wfu store");
+
+    assert!(
+        crate::runtime::rotation_block_on(&crate::profile::ProfileName::from("wfu"), true)
+            .is_some(),
+        "the account whose cleared store the session reads stays refused"
+    );
+}
+
+/// A row with no recorded store and a credential link that resolves nowhere
+/// gives the gate nothing to read but the row itself: the account the session
+/// runs on stays refused, and an account it never ran on rotates.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_row_with_no_store_and_a_dangling_link_blocks_its_current_account_only() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    save_profile(&profile_with_creds("wfu", "tok-wfu")).expect("an account outside the session");
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    // Handed off, never held: no watchdog converges the link under the test.
+    let mut row = crate::live_sessions::get(&sid).expect("the hand-off row");
+    row.current_member = Some("wfs".to_string());
+    row.launch_store = None;
+    crate::live_sessions::register(&row).expect("pose a row with no recorded store");
+    let link = tree.join(".credentials.json");
+    std::fs::remove_file(&link).expect("unlink");
+    std::os::unix::fs::symlink(tree.join("no-such-store.json"), &link).expect("dangling link");
+
+    assert!(
+        crate::runtime::rotation_block_on(&crate::profile::ProfileName::from("wfs"), true)
+            .is_some(),
+        "the account the session runs on stays refused"
+    );
+    assert_eq!(
+        crate::runtime::rotation_block_on(&crate::profile::ProfileName::from("wfu"), true),
+        None,
+        "an account the session never ran on rotates"
+    );
+}
+
+/// The live Claude Code process keeps every refresh token it was ever handed,
+/// so every account a session has run on stays a live session's account until
+/// the session ends, not only the one it runs on now: through a hand-off with
+/// no daemon, and once a fresh daemon holds the session again.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_handed_off_session_keeps_every_account_it_ran_on_live() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut first = daemon_for(config.clone());
+    tick_until(&mut first, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+    crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
+    let wfs_store = member_store_of("wfs");
+    tick_until(&mut first, "moved the session onto wfs", |d| {
+        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+    });
+    crate::sessions_cli::run_switch(&sid, "wfl").expect("switch back onto wfl");
+    let wfl_store = member_store_of("wfl");
+    tick_until(&mut first, "moved the session back onto wfl", |d| {
+        tree_store(&tree).as_ref() == Some(&wfl_store) && daemon_holds_session(d, &sid, "wfl")
+    });
+    let wfs = crate::profile::ProfileName::from("wfs");
+    assert!(
+        crate::runtime::has_live_session(&wfs),
+        "the held session keeps the account it left"
+    );
+
+    drop(first);
+    assert!(
+        crate::runtime::has_live_session(&wfs),
+        "the handed-off session still keeps the account it left"
+    );
+
+    let mut second = daemon_for(config);
+    tick_until(&mut second, "re-adopted the session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+    assert!(
+        crate::runtime::has_live_marker(&wfs),
+        "the re-adopted session holds a marker under the account it left"
+    );
+}
+
+/// Another live holder on the marker of an account the session ran on (a
+/// sibling process still tearing it down) refuses the adoption for a retry,
+/// and a refused attempt leaves no marker file of its own behind; once the
+/// holder lets go, the daemon holds the session.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_held_marker_of_a_visited_account_refuses_the_adoption_cleanly() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut first = daemon_for(config.clone());
+    tick_until(&mut first, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+    crate::sessions_cli::run_switch(&sid, "wfs").expect("switch onto wfs");
+    let wfs_store = member_store_of("wfs");
+    tick_until(&mut first, "moved the session onto wfs", |d| {
+        tree_store(&tree).as_ref() == Some(&wfs_store) && daemon_holds_session(d, &sid, "wfs")
+    });
+    crate::sessions_cli::run_switch(&sid, "wfl").expect("switch back onto wfl");
+    let wfl_store = member_store_of("wfl");
+    tick_until(&mut first, "moved the session back onto wfl", |d| {
+        tree_store(&tree).as_ref() == Some(&wfl_store) && daemon_holds_session(d, &sid, "wfl")
+    });
+    drop(first);
+    let visited = with_fallback_marker("wfs", &sid);
+    std::fs::create_dir_all(visited.parent().expect("marker dir")).expect("the holder's dir");
+    let held = crate::runtime::open_pid_file(&visited).expect("visited marker");
+    held.lock()
+        .expect("another holder keeps the visited marker");
+
+    let mut second = daemon_for(config);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        second.tick();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !second
+            .background
+            .held
+            .contains_key(&super::BackgroundKey::Session(sid.clone())),
+        "the daemon holds no session another process still holds a marker of"
+    );
+    assert!(
+        !with_fallback_marker("wfl", &sid).exists(),
+        "a refused attempt leaves no marker file of its own"
+    );
+
+    drop(held);
+    tick_until(
+        &mut second,
+        "held the session once the holder let go",
+        |d| daemon_holds_session(d, &sid, "wfl"),
+    );
+}
+
+/// An attempt that claimed one visited account's marker and then meets
+/// another holder on the next one rolls back what it made: the marker file and
+/// the `sessions-<sid>/` dir it created under the first account are gone, and
+/// the holder's own file stays.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_adoption_rolls_back_the_markers_it_claimed_first() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let mut config = persist(
+        vec![
+            profile_with_creds("wfl", "tok-wfl"),
+            profile_with_creds("wfs", "tok-wfs"),
+            profile_with_creds("wft", "tok-wft"),
+        ],
+        None,
+        60_000,
+    );
+    config.state.fallback_chain = vec!["wfl".into(), "wfs".into(), "wft".into()];
+    save_app_state(&config.state).expect("persist the chain");
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut first = daemon_for(config.clone());
+    tick_until(&mut first, "held the handed-off session", |d| {
+        daemon_holds_session(d, &sid, "wfl")
+    });
+    for member in ["wfs", "wft", "wfl"] {
+        crate::sessions_cli::run_switch(&sid, member).expect("switch along the chain");
+        let store = member_store_of(member);
+        tick_until(&mut first, "moved the session", |d| {
+            tree_store(&tree).as_ref() == Some(&store) && daemon_holds_session(d, &sid, member)
+        });
+    }
+    drop(first);
+    let first_visited = with_fallback_marker("wfs", &sid);
+    assert!(
+        !first_visited.exists(),
+        "the handed-off session's markers went with the daemon that held it"
+    );
+    let foreign = with_fallback_marker("wft", &sid);
+    std::fs::create_dir_all(foreign.parent().expect("marker dir")).expect("the holder's dir");
+    let held = crate::runtime::open_pid_file(&foreign).expect("foreign marker");
+    held.lock().expect("another holder keeps wft's marker");
+
+    let mut second = daemon_for(config);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        second.tick();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert!(
+        !second
+            .background
+            .held
+            .contains_key(&super::BackgroundKey::Session(sid.clone())),
+        "the daemon holds no session another process still holds a marker of"
+    );
+    assert!(
+        !first_visited.exists() && !first_visited.parent().expect("marker dir").exists(),
+        "the attempt rolled back the wfs marker file and dir it created"
+    );
+    assert!(foreign.is_file(), "the other holder's file stays");
+    drop(held);
+}
+
+/// The switch line's wait copy needs a job that names the tree: under a job
+/// store that cannot be read, a dead chain row reads as dead, never as a
+/// session waiting for a daemon.
+#[cfg(target_os = "linux")]
+#[test]
+fn switching_under_an_unreadable_job_store_never_claims_a_waiting_session() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    std::fs::remove_dir_all(job_naming(&sb, &tree)).expect("claude rm");
+    let torn = sb.home().join(".claude").join("jobs").join("b6a1c0d5");
+    std::fs::create_dir_all(&torn).expect("torn job dir");
+    std::fs::write(torn.join("state.json"), b"{ torn").expect("torn record");
+
+    let dead = crate::sessions_cli::run_switch(&sid, "wfs").expect_err("a dead row");
+    assert_eq!(
+        dead.to_string(),
+        format!(
+            "session '{sid}' is no longer running\n\
+             its row is reaped by the next `clauth daemon` or `clauth resume`"
+        )
     );
 }

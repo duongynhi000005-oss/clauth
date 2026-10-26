@@ -5267,6 +5267,10 @@ pub(crate) struct App {
     /// reload (jobs come and go without touching config), and seeded in
     /// [`App::new`] so the first frame already reads a real snapshot.
     pub(crate) job_trees: crate::claude_jobs::JobTrees,
+    /// The members a handed-off chain row keeps live, derived from the same
+    /// per-tick `job_trees` snapshot (one registry read, never one per frame),
+    /// so a Setup-detail frame pays a set lookup instead of a registry walk.
+    pub(crate) handed_off: HashSet<String>,
     /// The widest the header's `[ N live ]` chip has read its number field, in
     /// cells: the split `N+M` form counted whole, so the chip renders at least
     /// this wide for the TUI's lifetime.
@@ -5683,6 +5687,10 @@ impl App {
             .profiles
             .first()
             .and_then(|p| crate::profile_notes::load_note(&p.name));
+        // The handed-off set derives from the job snapshot, so both are read
+        // once here and refreshed as a pair on the tick.
+        let job_trees = crate::claude_jobs::job_trees();
+        let handed_off = crate::runtime::handed_off_live_members(&job_trees);
 
         let mut app = Self {
             config: Arc::new(RankedMutex::new(config)),
@@ -5897,7 +5905,8 @@ impl App {
                 .count(),
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
-            job_trees: crate::claude_jobs::job_trees(),
+            job_trees,
+            handed_off,
             tps: None,
             tps_rate_width: 0,
             last_tps_refresh: Instant::now(),
@@ -27099,10 +27108,12 @@ fn poll_live_sessions(app: &mut App) {
     app.last_live_sessions_refresh = Some(Instant::now());
     let tally = crate::live_sessions::LiveTally::collect(&app.config());
     app.set_live_sessions(tally);
-    // The job-store snapshot rides the same tick: refresh it here, never per
-    // frame, so the Setup detail's live-session field reads a store at most
-    // once a second.
-    app.job_trees = crate::claude_jobs::job_trees();
+    // The job-store snapshot and the handed-off set it implies ride the same
+    // tick: refreshed here, never per frame, so the Setup detail's live-session
+    // field reads a store at most once a second.
+    let jobs = crate::claude_jobs::job_trees();
+    app.handed_off = crate::runtime::handed_off_live_members(&jobs);
+    app.job_trees = jobs;
 }
 
 /// The header chip's number field, as spans: own sessions then delegates joined
