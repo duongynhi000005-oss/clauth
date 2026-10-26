@@ -215,10 +215,11 @@ fn drains_exhausted(remaining: Option<Duration>, now: Instant, deadline: Instant
 /// older build or created under a permissive umask can be 0o755
 /// (world-traversable → world-readable `daemon.log`, enumerable account names).
 /// Delegates to [`crate::profile::enforce_clauth_perms`] for the whole tree
-/// (dirs → 0o700, files → 0o600, symlinks skipped), which also covers the
-/// launchd-created `daemon.log`: launchd opens it (`StandardErrorPath`) at the
-/// umask (~0o644) before `exec`, and the already-open fd keeps appending to the
-/// now-0o600 inode. Best-effort — a chmod failure never stops the daemon.
+/// short of each codex home's contents (dirs → 0o700, files → 0o600, or 0o700
+/// when the file's owner exec bit is set, symlinks skipped), which also covers
+/// the launchd-created `daemon.log`: launchd opens it (`StandardErrorPath`) at
+/// the umask (~0o644) before `exec`, and the already-open fd keeps appending to
+/// the now-0o600 inode. Best-effort — a chmod failure never stops the daemon.
 fn migrate_clauth_perms_700(dir: &std::path::Path) {
     crate::profile::enforce_clauth_perms(dir);
 }

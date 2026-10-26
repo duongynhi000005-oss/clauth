@@ -2571,12 +2571,13 @@ pub(crate) fn open_state_file(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Retighten an existing `~/.clauth` tree to the owner-only invariant (0o700
-/// dirs, 0o600 files). Installs created before the invariant carry umask modes
-/// no writer revisits once the bytes stop changing, so [`load_config`] runs
-/// this on every entry point. Symlinks are skipped and never traversed: a
-/// shared-mode runtime is full of links into the operator's `~/.claude`, and
-/// following one would chmod a file clauth does not own. Best-effort per entry
-/// — a chmod failure on one path never aborts the walk or the load.
+/// dirs, 0o600 files, 0o700 for a file whose owner exec bit is set).
+/// Installs created before the invariant carry umask modes no writer revisits
+/// once the bytes stop changing, so [`load_config`] runs this on every entry
+/// point. Symlinks are skipped and never traversed: a shared-mode runtime is
+/// full of links into the operator's `~/.claude`, and following one would
+/// chmod a file clauth does not own. Best-effort per entry — a chmod failure
+/// on one path never aborts the walk or the load.
 pub(crate) fn enforce_clauth_perms(root: &Path) {
     #[cfg(unix)]
     {
@@ -2588,8 +2589,17 @@ pub(crate) fn enforce_clauth_perms(root: &Path) {
             return;
         }
         let is_dir = meta.is_dir();
-        let want = if is_dir { 0o700 } else { 0o600 };
-        if meta.permissions().mode() & 0o777 != want {
+        let mode = meta.permissions().mode() & 0o777;
+        // A file keeps an owner exec bit it already had: Claude Code writes
+        // runtime wrappers like `chrome/chrome-native-host` 0755 and the
+        // browser execs them, so forcing 0600 breaks the install. Only the
+        // owner's own bit carries over; no group or other bit ever does.
+        let want = if is_dir {
+            0o700
+        } else {
+            0o600 | (mode & 0o100)
+        };
+        if mode != want {
             let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(want));
         }
         // A codex home's CONTENTS are codex's own: the PATH-alias helper

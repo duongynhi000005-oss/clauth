@@ -2086,6 +2086,10 @@ pub(crate) fn env_overrides(cmd: &Command) -> HashMap<String, Option<String>> {
 
 /// Every path under `root` breaking the owner-only invariant clauth holds over
 /// `~/.clauth` (0o700 dirs, 0o600 files), rendered as `<mode> <path>` lines.
+/// clauth's own state writers create 0o600 files; the sweep's owner-exec
+/// carry-over is for the executables Claude Code writes into a runtime tree and
+/// the ones a fake-mode runtime copies in mode-preserved (`copy_file`, at build
+/// and on every mirror tick).
 /// Symlinks are skipped — a link's own mode is meaningless and its target lives
 /// outside the tree.
 #[cfg(unix)]

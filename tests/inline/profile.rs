@@ -2693,6 +2693,177 @@ fn the_perms_sweep_stops_at_a_codex_homes_threshold() {
     );
 }
 
+/// #122: Claude Code writes `chrome/chrome-native-host` 0755 into a runtime
+/// tree and points the browser's native-messaging manifest at it, so the
+/// browser execs it. The sweep keeps an owner-executable file executable by
+/// its owner alone and strips every group and other bit; a file the owner
+/// could not execute stays 0600, whatever group or other carried.
+#[cfg(unix)]
+#[test]
+fn the_perms_sweep_keeps_an_executables_owner_exec_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let clauth = clauth_dir().expect("clauth_dir");
+    let chrome = clauth
+        .join("profiles")
+        .join("p")
+        .join("runtime-4242-7")
+        .join("chrome");
+    std::fs::create_dir_all(&chrome).expect("mkdir chrome");
+    let chmod = |p: &std::path::Path, mode: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    let wrapper = chrome.join("chrome-native-host");
+    std::fs::write(&wrapper, b"#!/bin/sh\nexit 7\n").expect("write wrapper");
+    chmod(&wrapper, 0o755);
+    let manifest = chrome.join("manifest.json");
+    std::fs::write(&manifest, b"{}").expect("write manifest");
+    chmod(&manifest, 0o644);
+    let other_exec = chrome.join("other-exec");
+    std::fs::write(&other_exec, b"#!/bin/sh\n").expect("write other-exec");
+    chmod(&other_exec, 0o651);
+    let open_exec = chrome.join("open-exec");
+    std::fs::write(&open_exec, b"#!/bin/sh\n").expect("write open-exec");
+    chmod(&open_exec, 0o777);
+    let open_plain = chrome.join("open-plain");
+    std::fs::write(&open_plain, b"{}").expect("write open-plain");
+    chmod(&open_plain, 0o666);
+    let open_dir = chrome.join("open-dir");
+    std::fs::create_dir(&open_dir).expect("mkdir open-dir");
+    chmod(&open_dir, 0o777);
+
+    enforce_clauth_perms(&clauth);
+
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(mode(&wrapper), 0o700, "the wrapper stays owner-executable");
+    assert_eq!(
+        mode(&manifest),
+        0o600,
+        "a plain file is retightened to 0600"
+    );
+    assert_eq!(
+        mode(&other_exec),
+        0o600,
+        "group and other exec bits never make a file owner-executable"
+    );
+    assert_eq!(
+        mode(&open_exec),
+        0o700,
+        "an executable loses every group and other bit, write included"
+    );
+    assert_eq!(
+        mode(&open_plain),
+        0o600,
+        "a plain file loses every group and other bit, write included"
+    );
+    assert_eq!(mode(&open_dir), 0o700, "a nested open dir is retightened");
+    assert_eq!(mode(&chrome), 0o700, "the dir keeps the invariant");
+
+    // The exec the browser performs. A sibling test thread forking while the
+    // write fd was open can leave the file text-busy for a moment (ETXTBSY).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        match std::process::Command::new(&wrapper)
+            .stdin(std::process::Stdio::null())
+            .status()
+        {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => break other.expect("exec the wrapper"),
+        }
+    };
+    assert_eq!(status.code(), Some(7), "the swept wrapper still runs");
+}
+
+/// The owner-only checker every tree test leans on stays as strict as the rule
+/// clauth's own state writers follow: a file is 0600 and a dir 0700, so a
+/// state writer that leaves any other mode, an owner exec bit included, is
+/// named (the sweep's exec-bit carry-over serves the executables Claude Code
+/// writes and the fake-mode tree copy carries in, never a state file).
+/// Each of the 512 modes is posed on a file and on an empty dir directly under
+/// the root, which pins the per-bit rule there; a 0o755 root, two 0o755
+/// non-empty dirs below it and a 0o644 file at the bottom pin that the walk
+/// reads the root and descends. A rule that differs only at another depth is
+/// not pinned here.
+#[cfg(unix)]
+#[test]
+fn the_owner_only_checker_names_every_mode_but_0600_files_and_0700_dirs() {
+    use crate::testutil::owner_only_violations;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Hands every posed dir back to 0o700 on drop, a panic included, so the
+    /// tempdir's own removal can read each one.
+    struct RestoreDirs(Vec<std::path::PathBuf>);
+    impl Drop for RestoreDirs {
+        fn drop(&mut self) {
+            for dir in &self.0 {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("tree");
+    let nest = root.join("nest");
+    let inner = nest.join("inner");
+    std::fs::create_dir_all(&inner).expect("mkdir");
+    let chmod = |p: &std::path::Path, mode: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    let line = |mode: u32, path: &std::path::Path, want: u32| {
+        format!("{mode:#o} {} (want {want:#o})", path.display())
+    };
+    let mut want = Vec::new();
+    let mut dirs = RestoreDirs(Vec::new());
+    for mode in 0..=0o777u32 {
+        let file = root.join(format!("f{mode:03o}"));
+        std::fs::write(&file, b"").expect("write");
+        chmod(&file, mode);
+        if mode != 0o600 {
+            want.push(line(mode, &file, 0o600));
+        }
+        let dir = root.join(format!("d{mode:03o}"));
+        std::fs::create_dir(&dir).expect("mkdir");
+        dirs.0.push(dir.clone());
+        chmod(&dir, mode);
+        if mode != 0o700 {
+            want.push(line(mode, &dir, 0o700));
+        }
+    }
+    let deep = inner.join("deep");
+    std::fs::write(&deep, b"").expect("write");
+    chmod(&deep, 0o644);
+    want.push(line(0o644, &deep, 0o600));
+    chmod(&inner, 0o755);
+    want.push(line(0o755, &inner, 0o700));
+    chmod(&nest, 0o755);
+    want.push(line(0o755, &nest, 0o700));
+    chmod(&root, 0o755);
+    want.push(line(0o755, &root, 0o700));
+
+    let mut got = owner_only_violations(&root);
+    drop(dirs);
+    got.sort();
+    want.sort();
+    // Every file mode but 0o600, every dir mode but 0o700, the nested three and
+    // the root.
+    assert_eq!(want.len(), 511 + 511 + 4);
+    let missing: Vec<_> = want.iter().filter(|l| !got.contains(l)).collect();
+    assert!(missing.is_empty(), "the checker missed: {missing:?}");
+    let extra: Vec<_> = got.iter().filter(|l| !want.contains(l)).collect();
+    assert!(
+        extra.is_empty(),
+        "the checker named a compliant path: {extra:?}"
+    );
+    assert_eq!(got, want);
+}
+
 /// Installs from before the 0o600/0o700 rule carry a umask-moded tree that no
 /// writer ever revisits: bytes that never change keep their mode forever. Every
 /// entry point loads the config, so that is where the tree gets retightened.
