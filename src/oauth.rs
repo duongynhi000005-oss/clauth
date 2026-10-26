@@ -766,19 +766,18 @@ impl KickResult {
 ///
 /// Each recovery step is paced by [`ROTATION_STEP_DELAY_MS`] (kick → rotate →
 /// retry kick → caller's usage re-fetch); none of the sleeps holds the rotation
-/// lock. `activity` (the scheduler's store) drives the spinner; the CLI passes
-/// `None`. When `activity` is `Some`, `shutting_down` gates the marker raise
-/// through [`crate::usage::raise_refreshing_unless_shutting_down`]; a `None`
-/// flag (the CLI, or any caller without the flag plumbed) keeps the ungated
-/// base behaviour.
+/// lock. `spend_marker` is the scheduler's activity store and shutdown flag,
+/// which drive the spinner and the quit wait; the CLI passes `None`. The two
+/// travel as one pair so the refresh always runs under a
+/// [`crate::usage::claim_scheduler_spend_unless_shutting_down`] claim, held
+/// through the land of the minted pair; a set flag bails unrotated.
 pub(crate) fn auto_start_kick(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     access_token: &str,
     refresh_token: Option<&str>,
     access_expires_at: Option<i64>,
-    activity: Option<&ActivityStore>,
-    shutting_down: Option<&std::sync::atomic::AtomicBool>,
+    spend_marker: Option<(&ActivityStore, &std::sync::atomic::AtomicBool)>,
 ) -> KickResult {
     let first_rl = match kick(access_token) {
         Ok(()) => {
@@ -847,22 +846,25 @@ pub(crate) fn auto_start_kick(
         SendRule::Skip => return KickResult::not_opened_with(first_rl),
     };
 
-    // Refresh spinner during the round trip, then back to Fetching for the retry
-    // kick + the caller's fetch (the kick runs inside the scheduler's fetch leg).
-    match (activity, shutting_down) {
-        (Some(activity), Some(shutting_down)) => {
-            if !crate::usage::raise_refreshing_unless_shutting_down(activity, name, shutting_down) {
+    // Refresh spinner from the round trip through the land; the OAuth leg reads
+    // Fetching from the answer on, for the retry kick + the caller's fetch (the
+    // kick runs inside the scheduler's fetch leg).
+    let claim = match spend_marker {
+        Some((activity, shutting_down)) => {
+            let Some(claim) = crate::usage::claim_scheduler_spend_unless_shutting_down(
+                activity,
+                name,
+                shutting_down,
+            ) else {
                 // The shutdown flag is set: a spend that started now could die
                 // between the token endpoint's answer and its stage write, so
                 // bail unrotated — no token sent, no marker raised.
                 return KickResult::not_opened_with(first_rl);
-            }
+            };
+            Some(claim)
         }
-        (Some(activity), None) => {
-            mark_activity(activity, name, ProfileActivity::Refreshing);
-        }
-        (None, _) => {}
-    }
+        None => None,
+    };
     let refreshed = settle_refresh_answer(
         config,
         name,
@@ -870,9 +872,8 @@ pub(crate) fn auto_start_kick(
         refresh_result(&rt, stored_scopes(config, name).as_deref()),
         &rotation_guard,
     );
-    if let Some(activity) = activity {
-        // This site raised `Refreshing`, so it is the one that may retire it.
-        crate::usage::rotation_into_fetch(activity, name);
+    if let Some((activity, _)) = spend_marker {
+        mark_activity(activity, name, ProfileActivity::Fetching);
     }
     let minted = match refreshed {
         Ok(minted) => minted,
@@ -913,6 +914,7 @@ pub(crate) fn auto_start_kick(
             };
         }
     }
+    drop(claim);
     // Retry kick spends only the access token, so release the rotation lock
     // before the paced waits — a sibling worker shouldn't block on our sleeps.
     drop(rotation_guard);
@@ -1532,7 +1534,6 @@ pub(crate) fn prime_window(config: &crate::profile::ConfigHandle, name: &Profile
         &access_token,
         refresh_token.as_deref(),
         expires_at,
-        None,
         None,
     );
     if let Some(rl) = kicked.blocked {

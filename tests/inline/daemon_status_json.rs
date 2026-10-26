@@ -1676,7 +1676,11 @@ fn codex_entries_fall_back_to_the_id_token_plan_and_publish_broken() {
             "dead",
             1_700_000_000_000,
             "2026-08-13T00:00:00Z".into(),
-            &invalidated
+            &invalidated,
+            &std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+                std::collections::HashMap::new()
+            )),
+            &std::sync::atomic::AtomicBool::new(false)
         ),
         crate::codex_auth::StandbyOutcome::Failed
     );

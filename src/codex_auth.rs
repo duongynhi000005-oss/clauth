@@ -42,6 +42,7 @@
 use crate::profile::ProfileName;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 
@@ -792,7 +793,8 @@ pub(crate) fn clear_plight_warn(name: &str, plight: &'static str) {
 /// the tests read the same verdicts.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StandbyOutcome {
-    /// Nothing to do: no store, no chain, not due, or memo-blocked.
+    /// Nothing to do: no store, no chain, not due, memo-blocked, or shutdown
+    /// already under way.
     Idle,
     /// Stood down: a live codex session owns the pre-expiry window.
     StoodDown,
@@ -811,11 +813,22 @@ pub(crate) enum StandbyOutcome {
 
 /// One profile's standby pass. `refresher` is injected so every path is
 /// testable offline; production passes [`refresh_codex_chain`].
+///
+/// The refresh token is single-use, and a process dying between the POST and
+/// the store write loses the chain until a browser re-login. So the memo, the
+/// POST and the store write run under a scheduler spend claim in `activity`,
+/// the store a TUI quit waits on, taken only once the pass is about to spend
+/// (a not-due pass taking it would flash the save cue every tick) and released
+/// on every return and on unwind. Once `shutting_down` is set the claim
+/// refuses BEFORE the memo is written: a memo for a token nothing sent would
+/// idle the next process on a chain that was never spent.
 pub(crate) fn standby_pass(
     name: &str,
     now_ms: i64,
     now_rfc3339: String,
     refresher: &dyn Fn(&str) -> std::result::Result<CodexTokenResponse, CodexRefreshError>,
+    activity: &crate::usage::ActivityStore,
+    shutting_down: &AtomicBool,
 ) -> StandbyOutcome {
     let Ok(store) = profile_subpath(&ProfileName::from(name), "auth.json") else {
         return StandbyOutcome::Idle;
@@ -936,7 +949,7 @@ pub(crate) fn standby_pass(
     // the pre-guard capture, before the post-guard re-read), which the
     // re-read below must catch. Nothing outside tests sets this.
     #[cfg(test)]
-    run_pre_reread_hook(name);
+    run_standby_hook(StandbyHookPoint::PreReread, name);
 
     // Re-read under the guard: a live codex may have rotated while we
     // decided. Only the post-guard token feeds the wire.
@@ -967,6 +980,17 @@ pub(crate) fn standby_pass(
         return StandbyOutcome::Idle;
     }
 
+    // A refusal spends nothing, so a forced attempt it took is still owed.
+    let profile = ProfileName::from(name);
+    let Some(_claim) =
+        crate::usage::claim_scheduler_spend_unless_shutting_down(activity, &profile, shutting_down)
+    else {
+        if forced {
+            restore_kick(name);
+        }
+        return StandbyOutcome::Idle;
+    };
+
     // No token reaches the wire without its memo on disk: a memo that failed
     // to land is exactly the restart hole the memo exists to close, so the
     // pass ends here rather than sending unprotected. The kick it took is
@@ -986,6 +1010,8 @@ pub(crate) fn standby_pass(
     match refresher(&fresh_token) {
         Ok(tok) => {
             let rotated = auth.with_rotated(&tok, &now_rfc3339);
+            #[cfg(test)]
+            run_standby_hook(StandbyHookPoint::PreStoreWrite, name);
             match crate::profile::atomic_write_600(&store, rotated.to_bytes()) {
                 Ok(()) => {
                     record_lkg(name, &rotated.to_bytes());
@@ -1032,29 +1058,50 @@ pub(crate) fn standby_pass(
     }
 }
 
-/// Test seam for the post-guard re-read: a hook, keyed by profile name, run
-/// once between the pre-guard token capture and the post-guard re-read to
-/// simulate a live codex rotating the store in that window.
+/// Test seams inside a standby pass: a hook, keyed by its point and the
+/// profile name, run once there.
 #[cfg(test)]
-pub(crate) type PreRereadHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+pub(crate) type StandbyHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// Where a [`StandbyHook`] runs.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum StandbyHookPoint {
+    /// Between the pre-guard token capture and the post-guard re-read, to
+    /// simulate a live codex rotating the store in that window.
+    PreReread,
+    /// After the POST's answer, just before the rotated store is written.
+    PreStoreWrite,
+}
 
 #[cfg(test)]
-static PRE_REREAD_HOOK: Mutex<Option<HashMap<String, PreRereadHook>>> = Mutex::new(None);
+static STANDBY_HOOKS: Mutex<Option<HashMap<(StandbyHookPoint, String), StandbyHook>>> =
+    Mutex::new(None);
 
 #[cfg(test)]
-pub(crate) fn set_pre_reread_hook(name: &str, f: PreRereadHook) {
-    if let Ok(mut g) = PRE_REREAD_HOOK.lock() {
+pub(crate) fn set_pre_reread_hook(name: &str, f: StandbyHook) {
+    set_standby_hook(StandbyHookPoint::PreReread, name, f);
+}
+
+#[cfg(test)]
+pub(crate) fn set_pre_store_write_hook(name: &str, f: StandbyHook) {
+    set_standby_hook(StandbyHookPoint::PreStoreWrite, name, f);
+}
+
+#[cfg(test)]
+fn set_standby_hook(point: StandbyHookPoint, name: &str, f: StandbyHook) {
+    if let Ok(mut g) = STANDBY_HOOKS.lock() {
         g.get_or_insert_with(HashMap::new)
-            .insert(name.to_string(), f);
+            .insert((point, name.to_string()), f);
     }
 }
 
 #[cfg(test)]
-fn run_pre_reread_hook(name: &str) {
-    let hook = PRE_REREAD_HOOK
-        .lock()
-        .ok()
-        .and_then(|mut g| g.as_mut().and_then(|m| m.remove(name)));
+fn run_standby_hook(point: StandbyHookPoint, name: &str) {
+    let hook = STANDBY_HOOKS.lock().ok().and_then(|mut g| {
+        g.as_mut()
+            .and_then(|m| m.remove(&(point, name.to_string())))
+    });
     if let Some(f) = hook {
         f();
     }
@@ -1062,8 +1109,15 @@ fn run_pre_reread_hook(name: &str) {
 
 /// The daemon's codex leg: one standby pass per codex profile. Self-contained
 /// — reads the codex roster itself, so the claude scheduler's state stays
-/// untouched (per-harness independence, decision 4).
-pub(crate) fn standby_tick(now_ms: i64, now_rfc3339: &str) {
+/// untouched (per-harness independence, decision 4). `activity` and
+/// `shutting_down` are the caller's own, so a TUI quit waits on the same
+/// markers its exit wait reads.
+pub(crate) fn standby_tick(
+    now_ms: i64,
+    now_rfc3339: &str,
+    activity: &crate::usage::ActivityStore,
+    shutting_down: &AtomicBool,
+) {
     let Ok(state) = crate::codex_profiles::CodexState::load() else {
         return;
     };
@@ -1073,6 +1127,8 @@ pub(crate) fn standby_tick(now_ms: i64, now_rfc3339: &str) {
             now_ms,
             now_rfc3339.to_string(),
             &refresh_codex_chain,
+            activity,
+            shutting_down,
         );
     }
 }

@@ -2833,7 +2833,6 @@ fn a_captured_window_exhaustion_429_carries_the_limiters_rejection() {
         Some("rt-old"),
         Some(expires_at),
         None,
-        None,
     );
     let seen: Vec<String> = server
         .join()
@@ -3232,7 +3231,6 @@ fn the_kick_reserves_the_shared_anthropic_request_slot() {
         Some("rt-old"),
         None,
         None,
-        None,
     );
     let seen = server.join().expect("listener");
 
@@ -3276,7 +3274,6 @@ fn a_kick_rotation_carries_its_pair_back_when_the_persist_fails() {
         &crate::profile::ProfileName::from(name),
         "at-old",
         Some("rt-old"),
-        None,
         None,
         None,
     );
@@ -4219,7 +4216,6 @@ fn auto_start_kick_does_not_rotate_under_a_forced_live_session() {
         &crate::profile::ProfileName::from(name),
         "at-old",
         Some("rt-old"),
-        None,
         None,
         None,
     );
@@ -6950,7 +6946,6 @@ fn a_kick_persist_refuses_a_foreign_login_over_a_live_stage() {
         &crate::profile::ProfileName::from(name),
         "at-old",
         Some("rt-old"),
-        None,
         None,
         None,
     );

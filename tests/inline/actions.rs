@@ -1962,7 +1962,11 @@ fn switch_codex_refuses_a_quarantined_chain_until_a_fresh_one_lands() {
             "cx2",
             1_700_000_000_000,
             "2026-08-13T00:00:00Z".into(),
-            &reused
+            &reused,
+            &std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+                std::collections::HashMap::new()
+            )),
+            &std::sync::atomic::AtomicBool::new(false)
         ),
         crate::codex_auth::StandbyOutcome::Failed
     );

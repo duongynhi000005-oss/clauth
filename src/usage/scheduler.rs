@@ -519,7 +519,13 @@ pub(crate) type NextRefreshPerProfile = Arc<RankedMutex<HashMap<LegKey, u64>, ra
 /// work stays per leg so one hybrid leg cannot clear the other's spinner.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ProfileActivityState {
+    /// The TUI's: its rotate and switch gate stamp and clear it.
     account: Option<ProfileActivity>,
+    /// Scheduler token spends running on this account, each counted by its own
+    /// [`SchedulerSpend`]. A count, not a flag, because nothing serializes the
+    /// scheduler's legs per profile; and apart from `account`, so neither owner
+    /// can clear the other's marker while its spend still runs.
+    scheduler_spends: u32,
     oauth: Option<ProfileActivity>,
     third_party: Option<ProfileActivity>,
 }
@@ -541,12 +547,16 @@ impl ProfileActivityState {
 
     fn selected(&self, leg: FetchLeg) -> ProfileActivity {
         self.account
+            .or_else(|| (self.scheduler_spends > 0).then_some(ProfileActivity::Refreshing))
             .or_else(|| self.fetch(leg))
             .unwrap_or(ProfileActivity::Idle)
     }
 
     fn is_idle(&self) -> bool {
-        self.account.is_none() && self.oauth.is_none() && self.third_party.is_none()
+        self.account.is_none()
+            && self.scheduler_spends == 0
+            && self.oauth.is_none()
+            && self.third_party.is_none()
     }
 
     /// Retire the rotation marker, and only that one. `Switching` belongs to the
@@ -627,8 +637,7 @@ pub(crate) type StartupReceiver = Receiver<StartupSignal>;
 ///
 /// Each slot is written by its own owner and by nobody else: a leg mark leaves a
 /// concurrent rotation standing, or `partition_due` re-admits the profile while
-/// the rotation is still spending its single-use pair. The rotation owner hands
-/// its marker over through [`rotation_into_fetch`], the one site that may.
+/// the rotation is still spending its single-use pair.
 pub(crate) fn mark_activity(store: &ActivityStore, name: &ProfileName, activity: ProfileActivity) {
     match activity {
         // No production caller marks `Idle`; the arm keeps the match exhaustive
@@ -657,13 +666,50 @@ pub(crate) fn mark_activity(store: &ActivityStore, name: &ProfileName, activity:
 /// both, never neither. Returns false and raises nothing on a refusal (the flag
 /// set); true once the marker is raised.
 ///
-/// A poisoned store fails open: it can raise no marker, but the spend still
-/// proceeds unmarked (the base behaviour — the spinner is skipped, not the
-/// rotation) unless the flag is set. The poison is logged once per process.
+/// A poisoned store fails open: the spend proceeds unmarked unless the flag is
+/// set, because poison never clears and refusing on it would stop every
+/// rotation for the process's life. The poison is logged once per process.
+///
+/// Writes the TUI-owned account slot, for the TUI's rotate workers, which raise
+/// over the `Refreshing` pre-stamp their UI thread made. The scheduler's spends
+/// claim [`claim_scheduler_spend_unless_shutting_down`] instead.
 pub(crate) fn raise_refreshing_unless_shutting_down(
     store: &ActivityStore,
     name: &ProfileName,
     shutting_down: &AtomicBool,
+) -> bool {
+    admit_unless_shutting_down(store, name, shutting_down, |state| {
+        state.account = Some(ProfileActivity::Refreshing);
+    })
+}
+
+/// Count one scheduler token spend on `name` unless the shutdown flag is set,
+/// under the same one-hold contract and poison policy as
+/// [`raise_refreshing_unless_shutting_down`]. `None` is a refusal: nothing
+/// counted, nothing to spend. The returned claim uncounts itself on drop, an
+/// unwind included, and touches nothing else: the account slot stays the
+/// TUI's, so a TUI clear cannot end this spend's quit wait, and this spend
+/// cannot end a TUI marker.
+#[must_use]
+pub(crate) fn claim_scheduler_spend_unless_shutting_down<'a>(
+    store: &'a ActivityStore,
+    name: &'a ProfileName,
+    shutting_down: &AtomicBool,
+) -> Option<SchedulerSpend<'a>> {
+    admit_unless_shutting_down(store, name, shutting_down, |state| {
+        state.scheduler_spends = state.scheduler_spends.saturating_add(1);
+    })
+    .then_some(SchedulerSpend {
+        activity: store,
+        name,
+    })
+}
+
+fn admit_unless_shutting_down(
+    store: &ActivityStore,
+    name: &ProfileName,
+    shutting_down: &AtomicBool,
+    mark: impl FnOnce(&mut ProfileActivityState),
 ) -> bool {
     let mut states = match store.lock() {
         Ok(states) => states,
@@ -675,8 +721,30 @@ pub(crate) fn raise_refreshing_unless_shutting_down(
     if shutting_down.load(Ordering::SeqCst) {
         return false;
     }
-    states.entry(name.to_string()).or_default().account = Some(ProfileActivity::Refreshing);
+    mark(states.entry(name.to_string()).or_default());
     true
+}
+
+/// One running scheduler token spend on an account, counted while it lives.
+/// On a poisoned store the claim counted nothing and the drop uncounts nothing:
+/// poison never clears.
+#[must_use]
+pub(crate) struct SchedulerSpend<'a> {
+    activity: &'a ActivityStore,
+    name: &'a ProfileName,
+}
+
+impl Drop for SchedulerSpend<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut states) = self.activity.lock()
+            && let Some(state) = states.get_mut(self.name.as_str())
+        {
+            state.scheduler_spends = state.scheduler_spends.saturating_sub(1);
+            if state.is_idle() {
+                states.remove(self.name.as_str());
+            }
+        }
+    }
 }
 
 /// Whether an activity-store poison has already been logged this process.
@@ -685,20 +753,6 @@ static ACTIVITY_STORE_POISON_LOGGED: AtomicBool = AtomicBool::new(false);
 fn log_activity_store_poison_once() {
     if !ACTIVITY_STORE_POISON_LOGGED.swap(true, Ordering::Relaxed) {
         logline!("clauth: activity store poisoned; a refresh proceeds without a quit marker");
-    }
-}
-
-/// Hand the rotation owner's account-wide marker to the OAuth leg under one
-/// hold. Atomic on purpose: between two separate writes `partition_due` reads
-/// the profile as idle and re-admits it while the rotation's own fetch is still
-/// to come. Nothing enforces that the caller raised the `Refreshing` it retires;
-/// called from elsewhere it costs one spurious re-poll, and `RotationGuard`
-/// still blocks the double-spend that would otherwise follow.
-pub(crate) fn rotation_into_fetch(store: &ActivityStore, name: &ProfileName) {
-    if let Ok(mut states) = store.lock() {
-        let state = states.entry(name.to_string()).or_default();
-        state.end_rotation();
-        *state.fetch_mut(FetchLeg::OAuth) = Some(ProfileActivity::Fetching);
     }
 }
 
@@ -784,17 +838,18 @@ pub(crate) fn any_busy(store: &ActivityStore) -> bool {
     }
 }
 
-/// Whether the account slot marks a refresh-token spend. `Refreshing` and
-/// `Switching` bracket the token exchange through the stage write, and their
-/// owners retire them only once the minted pair has been staged.
+/// Whether a refresh-token spend runs on the account: the TUI's `Refreshing` or
+/// `Switching` in the account slot, or a counted scheduler spend. Each brackets
+/// the token exchange through the write that makes the minted pair durable.
 fn is_token_spend(state: &ProfileActivityState) -> bool {
-    matches!(
-        state.account,
-        Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
-    )
+    state.scheduler_spends > 0
+        || matches!(
+            state.account,
+            Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
+        )
 }
 
-/// One lock-and-scan behind the account-slot queries. Poison fails closed.
+/// One lock-and-scan behind the account-marker queries. Poison fails closed.
 fn any_account_marker(
     store: &ActivityStore,
     predicate: impl Fn(&ProfileActivityState) -> bool,
@@ -812,12 +867,14 @@ pub(crate) fn switch_gate_in_flight(store: &ActivityStore) -> bool {
     })
 }
 
-/// True while one of the two claude spends a quit waits on runs: an account's
-/// `Refreshing` marker (the scheduler's rotation leg) or its `Switching` marker
-/// (the switch gate, which can refresh too). Dying inside that window loses the
-/// minted pair, and the spent token quarantines on its resend. Poison fails
-/// closed: a poisoned store cannot prove no spend runs, and exiting mid-spend
-/// is worse than `shutdown`'s 2 s wait.
+/// True while a token spend a quit waits on runs: a scheduler spend (the poll
+/// leg's rotation, the auto-start kick, the CLA-ROLL re-stamp gate or the codex
+/// standby refresh), the TUI's rotate (`Refreshing`) or its switch gate
+/// (`Switching`, which can refresh too). Dying inside that window loses the
+/// minted pair: a claude token quarantines on its resend, and a codex chain is
+/// dead until a browser re-login. Poison fails closed: a poisoned store cannot
+/// prove no spend runs, and exiting mid-spend is worse than `shutdown`'s 2 s
+/// wait.
 pub(crate) fn token_spend_in_flight(store: &ActivityStore) -> bool {
     any_account_marker(store, is_token_spend)
 }
@@ -1158,6 +1215,35 @@ fn classify_pre_rotation(
     }
 }
 
+/// Test seam inside the poll leg's claimed rotation window: a hook, keyed by
+/// profile name and run once, between the spend claim and the token exchange,
+/// so a test can make the worker die while it holds the claim.
+#[cfg(test)]
+pub(super) type ClaimedRotationHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static CLAIMED_ROTATION_HOOK: std::sync::Mutex<Option<HashMap<String, ClaimedRotationHook>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn set_claimed_rotation_hook(name: &str, f: ClaimedRotationHook) {
+    if let Ok(mut g) = CLAIMED_ROTATION_HOOK.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .insert(name.to_string(), f);
+    }
+}
+
+#[cfg(test)]
+fn run_claimed_rotation_hook(name: &ProfileName) {
+    let hook = CLAIMED_ROTATION_HOOK
+        .lock()
+        .ok()
+        .and_then(|mut g| g.as_mut().and_then(|m| m.remove(name.as_str())));
+    if let Some(f) = hook {
+        f();
+    }
+}
+
 /// Fetch + rotate + retry for one profile. On 401 — or a 429 on a clock-expired
 /// token (the AUTH-1 dead-login unmasking, see [`token_clock_expired`]) — refresh
 /// the OAuth pair, persist, retry once. A 429 on a still-valid token bails to disk
@@ -1173,6 +1259,10 @@ fn classify_pre_rotation(
 /// `preemptive_rotation` toggle on (the default), a profile rotates ahead of
 /// expiry (see [`rotate_lead_ms`]) so the running `claude` reads a pair clauth
 /// already refreshed rather than refreshing it itself.
+///
+/// The rotation runs under a [`SchedulerSpend`] claim held through the land of
+/// the minted pair; a set `shutting_down` refuses it and bails unrotated,
+/// nothing sent.
 fn fetch_with_rotation(
     config: &crate::profile::ConfigHandle,
     entry: &TokenEntry,
@@ -1393,12 +1483,15 @@ fn fetch_with_rotation(
         }
     };
     let rt = rt.as_str();
-    if !raise_refreshing_unless_shutting_down(activity, name, shutting_down) {
+    let Some(claim) = claim_scheduler_spend_unless_shutting_down(activity, name, shutting_down)
+    else {
         // The shutdown flag is set: a spend that started now could die between
         // the token endpoint's answer and its stage write, so bail unrotated —
         // no token sent, no marker raised, no streak or quarantine.
         return bail_unrotated(&mut profile_fetch);
-    }
+    };
+    #[cfg(test)]
+    run_claimed_rotation_hook(name);
     // `refresh_result` (not `refresh`) so the RefreshError variant survives — the
     // poll needs to tell a dead token (quarantine) from a transient blip (retry).
     let rotation = crate::oauth::settle_refresh_answer(
@@ -1408,12 +1501,14 @@ fn fetch_with_rotation(
         crate::oauth::refresh_result(rt, crate::oauth::stored_scopes(config, name).as_deref()),
         &rotation_guard,
     );
-    // This site raised `Refreshing`, so it is the one that may retire it. One
-    // hold, so partition never reads the profile idle between the two writes.
-    rotation_into_fetch(activity, name);
+    // The token answer hands the profile to the OAuth leg on every exit, where
+    // the retry or bail fetch follows; the claim stays to the land.
+    mark_activity(activity, name, ProfileActivity::Fetching);
     let minted = match rotation {
         Ok(t) => t,
         Err(e) => {
+            // Nothing was minted, so nothing is left to land.
+            drop(claim);
             // A failed refresh on the ACTIVE profile usually means the live
             // claude rotated first and revoked our copy — one more adopt
             // attempt (its mirror may have JUST surfaced the fresh pair)
@@ -1487,6 +1582,8 @@ fn fetch_with_rotation(
             return bail_to_cache(rotated, &profile_fetch);
         }
     }
+    // The pair is durable now.
+    drop(claim);
     // A successful refresh + persist clears any prior auth-broken quarantine
     // (mirrors `ensure_installable`); a no-op when the flag was already clear.
     crate::oauth::mark_auth_broken(config, name, false);
@@ -2499,8 +2596,7 @@ fn run_fetch_flagged(
                 &entry.access_token,
                 entry.refresh_token.as_deref(),
                 entry.access_expires_at,
-                Some(activity),
-                Some(shutting_down),
+                Some((activity, shutting_down)),
             );
             // The kick leg's writes obey the landing's two-part gate: the durable
             // block (`kick_block.json`, section 1) and the queue-open history
@@ -3865,14 +3961,13 @@ fn fetch_oauth_due_with_flagged<F>(
 
         drain_oauth_completions(state, &rx, expected, interval_ms, timed_out);
 
-        // Reap the workers. A panicked worker sent nothing, so BOTH slots it
-        // owned may still be set: the leg it was queued on, and the account
-        // marker `poll_one`'s rotation raised before it died. This is the only
-        // site left to free either, and a stranded `Refreshing` excludes the
-        // profile from `partition_due` on every later tick.
+        // Reap the workers. A panicked worker sent nothing, so the leg it was
+        // queued on may still be set, and this is the only site left to free
+        // it. Neither account marker is the reap's: a rotation's spend claim
+        // uncounts itself on unwind (`SchedulerSpend`), and the account slot
+        // is the TUI's.
         for (name, h) in handles {
             if h.join().is_err() {
-                clear_activity(&state.activity, &name);
                 clear_fetch_activity(&state.activity, &FetchLeg::OAuth.key(name.clone()));
                 // No outcome exists to apply, so nothing this tick can say the
                 // fetch is healthy: record Failed, or the store keeps the
@@ -4846,9 +4941,16 @@ pub(crate) fn tick(state: &SchedulerState) {
     // times over. What remains
     // is one token round trip on a cold re-stamp, which delays a single tick.
     // Anyone adding per-tick work to this leg inherits the fan-out question.
-    claude_rolling_tick(&state.config, &state.claude_rolling, now_ms(), &|name| {
-        crate::oauth::restamp_rolling_token(&state.config, name, crate::oauth::refresh_result)
-    });
+    claude_rolling_tick(
+        &state.config,
+        &state.claude_rolling,
+        now_ms(),
+        &state.activity,
+        &state.shutting_down,
+        &|name| {
+            crate::oauth::restamp_rolling_token(&state.config, name, crate::oauth::refresh_result)
+        },
+    );
 
     // The codex standby leg, on THIS thread rather than the daemon's
     // watchdog-bounded reconcile loop: its refreshes are blocking token round
@@ -4861,7 +4963,12 @@ pub(crate) fn tick(state: &SchedulerState) {
     // the wire only when a chain is actually due or kicked, so the steady
     // state is zero HTTP; the NoWait guard inside keeps a `clauth start`
     // holding rotation.lock from parking this thread.
-    crate::codex_auth::standby_tick(now_ms() as i64, &chrono::Utc::now().to_rfc3339());
+    crate::codex_auth::standby_tick(
+        now_ms() as i64,
+        &chrono::Utc::now().to_rfc3339(),
+        &state.activity,
+        &state.shutting_down,
+    );
 
     // The codex usage leg. Deliberately AFTER the standby refresh above: a
     // chain that just re-stamped its access token polls with the fresh one
@@ -5013,12 +5120,7 @@ pub(crate) fn tick(state: &SchedulerState) {
         let excluded: HashSet<String> = match state.activity.lock() {
             Ok(a) => a
                 .iter()
-                .filter(|(_, state)| {
-                    matches!(
-                        state.account,
-                        Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
-                    )
-                })
+                .filter(|(_, state)| is_token_spend(state))
                 .map(|(n, _)| n.clone())
                 .collect(),
             Err(_) => oauth_snapshot.iter().map(|e| e.name.to_string()).collect(),
@@ -7167,12 +7269,7 @@ fn partition_due<T: NamedEntry + Clone>(
             .saturating_add(IntervalMs::from_millis(partition_extra));
         per_profile.insert(entry.key(), next.as_millis());
         let excluded = match act.as_ref() {
-            Ok(activity) => activity.get(entry.name()).is_some_and(|state| {
-                matches!(
-                    state.account,
-                    Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
-                )
-            }),
+            Ok(activity) => activity.get(entry.name()).is_some_and(is_token_spend),
             Err(_) => true, // Poisoned: fail safe to excluded.
         };
         if excluded {
@@ -7185,9 +7282,9 @@ fn partition_due<T: NamedEntry + Clone>(
     (due, per_profile)
 }
 
-/// Merge forced (cadence-bypassing) entries into `due`. Skips profiles that are
-/// `Refreshing`/`Switching` — `rotate_one_inner` or the switch gate owns the
-/// activity slot — and entries already due.
+/// Merge forced (cadence-bypassing) entries into `due`. Skips profiles a token
+/// spend runs on (the same set [`partition_due`] drops) and entries already
+/// due.
 fn merge_forced<T: NamedEntry + Clone>(
     snapshot: &[T],
     forced: &HashSet<String>,
@@ -7199,15 +7296,10 @@ fn merge_forced<T: NamedEntry + Clone>(
     if forced.is_empty() {
         return;
     }
-    let switching: HashSet<String> = match activity.lock() {
+    let spending: HashSet<String> = match activity.lock() {
         Ok(activity) => activity
             .iter()
-            .filter(|(_, state)| {
-                matches!(
-                    state.account,
-                    Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
-                )
-            })
+            .filter(|(_, state)| is_token_spend(state))
             .map(|(n, _)| n.clone())
             .collect(),
         Err(_) => snapshot.iter().map(|e| e.name().to_string()).collect(),
@@ -7215,7 +7307,7 @@ fn merge_forced<T: NamedEntry + Clone>(
     let mut extras: Vec<T> = Vec::with_capacity(forced.len());
     for entry in snapshot.iter().filter(|e| {
         forced.contains(e.name())
-            && !switching.contains(e.name())
+            && !spending.contains(e.name())
             && !due.iter().any(|d| d.name() == e.name())
     }) {
         per_profile_next.insert(entry.key(), now);
@@ -7322,7 +7414,7 @@ fn should_anchor_fetch(
 /// Force a single post-reset poll for every OAuth profile whose 5h window reset
 /// has passed since its last fetch (see [`should_anchor_fetch`]), so the overview
 /// leaves the stale pre-reset reading instead of holding it until the natural
-/// cadence slot. Skips `Refreshing`/`Switching` (`excluded`, the same set
+/// cadence slot. Skips a running token spend (`excluded`, the same set
 /// [`partition_due`] drops) and any name already `due`. A scheduled name's
 /// countdown is stamped to `now_ms` (fetching now), mirroring [`merge_forced`].
 /// Decomposed args (no [`SchedulerState`]) so the due decision tests directly.
@@ -7455,6 +7547,13 @@ pub(super) struct ClaudeRollingPacing {
 /// `gate_fn` is injected (production: [`crate::oauth::restamp_rolling_token`])
 /// so the orchestration — candidates → due → pace/widen — is testable
 /// offline; only the injected closure ever touches locks or the network.
+///
+/// A gate can spend the profile's refresh token, so each due gate runs under a
+/// [`SchedulerSpend`] claim in `activity`, the store a TUI quit waits on,
+/// released on return or unwind. Once `shutting_down` is set the claim
+/// refuses and the profile is skipped this scan, pacing untouched: a spend
+/// started after the quit decided could die between the token answer and its
+/// stage write.
 pub(super) fn claude_rolling_tick(
     config: &crate::profile::ConfigHandle,
     pacing: &crate::lockorder::RankedMutex<
@@ -7462,6 +7561,8 @@ pub(super) fn claude_rolling_tick(
         crate::lockorder::rank::RollingPacing,
     >,
     now: u64,
+    activity: &ActivityStore,
+    shutting_down: &AtomicBool,
     gate_fn: &dyn Fn(&ProfileName) -> crate::oauth::AuthGate,
 ) {
     {
@@ -7541,7 +7642,13 @@ pub(super) fn claude_rolling_tick(
         if !crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
             continue;
         }
+        let Some(claim) =
+            claim_scheduler_spend_unless_shutting_down(activity, &name, shutting_down)
+        else {
+            continue;
+        };
         let gate = gate_fn(&name);
+        drop(claim);
         // A standing `auth_broken` changes only via re-login, which re-arms
         // the rolling token anyway — so a quarantined chain takes the Broken
         // leash on EVERY verdict, not just a literal `Broken`. Without this, a

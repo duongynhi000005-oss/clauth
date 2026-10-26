@@ -702,26 +702,6 @@ fn an_oauth_fetch_mark_never_retires_a_concurrent_rotation() {
     );
 }
 
-/// The rotation owner's handoff is one write: the account marker retires and the
-/// OAuth leg opens under a single hold, so `partition_due` never observes the
-/// profile idle between the two.
-#[test]
-fn the_rotation_owner_hands_its_marker_to_the_oauth_leg() {
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
-    let name = crate::profile::ProfileName::from("a");
-
-    mark_activity(&activity, &name, ProfileActivity::Refreshing);
-    super::rotation_into_fetch(&activity, &name);
-
-    let states = activity.lock().unwrap();
-    let state = states.get("a").expect("activity state");
-    assert_eq!(state.account, None, "the rotation marker retires");
-    assert_eq!(
-        state.fetch(FetchLeg::OAuth),
-        Some(ProfileActivity::Fetching)
-    );
-}
-
 /// `end_rotation` retires the rotation marker alone. A rotation result drains on
 /// the UI thread a tick or more after its worker returned, by which time an
 /// unrelated refetch may already own the OAuth leg.
@@ -1430,37 +1410,100 @@ fn selected_next_refresh_picks_the_provider_leg_for_a_hybrid() {
     );
 }
 
-/// A panicking OAuth worker owns BOTH slots at the moment it dies: the leg it
-/// was queued on, and the account marker its own rotation raised inside
-/// `poll_one`. The join loop is the only site left to free either, so it frees
-/// both. Freeing the leg alone strands `Refreshing`, and `partition_due`
-/// excludes the profile from every later tick.
+/// A poll worker that dies inside its rotation's claimed window owns two
+/// things: the leg it was queued on and its scheduler spend claim. The claim's
+/// guard drops its count on unwind, and the join loop frees the leg, so neither
+/// is stranded: a stranded claim would exclude the profile from
+/// `partition_due` on every later tick and hold every quit.
 #[test]
 fn a_panicking_oauth_worker_strands_neither_slot() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "boom-claimed";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut state = completion_order_state();
+    state.config = crate::testutil::rotation_fixture_config(&profile);
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: profile.clone(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let marker_at_death = Arc::new(std::sync::Mutex::new(None));
+    {
+        let activity = Arc::clone(&state.activity);
+        let marker_at_death = Arc::clone(&marker_at_death);
+        super::set_claimed_rotation_hook(
+            name,
+            Arc::new(move || {
+                *marker_at_death.lock().expect("record") =
+                    Some(super::token_spend_in_flight(&activity));
+                panic!("the worker dies holding its claim")
+            }),
+        );
+    }
+
+    super::fetch_oauth_due(&state, vec![entry], REFRESH_INTERVAL_MS, None);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(
+        *marker_at_death.lock().expect("record"),
+        Some(true),
+        "the worker died inside its claimed rotation window"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the worker died before the token exchange: {seen:?}"
+    );
+    assert!(
+        super::is_idle(&state.activity, &profile),
+        "the claim's guard drops its count and the join loop frees the leg"
+    );
+}
+
+/// The reap frees only what the dead worker owned: an account marker the TUI
+/// stamped (its rotate) while the worker ran is the TUI's, and survives the
+/// worker's panic.
+#[test]
+fn a_panicking_oauth_worker_leaves_a_foreign_account_marker() {
     let _home = crate::testutil::HomeSandbox::new();
-    crate::testutil::register_names(&["boom"]);
+    crate::testutil::register_names(&["boom-foreign"]);
     let state = completion_order_state();
     let activity = Arc::clone(&state.activity);
-    let name = crate::profile::ProfileName::from("boom");
 
     super::fetch_oauth_due_with(
         &state,
-        vec![token("boom")],
+        vec![token("boom-foreign")],
         REFRESH_INTERVAL_MS,
         move |_| {
-            // What `poll_one` does before it reaches its rotation handoff.
+            // The TUI's rotate stamps the account while this worker runs, then
+            // the worker dies before it claimed anything.
             mark_activity(
                 &activity,
-                &crate::profile::ProfileName::from("boom"),
+                &crate::profile::ProfileName::from("boom-foreign"),
                 ProfileActivity::Refreshing,
             );
-            panic!("simulated worker panic mid-rotation")
+            panic!("simulated worker panic before any claim")
         },
     );
 
-    assert!(
-        super::is_idle(&state.activity, &name),
-        "the join loop frees the dead worker's account marker as well as its leg"
+    assert_eq!(
+        account_marker(&state.activity, "boom-foreign"),
+        Some(ProfileActivity::Refreshing),
+        "the TUI rotate's marker is not the dead worker's to clear"
     );
 }
 
@@ -13547,7 +13590,6 @@ fn auto_start_kick_rotates_under_a_live_session() {
         Some("rt-old"),
         None,
         None,
-        None,
     );
     let seen = server.join().expect("listener");
 
@@ -13676,7 +13718,6 @@ fn auto_start_kick_does_not_rotate_under_a_live_session_on_macos() {
         &crate::profile::ProfileName::from(name),
         "at-old",
         Some("rt-old"),
-        None,
         None,
         None,
     );
@@ -13814,6 +13855,135 @@ fn a_shutting_down_refresh_refuses_without_sending_or_marking() {
     );
 }
 
+/// The poll leg's claim is its own: a marker the TUI holds on the account (a
+/// switch gate, its rotate) is neither overwritten nor cleared by the rotation,
+/// and the rotation's own claim is gone once it returns.
+#[test]
+fn a_poll_rotation_runs_beside_a_tui_marker_and_leaves_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-slot-held";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    super::mark_activity(
+        &activity,
+        &crate::profile::ProfileName::from(name),
+        super::ProfileActivity::Switching,
+    );
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let outcome =
+        super::fetch_with_rotation(&config, &entry, None, &refetch, &activity, &shutting_down);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the poll leg rotates beside the TUI's marker: {seen:?}"
+    );
+    assert!(outcome.rotated.is_some(), "the rotation landed");
+    assert_eq!(
+        account_marker(&activity, name),
+        Some(super::ProfileActivity::Switching),
+        "the switch gate's marker survives the poll"
+    );
+    super::clear_activity(&activity, &crate::profile::ProfileName::from(name));
+    assert!(
+        !super::token_spend_in_flight(&activity),
+        "the poll leg's own claim is gone once it returned"
+    );
+}
+
+/// A TUI-side clear of the account slot while the poll leg spends (the TUI's
+/// rotate retiring its own marker) leaves the poll leg's claim standing: the
+/// quit still waits for the spend that runs.
+#[test]
+fn a_tui_clear_during_a_poll_rotation_leaves_its_claim() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-tui-clear";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&profile);
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: profile.clone(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let in_flight_after_clear = Arc::new(std::sync::Mutex::new(None));
+    {
+        let activity = Arc::clone(&activity);
+        let in_flight_after_clear = Arc::clone(&in_flight_after_clear);
+        super::set_claimed_rotation_hook(
+            name,
+            Arc::new(move || {
+                super::clear_activity(&activity, &crate::profile::ProfileName::from(name));
+                *in_flight_after_clear.lock().expect("record") =
+                    Some(super::token_spend_in_flight(&activity));
+            }),
+        );
+    }
+
+    let outcome =
+        super::fetch_with_rotation(&config, &entry, None, &refetch, &activity, &shutting_down);
+    server.join().expect("listener");
+
+    assert_eq!(
+        *in_flight_after_clear.lock().expect("record"),
+        Some(true),
+        "the poll leg's claim survives a TUI clear of the account slot"
+    );
+    assert!(outcome.rotated.is_some(), "the rotation landed");
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
 /// The kick's spend site refuses the same way: a 401 kick walks to the marker
 /// site, the flag gate refuses, and the token endpoint is never reached.
 #[test]
@@ -13844,8 +14014,7 @@ fn a_shutting_down_kick_refuses_without_sending_or_marking() {
         "at-old",
         Some("rt-old"),
         None,
-        Some(&activity),
-        Some(&shutting_down),
+        Some((&activity, &shutting_down)),
     );
     let seen = server.join().expect("listener");
 
@@ -13857,6 +14026,63 @@ fn a_shutting_down_kick_refuses_without_sending_or_marking() {
     assert!(
         activity.lock().unwrap().get(name).is_none(),
         "the refusal must leave no marker"
+    );
+}
+
+/// The kick's claim is its own: a marker the TUI holds on the account is
+/// neither overwritten nor cleared by the kick's rotation, and the kick's own
+/// claim is gone once it returns.
+#[test]
+fn a_kick_runs_beside_a_tui_marker_and_leaves_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "kick-slot-held";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    super::mark_activity(
+        &activity,
+        &crate::profile::ProfileName::from(name),
+        super::ProfileActivity::Switching,
+    );
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some((&activity, &shutting_down)),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the kick rotates beside the TUI's marker: {seen:?}"
+    );
+    assert!(result.rotated.is_some(), "the kick's rotation landed");
+    assert_eq!(
+        account_marker(&activity, name),
+        Some(super::ProfileActivity::Switching),
+        "the switch gate's marker survives the kick"
+    );
+    super::clear_activity(&activity, &crate::profile::ProfileName::from(name));
+    assert!(
+        !super::token_spend_in_flight(&activity),
+        "the kick's own claim is gone once it returned"
     );
 }
 
@@ -15307,17 +15533,29 @@ fn claude_rolling_tick_restamps_a_dying_rolling_sidecar() {
     let now = crate::usage::now_ms();
 
     let calls = std::sync::atomic::AtomicUsize::new(0);
-    super::claude_rolling_tick(&config, &pacing, now, &|name| {
-        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(name, "cl-feed");
-        crate::oauth::AuthGate::Ready
-    });
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|name| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(name, "cl-feed");
+            crate::oauth::AuthGate::Ready
+        },
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Inside the scan gap: no re-run even though the sidecar is still dying.
-    super::claude_rolling_tick(&config, &pacing, now + 1_000, &|_| {
-        panic!("inside the scan gap — must not re-run")
-    });
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + 1_000,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| panic!("inside the scan gap — must not re-run"),
+    );
 }
 
 /// Fresh sidecars and non-rolling profiles are never the timer's business.
@@ -15328,9 +15566,390 @@ fn claude_rolling_tick_ignores_fresh_and_non_rolling_profiles() {
     write_rolling_sidecar("cl-fresh", 6 * 60 * 60 * 1000); // clear of the horizon
     write_rolling_sidecar("cl-plain", 60 * 60 * 1000); // dying, but the rolling token is OFF
     let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
-    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
-        panic!("'{name}' must not be re-stamped")
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|name| panic!("'{name}' must not be re-stamped"),
+    );
+}
+
+/// A rolling profile whose sidecar is due for a re-stamp and whose stored chain
+/// is comfortable, so `tick`'s own gate re-stamps the sidecar from the chain
+/// with no token spend: the sidecar's access token says whether the leg ran.
+fn rolling_tick_state(name: &str) -> super::SchedulerState {
+    let profile_name = crate::profile::ProfileName::from(name);
+    let mut profile = crate::testutil::blank_profile(&profile_name);
+    profile.rolling_token = true;
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("{name}-chain"),
+            refresh_token: Some(format!("{name}-rt")),
+            expires_at: Some(crate::usage::now_ms() as i64 + 24 * 60 * 60 * 1000),
+            scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
     });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut app = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    app.state.profiles.push(profile_name);
+    crate::profile::save_app_state(&app.state).expect("save app state");
+    write_rolling_sidecar(name, 60 * 60 * 1000); // +1h, inside the 2h horizon
+    let mut state = third_party_state(stub_ok_stats);
+    state.config = Arc::new(RankedMutex::new(app));
+    state
+}
+
+/// The access token the profile's rolling sidecar holds.
+fn sidecar_access_token(name: &str) -> Option<String> {
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    let bytes = std::fs::read(dir.join("session-token.json")).ok()?;
+    let creds: crate::profile::ClaudeCredentials = serde_json::from_slice(&bytes).ok()?;
+    creds.claude_ai_oauth.map(|oauth| oauth.access_token)
+}
+
+/// Control for the two refusals below: the fixture reaches `tick`'s re-stamp
+/// leg, which re-stamps the dying sidecar from the stored chain.
+#[test]
+fn tick_restamps_a_due_rolling_sidecar_from_its_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    // Any token spend stays on a refused local port.
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, "http://127.0.0.1:9");
+    let state = rolling_tick_state("cl-tick-feed");
+
+    super::tick(&state);
+
+    assert_eq!(
+        sidecar_access_token("cl-tick-feed").as_deref(),
+        Some("cl-tick-feed-chain")
+    );
+}
+
+/// `tick` hands the re-stamp its OWN activity store: the re-stamp runs beside a
+/// marker the TUI holds there and leaves that marker standing.
+#[test]
+fn tick_restamps_beside_a_tui_marker_and_leaves_it() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, "http://127.0.0.1:9");
+    let state = rolling_tick_state("cl-tick-busy");
+    super::mark_activity(
+        &state.activity,
+        &crate::profile::ProfileName::from("cl-tick-busy"),
+        super::ProfileActivity::Switching,
+    );
+
+    super::tick(&state);
+
+    assert_eq!(
+        sidecar_access_token("cl-tick-busy").as_deref(),
+        Some("cl-tick-busy-chain"),
+        "the re-stamp runs beside the TUI's marker"
+    );
+    assert_eq!(
+        account_marker(&state.activity, "cl-tick-busy"),
+        Some(super::ProfileActivity::Switching)
+    );
+    super::clear_activity(
+        &state.activity,
+        &crate::profile::ProfileName::from("cl-tick-busy"),
+    );
+    assert!(!super::token_spend_in_flight(&state.activity));
+}
+
+/// `tick` hands the re-stamp its OWN shutdown flag: once a quit set it, the
+/// due sidecar is left alone.
+#[test]
+fn a_shutting_down_tick_leaves_a_due_rolling_sidecar() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, "http://127.0.0.1:9");
+    let state = rolling_tick_state("cl-tick-quit");
+    state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    super::tick(&state);
+
+    assert_eq!(
+        sidecar_access_token("cl-tick-quit").as_deref(),
+        Some("cl-tick-quit-rolled"),
+        "no re-stamp may start once shutdown began"
+    );
+}
+
+/// A codex profile whose chain is due inside the standby lead.
+fn write_due_codex_chain(name: &str) {
+    crate::testutil::write_codex_roster(&[name]);
+    crate::testutil::write_codex_store(
+        name,
+        &crate::testutil::codex_auth_body(
+            &crate::testutil::jwt_with_exp(crate::usage::now_ms() as i64 / 1000 + 60),
+            "rt.old",
+        ),
+    );
+}
+
+/// Whether the codex standby leg wrote its pre-wire attempt memo for `name`.
+fn codex_attempt_memo_exists(name: &str) -> bool {
+    crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("dir")
+        .join("auth.attempt")
+        .exists()
+}
+
+/// `tick` hands the codex standby leg its OWN activity store: the refresh POST
+/// goes out under the account's marker in the store a TUI quit reads.
+#[test]
+fn tick_refreshes_a_due_codex_chain_under_its_own_spend_marker() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_ok_stats);
+    let marked_at_post = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (addr, handle) = {
+        let activity = Arc::clone(&state.activity);
+        let marked_at_post = Arc::clone(&marked_at_post);
+        crate::testutil::serve_endpoints(1, move |_path, _i| {
+            marked_at_post
+                .lock()
+                .expect("record")
+                .push(super::spending_account(&activity));
+            (
+                200,
+                r#"{"id_token":"id.n","access_token":"at.n","refresh_token":"rt.new"}"#.to_string(),
+            )
+        })
+    };
+    let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
+    // The codex usage leg runs in the same tick: keep it on a refused port.
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    write_due_codex_chain("cx-tick-own");
+
+    super::tick(&state);
+    crate::usage::clear_codex_usage_url_override();
+
+    assert_eq!(handle.join().expect("join stub"), ["/oauth/token"]);
+    assert_eq!(
+        *marked_at_post.lock().expect("record"),
+        vec![Some("cx-tick-own".to_string())],
+        "the POST went out under the marker in tick's own store"
+    );
+    assert_eq!(super::spending_account(&state.activity), None);
+}
+
+/// `tick` hands the codex standby leg its OWN shutdown flag: once a quit set
+/// it, the due chain is left alone, with no attempt memo written.
+#[test]
+fn a_shutting_down_tick_leaves_a_due_codex_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    // Any refresh stays on a refused local port.
+    let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, "http://127.0.0.1:9");
+    let state = third_party_state(stub_ok_stats);
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    write_due_codex_chain("cx-tick-quit");
+    state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    super::tick(&state);
+    crate::usage::clear_codex_usage_url_override();
+
+    assert!(
+        !codex_attempt_memo_exists("cx-tick-quit"),
+        "no refresh attempt may start once shutdown began"
+    );
+    assert!(crate::testutil::read_codex_store("cx-tick-quit").contains("rt.old"));
+}
+
+/// The account marker a test reads for one profile, `None` when the store
+/// holds no entry (or no account op) for it.
+fn account_marker(activity: &super::ActivityStore, name: &str) -> Option<super::ProfileActivity> {
+    activity
+        .lock()
+        .expect("activity store")
+        .get(name)
+        .and_then(|state| state.account)
+}
+
+/// A re-stamp can spend the profile's refresh token, so its gate runs under a
+/// scheduler spend claim: a TUI quit waits for it (`token_spend_in_flight`),
+/// the save cue names its account, and the claim is gone once the gate returns.
+#[test]
+fn a_rolling_restamp_holds_the_spend_marker_while_its_gate_runs() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-marked"], &[]);
+    write_rolling_sidecar("cl-marked", 60 * 60 * 1000); // +1h, inside the 2h horizon
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let during = std::sync::Mutex::new(Vec::new());
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &activity,
+        &shutting_down,
+        &|name| {
+            during.lock().expect("record").push((
+                name.to_string(),
+                super::spending_account(&activity),
+                super::token_spend_in_flight(&activity),
+            ));
+            crate::oauth::AuthGate::Refreshed
+        },
+    );
+
+    assert_eq!(
+        *during.lock().expect("record"),
+        vec![("cl-marked".to_string(), Some("cl-marked".to_string()), true)],
+        "the gate runs once, under the profile's own spend claim"
+    );
+    assert!(
+        !super::token_spend_in_flight(&activity),
+        "the claim clears once the gate returns"
+    );
+}
+
+/// A gate that panics still drops its claim: a stranded claim would hold every
+/// later quit for the whole of `shutdown`'s backstop.
+#[test]
+fn a_panicking_rolling_restamp_clears_its_spend_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-panics"], &[]);
+    write_rolling_sidecar("cl-panics", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let ran = std::sync::atomic::AtomicBool::new(false);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::claude_rolling_tick(
+            &config,
+            &pacing,
+            crate::usage::now_ms(),
+            &activity,
+            &shutting_down,
+            &|_| {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                panic!("the gate dies mid-spend")
+            },
+        );
+    }));
+
+    assert!(unwound.is_err(), "the gate's panic propagates");
+    assert!(
+        ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the gate ran"
+    );
+    assert!(
+        !super::token_spend_in_flight(&activity),
+        "an unwinding gate leaves no spend claim behind"
+    );
+}
+
+/// The re-stamp's claim is its own: it runs beside a marker the TUI holds on
+/// the account (an answered switch gate whose drain waits on a modal) and leaves
+/// that marker standing.
+#[test]
+fn a_rolling_restamp_runs_beside_a_tui_marker_and_leaves_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-busy"], &[]);
+    write_rolling_sidecar("cl-busy", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let name = crate::profile::ProfileName::from("cl-busy");
+    super::mark_activity(&activity, &name, super::ProfileActivity::Switching);
+    let ran = std::sync::atomic::AtomicBool::new(false);
+
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &activity,
+        &shutting_down,
+        &|_| {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::oauth::AuthGate::Ready
+        },
+    );
+
+    assert!(
+        ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the gate ran"
+    );
+    assert_eq!(
+        account_marker(&activity, "cl-busy"),
+        Some(super::ProfileActivity::Switching),
+        "the switch gate's marker survives the scan"
+    );
+    super::clear_activity(&activity, &name);
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
+/// A TUI-side clear of the account slot while the re-stamp spends leaves the
+/// re-stamp's claim standing: the quit still waits for it.
+#[test]
+fn a_tui_clear_during_a_rolling_restamp_leaves_its_claim() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-cleared"], &[]);
+    write_rolling_sidecar("cl-cleared", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let after_clear = std::sync::Mutex::new(None);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &activity,
+        &shutting_down,
+        &|name| {
+            super::clear_activity(&activity, name);
+            *after_clear.lock().expect("record") = Some(super::token_spend_in_flight(&activity));
+            crate::oauth::AuthGate::Refreshed
+        },
+    );
+
+    assert_eq!(
+        *after_clear.lock().expect("record"),
+        Some(true),
+        "the re-stamp's claim survives a TUI clear of the account slot"
+    );
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
+/// Once shutdown began, a due re-stamp never starts: no gate call, so no token
+/// is spent after the quit decided, and no marker is raised to hold the quit.
+#[test]
+fn a_shutting_down_rolling_tick_runs_no_gate_and_raises_no_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-quitting"], &[]);
+    write_rolling_sidecar("cl-quitting", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let shutting_down = std::sync::atomic::AtomicBool::new(true);
+
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &activity,
+        &shutting_down,
+        &|name| panic!("'{name}' must not be re-stamped once shutdown began"),
+    );
+
+    assert_eq!(account_marker(&activity, "cl-quitting"), None);
+    assert!(!super::token_spend_in_flight(&activity));
+    assert!(
+        pacing.lock().expect("pacing").retry_after_ms.is_empty(),
+        "a refused profile takes no retry hold"
+    );
 }
 
 /// A Ready that leaves the sidecar STILL due (the degrade leg serving a live
@@ -15350,12 +15969,26 @@ fn claude_rolling_tick_ready_but_still_due_paces_like_transient() {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::oauth::AuthGate::Ready
     };
-    super::claude_rolling_tick(&config, &pacing, now, &degrading);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &degrading,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Re-open the scan gate: the still-due Ready must have widened.
     pacing.lock().unwrap().next_scan_ms = 0;
-    super::claude_rolling_tick(&config, &pacing, now + 60_000, &degrading);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + 60_000,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &degrading,
+    );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -15368,6 +16001,8 @@ fn claude_rolling_tick_ready_but_still_due_paces_like_transient() {
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &degrading,
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -15390,12 +16025,26 @@ fn claude_rolling_tick_transient_failure_widens_the_retry() {
             crate::format::Retry::Connection,
         ))
     };
-    super::claude_rolling_tick(&config, &pacing, now, &flaky);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &flaky,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Re-open the scan gate; the per-profile widening must still hold.
     pacing.lock().unwrap().next_scan_ms = 0;
-    super::claude_rolling_tick(&config, &pacing, now + 60_000, &flaky);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + 60_000,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &flaky,
+    );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -15404,7 +16053,14 @@ fn claude_rolling_tick_transient_failure_widens_the_retry() {
 
     // Past the widening → retried.
     pacing.lock().unwrap().next_scan_ms = 0;
-    super::claude_rolling_tick(&config, &pacing, now + super::ROLLING_RETRY_MS + 1, &flaky);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &flaky,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
@@ -15421,12 +16077,19 @@ fn claude_rolling_tick_logs_a_login_change_as_deferred() {
     let lines = crate::logline::LogLines::new();
     let capture = lines.capture_here();
 
-    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|_| {
-        crate::oauth::AuthGate::Transient(crate::format::Transient::new(
-            crate::format::Cause::LoginChanged("cl-moved".to_string()),
-            crate::format::Retry::Stated,
-        ))
-    });
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| {
+            crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+                crate::format::Cause::LoginChanged("cl-moved".to_string()),
+                crate::format::Retry::Stated,
+            ))
+        },
+    );
 
     drop(capture);
     assert_eq!(
@@ -15456,9 +16119,14 @@ fn claude_rolling_tick_skips_a_disabled_profile() {
     }
     write_rolling_sidecar("cl-off", 60 * 60 * 1000); // dying, inside the horizon
     let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
-    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
-        panic!("'{name}' is disabled and must never reach the re-stamp leg")
-    });
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|name| panic!("'{name}' is disabled and must never reach the re-stamp leg"),
+    );
 }
 
 /// A standing `auth_broken` takes the Broken leash on EVERY verdict. Without
@@ -15487,7 +16155,14 @@ fn claude_rolling_tick_quarantined_chain_takes_the_broken_leash() {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::oauth::AuthGate::Ready
     };
-    super::claude_rolling_tick(&config, &pacing, now, &degrading);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &degrading,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Where an unflagged profile would retry (past ROLLING_RETRY_MS), the
@@ -15497,6 +16172,8 @@ fn claude_rolling_tick_quarantined_chain_takes_the_broken_leash() {
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &degrading,
     );
     assert_eq!(
@@ -15511,6 +16188,8 @@ fn claude_rolling_tick_quarantined_chain_takes_the_broken_leash() {
         &config,
         &pacing,
         now + super::ROLLING_BROKEN_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &degrading,
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -15533,7 +16212,14 @@ fn claude_rolling_tick_scan_gap_holds_a_second_tick_off() {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::oauth::AuthGate::Refreshed // clears any widening
     };
-    super::claude_rolling_tick(&config, &pacing, now, &counting);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &counting,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Inside the gap, gate untouched: the scan must not run. Pinned on the
@@ -15545,6 +16231,8 @@ fn claude_rolling_tick_scan_gap_holds_a_second_tick_off() {
         &config,
         &pacing,
         now + super::ROLLING_SCAN_GAP_MS - 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &counting,
     );
     assert_eq!(
@@ -15567,6 +16255,8 @@ fn claude_rolling_tick_scan_gap_holds_a_second_tick_off() {
         &config,
         &pacing,
         now + super::ROLLING_SCAN_GAP_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &counting,
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -15605,12 +16295,26 @@ fn claude_rolling_tick_survives_a_backwards_clock_step() {
         crate::oauth::AuthGate::Refreshed
     };
     // Tick 1 clamps the scan stamp back into range (and runs nothing).
-    super::claude_rolling_tick(&config, &pacing, now, &counting);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &counting,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     // Tick 2, one gap later: the scan runs and clamps the retry leash to at
     // most one Broken leash from NOW — the profile is still leashed here.
     let t2 = now + super::ROLLING_SCAN_GAP_MS + 1;
-    super::claude_rolling_tick(&config, &pacing, t2, &counting);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        t2,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &counting,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     // Tick 3, one clamped leash later: the profile runs. Unclamped, the
     // ten-leash stamp would have held it for most of a day longer.
@@ -15618,6 +16322,8 @@ fn claude_rolling_tick_survives_a_backwards_clock_step() {
         &config,
         &pacing,
         t2 + super::ROLLING_BROKEN_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &counting,
     );
     assert_eq!(
@@ -15643,12 +16349,26 @@ fn claude_rolling_tick_broken_verdict_takes_the_long_leash() {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::oauth::AuthGate::Broken
     };
-    super::claude_rolling_tick(&config, &pacing, now, &broken);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &broken,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Where a transient would retry, Broken must still be leashed.
     pacing.lock().unwrap().next_scan_ms = 0;
-    super::claude_rolling_tick(&config, &pacing, now + super::ROLLING_RETRY_MS + 1, &broken);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &broken,
+    );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -15659,6 +16379,8 @@ fn claude_rolling_tick_broken_verdict_takes_the_long_leash() {
         &config,
         &pacing,
         now + super::ROLLING_BROKEN_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &broken,
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -15685,7 +16407,14 @@ fn claude_rolling_tick_relogin_transients_take_the_long_leash() {
             crate::format::Retry::Stated,
         ))
     };
-    super::claude_rolling_tick(&config, &pacing, now, &unrecorded);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &unrecorded,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     // Where an ordinary transient would retry, the re-login refusal is still
     // leashed…
@@ -15694,6 +16423,8 @@ fn claude_rolling_tick_relogin_transients_take_the_long_leash() {
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &unrecorded,
     );
     assert_eq!(
@@ -15712,13 +16443,22 @@ fn claude_rolling_tick_relogin_transients_take_the_long_leash() {
     };
     pacing.lock().unwrap().next_scan_ms = 0;
     pacing.lock().unwrap().retry_after_ms.clear();
-    super::claude_rolling_tick(&config, &pacing, now, &ordinary);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &ordinary,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     pacing.lock().unwrap().next_scan_ms = 0;
     super::claude_rolling_tick(
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &ordinary,
     );
     assert_eq!(
@@ -15750,7 +16490,14 @@ fn claude_rolling_tick_relogin_hold_releases_on_a_credential_write() {
             crate::format::Retry::Stated,
         ))
     };
-    super::claude_rolling_tick(&config, &pacing, now, &unrecorded);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &unrecorded,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Inside the leash with NOTHING changed on disk: still held.
@@ -15759,6 +16506,8 @@ fn claude_rolling_tick_relogin_hold_releases_on_a_credential_write() {
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &unrecorded,
     );
     assert_eq!(
@@ -15792,6 +16541,8 @@ fn claude_rolling_tick_relogin_hold_releases_on_a_credential_write() {
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 2,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &unrecorded,
     );
     assert_eq!(
@@ -15833,10 +16584,17 @@ fn claude_rolling_tick_reaches_the_gate_for_a_misfilled_sidecar() {
 
     let calls = std::sync::atomic::AtomicUsize::new(0);
     let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
-    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|_| {
-        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        crate::oauth::AuthGate::Ready
-    });
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        crate::usage::now_ms(),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::oauth::AuthGate::Ready
+        },
+    );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -15871,7 +16629,14 @@ fn claude_rolling_tick_clamps_a_short_hold_to_its_own_leash() {
         crate::oauth::AuthGate::Refreshed
     };
     // Tick 1: the clamp pulls the stamp back to the SHORT cadence; still held.
-    super::claude_rolling_tick(&config, &pacing, now, &counting);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &counting,
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     // Tick 2, one short cadence later: the profile runs. Clamped to the long
     // leash instead, this unwatched hold would sit for six hours with no
@@ -15881,6 +16646,8 @@ fn claude_rolling_tick_clamps_a_short_hold_to_its_own_leash() {
         &config,
         &pacing,
         now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
         &counting,
     );
     assert_eq!(
@@ -15908,7 +16675,14 @@ fn claude_rolling_tick_drops_retry_state_for_departed_profiles() {
             watched: None,
         },
     );
-    super::claude_rolling_tick(&config, &pacing, now, &|_| crate::oauth::AuthGate::Ready);
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| crate::oauth::AuthGate::Ready,
+    );
     let p = pacing.lock().unwrap();
     assert!(
         !p.retry_after_ms.contains_key("cl-deleted"),
@@ -18779,15 +19553,8 @@ fn a_second_process_holding_the_spent_token_sends_the_staged_one() {
     ));
     let _ = wedge_a_fetch_rotation(&config, name, &held_rx);
 
-    let _ = crate::oauth::auto_start_kick(
-        &peer,
-        &chain_pn(name),
-        "at-old",
-        Some("rt-old"),
-        None,
-        None,
-        None,
-    );
+    let _ =
+        crate::oauth::auto_start_kick(&peer, &chain_pn(name), "at-old", Some("rt-old"), None, None);
     let seen = server.join().expect("listener");
 
     let sent: Vec<String> = seen
@@ -22637,4 +23404,319 @@ fn a_subagent_success_does_not_drop_the_main_files_latch() {
         (Some("b".to_string()), Some(1)),
         "a subagent's success is another file's and must not drop the latch"
     );
+}
+
+/// A scheduler spend reads as the account's `Refreshing` without touching the
+/// TUI's account slot, counts once per claim, and its last claim's drop leaves
+/// no entry behind.
+#[test]
+fn a_scheduler_spend_counts_per_claim_and_reads_as_refreshing() {
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("spend-shown");
+    let flag = std::sync::atomic::AtomicBool::new(false);
+
+    let first = super::claim_scheduler_spend_unless_shutting_down(&activity, &name, &flag)
+        .expect("an unset flag admits the spend");
+    {
+        let states = activity.lock().unwrap();
+        let state = states.get("spend-shown").expect("activity state");
+        assert_eq!(state.selected(FetchLeg::OAuth), ProfileActivity::Refreshing);
+        assert_eq!(state.account, None, "the account slot stays the TUI's");
+    }
+    assert!(!super::is_idle(&activity, &name));
+    assert_eq!(
+        super::spending_account(&activity).as_deref(),
+        Some("spend-shown")
+    );
+
+    let second = super::claim_scheduler_spend_unless_shutting_down(&activity, &name, &flag)
+        .expect("a second leg's spend is admitted beside the first");
+    drop(first);
+    assert!(
+        super::token_spend_in_flight(&activity),
+        "the second spend still runs after the first returned"
+    );
+    drop(second);
+    assert!(
+        activity.lock().unwrap().get("spend-shown").is_none(),
+        "the last claim's drop leaves no entry"
+    );
+}
+
+/// Blocks the land of a rotation whose token answer is held at the stub, and
+/// samples the quit's predicate while the land waits: `answered` fires when the
+/// token endpoint is hit, `release` lets its answer go. Holding `config` blocks
+/// [`crate::oauth::apply_rotated_tokens_locked`], which takes it first, and the
+/// stage file shows the answer was settled before the land.
+fn spend_while_the_land_waits(
+    config: &crate::profile::ConfigHandle,
+    activity: &ActivityStore,
+    name: &crate::profile::ProfileName,
+    answered: &std::sync::mpsc::Receiver<()>,
+    release: &std::sync::mpsc::Sender<()>,
+) -> (bool, Vec<bool>) {
+    answered
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the rotation reached the token endpoint");
+    let held = config.lock().expect("config");
+    release.send(()).expect("release the token answer");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let staged = loop {
+        if crate::oauth::has_stage(name) {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let samples = (0..20)
+        .map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            super::token_spend_in_flight(activity)
+        })
+        .collect();
+    drop(held);
+    (staged, samples)
+}
+
+/// A token stub whose refresh answer waits for the test's release.
+fn held_token_stub(
+    first: &'static str,
+) -> (
+    String,
+    std::thread::JoinHandle<Vec<String>>,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (answered_tx, answered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with(first) {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            answered_tx.send(()).expect("signal the token hit");
+            release_rx.recv().expect("wait for the release");
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    (base, server, answered_rx, release_tx)
+}
+
+/// The poll leg's claim spans the land of the minted pair, not just its stage:
+/// a failed stage write leaves the land as the only durable point, so a quit
+/// must wait for it.
+#[test]
+fn a_poll_rotation_holds_its_claim_until_its_pair_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-land-held";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server, answered, release) = held_token_stub("/api/oauth/usage");
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&profile);
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: profile.clone(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let worker = {
+        let config = Arc::clone(&config);
+        let activity = Arc::clone(&activity);
+        std::thread::spawn(move || {
+            let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+            super::fetch_with_rotation(
+                &config,
+                &entry,
+                None,
+                &refetch,
+                &activity,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+        })
+    };
+
+    let (staged, samples) =
+        spend_while_the_land_waits(&config, &activity, &profile, &answered, &release);
+    let outcome = worker.join().expect("worker");
+    server.join().expect("listener");
+
+    assert!(staged, "the answer was staged before the land");
+    assert_eq!(
+        samples,
+        vec![true; 20],
+        "the claim stands while the land waits"
+    );
+    assert!(outcome.rotated.is_some(), "the rotation landed");
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
+/// The kick's claim spans the land of its minted pair too.
+#[test]
+fn a_kick_holds_its_claim_until_its_pair_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "kick-land-held";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server, answered, release) = held_token_stub("/v1/messages");
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&profile);
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let worker = {
+        let config = Arc::clone(&config);
+        let activity = Arc::clone(&activity);
+        let profile = profile.clone();
+        std::thread::spawn(move || {
+            crate::oauth::auto_start_kick(
+                &config,
+                &profile,
+                "at-old",
+                Some("rt-old"),
+                None,
+                Some((&activity, &std::sync::atomic::AtomicBool::new(false))),
+            )
+        })
+    };
+
+    let (staged, samples) =
+        spend_while_the_land_waits(&config, &activity, &profile, &answered, &release);
+    let result = worker.join().expect("worker");
+    server.join().expect("listener");
+
+    assert!(staged, "the answer was staged before the land");
+    assert_eq!(
+        samples,
+        vec![true; 20],
+        "the claim stands while the land waits"
+    );
+    assert!(result.rotated.is_some(), "the kick's rotation landed");
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
+/// The OAuth leg's marker for one profile, `None` when the store holds no
+/// entry (or no leg op) for it.
+fn oauth_leg(activity: &ActivityStore, name: &str) -> Option<ProfileActivity> {
+    activity
+        .lock()
+        .expect("activity store")
+        .get(name)
+        .and_then(|state| state.fetch(FetchLeg::OAuth))
+}
+
+/// Puts `name`'s stored expiry inside the rotation lead window, so the poll
+/// takes the proactive arm: no probe runs first to mark the OAuth leg itself.
+fn make_rotation_proactive(config: &crate::profile::ConfigHandle, name: &str) -> i64 {
+    let soon = crate::usage::now_ms() as i64 + 300_000;
+    let mut cfg = config.lock().unwrap();
+    let token = cfg
+        .find_mut(&crate::profile::ProfileName::from(name))
+        .and_then(|p| p.credentials.as_mut())
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+        .expect("oauth credentials");
+    token.expires_at = Some(soon);
+    soon
+}
+
+/// A kick whose refresh the token endpoint fails hands the profile to the
+/// OAuth leg all the same: the caller's fetch follows on that leg.
+#[test]
+fn a_kick_whose_refresh_fails_leaves_the_oauth_leg_fetching() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "kick-refresh-500";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (500, r#"{"error":"server_error"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some((&activity, &std::sync::atomic::AtomicBool::new(false))),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the kick reached the token endpoint: {seen:?}"
+    );
+    assert_eq!(result.rotated, None, "the refresh failed");
+    assert_eq!(oauth_leg(&activity, name), Some(ProfileActivity::Fetching));
+    assert!(!super::token_spend_in_flight(&activity));
+}
+
+/// A poll rotation whose land fails, on the proactive arm: no fetch follows
+/// the failed persist, so only the hand-off at the token answer leaves the
+/// OAuth leg `Fetching`.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_poll_rotation_whose_land_fails_leaves_the_oauth_leg_fetching() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-land-fails";
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let soon = make_rotation_proactive(&config, name);
+    seed_usage_cache(name);
+    crate::testutil::block_credentials_write(&crate::profile::ProfileName::from(name));
+    let entry = rotation_entry(name, Some(soon));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the poll rotated before its land could fail: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "no fetch follows a failed land: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string())))
+    );
+    assert_eq!(oauth_leg(&activity, name), Some(ProfileActivity::Fetching));
+    assert!(!super::token_spend_in_flight(&activity));
 }

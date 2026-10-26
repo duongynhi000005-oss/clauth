@@ -7369,7 +7369,16 @@ fn a_quarantined_codex_member_is_walked_around() {
         crate::codex_auth::CodexRefreshError,
     > { Err(crate::codex_auth::CodexRefreshError::Reused) };
     assert_eq!(
-        crate::codex_auth::standby_pass("cx2", now_ms, "2026-08-13T00:00:00Z".into(), &reused),
+        crate::codex_auth::standby_pass(
+            "cx2",
+            now_ms,
+            "2026-08-13T00:00:00Z".into(),
+            &reused,
+            &std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+                std::collections::HashMap::new()
+            )),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         crate::codex_auth::StandbyOutcome::Failed
     );
 
@@ -7453,7 +7462,16 @@ fn a_rotation_the_store_could_not_keep_is_walked_around() {
         })
     };
     assert_eq!(
-        crate::codex_auth::standby_pass("cxl2", now_ms, "2026-08-13T00:00:00Z".into(), &minted),
+        crate::codex_auth::standby_pass(
+            "cxl2",
+            now_ms,
+            "2026-08-13T00:00:00Z".into(),
+            &minted,
+            &std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+                std::collections::HashMap::new()
+            )),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         crate::codex_auth::StandbyOutcome::Failed
     );
     // What the store still holds: the token the wire just spent.
