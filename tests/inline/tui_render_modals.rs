@@ -6149,3 +6149,351 @@ fn settling_leaves_a_non_breaking_space_beside_a_run_as_written() {
         .collect();
     assert_eq!(rows, vec!["ab\u{a0}QA QB"]);
 }
+
+/// On a line holding a marked run, a prose non-breaking space is glue in both
+/// wrappers: it never breaks a row and never turns into a plain space.
+#[test]
+fn a_non_breaking_space_on_a_marked_line_is_glue_in_both_wrappers() {
+    for (text, w, want) in [
+        (
+            format!("{}漢a\u{a0}b", prose::cmd("A\u{a0}B")),
+            6,
+            vec!["A\u{a0}B", "漢a\u{a0}b"],
+        ),
+        (
+            format!("x ab\u{a0}cd {}", prose::cmd("QA QB")),
+            5,
+            vec!["x", "ab\u{a0}cd", "QA QB"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// On a line holding a marked run, a prose word made only of control
+/// characters draws nothing and spends no separator cell when the line wraps.
+#[test]
+fn a_control_only_word_on_a_marked_line_takes_no_cell() {
+    for (text, w, want) in [
+        (format!("a \u{7} {}", prose::cmd("QB")), 4, vec!["a", "QB"]),
+        (
+            format!("{} \u{7} QB", prose::cmd("QA")),
+            3,
+            vec!["QA", "QB"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// On a line holding a marked run, a combining mark after a space joins that
+/// space's cluster in both wrappers: the space is never a break taken apart
+/// from the mark it carries.
+#[test]
+fn a_combining_mark_after_a_space_joins_its_cluster() {
+    for (text, want) in [
+        (
+            format!("{} \u{301} 漢字", prose::cmd("漢字 QA REGION ABCD")),
+            vec!["漢字 QA REGION ABCD", " \u{301} 漢字"],
+        ),
+        (
+            format!("x {} \u{301} 漢字", prose::cmd("漢字 QA REGION ABCD")),
+            vec!["x", "漢字 QA REGION ABCD", " \u{301} 漢字"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 19);
+        assert_eq!(prose_rows, want, "prose: {text:?}");
+        assert_eq!(modal_rows, want, "modal: {text:?}");
+    }
+}
+
+/// Both wrappers settle a marked run's whitespace by one rule: only ASCII
+/// spaces and tabs collapse or stand in for a separator, so a run holding a
+/// non-breaking space or another Unicode space is data, at a line's start, its
+/// middle and its end.
+#[test]
+fn a_marked_run_of_non_ascii_whitespace_settles_alike_in_both_wrappers() {
+    for (text, want) in [
+        (format!("a {} b", prose::cmd(" \u{a0}")), "a \u{a0} b"),
+        (format!("a{}b", prose::cmd("\u{2003}")), "a\u{2003}b"),
+        (format!("a{}b", prose::cmd("\u{a0}")), "a\u{a0}b"),
+        (format!("{} b", prose::cmd(" \u{a0}")), "\u{a0} b"),
+        (format!("a {}", prose::cmd("\u{a0} ")), "a \u{a0}"),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 40);
+        assert_eq!(prose_rows, vec![want], "prose: {text:?}");
+        assert_eq!(modal_rows, vec![want], "modal: {text:?}");
+    }
+}
+
+/// Joining glue between a command's kept trailing space and the next
+/// command's kept leading space is still glue: it rides the row before it or
+/// takes its own, never carrying the next command's word.
+#[test]
+fn joining_glue_between_two_kept_edge_spaces_never_carries_the_next_word() {
+    for (w, want) in [
+        (6, vec!["QA", "login", ";", "ZONE", "QB"]),
+        (7, vec!["QA", "login ;", "ZONE QB"]),
+    ] {
+        let text = format!("{};{}", prose::cmd("QA login "), prose::cmd(" ZONE QB"));
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// Copy with no marked run keeps its old wrap: a non-breaking space there is
+/// still a separator, drawn as a plain space.
+#[test]
+fn prose_only_copy_still_breaks_at_a_non_breaking_space() {
+    assert_eq!(prose::plain_wrap("ab\u{a0}cd ef", 5), vec!["ab cd", "ef"]);
+    assert_eq!(prose::plain_wrap("ab\u{a0}cd", 3), vec!["ab", "cd"]);
+}
+
+/// A glue space inside prose on a marked line never breaks a row: U+00A0 at an
+/// exact-fit edge and one cell over, and U+202F / U+2007 each, stay data in
+/// both wrappers.
+#[test]
+fn marked_line_glue_spaces_never_break() {
+    for (text, w, want) in [
+        (
+            format!("{}x\u{a0}", prose::cmd("AB")),
+            2,
+            vec!["AB", "x\u{a0}"],
+        ),
+        (
+            format!("{}x\u{a0}y", prose::cmd("AB")),
+            3,
+            vec!["AB", "x\u{a0}y"],
+        ),
+        (
+            format!("x\u{202f}y {}", prose::cmd("QA")),
+            3,
+            vec!["x\u{202f}y", "QA"],
+        ),
+        (
+            format!("x\u{2007}y {}", prose::cmd("QA")),
+            3,
+            vec!["x\u{2007}y", "QA"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// A control-only prose word takes no separator cell at a wrap edge, and two
+/// such words in a row keep their runs apart: both wrappers drop them and wrap
+/// at the row the wider separator pushes over.
+#[test]
+fn a_control_only_word_at_a_wrap_edge_and_two_in_a_row() {
+    for (text, w, want) in [
+        (
+            format!("ab \u{7} {}", prose::cmd("QB")),
+            5,
+            vec!["ab", "QB"],
+        ),
+        (
+            format!("a \u{7} \u{7} {}", prose::cmd("QB")),
+            5,
+            vec!["a", "QB"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// A combining mark after a space keeps that space as part of its cluster at a
+/// row's exact fit and one cell wider, so the space is never a dropped break.
+#[test]
+fn a_combining_mark_after_a_space_keeps_its_space_at_fit() {
+    let text = format!("x {} \u{301} \u{6f22}", prose::cmd("QA"));
+    for (w, want) in [
+        (4, vec!["x", "QA \u{301}", "\u{6f22}"]),
+        (5, vec!["x QA \u{301}", "\u{6f22}"]),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// A wide glyph beside a glue space stays whole in both wrappers: the glue
+/// joins the glyph's word and never turns into a break.
+#[test]
+fn a_wide_glyph_beside_glue_stays_whole() {
+    let text = format!("{}\u{6f22}\u{a0}b", prose::cmd("A"));
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 4);
+    assert_eq!(prose_rows, vec!["A", "\u{6f22}\u{a0}b"], "prose: {text:?}");
+    assert_eq!(modal_rows, vec!["A", "\u{6f22}\u{a0}b"], "modal: {text:?}");
+}
+
+/// A marked run holding a non-ASCII whitespace settles as data at a line's
+/// start, middle and end in both wrappers: an NBSP-only or U+2003-only run, and
+/// a mixed ASCII-plus-NBSP run, each keeps its cells as written.
+#[test]
+fn a_non_ascii_whitespace_marked_run_settles_at_each_edge() {
+    for (text, want) in [
+        (format!("{} b", prose::cmd("\u{a0}")), "\u{a0} b"),
+        (format!("a {}", prose::cmd("\u{a0}")), "a \u{a0}"),
+        (format!("{} b", prose::cmd("\u{2003}")), "\u{2003} b"),
+        (format!("a {}", prose::cmd("\u{2003}")), "a \u{2003}"),
+        (format!("{} b", prose::cmd("  \u{a0} ")), "\u{a0} b"),
+        (format!("a{} b", prose::cmd("  \u{a0} ")), "a \u{a0} b"),
+        (format!("a {}", prose::cmd("  \u{a0} ")), "a \u{a0}"),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 40);
+        assert_eq!(prose_rows, vec![want], "prose: {text:?}");
+        assert_eq!(modal_rows, vec![want], "modal: {text:?}");
+    }
+}
+
+/// Joining glue between two kept edge tabs is still glue: it rides the row
+/// before it or takes its own, never carrying the next command's word.
+#[test]
+fn joining_glue_between_kept_tabs_never_carries_the_next_word() {
+    for (w, want) in [
+        (6, vec!["QA", "login", ";", "ZONE", "QB"]),
+        (7, vec!["QA", "login ;", "ZONE QB"]),
+    ] {
+        let text = format!("{};{}", prose::cmd("QA login\t"), prose::cmd("\tZONE QB"));
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// A prose tab on a marked line is a break space, exactly the way the modal
+/// normalizes tabs: it draws one space and never glues to the next char, and a
+/// tab before a combining mark still draws as the space that carries it.
+#[test]
+fn a_prose_tab_on_a_marked_line_is_a_break_space() {
+    for (text, w, want) in [
+        (format!("{}\tb", prose::cmd("x")), 8, vec!["x b"]),
+        (format!("{}\tab", prose::key("QA")), 4, vec!["QA", "ab"]),
+        (
+            format!("{}\t\u{301}b", prose::cmd("x")),
+            8,
+            vec!["x \u{301}b"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// A prose tab between two runs wraps as the space it draws: at a narrow width
+/// the two runs part across rows and the tab never fuses their words.
+#[test]
+fn a_prose_tab_between_two_runs_wraps_as_the_modal() {
+    let text = format!("{}\t{}", prose::cmd("QA QB"), prose::key("KB"));
+    for (w, want) in [(4, vec!["QA", "QB", "KB"]), (5, vec!["QA QB", "KB"])] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// On a marked line, an over-wide prose word keeps its glue spaces as data in
+/// the overflow path: a non-breaking space never becomes a break there.
+#[test]
+fn an_over_wide_word_keeps_its_glue_in_the_overflow_path() {
+    for (text, w, want) in [
+        (
+            format!("{} ab\u{a0}cdef", prose::cmd("QA")),
+            4,
+            vec!["QA", "ab\u{a0}c", "def"],
+        ),
+        (
+            format!("{} \u{a0}QZ", prose::key("x")),
+            2,
+            vec!["x", "\u{a0}Q", "Z"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// The prose walker settles a marked run's edges the way the modal does: a
+/// run's leading and trailing whitespace drops against a separator, a control
+/// char pressed against a run keeps its trailing space, and a whitespace-only
+/// run collapses to the one separator cell.
+#[test]
+fn settled_marked_run_edges_match_the_modal() {
+    for (text, w, want) in [
+        (
+            format!("x\u{a0}{}", prose::cmd("  QA")),
+            12,
+            vec!["x\u{a0}QA"],
+        ),
+        (format!("{}\u{a0}", prose::cmd("QA ")), 40, vec!["QA\u{a0}"]),
+        (format!("\u{7} {}", prose::key("QA")), 20, vec!["\u{7} QA"]),
+        (
+            format!("\u{6f22}\u{5b57}{}\u{1b}", prose::cmd("\u{6f22}\u{5b57} ")),
+            8,
+            vec!["\u{6f22}\u{5b57}", "\u{6f22}\u{5b57} "],
+        ),
+        (
+            format!("b{} \u{301}", prose::cmd(" ")),
+            40,
+            vec!["b \u{301}"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// A free glue word one cell over the row keeps its glue whole: the word
+/// splits after the glue, never at it.
+#[test]
+fn a_free_glue_word_one_cell_over_keeps_its_glue() {
+    let text = format!("{} ab\u{a0}c", prose::cmd("QA"));
+    let want = vec!["QA", "ab\u{a0}", "c"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 3);
+    assert_eq!(prose_rows, want, "prose: {text:?}");
+    assert_eq!(modal_rows, want, "modal: {text:?}");
+}
+
+/// Joining glue between one kept tab and one kept space is still glue: a tab
+/// on either side alone never carries the next command's word.
+#[test]
+fn joining_glue_with_one_kept_tab_never_carries_the_next_word() {
+    for (text, w, want) in [
+        (
+            format!("{};{}", prose::cmd("QA login\t"), prose::cmd(" ZONE QB")),
+            6,
+            vec!["QA", "login", ";", "ZONE", "QB"],
+        ),
+        (
+            format!("{};{}", prose::cmd("QA login\t"), prose::cmd(" ZONE QB")),
+            7,
+            vec!["QA", "login ;", "ZONE QB"],
+        ),
+        (
+            format!("{};{}", prose::cmd("QA login "), prose::cmd("\tZONE QB")),
+            6,
+            vec!["QA", "login", ";", "ZONE", "QB"],
+        ),
+        (
+            format!("{};{}", prose::cmd("QA login "), prose::cmd("\tZONE QB")),
+            7,
+            vec!["QA", "login ;", "ZONE QB"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}

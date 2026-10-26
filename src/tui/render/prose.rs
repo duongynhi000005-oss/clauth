@@ -171,13 +171,12 @@ impl Marked {
 /// [`spans`] keeping which graphemes are a marked unit.
 pub(crate) fn marked(text: &str, base: Style) -> Marked {
     let chars = classify(text);
-    // ASCII spaces and tabs inside a marked run are settled by [`settled`],
-    // which mirrors the prose tokenizer's run rules for them, so a wrapper that
-    // styles first and breaks after draws the same cells. Copy with no ASCII
-    // space or tab inside a run keeps its spans byte for byte.
+    // Whitespace inside a marked run is settled by the one routine the prose
+    // wrapper also runs, so both wrappers draw the same cells. Copy with no
+    // settle-able whitespace inside a run keeps its spans byte for byte.
     let chars = if chars
         .iter()
-        .any(|(ch, kind)| kind.marked() && matches!(ch, ' ' | '\t'))
+        .any(|(ch, kind)| kind.marked() && marked_whitespace(*ch))
     {
         settled(&chars)
     } else {
@@ -213,6 +212,53 @@ pub(crate) fn marked(text: &str, base: Style) -> Marked {
     }
 }
 
+/// Whether `ch` is the whitespace a marked run settles: ASCII space and tab
+/// alone. Every other whitespace (a non-breaking space included) is data.
+fn marked_whitespace(ch: char) -> bool {
+    matches!(ch, ' ' | '\t')
+}
+
+/// A marked run holding only ASCII spaces and tabs: it draws nothing, so the
+/// wrapper collapses it to the one separator cell between the words around it.
+fn blank_run(chars: &[(char, Kind)]) -> bool {
+    !chars.is_empty() && chars.iter().all(|(ch, _)| marked_whitespace(*ch))
+}
+
+/// Collapse each run of [`marked_whitespace`] to one ordinary space and drop a
+/// trailing run, unless `pressed` keeps the one space that separates the run's
+/// last word from prose glued to it.
+fn collapse_marked_whitespace(chars: &[(char, Kind)], pressed: bool) -> Vec<(char, Kind)> {
+    let mut out = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let (ch, kind) = chars[i];
+        if marked_whitespace(ch) {
+            let mut end = i;
+            while end < chars.len() && marked_whitespace(chars[end].0) {
+                end += 1;
+            }
+            if end < chars.len() || pressed {
+                out.push((' ', kind));
+            }
+            i = end;
+            continue;
+        }
+        out.push((ch, kind));
+        i += 1;
+    }
+    out
+}
+
+/// Drop a marked run's leading ASCII spaces and tabs: they repeat a separator
+/// the run already follows, or start the line where nothing precedes them.
+fn drop_leading_marked_whitespace(chars: &mut Vec<(char, Kind)>) {
+    let lead = chars
+        .iter()
+        .take_while(|(ch, kind)| kind.marked() && marked_whitespace(*ch))
+        .count();
+    chars.drain(..lead);
+}
+
 /// The visible characters after whitespace inside marked runs is settled: the
 /// stream [`fill`] places, so both wrappers wrap the same cells. Only a run's
 /// own whitespace changes, plus the one separator a whitespace-only run stands
@@ -227,7 +273,7 @@ fn settled(chars: &[(char, Kind)]) -> Vec<(char, Kind)> {
     while i < chars.len() {
         let (ch, kind) = chars[i];
         if !kind.marked() {
-            if sep && matches!(ch, ' ' | '\t') {
+            if sep && marked_whitespace(ch) {
                 i += 1;
                 continue;
             }
@@ -241,7 +287,7 @@ fn settled(chars: &[(char, Kind)]) -> Vec<(char, Kind)> {
             i += 1;
         }
         let run = &chars[start..i];
-        if run.iter().all(|(ch, _)| matches!(ch, ' ' | '\t')) {
+        if blank_run(run) {
             let before = out.iter().any(|(ch, _)| !ch.is_whitespace());
             let after = chars[i..].iter().any(|(ch, _)| !ch.is_whitespace());
             sep = before && after;
@@ -255,7 +301,7 @@ fn settled(chars: &[(char, Kind)]) -> Vec<(char, Kind)> {
                         break;
                     }
                     let cell = out.pop();
-                    if held.is_none() && cell.is_some_and(|(ch, _)| !matches!(ch, ' ' | '\t')) {
+                    if held.is_none() && cell.is_some_and(|(ch, _)| !marked_whitespace(ch)) {
                         held = cell;
                     }
                 }
@@ -263,37 +309,12 @@ fn settled(chars: &[(char, Kind)]) -> Vec<(char, Kind)> {
             }
             continue;
         }
-        // Collapse each run of ASCII spaces and tabs inside a visible run to
-        // one, drop a trailing one unless prose is pressed against it (the
-        // space that keeps the words apart), and drop a leading one beside a
-        // separator.
         let pressed = chars
             .get(i)
             .is_some_and(|(ch, kind)| !kind.marked() && !ch.is_whitespace());
-        let mut kept: Vec<(char, Kind)> = Vec::with_capacity(run.len());
-        let mut j = 0;
-        while j < run.len() {
-            let (ch, kind) = run[j];
-            if matches!(ch, ' ' | '\t') {
-                let mut end = j;
-                while end < run.len() && matches!(run[end].0, ' ' | '\t') {
-                    end += 1;
-                }
-                if end < run.len() || pressed {
-                    kept.push((' ', kind));
-                }
-                j = end;
-                continue;
-            }
-            kept.push((ch, kind));
-            j += 1;
-        }
+        let mut kept = collapse_marked_whitespace(run, pressed);
         if start == 0 || chars[start - 1].0.is_whitespace() {
-            let lead = kept
-                .iter()
-                .take_while(|(ch, _)| matches!(ch, ' ' | '\t'))
-                .count();
-            kept.drain(..lead);
+            drop_leading_marked_whitespace(&mut kept);
         }
         out.extend_from_slice(&kept);
         sep = false;
@@ -340,7 +361,20 @@ pub(crate) fn fit(text: &str, width: usize, base: Style) -> Vec<Span<'static>> {
 /// them rides the word before it. Prose-only copy wraps exactly as
 /// [`wrap_words`].
 pub(crate) fn wrap(text: &str, width: usize, base: Style) -> Vec<Vec<Span<'static>>> {
-    fill(&classify(text), width)
+    let chars = classify(text);
+    let marked_line = chars.iter().any(|(_, kind)| kind.marked());
+    // Settle marked-run whitespace the way [`marked`] does, so the walker
+    // below wraps the same cells the modal wrapper draws.
+    let chars = if marked_line
+        && chars
+            .iter()
+            .any(|(ch, kind)| kind.marked() && marked_whitespace(*ch))
+    {
+        settled(&chars)
+    } else {
+        chars
+    };
+    fill(&chars, width, marked_line)
         .into_iter()
         .map(|line| runs(&line, base))
         .collect()
@@ -350,7 +384,7 @@ pub(crate) fn wrap(text: &str, width: usize, base: Style) -> Vec<Vec<Span<'stati
 /// [`super::panes::wrap_words`] takes.
 pub(crate) fn plain_wrap(text: &str, width: usize) -> Vec<String> {
     let chars: Vec<(char, Kind)> = text.chars().map(|ch| (ch, PROSE)).collect();
-    fill(&chars, width)
+    fill(&chars, width, false)
         .into_iter()
         .map(|line| line.into_iter().map(|(ch, _)| ch).collect())
         .collect()
@@ -362,45 +396,100 @@ pub(crate) fn plain_wrap(text: &str, width: usize) -> Vec<String> {
 struct Token {
     chars: Vec<(char, Kind)>,
     width: usize,
-    /// The kind of the whitespace run before the token; `None` when it follows
-    /// the previous token with nothing between (`run{cmd("x")}`).
-    sep: Option<Kind>,
+    /// The whitespace before the token: its kind and how many separator cells
+    /// it draws (`None` when the token follows the previous one with nothing
+    /// between, `run{cmd("x")}`). A contiguous whitespace run collapses to one
+    /// cell; a dropped control-only word keeps the runs on either side apart,
+    /// so each stands as its own cell.
+    sep: Option<(Kind, usize)>,
 }
 
-fn tokens(chars: &[(char, Kind)], cells: Measure) -> Vec<Token> {
+/// Whether the whitespace at `at` draws as one grapheme with the char after
+/// it (a combining mark, a joiner, a variation selector): the buffer keeps
+/// the two together, so the space is data, never a break. The pair glues only
+/// inside one span, and never around a control char, which draws nothing.
+fn space_glued_to_next(chars: &[(char, Kind)], at: usize) -> bool {
+    let Some(&(next, next_kind)) = chars.get(at + 1) else {
+        return false;
+    };
+    let (lead, lead_kind) = chars[at];
+    if lead_kind != next_kind || lead.is_control() || next.is_control() {
+        return false;
+    }
+    let pair: String = [lead, next].into_iter().collect();
+    Span::raw(pair.as_str())
+        .styled_graphemes(Style::default())
+        .count()
+        == 1
+}
+
+fn tokens(
+    chars: &[(char, Kind)],
+    cells: Measure,
+    glue_aware: bool,
+    drop_controls: bool,
+) -> Vec<Token> {
+    // A prose break is whitespace the wrapper may cut at. On a marked line the
+    // glue spaces are data and a space that carries a combining mark stays
+    // inside its grapheme; prose-only copy keeps the full-whitespace rule.
+    let is_break = |at: usize| {
+        if glue_aware {
+            marked_break(chars, at)
+        } else {
+            chars[at].0.is_whitespace()
+        }
+    };
     let mut out: Vec<Token> = Vec::new();
-    let mut sep: Option<Kind> = None;
+    let mut sep: Option<(Kind, usize)> = None;
+    // A dropped control-only word keeps the whitespace runs on either side
+    // apart: the next run is a separate separator cell, not one more space in
+    // the run before it.
+    let mut control_gap = false;
     let mut i = 0;
     while i < chars.len() {
         let (ch, kind) = chars[i];
-        if !kind.marked() && ch.is_whitespace() {
+        if !kind.marked() && is_break(i) {
+            let mut end = i + 1;
+            while end < chars.len() && !chars[end].1.marked() && is_break(end) {
+                end += 1;
+            }
             finalize(&mut out, cells);
-            sep = Some(kind);
-            i += 1;
+            sep = Some((
+                kind,
+                if control_gap {
+                    sep.map_or(1, |(_, w)| w + 1)
+                } else {
+                    sep.map_or(1, |(_, w)| w)
+                },
+            ));
+            control_gap = false;
+            i = end;
+            continue;
+        }
+        // A control-only prose word draws nothing: drop it without touching
+        // the separator, so the whitespace runs on either side never merge.
+        if drop_controls && !kind.marked() && ch.is_control() {
+            let mut end = i + 1;
+            while end < chars.len() && !chars[end].1.marked() && chars[end].0.is_control() {
+                end += 1;
+            }
+            control_gap = true;
+            i = end;
             continue;
         }
         let marked = kind.marked();
         let start = i;
         while i < chars.len() {
-            let (ch, kind) = chars[i];
+            let (_, kind) = chars[i];
             let same = if marked {
                 kind.marked()
             } else {
-                !kind.marked() && !ch.is_whitespace()
+                !kind.marked() && !is_break(i)
             };
             if !same {
                 break;
             }
             i += 1;
-        }
-        // A run holding only whitespace draws nothing; between two words it is
-        // the one space that keeps them apart, never a second one beside a
-        // separator already there.
-        if marked && chars[start..i].iter().all(|(ch, _)| ch.is_whitespace()) {
-            if !out.is_empty() {
-                sep = Some(PROSE);
-            }
-            continue;
         }
         if sep.is_none()
             && let Some(last) = out.last_mut()
@@ -416,36 +505,18 @@ fn tokens(chars: &[(char, Kind)], cells: Measure) -> Vec<Token> {
             sep,
         });
         sep = None;
+        control_gap = false;
     }
     finalize(&mut out, cells);
     out
 }
 
-/// Settle a token's whitespace and width once nothing can press against it any
-/// more. Collapsing runs and dropping a trailing one earlier eats the space a
-/// glued word needs to stay apart from the token's last word.
+/// Measure a finished token once nothing can press against it any more. Its
+/// whitespace is already settled, so only the width is still open.
 fn finalize(out: &mut [Token], cells: Measure) {
-    let first = out.len() == 1;
     let Some(last) = out.last_mut() else {
         return;
     };
-    normalize_unit_whitespace(&mut last.chars);
-    // A marked run's leading whitespace repeats a separator the token already
-    // follows, or starts the line where nothing precedes it to keep apart: drop
-    // it rather than draw a second blank cell.
-    if (first || last.sep.is_some())
-        && last
-            .chars
-            .first()
-            .is_some_and(|(ch, kind)| kind.marked() && matches!(ch, ' ' | '\t'))
-    {
-        let lead = last
-            .chars
-            .iter()
-            .take_while(|(ch, kind)| kind.marked() && matches!(ch, ' ' | '\t'))
-            .count();
-        last.chars.drain(..lead);
-    }
     last.width = cells(&last.chars);
 }
 
@@ -461,57 +532,39 @@ fn drawn_cells(chars: &[(char, Kind)]) -> usize {
     grapheme_cells(&text)
 }
 
-/// A marked run copies its own whitespace, and a tab renders as nothing:
-/// collapse a run of ASCII spaces or tabs inside it to one ordinary space and
-/// drop a trailing run, so the rendered cells still paste as the command. A
-/// non-breaking space is data, never a break or a collapse, so the predicate
-/// is the ASCII space and tab alone.
-fn normalize_unit_whitespace(chars: &mut Vec<(char, Kind)>) {
-    if !chars.iter().any(|(_, kind)| kind.marked()) {
-        return;
-    }
-    let mut out = Vec::with_capacity(chars.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let (ch, kind) = chars[i];
-        if matches!(ch, ' ' | '\t') {
-            let mut end = i;
-            while end < chars.len() && matches!(chars[end].0, ' ' | '\t') {
-                end += 1;
-            }
-            if end < chars.len() {
-                out.push((' ', kind));
-            }
-            i = end;
-            continue;
-        }
-        out.push((ch, kind));
-        i += 1;
-    }
-    *chars = out;
-}
-
 /// Greedy fill to `width` cells, measured the way the buffer renders: by
 /// grapheme, a wide one taking two.
-fn fill(chars: &[(char, Kind)], width: usize) -> Vec<Vec<(char, Kind)>> {
+fn fill(chars: &[(char, Kind)], width: usize, marked_line: bool) -> Vec<Vec<(char, Kind)>> {
+    let owned;
+    let chars = if marked_line {
+        owned = chars
+            .iter()
+            .map(|&(ch, kind)| (if ch == '\t' { ' ' } else { ch }, kind))
+            .collect::<Vec<_>>();
+        owned.as_slice()
+    } else {
+        chars
+    };
     if width == 0 {
         return vec![chars.to_vec()];
     }
-    let cells: Measure = if chars.iter().any(|(_, kind)| kind.marked()) {
-        drawn_cells
-    } else {
-        width_of
-    };
+    let cells: Measure = if marked_line { drawn_cells } else { width_of };
+    // A control-only prose word draws nothing; the buffer drops it, never the
+    // wrapper, except on a marked line long enough to wrap, where the modal
+    // drops it during its flatten and the wrapper must too.
+    let drop_controls = marked_line && drawn_cells(chars) > width;
     let mut lines: Vec<Vec<(char, Kind)>> = Vec::new();
     let mut cur: Vec<(char, Kind)> = Vec::new();
     let mut cur_w = 0usize;
-    for token in tokens(chars, cells) {
+    for token in tokens(chars, cells, marked_line, drop_controls) {
         let sep = if cur.is_empty() { None } else { token.sep };
-        let sep_w = usize::from(sep.is_some());
+        let sep_w = sep.map_or(0, |(_, w)| w);
         if fits_a_row(&token, width) && cur_w + sep_w + token.width <= width {
-            if let Some(kind) = sep {
-                cur.push((' ', kind));
-                cur_w += 1;
+            if let Some((kind, w)) = sep {
+                for _ in 0..w {
+                    cur.push((' ', kind));
+                }
+                cur_w += w;
             }
             cur.extend_from_slice(&token.chars);
             cur_w += token.width;
@@ -528,7 +581,16 @@ fn fill(chars: &[(char, Kind)], width: usize) -> Vec<Vec<(char, Kind)>> {
         // Too wide for any row: glued punctuation is placed beside the marked
         // run, which keeps a row it fits; otherwise the token is no unit any
         // more and its words fill from where the row already stands.
-        place_overflow(&token, sep, width, &mut cur, &mut cur_w, &mut lines, cells);
+        place_overflow(
+            &token,
+            sep,
+            width,
+            &mut cur,
+            &mut cur_w,
+            &mut lines,
+            cells,
+            marked_line,
+        );
     }
     if !cur.is_empty() {
         lines.push(cur);
@@ -561,17 +623,29 @@ fn unit_bounds(chars: &[(char, Kind)]) -> Option<(usize, usize)> {
 /// punctuation glued to its first or last word taking a row of its own when
 /// that word fits one but the two together do not. Otherwise the token breaks
 /// at its spaces like prose.
+#[allow(clippy::too_many_arguments)]
 fn place_overflow(
     token: &Token,
-    sep: Option<Kind>,
+    sep: Option<(Kind, usize)>,
     width: usize,
     cur: &mut Vec<(char, Kind)>,
     cur_w: &mut usize,
     lines: &mut Vec<Vec<(char, Kind)>>,
     cells: Measure,
+    glue_aware: bool,
 ) {
     let Some((start, end)) = unit_bounds(&token.chars) else {
-        break_at_spaces(&token.chars, sep, width, cur, cur_w, lines, None, cells);
+        break_at_spaces(
+            &token.chars,
+            sep,
+            width,
+            cur,
+            cur_w,
+            lines,
+            None,
+            cells,
+            glue_aware,
+        );
         return;
     };
     let unit = &token.chars[start..end];
@@ -585,6 +659,7 @@ fn place_overflow(
             lines,
             Some((start, end)),
             cells,
+            glue_aware,
         );
         return;
     }
@@ -604,7 +679,7 @@ fn place_overflow(
 /// own.
 fn place_unit(
     unit: &[(char, Kind)],
-    sep: Option<Kind>,
+    sep: Option<(Kind, usize)>,
     width: usize,
     cur: &mut Vec<(char, Kind)>,
     cur_w: &mut usize,
@@ -613,12 +688,14 @@ fn place_unit(
 ) {
     let unit_w = cells(unit);
     let sep = if cur.is_empty() { None } else { sep };
-    if !cur.is_empty() && *cur_w + usize::from(sep.is_some()) + unit_w > width {
+    if !cur.is_empty() && *cur_w + sep.map_or(0, |(_, w)| w) + unit_w > width {
         lines.push(std::mem::take(cur));
         *cur_w = 0;
-    } else if let Some(kind) = sep {
-        cur.push((' ', kind));
-        *cur_w += 1;
+    } else if let Some((kind, w)) = sep {
+        for _ in 0..w {
+            cur.push((' ', kind));
+        }
+        *cur_w += w;
     }
     cur.extend_from_slice(unit);
     *cur_w += unit_w;
@@ -630,7 +707,7 @@ fn place_unit(
 /// never the word after it; two runs pressed together part where they meet.
 struct Piece {
     chars: Vec<(char, Kind)>,
-    sep: Option<Kind>,
+    sep: Option<(Kind, usize)>,
     glue: bool,
 }
 
@@ -638,6 +715,13 @@ struct Piece {
 /// the word beside it.
 fn break_space(ch: char) -> bool {
     ch.is_whitespace() && !matches!(ch, '\u{a0}' | '\u{202f}' | '\u{2007}')
+}
+
+/// Whether the grapheme at `at` is a break point on a marked line: breakable
+/// whitespace the buffer does not glue to the next grapheme. Both walkers that
+/// cut a marked line use this one predicate.
+fn marked_break(chars: &[(char, Kind)], at: usize) -> bool {
+    break_space(chars[at].0) && !space_glued_to_next(chars, at)
 }
 
 /// Place a token's words one row at a time: a marked run wider than a row
@@ -650,23 +734,27 @@ fn break_space(ch: char) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn break_at_spaces(
     chars: &[(char, Kind)],
-    first: Option<Kind>,
+    first: Option<(Kind, usize)>,
     width: usize,
     cur: &mut Vec<(char, Kind)>,
     cur_w: &mut usize,
     lines: &mut Vec<Vec<(char, Kind)>>,
     unit: Option<(usize, usize)>,
     cells: Measure,
+    glue_aware: bool,
 ) {
-    let breaks = |ch: char| match unit {
-        Some(_) => break_space(ch),
-        None => ch.is_whitespace(),
+    let breaks = |at: usize| {
+        if glue_aware {
+            marked_break(chars, at)
+        } else {
+            chars[at].0.is_whitespace()
+        }
     };
     let mut pieces: Vec<Piece> = Vec::new();
     let mut piece: Vec<(char, Kind)> = Vec::new();
     let mut sep = first;
     for (i, &(ch, kind)) in chars.iter().enumerate() {
-        if breaks(ch) {
+        if breaks(i) {
             if !piece.is_empty() {
                 pieces.push(Piece {
                     chars: std::mem::take(&mut piece),
@@ -674,7 +762,7 @@ fn break_at_spaces(
                     glue: false,
                 });
             }
-            sep = Some(kind);
+            sep = Some((kind, 1));
             continue;
         }
         if let Some((start, end)) = unit
@@ -683,11 +771,11 @@ fn break_at_spaces(
             && kind.marked()
             && !piece.is_empty()
         {
-            let (prev, prev_kind) = chars[i - 1];
+            let (_, prev_kind) = chars[i - 1];
             let joins = if prev_kind.marked() {
                 prev_kind != kind
             } else {
-                !breaks(prev)
+                !breaks(i - 1)
             };
             if joins {
                 let glue = if prev_kind.marked() {
@@ -696,7 +784,8 @@ fn break_at_spaces(
                     piece
                         .iter()
                         .rev()
-                        .take_while(|(ch, kind)| !kind.marked() && !breaks(*ch))
+                        .enumerate()
+                        .take_while(|(off, (_, kind))| !kind.marked() && !breaks(i - 1 - off))
                         .count()
                 };
                 if glue == piece.len() {
@@ -779,6 +868,18 @@ fn break_at_spaces(
             }
         }
     }
+    // A prose-only piece between two marked runs inside the run bounds is
+    // glue, whatever kept space sits on either side of it: it rides the word
+    // before it or takes its own row, never carrying the next run's word.
+    for k in 1..pieces.len().saturating_sub(1) {
+        if !pieces[k].glue
+            && pieces[k].chars.iter().all(|(_, kind)| !kind.marked())
+            && pieces[k - 1].chars.iter().any(|(_, kind)| kind.marked())
+            && pieces[k + 1].chars.iter().any(|(_, kind)| kind.marked())
+        {
+            pieces[k].glue = true;
+        }
+    }
     for piece in pieces {
         if !piece.glue {
             place_word(&piece.chars, piece.sep, width, cur, cur_w, lines, cells);
@@ -786,11 +887,13 @@ fn break_at_spaces(
         }
         let glue_w = cells(&piece.chars);
         let sep = if cur.is_empty() { None } else { piece.sep };
-        let sep_w = usize::from(sep.is_some());
+        let sep_w = sep.map_or(0, |(_, w)| w);
         if !cur.is_empty() && *cur_w + sep_w + glue_w <= width {
-            if let Some(kind) = sep {
-                cur.push((' ', kind));
-                *cur_w += 1;
+            if let Some((kind, w)) = sep {
+                for _ in 0..w {
+                    cur.push((' ', kind));
+                }
+                *cur_w += w;
             }
             cur.extend_from_slice(&piece.chars);
             *cur_w += glue_w;
@@ -808,7 +911,7 @@ fn break_at_spaces(
 
 fn place_word(
     word: &[(char, Kind)],
-    sep: Option<Kind>,
+    sep: Option<(Kind, usize)>,
     width: usize,
     cur: &mut Vec<(char, Kind)>,
     cur_w: &mut usize,
@@ -832,14 +935,16 @@ fn place_word(
     if cur.is_empty() {
         cur.extend_from_slice(word);
         *cur_w = word_w;
-    } else if *cur_w + usize::from(sep.is_some()) + word_w > width {
+    } else if *cur_w + sep.map_or(0, |(_, w)| w) + word_w > width {
         lines.push(std::mem::take(cur));
         *cur_w = word_w;
         cur.extend_from_slice(word);
     } else {
-        if let Some(kind) = sep {
-            cur.push((' ', kind));
-            *cur_w += 1;
+        if let Some((kind, w)) = sep {
+            for _ in 0..w {
+                cur.push((' ', kind));
+            }
+            *cur_w += w;
         }
         cur.extend_from_slice(word);
         *cur_w += word_w;

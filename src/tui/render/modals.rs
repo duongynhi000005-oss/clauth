@@ -954,6 +954,43 @@ fn chunk_line_units(
                 out.push(Atom::Unit(piece));
             }
         }
+        // A prose-only word between two marked runs inside the run bounds is
+        // glue, whatever kept space sits on either side of it: it rides the
+        // word before it or takes its own row, never carrying the next run's
+        // word.
+        let mut k = 0;
+        while k < out.len() {
+            if !matches!(&out[k], Atom::Unit(w) if w.iter().all(|g| g.3.is_none())) {
+                k += 1;
+                continue;
+            }
+            let before = out[..k]
+                .iter()
+                .rev()
+                .find(|a| !matches!(a, Atom::Space(_)))
+                .is_some_and(|a| a.flat().iter().any(|g| g.3.is_some()));
+            let after = out[k + 1..]
+                .iter()
+                .find(|a| !matches!(a, Atom::Space(_)))
+                .is_some_and(|a| a.flat().iter().any(|g| g.3.is_some()));
+            if before && after {
+                let Atom::Unit(word) = out[k].clone() else {
+                    k += 1;
+                    continue;
+                };
+                let mut glue = word;
+                if k > 0 && matches!(out[k - 1], Atom::Space(_)) {
+                    if let Atom::Space(space) = out.remove(k - 1) {
+                        let mut fused = space;
+                        fused.append(&mut glue);
+                        out[k - 1] = Atom::Glue(fused);
+                    }
+                } else {
+                    out[k] = Atom::Glue(glue);
+                }
+            }
+            k += 1;
+        }
         out
     }
 
