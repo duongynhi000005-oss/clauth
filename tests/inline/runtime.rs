@@ -13874,6 +13874,141 @@ fn a_fake_mode_codex_home_is_the_durable_store_and_survives_teardown() {
     });
 }
 
+/// An isolated codex session on a host that cannot symlink holds its marker
+/// under the bare `sessions-isolated` stem, where claude's isolated layout
+/// keeps the session suffix. The row probe must find it there, or GC reaps
+/// the live row and the tally and listing lose the session.
+#[test]
+fn a_fake_mode_isolated_codex_row_stays_live_and_survives_row_gc() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+
+    with_link_mode(LinkMode::Fake, || {
+        let runtime = CodexRuntime::acquire("cx", Isolation::Isolated).expect("acquire");
+        let sid = runtime.session.as_str().to_owned();
+        assert_eq!(
+            runtime.pid_file,
+            profile.join("sessions-isolated").join(&sid),
+            "fixture: fake mode stamps the bare isolated stem"
+        );
+
+        assert!(
+            session_row_is_live(&ProfileName::from("cx"), true, &sid),
+            "the held marker must read live"
+        );
+        gc_live_session_rows();
+        let rows: Vec<String> = crate::live_sessions::list()
+            .into_iter()
+            .map(|row| row.session_id)
+            .collect();
+        assert_eq!(rows, vec![sid], "row GC must keep the live session's row");
+
+        drop(runtime);
+    });
+}
+
+/// The isolated codex marker under real symlinks is keyed per session, so the
+/// probe must keep finding `sessions-isolated-<sid>` — the arm that must not be
+/// displaced by the fake-mode collapse.
+#[test]
+fn a_real_mode_isolated_codex_row_stays_live() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    if !host_poses(&profile, "a real-symlink isolated codex home") {
+        return;
+    }
+
+    let runtime = CodexRuntime::acquire("cx", Isolation::Isolated).expect("acquire");
+    let sid = runtime.session.as_str().to_owned();
+    assert_eq!(
+        runtime.pid_file,
+        profile.join(format!("sessions-isolated-{sid}")).join(&sid),
+        "fixture: real mode keeps the per-session stem"
+    );
+    assert!(
+        session_row_is_live(&ProfileName::from("cx"), true, &sid),
+        "the held marker must read live"
+    );
+
+    drop(runtime);
+}
+
+/// A shared codex session under the fake transport holds its marker in the bare
+/// `sessions` dir, the one path the claude shared-fake layout also uses; the
+/// probe must read it there for a codex row.
+#[test]
+fn a_fake_mode_shared_codex_row_stays_live() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+
+    with_link_mode(LinkMode::Fake, || {
+        let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+        let sid = runtime.session.as_str().to_owned();
+        assert_eq!(
+            runtime.pid_file,
+            profile.join("sessions").join(&sid),
+            "fixture: fake mode stamps the bare shared stem"
+        );
+        assert!(
+            session_row_is_live(&ProfileName::from("cx"), false, &sid),
+            "the held marker must read live"
+        );
+
+        drop(runtime);
+    });
+}
+
+/// [`hold_session_row_marker`] stamps the first candidate, which must stay the
+/// claude per-session (`LinkMode::Real`) layout: the codex candidates sit after
+/// it, and under the fake transport the codex shared path is a bare dir.
+#[test]
+fn holding_a_row_marker_stamps_the_claude_real_layout() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("cx");
+
+    let _marker = hold_session_row_marker(&name, false, "4242-0").expect("hold a session");
+
+    assert!(
+        home.home()
+            .join(".clauth/profiles/cx/sessions-4242-0/4242-0")
+            .is_file(),
+        "the held marker must sit in the per-session real layout"
+    );
+    assert!(
+        session_row_is_live(&name, false, "4242-0"),
+        "and the probe reads the marker it just held"
+    );
+}
+
+/// An isolated row's claude and codex arms collapse onto one path: both
+/// transports key that layout per session, and the codex real arm repeats the
+/// claude one. The probe must hold each path once and keep the claude real
+/// layout first, which is the candidate [`hold_session_row_marker`] stamps.
+#[test]
+fn an_isolated_row_probes_each_marker_path_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("cx");
+
+    let markers =
+        session_marker_paths(&name, true, "4242-0").expect("derive the isolated candidates");
+
+    let unique: std::collections::HashSet<&PathBuf> = markers.iter().collect();
+    assert_eq!(
+        unique.len(),
+        markers.len(),
+        "no candidate path is probed twice: {markers:?}"
+    );
+    assert_eq!(
+        markers[0],
+        home.home()
+            .join(".clauth/profiles/cx/sessions-isolated-4242-0/4242-0"),
+        "the claude real layout stays first"
+    );
+}
+
 /// `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml`, and
 /// CODEX_HOME is the session home — so the operator's profile-v2 files have to
 /// land there too, sanitized like the base config, or the flag silently

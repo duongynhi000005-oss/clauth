@@ -597,13 +597,26 @@ fn resolve_tree(
 /// silently stale if it spelled the path itself.
 ///
 /// A row carries the profile, the flavor, and the session id but NOT the
-/// transport. The two layouts put the marker in different dirs for a SHARED
-/// session; an isolated session is keyed per session in both modes, so both
-/// arms collapse to one path. Both are derived from [`paired_dir_names`] and a
-/// caller treats the row as live if EITHER is held — the fail-safe direction,
-/// matching [`session_marker_dirs`]'s deliberately loose filter: a row reaped
-/// under a live session is a live session nothing can be pointed at again,
-/// while probing an absent path costs one `open` that fails.
+/// transport. For a claude session the two layouts put the marker in different
+/// dirs under SHARED; an isolated session is keyed per session in both modes,
+/// so those arms collapse to one path. Every candidate is deduped against the
+/// ones before it as it is pushed, so a collapse costs no second `open`. Both
+/// are derived from [`paired_dir_names`] and a caller treats the row as live if
+/// EITHER is held — the fail-safe direction, matching
+/// [`session_marker_dirs`]'s deliberately loose filter: a row reaped under a
+/// live session is a live session nothing can be pointed at again, while
+/// probing an absent path costs one `open` that fails, and a union reads a
+/// stale spawn-settings file as live only while another session holds one of
+/// its candidate paths under the same `<sid>` on the same profile.
+///
+/// Codex's twin does not collapse where claude's does:
+/// [`codex_paired_dir_names`] drops the per-session suffix under the fake
+/// transport for BOTH flavors, so an isolated codex session holds its marker in
+/// the bare `sessions-isolated` dir while claude's isolated layout keeps
+/// `sessions-isolated-<sid>`. Both codex arms are candidates, not one selected
+/// by the row's `harness` tag: a row names no transport, and
+/// [`gc_spawn_settings_files`] probes with no row at all, so no row field can
+/// steer every caller.
 ///
 /// The background pair's marker dir is a third candidate unconditionally
 /// rather than behind a row flag: a background holder is a launcher, the daemon,
@@ -621,16 +634,28 @@ fn session_marker_paths(
     } else {
         Isolation::Shared
     };
-    let marker = |mode| -> Result<PathBuf> {
-        let (_, sessions_name) = paired_dir_names(isolation, session_id, mode);
-        Ok(profile_subpath(profile, &sessions_name)?.join(session_id))
+    let marker = |sessions_name: &str| -> Result<PathBuf> {
+        Ok(profile_subpath(profile, sessions_name)?.join(session_id))
     };
+    let (_, claude_real) = paired_dir_names(isolation, session_id, LinkMode::Real);
+    let (_, claude_fake) = paired_dir_names(isolation, session_id, LinkMode::Fake);
     let (_, background_sessions) = background_dir_names();
-    Ok(vec![
-        marker(LinkMode::Real)?,
-        marker(LinkMode::Fake)?,
-        profile_subpath(profile, &background_sessions)?.join(session_id),
-    ])
+    let (_, codex_real) = codex_paired_dir_names(isolation, session_id, LinkMode::Real);
+    let (_, codex_fake) = codex_paired_dir_names(isolation, session_id, LinkMode::Fake);
+    let mut markers: Vec<PathBuf> = Vec::new();
+    for sessions_name in [
+        claude_real,
+        claude_fake,
+        background_sessions,
+        codex_real,
+        codex_fake,
+    ] {
+        let path = marker(&sessions_name)?;
+        if !markers.contains(&path) {
+            markers.push(path);
+        }
+    }
+    Ok(markers)
 }
 
 /// The two runtime trees a live-sessions row's session could use as its
@@ -9644,13 +9669,14 @@ fn link_entry(_src: &Path, _dst: &Path) -> Result<()> {
 
 // ── codex session homes ──────────────────────────────────────────────────────
 //
-// The codex runtime mirrors the claude runtime: per-session, keyed by the same
-// minted sid, marker-flock liveness through the same `sessions[-isolated]-<sid>`
-// dirs (which is what makes `has_live_session` — and so delete/disable/rotation
-// gating — work for codex with no harness awareness), registered in the same
-// live-session registry with the codex tag. What it does NOT mirror: no swap
-// executor, no settings/claude-json watchdog legs, and no wipe of the
-// profile-global store.
+// The codex runtime mirrors the claude runtime: per-session under the real
+// transport, keyed by the same minted sid, marker-flock liveness in the dirs
+// `session_marker_paths` probes — `sessions[-isolated]-<sid>` under the real
+// transport, the bare stems under the fake one (which is what makes
+// `has_live_session` — and so delete/disable/rotation gating — work for codex
+// with no harness awareness), registered in the same live-session registry
+// with the codex tag. What it does NOT mirror: no swap executor, no
+// settings/claude-json watchdog legs, and no wipe of the profile-global store.
 
 /// The stem of a codex home of this flavor. Both spell a `codex-home` prefix,
 /// so [`is_codex_home_dir_name`] covers every variant, and neither matches the
