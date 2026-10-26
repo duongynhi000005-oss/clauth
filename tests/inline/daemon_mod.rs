@@ -599,7 +599,7 @@ fn drain_pending_switch_drops_a_target_holding_no_login() {
             "clauth daemon: dropping queued switch to 'beta': it has no login or api key"
                 .to_string()
         ],
-        "the drop's log line is the ruled wording, pinned by equality"
+        "the drop's log line is pinned by equality"
     );
 }
 
@@ -699,7 +699,7 @@ fn drain_pending_switch_defers_a_target_whose_stored_login_cannot_be_read() {
             vec![format!(
                 "clauth daemon: deferring switch to '{target}': its stored login could not be read"
             )],
-            "an unreadable {file} defers with the ruled reason, pinned by equality"
+            "an unreadable {file} defers naming the unreadable store, pinned by equality"
         );
         assert_eq!(
             queued_targets(&daemon),
@@ -710,7 +710,8 @@ fn drain_pending_switch_defers_a_target_whose_stored_login_cannot_be_read() {
 }
 
 /// The deferral is bounded: a target whose store stays unreadable until its
-/// retry window closes is given up with the same ruled reason, never linked.
+/// retry window closes is given up naming that reason once and the skip,
+/// never linked.
 #[test]
 fn drain_pending_switch_gives_up_on_a_store_that_stays_unreadable() {
     let _home = HomeSandbox::new();
@@ -752,10 +753,11 @@ fn drain_pending_switch_gives_up_on_a_store_that_stays_unreadable() {
         vec![
             "clauth daemon: deferring switch to 'delta': its stored login could not be read"
                 .to_string(),
-            "clauth daemon: gave up switching to 'delta': its stored login could not be read"
+            "clauth daemon: gave up switching to 'delta': its stored login could not be read; \
+             skipping it until it reads again"
                 .to_string(),
         ],
-        "the deferral, then the give-up, each with the ruled reason"
+        "the deferral, then the give-up naming the skip, the reason said once"
     );
     assert_eq!(
         active_of(&daemon).as_deref(),
@@ -765,6 +767,82 @@ fn drain_pending_switch_gives_up_on_a_store_that_stays_unreadable() {
     assert!(
         queued_targets(&daemon).is_empty() && daemon.switch_backoff.is_none(),
         "the given-up target leaves neither a queued retry nor backoff state"
+    );
+}
+
+/// A give-up on a store that reads unreadable names that store and the skip,
+/// even when the deferral before it was a different reason: the line is the
+/// only trace of why the member drops out of the walk.
+#[test]
+fn a_give_up_on_an_unreadable_store_names_it_after_a_mid_fetch_deferral() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("delta", "at-delta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let delta = crate::profile::ProfileName::from("delta");
+    let creds = crate::profile::profile_dir(&delta)
+        .expect("profile dir")
+        .join("credentials.json");
+    let readable = std::fs::read(&creds).expect("read stored credentials");
+    let torn = "{\"claudeAiOauth\": {\"accessToken\": ";
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "delta");
+    let lines = crate::logline::LogLines::new();
+    let guard = lines.capture_here();
+    std::fs::write(&creds, torn).expect("tear the store");
+    daemon.drain_pending_switch();
+
+    std::fs::write(&creds, &readable).expect("restore the store");
+    mark_activity(&daemon.activity, &delta, ProfileActivity::Fetching);
+    daemon
+        .switch_backoff
+        .as_mut()
+        .expect("the first drain defers through the backoff")
+        .not_before = now_ms().saturating_sub(1);
+    daemon.drain_pending_switch();
+
+    std::fs::write(&creds, torn).expect("tear the store again");
+    let now = now_ms();
+    let backoff = daemon
+        .switch_backoff
+        .as_mut()
+        .expect("the mid-fetch drain keeps the backoff");
+    backoff.not_before = now.saturating_sub(1);
+    backoff.retry_until = now.saturating_sub(1);
+    daemon.drain_pending_switch();
+    drop(guard);
+
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth daemon: deferring switch to 'delta': its stored login could not be read"
+                .to_string(),
+            "clauth daemon: deferring switch to 'delta': target is mid-fetch".to_string(),
+            "clauth daemon: gave up switching to 'delta': its stored login could not be read \
+             (last deferral: target is mid-fetch); skipping it until it reads again"
+                .to_string(),
+        ],
+        "the give-up names the unreadable store, the last deferral and the skip"
+    );
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "an unreadable store is never linked"
+    );
+    assert!(
+        daemon
+            .skipped_unreadable
+            .lock()
+            .expect("skipped set")
+            .contains("delta"),
+        "the given-up member is skipped until its store reads again"
     );
 }
 
@@ -2824,8 +2902,19 @@ fn backoff_gate_gives_up_when_the_retry_window_closes() {
     });
     stage_switch(&daemon, "beta");
 
+    let lines = crate::logline::LogLines::new();
+    let guard = lines.capture_here();
     daemon.drain_pending_switch();
+    drop(guard);
 
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth daemon: gave up switching to 'beta' (last deferral: target is mid-fetch)"
+                .to_string()
+        ],
+        "a readable target's give-up names its last deferral as past, and no skip"
+    );
     assert!(
         daemon.switch_backoff.is_none(),
         "a closed retry window clears the backoff state"
@@ -2838,6 +2927,65 @@ fn backoff_gate_gives_up_when_the_retry_window_closes() {
         active_of(&daemon).as_deref(),
         Some("home"),
         "no switch is attempted past the window"
+    );
+}
+
+/// A store that deferred unreadable and reads again by the time the window
+/// closes is no longer the cause: the give-up names the unreadable read as the
+/// last deferral, never as the present state, and skips nothing.
+#[test]
+fn a_give_up_on_a_store_that_reads_again_names_the_unreadable_read_as_past() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("delta", "at-delta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let creds = crate::profile::profile_dir(&crate::profile::ProfileName::from("delta"))
+        .expect("profile dir")
+        .join("credentials.json");
+    let readable = std::fs::read(&creds).expect("read stored credentials");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "delta");
+    let lines = crate::logline::LogLines::new();
+    let guard = lines.capture_here();
+    std::fs::write(&creds, "{\"claudeAiOauth\": {\"accessToken\": ").expect("tear the store");
+    daemon.drain_pending_switch();
+
+    std::fs::write(&creds, &readable).expect("restore the store");
+    let now = now_ms();
+    let backoff = daemon
+        .switch_backoff
+        .as_mut()
+        .expect("the unreadable drain defers through the backoff");
+    backoff.not_before = now.saturating_sub(1);
+    backoff.retry_until = now.saturating_sub(1);
+    daemon.drain_pending_switch();
+    drop(guard);
+
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth daemon: deferring switch to 'delta': its stored login could not be read"
+                .to_string(),
+            "clauth daemon: gave up switching to 'delta' \
+             (last deferral: its stored login could not be read)"
+                .to_string(),
+        ],
+        "the give-up states the unreadable read as the last deferral only"
+    );
+    assert!(
+        !daemon
+            .skipped_unreadable
+            .lock()
+            .expect("skipped set")
+            .contains("delta"),
+        "a store that reads again is not skipped"
     );
 }
 

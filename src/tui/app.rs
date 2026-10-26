@@ -26779,18 +26779,22 @@ pub(crate) fn on_tick(app: &mut App) {
         // The daemon drain's twin: the queued target's login is re-read ON DISK
         // right before dispatch, because the in-memory `Profile` is stale until
         // the next reload and a login deleted out-of-process after the scan's
-        // enqueue must still stop the link. The proven-none outcome drops
-        // (silent, like the stale-cause neighbour above — no toast: the ruled
-        // "it has no login or api key" line lives in the daemon-log register,
-        // and a fresh visible string would be out of scope); an unreadable store
-        // is skipped for this drain, like the not-idle skip above, and its
-        // FIRST skip marks the member skipped so the next scan passes over it —
-        // never linked on a guess.
+        // enqueue must still stop the link. A proven-none store drops; an
+        // unreadable store's first skip marks the member and logs one line, the
+        // only trace of why it leaves the walk, and it is never linked on a guess.
         match crate::profile::stored_login(&name) {
             crate::profile::StoredLogin::HoldsNone => continue,
             crate::profile::StoredLogin::Unknown => {
-                if let Ok(mut s) = app.skipped_unreadable.lock() {
-                    s.insert(name.as_str().to_string());
+                let newly = app
+                    .skipped_unreadable
+                    .lock()
+                    .map(|mut s| s.insert(name.as_str().to_string()))
+                    .unwrap_or(false);
+                if newly {
+                    crate::logline::logline!(
+                        "clauth: not switching to '{name}': {}; skipping it until it reads again",
+                        crate::format::STORED_LOGIN_UNREADABLE
+                    );
                 }
                 continue;
             }

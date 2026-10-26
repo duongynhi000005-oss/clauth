@@ -332,17 +332,27 @@ impl super::Daemon {
             && b.target == target.as_str()
         {
             if now >= b.retry_until {
-                logline!(
-                    "clauth daemon: gave up switching to '{target}': {}",
-                    b.reason
-                );
-                self.switch_backoff = None;
-                // The give-up ends the retry window. A member whose store is
-                // still unreadable must not be re-picked off the stale config
-                // next scan, so mark it skipped until `stored_login` reads again.
                 if unreadable {
+                    // The give-up line is the only trace of why the member
+                    // leaves the walk, so it names the unreadable store whatever
+                    // the last deferral was.
+                    let last = if b.reason == crate::format::STORED_LOGIN_UNREADABLE {
+                        String::new()
+                    } else {
+                        format!(" (last deferral: {})", b.reason)
+                    };
+                    logline!(
+                        "clauth daemon: gave up switching to '{target}': {}{last}; skipping it until it reads again",
+                        crate::format::STORED_LOGIN_UNREADABLE
+                    );
                     self.mark_skipped_unreadable(&target);
+                } else {
+                    logline!(
+                        "clauth daemon: gave up switching to '{target}' (last deferral: {})",
+                        b.reason
+                    );
                 }
+                self.switch_backoff = None;
                 return;
             }
             if now < b.not_before {
@@ -357,7 +367,7 @@ impl super::Daemon {
         // that does the widening gap make it fire once per fresh retry, never once
         // per tick.
         if unreadable {
-            self.fail_switch(&decision, now, "its stored login could not be read");
+            self.fail_switch(&decision, now, crate::format::STORED_LOGIN_UNREADABLE);
             return;
         }
 
@@ -515,12 +525,13 @@ impl super::Daemon {
         }
     }
 
-    /// Handle a switch that couldn't execute (busy / diverged / transient / switch
-    /// error). Advances exponential backoff for this target, DEDUPS the failure
+    /// Handle a switch that couldn't execute (unreadable store / busy / diverged /
+    /// transient / switch error). Advances exponential backoff for this target, DEDUPS the failure
     /// log (emits only when the target or reason changes — a stuck switch never
-    /// logs 1/tick), and re-queues the decision until its retry window closes.
-    /// A change of target resets the backoff. The decision (target + cause) is
-    /// re-queued whole so a later repair still invalidates it at dispatch.
+    /// logs 1/tick), and re-queues the decision for the retry window the backoff
+    /// gate owns (the gate's give-up branch is the one that closes it). A change
+    /// of target resets the backoff. The decision (target + cause) is re-queued
+    /// whole so a later repair still invalidates it at dispatch.
     fn fail_switch(&mut self, decision: &PendingSwitchTarget, now: u64, reason: &str) {
         let target = decision.target.as_str();
         let (attempts, retry_until) = match &self.switch_backoff {
@@ -536,20 +547,14 @@ impl super::Daemon {
             logline!("clauth daemon: deferring switch to '{target}': {reason}");
             self.switch_failure_logs += 1;
         }
-        if now < retry_until {
-            self.switch_backoff = Some(SwitchBackoff {
-                target: target.to_string(),
-                attempts,
-                not_before: now.saturating_add(switch_backoff_ms(attempts)),
-                reason: reason.to_string(),
-                retry_until,
-            });
-            self.requeue_quiet(decision);
-        } else {
-            // Retry window closed — give up and stop tracking this target.
-            logline!("clauth daemon: gave up switching to '{target}': {reason}");
-            self.switch_backoff = None;
-        }
+        self.switch_backoff = Some(SwitchBackoff {
+            target: target.to_string(),
+            attempts,
+            not_before: now.saturating_add(switch_backoff_ms(attempts)),
+            reason: reason.to_string(),
+            retry_until,
+        });
+        self.requeue_quiet(decision);
     }
 
     /// Re-queue a retry decision. A NEWER target that arrived since the drain

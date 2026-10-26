@@ -2729,10 +2729,11 @@ fn on_tick_still_switches_to_a_sidecar_only_target() {
 
 /// An unreadable store (a `credentials.json` caught mid-write, a damaged
 /// `session-token.json` on a sidecar-only member) proves nothing about the
-/// target's login: the TUI drain skips it silently, like its not-idle skip,
-/// and never links it on a guess (linking a sidecar-only member past its
-/// corrupt sidecar installs no login and signs the global slot out). No
-/// switch gate is dispatched and no auto-switch toast is shown.
+/// target's login: the TUI drain skips it, like its not-idle skip, and never
+/// links it on a guess (linking a sidecar-only member past its corrupt sidecar
+/// installs no login and signs the global slot out). No switch gate is
+/// dispatched and no auto-switch toast is shown; one log line names the skip
+/// the first time the member is marked, never again while it stays marked.
 #[test]
 fn on_tick_never_links_a_queued_target_whose_stored_login_cannot_be_read() {
     use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_profile};
@@ -2771,6 +2772,8 @@ fn on_tick_never_links_a_queued_target_whose_stored_login_cannot_be_read() {
                 key_rejected_cause: None,
             });
 
+        let lines = crate::logline::LogLines::new();
+        let guard = lines.capture_here();
         super::on_tick(&mut app);
 
         assert!(
@@ -2779,9 +2782,26 @@ fn on_tick_never_links_a_queued_target_whose_stored_login_cannot_be_read() {
         );
         assert!(
             !app.toasts.iter().any(|t| t.body.contains("ghost")),
-            "the skip is silent: no auto-switch toast names the unreadable target ({file})"
+            "no auto-switch toast names the unreadable target ({file})"
         );
+        app.pending_switch
+            .lock()
+            .expect("pending")
+            .insert(crate::usage::PendingSwitchTarget {
+                target: "ghost".to_string(),
+                key_rejected_cause: None,
+            });
         super::on_tick(&mut app);
+        drop(guard);
+        assert_eq!(
+            lines.snapshot(),
+            vec![
+                "clauth: not switching to 'ghost': its stored login could not be read; \
+                 skipping it until it reads again"
+                    .to_string()
+            ],
+            "the first skip of an unreadable {file} logs once, the second none"
+        );
         assert_eq!(
             app.config().state.active_profile.as_deref(),
             Some("tp"),

@@ -571,6 +571,9 @@ pub(crate) fn expired_token_refreshed_by_claude(name: &crate::profile::ProfileNa
 /// TUI, never a bare "the TUI" (which reads as some other UI).
 pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the clauth TUI";
 
+/// The one spelling for a stored login that exists but cannot be read.
+pub(crate) const STORED_LOGIN_UNREADABLE: &str = "its stored login could not be read";
+
 /// The `s` a count needs: singular at one.
 pub(crate) fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }

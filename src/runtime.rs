@@ -3484,7 +3484,7 @@ impl std::fmt::Display for SwapRefused {
                 f.write_str("its api-key state differs from the launch snapshot")
             }
             Self::NoCredentialStore => f.write_str("it has no stored login"),
-            Self::LoginUnreadable => f.write_str("its stored login could not be read"),
+            Self::LoginUnreadable => f.write_str(crate::format::STORED_LOGIN_UNREADABLE),
             Self::MarkerNotLockable => {
                 f.write_str("its liveness marker is held by another process")
             }
