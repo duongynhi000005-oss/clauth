@@ -2286,6 +2286,23 @@ fn a_hand_off_keeps_the_later_expiring_mcp_login() {
     );
 }
 
+/// The hand-off picks the copy to keep the way every switch carry does
+/// (`copy_non_login_keys`): a signed-out entry, which carries no token field,
+/// never replaces a store's working login, even one without an expiry.
+#[test]
+fn a_hand_off_never_carries_a_signed_out_entry_over_a_login() {
+    let mut store = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "incoming-bearer" },
+        "mcpOAuth": { "srv": { "accessToken": "working" } }
+    });
+    let carried = carried_keys_of(&serde_json::json!({
+        "mcpOAuth": { "srv": { "serverName": "srv", "serverUrl": "https://mcp.example" } }
+    }))
+    .expect("carried");
+    assert!(!merge_carried_into_store(&mut store, &carried).expect("merge"));
+    assert_eq!(store["mcpOAuth"]["srv"]["accessToken"], "working");
+}
+
 /// Garbage on either side is handled without a panic: an item that is not an
 /// object carries nothing, and a store that is not an object refuses the merge,
 /// which the caller turns into quarantine-then-delete.
