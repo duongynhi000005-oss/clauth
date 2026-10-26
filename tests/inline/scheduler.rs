@@ -23617,6 +23617,7 @@ fn oauth_leg(activity: &ActivityStore, name: &str) -> Option<ProfileActivity> {
 
 /// Puts `name`'s stored expiry inside the rotation lead window, so the poll
 /// takes the proactive arm: no probe runs first to mark the OAuth leg itself.
+#[cfg(not(target_os = "macos"))]
 fn make_rotation_proactive(config: &crate::profile::ConfigHandle, name: &str) -> i64 {
     let soon = crate::usage::now_ms() as i64 + 300_000;
     let mut cfg = config.lock().unwrap();
