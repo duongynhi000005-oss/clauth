@@ -1556,6 +1556,81 @@ fn a_selector_row_with_a_fix_line_ends_in_a_trailing_f() {
     );
 }
 
+/// The selected row's `BG_HOVER` band is unbroken from the caret's first cell
+/// to the list's last content cell, and the label cells promote to `TEXT +
+/// bold`. The block's right padding column, where an overflow scrollbar draws,
+/// stays untinted.
+#[test]
+fn the_selected_services_row_tints_from_the_caret_to_the_content_edge() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_with_checks(vec![
+        crate::tui::app::shunt_check(
+            &shunt_slot(crate::daemon::gateway::GatewayState::Absent),
+            false,
+            None,
+        ),
+        delegates_check(&[], &[]),
+        plugin_check_with_problems(),
+        herdr_check(&healthy_probe(), Some(&healthy_config())),
+    ]);
+    assert!(
+        matches!(app.services.focus, crate::tui::app::ServicesFocus::List),
+        "fixture: the list owns focus"
+    );
+    assert_eq!(app.services.cursor, 0, "fixture: the first row is selected");
+
+    let (rows, buf) = render(&app);
+    let screen = rows.join("\n");
+    let row_idx = rows
+        .iter()
+        .position(|r| r.contains("● shunt"))
+        .unwrap_or_else(|| panic!("no shunt selector row:\n{screen}"));
+    let row = &rows[row_idx];
+    let cell = |x: usize, y: usize| &buf.content[y * W as usize + x];
+
+    let caret_x = (0..W as usize)
+        .find(|&x| cell(x, row_idx).symbol() == "❯")
+        .expect("the selected row draws a caret");
+    // The list's content rect, measured off the pane's own right border: the
+    // block's 1-cell right padding column (the scrollbar's cell) sits just
+    // inside that border, and the content's last cell one cell further left.
+    let border_x = (caret_x..W as usize)
+        .find(|&x| cell(x, row_idx).symbol() == "│")
+        .expect("the selector pane draws a right border");
+    let content_right = border_x - 2;
+    let hover = super::theme::bg_hover();
+
+    for x in caret_x..=content_right {
+        assert_eq!(
+            cell(x, row_idx).style().bg,
+            Some(hover),
+            "the selected row's tint has a hole at column {x} of {}:\n{row}",
+            content_right
+        );
+    }
+    assert_ne!(
+        cell(content_right + 1, row_idx).style().bg,
+        Some(hover),
+        "the padding/scrollbar column stays untinted:\n{row}"
+    );
+
+    let dot_byte = row.find("● shunt").expect("the label renders");
+    let label_x = row[..dot_byte].chars().count() + 2;
+    for x in label_x..label_x + "shunt".chars().count() {
+        let c = cell(x, row_idx);
+        assert_eq!(
+            c.fg,
+            super::theme::text_color(),
+            "label cell {x} is TEXT:\n{row}"
+        );
+        assert!(
+            c.modifier.contains(ratatui::style::Modifier::BOLD),
+            "label cell {x} is bold:\n{row}"
+        );
+    }
+}
+
 /// A page key hid the plugin walk focus: `f` lands on the first fix line at or
 /// below the top of what the pane shows, and wraps to the first fix line when
 /// every one sits above it.

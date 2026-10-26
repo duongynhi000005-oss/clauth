@@ -47064,6 +47064,32 @@ fn a_plugin_row_health_change_out_of_view_colors_services() {
     );
 }
 
+/// The in-view recompute hands the plugin row the `clauth` path it resolved on
+/// PATH, so the row names the binary rather than reading "not on PATH" while
+/// clauth is installed.
+#[cfg(unix)]
+#[test]
+fn the_plugin_row_in_view_names_the_clauth_path_the_recompute_resolved() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _path = ClauthPath::new(&_home);
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    let expected = format!(
+        "path: {}",
+        _home.home().join("bin").join("clauth").display()
+    );
+    let line = plugin_check(&app)
+        .detail
+        .iter()
+        .find(|line| line.starts_with("path: "));
+    assert_eq!(
+        line.map(String::as_str),
+        Some(expected.as_str()),
+        "the in-view recompute names the clauth path it resolved"
+    );
+}
+
 /// A herdr row recovering to Ok while Services is out of view colors the
 /// Services tab Success.
 #[test]

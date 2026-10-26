@@ -22,7 +22,7 @@ use super::format::{
 };
 use super::panes::{
     draw_scrollbar, empty_state, follow_scroll_offset, key_cell, master_detail, section_box,
-    section_box_verbatim, wrap_words,
+    section_box_verbatim, with_bg, wrap_words,
 };
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase, shorten_component_status};
 
@@ -126,15 +126,7 @@ fn incident_rows(
     pane_focused: bool,
     content_w: usize,
 ) -> Vec<Line<'static>> {
-    let tint = if selected {
-        Some(theme::bg_hover())
-    } else {
-        None
-    };
-    let with_bg = |style: Style| match tint {
-        Some(c) => style.bg(c),
-        None => style,
-    };
+    let tint = selected.then(theme::bg_hover);
 
     // The stacked selector reaches content widths under the 2-cell gutter; the
     // row keeps its leading indent inside `content_w` rather than overrunning.
@@ -154,10 +146,11 @@ fn incident_rows(
                 Style::default()
                     .fg(theme::accent_color())
                     .add_modifier(Modifier::BOLD),
+                tint,
             ),
         )
     } else {
-        Span::styled(caret_text, with_bg(Style::default()))
+        Span::styled(caret_text, with_bg(Style::default(), tint))
     };
     // Unselected titles read as primary content (TEXT); the selected one keeps
     // the focused TEXT + bold promotion.
@@ -166,9 +159,10 @@ fn incident_rows(
             Style::default()
                 .fg(theme::text_color())
                 .add_modifier(Modifier::BOLD),
+            tint,
         )
     } else {
-        with_bg(theme::body())
+        with_bg(theme::body(), tint)
     };
     let title = truncate(&incident.title, content_w.saturating_sub(caret_w));
     let mut line1 = vec![caret, Span::styled(title, title_style)];
@@ -178,8 +172,10 @@ fn incident_rows(
     // word) + right-aligned age. Ongoing incidents swap the age for the phase
     // colour's `●` beside its word. Ongoing: phase word > impact; resolved:
     // impact > age.
-    let mut line2: Vec<Span<'static>> =
-        vec![Span::styled(" ".repeat(gutter), with_bg(Style::default()))];
+    let mut line2: Vec<Span<'static>> = vec![Span::styled(
+        " ".repeat(gutter),
+        with_bg(Style::default(), tint),
+    )];
     let mut used = gutter;
 
     let active = incident.is_active();
@@ -206,12 +202,15 @@ fn incident_rows(
         };
         if pill_stays_whole {
             line2.extend([
-                Span::styled("[ ", with_bg(theme::dim())),
+                Span::styled("[ ", with_bg(theme::dim(), tint)),
                 Span::styled(
                     iword,
-                    with_bg(Style::default().fg(icolor).add_modifier(Modifier::BOLD)),
+                    with_bg(
+                        Style::default().fg(icolor).add_modifier(Modifier::BOLD),
+                        tint,
+                    ),
                 ),
-                Span::styled(" ]", with_bg(theme::dim())),
+                Span::styled(" ]", with_bg(theme::dim(), tint)),
             ]);
             used += pill_w;
         } else if !active {
@@ -223,12 +222,15 @@ fn incident_rows(
             {
                 used += 4 + cut_w;
                 line2.extend([
-                    Span::styled("[ ", with_bg(theme::dim())),
+                    Span::styled("[ ", with_bg(theme::dim(), tint)),
                     Span::styled(
                         cut,
-                        with_bg(Style::default().fg(icolor).add_modifier(Modifier::BOLD)),
+                        with_bg(
+                            Style::default().fg(icolor).add_modifier(Modifier::BOLD),
+                            tint,
+                        ),
                     ),
-                    Span::styled(" ]", with_bg(theme::dim())),
+                    Span::styled(" ]", with_bg(theme::dim(), tint)),
                 ]);
             }
         }
@@ -245,19 +247,26 @@ fn incident_rows(
                 Style::default()
                     .fg(phase_text_color(&incident.phase))
                     .add_modifier(Modifier::BOLD),
+                tint,
             ),
         );
         if let Some((cut, cut_w)) = truncate_keeping_a_grapheme(&word, word_w, budget) {
             let gap = content_w.saturating_sub(used + (2 + cut_w) + 1);
-            line2.push(Span::styled(" ".repeat(gap), with_bg(Style::default())));
+            line2.push(Span::styled(
+                " ".repeat(gap),
+                with_bg(Style::default(), tint),
+            ));
             line2.push(dot);
-            line2.push(Span::styled(" ", with_bg(Style::default())));
-            line2.push(Span::styled(cut, with_bg(theme::dim())));
+            line2.push(Span::styled(" ", with_bg(Style::default(), tint)));
+            line2.push(Span::styled(cut, with_bg(theme::dim(), tint)));
         } else {
             // Not even one word cell fits: the bare dot, never a lone ellipsis.
             let gap = content_w.saturating_sub(used + 2);
             if gap > 0 {
-                line2.push(Span::styled(" ".repeat(gap), with_bg(Style::default())));
+                line2.push(Span::styled(
+                    " ".repeat(gap),
+                    with_bg(Style::default(), tint),
+                ));
                 line2.push(dot);
             }
         }
@@ -266,8 +275,11 @@ fn incident_rows(
         let age_w = grapheme_cells(&age);
         if used + 2 + age_w <= content_w {
             let gap = content_w.saturating_sub(used + age_w + 1);
-            line2.push(Span::styled(" ".repeat(gap), with_bg(Style::default())));
-            line2.push(Span::styled(age, with_bg(theme::faint())));
+            line2.push(Span::styled(
+                " ".repeat(gap),
+                with_bg(Style::default(), tint),
+            ));
+            line2.push(Span::styled(age, with_bg(theme::faint(), tint)));
         }
     }
     pad_to(&mut line2, content_w, tint);
@@ -295,11 +307,10 @@ fn pad_to(spans: &mut Vec<Span<'static>>, content_w: usize, tint: Option<ratatui
     let used: usize = spans.iter().map(|span| grapheme_cells(&span.content)).sum();
     let pad = content_w.saturating_sub(used);
     if pad > 0 {
-        let style = match tint {
-            Some(c) => Style::default().bg(c),
-            None => Style::default(),
-        };
-        spans.push(Span::styled(" ".repeat(pad), style));
+        spans.push(Span::styled(
+            " ".repeat(pad),
+            with_bg(Style::default(), tint),
+        ));
     }
 }
 

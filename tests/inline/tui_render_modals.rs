@@ -4786,6 +4786,25 @@ fn label_cells(buf: &ratatui::buffer::Buffer, y: u16, caret: u16, right: u16) ->
     cells
 }
 
+/// Where ASCII `needle` starts on row `y` between the modal borders, or
+/// `None` when the row does not hold it.
+fn row_needle_start(
+    buf: &ratatui::buffer::Buffer,
+    y: u16,
+    left: u16,
+    right: u16,
+    needle: &str,
+) -> Option<u16> {
+    let cells: Vec<char> = (left + 1..right)
+        .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+        .collect();
+    let needle_chars: Vec<char> = needle.chars().collect();
+    cells
+        .windows(needle_chars.len())
+        .position(|window| window == needle_chars.as_slice())
+        .map(|start| left + 1 + start as u16)
+}
+
 /// Whether row `y` between the modal borders holds ASCII `needle`.
 fn row_has_text(
     buf: &ratatui::buffer::Buffer,
@@ -4794,13 +4813,7 @@ fn row_has_text(
     right: u16,
     needle: &str,
 ) -> bool {
-    let cells: Vec<char> = (left + 1..right)
-        .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-        .collect();
-    let needle_chars: Vec<char> = needle.chars().collect();
-    cells
-        .windows(needle_chars.len())
-        .any(|window| window == needle_chars.as_slice())
+    row_needle_start(buf, y, left, right, needle).is_some()
 }
 
 /// The x range of ASCII `needle` on row `y` between the modal borders; panics
@@ -4812,15 +4825,9 @@ fn row_text(
     right: u16,
     needle: &str,
 ) -> std::ops::Range<u16> {
-    let cells: Vec<char> = (left + 1..right)
-        .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-        .collect();
-    let needle_chars: Vec<char> = needle.chars().collect();
-    let start = cells
-        .windows(needle_chars.len())
-        .position(|window| window == needle_chars.as_slice())
+    let start = row_needle_start(buf, y, left, right, needle)
         .unwrap_or_else(|| panic!("`{needle}` on row {y}"));
-    (left + 1 + start as u16)..(left + 1 + start as u16 + needle_chars.len() as u16)
+    start..start + needle.chars().count() as u16
 }
 
 /// Every pick-one modal (divergence, divergence target, env collision, preset
@@ -4969,7 +4976,7 @@ fn pick_one_modals_take_the_action_menu_row_look() {
         total: Cell::new(0),
     }));
     let buf = frame_buffer(&app);
-    let (y, _, _, caret) = modal_caret_row(&buf);
+    let (y, left, _, caret) = modal_caret_row(&buf);
     let below = &buf[(caret + 2, y + 1)];
     assert_eq!(
         below.symbol(),
@@ -4986,6 +4993,23 @@ fn pick_one_modals_take_the_action_menu_row_look() {
         theme::bg_hover(),
         "an unselected option carries no tint"
     );
+    let fill = buf[(left + 1, y + 1)].bg;
+    for x in [left + 3, left + 4] {
+        let cell = &buf[(x, y + 1)];
+        assert_eq!(
+            cell.symbol(),
+            " ",
+            "the unselected row's gutter is blank at x={x}"
+        );
+        assert_eq!(
+            cell.bg, fill,
+            "the unselected row's gutter carries the modal fill at x={x}"
+        );
+        assert!(
+            cell.modifier.is_empty(),
+            "the unselected row's gutter is unstyled at x={x}"
+        );
+    }
 }
 
 /// The `+ new account` and `+ new profile` synthetic rows keep their ACCENT
@@ -5092,6 +5116,23 @@ fn the_new_rows_keep_accent_identity_selected_and_unselected() {
         " ",
         "the unselected row's gutter is blank"
     );
+    let fill = buf[(left + 1, above)].bg;
+    for x in [left + 3, left + 4] {
+        let cell = &buf[(x, above)];
+        assert_eq!(
+            cell.symbol(),
+            " ",
+            "the unselected row's gutter is blank at x={x}"
+        );
+        assert_eq!(
+            cell.bg, fill,
+            "the unselected row's gutter carries the modal fill at x={x}"
+        );
+        assert!(
+            cell.modifier.is_empty(),
+            "the unselected row's gutter is unstyled at x={x}"
+        );
+    }
     let plus = &buf[(left + 5, above)];
     assert_eq!(plus.symbol(), "+", "the unselected row is `+ new account`");
     assert_eq!(
@@ -5123,6 +5164,23 @@ fn the_new_rows_keep_accent_identity_selected_and_unselected() {
     let buf = frame_buffer(&app);
     let (y, left, _, _) = modal_caret_row(&buf);
     let above = y - 1;
+    let fill = buf[(left + 1, above)].bg;
+    for x in [left + 3, left + 4] {
+        let cell = &buf[(x, above)];
+        assert_eq!(
+            cell.symbol(),
+            " ",
+            "the unselected row's gutter is blank at x={x}"
+        );
+        assert_eq!(
+            cell.bg, fill,
+            "the unselected row's gutter carries the modal fill at x={x}"
+        );
+        assert!(
+            cell.modifier.is_empty(),
+            "the unselected row's gutter is unstyled at x={x}"
+        );
+    }
     let plus = &buf[(left + 5, above)];
     assert_eq!(
         plus.symbol(),
@@ -5301,8 +5359,8 @@ fn pick_one_suffix_env_and_wrapped_rows_tint_their_whole_block() {
         label_end += 1;
     }
     assert!(
-        label_end < bottom,
-        "the wrapped label's closing `picker'` sits below the caret row"
+        label_end > y && label_end < bottom,
+        "the wrapped label's closing `picker'` sits below the caret row, inside the frame"
     );
     for yy in y..=label_end {
         assert_eq!(

@@ -12458,12 +12458,12 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
     app.services.settle_delegates_selection();
     checks.push(delegates_check(&app.services.delegates, &rate_limited));
 
-    // plugin + herdr rows — the folded readout, over the cached probes + the
-    // PATH read. The herdr probe is cached (its worker lands it, above); the
-    // config read is a cheap `fs::read_to_string` that rides the tick, using
-    // the path the probe already resolved. No herdr row when herdr does not
-    // resolve or its probe has not landed yet.
-    let (plugin_check, herdr) = plugin_herdr_checks(app);
+    // plugin + herdr rows — the folded readout, over the clauth binary path
+    // resolved above and the cached probes. The herdr probe is cached (its
+    // worker lands it, above); the config read is a cheap `fs::read_to_string`
+    // that rides the tick, using the config path the herdr probe resolved. No
+    // herdr row when herdr does not resolve or its probe has not landed yet.
+    let (plugin_check, herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
     let plugin_health = plugin_check.health;
     checks.push(plugin_check);
     let herdr_health = match herdr {
@@ -27183,13 +27183,17 @@ fn poll_services_refresh(app: &mut App) {
     }
 }
 
-/// Read the plugin and herdr rows' health from the cached probes and the local
-/// config files — the cheap reads the in-view recompute and the out-of-view
-/// refresh share. Never spawns a process.
-fn plugin_herdr_checks(app: &App) -> (Check, Option<(Check, Option<crate::herdr::ConfigStatus>)>) {
-    let clauth_path = crate::plugin_probe::on_path("clauth");
+/// Read the plugin and herdr rows' health from the clauth path the caller
+/// resolved, the cached probes and the local config files — the cheap reads
+/// the in-view recompute and the out-of-view refresh share. Never spawns a
+/// process. `clauth_path` is passed in so a recompute that already walked
+/// `PATH` for its own gates walks it once, not again here.
+fn plugin_herdr_checks(
+    app: &App,
+    clauth_path: Option<&std::path::Path>,
+) -> (Check, Option<(Check, Option<crate::herdr::ConfigStatus>)>) {
     let plugin = plugin_check(
-        clauth_path.as_deref(),
+        clauth_path,
         app.services.cc_version.clone(),
         app.services.mcp_boot.clone(),
     );
@@ -27211,11 +27215,12 @@ fn plugin_herdr_checks(app: &App) -> (Check, Option<(Check, Option<crate::herdr:
 }
 
 /// Re-read only the plugin and herdr rows' health while the Services tab is
-/// out of view, then record it for tab activity. Cheap local reads only — the
-/// cached probes and config file — so no subprocess and no shunt probe start
-/// out of view.
+/// out of view, then record it for tab activity. Cheap local reads only — one
+/// PATH walk, the cached probes and config file — so no subprocess and no
+/// shunt probe start out of view.
 fn refresh_services_activity(app: &mut App) {
-    let (plugin, herdr) = plugin_herdr_checks(app);
+    let clauth_path = crate::plugin_probe::on_path("clauth");
+    let (plugin, herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
     record_plugin_herdr_health(
         app,
         plugin.health,

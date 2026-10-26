@@ -45,7 +45,8 @@ use super::panes::{
     draw_scrolled_lines, draw_scrolled_lines_with_footnote, empty_state, empty_state_lines,
     follow_scroll_offset, footnote_lines, footnote_split, head_cols, help_tooltip_lines,
     help_tooltip_lines_at, highlight_row, invalid_tooltip_lines, key_cell, label_style,
-    master_detail, place_caret, section_box, select_line, toggle_value, value_caret, wrap_words,
+    master_detail, place_caret, section_box, select_line, toggle_value, value_caret, with_bg,
+    wrap_words,
 };
 use super::prose;
 use crate::gateway_edit::{
@@ -141,10 +142,6 @@ fn selector_row(
     content_w: usize,
 ) -> Line<'static> {
     let tint = selected.then(theme::bg_hover);
-    let with_bg = |style: Style| match tint {
-        Some(color) => style.bg(color),
-        None => style,
-    };
 
     let caret = if selected && focused {
         Span::styled(
@@ -153,16 +150,20 @@ fn selector_row(
                 Style::default()
                     .fg(theme::accent_color())
                     .add_modifier(Modifier::BOLD),
+                tint,
             ),
         )
     } else {
-        Span::styled("  ", with_bg(Style::default()))
+        Span::styled("  ", with_bg(Style::default(), tint))
     };
-    let dot = Span::styled("● ", with_bg(Style::default().fg(health_color(health))));
+    let dot = Span::styled(
+        "● ",
+        with_bg(Style::default().fg(health_color(health)), tint),
+    );
     let label_style = if selected && focused {
-        with_bg(theme::body().add_modifier(Modifier::BOLD))
+        with_bg(theme::body().add_modifier(Modifier::BOLD), tint)
     } else {
-        with_bg(theme::body())
+        with_bg(theme::body(), tint)
     };
 
     let mut spans = vec![caret, dot, Span::styled(label.to_string(), label_style)];
@@ -170,11 +171,14 @@ fn selector_row(
     let mark = has_fix && used + RIGHT_COLUMN_GAP < content_w;
     let pad = content_w.saturating_sub(used + usize::from(mark));
     if pad > 0 {
-        spans.push(Span::styled(" ".repeat(pad), with_bg(Style::default())));
+        spans.push(Span::styled(
+            " ".repeat(pad),
+            with_bg(Style::default(), tint),
+        ));
     }
     if mark {
         let f = fix_mark();
-        let style = with_bg(f.style);
+        let style = with_bg(f.style, tint);
         spans.push(f.style(style));
     }
     Line::from(spans)

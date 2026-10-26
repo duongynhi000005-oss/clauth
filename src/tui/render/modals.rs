@@ -25,7 +25,7 @@ use super::panes::{
     DIAG_KEY_REJECTED, DIAG_KICK, DIAG_LOGGED_OUT, DIAG_NO_USAGE, DIAG_SCOPED_SPENT_LEGEND,
     DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, META_RULE_MIN, bold_when, draw_scrollbar,
     draw_scrolled_lines, field_window, follow_scroll_offset, follow_scroll_offset_tail, head_cols,
-    key_cell, meta_line, place_caret, right_meta_fits, title_label,
+    key_cell, meta_line, place_caret, right_meta_fits, title_label, with_bg,
 };
 use super::prose::{self, cmd_lit, key_lit};
 use crate::fallback::BlockedReason;
@@ -1464,28 +1464,28 @@ fn divergence_action_text(action: &DivergenceAction, active: &str) -> String {
     }
 }
 
-/// Arrow-selected menu row shared by the Divergence and target-picker modals,
-/// the action-menu row look: `❯ ` in ACCENT + bold and the label in TEXT +
-/// bold, both on a `BG_HOVER` tint, when selected; an unselected label is
-/// TEXT, not bold, on no tint. The scrolled-modal draw pads the tint to the
-/// modal's full content width.
-fn option_line(selected: bool, label: String) -> Line<'static> {
+/// Arrow-selected menu row shared by every pick-one modal and the `+ new`
+/// rows, the action-menu row look: `❯ ` in ACCENT + bold and the label in
+/// `rest` + bold, both on a `BG_HOVER` tint, when selected; an unselected row
+/// is `rest`, not bold, on no tint. The scrolled-modal draw pads the tint to
+/// the modal's full content width.
+fn pick_row(selected: bool, label: String, rest: Style) -> Line<'static> {
     let tint = selected.then(theme::bg_hover);
-    let with_bg = |style: Style| match tint {
-        Some(color) => style.bg(color),
-        None => style,
-    };
     let arrow = if selected {
-        Span::styled("\u{276f} ", with_bg(theme::accent().bold()))
+        Span::styled("\u{276f} ", with_bg(theme::accent().bold(), tint))
     } else {
         Span::raw("  ")
     };
     let style = if selected {
-        with_bg(theme::body().bold())
+        with_bg(rest.bold(), tint)
     } else {
-        theme::body()
+        rest
     };
     Line::from(vec![arrow, Span::styled(label, style)])
+}
+
+fn option_line(selected: bool, label: String) -> Line<'static> {
+    pick_row(selected, label, theme::body())
 }
 
 fn draw_divergence_target(frame: &mut Frame<'_>, area: Rect, form: &DivergenceTargetForm) {
@@ -1557,22 +1557,7 @@ fn draw_token_picker(frame: &mut Frame<'_>, area: Rect, form: &TokenPickerForm) 
 /// while selected (the `+ new` row's color is its identity), with the
 /// action-menu tint when selected.
 fn new_row(selected: bool, label: &str) -> Line<'static> {
-    let tint = selected.then(theme::bg_hover);
-    let with_bg = |style: Style| match tint {
-        Some(color) => style.bg(color),
-        None => style,
-    };
-    let arrow = if selected {
-        Span::styled("\u{276f} ", with_bg(theme::accent().bold()))
-    } else {
-        Span::raw("  ")
-    };
-    let style = if selected {
-        with_bg(theme::accent().bold())
-    } else {
-        theme::accent()
-    };
-    Line::from(vec![arrow, Span::styled(label.to_string(), style)])
+    pick_row(selected, label.to_string(), theme::accent())
 }
 
 /// One profile row of the token picker: the shared `option_line` shape (the
@@ -1582,11 +1567,7 @@ fn new_row(selected: bool, label: &str) -> Line<'static> {
 fn token_picker_row(selected: bool, name: &str, has_token: bool) -> Line<'static> {
     let mut line = option_line(selected, name.to_string());
     if has_token {
-        let style = if selected {
-            theme::dim().bg(theme::bg_hover())
-        } else {
-            theme::dim()
-        };
+        let style = with_bg(theme::dim(), selected.then(theme::bg_hover));
         line.push_span(Span::styled("  has a token", style));
     }
     line
@@ -1641,29 +1622,15 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
 
     for (i, option) in options.iter().enumerate() {
         let selected = i == cursor;
-        let tint = selected.then(theme::bg_hover);
-        let with_bg = |style: Style| match tint {
-            Some(color) => style.bg(color),
-            None => style,
-        };
-        let arrow = if selected {
-            Span::styled("\u{276f} ", with_bg(theme::accent().bold()))
-        } else {
-            Span::raw("  ")
-        };
         let (label, detail) = env_collision_option_text(*option, form);
-        let label_style = if selected {
-            with_bg(theme::body().bold())
-        } else {
-            theme::body()
-        };
-        lines.push(Line::from(vec![arrow, Span::styled(label, label_style)]));
+        lines.push(option_line(selected, label));
         // The detail line is part of the selected option's block: it keeps
         // TEXT_DIM but rides the same tint, so a wrapped option tints every
         // line of its block.
+        let tint = selected.then(theme::bg_hover);
         lines.push(Line::from(vec![
-            Span::styled("    ", with_bg(Style::default())),
-            Span::styled(detail, with_bg(theme::dim())),
+            Span::styled("    ", with_bg(Style::default(), tint)),
+            Span::styled(detail, with_bg(theme::dim(), tint)),
         ]));
     }
 
@@ -1798,11 +1765,7 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
         let selected = i == cursor;
         let mut line = option_line(selected, preset.name.clone());
         if preset.builtin {
-            let style = if selected {
-                theme::dim().bg(theme::bg_hover())
-            } else {
-                theme::dim()
-            };
+            let style = with_bg(theme::dim(), selected.then(theme::bg_hover));
             line.push_span(Span::styled("  built-in", style));
         }
         lines.push(line);

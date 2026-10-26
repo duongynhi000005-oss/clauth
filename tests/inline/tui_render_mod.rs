@@ -2410,7 +2410,9 @@ fn status_selected_row_tint_spans_both_lines() {
     app.status.incidents = demo_incidents();
     app.tab = Tab::Status;
     app.status.focus = StatusFocus::List;
-    app.status.cursor = 0;
+    // The resolved incident's second line carries the relative age; the
+    // ongoing one swaps that span for its phase word.
+    app.status.cursor = 1;
 
     let (w, h) = (90u16, 20u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -2433,29 +2435,35 @@ fn status_selected_row_tint_spans_both_lines() {
         }
     }
     let caret_y = caret_y.expect("selected incident renders a caret");
+    let caret_x = (0..w)
+        .find(|&x| cell(x, caret_y).symbol() == "❯")
+        .expect("the caret cell");
+    // The list's content rect, measured off the pane's own right border rather
+    // than the tint: the block's 1-cell right padding column (where an overflow
+    // scrollbar draws) sits just inside that border, and the content's last
+    // cell one cell further left. A band that stops short must not move the
+    // edge it is checked against.
+    let border_x = (caret_x..w)
+        .find(|&x| cell(x, caret_y).symbol() == "│")
+        .expect("the incident list draws a right border");
+    let content_right = border_x - 2;
+    assert!(
+        content_right > caret_x,
+        "the scanned band must reach past the caret"
+    );
 
-    let row_has_full_tint = |y: u16| {
-        let caret_x = (0..w).find(|&x| cell(x, caret_y).symbol() == "❯").unwrap();
-        let mut saw_filler_tint = false;
-        for x in caret_x..w {
-            let c = cell(x, y);
-            if c.style().bg != Some(hover) {
-                return saw_filler_tint && x > caret_x + 4;
-            }
-            if c.symbol() == " " {
-                saw_filler_tint = true;
-            }
-        }
-        saw_filler_tint
-    };
+    // Any untinted cell left of the content's right edge is a hole in the
+    // BG_HOVER band; the band has to reach that edge.
+    let row_has_full_tint =
+        |y: u16| (caret_x..=content_right).all(|x| cell(x, y).style().bg == Some(hover));
 
     assert!(
         row_has_full_tint(caret_y),
-        "title row tint must span the full content width"
+        "title row tint must span from the caret to the content edge"
     );
     assert!(
         row_has_full_tint(caret_y + 1),
-        "pill row tint must span the full content width"
+        "age row tint must span from the caret to the content edge"
     );
 }
 

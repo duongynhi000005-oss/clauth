@@ -5,7 +5,7 @@ use std::cell::Cell;
 
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
@@ -209,6 +209,15 @@ pub(super) fn bold_when(style: Style, cond: bool) -> Style {
         style.add_modifier(Modifier::BOLD)
     } else {
         style
+    }
+}
+
+/// The `BG_HOVER` tint a selected row's block rides; an unselected row leaves
+/// the style untouched.
+pub(super) fn with_bg(style: Style, tint: Option<Color>) -> Style {
+    match tint {
+        Some(color) => style.bg(color),
+        None => style,
     }
 }
 
