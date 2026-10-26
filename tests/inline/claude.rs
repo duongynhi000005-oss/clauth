@@ -2152,6 +2152,122 @@ fn a_store_with_no_account_keys_is_already_signed_out() {
     );
 }
 
+/// The refreshless swap hand-off: an item holding a login and MCP logins puts
+/// the MCP logins into the incoming store, beside the store's own login, and
+/// the item is deleted. A strip-and-rewrite would leave an item holding only
+/// `mcpOAuth`, which Claude Code reads before the file as "Not logged in".
+#[test]
+fn a_hand_off_moves_the_mcp_logins_into_the_store_and_deletes_the_item() {
+    let item = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "outgoing-login" },
+        "organizationUuid": "org-1",
+        "mcpOAuth": { "linear": { "accessToken": "mock-linear" } }
+    });
+    let mut store = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "incoming-bearer" }
+    });
+
+    let carried = carried_keys_of(&item).expect("the item carries its MCP logins");
+    assert_eq!(
+        carried.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["mcpOAuth"],
+        "only the carried keys leave the item, never its login or identity"
+    );
+    assert!(merge_carried_into_store(&mut store, &carried).expect("merge"));
+    assert_eq!(
+        store["claudeAiOauth"]["accessToken"], "incoming-bearer",
+        "the store keeps its own login"
+    );
+    assert_eq!(store["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
+    assert!(store.get("organizationUuid").is_none());
+    assert_eq!(hand_off_after_carry(true), HandOff::Delete);
+}
+
+/// An item holding only the login carries nothing: the store is left as it is
+/// and the item still goes.
+#[test]
+fn a_hand_off_over_a_login_only_item_leaves_the_store_unchanged() {
+    let item = serde_json::json!({ "claudeAiOauth": { "accessToken": "outgoing-login" } });
+    assert!(carried_keys_of(&item).is_none());
+    // Nothing to carry reads as a landed carry: the item is deleted.
+    assert_eq!(hand_off_after_carry(true), HandOff::Delete);
+
+    let mut store = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "incoming-bearer" },
+        "mcpOAuth": { "github": { "accessToken": "store-github" } }
+    });
+    let before = store.clone();
+    assert!(
+        !merge_carried_into_store(&mut store, &serde_json::Map::new()).expect("merge"),
+        "an empty carry changes nothing"
+    );
+    assert_eq!(store, before);
+}
+
+/// The item's MCP entry wins over the store's copy of the same server, and a
+/// server only the store holds keeps its login: the merge adds, never deletes.
+#[test]
+fn a_hand_off_takes_the_items_mcp_entry_and_keeps_the_stores_others() {
+    let item = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "outgoing-login" },
+        "mcpOAuth": { "linear": { "accessToken": "newer-linear" } }
+    });
+    let mut store = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "incoming-bearer" },
+        "mcpOAuth": {
+            "linear": { "accessToken": "older-linear" },
+            "github": { "accessToken": "store-github" }
+        }
+    });
+
+    let carried = carried_keys_of(&item).expect("carried");
+    assert!(merge_carried_into_store(&mut store, &carried).expect("merge"));
+    assert_eq!(store["mcpOAuth"]["linear"]["accessToken"], "newer-linear");
+    assert_eq!(
+        store["mcpOAuth"]["github"]["accessToken"], "store-github",
+        "a server only the store holds stays"
+    );
+    assert!(
+        !merge_carried_into_store(&mut store, &carried).expect("merge"),
+        "a second hand-off of the same item writes nothing"
+    );
+}
+
+/// Garbage on either side is handled without a panic: an item that is not an
+/// object carries nothing, and a store that is not an object refuses the merge,
+/// which the caller turns into quarantine-then-delete.
+#[test]
+fn a_hand_off_over_garbage_is_safe() {
+    for item in [
+        serde_json::json!("torn"),
+        serde_json::json!(null),
+        serde_json::json!([1, 2]),
+        serde_json::json!({}),
+    ] {
+        assert!(carried_keys_of(&item).is_none(), "{item} carries nothing");
+    }
+
+    let carried = carried_keys_of(&serde_json::json!({
+        "mcpOAuth": { "linear": { "accessToken": "mock-linear" } }
+    }))
+    .expect("carried");
+    let mut not_a_store = serde_json::json!("torn");
+    assert!(merge_carried_into_store(&mut not_a_store, &carried).is_err());
+    assert_eq!(not_a_store, serde_json::json!("torn"), "left as it was");
+
+    // A non-object `mcpOAuth` on either side replaces the store's whole.
+    let mut store = serde_json::json!({ "mcpOAuth": "torn" });
+    assert!(merge_carried_into_store(&mut store, &carried).expect("merge"));
+    assert_eq!(store["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
+}
+
+/// A carry that fails never strands the session: the item's bytes are
+/// quarantined and the item still goes, so Claude Code reaches the store.
+#[test]
+fn a_failed_hand_off_carry_quarantines_then_deletes() {
+    assert_eq!(hand_off_after_carry(false), HandOff::QuarantineThenDelete);
+}
+
 /// The carry is a new writer of a file under `~/.clauth`, so it owes the tree's
 /// 0600 invariant like every other one.
 #[cfg(unix)]
