@@ -68,7 +68,7 @@ On the Tokens dashboard, <kbd>↑</kbd> / <kbd>↓</kbd> move focus card to card
 
 The day picker on a Fallback card's `preferred days` row shows each weekday as `[x]` or `[ ]`: <kbd>←</kbd> <kbd>→</kbd> walk the days (and do not switch tabs while it is open), <kbd>space</kbd> toggles the day and saves at once, <kbd>⏎</kbd>, <kbd>esc</kbd> or <kbd>q</kbd> leave it, and <kbd>↑</kbd> <kbd>↓</kbd> leave it and move to the row above or below. <kbd>?</kbd> and <kbd>x</kbd> keep working while it is open; every other key does nothing until you leave, except <kbd>⌥1</kbd>–<kbd>⌥9</kbd>, which still jump to a tab and suspend the picker.
 
-On macOS, <kbd>t</kbd> skips any account holding a live `clauth start` session or an unfinished background job holding the rotating login: that session's login lives in a Keychain item clauth cannot write, so rotating it would sign the session out.
+On macOS, <kbd>t</kbd> skips any account holding a live `clauth start` session or an unfinished background job holding the rotating login: that session's login lives in a Keychain item clauth cannot write, so rotating it would sign the session out. An account a background `--with-fallback` session has moved off is not skipped, since the session no longer reads that login.
 
 The footer labels <kbd>c</kbd> `harness` on the Overview; the <kbd>?</kbd> help for that tab does not list it. With the Overview showing codex rows alone, <kbd>↑</kbd> and <kbd>↓</kbd> select codex accounts and the scrollbar follows; <kbd>⇧↑</kbd>, <kbd>⇧↓</kbd> and <kbd>⏎</kbd> do not change a Claude Code account, and <kbd>a</kbd> opens tab-wide entries alone. <kbd>r</kbd> and <kbd>t</kbd> keep working on the Claude Code accounts; <kbd>n</kbd> opens a fresh new-account form with `type  codex`. Neither refresh nor rotation reaches a codex row (codex usage polls on the refresh interval alone, and a codex chain rotates only in the background). On every other tab <kbd>c</kbd> keeps its own meaning or none.
 
@@ -108,7 +108,7 @@ The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is
 
 There is no `remove field` because none is needed: an env row's <kbd>⏎</kbd> edits its value, and an empty value removes the key. Editing it back is the same row.
 
-`disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session — a Claude Code background job naming one of the profile's runtime trees (launched with `clauth start <p> -- --bg`) counts as a live session, a stopped one too, until `claude rm <id>` (in an `--isolated` session, an unfinished one only); the pick names whichever is in the way.
+`disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session — a Claude Code background job naming one of the profile's runtime trees (launched with `clauth start <p> -- --bg`) counts as a live session, a stopped one too, until `claude rm <id>` (in an `--isolated` session, an unfinished one only), and so does a handed-off `--with-fallback` background session ([Auto-Switch](Auto-Switch)) on every account it has run on; the pick names whichever is in the way.
 
 ## Setup tab rows
 

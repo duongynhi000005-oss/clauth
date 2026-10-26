@@ -315,11 +315,11 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
       touch-receipt.json   # what the last credential swap wrote, for the watchdog
       adopt_refusal.json   # last standing live-credential adoption refusal announced
       quarantine/          # credentials parked after a refresh token was rejected
-      runtime-<sid>/       # one CLAUDE_CONFIG_DIR tree per live session, holding its own Claude Code supervisor state (daemon/, daemon.lock, daemon.status.json, daemon.log, daemon.json, daemon.scheduled.status.json) inside it, never linked from ~/.claude
+      runtime-<sid>/       # one CLAUDE_CONFIG_DIR tree per live session, holding its own Claude Code supervisor state (daemon/, daemon.lock, daemon.status.json, daemon.log, daemon.json, daemon.scheduled.status.json) inside it, never linked from ~/.claude; a --with-fallback session's tree outlives it while a background job names it, held by the daemon until none does
       runtime-isolated-<sid>/ # likewise, linking nothing from ~/.claude, so any supervisor state stays inside it
       sessions-<sid>/      # that session's PID file, flock-held while it runs
       sessions-isolated-<sid>/
-      runtime-bg/         # the tree a clauth start <p> -- --bg session runs in (a --with-fallback launch keeps its own tree), daemon-held while a job names it; its own supervisor state lives inside it, and collecting the tree stops that supervisor first
+      runtime-bg/         # the tree a clauth start <p> -- --bg session runs in (a --with-fallback launch keeps its own runtime-<sid>/), daemon-held while a job names it; its own supervisor state lives inside it, and collecting the tree stops that supervisor first
       sessions-bg/        # that tree's per-holder PID files, flock-held while a launcher or the daemon holds it
       spawn-settings-<sid>.json # that session's --settings (auto-memory dir, Read hook, any --settings you passed), removed at exit; kept while a background session's (clauth start <p> -- --bg) job names it, until claude rm <id>, or while a job store clauth reads (the global one, or the tree's own) cannot be read, or holds a job whose recorded launch flags clauth cannot read and that runs in this session's runtime tree (at clauth's cleanup of a shared session's file, also one in the profile's unsuffixed runtime/ or runtime-bg/); clauth's next stale-session cleanup (when clauth start or resume launches, the TUI opens, or the daemon or the plugin's MCP server starts) removes it after that
       spawn-settings-isolated-<sid>.json # likewise, only when the isolated tree sits under a symlinked path
