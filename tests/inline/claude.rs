@@ -2204,8 +2204,9 @@ fn a_hand_off_over_a_login_only_item_leaves_the_store_unchanged() {
     assert_eq!(store, before);
 }
 
-/// The item's MCP entry wins over the store's copy of the same server, and a
-/// server only the store holds keeps its login: the merge adds, never deletes.
+/// With no expiry on either copy the item's MCP entry wins over the store's for
+/// the same server, and a server only the store holds keeps its login: the
+/// merge adds, never deletes.
 #[test]
 fn a_hand_off_takes_the_items_mcp_entry_and_keeps_the_stores_others() {
     let item = serde_json::json!({
@@ -2230,6 +2231,58 @@ fn a_hand_off_takes_the_items_mcp_entry_and_keeps_the_stores_others() {
     assert!(
         !merge_carried_into_store(&mut store, &carried).expect("merge"),
         "a second hand-off of the same item writes nothing"
+    );
+}
+
+/// For a server both sides hold, the copy that expires later stays: the store
+/// is shared by every session on its member, so another session's fresher
+/// refresh must not be rewound by this item's older copy.
+#[test]
+fn a_hand_off_keeps_the_later_expiring_mcp_login() {
+    let entry = |token: &str, expires: Option<i64>| match expires {
+        Some(at) => serde_json::json!({ "accessToken": token, "expiresAt": at }),
+        None => serde_json::json!({ "accessToken": token }),
+    };
+    let merge = |stored: serde_json::Value, item: serde_json::Value| {
+        let mut store = serde_json::json!({
+            "claudeAiOauth": { "accessToken": "incoming-bearer" },
+            "mcpOAuth": { "srv": stored, "storeOnly": entry("store-only", Some(5)) }
+        });
+        let carried = carried_keys_of(&serde_json::json!({
+            "mcpOAuth": { "srv": item, "itemOnly": entry("item-only", None) }
+        }))
+        .expect("carried");
+        merge_carried_into_store(&mut store, &carried).expect("merge");
+        assert_eq!(store["mcpOAuth"]["storeOnly"]["accessToken"], "store-only");
+        assert_eq!(store["mcpOAuth"]["itemOnly"]["accessToken"], "item-only");
+        store["mcpOAuth"]["srv"]["accessToken"].clone()
+    };
+
+    assert_eq!(
+        merge(entry("store", Some(200)), entry("item", Some(100))),
+        "store"
+    );
+    assert_eq!(
+        merge(entry("store", Some(100)), entry("item", Some(200))),
+        "item"
+    );
+    assert_eq!(
+        merge(entry("store", Some(100)), entry("item", None)),
+        "store"
+    );
+    assert_eq!(
+        merge(entry("store", None), entry("item", Some(100))),
+        "item"
+    );
+    assert_eq!(
+        merge(entry("store", Some(100)), entry("item", Some(100))),
+        "item"
+    );
+    assert_eq!(merge(entry("store", None), entry("item", None)), "item");
+    assert_eq!(
+        merge(serde_json::json!("torn"), entry("item", None)),
+        "item",
+        "a non-object entry has no expiry"
     );
 }
 

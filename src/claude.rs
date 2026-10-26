@@ -2124,12 +2124,14 @@ pub(crate) fn carried_keys_of(
 }
 
 /// Merge `carried` (from [`carried_keys_of`]) into `store`, reporting whether
-/// anything changed. Additive: an entry the item holds wins over the store's
-/// copy, and an entry only the store holds stays, so an MCP server logged in
-/// under the incoming member alone keeps its login. A carried value that is not
-/// an object on both sides replaces the store's whole. The login is never
-/// touched ([`carry_live_extra_over`]). A store that is not an object is
-/// refused: there is no credential store to hand the session over to.
+/// anything changed. Additive and per MCP server: a server only one side holds
+/// is kept, and for one both hold the copy that expires later stays
+/// ([`mcp_entry_outlasts`]). The store is shared by every session on its
+/// member, so another session's fresher refresh must not be rewound by this
+/// item's older copy: a rotating refresh token would then be spent. A carried
+/// value that is not an object on both sides replaces the store's whole. The
+/// login is never touched ([`carry_live_extra_over`]). A store that is not an
+/// object is refused: there is no credential store to hand the session over to.
 #[cfg_attr(
     not(target_os = "macos"),
     allow(
@@ -2153,7 +2155,14 @@ pub(crate) fn merge_carried_into_store(
             ) {
                 (Some(held), Some(entries)) => {
                     let mut both = held.clone();
-                    both.extend(entries.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    for (server, entry) in entries {
+                        let keep_held = both
+                            .get(server)
+                            .is_some_and(|stored| mcp_entry_outlasts(stored, entry));
+                        if !keep_held {
+                            both.insert(server.clone(), entry.clone());
+                        }
+                    }
                     serde_json::Value::Object(both)
                 }
                 _ => item.clone(),
@@ -2162,6 +2171,26 @@ pub(crate) fn merge_carried_into_store(
         })
         .collect();
     Ok(carry_live_extra_over(target, &merged))
+}
+
+/// Whether the store's copy of one MCP server login (`stored`) stays over the
+/// item's (`item`): only when it carries a numeric `expiresAt` that is later,
+/// or the item's carries none. Equal or absent expiries keep the item's copy,
+/// the session's most recent view; a non-object entry has no expiry. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS refreshless swap hand-off; the rule is pinned on every platform"
+    )
+)]
+fn mcp_entry_outlasts(stored: &serde_json::Value, item: &serde_json::Value) -> bool {
+    let expiry = |v: &serde_json::Value| v.get("expiresAt").and_then(serde_json::Value::as_f64);
+    match (expiry(stored), expiry(item)) {
+        (Some(s), Some(i)) => s > i,
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 /// What the refreshless swap hand-off does with the per-session item once the
