@@ -2101,6 +2101,134 @@ pub(crate) fn sign_out_keeps_non_login_keys(preserve: bool, saved_elsewhere: boo
     preserve && !saved_elsewhere
 }
 
+/// The [`CARRIED_CREDENTIAL_KEYS`] a per-session Keychain item holds, for the
+/// refreshless swap hand-off: `None` when it holds none or is not an object,
+/// so the hand-off deletes the item with nothing to save. PURE so the rule is
+/// pinned on every platform; the macOS hand-off is its caller.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS refreshless swap hand-off; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn carried_keys_of(
+    item: &serde_json::Value,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let obj = item.as_object()?;
+    let carried: serde_json::Map<String, serde_json::Value> = CARRIED_CREDENTIAL_KEYS
+        .iter()
+        .filter_map(|key| Some(((*key).to_string(), obj.get(*key)?.clone())))
+        .collect();
+    (!carried.is_empty()).then_some(carried)
+}
+
+/// Merge `carried` (from [`carried_keys_of`]) into `store`, reporting whether
+/// anything changed. Additive: an entry the item holds wins over the store's
+/// copy, and an entry only the store holds stays, so an MCP server logged in
+/// under the incoming member alone keeps its login. A carried value that is not
+/// an object on both sides replaces the store's whole. The login is never
+/// touched ([`carry_live_extra_over`]). A store that is not an object is
+/// refused: there is no credential store to hand the session over to.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS refreshless swap hand-off; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn merge_carried_into_store(
+    store: &mut serde_json::Value,
+    carried: &serde_json::Map<String, serde_json::Value>,
+) -> Result<bool> {
+    let Some(target) = store.as_object_mut() else {
+        anyhow::bail!("the store is not a JSON object");
+    };
+    let merged: serde_json::Map<String, serde_json::Value> = carried
+        .iter()
+        .map(|(key, item)| {
+            let value = match (
+                target.get(key).and_then(|v| v.as_object()),
+                item.as_object(),
+            ) {
+                (Some(held), Some(entries)) => {
+                    let mut both = held.clone();
+                    both.extend(entries.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    serde_json::Value::Object(both)
+                }
+                _ => item.clone(),
+            };
+            (key.clone(), value)
+        })
+        .collect();
+    Ok(carry_live_extra_over(target, &merged))
+}
+
+/// What the refreshless swap hand-off does with the per-session item once the
+/// carry into the incoming member's store has run (or had nothing to carry).
+/// Either way the item goes: Claude Code resolves the item before any file, so
+/// an item left holding only `mcpOAuth` reads as "Not logged in" and the
+/// session never reaches the store its `.credentials.json` now points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only consumer is the macOS refreshless swap hand-off; the rule is pinned on every platform"
+    )
+)]
+pub(crate) enum HandOff {
+    /// The store holds what the item carried, or it carried nothing: delete.
+    Delete,
+    /// The carry failed: quarantine the item's bytes, then delete, so the MCP
+    /// logins stay recoverable without stranding the session.
+    QuarantineThenDelete,
+}
+
+/// See [`HandOff`]. PURE so the rule is pinned on every platform.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS refreshless swap hand-off; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn hand_off_after_carry(carry_landed: bool) -> HandOff {
+    if carry_landed {
+        HandOff::Delete
+    } else {
+        HandOff::QuarantineThenDelete
+    }
+}
+
+/// macOS: write [`carried_keys_of`] an item into `store`, the incoming
+/// member's install source the session's `.credentials.json` now points at,
+/// merged by [`merge_carried_into_store`]. Read and write share ONE state-flock
+/// hold, the way [`carry_session_item_into`] writes a store, so a re-stamp
+/// landing between them cannot be reverted. An absent or unparseable store
+/// refuses: the caller then quarantines the item rather than lose what it
+/// carried.
+#[cfg(target_os = "macos")]
+pub(crate) fn carry_item_keys_into_store(
+    store: &Path,
+    carried: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    crate::lock::with_state_lock(|_held| {
+        let bytes =
+            std::fs::read(store).with_context(|| format!("failed to read {}", store.display()))?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("{} is not valid JSON", store.display()))?;
+        if !merge_carried_into_store(&mut value, carried)
+            .with_context(|| format!("{} is not a credential store", store.display()))?
+        {
+            return Ok(());
+        }
+        let out = serde_json::to_vec_pretty(&value).context("failed to serialize the store")?;
+        crate::profile::atomic_write_600(store, out)
+            .with_context(|| format!("failed to write {}", store.display()))
+    })
+}
+
 /// Copy [`CARRIED_CREDENTIAL_KEYS`] from the live credential onto `target`
 /// before it becomes the live credential, so an account switch keeps MCP-server
 /// auth. A key the live file holds overwrites the target's copy; one the live

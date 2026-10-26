@@ -4366,9 +4366,9 @@ impl SessionSwap {
         // for this runtime dir (it sets `CLAUDE_CONFIG_DIR`, and CC resolves
         // the Keychain first), so the link repoint above moved only the file
         // layer. CARRY, then WRITE — or, when the incoming member's store is
-        // refreshless, SIGN OUT (see [`swap_item_arm`]) — in that order, and
-        // the second leg only runs if the carry could: the item holds the
-        // outgoing member's only live pair
+        // refreshless, HAND OFF to the file (see [`swap_item_arm`]) — in that
+        // order, and the second leg only runs if the carry could: the item
+        // holds the outgoing member's only live pair
         // once CC has refreshed there (it deletes the runtime file on
         // migration), so writing before carrying would brick that member, and
         // skipping both on a failed carry leaves an inert swap — the session
@@ -4407,7 +4407,10 @@ impl SessionSwap {
                     // forever and never return to the file the re-stamp leg
                     // writes), and the outgoing member's login it still holds
                     // must go too, or CC keeps serving the member the chain
-                    // just moved the session off of. Sign-out does both.
+                    // just moved the session off of. The hand-off does both:
+                    // it saves the item's MCP logins into the incoming store
+                    // and deletes the item, since an item left holding only
+                    // them reads as "Not logged in" and never reaches the file.
                     match swap_item_arm(
                         crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(
                             &plan.store,
@@ -4476,16 +4479,18 @@ impl SessionSwap {
                                     )
                                 },
                                 |owned| {
-                                    crate::keychain::keychain_sign_out_for_config_dir(
+                                    crate::keychain::keychain_hand_off_for_config_dir(
                                         &self.runtime,
                                         owned,
+                                        &plan.store,
                                     )
                                 },
                             );
                             match sign_out {
-                                // The item holds nothing now, so the session
-                                // falls back to the file layer this swap moved:
-                                // the row's verdict follows.
+                                // The item is gone and its MCP logins sit in
+                                // the store this swap moved the file layer
+                                // onto, so the session falls back to that
+                                // file: the row's verdict follows.
                                 Ok(crate::keychain::SignOutOutcome::SignedOut) => {
                                     self.repoint_row_store(&plan);
                                     self.retouch_after_item_leg(&plan);
@@ -4583,9 +4588,9 @@ impl SessionSwap {
         if drained == Drain::Unjudged {
             return Ok(SwapOutcome::Refused(drain_unjudged(&self.member())));
         }
-        // macOS: CARRY, then SIGN OUT — in that order, and the sign-out only
+        // macOS: CARRY, then HAND OFF — in that order, and the hand-off only
         // runs if the carry could: the item may hold the freshest pair once CC
-        // has refreshed there, and signing out over a failed carry would
+        // has refreshed there, and handing off over a failed carry would
         // destroy it. A failed leg returns a refusal with nothing moved — the
         // session stays on the rotating pair with the row and cell naming it,
         // and the next poll retries. A failure classified as the
@@ -4622,9 +4627,10 @@ impl SessionSwap {
                                 )
                             },
                             |owned| {
-                                crate::keychain::keychain_sign_out_for_config_dir(
+                                crate::keychain::keychain_hand_off_for_config_dir(
                                     &self.runtime,
                                     owned,
+                                    &plan.store,
                                 )
                             },
                         );
@@ -8326,9 +8332,12 @@ fn session_seed_arm(
 ///   site's bare skip because the swap's item already EXISTS and holds the
 ///   OUTGOING member's login — merely skipping the write would leave the
 ///   session authenticating as the member the chain just moved it off of (CC
-///   resolves the Keychain first), an inert swap; signing the login out (the
-///   same tool the seed's absent-source arm uses to make an item stop serving
-///   what it holds) is what drops CC back onto the file.
+///   resolves the Keychain first), an inert swap. Nor is a strip-and-rewrite
+///   enough: an item left holding only `mcpOAuth` still wins over the file and
+///   reads as "Not logged in". The arm hands the item over instead
+///   (`keychain::keychain_hand_off_for_config_dir`): its MCP logins move into
+///   the incoming store and the item is deleted, which is what drops CC back
+///   onto the file with those logins kept.
 /// - otherwise → [`SwapItemArm::Install`]: install the incoming store into the
 ///   item after the carry-back. An unparseable read lands here too: a torn
 ///   read is not evidence of refreshlessness, and the install leg that follows

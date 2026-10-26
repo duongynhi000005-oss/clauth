@@ -1597,6 +1597,107 @@ pub(crate) fn keychain_sign_out_for_config_dir(
     sign_out_at(&service, &account()?, false)
 }
 
+/// Hand a session's NAMESPACED item over to the file layer, for a swap or a
+/// same-member convergence onto a refreshless store (a rolling or static
+/// session token): `store` is that store, the one the session's
+/// `.credentials.json` now points at. Unlike [`keychain_sign_out_for_config_dir`]
+/// the item never survives holding only its MCP logins: Claude Code resolves
+/// the item before any file, and an item with no `claudeAiOauth` reads as
+/// "Not logged in", so the session would never reach the store. Instead the
+/// item's MCP logins move into `store`
+/// ([`crate::claude::carry_item_keys_into_store`]) and the item is deleted,
+/// leaving the session on the store's login with its MCP logins beside it. A
+/// carry that fails quarantines the item's bytes before the delete
+/// ([`crate::claude::hand_off_after_carry`]); a failed read takes the
+/// sign-out's own arms ([`sign_out_over_failed_read`]), the locked-keychain
+/// skip among them.
+pub(crate) fn keychain_hand_off_for_config_dir(
+    config_dir: &Path,
+    owned: &crate::runtime::namespaced_keychain_ledger::OwnedKeychainWrite,
+    store: &Path,
+) -> Result<SignOutOutcome> {
+    let service = keychain_service_for_config_dir(config_dir)?;
+    anyhow::ensure!(
+        service == owned.service(),
+        "refusing to write per-session Keychain item `{service}`: the durable ownership row names \
+         `{}`",
+        owned.service()
+    );
+    let account = account()?;
+    let blob = match read_blob_at(&service, &account) {
+        Ok(None) => return delete_at(&service, &account).map(|_| SignOutOutcome::SignedOut),
+        Ok(Some(blob)) => blob,
+        Err(e) => return sign_out_over_failed_read(&service, &account, &e),
+    };
+    let landed = match crate::claude::carried_keys_of(&blob) {
+        None => true,
+        Some(carried) => match crate::claude::carry_item_keys_into_store(store, &carried) {
+            Ok(()) => true,
+            Err(e) => {
+                logline!(
+                    "clauth: could not save the per-session Keychain item's MCP server logins \
+                     into {}: {e:#}",
+                    store.display()
+                );
+                false
+            }
+        },
+    };
+    match crate::claude::hand_off_after_carry(landed) {
+        crate::claude::HandOff::Delete => logline!(
+            "clauth: handed the per-session Keychain item over to {}: its MCP server logins \
+             are in that store now and the item was deleted, so Claude Code reads the store",
+            store.display()
+        ),
+        crate::claude::HandOff::QuarantineThenDelete => {
+            // Names only on the line, never values: the bytes go to the
+            // quarantine file the tail names.
+            let raw = serde_json::to_string(&blob).unwrap_or_default();
+            logline!(
+                "clauth: handed the per-session Keychain item over to {} by deleting it \
+                 without saving its MCP server logins there. Their {}",
+                store.display(),
+                quarantine_tail(&quarantine_item_bytes(&service, &raw))
+            );
+        }
+    }
+    delete_at(&service, &account).map(|_| SignOutOutcome::SignedOut)
+}
+
+/// A sign-out over an item whose read FAILED: skip over the classified
+/// locked-keychain transient, otherwise delete the item, quarantining its raw
+/// bytes first whenever the read brought any back. Shared by
+/// [`sign_out_saving_at`] (whose doc carries the reasoning) and
+/// [`keychain_hand_off_for_config_dir`], so the two cannot drift apart.
+fn sign_out_over_failed_read(
+    service: &str,
+    account: &str,
+    e: &anyhow::Error,
+) -> Result<SignOutOutcome> {
+    if !crate::claude::failed_read_degrades_to_delete(classified_exit(e)) {
+        logline!(
+            "clauth: could not sign Claude Code out of the macOS Keychain: {e:#}. The \
+             item was left untouched; retry the operation once the keychain is unlocked"
+        );
+        return Ok(SignOutOutcome::SkippedLocked);
+    }
+    match carried_raw(e) {
+        Some(raw) => logline!(
+            "clauth: signed Claude Code out of the macOS Keychain by deleting the item: \
+             it could not be read first ({e:#}), so the MCP server logins stored beside \
+             the login went with it. Their {}",
+            quarantine_tail(&quarantine_item_bytes(service, raw))
+        ),
+        None => logline!(
+            "clauth: signed Claude Code out of the macOS Keychain by deleting the item: it \
+             could not be read first ({e:#}), so the MCP server logins stored beside the \
+             login went with it. Re-authenticate any MCP server that reports a signed-out \
+             session"
+        ),
+    }
+    delete_at(service, account).map(|_| SignOutOutcome::SignedOut)
+}
+
 /// [`sign_out_saving_at`] with nothing saved elsewhere: the per-session items
 /// and the e2e leg, whose items no account store takes over.
 fn sign_out_at(service: &str, account: &str, preserve: bool) -> Result<SignOutOutcome> {
@@ -1660,30 +1761,7 @@ fn sign_out_saving_at(
     let mut blob = match read_blob_at(service, account) {
         Ok(None) => return delete_at(service, account).map(|_| SignOutOutcome::SignedOut),
         Ok(Some(blob)) => blob,
-        Err(e) => {
-            if !crate::claude::failed_read_degrades_to_delete(classified_exit(&e)) {
-                logline!(
-                    "clauth: could not sign Claude Code out of the macOS Keychain: {e:#}. The \
-                     item was left untouched; retry the operation once the keychain is unlocked"
-                );
-                return Ok(SignOutOutcome::SkippedLocked);
-            }
-            match carried_raw(&e) {
-                Some(raw) => logline!(
-                    "clauth: signed Claude Code out of the macOS Keychain by deleting the item: \
-                     it could not be read first ({e:#}), so the MCP server logins stored beside \
-                     the login went with it. Their {}",
-                    quarantine_tail(&quarantine_item_bytes(service, raw))
-                ),
-                None => logline!(
-                    "clauth: signed Claude Code out of the macOS Keychain by deleting the item: it \
-                     could not be read first ({e:#}), so the MCP server logins stored beside the \
-                     login went with it. Re-authenticate any MCP server that reports a signed-out \
-                     session"
-                ),
-            }
-            return delete_at(service, account).map(|_| SignOutOutcome::SignedOut);
-        }
+        Err(e) => return sign_out_over_failed_read(service, account, &e),
     };
     let saved = preserve && saved_elsewhere(&blob);
     let keep = crate::claude::sign_out_keeps_non_login_keys(preserve, saved);
