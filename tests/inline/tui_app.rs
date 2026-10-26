@@ -2079,6 +2079,41 @@ fn the_install_failure_toast_escapes_a_marker_in_the_claude_stderr() {
     );
 }
 
+/// The stock fake `claude` installs cleanly even when the variable that fails
+/// its install is already set in the environment, and dropping it hands that
+/// value back unchanged. Unix-only: the fake `claude` is a shell shim.
+#[cfg(unix)]
+#[test]
+fn the_stock_fake_claude_ignores_an_inherited_install_failure_switch() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = crate::testutil::ConfigDirSandbox::new(&home, &config);
+    let _inherited = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_SHIM_FAIL_INSTALL",
+            Some(std::ffi::OsStr::new("inherited")),
+        )],
+    );
+    let fake = crate::testutil::FakeClaude::new(&home);
+
+    let mut app = bare_app();
+    super::run_confirm_action(&mut app, super::ConfirmAction::InstallPlugin);
+
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("clauth plugin installed"),
+        "the stock shim's install succeeds whatever the environment held"
+    );
+    drop(fake);
+    assert_eq!(
+        std::env::var_os("CLAUDE_SHIM_FAIL_INSTALL").as_deref(),
+        Some(std::ffi::OsStr::new("inherited")),
+        "dropping the fake restores the value it found"
+    );
+}
+
 #[test]
 fn config_rows_login_and_delete_creds_visibility() {
     use super::{ConfigRow, config_rows};

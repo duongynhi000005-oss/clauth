@@ -1208,7 +1208,10 @@ impl Drop for EnvPin<'_> {
 
 /// The body of the fake `claude` the agentgear lifecycle pins stage.
 /// `@VERSION@` is substituted with the crate version at write time so the
-/// entry the shim reports is never stale against the embedded tree.
+/// entry the shim reports is never stale against the embedded tree. When
+/// `CLAUDE_SHIM_FAIL_INSTALL` holds a non-empty value, `plugin install` prints
+/// a prose marker to stderr and exits 7 instead of succeeding; every other
+/// command is unaffected.
 #[cfg(unix)]
 const FAKE_CLAUDE_SHIM: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CLAUDE_SHIM_LOG"
@@ -1264,50 +1267,15 @@ case "$1" in
         esac
         ;;
       install)
+        if [ -n "${CLAUDE_SHIM_FAIL_INSTALL-}" ]; then
+          printf 'boom\356\200\200\n' >&2
+          exit 7
+        fi
         : > "$CLAUDE_SHIM_STATE"
         # The registry clauth's own probe reads: write the user-scope entry so
         # the Services tab recompute after the install sees it.
         mkdir -p "$CLAUDE_CONFIG_DIR/plugins"
         printf '{"plugins":{"clauth@clauth":[{"scope":"user","version":"@VERSION@","installedAt":"2026-08-25T00:00:00.000Z","installPath":"%s"}]}}\n' "$CLAUDE_SHIM_TREE" > "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
-        ;;
-    esac
-    ;;
-esac
-exit 0
-"#;
-
-/// The fake `claude` for the install-failure producer pin: every command the
-/// install lifecycle runs succeeds, except `plugin install`, which prints a
-/// prose marker to stderr and exits nonzero so the lifecycle error carries the
-/// marker into the `install failed` toast.
-#[cfg(unix)]
-const FAKE_CLAUDE_FAILING_SHIM: &str = r#"#!/bin/sh
-printf '%s\n' "$*" >> "$CLAUDE_SHIM_LOG"
-printf '%s\t%s\n' "${CLAUDE_CONFIG_DIR-}" "$*" >> "$CLAUDE_SHIM_LOG.spawns"
-case "$1" in
-  --version)
-    echo "2.1.220 (Claude Code)"
-    ;;
-  plugin)
-    case "$2" in
-      list)
-        if [ "$3" = "--json" ]; then
-          echo '[]'
-        fi
-        ;;
-      marketplace)
-        case "$3" in
-          list)
-            echo '[]'
-            ;;
-          add)
-            printf '%s\n' "$4" > "$CLAUDE_SHIM_MKT_STATE"
-            ;;
-        esac
-        ;;
-      install)
-        printf 'boom\356\200\200\n' >&2
-        exit 7
         ;;
     esac
     ;;
@@ -1337,6 +1305,7 @@ pub(crate) struct FakeClaude<'a> {
     prev_state: Option<std::ffi::OsString>,
     prev_mkt_state: Option<std::ffi::OsString>,
     prev_log: Option<std::ffi::OsString>,
+    prev_fail_install: Option<std::ffi::OsString>,
 }
 
 #[cfg(unix)]
@@ -1345,28 +1314,34 @@ impl<'a> FakeClaude<'a> {
     /// own PATH.
     pub(crate) fn new(home: &'a HomeSandbox) -> Self {
         let prev_path = std::env::var_os("PATH").expect("PATH is set");
-        Self::stage(home, &prev_path, Some(FAKE_CLAUDE_SHIM))
+        Self::stage(home, &prev_path, Some(FAKE_CLAUDE_SHIM), false)
     }
 
     /// The same pins with a claude-free PATH (empty shim dir + a minimal
     /// tail), so agentgear's claude backend is undetected and the lifecycle
     /// converges to `NoOp` without spawning anything.
     pub(crate) fn new_without_claude(home: &'a HomeSandbox) -> Self {
-        Self::stage(home, std::ffi::OsStr::new("/usr/bin:/bin"), None)
+        Self::stage(home, std::ffi::OsStr::new("/usr/bin:/bin"), None, false)
     }
 
-    /// The success pins with a shim whose `plugin install` fails, so the
+    /// The success pins with `CLAUDE_SHIM_FAIL_INSTALL` set to `1`, so the shim's
+    /// `plugin install` prints the prose marker to stderr and exits 7, and the
     /// install failure's own error carries the marker into the toast.
     pub(crate) fn new_failing_install(home: &'a HomeSandbox) -> Self {
         let prev_path = std::env::var_os("PATH").expect("PATH is set");
-        Self::stage(home, &prev_path, Some(FAKE_CLAUDE_FAILING_SHIM))
+        Self::stage(home, &prev_path, Some(FAKE_CLAUDE_SHIM), true)
     }
 
     #[expect(
         unsafe_code,
         reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
     )]
-    fn stage(home: &'a HomeSandbox, path_tail: &std::ffi::OsStr, shim: Option<&str>) -> Self {
+    fn stage(
+        home: &'a HomeSandbox,
+        path_tail: &std::ffi::OsStr,
+        shim: Option<&str>,
+        fail_install: bool,
+    ) -> Self {
         let tmp = tempfile::tempdir_in(home.home()).expect("shim dir");
         let data = tmp.path().join("data");
         let run = tmp.path().join("run");
@@ -1413,6 +1388,15 @@ impl<'a> FakeClaude<'a> {
         let prev_mkt_state = pin("CLAUDE_SHIM_MKT_STATE", &tmp.path().join("mkt-state"));
         let log = tmp.path().join("log");
         let prev_log = pin("CLAUDE_SHIM_LOG", &log);
+        let prev_fail_install = std::env::var_os("CLAUDE_SHIM_FAIL_INSTALL");
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe {
+            if fail_install {
+                std::env::set_var("CLAUDE_SHIM_FAIL_INSTALL", "1");
+            } else {
+                std::env::remove_var("CLAUDE_SHIM_FAIL_INSTALL");
+            }
+        }
         Self {
             _home: std::marker::PhantomData,
             _tmp: tmp,
@@ -1425,6 +1409,7 @@ impl<'a> FakeClaude<'a> {
             prev_state,
             prev_mkt_state,
             prev_log,
+            prev_fail_install,
         }
     }
 
@@ -1464,6 +1449,7 @@ impl Drop for FakeClaude<'_> {
                 ("CLAUDE_SHIM_STATE", &self.prev_state),
                 ("CLAUDE_SHIM_MKT_STATE", &self.prev_mkt_state),
                 ("CLAUDE_SHIM_LOG", &self.prev_log),
+                ("CLAUDE_SHIM_FAIL_INSTALL", &self.prev_fail_install),
             ] {
                 match value {
                     Some(v) => std::env::set_var(key, v),
