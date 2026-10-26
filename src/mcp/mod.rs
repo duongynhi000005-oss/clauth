@@ -3981,10 +3981,20 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // one pid. The herdr pane-tag walk joins rows to processes by pid, and a row
     // keyed on the mcp names a delegate's account for the pane hosting the
     // parent session (the pane the delegate's child runs in). The child IS the
-    // session; its row must say so. Best-effort like the register itself — a
-    // failed update leaves a wrong key, never a dead run.
+    // session; its row must say so. The cwd registered beside the pid is the
+    // server's too, so move it onto the directory the child runs in when there
+    // is one, made absolute since a reader of the row cannot resolve a relative
+    // spelling against this server's cwd; a delegate with no cwd inherits the
+    // server's, which the row already holds. Best-effort like the register
+    // itself — a failed update leaves a wrong key, never a dead run.
     if let Err(e) = crate::live_sessions::update_as_session(runtime.session_id(), |fields| {
-        fields.set_pid(child.id())
+        fields.set_pid(child.id());
+        if let Some(dir) = delegate_cwd
+            .as_deref()
+            .and_then(|dir| std::path::absolute(dir).ok())
+        {
+            fields.set_cwd(dir);
+        }
     }) {
         logline!("clauth: re-keying the delegate session onto its child failed: {e}");
     }

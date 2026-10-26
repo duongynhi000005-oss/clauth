@@ -708,7 +708,7 @@ fn the_human_row_and_json_disagree_on_the_stamp_shape_by_design() {
 #[test]
 fn no_sessions_found_maps_to_exit_one() {
     let _sb = HomeSandbox::new(); // empty tree ⇒ empty index
-    let err = run_sessions(true, false).expect_err("empty index must error");
+    let err = run_sessions(true, false, false).expect_err("empty index must error");
     assert!(
         err.to_string().contains("no sessions"),
         "error must say no sessions were found: {err}"
@@ -1251,7 +1251,7 @@ fn switch_refuses_an_unknown_sid_with_the_listing_hint() {
         let err = run_switch(sid, "work").expect_err("an unknown sid must be refused");
         assert_eq!(
             err.to_string(),
-            format!("no live session '{sid}'\nsee `clauth sessions`"),
+            format!("no live session '{sid}'\nsee `clauth sessions --live`"),
             "the refusal names the sid and the listing verb"
         );
         assert!(
@@ -1274,7 +1274,7 @@ fn switch_refuses_an_unknown_sid_that_is_a_profile_with_the_global_hint() {
     let err = run_switch("work", "spare").expect_err("a profile name is not a live sid");
     assert_eq!(
         err.to_string(),
-        "no live session 'work'\nsee `clauth sessions`\nto switch the global account: `clauth switch work`"
+        "no live session 'work'\nsee `clauth sessions --live`\nto switch the global account: `clauth switch work`"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
@@ -1294,7 +1294,7 @@ fn switch_refuses_an_unknown_sid_that_is_a_codex_profile_with_the_global_hint() 
     let err = run_switch("cx", "spare").expect_err("a codex name is not a live sid");
     assert_eq!(
         err.to_string(),
-        "no live session 'cx'\nsee `clauth sessions`\nto switch the global account: `clauth switch cx`"
+        "no live session 'cx'\nsee `clauth sessions --live`\nto switch the global account: `clauth switch cx`"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
@@ -1557,4 +1557,490 @@ fn the_sessions_listing_rejects_extra_arguments() {
     let err = crate::cli::Cli::try_parse_from(["clauth", "sessions", "--json", "extra"])
         .expect_err("extra args must be a usage error");
     assert_eq!(err.exit_code(), 2);
+}
+
+// ── clauth sessions --live ──────────────────────────────────────────────────
+//
+// The live roster reads the registry and Claude Code's per-pid session
+// records only; transcripts stay closed.
+
+/// Fixed instant every `--live` fixture is aged against: 2027-01-15T08:00:00Z.
+const LIVE_NOW_SECS: u64 = 1_800_000_000;
+
+/// A registry row started `ago_secs` before [`LIVE_NOW_SECS`], dead until a
+/// marker is held for it.
+fn live_fixture_row(sid: &str, profile: &str, ago_secs: u64) -> crate::live_sessions::LiveSession {
+    crate::live_sessions::LiveSession {
+        session_id: sid.to_string(),
+        start_profile: profile.to_string(),
+        harness: crate::harness::Harness::Claude,
+        pid: 4242,
+        claude_pid: None,
+        launch_families: None,
+        started_at: (LIVE_NOW_SECS - ago_secs) * 1000,
+        cwd: None,
+        isolated: false,
+        follows_chain: false,
+        intended_member: None,
+        chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
+        current_member: None,
+        last_swap_at: None,
+        launch_store: None,
+        boot_transport: None,
+        is_delegate: false,
+        background: false,
+        background_hold: false,
+    }
+}
+
+/// Register `row` and hold its marker under `marker_profile` (where a running
+/// session holds it: its current member once moved, else its start profile).
+fn register_live(row: &crate::live_sessions::LiveSession, marker_profile: &str) -> std::fs::File {
+    crate::live_sessions::register(row).expect("register row");
+    crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from(marker_profile),
+        false,
+        &row.session_id,
+    )
+    .expect("hold the session's marker")
+}
+
+/// Claude Code's own record for the process `pid`, naming its transcript.
+fn seed_cc_record(sb: &HomeSandbox, pid: u32, transcript: &str) {
+    let dir = sb.home().join(".claude").join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{pid}.json")),
+        json!({ "sessionId": transcript, "pid": pid }).to_string(),
+    )
+    .unwrap();
+}
+
+/// Seeds every row shape the roster must tell apart and returns the marker
+/// handles that keep the live ones live:
+/// - `100-0` moved `cld1 → cld2` (marker under `cld2`), transcript known
+/// - `200-0` never moved, no Claude Code record yet, no cwd
+/// - `300-1` codex
+/// - `400-0` delegate, joined on its re-keyed `pid`
+/// - `500-0` background
+/// - `600-0` dead (no marker), `700-0` the daemon's background hold, `800-0` torn
+fn seed_live_roster(sb: &HomeSandbox) -> Vec<std::fs::File> {
+    let mut held = Vec::new();
+
+    let mut moved = live_fixture_row("100-0", "cld1", 7200);
+    moved.current_member = Some("cld2".to_string());
+    moved.claude_pid = Some(7001);
+    moved.cwd = Some(std::path::PathBuf::from("/w/a"));
+    held.push(register_live(&moved, "cld2"));
+    seed_cc_record(sb, 7001, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa");
+
+    let mut fresh = live_fixture_row("200-0", "cld1", 720);
+    fresh.claude_pid = Some(7002);
+    held.push(register_live(&fresh, "cld1"));
+
+    let mut codex = live_fixture_row("300-1", "cx0", 240);
+    codex.harness = crate::harness::Harness::Codex;
+    codex.cwd = Some(std::path::PathBuf::from("/w/c"));
+    held.push(register_live(&codex, "cx0"));
+
+    let mut delegate = live_fixture_row("400-0", "D1", 180);
+    delegate.is_delegate = true;
+    delegate.pid = 7004;
+    delegate.cwd = Some(std::path::PathBuf::from("/w/d"));
+    held.push(register_live(&delegate, "D1"));
+    seed_cc_record(sb, 7004, "dddddddd-4444-4444-8444-dddddddddddd");
+
+    let mut background = live_fixture_row("500-0", "cld1", 60);
+    background.background = true;
+    background.claude_pid = Some(7005);
+    background.cwd = Some(std::path::PathBuf::from("/w/e"));
+    held.push(register_live(&background, "cld1"));
+
+    crate::live_sessions::register(&live_fixture_row("600-0", "cld1", 30)).expect("dead row");
+
+    let mut hold = live_fixture_row("700-0", "cld1", 30);
+    hold.background_hold = true;
+    held.push(register_live(&hold, "cld1"));
+
+    let registry = sb.home().join(".clauth").join("live_sessions");
+    fs::write(
+        registry.join("800-0.json"),
+        "{\"session_id\": \"800-0\", \"start_pro",
+    )
+    .unwrap();
+
+    held
+}
+
+/// The reader keeps exactly the rows whose session still runs: a dead row, the
+/// daemon's background hold and a torn file drop out; a moved session counts
+/// by the marker its current member holds.
+#[test]
+fn live_rows_keep_only_the_running_sessions() {
+    let sb = HomeSandbox::new();
+    let _held = seed_live_roster(&sb);
+
+    let mut sids: Vec<String> = crate::live_sessions::live_rows()
+        .expect("the registry lists")
+        .into_iter()
+        .map(|row| row.session_id)
+        .collect();
+    sids.sort();
+    assert_eq!(sids, ["100-0", "200-0", "300-1", "400-0", "500-0"]);
+}
+
+/// One line per live session, newest first: sid, account (`start → current`
+/// once moved), harness, age, transcript id, cwd, and a `delegate` or
+/// `background` tag naming the session's kind; `-` fills a missing transcript
+/// id or cwd.
+#[test]
+fn live_table_lists_each_running_session_newest_first() {
+    let sb = HomeSandbox::new();
+    let _held = seed_live_roster(&sb);
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(
+        live_lines(now),
+        [
+            "500-0  cld1         claude  1m ago   -                                     /w/e  background",
+            "400-0  D1           claude  3m ago   dddddddd-4444-4444-8444-dddddddddddd  /w/d  delegate",
+            "300-1  cx0          codex   4m ago   -                                     /w/c",
+            "200-0  cld1         claude  12m ago  -                                     -",
+            "100-0  cld1 → cld2  claude  2h ago   aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa  /w/a",
+        ]
+    );
+}
+
+/// `--json` carries the same rows, newest first, with absent cells as `null`.
+#[test]
+fn live_json_carries_the_same_rows() {
+    let sb = HomeSandbox::new();
+    let _held = seed_live_roster(&sb);
+
+    let row = |sid: &str,
+               start: &str,
+               current: &str,
+               harness: &str,
+               cwd: Option<&str>,
+               started: &str,
+               transcript: Option<&str>,
+               delegate: bool,
+               background: bool| {
+        json!({
+            "sid": sid,
+            "start_profile": start,
+            "current_profile": current,
+            "harness": harness,
+            "cwd": cwd,
+            "started_at": started,
+            "transcript_id": transcript,
+            "delegate": delegate,
+            "background": background,
+        })
+    };
+    assert_eq!(
+        live_json(),
+        json!([
+            row(
+                "500-0",
+                "cld1",
+                "cld1",
+                "claude",
+                Some("/w/e"),
+                "2027-01-15T07:59:00+00:00",
+                None,
+                false,
+                true
+            ),
+            row(
+                "400-0",
+                "D1",
+                "D1",
+                "claude",
+                Some("/w/d"),
+                "2027-01-15T07:57:00+00:00",
+                Some("dddddddd-4444-4444-8444-dddddddddddd"),
+                true,
+                false
+            ),
+            row(
+                "300-1",
+                "cx0",
+                "cx0",
+                "codex",
+                Some("/w/c"),
+                "2027-01-15T07:56:00+00:00",
+                None,
+                false,
+                false
+            ),
+            row(
+                "200-0",
+                "cld1",
+                "cld1",
+                "claude",
+                None,
+                "2027-01-15T07:48:00+00:00",
+                None,
+                false,
+                false
+            ),
+            row(
+                "100-0",
+                "cld1",
+                "cld2",
+                "claude",
+                Some("/w/a"),
+                "2027-01-15T06:00:00+00:00",
+                Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"),
+                false,
+                false
+            ),
+        ])
+    );
+}
+
+/// No live session is the listing's empty case: exit 1 with a named error,
+/// the same scripting contract as an empty `clauth sessions`.
+#[test]
+fn live_listing_with_nothing_running_is_a_named_error() {
+    let _sb = HomeSandbox::new();
+    crate::live_sessions::register(&live_fixture_row("600-0", "cld1", 30)).expect("dead row");
+
+    let err = run_sessions(false, false, true).expect_err("an empty roster is an error");
+    assert_eq!(err.to_string(), "no live sessions found");
+    assert_eq!(crate::exit_code(Err(err)), 1);
+}
+
+/// A registry that cannot be listed is not an empty one: the reader says so,
+/// and the listing names the directory instead of claiming nothing runs.
+#[test]
+fn live_listing_names_an_unreadable_registry() {
+    let sb = HomeSandbox::new();
+    let clauth = sb.home().join(".clauth");
+    fs::create_dir_all(&clauth).unwrap();
+    let registry = clauth.join("live_sessions");
+    fs::write(&registry, "not a directory").unwrap();
+
+    assert!(crate::live_sessions::live_rows().is_none());
+    for json in [false, true] {
+        let err = run_sessions(json, false, true).expect_err("an unlistable registry is an error");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "cannot list live sessions: {} is unreadable",
+                registry.display()
+            ),
+            "json {json}"
+        );
+        assert_eq!(crate::exit_code(Err(err)), 1);
+    }
+}
+
+/// A cwd that is not UTF-8 still lists: both shapes show it lossily instead
+/// of failing the whole listing.
+#[cfg(unix)]
+#[test]
+fn live_listing_shows_a_non_utf8_cwd_lossily() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let _sb = HomeSandbox::new();
+    let mut row = live_fixture_row("950-0", "cld1", 60);
+    row.cwd = Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        b"/w/\xff",
+    )));
+    let _held = register_live(&row, "cld1");
+
+    assert_eq!(live_json()[0]["cwd"], json!("/w/\u{fffd}"));
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(
+        live_lines(now),
+        ["950-0  cld1  claude  1m ago  -  /w/\u{fffd}"]
+    );
+}
+
+/// Sessions started in the same millisecond keep one order on every run:
+/// newest first, then by sid.
+#[test]
+fn live_rows_started_together_order_by_sid() {
+    let _sb = HomeSandbox::new();
+    let mut held = Vec::new();
+    for sid in ["930-0", "910-0", "920-0"] {
+        held.push(register_live(&live_fixture_row(sid, "cld1", 60), "cld1"));
+    }
+    held.push(register_live(
+        &live_fixture_row("900-0", "cld1", 30),
+        "cld1",
+    ));
+
+    let sids: Vec<String> = live_json()
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|row| row["sid"].as_str().expect("a sid").to_string())
+        .collect();
+    assert_eq!(sids, ["900-0", "910-0", "920-0", "930-0"]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    let line_sids: Vec<String> = live_lines(now)
+        .iter()
+        .map(|line| line[..5].to_string())
+        .collect();
+    assert_eq!(line_sids, sids);
+}
+
+/// `--live` reads no transcript, so it cannot carry `--tokens`, which reads
+/// every one in full.
+#[test]
+fn the_live_listing_refuses_tokens() {
+    use clap::Parser as _;
+
+    let live = crate::cli::Cli::try_parse_from(["clauth", "sessions", "--live", "--json"])
+        .expect("--live --json parses");
+    match live.command {
+        Some(crate::cli::Command::Sessions {
+            live: true,
+            json: true,
+            tokens: false,
+        }) => {}
+        other => panic!("`sessions --live --json` must parse to the live listing: {other:?}"),
+    }
+    let err = crate::cli::Cli::try_parse_from(["clauth", "sessions", "--live", "--tokens"])
+        .expect_err("--live with --tokens must refuse");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// `--live` opens no transcript: the registry and Claude Code's per-pid
+/// session records are its only reads. A thread-local ledger counts every
+/// preview/history transcript read in [`crate::sessions`]; the live listing
+/// must leave it at zero while the full listing over the same fixture moves it
+/// — the control that proves the ledger counts. Opens through `crate::tokens`
+/// / `crate::tps` and the rescue/move paths are not counted.
+#[test]
+fn live_listing_opens_no_transcript() {
+    let sb = HomeSandbox::new();
+    let _held = seed_live_roster(&sb);
+
+    // Real transcripts named for the LIVE rows' own ids, so a by-id read of a
+    // live row's transcript id actually opens one and moves the ledger.
+    for (id, slug, cwd) in [
+        ("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", "-w-a", "/w/a"),
+        ("dddddddd-4444-4444-8444-dddddddddddd", "-w-d", "/w/d"),
+    ] {
+        let path = sb
+            .home()
+            .join(format!(".claude/projects/{slug}/{id}.jsonl"));
+        write_jsonl(&path, &[user_line(id, cwd, "hi")]);
+    }
+
+    crate::sessions::reset_transcript_opens();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    let _ = live_lines(now);
+    let _ = live_json();
+    run_sessions(false, false, true).expect("a non-empty live roster lists");
+    run_sessions(true, false, true).expect("a non-empty live roster lists as json");
+    assert_eq!(
+        crate::sessions::transcript_opens(),
+        0,
+        "the live listing must open no transcript"
+    );
+
+    // Control: the full listing reads the same fixture's transcripts, so the
+    // same ledger reports the opens — proving it would have caught one.
+    let _ = build_listing(false);
+    assert!(
+        crate::sessions::transcript_opens() > 0,
+        "the full listing opens a transcript, so the ledger counts"
+    );
+}
+
+/// Claude Code's own record for the process `pid` under `rel` (relative to the
+/// sandbox home), naming its transcript — the form for fixtures whose record
+/// lives in a runtime tree.
+fn seed_cc_record_in(sb: &HomeSandbox, rel: &str, pid: u32, transcript: &str) {
+    let dir = sb.home().join(rel);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{pid}.json")),
+        json!({ "sessionId": transcript, "pid": pid }).to_string(),
+    )
+    .unwrap();
+}
+
+/// A moved session's record lives in the tree of its START profile (the swap
+/// re-stamps markers, never the config dir), and an isolated session's in the
+/// isolated tree: the join must pick those, not `current_member`'s tree or the
+/// global store.
+#[test]
+fn live_rows_read_their_runtime_tree_records() {
+    let sb = HomeSandbox::new();
+
+    let mut moved = live_fixture_row("111-0", "cld1", 7200);
+    moved.current_member = Some("cld2".to_string());
+    moved.claude_pid = Some(7101);
+    let _moved_held = register_live(&moved, "cld2");
+    seed_cc_record_in(
+        &sb,
+        ".clauth/profiles/cld1/runtime-111-0/sessions",
+        7101,
+        "eeeeeeee-1111-4111-8111-eeeeeeeeeeee",
+    );
+
+    let mut isolated = live_fixture_row("222-0", "cld1", 3600);
+    isolated.isolated = true;
+    isolated.claude_pid = Some(7102);
+    crate::live_sessions::register(&isolated).expect("register row");
+    let _isolated_held = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("cld1"),
+        true,
+        "222-0",
+    )
+    .expect("hold the session's marker");
+    seed_cc_record_in(
+        &sb,
+        ".clauth/profiles/cld1/runtime-isolated-222-0/sessions",
+        7102,
+        "ffffffff-2222-4222-8222-ffffffffffff",
+    );
+
+    let rows = live_json();
+    let transcript = |sid: &str| {
+        rows.as_array()
+            .expect("an array")
+            .iter()
+            .find(|row| row["sid"] == sid)
+            .expect("row")["transcript_id"]
+            .as_str()
+            .expect("a transcript id")
+            .to_string()
+    };
+    assert_eq!(transcript("111-0"), "eeeeeeee-1111-4111-8111-eeeeeeeeeeee");
+    assert_eq!(transcript("222-0"), "ffffffff-2222-4222-8222-ffffffffffff");
+}
+
+/// A background row's record is found through the account's fixed
+/// `runtime-bg` tree.
+#[test]
+fn live_rows_find_a_background_rows_record_in_the_background_tree() {
+    let sb = HomeSandbox::new();
+
+    let mut background = live_fixture_row("333-0", "cld1", 60);
+    background.background = true;
+    background.claude_pid = Some(7103);
+    let _held = register_live(&background, "cld1");
+    seed_cc_record_in(
+        &sb,
+        ".clauth/profiles/cld1/runtime-bg/sessions",
+        7103,
+        "cccccccc-3333-4333-8333-cccccccccccc",
+    );
+
+    let rows = crate::live_sessions::live_rows().expect("the registry lists");
+    let row = rows.iter().find(|r| r.session_id == "333-0").expect("row");
+    assert_eq!(
+        crate::session_record::live_record(row).map(|r| r.session_id),
+        Some("cccccccc-3333-4333-8333-cccccccccccc".to_string()),
+    );
 }

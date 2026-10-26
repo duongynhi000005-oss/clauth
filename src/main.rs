@@ -282,7 +282,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Which { json } => which::run(json),
         Command::List { all, disabled } => list::run(all || disabled),
         Command::Jobs { json } => jobs_cli::run(json),
-        Command::Sessions { json, tokens } => sessions_cli::run_sessions(json, tokens),
+        Command::Sessions { json, tokens, live } => sessions_cli::run_sessions(json, tokens, live),
         // One positional is the bare-word act under its own verb: the exact
         // function `Command::External`'s single-word arm calls, so the exits
         // and copy are identical.

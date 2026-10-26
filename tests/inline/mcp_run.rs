@@ -692,6 +692,85 @@ fn a_delegate_reads_a_project_settings_model_from_its_spawn_cwd() {
     assert_eq!(err, REFUSES_FABLE);
 }
 
+/// Run an admitted delegate with `cwd` through the fake `claude`, which dumps
+/// the live row once it is re-keyed onto the shim's own pid, and return that row.
+#[cfg(unix)]
+fn delegate_live_row(cwd: &str) -> serde_json::Value {
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    // `ProfileRuntime::acquire` refuses a start when `~/.claude` is absent.
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    let mut fake = FakeClaude::new(&home);
+    let dump = home.home().join("row-dump.json");
+    fake.set_row_dump(&dump);
+
+    // An admitted profile: the credit-cap check is off and the named model is a
+    // subscription, so the gate admits; the real cwd then reaches the spawn,
+    // where `claude` resolves to the shim.
+    let _ = seed_credit_spend_target(&home, None, false, true);
+    let result = run_delegate(DelegateOpts {
+        profile: "capped",
+        prompt: "hello",
+        model: Some("opus"),
+        cwd: Some(cwd),
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    // The run's own result is not under test: the shim prints no stream-json,
+    // so the envelope may be an error.
+    let _ = result;
+
+    let dumped = std::fs::read_to_string(&dump).expect("the shim dumped the re-keyed row");
+    serde_json::from_str(&dumped).expect("the dumped row parses")
+}
+
+/// A delegate's live row must name the directory the delegate CHILD runs in,
+/// not the mcp server's: `run_delegate` registers the row in-process, where
+/// `current_dir()` is the server's, so the re-key that moves the pid onto the
+/// child must move the cwd with it.
+#[cfg(unix)]
+#[test]
+fn a_delegates_live_row_carries_the_delegates_own_cwd() {
+    let cwd = tempfile::tempdir().expect("delegate cwd");
+    let row = delegate_live_row(cwd.path().to_str().expect("utf-8 tempdir"));
+    let row_cwd = row["cwd"].as_str().expect("the row carries a cwd");
+    assert_eq!(
+        crate::canonical::identity(row_cwd).expect("canonicalize the row cwd"),
+        crate::canonical::identity(cwd.path()).expect("canonicalize the delegate cwd"),
+        "the row's cwd is the delegate child's cwd, not the mcp server's"
+    );
+    let pid = row["pid"].as_u64().expect("the row carries a pid");
+    assert_ne!(
+        pid,
+        std::process::id() as u64,
+        "the row is re-keyed onto the child, not the registering mcp"
+    );
+}
+
+/// A relative `cwd` is resolved where the child resolves it, against the
+/// server's cwd, and the row stores the absolute result: a reader of the row
+/// cannot see the server's cwd to resolve it later.
+#[cfg(unix)]
+#[test]
+fn a_delegates_relative_cwd_lands_on_its_row_absolute() {
+    let row = delegate_live_row("src");
+    let row_cwd = row["cwd"].as_str().expect("the row carries a cwd");
+    let expected = std::env::current_dir().expect("test cwd").join("src");
+    assert_eq!(
+        std::path::Path::new(row_cwd),
+        expected.as_path(),
+        "the row holds the resolved absolute dir, never the relative spelling"
+    );
+}
+
 // A run started as an agent (`subagent_type`, `--agent`, the settings `agent`
 // key) runs whatever model its def names, and clauth reads no def: with no
 // named model, a capped account refuses it whatever its credit gate says; a

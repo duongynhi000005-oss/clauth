@@ -709,11 +709,12 @@ pub(crate) fn session_sessions_tree(
 /// dead silently freezes that session out of the chain (or, for GC, reaps a live
 /// session's row).
 ///
-/// Callers choose WHICH profile to probe: the tally, GC, and the decision leg all
-/// probe `current_member` first (where a swapped session holds its marker) and
-/// fall back to `start_profile` (where a session that never moved lives), so a row
-/// can never be alive for one consumer and dead for another. A caller MUST use the
-/// same fallback the tally uses, or GC would reap what the tally counts.
+/// Callers choose WHICH profile to probe:
+/// [`crate::live_sessions::LiveSession::marker_is_held`] probes
+/// `current_member` first (where a swapped session holds its marker) and falls
+/// back to `start_profile` (where a session that never moved lives), so a row
+/// can never be alive for one consumer and dead for another. A caller MUST use
+/// that same fallback, or GC would reap what the tally counts.
 pub(crate) fn session_row_is_live(
     start_profile: &ProfileName,
     isolated: bool,
@@ -1069,11 +1070,10 @@ fn sessions_holding_store(profile: &ProfileName, store: &Path, session: &Session
         .into_iter()
         .filter(|row| {
             let member = row.current_member.as_deref().unwrap_or(&row.start_profile);
-            let probe = crate::profile::ProfileName::from(member);
             member == profile.as_str()
                 && row.launch_store.as_deref() == Some(store)
                 && row.session_id != session.as_str()
-                && session_row_is_live(&probe, row.isolated, &row.session_id)
+                && row.marker_is_held()
         })
         .count()
 }
@@ -2313,8 +2313,7 @@ fn gc_bare_markers() {
 /// its own entry point so every existing `gc_stale_runtimes` caller gets it.
 fn gc_live_session_rows() {
     for row in crate::live_sessions::list() {
-        let probe = ProfileName::from(row.current_member.as_deref().unwrap_or(&row.start_profile));
-        if !session_row_is_live(&probe, row.isolated, &row.session_id)
+        if !row.marker_is_held()
             && let Err(e) = crate::live_sessions::unregister(&row.session_id)
         {
             logline!("clauth: dropping stale live-session row failed: {e}");

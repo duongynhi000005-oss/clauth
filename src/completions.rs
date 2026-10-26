@@ -36,7 +36,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
-        COMPREPLY=( $(compgen -W "--json --tokens" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--json --tokens --live" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "switch" ]; then
         local profiles sids
         profiles=$(clauth __complete 2>/dev/null)
@@ -207,7 +207,8 @@ _clauth() {
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]' \
-            '--tokens[add token totals + cost; reads every transcript in full]'
+            '--tokens[add token totals + cost; reads every transcript in full]' \
+            '--live[only the sessions running now; opens no transcript]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == switch ]]; then
         local -a profiles sids
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
@@ -334,6 +335,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (c
 complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
+complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --live -d "Only the sessions running now; opens no transcript"
 complete -c clauth -f -n "__fish_seen_subcommand_from resume; and not contains -- --profile (commandline -opc)" -a --profile -d "Resume under this profile instead of prompting"
 complete -c clauth -f -n "__fish_seen_subcommand_from resume; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session
 complete -c clauth -f -n '__fish_seen_subcommand_from resume; and set -l t (commandline -opc); and test "$t[-1]" = --profile' -a "(__clauth_profiles)" -d Profile

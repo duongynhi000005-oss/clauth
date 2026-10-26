@@ -32,6 +32,31 @@ use crate::logline::logline;
 use crate::pricing::PriceTable;
 use crate::profile::{atomic_write_600, claude_dir, clauth_dir, mkdir_700};
 
+// Test-only ledger of transcript opens, so `clauth sessions --live` can prove
+// it opens none: every preview/history transcript read in this module bumps
+// it, and the `--live` test asserts the counter stays put. Rescue/move reads
+// and opens through `crate::tokens` / `crate::tps` are not counted.
+// Thread-local so parallel `cargo test` threads never share a count.
+#[cfg(test)]
+thread_local! {
+    static TRANSCRIPT_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn transcript_opens() -> usize {
+    TRANSCRIPT_OPENS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_transcript_opens() {
+    TRANSCRIPT_OPENS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+fn bump_transcript_open() {
+    TRANSCRIPT_OPENS.with(|c| c.set(c.get() + 1));
+}
+
 /// Bytes read from a file's head to recover its workspace and first user
 /// message. The session id comes from the filename stem, not the head, so this
 /// window only has to reach the first user turn, which sits at or near the top.
@@ -308,6 +333,8 @@ struct Head {
 /// workspace / `None` message rather than dropping the session — its id comes
 /// from the filename, so a summary-first or oversized head is still indexed.
 fn read_head(path: &Path) -> Head {
+    #[cfg(test)]
+    bump_transcript_open();
     let Ok(file) = File::open(path) else {
         return Head::default();
     };
@@ -347,6 +374,8 @@ fn read_head(path: &Path) -> Head {
 /// A non-UTF-8 line is one bad record, not the end of the file: it is skipped,
 /// as is an unparseable one.
 fn read_last_agent(path: &Path) -> Option<String> {
+    #[cfg(test)]
+    bump_transcript_open();
     let Ok(file) = File::open(path) else {
         return None;
     };
@@ -441,6 +470,8 @@ fn lines_before(
     window: Window,
     mut visit: impl FnMut(u64, &[u8]) -> ControlFlow<()>,
 ) -> std::io::Result<()> {
+    #[cfg(test)]
+    bump_transcript_open();
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
     let mut end = end.map_or(len, |end| end.min(len));

@@ -2068,8 +2068,7 @@ fn row_follows_chain_live(row: &crate::live_sessions::LiveSession) -> bool {
     row.follows_chain && !row.isolated && {
         // `gc_stale_runtimes` reaps rows at daemon STARTUP, not per tick,
         // so a SIGKILLed session's row outlives the whole daemon run.
-        let probe = ProfileName::from(row.current_member.as_deref().unwrap_or(&row.start_profile));
-        crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id)
+        row.marker_is_held()
     }
 }
 
@@ -6385,23 +6384,8 @@ struct SessionDecision {
 /// each tick — the join stays direct.
 fn session_conversation_id(row: &crate::live_sessions::LiveSession) -> Option<String> {
     let pid = row.claude_pid?;
-    let dir = session_sessions_dir(row)?;
+    let dir = crate::session_record::session_sessions_dir(row)?;
     crate::session_record::session_record(&dir, pid).map(|r| r.session_id)
-}
-
-/// The sessions dir a row's Claude Code record lives in: the runtime tree the
-/// bridge's [`crate::runtime::session_sessions_tree`] picks (a fake-link box
-/// holds the record off `~/.claude`), else `~/.claude/sessions`. The tree pick
-/// is shared with the bridge so the rule lives once.
-fn session_sessions_dir(row: &crate::live_sessions::LiveSession) -> Option<std::path::PathBuf> {
-    if let Some(tree) =
-        crate::runtime::session_sessions_tree(&row.start_profile, row.isolated, &row.session_id)
-    {
-        return Some(tree.join("sessions"));
-    }
-    crate::profile::claude_dir()
-        .ok()
-        .map(|d| d.join("sessions"))
 }
 
 /// Whether a conversation the row joined is ambiguous: some live process other
@@ -6549,7 +6533,7 @@ fn scan_session_switches(
     if !drained.pending.is_empty() {
         let mut dirs: HashSet<std::path::PathBuf> = HashSet::new();
         for row in crate::live_sessions::list() {
-            let Some(dir) = session_sessions_dir(&row) else {
+            let Some(dir) = crate::session_record::session_sessions_dir(&row) else {
                 continue;
             };
             if let Ok(id) = crate::canonical::identity(&dir) {

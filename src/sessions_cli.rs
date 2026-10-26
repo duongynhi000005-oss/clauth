@@ -1,15 +1,18 @@
-//! `clauth sessions [--json] [--tokens]`, `clauth resume <id|latest>
+//! `clauth sessions [--json] [--tokens] [--live]`, `clauth resume <id|latest>
 //! [--profile <name>]`, `clauth info <id|latest>`, and the two-name form of
 //! `clauth switch <sid> <profile>` (one name is the global account switch,
 //! `main::cmd_switch`) — the CLI surface over the session index
 //! ([`crate::sessions`]). The index owns the heavy work (transcript walk,
 //! preview redaction, token/cost annotation, owner stamping); this module
 //! only flattens it, renders it, and drives the account-aware resume spawn.
-//! `switch` is the exception: it touches no transcript at all, only the
-//! live-session registry ([`crate::live_sessions`]).
+//! `switch` and `sessions --live` are the exceptions: neither touches a
+//! transcript — `switch` reads only the live-session registry
+//! ([`crate::live_sessions`]), and `--live` the registry plus Claude Code's
+//! per-pid session records.
 //!
 //! # What each command reads
-//! Only `sessions` browses, so only `sessions` builds the index. `resume` and
+//! Only the full `sessions` listing browses, so only it builds the index;
+//! `--live` builds no index. `resume` and
 //! `info` want one row, and take [`crate::sessions::find_session`] /
 //! [`crate::sessions::newest_session`] instead: a filename-and-mtime walk, then
 //! the head of the single transcript they resolved to. Those two read the shared
@@ -25,7 +28,8 @@
 //!
 //! # Exit codes (the `clauth sessions` scripting contract)
 //! - `0` success.
-//! - `1` a genuine error, INCLUDING "no sessions found".
+//! - `1` a genuine error, INCLUDING "no sessions found", "no live sessions
+//!   found", and an unlistable live-session registry.
 //! - `2` a usage error (bad flag/args).
 //!
 //! `1` vs `2` is carried by [`crate::UsageError`] and mapped in
@@ -43,12 +47,36 @@ use crate::profile::{AppConfig, load_config};
 use crate::runtime::Isolation;
 use crate::sessions::{IsolatedHold, SessionInfo, SessionRef, WorkspaceGroup};
 
-/// `clauth sessions [--json] [--tokens]` — the full inventory, newest-first.
-/// Both a TTY and a pipe print a table (the `--json` flag, not the tty, selects
-/// machine output; this is deliberately NOT showagent's pipe-prints-different
-/// behavior). An empty index is exit 1 ("no sessions found") on both paths, per
-/// the scripting contract above.
-pub(crate) fn run_sessions(json: bool, tokens: bool) -> Result<()> {
+/// `clauth sessions [--json] [--tokens] [--live]` — the full inventory,
+/// newest-first, or (`--live`) the running sessions only, read from the
+/// registry and Claude Code's per-pid session records with no transcript
+/// opened. Both a TTY and a pipe print a table (the `--json` flag, not the tty,
+/// selects machine output; this is deliberately NOT showagent's
+/// pipe-prints-different behavior). An empty listing is exit 1 ("no sessions
+/// found" / "no live sessions found") on both paths, per the scripting contract
+/// above.
+pub(crate) fn run_sessions(json: bool, tokens: bool, live: bool) -> Result<()> {
+    if live {
+        let Some(rows) = crate::live_sessions::live_rows() else {
+            let dir = crate::live_sessions::registry_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|_| "~/.clauth/live_sessions".to_string());
+            anyhow::bail!("cannot list live sessions: {dir} is unreadable");
+        };
+        let rows = live_rows_newest_first(rows);
+        if rows.is_empty() {
+            anyhow::bail!("no live sessions found");
+        }
+        if json {
+            outln!("{}", live_json_of(&rows));
+        } else {
+            for line in live_lines_of(&rows, SystemTime::now()) {
+                outln!("{line}");
+            }
+        }
+        return Ok(());
+    }
+
     let groups = build_listing(tokens);
 
     let flat = flatten_newest_first(&groups);
@@ -205,20 +233,16 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
         } else {
             String::new()
         };
-        anyhow::bail!("no live session '{sid}'\nsee `clauth sessions`{hint}");
+        anyhow::bail!("no live session '{sid}'\nsee `clauth sessions --live`{hint}");
     };
     // A codex row has no executor: codex reads auth.json once at start, so a
     // mid-session intent would stand forever as a silent no-op.
     if row.harness == crate::harness::Harness::Codex {
         anyhow::bail!("session '{sid}' is a codex session; switch is claude-only");
     }
-    // The same liveness probe the tally and the decision leg use, current
-    // member first: a row whose flock is gone is a stale row awaiting GC, not
-    // a session to move.
-    let probe = crate::profile::ProfileName::from(
-        row.current_member.as_deref().unwrap_or(&row.start_profile),
-    );
-    if !crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id) {
+    // The shared liveness probe: a row whose flock is gone is a stale row
+    // awaiting GC, not a session to move.
+    if !row.marker_is_held() {
         anyhow::bail!(
             "session '{sid}' is no longer running\n\
              its row is reaped by the next `clauth daemon` or `clauth resume`"
@@ -476,6 +500,190 @@ fn session_json_row(s: &SessionInfo) -> serde_json::Value {
         "tokens": s.tokens,
         "cost": s.cost,
     })
+}
+
+// ── clauth sessions --live ──
+
+/// One sort for every `--live` shape: newest first, equal `started_at` broken
+/// by `session_id` in byte order, so the listing never depends on the
+/// registry's read order.
+fn live_rows_newest_first(
+    mut rows: Vec<crate::live_sessions::LiveSession>,
+) -> Vec<crate::live_sessions::LiveSession> {
+    rows.sort_by(|a, b| {
+        b.started_at
+            .cmp(&a.started_at)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    rows
+}
+
+/// The live roster's human table, one line per running session, newest first.
+/// Columns: sid, account (`start → current` once moved), harness, age,
+/// transcript id, cwd, and the tag naming the session's kind (`switch` accepts
+/// delegate rows, refuses codex rows by harness).
+fn live_lines_of(rows: &[crate::live_sessions::LiveSession], now: SystemTime) -> Vec<String> {
+    let cells: Vec<LiveCells> = rows.iter().map(|row| live_cells(row, now)).collect();
+    let widths = LiveWidths::fit(&cells);
+    cells
+        .into_iter()
+        .map(|c| live_row_line(&c, widths))
+        .collect()
+}
+
+/// The `--live --json` array over `rows`, absent cells `null`, `started_at`
+/// ISO-8601 UTC.
+fn live_json_of(rows: &[crate::live_sessions::LiveSession]) -> serde_json::Value {
+    serde_json::Value::Array(rows.iter().map(live_json_row).collect())
+}
+
+#[cfg(test)]
+fn live_lines(now: SystemTime) -> Vec<String> {
+    let rows = crate::live_sessions::live_rows().expect("the registry lists");
+    live_lines_of(&live_rows_newest_first(rows), now)
+}
+
+#[cfg(test)]
+fn live_json() -> serde_json::Value {
+    let rows = crate::live_sessions::live_rows().expect("the registry lists");
+    live_json_of(&live_rows_newest_first(rows))
+}
+
+fn live_json_row(row: &crate::live_sessions::LiveSession) -> serde_json::Value {
+    serde_json::json!({
+        "sid": row.session_id,
+        "start_profile": row.start_profile,
+        "current_profile": row.current_member.as_deref().unwrap_or(&row.start_profile),
+        "harness": row.harness,
+        "cwd": row.cwd.as_ref().map(|p| p.display().to_string()),
+        "started_at": crate::usage::epoch_secs_to_iso((row.started_at / 1000) as i64),
+        "transcript_id": live_transcript_id(row),
+        "delegate": row.is_delegate,
+        "background": row.background,
+    })
+}
+
+/// The transcript id the row's Claude Code record names, `None` when the row
+/// carries no pid or no record reads.
+fn live_transcript_id(row: &crate::live_sessions::LiveSession) -> Option<String> {
+    crate::session_record::live_record(row).map(|r| r.session_id)
+}
+
+/// One row's rendered cells, before the width pass. The account cell is
+/// `start → current` only once the session moved to a different member, else
+/// the start profile alone.
+fn live_cells(row: &crate::live_sessions::LiveSession, now: SystemTime) -> LiveCells {
+    let account = match row.current_member.as_deref() {
+        Some(current) if current != row.start_profile => {
+            format!("{} → {}", row.start_profile, current)
+        }
+        _ => row.start_profile.clone(),
+    };
+    LiveCells {
+        sid: row.session_id.clone(),
+        account,
+        harness: row.harness.as_str().to_string(),
+        age: live_age(row.started_at, now),
+        transcript: live_transcript_id(row),
+        cwd: row.cwd.as_ref().map(|p| p.display().to_string()),
+        tag: if row.is_delegate {
+            "delegate".to_string()
+        } else if row.background {
+            "background".to_string()
+        } else {
+            String::new()
+        },
+    }
+}
+
+/// The age cell: the shared one-unit age from `started_at` (epoch ms), the
+/// same formatter the full listing's `updated` cell uses.
+fn live_age(started_at: u64, now: SystemTime) -> String {
+    let now_secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let start_secs = (started_at / 1000) as i64;
+    crate::format::spoken_age((now_secs - start_secs).max(0) as u64, start_secs)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// A row's cells, in column order.
+struct LiveCells {
+    sid: String,
+    account: String,
+    harness: String,
+    age: String,
+    transcript: Option<String>,
+    cwd: Option<String>,
+    tag: String,
+}
+
+/// The padded widths, measured over every row so one wide cell widens its
+/// column for all rows.
+#[derive(Debug, Clone, Copy)]
+struct LiveWidths {
+    sid: usize,
+    account: usize,
+    harness: usize,
+    age: usize,
+    transcript: usize,
+    cwd: usize,
+    tag: usize,
+}
+
+impl LiveWidths {
+    fn fit(cells: &[LiveCells]) -> Self {
+        let width = |s: &str| s.chars().count();
+        let mut w = Self {
+            sid: 0,
+            account: 0,
+            harness: 0,
+            age: 0,
+            transcript: 0,
+            cwd: 0,
+            tag: 0,
+        };
+        for c in cells {
+            w.sid = w.sid.max(width(&c.sid));
+            w.account = w.account.max(width(&c.account));
+            w.harness = w.harness.max(width(&c.harness));
+            w.age = w.age.max(width(&c.age));
+            w.transcript = w
+                .transcript
+                .max(width(c.transcript.as_deref().unwrap_or("-")));
+            w.cwd = w.cwd.max(width(c.cwd.as_deref().unwrap_or("-")));
+            w.tag = w.tag.max(width(&c.tag));
+        }
+        w
+    }
+}
+
+/// One line, columns joined by two spaces and left-padded to their width,
+/// trailing blanks trimmed. `-` fills a missing transcript id or cwd.
+fn live_row_line(c: &LiveCells, w: LiveWidths) -> String {
+    let transcript = c.transcript.as_deref().unwrap_or("-");
+    let cwd = c.cwd.as_deref().unwrap_or("-");
+    format!(
+        "{sid:<sid_w$}  {account:<account_w$}  {harness:<harness_w$}  {age:<age_w$}  \
+         {transcript:<transcript_w$}  {cwd:<cwd_w$}  {tag:<tag_w$}",
+        sid = c.sid,
+        sid_w = w.sid,
+        account = c.account,
+        account_w = w.account,
+        harness = c.harness,
+        harness_w = w.harness,
+        age = c.age,
+        age_w = w.age,
+        transcript = transcript,
+        transcript_w = w.transcript,
+        cwd = cwd,
+        cwd_w = w.cwd,
+        tag = c.tag,
+        tag_w = w.tag,
+    )
+    .trim_end()
+    .to_string()
 }
 
 /// Human table: a workspace header per group, then one row per session. The

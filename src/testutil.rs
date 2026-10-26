@@ -1216,6 +1216,25 @@ impl Drop for EnvPin<'_> {
 const FAKE_CLAUDE_SHIM: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CLAUDE_SHIM_LOG"
 printf '%s\t%s\n' "${CLAUDE_CONFIG_DIR-}" "$*" >> "$CLAUDE_SHIM_LOG.spawns"
+# Opt-in: a delegate's row is registered by the mcp that spawns us and re-keyed
+# onto our pid once we exist. When this var names a file, wait for that re-key
+# (a row under the live-sessions registry whose pid is ours) and copy the row
+# out, so a test can read what the registry holds while this child still runs.
+if [ -n "${CLAUDE_SHIM_ROW_DUMP-}" ]; then
+  i=0
+  while [ "$i" -lt 10 ]; do
+    for row in "$HOME"/.clauth/live_sessions/*.json; do
+      [ -f "$row" ] || continue
+      if grep -q "\"pid\":$$," "$row" 2>/dev/null; then
+        cp "$row" "$CLAUDE_SHIM_ROW_DUMP"
+        exit 0
+      fi
+    done
+    i=$((i + 1))
+    sleep 1
+  done
+  exit 0
+fi
 # Like the real background launch: the job service takes the session, the
 # launch returns at once, and the job record names the config dir it reads.
 # The record is written through that config dir, as Claude Code writes it.
@@ -1306,6 +1325,7 @@ pub(crate) struct FakeClaude<'a> {
     prev_mkt_state: Option<std::ffi::OsString>,
     prev_log: Option<std::ffi::OsString>,
     prev_fail_install: Option<std::ffi::OsString>,
+    prev_row_dump: Option<std::ffi::OsString>,
 }
 
 #[cfg(unix)]
@@ -1397,6 +1417,12 @@ impl<'a> FakeClaude<'a> {
                 std::env::remove_var("CLAUDE_SHIM_FAIL_INSTALL");
             }
         }
+        let prev_row_dump = std::env::var_os("CLAUDE_SHIM_ROW_DUMP");
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the dump branch.
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_ROW_DUMP");
+        }
         Self {
             _home: std::marker::PhantomData,
             _tmp: tmp,
@@ -1410,6 +1436,7 @@ impl<'a> FakeClaude<'a> {
             prev_mkt_state,
             prev_log,
             prev_fail_install,
+            prev_row_dump,
         }
     }
 
@@ -1428,6 +1455,18 @@ impl<'a> FakeClaude<'a> {
             .filter_map(|line| line.split_once('\t'))
             .map(|(dir, argv)| (dir.to_string(), argv.to_string()))
             .collect()
+    }
+
+    /// Point the shim's opt-in live-row dump at `path`: the shim waits for its
+    /// own row to be re-keyed and copies the row there. Restored on drop like
+    /// every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_row_dump(&mut self, path: &std::path::Path) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_ROW_DUMP", path) };
     }
 }
 
@@ -1450,6 +1489,7 @@ impl Drop for FakeClaude<'_> {
                 ("CLAUDE_SHIM_MKT_STATE", &self.prev_mkt_state),
                 ("CLAUDE_SHIM_LOG", &self.prev_log),
                 ("CLAUDE_SHIM_FAIL_INSTALL", &self.prev_fail_install),
+                ("CLAUDE_SHIM_ROW_DUMP", &self.prev_row_dump),
             ] {
                 match value {
                     Some(v) => std::env::set_var(key, v),

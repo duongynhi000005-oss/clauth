@@ -83,6 +83,7 @@ pub(crate) struct LiveSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) launch_families: Option<Vec<String>>,
     pub(crate) started_at: u64,
+    #[serde(serialize_with = "serialize_cwd_lossy")]
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) isolated: bool,
     /// Whether this session follows the shared fallback chain. Set once at
@@ -179,6 +180,22 @@ pub(crate) struct LiveSession {
     pub(crate) background_hold: bool,
 }
 
+/// Serializes [`LiveSession::cwd`] as its lossy UTF-8 form, so a session whose
+/// working directory is not UTF-8 still registers and lists (a row is JSON,
+/// which is UTF-8; the lossy form is all it can hold).
+fn serialize_cwd_lossy<S: serde::Serializer>(
+    cwd: &Option<PathBuf>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match cwd {
+        Some(path) => {
+            let lossy = path.to_string_lossy();
+            serializer.serialize_str(&lossy)
+        }
+        None => serializer.serialize_none(),
+    }
+}
+
 impl LiveSession {
     /// A row for a session starting now. Pid, start time, and cwd are read here
     /// rather than passed in, so every registration reports them the same way.
@@ -216,6 +233,19 @@ impl LiveSession {
             background: false,
             background_hold: false,
         }
+    }
+
+    /// Whether the session this row names still runs: `current_member` first
+    /// (where a swapped session holds its marker) then `start_profile` (where a
+    /// session that never moved lives). One predicate, so a row can never be
+    /// live for one consumer and dead for another.
+    pub(crate) fn marker_is_held(&self) -> bool {
+        let probe = crate::profile::ProfileName::from(
+            self.current_member
+                .as_deref()
+                .unwrap_or(&self.start_profile),
+        );
+        crate::runtime::session_row_is_live(&probe, self.isolated, &self.session_id)
     }
 }
 
@@ -274,6 +304,15 @@ impl SessionFields<'_> {
     /// names a delegate's account for the pane hosting its parent session.
     pub(crate) fn set_pid(&mut self, pid: u32) {
         self.0.pid = pid;
+    }
+
+    /// Record the directory the session's child actually runs in. A delegate's
+    /// row is registered by the `clauth mcp` that spawns it, whose cwd is the
+    /// server's, not the child's; the re-key that moves the pid onto the child
+    /// must move the cwd with it, or `clauth sessions --live` reports where the
+    /// server sat, not where the child runs.
+    pub(crate) fn set_cwd(&mut self, cwd: impl Into<PathBuf>) {
+        self.0.cwd = Some(cwd.into());
     }
 
     /// Record the spawned `claude` child's pid, once `clauth start` has it. The
@@ -346,10 +385,7 @@ impl LiveTally {
             if row.background_hold {
                 return false;
             }
-            let probe = crate::profile::ProfileName::from(
-                row.current_member.as_deref().unwrap_or(&row.start_profile),
-            );
-            crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id)
+            row.marker_is_held()
         }));
         tally.unread = unread;
         tally.add_bare_sessions(config);
@@ -486,7 +522,7 @@ impl LiveTally {
     }
 }
 
-fn registry_dir() -> Result<PathBuf> {
+pub(crate) fn registry_dir() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("live_sessions"))
 }
 
@@ -536,6 +572,18 @@ pub(crate) fn unregister(session_id: &str) -> Result<()> {
 /// unlistable registry.
 pub(crate) fn list() -> Vec<LiveSession> {
     read_registry().unwrap_or_default()
+}
+
+/// The running sessions' rows: drop the daemon's background hold and every row
+/// whose marker is no longer held, so a stale row awaiting GC never reads as
+/// live here. `None` when the registry cannot be listed or located, an empty
+/// vec when no row is live.
+pub(crate) fn live_rows() -> Option<Vec<LiveSession>> {
+    read_registry().map(|rows| {
+        rows.into_iter()
+            .filter(|row| !row.background_hold && row.marker_is_held())
+            .collect()
+    })
 }
 
 /// [`list`], telling an absent registry (nothing ever registered: empty) from

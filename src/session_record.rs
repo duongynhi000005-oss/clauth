@@ -5,7 +5,7 @@
 //! the stamp is never re-taken: the shared reader retries once, so the torn-read
 //! retry lives here rather than in each caller.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -131,6 +131,40 @@ pub(crate) fn session_record(dir: &Path, pid: u32) -> Option<SessionRecord> {
     let record = (0..2)
         .find_map(|_| serde_json::from_slice::<SessionRecord>(&std::fs::read(&path).ok()?).ok())?;
     (record.pid == pid && !record.session_id.is_empty()).then_some(record)
+}
+
+/// The sessions dir a live-session row's Claude Code record lives in: a
+/// background row writes through the account's fixed `runtime-bg` tree, else
+/// the runtime tree [`crate::runtime::session_sessions_tree`] picks (a
+/// fake-link box holds the record off `~/.claude`), else `~/.claude/sessions`.
+pub(crate) fn session_sessions_dir(row: &crate::live_sessions::LiveSession) -> Option<PathBuf> {
+    if row.background {
+        let profile = crate::profile::ProfileName::from(row.start_profile.as_str());
+        return crate::runtime::background_runtime_tree(&profile)
+            .ok()
+            .map(|tree| tree.join("sessions"));
+    }
+    if let Some(tree) =
+        crate::runtime::session_sessions_tree(&row.start_profile, row.isolated, &row.session_id)
+    {
+        return Some(tree.join("sessions"));
+    }
+    crate::profile::claude_dir()
+        .ok()
+        .map(|d| d.join("sessions"))
+}
+
+/// The Claude Code record a live-session row names: the delegate child's
+/// record for a delegate (its row is re-keyed onto that pid), else the
+/// `claude` child's; `None` when the row carries no pid or no record reads.
+pub(crate) fn live_record(row: &crate::live_sessions::LiveSession) -> Option<SessionRecord> {
+    let pid = if row.is_delegate {
+        row.pid
+    } else {
+        row.claude_pid?
+    };
+    let dir = session_sessions_dir(row)?;
+    session_record(&dir, pid)
 }
 
 /// Whether `/proc/<pid>/stat` field 22 (the start time in clock ticks since

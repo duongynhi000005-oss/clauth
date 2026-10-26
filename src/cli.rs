@@ -234,18 +234,23 @@ pub(crate) enum Command {
         json: bool,
     },
 
-    /// List Claude Code sessions as a table
+    /// List Claude Code sessions, or with --live every running clauth session
     ///
     /// Exits 0 on success, 2 on a usage error, 1 on any other failure.
     Sessions {
-        /// Emit a stable newest-first JSON array instead of the table. The field
-        /// set is fixed; `tokens` and `cost` are null without `--tokens`.
+        /// Emit a stable newest-first JSON array instead of the table. Each
+        /// listing's field set is fixed; without `--tokens`, the full listing's
+        /// `tokens` and `cost` are null.
         #[arg(long)]
         json: bool,
         /// Add each session's token total and cost. Reads every transcript in
         /// full, so a large store takes a while; omitted, both stay blank.
         #[arg(long)]
         tokens: bool,
+        /// Only the sessions running now, with the id `clauth switch` takes.
+        /// Opens no transcript.
+        #[arg(long, conflicts_with = "tokens")]
+        live: bool,
     },
 
     /// Switch the global account, or move a live session to another profile
@@ -263,8 +268,8 @@ pub(crate) enum Command {
     /// next request, never before it. For a session started with
     /// --with-fallback, the chain's decider can supersede a manual intent on
     /// its next tick. The sid is the `<pid>-<seq>` of a live
-    /// `clauth start` session, one row per session under
-    /// ~/.clauth/live_sessions/.
+    /// `clauth start` session or delegate, as `clauth sessions --live` lists
+    /// it.
     Switch {
         /// Profile to switch the global account to, or a live session id.
         name: String,
