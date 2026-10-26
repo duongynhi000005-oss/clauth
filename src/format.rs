@@ -612,6 +612,37 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// Untrusted text with its control and bidi formatting characters dropped: it
+/// reaches a terminal, where an escape sequence could retitle it or hide a
+/// line, and a bidi override could reorder the line to read as something it is
+/// not.
+pub(crate) fn terminal_safe(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && !reorders_display(*c))
+        .collect()
+}
+
+/// Unicode's `Bidi_Control` property, all twelve codepoints: the embeddings and
+/// overrides (`U+202A..=U+202E`), the isolates (`U+2066..=U+2069`), and the
+/// three directional marks — `U+200E` LRM, `U+200F` RLM, and `U+061C` ALM, the
+/// Arabic-script twin of RLM.
+///
+/// Spelled out rather than tested by general category, because the crate carries
+/// no Unicode tables. The cost of spelling it out is that it is only closed
+/// against the Unicode version it was written from; `Bidi_Control` has been
+/// stable for many releases, and a new member would surface as a codepoint
+/// reaching the terminal rather than as a wrong figure.
+///
+/// Legitimate right-to-left text needs none of them: the implicit bidi algorithm
+/// renders a plain Arabic or Hebrew tail correctly on its own, measured on
+/// both.
+pub(crate) fn reorders_display(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}'
+    )
+}
+
 /// The account's tier: a fetched plan wins when classified, else the OAuth
 /// token's `subscription_type` claim, else `None` when neither names one. A
 /// surface renders its own no-data form on `None` rather than a bare "Claude"

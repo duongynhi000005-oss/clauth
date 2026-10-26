@@ -367,19 +367,24 @@ fn fixed_credit(expires_at: Option<&str>) -> ResetCredit {
     )
 }
 
+const PROMPT_TAIL: &str =
+    ", 1 of 3 available. It reopens the account's usage windows now and cannot be undone.";
+
+fn titled_credit(title: &str) -> ResetCredit {
+    ResetCredit {
+        title: Some(title.to_string()),
+        ..fixed_credit(None)
+    }
+}
+
 /// What the server sends is shown as sent, minus what would hide or reorder
 /// the confirm line: a lowercase title stays lowercase, a title that is only
 /// blanks and control characters is no title, a long one is capped, and the
 /// bidi controls that reorder a terminal line are dropped.
 #[test]
 fn limit_reset_prompt_shows_the_title_as_sent_minus_what_hides_the_line() {
-    let base = fixed_credit(None);
-    let titled = |title: &str| ResetCredit {
-        title: Some(title.to_string()),
-        ..base.clone()
-    };
-    let tail =
-        ", 1 of 3 available. It reopens the account's usage windows now and cannot be undone.";
+    let titled = titled_credit;
+    let tail = PROMPT_TAIL;
 
     assert_eq!(
         sole_prompt(&titled("weekly reset")),
@@ -421,10 +426,7 @@ fn limit_reset_prompt_shows_the_title_as_sent_minus_what_hides_the_line() {
 /// as sent.
 #[test]
 fn limit_reset_invisible_title_reads_as_untitled() {
-    let titled = |title: &str| ResetCredit {
-        title: Some(title.to_string()),
-        ..fixed_credit(None)
-    };
+    let titled = titled_credit;
     for invisible in [
         "\u{200b}",
         "\u{3164}",
@@ -650,6 +652,274 @@ fn limit_reset_unparseable_stamps_reach_the_terminal_without_control_characters(
         lines[1],
         "  * usage-limit reset: available, expires 2026-01-01T00:00:00]52;c;AAAA, \
          granted 2026-01-01T00:00:00]52;c;AAAA  (used next)"
+    );
+}
+
+/// The title's 60 cap counts only the characters that take a cell: a run of
+/// zero-width characters inside a title never pushes it past the cap, and none
+/// of them is dropped. A cut keeps the invisible characters right after the last drawn one,
+/// so an emoji keeps its variation selector. Blanks count, as spaces do; a
+/// title exactly at the cap is shown whole.
+#[test]
+fn limit_reset_title_cap_counts_only_drawn_characters() {
+    let padded = format!("x{}y", "\u{200b}".repeat(70));
+    assert_eq!(
+        sole_prompt(&titled_credit(&padded)),
+        format!("clauth: use a usage-limit reset on 'work'? {padded}, no expiry{PROMPT_TAIL}")
+    );
+    assert_eq!(
+        sole_list_row(&titled_credit(&padded)),
+        format!("  * {padded}: available, no expiry, granted not-a-stamp  (used next)")
+    );
+
+    let heart = "\u{2764}\u{fe0f}";
+    assert_eq!(
+        sole_prompt(&titled_credit(&heart.repeat(70))),
+        format!(
+            "clauth: use a usage-limit reset on 'work'? {}..., no expiry{PROMPT_TAIL}",
+            heart.repeat(57)
+        )
+    );
+
+    assert_eq!(
+        sole_prompt(&titled_credit(&"x ".repeat(35))),
+        format!(
+            "clauth: use a usage-limit reset on 'work'? {}x..., no expiry{PROMPT_TAIL}",
+            "x ".repeat(28)
+        )
+    );
+
+    let at_cap = format!(
+        "{}{}{}",
+        "x".repeat(30),
+        "\u{200b}".repeat(5),
+        "x".repeat(30)
+    );
+    assert_eq!(
+        sole_prompt(&titled_credit(&at_cap)),
+        format!("clauth: use a usage-limit reset on 'work'? {at_cap}, no expiry{PROMPT_TAIL}")
+    );
+}
+
+/// The `--list` status cap (20) counts only drawn characters too.
+#[test]
+fn limit_reset_status_cap_counts_only_drawn_characters() {
+    let status = format!("re{}deemed", "\u{200b}".repeat(25));
+    let c = credit("c", "codex_rate_limits", &status, "not-a-stamp", None);
+    assert_eq!(
+        describe_reset_credits("work", &list_of(vec![c], 0))[1],
+        format!("    usage-limit reset: {status}, no expiry, granted not-a-stamp")
+    );
+}
+
+/// An unparseable stamp's cap (40) counts only drawn characters too, on the
+/// expiry and the grant alike.
+#[test]
+fn limit_reset_raw_stamp_cap_counts_only_drawn_characters() {
+    let raw = format!("{}soon", "\u{200b}".repeat(45));
+    assert_eq!(
+        sole_prompt(&fixed_credit(Some(&raw))),
+        format!("clauth: use a usage-limit reset on 'work'? Expires {raw}{PROMPT_TAIL}")
+    );
+    let granted = credit("a", "codex_rate_limits", "available", &raw, None);
+    assert_eq!(
+        sole_list_row(&granted),
+        format!("  * usage-limit reset: available, no expiry, granted {raw}  (used next)")
+    );
+}
+
+/// U+2800 BRAILLE PATTERN BLANK draws an empty cell, so it is blank like a
+/// space: a title, expiry, status or grant made of it shows nothing.
+#[test]
+fn limit_reset_braille_blank_alone_shows_nothing() {
+    let blank = "\u{2800}";
+    for text in [blank.to_string(), format!(" {blank} {blank} ")] {
+        assert_eq!(
+            sole_prompt(&titled_credit(&text)),
+            format!("clauth: use a usage-limit reset on 'work'? No expiry{PROMPT_TAIL}"),
+            "title {text:?}"
+        );
+        assert_eq!(
+            sole_list_row(&titled_credit(&text)),
+            "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)",
+            "title {text:?}"
+        );
+        assert_eq!(
+            sole_prompt(&fixed_credit(Some(&text))),
+            format!("clauth: use a usage-limit reset on 'work'? No expiry{PROMPT_TAIL}"),
+            "expires_at {text:?}"
+        );
+        let no_status = credit("c", "codex_rate_limits", &text, "not-a-stamp", None);
+        assert_eq!(
+            describe_reset_credits("work", &list_of(vec![no_status], 0))[1],
+            "    usage-limit reset: no expiry, granted not-a-stamp",
+            "status {text:?}"
+        );
+        let no_grant = credit("c", "codex_rate_limits", "available", &text, None);
+        assert_eq!(
+            sole_list_row(&no_grant),
+            "  * usage-limit reset: available, no expiry  (used next)",
+            "granted_at {text:?}"
+        );
+    }
+}
+
+/// A title trims U+2800 off both ends, as it trims spaces.
+#[test]
+fn limit_reset_title_trims_braille_blanks_off_its_ends() {
+    let c = titled_credit("\u{2800} Full reset \u{2800}\u{2800}");
+    assert_eq!(
+        sole_prompt(&c),
+        format!("clauth: use a usage-limit reset on 'work'? Full reset, no expiry{PROMPT_TAIL}")
+    );
+    assert_eq!(
+        sole_list_row(&c),
+        "  * Full reset: available, no expiry, granted not-a-stamp  (used next)"
+    );
+}
+
+/// A status sent with blanks around `available` is available: it is the one
+/// `limit-reset` spends, and `--list` prints it trimmed.
+#[test]
+fn limit_reset_spends_an_available_status_sent_with_blanks() {
+    for status in [" available ", "\u{2800}available\t"] {
+        let c = credit("a", "codex_rate_limits", status, "not-a-stamp", None);
+        let credits = list_of(vec![c.clone()], 3);
+        assert_eq!(credits.next_to_use(), Some(&c), "status {status:?}");
+        assert_eq!(
+            describe_reset_credits("work", &credits),
+            vec![
+                "clauth: 'work' has 3 usage-limit resets available.".to_string(),
+                "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)"
+                    .to_string(),
+            ],
+            "status {status:?}"
+        );
+    }
+}
+
+/// The Hangul fillers draw an empty cell, so they are blank like a space: they
+/// count toward a cap and trim off the ends.
+#[test]
+fn limit_reset_hangul_fillers_count_and_trim_as_blank() {
+    let filled = format!("a{}b", "\u{3164}".repeat(100));
+    assert_eq!(
+        sole_prompt(&titled_credit(&filled)),
+        format!(
+            "clauth: use a usage-limit reset on 'work'? a{}..., no expiry{PROMPT_TAIL}",
+            "\u{3164}".repeat(56)
+        )
+    );
+    assert_eq!(
+        sole_prompt(&titled_credit("\u{3164}Full reset\u{ffa0}")),
+        format!("clauth: use a usage-limit reset on 'work'? Full reset, no expiry{PROMPT_TAIL}")
+    );
+    assert_eq!(
+        sole_prompt(&titled_credit("Full reset\u{115f}")),
+        format!("clauth: use a usage-limit reset on 'work'? Full reset, no expiry{PROMPT_TAIL}")
+    );
+    let c = credit(
+        "a",
+        "codex_rate_limits",
+        "\u{115f}available",
+        "not-a-stamp",
+        None,
+    );
+    let credits = list_of(vec![c.clone()], 3);
+    assert_eq!(credits.next_to_use(), Some(&c));
+    assert_eq!(
+        describe_reset_credits("work", &credits)[1],
+        "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)"
+    );
+}
+
+/// A credit is spent when the status `--list` shows for it reads `available`:
+/// control, bidi and invisible characters never keep a row that reads
+/// `available` from being the one `limit-reset` spends.
+#[test]
+fn limit_reset_spends_the_status_list_shows_as_available() {
+    for (status, shown) in [
+        ("available\u{7}", "available"),
+        ("available\u{202e}", "available"),
+        ("\u{200b}available", "available"),
+    ] {
+        let c = credit("a", "codex_rate_limits", status, "not-a-stamp", None);
+        let credits = list_of(vec![c.clone()], 3);
+        assert_eq!(credits.next_to_use(), Some(&c), "status {status:?}");
+        assert_eq!(
+            describe_reset_credits("work", &credits),
+            vec![
+                "clauth: 'work' has 3 usage-limit resets available.".to_string(),
+                format!(
+                    "  * usage-limit reset: {shown}, no expiry, granted not-a-stamp  (used next)"
+                ),
+            ],
+            "status {status:?}"
+        );
+    }
+}
+
+/// A title trims invisible padding off its ends along with blanks, and keeps
+/// the invisible characters right after its last drawn one.
+#[test]
+fn limit_reset_title_trims_invisible_padding_off_its_ends() {
+    for (title, shown) in [
+        (" \u{200b} Full reset \u{200b} ", "Full reset"),
+        ("\u{2060}\u{feff}Full reset\u{2060}", "Full reset\u{2060}"),
+        ("\u{2764}\u{fe0f} ", "\u{2764}\u{fe0f}"),
+    ] {
+        assert_eq!(
+            sole_prompt(&titled_credit(title)),
+            format!("clauth: use a usage-limit reset on 'work'? {shown}, no expiry{PROMPT_TAIL}"),
+            "title {title:?}"
+        );
+    }
+}
+
+/// A cap below the ellipsis' own width is dots alone, as `format::truncate`
+/// gives, never a panic.
+#[test]
+fn limit_reset_cap_below_the_ellipsis_is_dots_alone() {
+    assert_eq!(cap_drawn("abcd", 2), "..");
+    assert_eq!(cap_drawn("abcd", 0), "");
+    assert_eq!(cap_drawn("abcd", 3), "...");
+    assert_eq!(cap_drawn("a\u{200b}\u{200b}", 2), "a\u{200b}\u{200b}");
+}
+
+/// A soft hyphen takes a cell on most terminals (drawn as a hyphen), so it
+/// counts toward a cap and a status holding one inside is not `available`;
+/// alone or at the ends it is padding, like an invisible character.
+#[test]
+fn limit_reset_soft_hyphen_takes_a_cell() {
+    let c = credit(
+        "a",
+        "codex_rate_limits",
+        "avail\u{ad}able",
+        "not-a-stamp",
+        None,
+    );
+    let credits = list_of(vec![c], 0);
+    assert_eq!(credits.next_to_use(), None);
+    assert_eq!(
+        describe_reset_credits("work", &credits),
+        vec![
+            "clauth: no usage-limit resets available on 'work'.".to_string(),
+            "    usage-limit reset: avail\u{ad}able, no expiry, granted not-a-stamp".to_string(),
+        ]
+    );
+
+    let hyphens = format!("x{}y", "\u{ad}".repeat(70));
+    assert_eq!(
+        sole_prompt(&titled_credit(&hyphens)),
+        format!(
+            "clauth: use a usage-limit reset on 'work'? x{}..., no expiry{PROMPT_TAIL}",
+            "\u{ad}".repeat(56)
+        )
+    );
+
+    assert_eq!(
+        sole_prompt(&titled_credit("\u{ad}Full reset\u{ad}")),
+        format!("clauth: use a usage-limit reset on 'work'? Full reset, no expiry{PROMPT_TAIL}")
     );
 }
 

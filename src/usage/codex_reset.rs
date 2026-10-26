@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use super::fetch::iso_to_epoch_secs;
-use crate::format::{local_stamp, plural, truncate};
+use crate::format::{local_stamp, plural, terminal_safe, truncate};
 
 /// Lists the account's reset credits. The ChatGPT-flavored spelling, the only
 /// one a clauth-held login reaches (see `codex::CODEX_USAGE_URL`).
@@ -91,20 +91,33 @@ pub(crate) struct ResetCredit {
 }
 
 impl ResetCredit {
+    /// The status as `--list` shows it: `terminal_safe`, its padding off.
+    fn shown_status(&self) -> String {
+        trim_padding(&terminal_safe(&self.status)).to_string()
+    }
+
+    /// Whether the shown status reads `available`: its invisible characters
+    /// never keep a row that reads available from being the one spent.
     fn is_available(&self) -> bool {
-        self.status == AVAILABLE
+        let shown: String = self
+            .shown_status()
+            .chars()
+            .filter(|&c| !is_invisible(c))
+            .collect();
+        shown == AVAILABLE
     }
 
     /// The server's title, else `None` when it is absent or, after
-    /// `terminal_safe`, holds nothing a terminal draws: whitespace and
-    /// `Default_Ignorable_Code_Point` characters only. The cap runs here too,
-    /// since this text reaches a terminal.
+    /// `terminal_safe`, holds nothing a terminal draws: blanks and invisible
+    /// characters only. Blank and invisible padding comes off both ends, and
+    /// the cap counts only what takes a cell, since this text reaches a
+    /// terminal.
     fn shown_title(&self) -> Option<String> {
         let title = terminal_safe(self.title.as_deref().unwrap_or_default());
         if shows_nothing(&title) {
             None
         } else {
-            Some(truncate(title.trim(), 60))
+            Some(cap_drawn(trim_padding(&title), 60))
         }
     }
 
@@ -306,19 +319,25 @@ fn uuid_v4_from(mut bytes: [u8; 16]) -> String {
 // One spelling per outcome. A script can read the first stdout line as the
 // success summary and a failure off stderr.
 
-/// Server text with its control and bidi formatting characters dropped: it
-/// reaches a terminal, where an escape sequence could retitle it or hide the
-/// confirm line, and a bidi override could reorder the line to read as
-/// something it is not.
-fn terminal_safe(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() && !crate::jobs_cli::reorders_display(*c))
-        .collect()
+/// Whether a terminal may draw `c` as a blank cell: whitespace, `U+2800` BRAILLE
+/// PATTERN BLANK, and the Hangul fillers `U+115F`, `U+3164` and `U+FFA0`. Width
+/// tables disagree on the last two (glibc's `wcwidth` gives 0 for both, East
+/// Asian Width calls them wide and halfwidth), so they count as blank: a cap
+/// cuts early rather than late, and a status holding one inside is never spent.
+fn is_blank(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{2800}' | '\u{115F}' | '\u{3164}' | '\u{FFA0}')
+}
+
+/// Whether a terminal draws nothing for `c` and it takes no cell either: a
+/// `Default_Ignorable_Code_Point` character that is neither a blank nor the
+/// soft hyphen `U+00AD`, which glibc's `wcwidth` gives a cell.
+fn is_invisible(c: char) -> bool {
+    draws_nothing(c) && !is_blank(c) && c != '\u{AD}'
 }
 
 /// `Unicode 18.0.0` `DerivedCoreProperties.txt`: the
 /// `Default_Ignorable_Code_Point` ranges, characters a terminal draws no glyph
-/// for. Some of them, the Hangul fillers included, still occupy a blank cell.
+/// for. Some of them, the Hangul fillers included, can occupy a blank cell.
 fn draws_nothing(c: char) -> bool {
     matches!(
         c,
@@ -342,11 +361,61 @@ fn draws_nothing(c: char) -> bool {
     )
 }
 
-/// Whether `text` holds nothing a terminal draws: whitespace and
-/// `Default_Ignorable_Code_Point` characters only. Callers pass `terminal_safe`
-/// output.
+/// Whether `c` takes a cell in a terminal: every character but an invisible one
+/// does, blanks included.
+fn takes_a_cell(c: char) -> bool {
+    !is_invisible(c)
+}
+
+/// Whether `text` shows nothing: blanks and `draws_nothing` characters only, a
+/// soft hyphen included. Callers pass `terminal_safe` output.
 fn shows_nothing(text: &str) -> bool {
-    text.chars().all(|c| c.is_whitespace() || draws_nothing(c))
+    text.chars().all(|c| is_blank(c) || draws_nothing(c))
+}
+
+/// `text` without the blank and `draws_nothing` padding on either end: the slice from
+/// the first drawn character through the last, plus the invisible characters
+/// directly after the last one (a variation selector travels with its emoji).
+/// `""` when `text` holds no drawn character.
+fn trim_padding(text: &str) -> &str {
+    let drawn = |c: char| !is_blank(c) && !draws_nothing(c);
+    let Some(start) = text.find(drawn) else {
+        return "";
+    };
+    let last = text.rfind(drawn).unwrap_or(start);
+    let after = last + text[last..].chars().next().map_or(0, char::len_utf8);
+    let tail = text[after..]
+        .find(|c: char| !is_invisible(c))
+        .unwrap_or(text.len() - after);
+    &text[start..after + tail]
+}
+
+/// Cap `text` at `max` characters that take a cell — drawn characters and
+/// blanks alike, never the invisible ones — appending `...` when it is over; at
+/// or under the cap the text comes back unchanged, padding and all. A cut keeps
+/// the invisible characters directly after the last character that takes a
+/// cell, so an emoji keeps its variation selector, and never counts those
+/// against the cap.
+fn cap_drawn(text: &str, max: usize) -> String {
+    if text.chars().filter(|&c| takes_a_cell(c)).count() <= max {
+        return text.to_string();
+    }
+    if max < 3 {
+        return truncate(text, max);
+    }
+    let mut kept = String::new();
+    let mut cells = 0;
+    for c in text.chars() {
+        if takes_a_cell(c) {
+            if cells == max - 3 {
+                break;
+            }
+            cells += 1;
+        }
+        kept.push(c);
+    }
+    kept.push_str("...");
+    kept
 }
 
 /// An RFC 3339 stamp as local wall-clock time, or the raw text (made
@@ -355,7 +424,7 @@ fn shows_nothing(text: &str) -> bool {
 fn stamp(raw: &str) -> String {
     iso_to_epoch_secs(raw)
         .and_then(local_stamp)
-        .unwrap_or_else(|| truncate(&terminal_safe(raw), 40))
+        .unwrap_or_else(|| cap_drawn(&terminal_safe(raw), 40))
 }
 
 fn expiry(credit: &ResetCredit) -> String {
@@ -410,11 +479,11 @@ pub(crate) fn describe_reset_credits(name: &str, credits: &ResetCredits) -> Vec<
     }];
     for credit in &credits.credits {
         let marked = next == Some(credit.id.as_str());
-        let status = terminal_safe(&credit.status);
+        let status = credit.shown_status();
         let status_clause = if shows_nothing(&status) {
             String::new()
         } else {
-            format!("{}, ", truncate(&status, 20))
+            format!("{}, ", cap_drawn(&status, 20))
         };
         let granted = match credit.granted_at.as_deref() {
             Some(raw) if !shows_nothing(&terminal_safe(raw)) => {

@@ -708,10 +708,9 @@ fn repr(v: &Value) -> String {
 /// and C1) and every bidi formatting character is written as its `\u{..}`
 /// escape, so a proxy can neither drive the terminal nor reorder a line.
 fn escape(text: &str) -> String {
-    let bidi = |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
     text.chars()
         .map(|c| {
-            if c.is_control() || bidi(c) {
+            if c.is_control() || crate::format::reorders_display(c) {
                 format!("\\u{{{:04x}}}", u32::from(c))
             } else {
                 c.to_string()

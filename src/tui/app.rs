@@ -16691,7 +16691,7 @@ fn run_admin_edit(
 pub(crate) fn escape_control(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_control() || crate::jobs_cli::reorders_display(c) || prose::is_marker(c) {
+            if c.is_control() || crate::format::reorders_display(c) || prose::is_marker(c) {
                 c.escape_default().to_string()
             } else {
                 c.to_string()
