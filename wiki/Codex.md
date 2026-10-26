@@ -148,7 +148,7 @@ clauth limit-reset work --list   # the account's resets; spends nothing
 clauth limit-reset work          # spend one, after a [y/N]
 ```
 
-`--list` prints the count and every reset with its status, expiry and grant time in local time, `*` marking the one a spend would use:
+`--list` prints the count and every reset with its status, expiry and grant time in local time (a status or grant time with nothing to show is left out), `*` marking the one a spend would use:
 
 ```
 clauth: 'work' has 2 usage-limit resets available.
@@ -160,6 +160,12 @@ A spend uses a codex usage-limit (`codex_rate_limits`) reset before any other ki
 
 ```
 clauth: use a usage-limit reset on 'work'? Full reset (Weekly + 5 hr), expires 2026-10-01 09:00:00, 1 of 2 available. It reopens the account's usage windows now and cannot be undone. [y/N]
+```
+
+Once that one is spent, the untitled reset is next; with no title to name, its question opens on its expiry:
+
+```
+clauth: use a usage-limit reset on 'work'? No expiry, 1 of 1 available. It reopens the account's usage windows now and cannot be undone. [y/N]
 ```
 
 `--yes` (`-y`) skips the question and is required on a non-TTY stdin, where the command otherwise stops before any request with `refusing to use a reset on 'work' without confirmation; pass --yes`. Anything but `y` or `yes` leaves the resets alone: `clauth: aborted. no reset was used on 'work'.`
