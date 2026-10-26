@@ -9849,9 +9849,10 @@ fn relink_to_canonical(link_path: &Path, canonical: &Path) -> Result<()> {
 ///     and a blank access is no login) and relink onto C. Or F is T's current
 ///     static token — relink onto T and carry non-login keys, never writing
 ///     T's login. A rotation staged beside C takes no login write either, so
-///     the staged pair still reads as newer: only F's in-login extras wait,
-///     its refresh token being C's already, and the carry stands down there
-///     itself.
+///     the staged pair still reads as newer: F's refresh token is C's already,
+///     so nothing is written to C, and the carry stands down there itself,
+///     logging that F's non-login keys (a design login, MCP logins) go with
+///     the relink.
 ///  2. OLDER LOGIN: F's non-blank refresh token is in C's spent record — carry
 ///     F's non-login keys into C, relink onto C, write no login. An unreadable
 ///     record refuses.
@@ -9909,7 +9910,12 @@ fn adopt_saved_login(
         }
         if crate::profile::rotation_staged_beside(&c_path) {
             // Writing C would move it past the staged pair, which the next load
-            // then discards; F's refresh token is C's, so only its extras wait.
+            // then discards. F's refresh token is C's already, so no login is
+            // lost, but a non-login key only F holds goes with the relink: the
+            // sync stands down and says so.
+            if crate::claude::preserve_non_login_keys() {
+                crate::claude::sync_live_extra_best_effort(link_path, &c_path);
+            }
             relink_to_canonical(link_path, &c_path)?;
             return Ok(());
         }

@@ -2731,7 +2731,11 @@ fn non_login_keys_for_login(
 /// staged beside a `credentials.json` store
 /// ([`crate::profile::rotation_staged_beside`]): a store written after the
 /// stage reads as the newer commit, and the load would discard the staged pair.
-/// The next relink retries.
+/// The keys then stay only in the live file: a caller that relinks it away
+/// right after (a switch, the boot reconcile, the adoption) loses them with it,
+/// and one that leaves it in place (a rotation's sync, a sidecar writer's
+/// pre-save) leaves them there for a later sync, which carries them only while
+/// the live login still matches the store's.
 ///
 /// Accepted ceiling, the carry's own: this adds and overwrites, never deletes,
 /// so a key Claude Code removed from the live file stays in the store. Where
@@ -2763,8 +2767,7 @@ fn sync_live_extra_matching(link: &Path, store: &Path, login: Option<&str>) -> R
     };
     if crate::profile::rotation_staged_beside(store) {
         logline!(
-            "clauth: a rotation is staged beside {}, so {purpose} this time; the next relink \
-             retries",
+            "clauth: a rotation is staged beside {}, so {purpose}",
             store.display()
         );
         return Ok(false);

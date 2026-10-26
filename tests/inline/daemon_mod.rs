@@ -7693,6 +7693,57 @@ fn a_re_save_never_buries_a_legacy_pending_rotation() {
     drop(held);
 }
 
+/// A re-save of wfl's login that also carries an MCP login, adopted while a
+/// legacy pending rotation sits beside wfl's store: nothing is written to the
+/// store, and the MCP login that leaves with the relink is reported.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_re_save_beside_a_legacy_pending_rotation_reports_the_keys_it_drops() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&resave_of("wfl")).expect("the re-save parses");
+    saved["mcpOAuth"] =
+        serde_json::json!({"srv": {"accessToken": "m", "expiresAt": 9_999_999_999_999_i64}});
+    save_over_link(
+        &tree.join(".credentials.json"),
+        &serde_json::to_vec(&saved).expect("serialize"),
+    );
+    crate::profile::stage_rotated_credentials(
+        &crate::profile::ProfileName::from("wfl"),
+        &oauth_creds("tok-wfl-pending"),
+    )
+    .expect("a legacy pending rotation");
+    crate::testutil::set_mtime(
+        &rotating_store("wfl").with_file_name("credentials.json.pending"),
+        std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+    );
+    let before = std::fs::read(rotating_store("wfl")).expect("wfl store");
+    drop(config);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let held = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]).expect("adopted");
+
+    drop(capture);
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("wfl store"),
+        before,
+        "the store is not written beside the pending rotation"
+    );
+    let captured = lines.snapshot();
+    assert!(
+        captured
+            .iter()
+            .any(|line| line.contains("a rotation is staged beside")),
+        "the dropped MCP login is reported, got {captured:?}"
+    );
+    drop(held);
+}
+
 /// The same legacy pending rotation beside wfl's store when a logged-out
 /// shell carrying an MCP login is adopted: the merge stands down rather than
 /// write the store over the pending pair, and its event line never promises a
@@ -7779,6 +7830,103 @@ fn a_shell_merge_never_writes_a_sidecar_with_preservation_off() {
         every_credential_file(),
         before,
         "no credential file is written"
+    );
+    drop(held);
+}
+
+/// A logged-out shell whose MCP block is null over a store that holds no MCP
+/// logins at all: nothing is carried, so the store never gains a null block.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_null_mcp_block_never_lands_in_a_store_without_one() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    save_over_link(
+        &tree.join(".credentials.json"),
+        br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0},"mcpOAuth":null}"#,
+    );
+    assert!(
+        stored_json("wfl").get("mcpOAuth").is_none(),
+        "the fixture's store holds no MCP logins"
+    );
+    let before = std::fs::read(rotating_store("wfl")).expect("wfl store");
+    drop(config);
+
+    let held = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]).expect("adopted");
+
+    assert_eq!(
+        std::fs::read(rotating_store("wfl")).expect("wfl store"),
+        before,
+        "the store gains no null MCP block"
+    );
+    drop(held);
+}
+
+/// An older login of `wfl` (its refresh token recorded spent) carrying an MCP
+/// login is saved over the link while a legacy pending rotation sits beside
+/// the store: the carry stands down and says so, and since the relink right
+/// after takes the session's file away, its line never promises a retry.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_older_logins_carry_beside_a_pending_rotation_promises_no_retry() {
+    let sb = HomeSandbox::new();
+    let _claude = with_fallback_claude_home(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let config = with_fallback_chain();
+    let (tree, sid) = launch_with_fallback(&fake, &config, "--bg");
+    let mut saved = stored_json("wfl");
+    saved["mcpOAuth"] =
+        serde_json::json!({"srv": {"accessToken": "m", "expiresAt": 9_999_999_999_999_i64}});
+    let old_refresh = saved["claudeAiOauth"]["refreshToken"]
+        .as_str()
+        .expect("a refresh token")
+        .to_string();
+    std::fs::write(
+        rotating_store("wfl"),
+        serde_json::to_vec(&oauth_creds("tok-wfl-rotated")).expect("serialize"),
+    )
+    .expect("the rotation lands");
+    std::fs::write(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("wfl"))
+            .expect("profile dir")
+            .join("auth.spent.json"),
+        serde_json::to_vec(&vec![crate::codex_auth::token_fingerprint(&old_refresh)])
+            .expect("serialize"),
+    )
+    .expect("the rotation records the spent token");
+    crate::profile::stage_rotated_credentials(
+        &crate::profile::ProfileName::from("wfl"),
+        &oauth_creds("tok-wfl-pending"),
+    )
+    .expect("a legacy pending rotation");
+    crate::testutil::set_mtime(
+        &rotating_store("wfl").with_file_name("credentials.json.pending"),
+        std::time::SystemTime::now() + std::time::Duration::from_secs(30),
+    );
+    save_over_link(
+        &tree.join(".credentials.json"),
+        &serde_json::to_vec(&saved).expect("serialize"),
+    );
+    drop(config);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let held = crate::runtime::ProfileRuntime::acquire_adopted(&sid, &[]).expect("adopted");
+
+    drop(capture);
+    let captured = lines.snapshot();
+    assert!(
+        captured
+            .iter()
+            .any(|line| line.contains("a rotation is staged beside")),
+        "the stand-down is reported, got {captured:?}"
+    );
+    assert!(
+        !captured.iter().any(|line| line.contains("retries")),
+        "and promises no retry, got {captured:?}"
     );
     drop(held);
 }
