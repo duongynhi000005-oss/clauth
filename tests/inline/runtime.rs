@@ -445,10 +445,13 @@ fn pose_dir_link(link: &Path, target: &Path) {
     std::os::unix::fs::symlink(target, link).expect("symlink dir");
     #[cfg(windows)]
     {
+        // cmd reads a `/` inside an argument as a switch, so mklink gets each
+        // path rebuilt in native separators whatever spelling the caller joined.
+        let native = |p: &Path| p.components().collect::<std::path::PathBuf>();
         let out = std::process::Command::new("cmd")
             .args(["/D", "/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
+            .arg(native(link))
+            .arg(native(target))
             .output()
             .expect("spawn `cmd /C mklink /J`");
         assert!(
