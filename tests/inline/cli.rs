@@ -2332,19 +2332,26 @@ mod api_key_helper_tests {
         );
     }
 
-    /// A `config.toml` whose `[env]` key is valid only quoted is one a full
-    /// profile load rewrites; the helper leaves its bytes alone. The closing
-    /// `load_profile` is the control: once a load stops rewriting this file,
-    /// this test and the flock test below stop binding anything.
+    /// The helper never rewrites `config.toml`, and never lands a legacy
+    /// `.pending` sidecar: it reads the config alone. Residual: no valid
+    /// `config.toml` makes a full load rewrite it anymore (the render
+    /// round-trips), so the closing `load_profile` control observes the sidecar
+    /// write-through a full load still does, never a config rewrite.
     #[test]
     fn api_key_for_profile_never_rewrites_config_toml() {
         let _home = HomeSandbox::new();
         save_profile_with_key("acme", Some("sk-test-12345"));
-        let config = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
-            .expect("profile dir")
-            .join("config.toml");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        let config = dir.join("config.toml");
         let raw = "api_key = \"sk-test-12345\"\n\n[env]\n\"A:B\" = \"x\"\n";
         std::fs::write(&config, raw).expect("write config");
+        // An adoptable legacy `.pending` sidecar (no `credentials.json` to be
+        // newer than): a full load takes the state flock and writes it through.
+        let pending = dir.join("credentials.json.pending");
+        let pending_json =
+            "{\"claudeAiOauth\":{\"accessToken\":\"new-access\",\"refreshToken\":\"new-refresh\"}}";
+        std::fs::write(&pending, pending_json).expect("write the legacy sidecar");
         let key = api_key_for_profile("acme").expect("read key");
         assert_eq!(key.as_deref(), Some("sk-test-12345"));
         assert_eq!(
@@ -2352,11 +2359,19 @@ mod api_key_helper_tests {
             raw,
             "the helper never rewrites config.toml"
         );
+        assert!(
+            !dir.join("credentials.json").exists(),
+            "the helper never lands the sidecar"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pending).expect("re-read the sidecar"),
+            pending_json,
+            "the helper leaves the sidecar"
+        );
         let _ = crate::profile::load_profile(&crate::profile::ProfileName::from("acme"));
-        assert_ne!(
-            std::fs::read_to_string(&config).expect("re-read config"),
-            raw,
-            "control: a full profile load still rewrites this fixture"
+        assert!(
+            dir.join("credentials.json").exists(),
+            "control: a full profile load still lands the sidecar"
         );
     }
 

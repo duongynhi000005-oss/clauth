@@ -429,10 +429,10 @@ impl Drop for KilledServer {
 }
 
 /// The handshake never waits on the state flock. A peer holding `~/.clauth/.lock`
-/// plus a profile whose `config.toml` would be rewritten (a hand-quoted `[env]`
-/// key the renderer writes unquoted, so `load_profile` takes the flock for its
-/// rewrite) is exactly the shape the old `load_config` call stalled on: the
-/// server must still answer `server/discover`, and fast.
+/// plus a profile whose adoptable legacy `credentials.json.pending` sidecar an
+/// ordinary load would land under the flock is exactly the shape the old
+/// `load_config` call stalled on: the server must still answer
+/// `server/discover`, and fast, leaving the sidecar for the next ordinary load.
 #[test]
 fn the_server_answers_discover_while_the_state_flock_is_held() {
     use std::os::unix::io::AsRawFd;
@@ -452,11 +452,10 @@ fn the_server_answers_discover_while_the_state_flock_is_held() {
         .mode(0o700)
         .create(&alpha)
         .expect("create the profile dir");
-    // `A:B` parses only quoted; the canonical render writes it BARE, so the
-    // render fails to parse and `maybe_rewrite_config_toml` decides to rewrite
-    // — under the state flock.
+    // A plain valid profile config; the flock trigger is the sidecar below, not
+    // this file.
     std::fs::write(alpha.join("config.toml"), "[env]\n\"A:B\" = \"x\"\n")
-        .expect("write the non-round-tripping config");
+        .expect("write the profile config");
     // An adoptable legacy `.pending` sidecar: newer than `credentials.json`, so
     // an ordinary load would take the state flock and write the sidecar through.
     // The handshake's no-rewrite read must answer without either, leaving both

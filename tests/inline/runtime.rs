@@ -10257,14 +10257,15 @@ fn the_shared_target_check_resolves_an_adoptable_pending_sidecar_like_a_full_loa
     });
 }
 
-/// The shared target check must not rewrite `config.toml` either. A config whose
-/// canonical render does not round-trip — an `[env]` key that needs quoting,
-/// which `render_config_toml` emits bare — makes `load_profile`'s rewrite leg
-/// fire; the side-effect-free read must leave it byte-identical. The fixture is
-/// asserted LIVE (a full load on a sibling copy of the same bytes changes them),
-/// so the pin stays armed once the renderer learns to quote keys, and the check
-/// runs on its `Ok` path (a launch carrying the same env) so the read reaches
-/// past the transport gate.
+/// The shared target check must not rewrite `config.toml`, and must not land a
+/// legacy `.pending` sidecar either: it reads through `read_profile`, which
+/// leaves both for the next ordinary load. The `[env]` key `A.B` keeps the
+/// check on its `Ok` path (a launch carrying the same env), so the read reaches
+/// past the transport gate. The fixture is asserted LIVE: a full load on a
+/// sibling copy still writes — it lands the sidecar as `credentials.json` — so
+/// the pin stays armed. Residual: no valid `config.toml` makes a full load
+/// rewrite it anymore (the render round-trips), so the control observes the
+/// sidecar write-through, never a config rewrite.
 #[test]
 fn the_shared_target_check_does_not_rewrite_config_toml() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -10276,27 +10277,43 @@ fn the_shared_target_check_does_not_rewrite_config_toml() {
 
         let seed = |name: &str| {
             crate::profile::save_profile(&member(name)).expect("save member");
-            let config = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
-                .expect("profile dir")
-                .join("config.toml");
+            let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+                .expect("profile dir");
+            let config = dir.join("config.toml");
             std::fs::write(&config, "[env]\n\"A.B\" = \"x\"\n")
-                .expect("write a config whose render does not round-trip");
-            config
+                .expect("write the launch-matching env config");
+            let creds = dir.join("credentials.json");
+            // An adoptable legacy `.pending` sidecar, written after
+            // `credentials.json` so its mtime is not older: an ordinary load
+            // lands it under the flock.
+            let pending = dir.join("credentials.json.pending");
+            std::fs::write(
+                &pending,
+                "{\"claudeAiOauth\":{\"accessToken\":\"new-access\",\"refreshToken\":\"new-refresh\"}}",
+            )
+            .expect("write the legacy sidecar");
+            (config, creds, pending)
         };
 
-        // The fixture is live: a full load rewrites these exact bytes.
-        let live_config = seed("scc-rewrite-live");
-        let live_before = std::fs::read(&live_config).expect("read live config before");
+        // The fixture is live: a full load lands the sidecar, rewriting
+        // `credentials.json`.
+        let (_, live_creds, live_pending) = seed("scc-rewrite-live");
+        let live_creds_before = std::fs::read(&live_creds).expect("read live credentials before");
         crate::profile::load_profile(&crate::profile::ProfileName::from("scc-rewrite-live"))
             .expect("load live profile");
         assert_ne!(
-            std::fs::read(&live_config).expect("read live config after"),
-            live_before,
-            "fixture liveness: a full load must rewrite this config"
+            std::fs::read(&live_creds).expect("read live credentials after"),
+            live_creds_before,
+            "fixture liveness: a full load lands the sidecar"
+        );
+        assert!(
+            !live_pending.exists(),
+            "fixture liveness: a full load consumes the sidecar"
         );
 
-        let config = seed("scc-rewrite");
+        let (config, creds, pending) = seed("scc-rewrite");
         let before = std::fs::read(&config).expect("read config before");
+        let creds_before = std::fs::read(&creds).expect("read credentials before");
         assert!(
             crate::runtime::swap_target_precondition(
                 &crate::profile::ProfileName::from("scc-rewrite"),
@@ -10310,6 +10327,15 @@ fn the_shared_target_check_does_not_rewrite_config_toml() {
             std::fs::read(&config).expect("read config after"),
             before,
             "the shared check must not rewrite config.toml"
+        );
+        assert_eq!(
+            std::fs::read(&creds).expect("read credentials after"),
+            creds_before,
+            "the shared check must not land the sidecar"
+        );
+        assert!(
+            pending.exists(),
+            "the shared check must not consume the sidecar"
         );
     });
 }

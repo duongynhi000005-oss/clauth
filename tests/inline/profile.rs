@@ -4570,6 +4570,81 @@ fn loading_a_config_toml_with_unknown_keys_does_not_rewrite_it() {
     );
 }
 
+/// A non-bare `[env]` key renders as a single-line quoted key that parses back
+/// to the same map, one fixture per encoding a key encoder can pick: a
+/// TUI-entered `A:B`, a space, a dot (which a bare render reads as a nested
+/// table), `=`, a `"` or `\`, both quote kinds, a newline and a control
+/// character. A bare-safe key stays bare, byte for byte. Residual: a key class
+/// outside these encodings is not exercised.
+#[test]
+fn an_env_key_that_needs_quotes_renders_quoted_and_round_trips() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    for (k, v) in [
+        ("A:B", "colon"),
+        ("HAS SPACE", "space"),
+        ("dot.ted", "dot"),
+        ("K=V", "equals"),
+        ("say\"hi", "quote"),
+        ("back\\slash", "backslash"),
+        ("it's \"both\"", "both quotes"),
+        ("A\nB", "newline"),
+        ("ctl\u{1}", "control"),
+        ("PLAIN_KEY-1", "bare"),
+    ] {
+        profile.env.insert(k.to_string(), v.to_string());
+    }
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered)
+        .unwrap_or_else(|e| panic!("the render does not parse: {e}\n{rendered}"));
+    assert_eq!(
+        parsed.env, profile.env,
+        "the env map round-trips:\n{rendered}"
+    );
+    assert!(
+        rendered.lines().any(|l| l == "PLAIN_KEY-1 = \"bare\""),
+        "a bare-safe key stays bare:\n{rendered}"
+    );
+}
+
+/// A quoted `[env]` key survives the real write path: a save writes it, a load
+/// reads it back, and the file still parses for the load after that.
+#[test]
+fn a_saved_quoted_env_key_loads_and_reloads() {
+    let _home = HomeSandbox::new();
+
+    let mut profile = Profile::new("envquote".to_string(), None, None);
+    profile.env.insert("A.B".to_string(), "x".to_string());
+    profile.env.insert("A:B".to_string(), "y".to_string());
+    save_profile(&profile).expect("save");
+
+    let name = crate::profile::ProfileName::from("envquote");
+    let config_path = profile_config_path(&name).expect("config path");
+    let on_disk = std::fs::read_to_string(&config_path).expect("read config");
+    let parsed: ProfileConfig = toml::from_str(&on_disk)
+        .unwrap_or_else(|e| panic!("the saved config.toml does not parse: {e}\n{on_disk}"));
+    assert_eq!(parsed.env, profile.env, "{on_disk}");
+
+    let first = load_profile(&name).expect("first load");
+    assert_eq!(first.env, profile.env);
+    let second = load_profile(&name).expect("second load");
+    assert_eq!(second.env, profile.env);
+}
+
+/// A hand-quoted key a value encoder would write multi-line survives two
+/// loads: the first load must not rewrite the file into one that no longer
+/// parses.
+#[test]
+fn a_hand_quoted_newline_env_key_survives_two_loads() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new("envnl".to_string(), None, None)).expect("save");
+    let name = crate::profile::ProfileName::from("envnl");
+    let config_path = profile_config_path(&name).expect("config path");
+    std::fs::write(&config_path, "[env]\n\"A\\nB\" = \"x\"\n").expect("write config");
+    load_profile(&name).expect("first load");
+    let second = load_profile(&name).expect("second load");
+    assert_eq!(second.env.get("A\nB").map(String::as_str), Some("x"));
+}
+
 /// The pre-rename `session_feed` spelling is deliberately NOT aliased: no
 /// released clauth ever wrote it, and a permanent alias for something that
 /// never shipped is pure legacy surface. An unknown key parses as OFF.
@@ -5133,11 +5208,12 @@ fn the_credit_gate_defaults_on_and_round_trips_through_config_toml() {
 }
 
 /// The MCP handshake's profile read never waits on the state flock, while the
-/// ordinary load DOES take it for a `config.toml` that would be rewritten. The
-/// fixture is the reach the review found: `[env]` key `A:B` parses only quoted,
-/// and the canonical render writes it bare, so `maybe_rewrite_config_toml`
-/// decides on a rewrite — which is a `with_state_lock` the handshake cannot
-/// afford.
+/// ordinary load DOES take it to land an adoptable legacy
+/// `credentials.json.pending` sidecar (`land_pending_credentials` writes it
+/// through under the flock). The fixture is that sidecar: with a peer holding
+/// the flock, `read_profile` answers at once from memory and leaves the sidecar
+/// for the next ordinary load, while `load_profile` blocks on the flock to land
+/// it.
 #[test]
 fn the_handshake_profile_read_never_waits_on_the_state_flock() {
     let _home = HomeSandbox::new();
@@ -5145,6 +5221,15 @@ fn the_handshake_profile_read_never_waits_on_the_state_flock() {
     std::fs::create_dir_all(clauth.join("profiles").join("held")).expect("create profile dir");
     let config_path = clauth.join("profiles").join("held").join("config.toml");
     std::fs::write(&config_path, "[env]\n\"A:B\" = \"x\"\n").expect("write config.toml");
+    // An adoptable legacy `.pending` sidecar (no `credentials.json` to be newer
+    // than): an ordinary load takes the state flock and writes it through.
+    let pending_path = clauth
+        .join("profiles")
+        .join("held")
+        .join("credentials.json.pending");
+    let pending_json =
+        "{\"claudeAiOauth\":{\"accessToken\":\"new-access\",\"refreshToken\":\"new-refresh\"}}";
+    std::fs::write(&pending_path, pending_json).expect("write the legacy sidecar");
 
     // This process holds the flock a peer process would hold. `try_lock` so a
     // second holder can never hang the suite; a lock file is never truncated.
@@ -5176,9 +5261,14 @@ fn the_handshake_profile_read_never_waits_on_the_state_flock() {
         "[env]\n\"A:B\" = \"x\"\n",
         "the no-rewrite read leaves the file as it is"
     );
+    assert_eq!(
+        std::fs::read_to_string(&pending_path).expect("read back the sidecar"),
+        pending_json,
+        "the no-rewrite read leaves the sidecar for the next ordinary load"
+    );
 
-    // The control: the ordinary load takes the flock for the same fixture, so
-    // the test would fail if the fixture stopped needing a rewrite.
+    // The control: the ordinary load takes the flock to land the same sidecar,
+    // so the test would fail if the fixture stopped being adoptable.
     let (tx, rx) = std::sync::mpsc::channel();
     let control_name = name.clone();
     std::thread::spawn(move || {

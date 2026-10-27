@@ -3288,9 +3288,9 @@ fn merge_nested_carried_keys(rendered: String, nested: &[(String, String, toml::
     out
 }
 
-/// A key segment the carry can re-attach: a bare TOML identifier, the charset
-/// the model's own fields serialize with. Anything else is dropped rather than
-/// risk a mis-scoped header (see [`merge_nested_carried_keys`]).
+/// A key segment the carry ([`merge_nested_carried_keys`]) can re-attach: a
+/// bare TOML identifier, the charset the model's own fields serialize with.
+/// Anything else is dropped rather than risk a mis-scoped header.
 fn is_bare_key(segment: &str) -> bool {
     !segment.is_empty()
         && segment
@@ -3696,10 +3696,10 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
 /// [`load_profile`]'s read-only form, used by the shared swap-target check and
 /// the `clauth mcp` handshake: the same read, but never through
 /// [`maybe_rewrite_config_toml`] and never through a legacy `.pending` sidecar's
-/// write-through, both of which take the state flock — a `config.toml` that does
-/// not round-trip (a hand-quoted `[env]` key the renderer writes unquoted) is
-/// left as it is, and an adoptable sidecar is answered from memory and left for
-/// the next ordinary load to land.
+/// write-through, both of which take the state flock — a `config.toml` whose
+/// canonical render does not parse back is left as it is, and an adoptable
+/// sidecar is answered from memory and left for the next ordinary load to
+/// land.
 pub(crate) fn read_profile(name: &ProfileName) -> Result<Profile> {
     load_profile_with(name, false)
 }
@@ -3924,10 +3924,11 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
     (profile, config_path, raw_config)
 }
 
-/// Refresh config.toml when its semantic content drifts from what we'd render
-/// today. Comment-only or whitespace-only differences shouldn't trigger a
-/// rewrite — the TUI reloads on every state-file change and we don't want to
-/// thrash disk on every reload.
+/// Rewrite config.toml only when the canonical render of the loaded profile does
+/// not parse back to it. The parsed comparison never reads the raw file: a hand
+/// edit that parses stays on disk as written until the next save, so the TUI's
+/// reload on every state-file change never touches disk. A render that does not
+/// parse is compared byte-wise against the raw file instead.
 fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Profile) {
     let rendered = render_config_toml(profile);
     let needs_rewrite = match toml::from_str::<ProfileConfig>(&rendered) {
@@ -4725,7 +4726,14 @@ fn render_config_toml(profile: &Profile) -> String {
     } else {
         out.push_str("[env]\n");
         for (k, v) in &profile.env {
-            out.push_str(&format!("{k} = {}\n", toml_str(v)));
+            // The key encoder, never `toml_str`: a value encoder emits a
+            // multi-line string for a newline or for both quote kinds, which
+            // TOML refuses as a key.
+            out.push_str(&format!(
+                "{} = {}\n",
+                toml_edit::Key::new(k.as_str()),
+                toml_str(v)
+            ));
         }
     }
 
