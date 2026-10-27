@@ -359,8 +359,20 @@ fn member_launch_demand_with(
             .map(|m| m.to_owned())
     });
 
-    let mut union = overlay.fallbacks.clone();
-    union.extend(arg_fallbacks);
+    let settings_fallbacks = if !passthrough.fallbacks.is_empty() {
+        &passthrough.fallbacks
+    } else {
+        &overlay.fallbacks
+    };
+    let ignores_fallback_arg = !arg_fallbacks.is_empty()
+        && named_model
+            .as_ref()
+            .is_some_and(|m| arg_fallbacks.iter().all(|fb| fb == m));
+    let union = if !arg_fallbacks.is_empty() && !ignores_fallback_arg {
+        arg_fallbacks
+    } else {
+        settings_fallbacks.clone()
+    };
     let survives = |key: &str| match env_leg {
         EnvLeg::Process => crate::runtime::env_survives_scrub(key, stale_env_keys),
         EnvLeg::Caller => true,

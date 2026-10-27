@@ -2244,6 +2244,80 @@ fn an_overlay_settings_agent_key_is_the_sessions_agent() {
     assert!(demand.models.is_empty());
 }
 
+#[test]
+fn fallback_model_arg_replaces_settings_fallback_chain() {
+    let home = HomeSandbox::new();
+    fs::create_dir_all(home.home().join(".claude")).unwrap();
+    fs::write(
+        home.home().join(".claude").join("settings.json"),
+        r#"{"model":"opus","fallbackModel":["sonnet","fable"]}"#,
+    )
+    .unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &["--fallback-model".to_owned(), "haiku".to_owned()],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.models, ["opus", "haiku"]);
+}
+
+#[test]
+fn without_fallback_model_arg_settings_fallback_chain_is_included() {
+    let home = HomeSandbox::new();
+    fs::create_dir_all(home.home().join(".claude")).unwrap();
+    fs::write(
+        home.home().join(".claude").join("settings.json"),
+        r#"{"model":"opus","fallbackModel":["sonnet","fable"]}"#,
+    )
+    .unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &[],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.models, ["opus", "sonnet", "fable"]);
+}
+
+#[test]
+fn fallback_model_matching_model_keeps_settings_fallback_chain() {
+    let home = HomeSandbox::new();
+    fs::create_dir_all(home.home().join(".claude")).unwrap();
+    fs::write(
+        home.home().join(".claude").join("settings.json"),
+        r#"{"model":"opus","fallbackModel":["sonnet","fable"]}"#,
+    )
+    .unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &[
+            "--model".to_owned(),
+            "opus".to_owned(),
+            "--fallback-model".to_owned(),
+            "opus".to_owned(),
+        ],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.models, ["opus", "sonnet", "fable"]);
+}
+
 /// The runtime tree a `--bg` launch handed to Claude Code's background
 /// service, as the fake-`claude` shim recorded it.
 #[cfg(unix)]
