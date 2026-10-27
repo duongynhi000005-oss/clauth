@@ -1745,7 +1745,7 @@ fn sidecar_trees_land_in_global_store_with_contents_intact() {
     // The operator's own snapshot dir already exists and must be merged into.
     write_file(&global.join("shell-snapshots/mine.sh"), "operator shell");
 
-    let moved = rescue_isolated_sidecars(&iso, &global);
+    let moved = rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved;
 
     assert_eq!(moved, 3, "three sidecar files moved");
     assert_eq!(
@@ -1788,7 +1788,7 @@ fn sidecar_collision_lands_beside_without_clobbering() {
     write_file(&iso.join("session-env/envfile"), "ISO=1");
     write_file(&global.join("session-env/envfile"), "OPERATOR=1");
 
-    let moved = rescue_isolated_sidecars(&iso, &global);
+    let moved = rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved;
 
     // Counts entries whose state ended up in the global store, matching the
     // transcript leg — the deduped one is there too, by the copy already present.
@@ -1847,7 +1847,7 @@ fn sidecar_rescue_leaves_everything_off_the_allowlist() {
         write_file(&iso.join(path), "content");
     }
 
-    let moved = rescue_isolated_sidecars(&iso, &global);
+    let moved = rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved;
 
     assert_eq!(moved, 0, "nothing off the allowlist moves");
     for path in left {
@@ -1885,7 +1885,7 @@ fn sidecar_rescue_never_follows_a_symlink_into_the_global_store() {
         fs::create_dir_all(iso.join("tasks")).unwrap();
         std::os::unix::fs::symlink(global.join("projects"), iso.join(link_at)).unwrap();
 
-        let moved = rescue_isolated_sidecars(&iso, &global);
+        let moved = rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved;
 
         assert_eq!(moved, 0, "a symlinked tree at {link_at} is not walked");
         assert_eq!(
@@ -1920,7 +1920,7 @@ fn sidecar_rescue_never_writes_through_a_symlinked_destination() {
     fs::create_dir_all(global.join("tasks")).unwrap();
     std::os::unix::fs::symlink(outside.join("t1.json"), global.join("tasks/t1.json")).unwrap();
 
-    let moved = rescue_isolated_sidecars(&iso, &global);
+    let moved = rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved;
 
     assert_eq!(moved, 0, "neither link is written through");
     assert!(
@@ -1949,7 +1949,7 @@ fn sidecar_rescue_moves_up_to_the_depth_cap_and_stops_past_it() {
     write_file(&deepest.join("d/too-deep.json"), "past the cap");
     write_file(&iso.join("file-history/shallow.json"), "near the top");
 
-    let moved = rescue_isolated_sidecars(&iso, &global);
+    let moved = rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved;
 
     assert_eq!(moved, 2, "everything within the cap moves, nothing past it");
     let landed = deepest
@@ -1986,7 +1986,7 @@ fn transcript_rescue_preserves_the_source_file_mode() {
     write_jsonl(&src, &[user_line("s1", "/w/iso", "owner-only transcript")]);
     fs::set_permissions(&src, fs::Permissions::from_mode(0o600)).unwrap();
 
-    assert_eq!(rescue_isolated_store(&iso, &global), 1);
+    assert_eq!(rescue_transcripts(&iso, &global).moved, 1);
 
     let mode = fs::metadata(global.join("-w-iso/s1.jsonl"))
         .unwrap()
@@ -1996,6 +1996,37 @@ fn transcript_rescue_preserves_the_source_file_mode() {
     assert_eq!(
         mode, 0o600,
         "a 0600 transcript must not land world-readable"
+    );
+}
+
+/// The append arm's tail lands after the compare that found the global
+/// transcript a prefix of the tree's copy; a writer that rewrites the global
+/// file in between leaves it holding the tail after bytes the source never
+/// had. The post-append re-check catches that, and the source, the only whole
+/// copy, is kept.
+#[test]
+fn an_append_onto_a_global_rewritten_since_its_compare_keeps_the_source() {
+    let sb = HomeSandbox::new();
+    let src = sb.home().join("tree.jsonl");
+    let target = sb.home().join("global.jsonl");
+    fs::write(&src, "line-a\nline-b\n").unwrap();
+    // The compare saw `line-a\n` (7 bytes); another writer replaced it since.
+    fs::write(&target, "line-x\n").unwrap();
+
+    let outcome = append_tail(&src, &target, 7);
+
+    assert!(
+        outcome.is_err(),
+        "an append whose target no longer starts with the source must fail its re-check"
+    );
+    assert_eq!(
+        fs::read_to_string(&src).ok().as_deref(),
+        Some("line-a\nline-b\n"),
+        "the source must survive a failed re-check"
+    );
+    assert!(
+        fs::read_to_string(&target).unwrap().starts_with("line-x\n"),
+        "the other writer's bytes stay in the global file"
     );
 }
 
@@ -2023,7 +2054,10 @@ fn rescue_preserves_the_source_file_mode() {
     )
     .unwrap();
 
-    assert_eq!(rescue_isolated_sidecars(&iso, &global), 2);
+    assert_eq!(
+        rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved,
+        2
+    );
 
     let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(

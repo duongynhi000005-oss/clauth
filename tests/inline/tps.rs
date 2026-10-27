@@ -5755,7 +5755,7 @@ fn a_restart_after_a_rescue_moved_a_counted_transcript_counts_it_once() {
     write_cache(home.home(), &s1);
     let global = home.home().join(".claude/projects");
     assert_eq!(
-        crate::sessions::rescue_isolated_store(&iso_root, &global),
+        crate::sessions::rescue_transcripts(&iso_root, &global).moved,
         1,
         "the rescue moved the transcript"
     );
@@ -6418,7 +6418,7 @@ fn a_restart_after_a_renaming_rescue_counts_the_moved_transcript_once() {
     write_cache(home.home(), &s1);
     let global = home.home().join(".claude/projects");
     assert_eq!(
-        crate::sessions::rescue_isolated_store(&iso_root, &global),
+        crate::sessions::rescue_transcripts(&iso_root, &global).moved,
         1,
         "the rescue moved the transcript"
     );
@@ -6890,7 +6890,7 @@ fn a_rescued_copy_extending_its_sibling_counts_once_on_every_restart() {
         assert_eq!(day_total(&s1), 2300, "run {run}: before the rescue");
         write_cache(home.home(), &s1);
         drop(p1);
-        crate::sessions::rescue_isolated_store(&iso_root, &home.home().join(".claude/projects"));
+        crate::sessions::rescue_transcripts(&iso_root, &home.home().join(".claude/projects"));
         let s2 = Producer::new().tick(x + 67_000);
         assert_eq!(day_total(&s2), 2300, "run {run}: the restarted producer");
         assert_eq!(

@@ -1046,6 +1046,8 @@ fn demo_data_drives_all_actions() {
         "first ⏎ arms the delete row"
     );
     press(&mut app, KeyCode::Enter); // confirm
+    app::join_test_workers();
+    app::drain_profile_delete(&mut app);
     assert_eq!(app.profile_count(), before - 1, "delete drops one profile");
     assert!(
         app.config()
@@ -1134,6 +1136,8 @@ fn demo_data_drives_all_actions() {
             .is_some_and(|d| d.armed_action == Some(app::ConfigRow::Delete))
     );
     press(&mut app, KeyCode::Enter); // confirm delete
+    app::join_test_workers();
+    app::drain_profile_delete(&mut app);
     assert_eq!(
         app.profile_count(),
         before - 1,

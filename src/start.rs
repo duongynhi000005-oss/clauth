@@ -37,8 +37,8 @@ struct ChildOutcome {
 /// what proves nothing is reading the tree being emptied, since the sidecar leg
 /// would otherwise pull `shell-snapshots/` out from under a live Claude Code
 /// mid-session. Self holds its own marker, hence `> 1`. The move itself lives
-/// in [`crate::runtime::rescue_isolated_runtime`], shared with the stale-runtime
-/// GC so an unrescued tree is lifted at its deletion site too.
+/// in [`crate::runtime::rescue_runtime`], shared with the stale-runtime GC and
+/// the teardown so an unrescued tree is lifted at its deletion site too.
 ///
 /// Under real symlinks each session owns its tree and marker dir, and under
 /// fake symlinks an isolated session owns them too, so the count is this
@@ -59,7 +59,12 @@ pub(crate) fn rescue_teardown(
         logline!("clauth: skipping rescue, another isolated session is still live");
         return (0, 0);
     }
-    crate::runtime::rescue_isolated_runtime(iso_root, claude_home)
+    let (transcripts, sidecars) = crate::runtime::rescue_runtime(
+        iso_root,
+        claude_home,
+        crate::sessions::SidecarSource::Isolated,
+    );
+    (transcripts.moved, sidecars.moved)
 }
 
 /// The refusal a `--with-fallback` start gets on a host that structurally cannot
@@ -1045,10 +1050,11 @@ pub(crate) fn run(
         crate::sessions::stamp_run_sessions(name, &projects_dir, isolated, run_start);
     }
 
-    // Rescue (isolated only): the throwaway isolated store is discarded on
-    // `drop(runtime)`, taking the session's state with it, so lift it into the
-    // global store first. A shared start needs nothing here — its transcripts
-    // already live in the global store.
+    // Rescue (isolated only): the throwaway isolated store leaves its live name
+    // on `drop(runtime)`, so lift the session's state into the global store
+    // first; the drop keeps whatever this rescue could not land for the next
+    // sweep. A shared start needs nothing here — its transcripts already live
+    // in the global store.
     if isolated && let Ok(claude_home) = crate::profile::claude_dir() {
         rescue_teardown(runtime.config_dir(), runtime.sessions_dir(), &claude_home);
     }

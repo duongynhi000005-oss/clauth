@@ -14457,10 +14457,12 @@ fn live_marker(path: &std::path::Path) -> fs::File {
     file
 }
 
-/// The tombstone name GC renames an isolated runtime to must fall through both
+/// The tombstone name GC renames a dead runtime tree to must fall through both
 /// strict pairing predicates, or a later pass could re-pair it as a runtime and
-/// `remove_dir_all` it unrescued. The `.rescuing` suffix does that because a `.`
-/// is not in [`is_session_id`]'s alphabet.
+/// `remove_dir_all` it unrescued, while the stranded-tombstone sweep must still
+/// match every flavor of it, shared per-session trees included, or a crash
+/// mid-rescue strands the tree. The `.rescuing` suffix does the first because a
+/// `.` is not in [`is_session_id`]'s alphabet.
 #[test]
 fn the_rescue_tombstone_name_is_rejected_by_the_pairing_predicate() {
     for base in [
@@ -14479,9 +14481,11 @@ fn the_rescue_tombstone_name_is_rejected_by_the_pairing_predicate() {
     assert!(is_rescuing_runtime_dir_name(
         "runtime-isolated-4242-7.rescuing"
     ));
+    assert!(is_rescuing_runtime_dir_name("runtime.rescuing"));
+    assert!(is_rescuing_runtime_dir_name("runtime-4242-7.rescuing"));
     assert!(!is_rescuing_runtime_dir_name("runtime-4242-7"));
-    assert!(!is_rescuing_runtime_dir_name("runtime-4242-7.rescuing"));
     assert!(!is_rescuing_runtime_dir_name("sessions-isolated.rescuing"));
+    assert!(!is_rescuing_runtime_dir_name("sessions-4242-7.rescuing"));
 }
 
 /// The defect: a stale isolated tree with no live marker is deleted unrescued,
@@ -14572,6 +14576,898 @@ fn gc_rescues_a_per_session_isolated_tree_with_no_live_marker() {
     );
 }
 
+/// A dead shared copy-host tree: the bare `runtime` + `sessions` pair a
+/// `clauth start` killed before its final sync leaves behind (#136), holding a
+/// transcript only the tree has and a `history.jsonl` newer than the global
+/// one (not a transcript or a sidecar, so no rescue carries it). Its copied
+/// `CLAUDE.md` is what marks the tree as a copy ([`link_mode_of`] reads
+/// `Fake`). Returns `(claude_home, runtime, sessions)`.
+fn dead_shared_fake_tree(root: &Path, profile: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let claude_home = fake_claude_home(root);
+    let profile_dir = root.join(".clauth/profiles").join(profile);
+    let runtime = profile_dir.join("runtime");
+    let sessions = profile_dir.join("sessions");
+    fs::write(claude_home.join("CLAUDE.md"), "memory").unwrap();
+    fs::create_dir_all(&runtime).unwrap();
+    fs::write(runtime.join("CLAUDE.md"), "memory").unwrap();
+    let base = SystemTime::now() - Duration::from_secs(3600);
+    fs::write(claude_home.join("history.jsonl"), "old\n").unwrap();
+    set_mtime(&claude_home.join("history.jsonl"), base);
+    fs::create_dir_all(runtime.join("projects/-w-kill")).unwrap();
+    fs::write(runtime.join("projects/-w-kill/s1.jsonl"), "transcript").unwrap();
+    fs::write(runtime.join("history.jsonl"), "old\nnew\n").unwrap();
+    set_mtime(
+        &runtime.join("history.jsonl"),
+        base + Duration::from_secs(60),
+    );
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(sessions.join("dead"), b"").unwrap();
+    (claude_home, runtime, sessions)
+}
+
+/// #136: the GC sweep of a dead shared copy-host tree publishes what only the
+/// tree holds before it removes the tree, so a killed start loses nothing.
+#[test]
+fn gc_publishes_a_dead_shared_fake_tree_before_removing_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let (claude_home, runtime, sessions) = dead_shared_fake_tree(tmp.path(), "killed");
+
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-kill/s1.jsonl")).unwrap(),
+                "transcript",
+                "the tree-only transcript must land in the global store"
+            );
+            assert!(!runtime.exists(), "the dead tree must be gone");
+            assert!(!sessions.exists(), "the marker dir must be gone");
+        });
+    });
+}
+
+/// #136, the acquire leg: a start that finds the dead shared copy-host tree at
+/// its path rescues it out of the state flock's hold, before `acquire`
+/// returns, so the transcript reaches the global store and no tombstone stays.
+#[test]
+fn acquire_publishes_a_dead_shared_fake_tree_before_its_rebuild() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let (claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "relaunch");
+            let profile = configured_profile("relaunch");
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-kill/s1.jsonl")).unwrap(),
+                "transcript",
+                "the tree-only transcript must land in the global store"
+            );
+            assert_eq!(
+                rt.config_dir(),
+                runtime.as_path(),
+                "the shared copy-host session runs out of the bare tree"
+            );
+            assert!(
+                !runtime.with_file_name("runtime.rescuing").exists(),
+                "a rescued tombstone is collected"
+            );
+
+            drop(rt);
+        });
+    });
+}
+
+/// The linking transport needs no publish: its shared tree links `projects`
+/// into `~/.claude`, so a file only the tree holds is not one the GC copies out.
+/// Pins that the #136 publish stays gated to copy hosts.
+#[test]
+fn gc_publishes_nothing_from_a_dead_linked_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Real, || {
+            let claude_home = fake_claude_home(tmp.path());
+            let profile_dir = tmp.path().join(".clauth/profiles/linked");
+            let runtime = profile_dir.join("runtime-4242-7");
+            let sessions = profile_dir.join("sessions-4242-7");
+            fs::create_dir_all(&runtime).unwrap();
+            fs::write(runtime.join("stray.txt"), "tree only").unwrap();
+            fs::create_dir_all(&sessions).unwrap();
+
+            gc_stale_runtimes();
+
+            assert!(!runtime.exists(), "the dead tree must be gone");
+            assert!(
+                !claude_home.join("stray.txt").exists(),
+                "a linked tree's GC must publish nothing into ~/.claude"
+            );
+        });
+    });
+}
+
+/// A publish that stops part-way must not cost the tree: the copy host's
+/// tombstone keeps the transcript the walk could not land, and a later sweep
+/// finishes it once the fault clears. The fault is a regular file where
+/// `~/.claude/projects` belongs, so the walk cannot create the project dir.
+#[test]
+fn gc_keeps_a_copy_host_tombstone_whose_publish_failed_and_finishes_it_later() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let (claude_home, runtime, sessions) = dead_shared_fake_tree(tmp.path(), "blocked");
+            let tombstone = runtime.with_file_name("runtime.rescuing");
+            fs::write(claude_home.join("projects"), "not a dir").unwrap();
+
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(tombstone.join("projects/-w-kill/s1.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("transcript"),
+                "a failed publish must keep the transcript it could not land"
+            );
+            assert!(!runtime.exists(), "the tree leaves its live name first");
+            assert!(!sessions.exists(), "the marker dir must be gone");
+
+            fs::remove_file(claude_home.join("projects")).unwrap();
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-kill/s1.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("transcript"),
+                "the next sweep must publish the stranded tombstone"
+            );
+            assert!(!tombstone.exists(), "a published tombstone is collected");
+        });
+    });
+}
+
+/// The acquire leg's twin: a rescue that fails keeps the dead tree's tombstone,
+/// so the transcript survives beside the rebuilt tree and a later sweep lands
+/// it once the fault clears.
+#[test]
+fn acquire_keeps_a_dead_shared_fake_tree_whose_publish_fails() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let (claude_home, runtime, _sessions) =
+                dead_shared_fake_tree(tmp.path(), "blocked-relaunch");
+            let tombstone = runtime.with_file_name("runtime.rescuing");
+            let profile = configured_profile("blocked-relaunch");
+            fs::write(claude_home.join("projects"), "not a dir").unwrap();
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+
+            assert_eq!(
+                fs::read_to_string(tombstone.join("projects/-w-kill/s1.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("transcript"),
+                "a tree whose rescue failed must keep its transcript in the tombstone"
+            );
+
+            drop(rt);
+            fs::remove_file(claude_home.join("projects")).unwrap();
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-kill/s1.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("transcript"),
+                "the next sweep must land the kept tombstone's transcript"
+            );
+            assert!(!tombstone.exists(), "a rescued tombstone is collected");
+        });
+    });
+}
+
+/// A recycled `<pid>-<seq>` lands an isolated acquire on a dead session's tree
+/// no sweep has rescued yet. The wipe must lift its transcript into the global
+/// store first. The next sids this process mints are pre-seeded so the acquire
+/// meets one of them, whichever it draws.
+#[test]
+fn acquire_rescues_a_dead_isolated_tree_at_its_own_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            let profile = configured_profile("recycled");
+            let profile_dir = tmp.path().join(".clauth/profiles/recycled");
+            let pid = std::process::id();
+            let next = SESSION_SEQ.load(std::sync::atomic::Ordering::Relaxed);
+            let seeded = next..next + 8;
+            for seq in seeded.clone() {
+                let projects = profile_dir
+                    .join(format!("runtime-isolated-{pid}-{seq}"))
+                    .join("projects")
+                    .join(format!("-w-{seq}"));
+                fs::create_dir_all(&projects).unwrap();
+                fs::write(projects.join("s1.jsonl"), "dead transcript").unwrap();
+                fs::create_dir_all(profile_dir.join(format!("sessions-isolated-{pid}-{seq}")))
+                    .unwrap();
+            }
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false, Launcher::Own)
+                    .expect("acquire");
+
+            let seq = seeded
+                .clone()
+                .find(|seq| {
+                    rt.config_dir() == profile_dir.join(format!("runtime-isolated-{pid}-{seq}"))
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} is none of the pre-seeded trees",
+                        rt.config_dir().display()
+                    )
+                });
+            assert_eq!(
+                fs::read_to_string(
+                    claude_home
+                        .join("projects")
+                        .join(format!("-w-{seq}"))
+                        .join("s1.jsonl")
+                )
+                .ok()
+                .as_deref(),
+                Some("dead transcript"),
+                "the dead isolated tree's transcript must reach the global store"
+            );
+            assert!(
+                !rt.config_dir()
+                    .join("projects")
+                    .join(format!("-w-{seq}"))
+                    .exists(),
+                "the dead tree is still wiped before the rebuild"
+            );
+
+            drop(rt);
+        });
+    });
+}
+
+/// The teardown leg: a copy host's last session whose final tick fails must not
+/// take the tree with it, and a later sweep publishes what the tick could not.
+/// The watchdog is stopped before the transcript lands so only the final tick
+/// can meet it; the fault is a regular file where `~/.claude/projects` belongs.
+#[test]
+fn drop_spares_a_copy_host_tree_whose_final_tick_failed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            let profile = configured_profile("torn-down");
+            let mut rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            drop(rt.watchdog_signal.take());
+            if let Some(handle) = rt.watchdog_handle.take() {
+                handle.join().expect("join the watchdog");
+            }
+            let runtime = rt.config_dir().to_path_buf();
+            fs::create_dir_all(runtime.join("projects/-w-exit")).unwrap();
+            fs::write(runtime.join("projects/-w-exit/s1.jsonl"), "transcript").unwrap();
+            fs::write(claude_home.join("projects"), "not a dir").unwrap();
+
+            drop(rt);
+
+            assert_eq!(
+                fs::read_to_string(runtime.join("projects/-w-exit/s1.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("transcript"),
+                "a tree whose final tick failed must survive its teardown"
+            );
+
+            fs::remove_file(claude_home.join("projects")).unwrap();
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-exit/s1.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("transcript"),
+                "the next sweep must publish the spared tree"
+            );
+            assert!(!runtime.exists(), "the published tree is collected");
+        });
+    });
+}
+
+/// The copy-host test reads the tree, never the sweeping process: a copy
+/// host's dead tree swept by a process that can link (Developer Mode turned on
+/// after the kill, or an elevated clauth) still holds the only copy of its
+/// transcript, so it is rescued all the same.
+#[test]
+fn gc_rescues_a_copy_host_tree_that_a_linking_sweep_finds() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, runtime, sessions) = dead_shared_fake_tree(tmp.path(), "flipped");
+
+        with_link_mode(LinkMode::Real, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("projects/-w-kill/s1.jsonl"))
+                .ok()
+                .as_deref(),
+            Some("transcript"),
+            "a copy host's transcript must survive a sweep that can link"
+        );
+        assert!(!runtime.exists(), "the dead tree must be gone");
+        assert!(!sessions.exists(), "the marker dir must be gone");
+    });
+}
+
+/// Sweep a dead copy-host tree whose `projects/-w-kill/s2.jsonl` holds `tree`
+/// (stamped `tree_age` before now) beside a global copy holding `global`
+/// (stamped `global_age` before now). The two stamps are set against the
+/// outcome each test pins, so an mtime rule reds where the byte rule passes.
+/// Returns `~/.claude`.
+fn sweep_transcript_pair(
+    root: &Path,
+    tree: &str,
+    tree_age: u64,
+    global: &str,
+    global_age: u64,
+) -> PathBuf {
+    let (claude_home, runtime, _sessions) = dead_shared_fake_tree(root, "pair");
+    let now = SystemTime::now();
+    let global_file = claude_home.join("projects/-w-kill/s2.jsonl");
+    fs::create_dir_all(global_file.parent().unwrap()).unwrap();
+    fs::write(&global_file, global).unwrap();
+    set_mtime(&global_file, now - Duration::from_secs(global_age));
+    let tree_file = runtime.join("projects/-w-kill/s2.jsonl");
+    fs::write(&tree_file, tree).unwrap();
+    set_mtime(&tree_file, now - Duration::from_secs(tree_age));
+
+    with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+    assert!(!runtime.exists(), "the dead tree must be gone");
+    claude_home
+}
+
+/// The killed session's own transcript: the global copy is what its last tick
+/// published, the tree holds that plus the lines after it. The longer file
+/// replaces the global one under its own name, so `--resume <id>` opens it,
+/// even when the global copy carries the newer stamp.
+#[test]
+fn gc_replaces_a_global_transcript_the_dead_tree_extends() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = sweep_transcript_pair(tmp.path(), "l1\nl2\n", 600, "l1\n", 60);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("projects/-w-kill/s2.jsonl")).unwrap(),
+            "l1\nl2\n",
+            "the tree's unsynced tail must land under the transcript's own name"
+        );
+        assert!(
+            !claude_home
+                .join("projects/-w-kill/s2.rescued-0.jsonl")
+                .exists(),
+            "an extension is no collision: no sibling"
+        );
+    });
+}
+
+/// Another session's transcript the dead tree holds a stale copy of: the global
+/// file grew after the tree copied it. The stale copy is dropped, even when it
+/// carries the newer stamp.
+#[test]
+fn gc_drops_a_dead_trees_stale_copy_of_a_longer_global_transcript() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = sweep_transcript_pair(tmp.path(), "l1\n", 60, "l1\nl2\n", 600);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("projects/-w-kill/s2.jsonl")).unwrap(),
+            "l1\nl2\n",
+            "the longer global transcript must stay as it is"
+        );
+        assert!(
+            !claude_home
+                .join("projects/-w-kill/s2.rescued-0.jsonl")
+                .exists(),
+            "a stale prefix is no collision: no sibling"
+        );
+    });
+}
+
+/// Two copies that each hold lines the other lacks: neither is lost. The global
+/// one stays, the tree's lands beside it, whichever carries the newer stamp.
+#[test]
+fn gc_keeps_a_diverged_dead_tree_transcript_beside_the_global_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = sweep_transcript_pair(tmp.path(), "l1\nB\n", 600, "l1\nA\n", 60);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("projects/-w-kill/s2.jsonl")).unwrap(),
+            "l1\nA\n",
+            "the global transcript must stay as it is"
+        );
+        assert_eq!(
+            fs::read_to_string(claude_home.join("projects/-w-kill/s2.rescued-0.jsonl"))
+                .ok()
+                .as_deref(),
+            Some("l1\nB\n"),
+            "the tree's diverged copy must land beside it"
+        );
+    });
+}
+
+/// A copy host's tree holds a copy of every global sidecar: one the global store
+/// already has is a stale copy and is dropped, whichever stamp is newer; one
+/// only the tree has is the killed session's and moves.
+#[test]
+fn gc_moves_only_new_sidecars_out_of_a_dead_copy_host_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "sidecars");
+        let now = SystemTime::now();
+        fs::create_dir_all(claude_home.join("plans")).unwrap();
+        fs::write(claude_home.join("plans/p.md"), "global").unwrap();
+        set_mtime(
+            &claude_home.join("plans/p.md"),
+            now - Duration::from_secs(600),
+        );
+        fs::create_dir_all(runtime.join("plans")).unwrap();
+        fs::write(runtime.join("plans/p.md"), "stale copy").unwrap();
+        set_mtime(&runtime.join("plans/p.md"), now - Duration::from_secs(60));
+        fs::write(runtime.join("plans/q.md"), "tree only").unwrap();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("plans/p.md")).unwrap(),
+            "global",
+            "a sidecar the global store has must stay as it is"
+        );
+        assert!(
+            !claude_home.join("plans/p.rescued-0.md").exists(),
+            "a stale sidecar copy must not land as a sibling"
+        );
+        assert_eq!(
+            fs::read_to_string(claude_home.join("plans/q.md"))
+                .ok()
+                .as_deref(),
+            Some("tree only"),
+            "a sidecar only the tree has must move"
+        );
+        assert!(!runtime.exists(), "the dead tree must be gone");
+    });
+}
+
+/// Only transcripts and sidecars leave a dead copy-host tree: a skill the
+/// operator deleted from `~/.claude` after the kill stays deleted, and the
+/// tree's newer `history.jsonl` is not published.
+#[test]
+fn gc_carries_nothing_else_out_of_a_dead_copy_host_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "deleted");
+        fs::create_dir_all(runtime.join("skills/gone")).unwrap();
+        fs::write(runtime.join("skills/gone/SKILL.md"), "removed since").unwrap();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert!(
+            !claude_home.join("skills/gone").exists(),
+            "a deleted skill must not come back"
+        );
+        assert_eq!(
+            fs::read_to_string(claude_home.join("history.jsonl")).unwrap(),
+            "old\n",
+            "the tree's history.jsonl must not be published"
+        );
+        assert!(!runtime.exists(), "the dead tree must be gone");
+    });
+}
+
+/// The rescue is one-way: a tombstone kept after a failed rescue never takes in
+/// what `~/.claude` holds, so a sparse tree killed mid-build costs no reverse
+/// copy of the global store.
+#[test]
+fn gc_copies_nothing_into_a_copy_host_tombstone_it_keeps() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "sparse");
+        let tombstone = runtime.with_file_name("runtime.rescuing");
+        fs::create_dir_all(claude_home.join("agents")).unwrap();
+        fs::write(claude_home.join("agents/a.md"), "global only").unwrap();
+        fs::write(claude_home.join("projects"), "not a dir").unwrap();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(tombstone.join("projects/-w-kill/s1.jsonl"))
+                .ok()
+                .as_deref(),
+            Some("transcript"),
+            "a failed rescue must keep the tombstone"
+        );
+        assert!(
+            !tombstone.join("agents").exists(),
+            "a kept tombstone must not receive the global store's entries"
+        );
+    });
+}
+
+/// An isolated tombstone whose transcript rescue failed is kept like a shared
+/// one, and the next sweep lands it: removing it would delete the only copy.
+#[test]
+fn gc_keeps_an_isolated_tombstone_whose_transcript_rescue_failed() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let profile_dir = sb.home().join(".clauth/profiles/iso");
+    let runtime = profile_dir.join("runtime-isolated-4242-7");
+    let tombstone = profile_dir.join("runtime-isolated-4242-7.rescuing");
+    fs::create_dir_all(runtime.join("projects/-w-iso")).unwrap();
+    fs::write(runtime.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-isolated-4242-7")).unwrap();
+    fs::create_dir_all(&claude_home).unwrap();
+    fs::write(claude_home.join("projects"), "not a dir").unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(tombstone.join("projects/-w-iso/s1.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "a failed transcript rescue must keep the tombstone"
+    );
+
+    fs::remove_file(claude_home.join("projects")).unwrap();
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "the next sweep must land the kept tombstone's transcript"
+    );
+    assert!(!tombstone.exists(), "a rescued tombstone is collected");
+}
+
+/// A clean isolated exit, in the shape `start::run` and the MCP delegate use
+/// (the teardown rescue, then the drop): a rescue that could not land the
+/// transcript must not let the drop delete its only copy; the next sweep lands
+/// it once the fault clears.
+#[test]
+fn an_isolated_exit_keeps_a_transcript_its_rescue_could_not_land() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            let profile = configured_profile("isoexit");
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Isolated, &[], false, Launcher::Own)
+                    .expect("acquire");
+            let runtime = rt.config_dir().to_path_buf();
+            let tombstone = runtime.with_file_name(format!(
+                "{}.rescuing",
+                runtime.file_name().unwrap().to_str().unwrap()
+            ));
+            fs::create_dir_all(runtime.join("projects/-w-x")).unwrap();
+            fs::write(runtime.join("projects/-w-x/s.jsonl"), "only copy").unwrap();
+            fs::write(claude_home.join("projects"), "not a dir").unwrap();
+
+            let _ = crate::start::rescue_teardown(rt.config_dir(), rt.sessions_dir(), &claude_home);
+            drop(rt);
+
+            assert!(
+                runtime.join("projects/-w-x/s.jsonl").exists()
+                    || tombstone.join("projects/-w-x/s.jsonl").exists(),
+                "the only copy of the transcript must survive the teardown"
+            );
+
+            fs::remove_file(claude_home.join("projects")).unwrap();
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-x/s.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("only copy"),
+                "the next sweep must land the kept transcript"
+            );
+        });
+    });
+}
+
+/// A `profiles/<p>/runtime` that is itself a link (a Windows junction needs no
+/// privilege) points at a store the rescue would walk as its own source: the
+/// sweep removes the link alone and never walks through it, so the global
+/// store it points at keeps every file.
+#[test]
+fn gc_unlinks_a_linked_runtime_root_without_walking_it() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects/-w-g")).unwrap();
+    fs::write(claude_home.join("projects/-w-g/s.jsonl"), "global").unwrap();
+    fs::create_dir_all(claude_home.join("plans")).unwrap();
+    fs::write(claude_home.join("plans/p.md"), "global plan").unwrap();
+    let profile_dir = sb.home().join(".clauth/profiles/lnk");
+    fs::create_dir_all(&profile_dir).unwrap();
+    pose_dir_link(&profile_dir.join("runtime"), &claude_home);
+    fs::create_dir_all(profile_dir.join("sessions")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-g/s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("global"),
+        "a global transcript must survive a sweep of a linked runtime root"
+    );
+    assert_eq!(
+        fs::read_to_string(claude_home.join("plans/p.md"))
+            .ok()
+            .as_deref(),
+        Some("global plan"),
+        "a global sidecar must survive a sweep of a linked runtime root"
+    );
+    assert!(
+        profile_dir.join("runtime").symlink_metadata().is_err(),
+        "the dead link itself is collected"
+    );
+    assert!(
+        !profile_dir.join("runtime.rescuing").exists(),
+        "a linked root is never renamed to a tombstone"
+    );
+}
+
+/// A linking host's legacy bare tree built before `~/.claude/projects` existed
+/// holds a real `projects`: its transcript lives only in the tree, so it is
+/// rescued like a copy host's, whatever the sweeping process can create.
+#[test]
+fn gc_rescues_a_legacy_linked_bare_tree_with_a_real_projects() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::create_dir_all(claude_home.join("skills")).unwrap();
+        let profile_dir = tmp.path().join(".clauth/profiles/legacy");
+        let runtime = profile_dir.join("runtime");
+        fs::create_dir_all(runtime.join("projects/-w-l")).unwrap();
+        fs::write(runtime.join("projects/-w-l/t.jsonl"), "tree only").unwrap();
+        pose_dir_link(&runtime.join("skills"), &claude_home.join("skills"));
+        fs::create_dir_all(profile_dir.join("sessions")).unwrap();
+
+        with_link_mode(LinkMode::Real, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("projects/-w-l/t.jsonl"))
+                .ok()
+                .as_deref(),
+            Some("tree only"),
+            "a legacy linked tree's tree-only transcript must be rescued"
+        );
+        assert!(!runtime.exists(), "the dead tree must be gone");
+    });
+}
+
+/// A copy host's session that wrote sidecars but no transcript yet has no
+/// `projects` in its tree: a failed final tick still spares the tree, and the
+/// next sweep lands the sidecar.
+#[test]
+fn drop_spares_a_copy_host_tree_without_projects_whose_final_tick_failed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            let profile = configured_profile("noproj");
+            let mut rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            drop(rt.watchdog_signal.take());
+            if let Some(handle) = rt.watchdog_handle.take() {
+                handle.join().expect("join the watchdog");
+            }
+            let runtime = rt.config_dir().to_path_buf();
+            assert!(
+                runtime.join("projects").symlink_metadata().is_err(),
+                "fixture: the tree holds no projects"
+            );
+            fs::create_dir_all(runtime.join("plans")).unwrap();
+            fs::write(runtime.join("plans/new.md"), "tree only").unwrap();
+            fs::write(claude_home.join("plans"), "not a dir").unwrap();
+
+            drop(rt);
+
+            assert_eq!(
+                fs::read_to_string(runtime.join("plans/new.md"))
+                    .ok()
+                    .as_deref(),
+                Some("tree only"),
+                "a tree whose final tick failed must survive its teardown"
+            );
+
+            fs::remove_file(claude_home.join("plans")).unwrap();
+            gc_stale_runtimes();
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("plans/new.md"))
+                    .ok()
+                    .as_deref(),
+                Some("tree only"),
+                "the next sweep must land the spared sidecar"
+            );
+        });
+    });
+}
+
+/// A shared tree's rescue writes through a sidecar dir the operator linked out
+/// of `~/.claude`, the way the live tick does, so a killed copy-host session's
+/// new plan lands where the operator keeps them.
+#[test]
+fn gc_rescues_a_copy_host_sidecar_through_an_operator_linked_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "linkplans");
+        let elsewhere = tmp.path().join("dotfiles/plans");
+        fs::create_dir_all(&elsewhere).unwrap();
+        pose_dir_link(&claude_home.join("plans"), &elsewhere);
+        fs::create_dir_all(runtime.join("plans")).unwrap();
+        fs::write(runtime.join("plans/new.md"), "tree only plan").unwrap();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(elsewhere.join("new.md")).ok().as_deref(),
+            Some("tree only plan"),
+            "the new plan must land through the operator's link"
+        );
+        assert!(
+            claude_home
+                .join("plans")
+                .symlink_metadata()
+                .is_ok_and(|m| !m.file_type().is_dir()),
+            "the operator's link stays a link"
+        );
+        assert!(!runtime.exists(), "the dead tree must be gone");
+    });
+}
+
+/// A dead per-session tree on a linking host links what `~/.claude` held at
+/// build; a sidecar dir it lacked then (a first-ever `plans/`) is a real dir
+/// only that tree holds, rescued before the tree goes.
+#[test]
+fn gc_rescues_a_new_sidecar_dir_from_a_dead_linked_session_tree() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).unwrap();
+    let profile_dir = sb.home().join(".clauth/profiles/lnk");
+    let runtime = profile_dir.join("runtime-4242-7");
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::write(runtime.join("plans/new.md"), "tree only").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-4242-7")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("plans/new.md"))
+            .ok()
+            .as_deref(),
+        Some("tree only"),
+        "the dead session's new sidecar must land in the global store"
+    );
+    assert!(!runtime.exists(), "the dead tree must be gone");
+}
+
+/// The teardown leg of the same rule: a linking host's session ending with a
+/// sidecar dir `~/.claude` lacked at build hands it to the global store before
+/// its tree is removed.
+#[test]
+fn a_linked_session_teardown_rescues_a_new_sidecar_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        if !host_poses(&claude_home, "a linking host's per-session tree") {
+            return;
+        }
+        with_link_mode(LinkMode::Real, || {
+            let profile = configured_profile("linked-exit");
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+            let runtime = rt.config_dir().to_path_buf();
+            fs::create_dir_all(runtime.join("plans")).unwrap();
+            fs::write(runtime.join("plans/new.md"), "tree only").unwrap();
+
+            drop(rt);
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("plans/new.md"))
+                    .ok()
+                    .as_deref(),
+                Some("tree only"),
+                "the session's new sidecar must land in the global store"
+            );
+            assert!(!runtime.exists(), "the ended session's tree is removed");
+        });
+    });
+}
+
+/// A sidecar a linked session wrote under a name the global store gained
+/// meanwhile is that session's own, never a stale copy: it lands as a sibling
+/// and the global one stays.
+#[test]
+fn gc_keeps_a_linked_trees_colliding_sidecar_as_a_sibling() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).unwrap();
+    fs::create_dir_all(claude_home.join("plans")).unwrap();
+    fs::write(claude_home.join("plans/x.md"), "global").unwrap();
+    let profile_dir = sb.home().join(".clauth/profiles/lnk");
+    let runtime = profile_dir.join("runtime-4242-8");
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::write(runtime.join("plans/x.md"), "mine").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-4242-8")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("plans/x.md")).unwrap(),
+        "global",
+        "the global sidecar must stay as it is"
+    );
+    assert_eq!(
+        fs::read_to_string(claude_home.join("plans/x.rescued-0.md"))
+            .ok()
+            .as_deref(),
+        Some("mine"),
+        "the session's own colliding sidecar must land beside it"
+    );
+}
+
+/// The append arm writes the missing tail into the global transcript itself,
+/// never a replacement file: a process holding the global file open keeps
+/// writing into the file the store names.
+#[cfg(unix)]
+#[test]
+fn gc_appends_a_dead_trees_tail_into_the_same_global_file() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, _runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "inode");
+        let global = claude_home.join("projects/-w-kill/s1.jsonl");
+        fs::create_dir_all(global.parent().unwrap()).unwrap();
+        fs::write(&global, "transc").unwrap();
+        let before = fs::metadata(&global).unwrap().ino();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(&global).unwrap(),
+            "transcript",
+            "the tree's tail must land in the global transcript"
+        );
+        assert_eq!(
+            fs::metadata(&global).unwrap().ino(),
+            before,
+            "the global transcript must stay the same file"
+        );
+    });
+}
+
 /// A live marker in the pair's marker dir blocks every leg: nothing is renamed,
 /// nothing is rescued, the tree stays put.
 #[test]
@@ -14610,28 +15506,43 @@ fn gc_spares_an_isolated_tree_with_a_live_marker() {
     );
 }
 
-/// A shared pair with no live marker keeps today's removal: deleted under the
-/// lock, never rescued.
+/// A dead bare shared tree whose stores link into `~/.claude` (a linking
+/// host's legacy tree): the rescue never walks through its links, so the
+/// global transcript behind `projects` stays as it is, while a real sidecar
+/// only the tree holds still lands in the global store.
 #[test]
-fn gc_removes_a_shared_pair_without_rescuing() {
+fn gc_rescues_only_the_real_entries_of_a_linked_bare_tree() {
     let sb = HomeSandbox::new();
     let claude_home = sb.home().join(".claude");
     let runtime = sb.home().join(".clauth/profiles/sh/runtime");
     let sessions = sb.home().join(".clauth/profiles/sh/sessions");
-    fs::create_dir_all(runtime.join("projects/-w-sh")).unwrap();
-    fs::write(runtime.join("projects/-w-sh/s1.jsonl"), "transcript").unwrap();
+    fs::create_dir_all(claude_home.join("projects/-w-sh")).unwrap();
+    fs::write(claude_home.join("projects/-w-sh/s1.jsonl"), "global").unwrap();
+    fs::create_dir_all(claude_home.join("skills")).unwrap();
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    pose_dir_link(&runtime.join("skills"), &claude_home.join("skills"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::write(runtime.join("plans/q.md"), "tree only").unwrap();
     fs::create_dir_all(&sessions).unwrap();
     fs::write(sessions.join("dead"), b"").unwrap();
 
-    gc_stale_runtimes();
+    with_link_mode(LinkMode::Fake, gc_stale_runtimes);
 
     assert!(!runtime.exists(), "the shared tree must be removed");
     assert!(!sessions.exists(), "the shared marker dir must be removed");
-    assert!(
-        !claude_home.join("projects").exists(),
-        "a shared tree is never rescued"
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-sh/s1.jsonl")).unwrap(),
+        "global",
+        "removing the tree must not reach through its links"
     );
-    assert!(!claude_home.join("shell-snapshots").exists());
+    assert_eq!(
+        fs::read_to_string(claude_home.join("plans/q.md"))
+            .ok()
+            .as_deref(),
+        Some("tree only"),
+        "a real sidecar only the tree holds must be rescued"
+    );
 }
 
 /// A `.rescuing` directory left by a crash between the rename and the delete is
@@ -14661,6 +15572,981 @@ fn gc_finishes_a_stranded_rescue_tombstone() {
         "the sidecar must be rescued from the stranded tombstone"
     );
     assert!(!tombstone.exists(), "the tombstone must be collected");
+}
+
+/// The append rule holds for an isolated tree too: a global transcript its
+/// session's copy extends is replaced under its own name, with no sibling.
+#[test]
+fn gc_replaces_a_global_transcript_an_isolated_tree_extends() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let profile_dir = sb.home().join(".clauth/profiles/iso");
+    let runtime = profile_dir.join("runtime-isolated-4242-7");
+    fs::create_dir_all(runtime.join("projects/-w-iso")).unwrap();
+    fs::write(runtime.join("projects/-w-iso/s1.jsonl"), "l1\nl2\n").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-isolated-4242-7")).unwrap();
+    fs::create_dir_all(claude_home.join("projects/-w-iso")).unwrap();
+    fs::write(claude_home.join("projects/-w-iso/s1.jsonl"), "l1\n").unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl")).unwrap(),
+        "l1\nl2\n",
+        "the isolated tree's longer transcript must replace the global prefix"
+    );
+    assert!(
+        !claude_home
+            .join("projects/-w-iso/s1.rescued-0.jsonl")
+            .exists(),
+        "an extension is no collision: no sibling"
+    );
+    assert!(!runtime.exists(), "the rescued tree must be gone");
+    assert!(
+        !profile_dir
+            .join("runtime-isolated-4242-7.rescuing")
+            .exists(),
+        "the rescued tombstone must be collected"
+    );
+}
+
+/// A tombstone whose `projects` is a link resolves into the global store
+/// itself: the rescue never walks it, so no global transcript is deleted as an
+/// already-rescued copy of itself.
+#[test]
+fn gc_never_rescues_through_a_linked_projects_store() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let tombstone = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated.rescuing");
+    fs::create_dir_all(claude_home.join("projects/-w-iso")).unwrap();
+    fs::write(claude_home.join("projects/-w-iso/s1.jsonl"), "global").unwrap();
+    fs::create_dir_all(&tombstone).unwrap();
+    pose_dir_link(&tombstone.join("projects"), &claude_home.join("projects"));
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("global"),
+        "a rescue must not reach the global store through a linked projects"
+    );
+    assert!(!tombstone.exists(), "the tombstone must be collected");
+}
+
+/// A transcript gone from under the rescue (a concurrent sweep moved it first)
+/// leaves nothing to keep: the tombstone is collected, never kept for a retry
+/// that cannot land. A link resolving to nothing poses the vanished source: its
+/// read fails `NotFound` at the same step a moved-away file's does.
+#[cfg(unix)]
+#[test]
+fn gc_collects_a_tombstone_whose_unmoved_transcript_is_gone() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let tombstone = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated.rescuing");
+    let slug = tombstone.join("projects/-w-iso");
+    fs::create_dir_all(&slug).unwrap();
+    fs::write(slug.join("s1.jsonl"), "transcript").unwrap();
+    std::os::unix::fs::symlink(slug.join("moved-away.jsonl"), slug.join("gone.jsonl")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "the transcript still in the tombstone must be rescued"
+    );
+    assert!(
+        !tombstone.exists(),
+        "a vanished source must not keep the tombstone"
+    );
+}
+
+/// A dead copy-host tree whose tombstone name a kept tombstone already holds
+/// cannot be renamed aside: the start builds over it, never wipes it, and the
+/// kept tombstone stays for its own sweep. `daemon.json` is a name the build and
+/// the mirror both skip, so only a wipe can remove it.
+#[test]
+fn acquire_builds_over_a_dead_copy_host_tree_it_cannot_rename() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let (_claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "occupied");
+            let kept = runtime.with_file_name("runtime.rescuing");
+            fs::create_dir_all(kept.join("projects/-w-old")).unwrap();
+            fs::write(kept.join("projects/-w-old/s0.jsonl"), "kept").unwrap();
+            fs::write(runtime.join("daemon.json"), "tree only").unwrap();
+            let profile = configured_profile("occupied");
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+
+            assert_eq!(
+                rt.config_dir(),
+                runtime.as_path(),
+                "the shared copy-host session runs out of the bare tree"
+            );
+            assert_eq!(
+                fs::read_to_string(runtime.join("daemon.json"))
+                    .ok()
+                    .as_deref(),
+                Some("tree only"),
+                "a tree the start cannot rename aside is built over, never wiped"
+            );
+            assert_eq!(
+                fs::read_to_string(kept.join("projects/-w-old/s0.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("kept"),
+                "the kept tombstone stays for its own sweep"
+            );
+
+            drop(rt);
+        });
+    });
+}
+
+/// The acquire leg of a linked runtime root: a start that finds its path is a
+/// link into `~/.claude` unlinks it and builds a real tree there, never
+/// renaming the link to a tombstone or walking the store behind it.
+#[test]
+fn acquire_unlinks_a_linked_runtime_root_without_walking_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            fs::write(claude_home.join("CLAUDE.md"), "memory").unwrap();
+            fs::create_dir_all(claude_home.join("projects/-w-g")).unwrap();
+            fs::write(claude_home.join("projects/-w-g/s.jsonl"), "global").unwrap();
+            fs::create_dir_all(claude_home.join("plans")).unwrap();
+            fs::write(claude_home.join("plans/p.md"), "global plan").unwrap();
+            let profile = configured_profile("lnkacq");
+            let runtime = tmp.path().join(".clauth/profiles/lnkacq/runtime");
+            fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+            pose_dir_link(&runtime, &claude_home);
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("acquire");
+
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-g/s.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("global"),
+                "a global transcript must survive a start over a linked runtime root"
+            );
+            assert_eq!(
+                fs::read_to_string(claude_home.join("plans/p.md"))
+                    .ok()
+                    .as_deref(),
+                Some("global plan"),
+                "a global sidecar must survive a start over a linked runtime root"
+            );
+            assert!(
+                runtime.symlink_metadata().is_ok_and(|m| m.is_dir()),
+                "the session runs out of a real tree at the runtime path"
+            );
+            assert!(
+                runtime
+                    .with_file_name("runtime.rescuing")
+                    .symlink_metadata()
+                    .is_err(),
+                "a linked root is never renamed to a tombstone"
+            );
+
+            drop(rt);
+        });
+    });
+}
+
+/// An isolated tree's rescue never writes through a sidecar dir the operator
+/// linked out of `~/.claude`: its session never wrote through it. The
+/// transcript beside it is the control that the rescue ran.
+#[test]
+fn gc_never_writes_an_isolated_sidecar_through_an_operator_linked_dir() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let elsewhere = sb.home().join("dotfiles/plans");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::create_dir_all(&claude_home).unwrap();
+    pose_dir_link(&claude_home.join("plans"), &elsewhere);
+    let profile_dir = sb.home().join(".clauth/profiles/iso");
+    let runtime = profile_dir.join("runtime-isolated-4242-7");
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::write(runtime.join("plans/new.md"), "iso plan").unwrap();
+    fs::create_dir_all(runtime.join("projects/-w-iso")).unwrap();
+    fs::write(runtime.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-isolated-4242-7")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "the isolated tree's rescue ran"
+    );
+    assert!(
+        elsewhere.join("new.md").symlink_metadata().is_err(),
+        "an isolated rescue must not write through the operator's link"
+    );
+}
+
+/// Two sweeps can reach one tombstone at once (the renaming sweep's own tail and
+/// another process's stranded-tombstone arm). The global transcript must end up
+/// holding the tree's bytes exactly once: the tail is never appended twice. The
+/// 8 MiB prefix widens the window between the compare and the append.
+#[test]
+fn two_rescues_of_one_tombstone_append_the_tail_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let prefix = "p".repeat(8 << 20) + "\n";
+        let tail: String = (0..20_000)
+            .map(|i| format!("{{\"line\":{i:08}}}\n"))
+            .collect();
+        let whole = format!("{prefix}{tail}");
+        for trial in 0..10 {
+            let tombstone = tmp
+                .path()
+                .join(format!(".clauth/profiles/race{trial}/runtime.rescuing"));
+            let rel = format!("projects/-w-race{trial}/s.jsonl");
+            fs::create_dir_all(claude_home.join(&rel).parent().unwrap()).unwrap();
+            fs::write(claude_home.join(&rel), &prefix).unwrap();
+            fs::create_dir_all(tombstone.join(&rel).parent().unwrap()).unwrap();
+            fs::write(tombstone.join(&rel), &whole).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let rescuers: Vec<_> = (0..2)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let tombstone = tombstone.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        rescue_tombstone(&tombstone);
+                    })
+                })
+                .collect();
+            for rescuer in rescuers {
+                rescuer.join().expect("join a rescuer");
+            }
+
+            assert!(
+                fs::read_to_string(claude_home.join(&rel)).unwrap() == whole,
+                "trial {trial}: the global transcript must hold the tree's bytes once"
+            );
+        }
+    });
+}
+
+/// A linked runtime root that acquire's liveness checks spare (its target
+/// carries a supervisor record they cannot verify) is never built into: the
+/// start refuses by name, and the store the link points at is untouched.
+#[test]
+fn acquire_refuses_a_spared_linked_runtime_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            fs::write(claude_home.join("settings.json"), "{\"operator\":true}").unwrap();
+            fs::write(claude_home.join("daemon.lock"), b"{}").unwrap();
+            let profile = configured_profile("lnkspared");
+            let runtime = tmp.path().join(".clauth/profiles/lnkspared/runtime");
+            fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+            pose_dir_link(&runtime, &claude_home);
+
+            let Err(err) =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+            else {
+                panic!("a start over a linked runtime root must refuse");
+            };
+
+            assert_eq!(
+                err.root_cause().to_string(),
+                format!(
+                    "{} is a link, not a runtime tree clauth made; remove it and start again",
+                    runtime.display()
+                ),
+                "the refusal names the link and the fix"
+            );
+            assert_eq!(
+                fs::read_to_string(claude_home.join("settings.json")).unwrap(),
+                "{\"operator\":true}",
+                "a start must never write through a linked runtime root"
+            );
+        });
+    });
+}
+
+/// A stranded tombstone that is a link (a crash between renaming a linked root
+/// and unlinking it) is unlinked by the next sweep and never walked: the store
+/// it points at keeps every file.
+#[test]
+fn gc_unlinks_a_stranded_linked_tombstone_without_walking_it() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects/-w-g")).unwrap();
+    fs::write(claude_home.join("projects/-w-g/s.jsonl"), "global").unwrap();
+    fs::create_dir_all(claude_home.join("plans")).unwrap();
+    fs::write(claude_home.join("plans/p.md"), "global plan").unwrap();
+    let profile_dir = sb.home().join(".clauth/profiles/lnk");
+    fs::create_dir_all(&profile_dir).unwrap();
+    let tombstone = profile_dir.join("runtime.rescuing");
+    pose_dir_link(&tombstone, &claude_home);
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-g/s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("global"),
+        "a global transcript must survive a linked tombstone"
+    );
+    assert_eq!(
+        fs::read_to_string(claude_home.join("plans/p.md"))
+            .ok()
+            .as_deref(),
+        Some("global plan"),
+        "a global sidecar must survive a linked tombstone"
+    );
+    assert!(
+        tombstone.symlink_metadata().is_err(),
+        "the linked tombstone itself is collected"
+    );
+}
+
+/// A copy host whose `~/.claude` holds neither `CLAUDE.md` nor `skills` builds
+/// a tree with no link in it at all: it is still a copy, so its stale copy of a
+/// global sidecar is dropped, never landed beside the global one.
+#[test]
+fn gc_drops_a_plain_copy_trees_stale_sidecar_copy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let profile_dir = tmp.path().join(".clauth/profiles/plain");
+        let runtime = profile_dir.join("runtime");
+        let sessions = profile_dir.join("sessions");
+        fs::create_dir_all(runtime.join("projects/-w")).unwrap();
+        fs::create_dir_all(claude_home.join("sessions")).unwrap();
+        fs::write(
+            claude_home.join("sessions/777.json"),
+            "{\"status\":\"busy\"}",
+        )
+        .unwrap();
+        fs::create_dir_all(runtime.join("sessions")).unwrap();
+        fs::write(runtime.join("sessions/777.json"), "{\"status\":\"idle\"}").unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("dead"), b"").unwrap();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert_eq!(
+            fs::read_to_string(claude_home.join("sessions/777.json")).unwrap(),
+            "{\"status\":\"busy\"}",
+            "the global sidecar must stay as it is"
+        );
+        assert!(
+            !claude_home.join("sessions/777.rescued-0.json").exists(),
+            "a copy's stale sidecar must be dropped, not landed beside the global one"
+        );
+        assert!(!runtime.exists(), "the dead tree must be gone");
+    });
+}
+
+/// A shared tree's real sidecar whose global dir is a dangling operator link
+/// can be neither moved nor written through: it is left, so the tree is kept
+/// for a later sweep instead of being deleted with it.
+#[cfg(unix)]
+#[test]
+fn gc_keeps_a_tree_whose_sidecar_meets_a_dangling_global_link() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).unwrap();
+    std::os::unix::fs::symlink(
+        sb.home().join("dotfiles-not-cloned/plans"),
+        claude_home.join("plans"),
+    )
+    .unwrap();
+    let profile_dir = sb.home().join(".clauth/profiles/lnk");
+    let runtime = profile_dir.join("runtime-4242-9");
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::write(runtime.join("plans/new.md"), "tree only").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-4242-9")).unwrap();
+
+    gc_stale_runtimes();
+
+    let tombstone = profile_dir.join("runtime-4242-9.rescuing");
+    assert!(
+        runtime.join("plans/new.md").exists() || tombstone.join("plans/new.md").exists(),
+        "a sidecar the rescue could not land must not be deleted with the tree"
+    );
+}
+
+/// A dead linked runtime root is unlinked where it stands, never renamed to its
+/// tombstone: beside a tombstone a failed rescue kept, that rename fails and
+/// leaves the link, so the start would refuse instead of building.
+#[test]
+fn acquire_unlinks_a_linked_root_beside_a_kept_tombstone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            fs::create_dir_all(claude_home.join("projects/-w-g")).unwrap();
+            fs::write(claude_home.join("projects/-w-g/s.jsonl"), "global").unwrap();
+            let profile = configured_profile("lnkkept");
+            let runtime = tmp.path().join(".clauth/profiles/lnkkept/runtime");
+            let kept = runtime.with_file_name("runtime.rescuing");
+            fs::create_dir_all(kept.join("projects/-w-old")).unwrap();
+            fs::write(kept.join("projects/-w-old/s0.jsonl"), "kept").unwrap();
+            pose_dir_link(&runtime, &claude_home);
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false, Launcher::Own)
+                    .expect("a dead linked root beside a kept tombstone must not refuse the start");
+
+            assert!(
+                runtime.symlink_metadata().is_ok_and(|m| m.is_dir()),
+                "the session runs out of a real tree at the runtime path"
+            );
+            assert_eq!(
+                fs::read_to_string(claude_home.join("projects/-w-g/s.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("global"),
+                "the store behind the link is untouched"
+            );
+            assert_eq!(
+                fs::read_to_string(kept.join("projects/-w-old/s0.jsonl"))
+                    .ok()
+                    .as_deref(),
+                Some("kept"),
+                "the kept tombstone stays for its own sweep"
+            );
+
+            drop(rt);
+        });
+    });
+}
+
+/// A claim file a crashed rescue left is held by nobody: beside its tombstone
+/// it does not stop the next sweep finishing the rescue, and it goes with the
+/// tombstone; alone, it is collected.
+#[test]
+fn gc_finishes_a_tombstone_past_a_crashed_rescues_claim() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(&claude_home).unwrap();
+    let tombstone = sb
+        .home()
+        .join(".clauth/profiles/crash/runtime-isolated.rescuing");
+    fs::create_dir_all(tombstone.join("projects/-w")).unwrap();
+    fs::write(tombstone.join("projects/-w/s.jsonl"), "transcript").unwrap();
+    let claim = tombstone.with_file_name("runtime-isolated.rescuing.claim");
+    fs::write(&claim, b"").unwrap();
+    let orphan = sb
+        .home()
+        .join(".clauth/profiles/gone/runtime.rescuing.claim");
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(&orphan, b"").unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w/s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "a stale claim must not stop the rescue"
+    );
+    assert!(
+        tombstone.symlink_metadata().is_err(),
+        "the rescued tombstone is removed"
+    );
+    assert!(
+        claim.symlink_metadata().is_err(),
+        "the claim goes with its tombstone"
+    );
+    assert!(
+        orphan.symlink_metadata().is_err(),
+        "a claim whose tombstone is gone is collected"
+    );
+}
+
+/// A sweep that opened a rescue claim just before its holder unlinked it locks
+/// an orphan once the holder lets go, while a later sweep may create and lock a
+/// new claim at the same name: the orphan must not count as the claim, or both
+/// rescue one tombstone.
+#[cfg(unix)]
+#[test]
+fn a_rescue_claim_unlinked_under_its_opener_is_not_the_claim() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("runtime.rescuing.claim");
+    let opened = open_rescue_claim(&path).unwrap();
+    assert!(
+        claim_is_named(&opened, &path),
+        "control: the file the name points at is the claim"
+    );
+
+    fs::remove_file(&path).unwrap();
+    let _recreated = open_rescue_claim(&path).unwrap();
+
+    assert!(
+        !claim_is_named(&opened, &path),
+        "a claim file unlinked under its opener must not be the claim"
+    );
+}
+
+/// Two dead trees holding different tails of one global transcript, rescued at
+/// the same moment by two sweeps: one tail extends the global file, the other
+/// lands beside it as a sibling, and neither lands twice or torn into the
+/// other. The 8 MiB prefix widens the window between compare and append.
+#[test]
+fn two_trees_extending_one_transcript_never_both_append() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let prefix = "p".repeat(8 << 20) + "\n";
+        let tail_a: String = (0..10_000).map(|i| format!("{{\"a\":{i:08}}}\n")).collect();
+        let tail_b: String = (0..10_000).map(|i| format!("{{\"b\":{i:08}}}\n")).collect();
+        let with_a = format!("{prefix}{tail_a}");
+        let with_b = format!("{prefix}{tail_b}");
+        for trial in 0..10 {
+            let rel = format!("projects/-w-cross{trial}/s.jsonl");
+            let global = claude_home.join(&rel);
+            fs::create_dir_all(global.parent().unwrap()).unwrap();
+            fs::write(&global, &prefix).unwrap();
+            let tombstones: Vec<PathBuf> = [("a", &with_a), ("b", &with_b)]
+                .into_iter()
+                .map(|(side, body)| {
+                    let tombstone = tmp.path().join(format!(
+                        ".clauth/profiles/cross{trial}{side}/runtime.rescuing"
+                    ));
+                    fs::create_dir_all(tombstone.join(&rel).parent().unwrap()).unwrap();
+                    fs::write(tombstone.join(&rel), body).unwrap();
+                    tombstone
+                })
+                .collect();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let rescuers: Vec<_> = tombstones
+                .iter()
+                .cloned()
+                .map(|tombstone| {
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        rescue_tombstone(&tombstone);
+                    })
+                })
+                .collect();
+            for rescuer in rescuers {
+                rescuer.join().expect("join a rescuer");
+            }
+
+            let landed = fs::read_to_string(&global).unwrap();
+            let sibling =
+                fs::read_to_string(global.with_file_name("s.rescued-0.jsonl")).unwrap_or_default();
+            assert!(
+                (landed == with_a && sibling == with_b) || (landed == with_b && sibling == with_a),
+                "trial {trial}: one tail extends the global transcript, the other lands as its \
+                 sibling (global {} bytes, sibling {} bytes)",
+                landed.len(),
+                sibling.len()
+            );
+        }
+    });
+}
+
+/// An empty sidecar dir under a dangling global link holds nothing to lose: it
+/// never keeps its tree, which would otherwise sit as a tombstone forever.
+#[cfg(unix)]
+#[test]
+fn gc_collects_a_tree_whose_only_refused_sidecar_is_empty() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).unwrap();
+    std::os::unix::fs::symlink(
+        sb.home().join("dotfiles-not-cloned/plans"),
+        claude_home.join("plans"),
+    )
+    .unwrap();
+    let profile_dir = sb.home().join(".clauth/profiles/lnk");
+    let runtime = profile_dir.join("runtime-4242-11");
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-4242-11")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert!(!runtime.exists(), "the dead tree must be gone");
+    assert!(
+        !profile_dir.join("runtime-4242-11.rescuing").exists(),
+        "an empty refused sidecar must not keep a tombstone"
+    );
+}
+
+/// A copy tree's copy of a global sidecar file the operator linked elsewhere is
+/// a stale copy like any other: dropped, never a reason to keep the tree (a kept
+/// `runtime.rescuing` would block every later retire of the bare `runtime`).
+#[cfg(unix)]
+#[test]
+fn gc_drops_a_copy_trees_copy_of_a_linked_global_sidecar_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let (claude_home, runtime, _sessions) = dead_shared_fake_tree(tmp.path(), "filelink");
+        let elsewhere = tmp.path().join("dotfiles/x.md");
+        fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        fs::write(&elsewhere, "operator's").unwrap();
+        fs::create_dir_all(claude_home.join("plans")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, claude_home.join("plans/x.md")).unwrap();
+        fs::create_dir_all(runtime.join("plans")).unwrap();
+        fs::write(runtime.join("plans/x.md"), "stale copy").unwrap();
+
+        with_link_mode(LinkMode::Fake, gc_stale_runtimes);
+
+        assert!(!runtime.exists(), "the dead tree must be gone");
+        assert!(
+            !runtime.with_file_name("runtime.rescuing").exists(),
+            "a stale copy must not keep a tombstone"
+        );
+        assert_eq!(
+            fs::read_to_string(&elsewhere).unwrap(),
+            "operator's",
+            "the operator's file stays as it is"
+        );
+    });
+}
+
+/// A finished rescue's claim file goes while its lock is still held: a sweep
+/// that opened the claim during the rescue must not lock it in between, or it
+/// holds a claim at a name the next claimant recreates and locks too.
+#[cfg(unix)]
+#[test]
+fn a_released_claims_name_goes_while_it_is_still_held() {
+    let sb = HomeSandbox::new();
+    fs::create_dir_all(sb.home().join(".claude")).unwrap();
+    let tombstone = sb.home().join(".clauth/profiles/rel/runtime.rescuing");
+    fs::create_dir_all(tombstone.join("projects/-w")).unwrap();
+    fs::write(tombstone.join("projects/-w/s.jsonl"), "transcript").unwrap();
+    let taken = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = taken.clone();
+    let probe = tombstone.clone();
+    set_claim_hook(
+        &CLAIM_UNLINK_HOOK,
+        Box::new(move |_path| seen.set(Some(RescueClaim::take(&probe).is_some()))),
+    );
+
+    rescue_tombstone(&tombstone);
+
+    assert!(
+        tombstone.symlink_metadata().is_err(),
+        "control: the rescue finished and released its claim"
+    );
+    assert_eq!(
+        taken.get(),
+        Some(false),
+        "a claim being released must still be held when its name goes"
+    );
+}
+
+/// A sweep that opened a rescue claim just before its holder unlinked it locks
+/// that orphan once the holder lets go, while a later sweep holds a new claim at
+/// the same name over a tombstone retired since: the orphan's holder must leave
+/// that tombstone to the new claim's holder.
+#[cfg(unix)]
+#[test]
+fn a_sweep_locking_an_unlinked_claim_leaves_the_tombstone_alone() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(&claude_home).unwrap();
+    let tombstone = sb.home().join(".clauth/profiles/orph/runtime.rescuing");
+    fs::create_dir_all(tombstone.join("projects/-w")).unwrap();
+    fs::write(tombstone.join("projects/-w/s.jsonl"), "transcript").unwrap();
+    let holder: std::rc::Rc<std::cell::RefCell<Option<File>>> = Default::default();
+    let keep = holder.clone();
+    set_claim_hook(
+        &CLAIM_OPENED_HOOK,
+        Box::new(move |path| {
+            fs::remove_file(path).unwrap();
+            let claim = open_rescue_claim(path).unwrap();
+            claim.try_lock().unwrap();
+            *keep.borrow_mut() = Some(claim);
+        }),
+    );
+
+    rescue_tombstone(&tombstone);
+
+    assert!(
+        holder.borrow().is_some(),
+        "control: a new claim was taken between the open and the lock"
+    );
+    assert_eq!(
+        fs::read_to_string(tombstone.join("projects/-w/s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "a sweep holding an unlinked claim must leave the tombstone to the claim's holder"
+    );
+    assert!(
+        !claude_home.join("projects/-w/s.jsonl").exists(),
+        "nothing lands from a tombstone another sweep holds"
+    );
+}
+
+/// A rescue that cannot take the box-wide rescue lock in time leaves the file
+/// in its tombstone, which stays; once the lock is free the next sweep finishes
+/// it.
+#[test]
+fn a_rescue_that_cannot_take_the_file_lock_keeps_its_tombstone() {
+    struct ClearWait;
+    impl Drop for ClearWait {
+        fn drop(&mut self) {
+            crate::sessions::set_rescue_lock_wait_override(None);
+        }
+    }
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(&claude_home).unwrap();
+    let tombstone = sb
+        .home()
+        .join(".clauth/profiles/wait/runtime-isolated.rescuing");
+    fs::create_dir_all(tombstone.join("projects/-w")).unwrap();
+    fs::write(tombstone.join("projects/-w/s.jsonl"), "transcript").unwrap();
+    let held = crate::profile::open_state_file(&sb.home().join(".clauth/rescue.lock")).unwrap();
+    held.lock().unwrap();
+    let _clear = ClearWait;
+    crate::sessions::set_rescue_lock_wait_override(Some(Duration::from_millis(50)));
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(tombstone.join("projects/-w/s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "a file whose lock wait ran out stays in its tombstone"
+    );
+    assert!(
+        !claude_home.join("projects/-w/s.jsonl").exists(),
+        "nothing lands without the lock"
+    );
+
+    drop(held);
+    // The positive control runs with the whole wait: a parallel test thread's
+    // fork that copied `held`'s fd keeps the flock until its exec.
+    crate::sessions::set_rescue_lock_wait_override(None);
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w/s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("transcript"),
+        "the next sweep finishes it once the lock is free"
+    );
+    assert!(
+        tombstone.symlink_metadata().is_err(),
+        "and removes the tombstone"
+    );
+}
+
+/// A wedged holder of the rescue lock costs one sweep its wait once, never once
+/// per file or per tree: three tombstones whose files all wait on a held lock
+/// leave the sweep short of the three waits a per-file or per-tree budget
+/// spends.
+#[test]
+fn a_sweep_against_a_held_rescue_lock_spends_its_wait_once() {
+    struct ClearWait;
+    impl Drop for ClearWait {
+        fn drop(&mut self) {
+            crate::sessions::set_rescue_lock_wait_override(None);
+        }
+    }
+    let sb = HomeSandbox::new();
+    fs::create_dir_all(sb.home().join(".claude")).unwrap();
+    let transcripts: Vec<PathBuf> = ["1-0", "2-0", "3-0"]
+        .into_iter()
+        .map(|sid| {
+            let slug = sb.home().join(format!(
+                ".clauth/profiles/wedge/runtime-isolated-{sid}.rescuing/projects/-w-{sid}"
+            ));
+            fs::create_dir_all(&slug).unwrap();
+            fs::write(slug.join("s.jsonl"), "transcript").unwrap();
+            slug.join("s.jsonl")
+        })
+        .collect();
+    let held = crate::profile::open_state_file(&sb.home().join(".clauth/rescue.lock")).unwrap();
+    held.lock().unwrap();
+    let _clear = ClearWait;
+    let wait = Duration::from_millis(800);
+    crate::sessions::set_rescue_lock_wait_override(Some(wait));
+
+    let started = std::time::Instant::now();
+    gc_stale_runtimes();
+    let spent = started.elapsed();
+
+    for transcript in &transcripts {
+        assert!(
+            transcript.exists(),
+            "control: {} landed without the lock",
+            transcript.display()
+        );
+    }
+    assert!(
+        spent >= wait,
+        "control: the first file waited out the bound ({spent:?})"
+    );
+    assert!(
+        spent < wait * 3,
+        "three trees waiting on one held lock spent {spent:?}, past the one {wait:?} the sweep \
+         shares"
+    );
+}
+
+/// A second sweep reaching a tombstone whose rescue is about to remove it must
+/// leave it to that rescue: removing it would free the name, and a dead tree
+/// retired onto it then would go unwalked with the first rescue's removal.
+#[test]
+fn a_tombstone_mid_rescue_keeps_its_name_from_the_next_retired_tree() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(&claude_home).unwrap();
+    let profile_dir = sb.home().join(".clauth/profiles/reuse");
+    let tombstone = profile_dir.join("runtime-isolated.rescuing");
+    fs::create_dir_all(tombstone.join("projects/-w-old")).unwrap();
+    fs::write(tombstone.join("projects/-w-old/old.jsonl"), "old").unwrap();
+    let next = profile_dir.join("runtime-isolated");
+    fs::create_dir_all(next.join("projects/-w-next")).unwrap();
+    fs::write(next.join("projects/-w-next/next.jsonl"), "next").unwrap();
+    let other_sweep = tombstone.clone();
+    let retired = next.clone();
+    set_claim_hook(
+        &TOMBSTONE_REMOVAL_HOOK,
+        Box::new(move |_path| {
+            rescue_tombstone(&other_sweep);
+            let _ = retire_tree(&retired);
+        }),
+    );
+
+    rescue_tombstone(&tombstone);
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-old/old.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("old"),
+        "control: the first rescue landed its transcript"
+    );
+    let survivors: Vec<PathBuf> = [
+        next.join("projects/-w-next/next.jsonl"),
+        tombstone.join("projects/-w-next/next.jsonl"),
+        claude_home.join("projects/-w-next/next.jsonl"),
+    ]
+    .into_iter()
+    .filter(|path| fs::read_to_string(path).is_ok_and(|body| body == "next"))
+    .collect();
+    assert_eq!(
+        survivors.len(),
+        1,
+        "the next dead tree's transcript must survive the first rescue's removal"
+    );
+}
+
+/// A refused sidecar dir holding only links carries nothing the walk would
+/// move: it never keeps its tree.
+#[cfg(unix)]
+#[test]
+fn gc_collects_a_tree_whose_refused_sidecar_holds_only_links() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).unwrap();
+    std::os::unix::fs::symlink(
+        sb.home().join("dotfiles-not-cloned/plans"),
+        claude_home.join("plans"),
+    )
+    .unwrap();
+    let profile_dir = sb.home().join(".clauth/profiles/lnk");
+    let runtime = profile_dir.join("runtime-4242-12");
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    std::os::unix::fs::symlink(sb.home().join("elsewhere.md"), runtime.join("plans/l.md")).unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-4242-12")).unwrap();
+
+    gc_stale_runtimes();
+
+    assert!(!runtime.exists(), "the dead tree must be gone");
+    assert!(
+        !profile_dir.join("runtime-4242-12.rescuing").exists(),
+        "a refused sidecar holding only links must not keep a tombstone"
+    );
+}
+
+/// A refused sidecar dir the rescue cannot read may hold anything: it counts
+/// one file left, so its tree is kept for a later sweep.
+#[cfg(unix)]
+#[test]
+fn gc_keeps_a_tree_whose_refused_sidecar_cannot_be_read() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Readable([PathBuf; 2]);
+    impl Drop for Readable {
+        fn drop(&mut self) {
+            for dir in &self.0 {
+                let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).unwrap();
+    std::os::unix::fs::symlink(
+        sb.home().join("dotfiles-not-cloned/plans"),
+        claude_home.join("plans"),
+    )
+    .unwrap();
+    let profile_dir = sb.home().join(".clauth/profiles/lnk");
+    let runtime = profile_dir.join("runtime-4242-13");
+    fs::create_dir_all(&runtime).unwrap();
+    pose_dir_link(&runtime.join("projects"), &claude_home.join("projects"));
+    fs::create_dir_all(runtime.join("plans")).unwrap();
+    fs::write(runtime.join("plans/new.md"), "tree only").unwrap();
+    fs::create_dir_all(profile_dir.join("sessions-4242-13")).unwrap();
+    let tombstone = profile_dir.join("runtime-4242-13.rescuing");
+    let _readable = Readable([runtime.join("plans"), tombstone.join("plans")]);
+    fs::set_permissions(runtime.join("plans"), fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(runtime.join("plans")).is_ok() {
+        println!("skipped: this host reads through a 0o000 dir");
+        return;
+    }
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line.contains("could not be rescued"))
+            .collect::<Vec<_>>(),
+        vec![&format!(
+            "clauth: kept {}: 1 file(s) could not be rescued; a later sweep retries",
+            tombstone.display()
+        )],
+        "an unreadable refused sidecar counts one file left"
+    );
 }
 
 #[test]

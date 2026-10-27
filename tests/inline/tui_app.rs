@@ -5605,6 +5605,7 @@ fn perform_delete_with_live_session_arms_a_confirm_modal() {
 
     let action = confirm.on_confirm.clone();
     run_confirm_action(&mut app, action);
+    drain_delete(&mut app);
     assert!(
         app.config()
             .find(&crate::profile::ProfileName::from("busy"))
@@ -5659,6 +5660,7 @@ fn perform_delete_without_live_session_deletes_immediately() {
     let mut app = app_with(vec![Profile::new("quiet".to_string(), None, None)]);
 
     perform_delete(&mut app, &crate::profile::ProfileName::from("quiet"));
+    drain_delete(&mut app);
 
     assert!(
         app.config()
@@ -5694,6 +5696,7 @@ fn a_tui_delete_refused_on_a_live_supervisor_never_names_a_cli_flag() {
         crate::runtime::SupervisorStopDeadlineGuard::set(std::time::Duration::from_millis(300));
 
     perform_delete(&mut app, &crate::profile::ProfileName::from("quiet"));
+    drain_delete(&mut app);
 
     let bodies: Vec<&String> = app.toasts.iter().map(|t| &t.body).collect();
     let expected = format!(
@@ -5710,6 +5713,219 @@ fn a_tui_delete_refused_on_a_live_supervisor_never_names_a_cli_flag() {
             .find(&crate::profile::ProfileName::from("quiet"))
             .is_some(),
         "the refused delete keeps the account"
+    );
+}
+
+/// Join the delete worker and land its outcome.
+fn drain_delete(app: &mut App) {
+    drain_workers(
+        app,
+        std::time::Duration::from_secs(60),
+        "the delete",
+        |app: &App| app.deleting.is_some(),
+        super::drain_profile_delete,
+    );
+}
+
+/// The TUI's delete runs on a worker: the UI thread returns while the delete
+/// waits on its first flock, the config lock is free across that wait, and the
+/// outcome (the rescued transcript, the account gone, the toast) lands on the
+/// drain.
+#[test]
+fn a_tui_delete_waits_on_a_worker_without_the_config_lock() {
+    use super::perform_delete;
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![Profile::new("gone".to_string(), None, None)]);
+    let claude_home = home.home().join(".claude");
+    std::fs::create_dir_all(&claude_home).expect("mkdir .claude");
+    let profile_dir = home.home().join(".clauth").join("profiles").join("gone");
+    let slug = profile_dir.join("runtime").join("projects").join("-w-gone");
+    std::fs::create_dir_all(&slug).expect("mkdir tree");
+    std::fs::write(slug.join("s.jsonl"), "only copy").expect("tree-only transcript");
+    std::fs::create_dir_all(profile_dir.join("sessions")).expect("mkdir sessions");
+    std::fs::write(profile_dir.join("sessions").join("dead"), b"").expect("dead marker");
+    let park = crate::lock::flock_wait_park::arm();
+    let (returned_tx, returned_rx) = std::sync::mpsc::channel::<()>();
+    let config = Arc::clone(&app.config);
+    let watcher = std::thread::spawn(move || {
+        park.parked
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the delete reaches its first flock wait");
+        let returned = returned_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok();
+        let config_free = config.try_lock().is_ok();
+        let _ = park.release.send(());
+        (returned, config_free)
+    });
+
+    perform_delete(&mut app, &crate::profile::ProfileName::from("gone"));
+    let _ = returned_tx.send(());
+    let (returned, config_free) = watcher.join().expect("join the watcher");
+
+    assert!(
+        returned,
+        "the UI thread must not wait on the delete's flock wait"
+    );
+    assert!(
+        config_free,
+        "the delete must not hold the config lock across its waits"
+    );
+    drain_delete(&mut app);
+    assert_eq!(
+        std::fs::read_to_string(claude_home.join("projects").join("-w-gone").join("s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("only copy"),
+        "the worker's rescue lands the dead tree's transcript"
+    );
+    assert!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("gone"))
+            .is_none(),
+        "the worker removes the account"
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.body == "deleted 'gone'"),
+        "the drain toasts the delete: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A quit over a running delete does not exit while the delete's worker runs
+/// (an exit mid-delete can leave the record beside a half-removed dir); once
+/// the delete lands, the next tick exits with the account gone.
+#[test]
+fn a_quit_over_a_running_delete_holds_until_it_lands() {
+    use super::perform_delete;
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![Profile::new("gone".to_string(), None, None)]);
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let park = crate::lock::flock_wait_park::arm();
+
+    perform_delete(&mut app, &crate::profile::ProfileName::from("gone"));
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the delete reaches its first flock wait");
+    super::handle_key(&mut app, ctrl_c());
+    super::handle_key(&mut app, ctrl_c());
+
+    assert!(!app.quit, "the quit exited under the running delete");
+
+    let _ = park.release.send(());
+    drain_delete(&mut app);
+    super::on_tick(&mut app);
+
+    assert!(app.quit, "the landed delete did not exit");
+    assert!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("gone"))
+            .is_none(),
+        "the delete landed before the exit"
+    );
+}
+
+/// A delete pressed while another delete's worker runs toasts that it is still
+/// running and starts no second worker: the other account survives the first
+/// delete landing.
+#[test]
+fn a_second_delete_while_one_runs_toasts_and_starts_nothing() {
+    use super::perform_delete;
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![
+        Profile::new("gone".to_string(), None, None),
+        Profile::new("kept".to_string(), None, None),
+    ]);
+    std::fs::create_dir_all(home.home().join(".claude")).expect("mkdir .claude");
+    let park = crate::lock::flock_wait_park::arm();
+
+    perform_delete(&mut app, &crate::profile::ProfileName::from("gone"));
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the first delete reaches its first flock wait");
+    let workers = super::TEST_WORKERS.lock().map(|w| w.len()).unwrap_or(0);
+    perform_delete(&mut app, &crate::profile::ProfileName::from("kept"));
+
+    let toasts: Vec<(super::ToastKind, &str)> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(
+        toasts.last().copied(),
+        Some((
+            super::ToastKind::Info,
+            "a delete is still running\nwait for it, then try again"
+        )),
+        "the second delete toasts the busy guard: {toasts:?}"
+    );
+    assert_eq!(
+        super::TEST_WORKERS.lock().map(|w| w.len()).unwrap_or(0),
+        workers,
+        "the second delete started no worker"
+    );
+    let _ = park.release.send(());
+    drain_delete(&mut app);
+    assert!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("gone"))
+            .is_none(),
+        "the first delete landed"
+    );
+    assert!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("kept"))
+            .is_some(),
+        "the refused second delete kept its account"
+    );
+}
+
+/// A panic inside the delete worker still lands a failure, so the in-flight
+/// marker never sticks and the next delete runs.
+#[test]
+fn a_panicking_delete_worker_lands_a_failure_and_clears_the_marker() {
+    use super::perform_delete;
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![Profile::new("gone".to_string(), None, None)]);
+    let panics = super::DeleteWorkerPanics::set();
+    perform_delete(&mut app, &crate::profile::ProfileName::from("gone"));
+    drop(panics);
+    assert!(
+        app.deleting.is_some(),
+        "the marker is set before the worker runs"
+    );
+    super::join_test_workers();
+    super::drain_profile_delete(&mut app);
+
+    assert!(
+        app.deleting.is_none(),
+        "the in-flight marker cleared despite the panic"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == super::ToastKind::Danger && t.body == "delete failed"),
+        "the panic lands a failure: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    assert!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("gone"))
+            .is_some(),
+        "the panicked delete kept the account"
+    );
+
+    perform_delete(&mut app, &crate::profile::ProfileName::from("gone"));
+    drain_delete(&mut app);
+    assert!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("gone"))
+            .is_none(),
+        "the delete after the panic ran"
     );
 }
 
@@ -39469,6 +39685,7 @@ fn a_jump_drops_the_armed_setup_draft() {
         "the pane did not ascend"
     );
     assert!(app.config_draft.is_none(), "the jump kept the armed draft");
+    drain_delete(&mut app);
     assert!(
         app.config()
             .find(&crate::profile::ProfileName::from("a"))
@@ -41844,6 +42061,7 @@ fn an_in_app_delete_closes_the_suspended_note_editor() {
     super::handle_key(&mut app, alt_digit('4'));
     assert_eq!(app.tab, Tab::Setup, "precondition: jumped");
     super::perform_delete(&mut app, &crate::profile::ProfileName::from("a"));
+    drain_delete(&mut app);
     assert!(
         app.config()
             .find(&crate::profile::ProfileName::from("a"))

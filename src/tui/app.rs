@@ -25,11 +25,11 @@ use ratatui::text::Span;
 use crate::actions::{
     CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_into_profile,
     capture_snapshot, classify_env_key, clear_profile_api_key, clear_profile_credentials,
-    create_blank_profile, create_profile_from_login, delete_profile_offering, duplicate_profile,
-    edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset,
-    find_matching_oauth_profile, overwrite_captured_profile, rename_profile, reorder_profile,
-    rotation_guard_for_mutation, set_chain_order, set_member_threshold, set_wrap_off,
-    snapshot_is_empty, switch_off, switch_profile, validate_foreign_harness_free,
+    create_blank_profile, create_profile_from_login, delete_profile_taking_config,
+    duplicate_profile, edit_profile_endpoint, edit_profile_env, edit_profile_model,
+    edit_profile_preset, find_matching_oauth_profile, overwrite_captured_profile, rename_profile,
+    reorder_profile, rotation_guard_for_mutation, set_chain_order, set_member_threshold,
+    set_wrap_off, snapshot_is_empty, switch_off, switch_profile, validate_foreign_harness_free,
     validate_name_chars, validate_profile_name,
 };
 use crate::claude::{
@@ -1435,7 +1435,7 @@ pub(crate) enum ConfirmAction {
     /// held. Confirm, then change the type (dropping the staged login).
     CycleAccountType(NewAccountType),
     /// Delete row on a profile with a live `clauth start` session: the unforced
-    /// guard in `delete_profile_offering` refuses this, so confirm the deauth risk here
+    /// guard in `delete_profile_taking_config` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
     DeleteLiveSession(String),
     /// Fallback tab `+ add`: the candidate would mix api-key and oauth accounts
@@ -5373,6 +5373,12 @@ pub(crate) struct App {
     /// Pool remove/refresh worker results; drained in `on_tick`.
     pool_mutation_rx: std::sync::mpsc::Receiver<PoolMutationResult>,
     pool_mutation_tx: std::sync::mpsc::Sender<PoolMutationResult>,
+    /// The account a delete worker is removing; `None` while none runs. A
+    /// second delete while one runs toasts that it is still running.
+    pub(crate) deleting: Option<ProfileName>,
+    /// Delete worker results; drained in `on_tick`.
+    delete_rx: std::sync::mpsc::Receiver<DeleteResult>,
+    delete_tx: std::sync::mpsc::Sender<DeleteResult>,
 }
 
 /// Read every named profile's long-lived-token status for the Overview cache.
@@ -5674,6 +5680,7 @@ impl App {
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
         let (pool_mutation_tx, pool_mutation_rx) = std::sync::mpsc::channel();
+        let (delete_tx, delete_rx) = std::sync::mpsc::channel();
         let (codex_login_url_tx, codex_login_url_rx) = std::sync::mpsc::channel();
         let (codex_login_result_tx, codex_login_result_rx) = std::sync::mpsc::channel();
         let (codex_new_login_result_tx, codex_new_login_result_rx) = std::sync::mpsc::channel();
@@ -5944,6 +5951,9 @@ impl App {
             pool_mutation_kind: None,
             pool_mutation_rx,
             pool_mutation_tx,
+            deleting: None,
+            delete_rx,
+            delete_tx,
         };
         adopt_shunt_record(&mut app, shunt_record);
         // Seed the Overview's mark cache from the client-token store before the
@@ -8921,11 +8931,15 @@ fn in_flight_shunt_card_write(app: &App) -> bool {
 
 /// A running write the exit waits for, the one predicate both the quit's
 /// decision (`quit_or_wait`) and its resolution (`on_tick`) call so the two
-/// cannot drift: any shunt-card write, or an account between a refresh token's
-/// request and its stage write. Dying inside that window loses the minted pair,
-/// so a quit over it waits instead of exiting. A usage read never holds a quit.
+/// cannot drift: any shunt-card write, a profile delete's worker, or an account
+/// between a refresh token's request and its stage write. Dying inside that
+/// window loses the minted pair, and dying inside a delete can leave the record
+/// beside a half-removed profile dir, so a quit over either waits instead of
+/// exiting. A usage read never holds a quit.
 fn in_flight_exit_write(app: &App) -> bool {
-    in_flight_shunt_card_write(app) || token_spend_in_flight(&app.activity)
+    in_flight_shunt_card_write(app)
+        || app.deleting.is_some()
+        || token_spend_in_flight(&app.activity)
 }
 
 /// A switch the user asked for: disarm it, warn over changed work, hold on an
@@ -8990,8 +9004,8 @@ fn request_quit(app: &mut App) {
 /// The one place a quit is decided: a field or `+ add` save in flight holds the
 /// quit (a refusal re-runs the gate over the red item); any other running write
 /// enters the exit wait (the exit waits until the write finishes, whatever its
-/// outcome) — a shunt-card write, or a token spend, which must land its minted
-/// pair before the process dies; otherwise it quits at once.
+/// outcome) — a shunt-card write, a profile delete, or a token spend, which must
+/// land its minted pair before the process dies; otherwise it quits at once.
 fn quit_or_wait(app: &mut App) {
     if in_flight_shunt_edit_save(app) {
         app.loss_pending = Some(LossWarningTarget::Quit);
@@ -23728,7 +23742,7 @@ fn commit_new_account(app: &mut App) {
 }
 
 fn perform_delete(app: &mut App, name: &ProfileName) {
-    // The unforced guard in `delete_profile_offering` refuses a live-session profile,
+    // The unforced guard in `delete_profile_taking_config` refuses a live-session profile,
     // which would otherwise dead-end the TUI on a danger toast with no way
     // forward. Confirm the deauth risk instead of attempting (and failing)
     // the unforced delete first.
@@ -23749,25 +23763,116 @@ fn perform_delete(app: &mut App, name: &ProfileName) {
     finish_delete(app, name, false);
 }
 
+/// How a delete worker ended.
+enum DeleteResult {
+    /// The delete ran: done, or its refusal or failure.
+    Ran(ProfileName, Result<()>),
+    /// The worker panicked; the in-flight marker must still clear.
+    Panicked,
+}
+
+/// Run the delete on a worker: its rescue walks the account's dead runtime
+/// trees and can wait on another process's rescue lock, and the UI thread
+/// waits on neither. The outcome lands through [`drain_profile_delete`].
 fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
-    // Before `app.config()`, for the reason the rename path states.
-    let result = rotation_guard_for_mutation(name).and_then(|rotation| {
-        let mut cfg = app.config();
-        // The TUI has no `--force` flag, so no refusal names it.
-        delete_profile_offering(&mut cfg, name, force, false, &rotation)
+    if app.deleting.is_some() {
+        app.toast(
+            ToastKind::Info,
+            "a delete is still running\nwait for it, then try again",
+        );
+        return;
+    }
+    app.deleting = Some(name.clone());
+    let config = Arc::clone(&app.config);
+    let tx = app.delete_tx.clone();
+    let name = name.clone();
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    let stop_deadline = crate::runtime::SupervisorStopDeadlineGuard::current();
+    #[cfg(test)]
+    let panic_plant = DELETE_WORKER_PANICS.with(std::cell::Cell::get);
+    spawn_worker(move || {
+        // A test's supervisor-stop deadline is per thread: the worker takes it.
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        let _stop_deadline = stop_deadline.map(crate::runtime::SupervisorStopDeadlineGuard::set);
+        // A panic inside the delete still lands a result, so `deleting` never
+        // sticks (the `start_pool_mutation` precedent).
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if panic_plant {
+                panic!("test seam: the delete worker panicked");
+            }
+            // Before the config lock, for the reason the rename path states.
+            rotation_guard_for_mutation(&name).and_then(|rotation| {
+                // The TUI has no `--force` flag, so no refusal names it.
+                delete_profile_taking_config(
+                    || App::lock_config(&config),
+                    &name,
+                    force,
+                    false,
+                    &rotation,
+                )
+            })
+        }));
+        let _ = tx.send(match result {
+            Ok(result) => DeleteResult::Ran(name, result),
+            Err(_) => DeleteResult::Panicked,
+        });
     });
-    match result {
-        Ok(()) => {
-            app.refresh_tokens();
-            app.apply_forgets();
-            app.rebaseline_and_forget(reload_fingerprint());
-            app.refresh_unsaved_live_login();
-            app.config_focus = ConfigFocus::Profiles;
-            app.config_draft = None;
-            app.clamp_profile_cursor();
-            app.toast(ToastKind::Success, format!("deleted '{name}'"));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by [`DeleteWorkerPanics`]: a delete started on this thread hands its
+    /// worker a panic before the delete runs.
+    static DELETE_WORKER_PANICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes every delete worker started on the calling thread panic until dropped.
+#[cfg(test)]
+pub(crate) struct DeleteWorkerPanics(bool);
+
+#[cfg(test)]
+impl DeleteWorkerPanics {
+    pub(crate) fn set() -> Self {
+        Self(DELETE_WORKER_PANICS.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for DeleteWorkerPanics {
+    fn drop(&mut self) {
+        DELETE_WORKER_PANICS.with(|c| c.set(self.0));
+    }
+}
+
+/// Land a finished delete: the stores forget the account and its open draft
+/// closes, or the refusal or failure is toasted as it reads.
+pub(crate) fn drain_profile_delete(app: &mut App) {
+    while let Ok(result) = app.delete_rx.try_recv() {
+        app.deleting = None;
+        match result {
+            DeleteResult::Ran(name, Ok(())) => {
+                app.refresh_tokens();
+                app.apply_forgets();
+                app.rebaseline_and_forget(reload_fingerprint());
+                app.refresh_unsaved_live_login();
+                // A draft opened on another account while the worker ran stays.
+                if !app
+                    .config_draft
+                    .as_ref()
+                    .is_some_and(|d| d.editing_name.as_deref() != Some(name.as_str()))
+                {
+                    app.config_focus = ConfigFocus::Profiles;
+                    app.config_draft = None;
+                }
+                app.clamp_profile_cursor();
+                app.toast(ToastKind::Success, format!("deleted '{name}'"));
+            }
+            DeleteResult::Ran(_, Err(e)) => {
+                app.toast(ToastKind::Danger, format!("delete failed\n{e}"));
+            }
+            DeleteResult::Panicked => app.toast(ToastKind::Danger, "delete failed"),
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("delete failed\n{e}")),
     }
 }
 
@@ -26737,6 +26842,7 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_login_events(app);
     drain_codex_login(app);
     drain_codex_new_login(app);
+    drain_profile_delete(app);
 
     refresh_shunt_mark(app);
     if app.reload_if_state_changed() {
@@ -26866,8 +26972,8 @@ pub(crate) fn on_tick(app: &mut App) {
     app.prune_toasts();
 
     // The quit is decided and the exit waits for the running writes (a
-    // shunt-card write or a token spend): resolve here, after every drain, so
-    // the tick that drains the last write is the one that exits.
+    // shunt-card write, a profile delete or a token spend): resolve here, after
+    // every drain, so the tick that drains the last write is the one that exits.
     if app.exit_wait && !in_flight_exit_write(app) {
         app.quit = true;
         app.shutting_down.store(true, Ordering::SeqCst);

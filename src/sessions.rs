@@ -1429,13 +1429,15 @@ pub(crate) fn annotate_owners_of<'a>(rows: impl IntoIterator<Item = &'a mut Sess
     }
 }
 
-// ── Session rescue: lift an isolated transcript into the global store ─────────
+// ── Session rescue: lift a runtime tree's session state into the global store ─
 //
-// An isolated runtime is GC'd along with its throwaway `projects/` store, which
-// would take any session that ran under it. Rescue copies the transcript into
-// the shared global store so it outlives that GC. Data safety is the one hard
-// rule: copy, verify the copy landed intact, only THEN drop the source — a crash
-// at any point leaves at worst a duplicate (source + target), never a loss.
+// A dead runtime tree is removed with every real entry it holds: an isolated
+// tree's throwaway `projects/`, and whatever a shared tree's session wrote that
+// never reached `~/.claude`. Rescue carries its transcripts and sidecars into
+// the global store first, so they outlive the removal. Data safety is the one
+// hard rule: write, verify the global store holds the bytes intact, only THEN
+// drop the source — a crash at any point leaves at worst a duplicate (source +
+// target), never a loss.
 
 /// Move `src` to `dst` without ever destroying `src` before the copy is proven
 /// intact. Copies into a temp sibling of `dst`, fsyncs it, renames it into place
@@ -1526,75 +1528,263 @@ pub(crate) fn rescue_move(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Rescue an isolated session transcript at `src` into the global store,
-/// preserving its `<slug>` subdir so `--resume` run from that workspace still
-/// finds it. Collision-safe on the final `<id>.jsonl`: a byte-identical target
-/// is already-rescued (source dropped, no duplicate); a differing target is a
-/// real id collision with another session and is never overwritten — the rescue
-/// lands beside it as `<id>.rescued-<n>.jsonl`. Returns the final path.
+/// What a rescue does with an entry whose name the global store already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Occupied {
+    /// A byte-identical target means the entry is already rescued, so the
+    /// source is dropped; anything else is a real name collision and the rescue
+    /// lands beside it as the first free `<stem>.rescued-<n>[.<ext>]`.
+    Sibling,
+    /// A transcript only ever grows by appends. A source that is a byte-prefix
+    /// of the target is a stale copy of it and is dropped; a target that is a
+    /// byte-prefix of the source is the same conversation missing its tail, so
+    /// that tail is appended to the target itself and `--resume <id>` opens the
+    /// whole of it. Copies that each hold lines the other lacks collide as under
+    /// [`Occupied::Sibling`].
+    Append,
+    /// The target is authoritative and the source a stale copy, dropped whatever
+    /// its bytes or stamp: a copy host's shared tree took a copy of every global
+    /// entry at its build, so a name the global store holds is one the tree
+    /// inherited. An in-place edit its session made after its last mirror tick
+    /// is lost with it.
+    Stale,
+}
+
+/// The tree a sidecar rescue lifts from, which decides what an occupied global
+/// name means and whether a linked global dir is written through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidecarSource {
+    /// An isolated tree: it shares nothing with the global store, so an
+    /// occupied name is a collision ([`Occupied::Sibling`]) and its session
+    /// never wrote through a global link, which the rescue therefore skips.
+    Isolated,
+    /// A shared tree that is not positively a copy of the global store: an
+    /// occupied name is that session's own ([`Occupied::Sibling`]). Its session
+    /// wrote through the global store's links, so the rescue does too.
+    Shared,
+    /// A shared tree built as a copy of the global store, so an occupied name
+    /// is a copy it inherited ([`Occupied::Stale`]); written through like
+    /// [`SidecarSource::Shared`].
+    SharedCopy,
+}
+
+impl SidecarSource {
+    fn occupied(self) -> Occupied {
+        match self {
+            Self::Isolated | Self::Shared => Occupied::Sibling,
+            Self::SharedCopy => Occupied::Stale,
+        }
+    }
+
+    /// Whether the global entry `dst` is a link the rescue must not write
+    /// through. Only a link resolving to a directory is ever followed, and only
+    /// from a shared tree: a dangling link reads as a free name, so the move
+    /// would replace it rather than write through it.
+    fn refuses(self, dst: &Path) -> bool {
+        is_symlink(dst) && (self == Self::Isolated || !dst.is_dir())
+    }
+
+    /// What the entry `src` the rescue [`refuses`](Self::refuses) at `dst`
+    /// counts as, `depth` the cap its walk would have run under. An isolated
+    /// session never wrote through the link, so its entry goes with the tree.
+    /// On a copy, a file whose global counterpart exists, link or not, is a
+    /// stale copy and is dropped as [`Occupied::Stale`] drops one. Any other
+    /// shared entry is the session's own, met by a global link that dangles or
+    /// names no directory: it counts the files the walk would have carried as
+    /// left, so the tree is kept for a later sweep only when there is something
+    /// in it to lose.
+    fn refused(self, src: &Path, dst: &Path, depth: usize) -> Rescued {
+        if self == Self::Isolated {
+            return Rescued::default();
+        }
+        match src.symlink_metadata() {
+            Ok(meta) if meta.is_dir() => Rescued {
+                moved: 0,
+                left: files_to_rescue(src, depth),
+            },
+            Ok(_) if self == Self::SharedCopy && dst.exists() => {
+                let mut rescued = Rescued::default();
+                rescued.record(src, std::fs::remove_file(src).map(|()| dst.to_path_buf()));
+                rescued
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Rescued::default(),
+            Ok(_) | Err(_) => Rescued { moved: 0, left: 1 },
+        }
+    }
+}
+
+/// How many files a sidecar walk of `dir` under `depth` would carry: every
+/// non-link file down to the cap [`rescue_tree`] stops at. A dir or entry that
+/// cannot be read counts one, since nothing shows it holds nothing.
+fn files_to_rescue(dir: &Path, depth: usize) -> usize {
+    if depth == 0 {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 1;
+    };
+    entries
+        .map(
+            |entry| match entry.and_then(|e| Ok((e.file_type()?, e.path()))) {
+                Ok((file_type, _)) if file_type.is_symlink() => 0,
+                Ok((file_type, path)) if file_type.is_dir() => files_to_rescue(&path, depth - 1),
+                Ok(_) | Err(_) => 1,
+            },
+        )
+        .sum()
+}
+
+/// Which copy an occupied rescue keeps.
+enum Keep {
+    /// The global one; the source is dropped.
+    Target,
+    /// The global one, extended in place by the source's bytes past this
+    /// offset, which the global one already holds.
+    Tail(u64),
+    /// Both: the source lands beside the global one.
+    Both,
+}
+
+/// How one rescue leg ended: the files it carried into the global store (an
+/// already-present copy it dropped counts, matching the transcript leg), and
+/// the files it was meant to carry and left in the source tree (an entry
+/// [`SidecarSource::refused`] leaves counts the files under it). A source
+/// that vanished under the rescue is in neither count: nothing of it is left
+/// to lose.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Rescued {
+    pub(crate) moved: usize,
+    pub(crate) left: usize,
+}
+
+impl Rescued {
+    /// Count one file's rescue outcome. A failure whose source cannot be shown
+    /// gone counts as left; only a `NotFound` stat proves it is, and a link
+    /// that resolves to nothing holds nothing either.
+    fn record(&mut self, src: &Path, outcome: std::io::Result<PathBuf>) {
+        match outcome {
+            Ok(_) => self.moved += 1,
+            Err(_)
+                if src
+                    .metadata()
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(e) => {
+                logline!("clauth: failed to rescue {}: {e}", src.display());
+                self.left += 1;
+            }
+        }
+    }
+
+    fn add(&mut self, other: Self) {
+        self.moved += other.moved;
+        self.left += other.left;
+    }
+}
+
+/// Rescue a session transcript at `src` in a runtime tree's store into the
+/// global store, preserving its `<slug>` subdir so `--resume` run from that
+/// workspace still finds it. An occupied `<id>.jsonl` takes
+/// [`Occupied::Append`]'s rule, so a target holding lines the source lacks is
+/// never overwritten. Returns the final path.
 pub(crate) fn rescue_session_transcript(
     src: &Path,
-    iso_projects_root: &Path,
+    tree_projects_root: &Path,
     global_projects_root: &Path,
 ) -> std::io::Result<PathBuf> {
-    // The isolated store mirrors the global `<slug>/<id>.jsonl` layout, so the
+    // A tree's store mirrors the global `<slug>/<id>.jsonl` layout, so the
     // existing subdir is authoritative — preserve it verbatim rather than
     // recomputing the (lossy) slug from cwd.
-    let rel = src.strip_prefix(iso_projects_root).map_err(|_| {
+    let rel = src.strip_prefix(tree_projects_root).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "{} is not under the isolated projects root {}",
+                "{} is not under the runtime projects root {}",
                 src.display(),
-                iso_projects_root.display()
+                tree_projects_root.display()
             ),
         )
     })?;
     let target = global_projects_root.join(rel);
-    rescue_file(src, &target)
+    rescue_file(src, &target, Occupied::Append)
 }
 
-/// Move `src` onto `target`, never overwriting an occupied `target`. A
-/// byte-identical target means the entry is already rescued, so the source is
-/// dropped and the single copy kept; anything else is a real name collision and
-/// the rescue lands beside it as the first free `<stem>.rescued-<n>[.<ext>]`.
-/// Returns the final path.
-fn rescue_file(src: &Path, target: &Path) -> std::io::Result<PathBuf> {
+/// Move `src` onto `target`; an occupied `target` takes `occupied`'s rule.
+/// Returns the final path. A moved file goes through [`rescue_move`]'s
+/// verified copy and an extended one through [`append_tail`]'s verified
+/// append, so a crash leaves at worst both copies. The whole decision and its
+/// landing run under [`RescueFileLock`], so a second rescue onto the same name
+/// compares against the target as the first one left it.
+fn rescue_file(src: &Path, target: &Path, occupied: Occupied) -> std::io::Result<PathBuf> {
+    let _lock = RescueFileLock::acquire()?;
     if !target.exists() {
         rescue_move(src, target)?;
         return Ok(target.to_path_buf());
     }
-    // `is_dir` guard: a directory sitting where the rescue wants a file is a name
-    // collision like any other, and `files_equal` would only error on it.
-    if !target.is_dir() && files_equal(src, target)? {
-        std::fs::remove_file(src)?;
-        return Ok(target.to_path_buf());
-    }
-    let sibling = free_rescued_sibling(target)?;
-    rescue_move(src, &sibling)?;
-    Ok(sibling)
-}
-
-/// Rescue every `*.jsonl` under an isolated run's `iso_projects` into the global
-/// `global_projects` store, returning the count moved. Fail-soft per file: a
-/// rescue error is logged and skipped so one bad transcript never blocks the
-/// rest — the isolated store is discarded right after this call, so a skipped
-/// file is at worst a lost rescue, never corruption. Each move is collision- and
-/// crash-safe (see [`rescue_session_transcript`]).
-pub(crate) fn rescue_isolated_store(iso_projects: &Path, global_projects: &Path) -> usize {
-    let mut paths = Vec::new();
-    collect_jsonl(iso_projects, WALK_MAX_DEPTH, &mut paths);
-    let mut moved = 0usize;
-    for src in paths {
-        match rescue_session_transcript(&src, iso_projects, global_projects) {
-            Ok(_) => moved += 1,
-            Err(e) => logline!("clauth: failed to rescue {}: {e}", src.display()),
+    let keep = match occupied {
+        Occupied::Stale => Keep::Target,
+        // A directory sitting where the rescue wants a file is a name collision
+        // like any other, and reading it would only error.
+        Occupied::Sibling | Occupied::Append if target.is_dir() => Keep::Both,
+        Occupied::Sibling if files_equal(src, target)? => Keep::Target,
+        Occupied::Sibling => Keep::Both,
+        Occupied::Append => {
+            let source_len = std::fs::metadata(src)?.len();
+            let held_len = std::fs::metadata(target)?.len();
+            if source_len <= held_len {
+                if same_prefix(src, target, source_len)? {
+                    Keep::Target
+                } else {
+                    Keep::Both
+                }
+            } else if same_prefix(src, target, held_len)? {
+                Keep::Tail(held_len)
+            } else {
+                Keep::Both
+            }
+        }
+    };
+    match keep {
+        Keep::Target => {
+            std::fs::remove_file(src)?;
+            Ok(target.to_path_buf())
+        }
+        Keep::Tail(held) => {
+            append_tail(src, target, held)?;
+            Ok(target.to_path_buf())
+        }
+        Keep::Both => {
+            let sibling = free_rescued_sibling(target)?;
+            rescue_move(src, &sibling)?;
+            Ok(sibling)
         }
     }
-    moved
 }
 
-/// The per-session sidecar trees a rescue lifts out of an isolated runtime.
+/// Rescue every `*.jsonl` under a runtime tree's `tree_projects` into the global
+/// `global_projects` store. Fail-soft per file: a rescue error is logged and
+/// counted as left, so one bad transcript never blocks the rest and a caller
+/// can keep the tree that still holds it. Each move is collision- and crash-safe
+/// (see [`rescue_session_transcript`]).
+///
+/// A symlinked `tree_projects` is never walked: it resolves into a store the
+/// rescue would then "move" onto itself, deleting each file there as an
+/// already-rescued copy of itself. That is every linking host's shared tree,
+/// so the skip is silent.
+pub(crate) fn rescue_transcripts(tree_projects: &Path, global_projects: &Path) -> Rescued {
+    let mut rescued = Rescued::default();
+    if is_symlink(tree_projects) {
+        return rescued;
+    }
+    let mut paths = Vec::new();
+    collect_jsonl(tree_projects, WALK_MAX_DEPTH, &mut paths);
+    for src in paths {
+        let outcome = rescue_session_transcript(&src, tree_projects, global_projects);
+        rescued.record(&src, outcome);
+    }
+    rescued
+}
+
+/// The per-session sidecar trees a rescue lifts out of a runtime tree.
 /// An ALLOWLIST, applied to what the store actually holds: the walk enumerates
 /// the runtime root and moves the ones present, so a Claude Code release that
 /// renames a tree shows up as "not rescued" (and in the untouched-entry log
@@ -1631,7 +1821,7 @@ const SIDECAR_TREES: &[&str] = &[
 /// about to be discarded.
 const SIDECAR_MAX_DEPTH: usize = 8;
 
-/// Whether a top-level isolated-runtime entry is session sidecar state to
+/// Whether a top-level runtime-tree entry is session sidecar state to
 /// rescue. Name-only: with an allowlist the entry's shape carries no safety
 /// weight (the old "directories only" rule existed to bound what a denylist let
 /// through), so the caller merges a dir and moves a file under the same name.
@@ -1639,28 +1829,33 @@ fn rescuable_sidecar(name: &std::ffi::OsStr) -> bool {
     SIDECAR_TREES.iter().any(|tree| name == *tree)
 }
 
-/// Rescue Claude Code's session sidecar state out of an isolated runtime root
-/// into the global `~/.claude/`, returning how many files ended up there (an
-/// already-present identical copy counts, matching the transcript leg).
-/// [`SIDECAR_TREES`] is the admission rule; every other entry is left for the
-/// GC and named once in a log line, so a renamed tree is visible.
+/// Rescue Claude Code's session sidecar state out of a runtime root into the
+/// global `~/.claude/`. [`SIDECAR_TREES`] is the admission rule; every other
+/// entry is left for the GC, named once in a log line for an isolated tree, so
+/// a renamed tree is visible. An entry the global store already holds takes
+/// `source`'s rule
+/// ([`SidecarSource`]).
 ///
 /// The merge is per ENTRY, never per tree: the global store usually already has
-/// a `shell-snapshots/`, so moving the dir wholesale would replace it. Each
-/// moved file keeps the transcript leg's collision safety ([`rescue_file`]).
-/// Fail-soft per entry like that leg — a failure is logged and skipped, since
-/// the isolated tree is discarded right after this call.
+/// a `shell-snapshots/`, so moving the dir wholesale would replace it.
+/// Fail-soft per entry like the transcript leg: a failure is logged and counted
+/// as left.
 ///
-/// Symlinks are skipped on BOTH sides, never followed: an isolated runtime links
-/// nothing, so a source link is anomalous and walking one could reach the
-/// operator's own store, while `~/.claude` can hold operator links pointing
-/// outside the store (a `skills` dir symlinked elsewhere) that a rescue must
-/// not write through.
-pub(crate) fn rescue_isolated_sidecars(iso_root: &Path, global_root: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(iso_root) else {
-        return 0;
+/// A source link is skipped, never followed: what a tree links resolves into
+/// the global store or past it, so walking one could reach the operator's own
+/// store and move it onto itself. `~/.claude` can hold operator links pointing
+/// outside the store (a `plans` dir symlinked into dotfiles): a shared tree's
+/// rescue writes through a directory link the way its session did, an
+/// isolated tree's never does ([`SidecarSource::refuses`]).
+pub(crate) fn rescue_sidecars(
+    tree_root: &Path,
+    global_root: &Path,
+    source: SidecarSource,
+) -> Rescued {
+    let mut rescued = Rescued::default();
+    let Ok(entries) = std::fs::read_dir(tree_root) else {
+        return rescued;
     };
-    let mut moved = 0usize;
     let mut untouched: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -1678,50 +1873,52 @@ pub(crate) fn rescue_isolated_sidecars(iso_root: &Path, global_root: &Path) -> u
         }
         let src = entry.path();
         let dst = global_root.join(&name);
-        if is_symlink(&dst) {
+        if source.refuses(&dst) {
             logline!(
                 "clauth: skipping rescue of {}, {} is a symlink",
                 src.display(),
                 dst.display()
             );
+            rescued.add(source.refused(&src, &dst, SIDECAR_MAX_DEPTH - 1));
             continue;
         }
         if file_type.is_dir() {
-            moved += rescue_tree(&src, &dst, SIDECAR_MAX_DEPTH - 1);
+            rescued.add(rescue_tree(&src, &dst, SIDECAR_MAX_DEPTH - 1, source));
         } else {
-            match rescue_file(&src, &dst) {
-                Ok(_) => moved += 1,
-                Err(e) => logline!("clauth: failed to rescue {}: {e}", src.display()),
-            }
+            let outcome = rescue_file(&src, &dst, source.occupied());
+            rescued.record(&src, outcome);
         }
     }
-    if !untouched.is_empty() {
+    // Only an isolated tree is all session-authored, so only there does an
+    // unlisted dir hint at a renamed sidecar tree; a shared tree holds the
+    // operator's own entries too.
+    if source == SidecarSource::Isolated && !untouched.is_empty() {
         untouched.sort();
         logline!(
-            "clauth: left {} in the isolated store (not session state)",
-            untouched.join(", ")
+            "clauth: left {} in {} (not session state)",
+            untouched.join(", "),
+            tree_root.display()
         );
     }
-    moved
+    rescued
 }
 
-/// Merge one isolated sidecar tree into its global counterpart entry by entry,
-/// returning the file count moved. Symlinks are skipped rather than followed on
-/// both sides (so no link cycle is entered and no write escapes the store).
-/// Reaching the depth cap is logged, never silent: what it drops is state in a
-/// tree about to be discarded.
-fn rescue_tree(src: &Path, dst: &Path, depth: usize) -> usize {
+/// Merge one sidecar tree into its global counterpart entry by entry.
+/// Source links are skipped rather than followed (so no link cycle is entered),
+/// and a global link only as `source` allows. Reaching the depth cap is logged,
+/// never silent: what it drops is state in a tree about to be discarded.
+fn rescue_tree(src: &Path, dst: &Path, depth: usize, source: SidecarSource) -> Rescued {
+    let mut rescued = Rescued::default();
     if depth == 0 {
         logline!(
             "clauth: rescue depth cap reached at {}, leaving the subtree",
             src.display()
         );
-        return 0;
+        return rescued;
     }
     let Ok(entries) = std::fs::read_dir(src) else {
-        return 0;
+        return rescued;
     };
-    let mut moved = 0usize;
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -1731,40 +1928,211 @@ fn rescue_tree(src: &Path, dst: &Path, depth: usize) -> usize {
         }
         let path = entry.path();
         let target = dst.join(entry.file_name());
-        if is_symlink(&target) {
+        if source.refuses(&target) {
             logline!(
                 "clauth: skipping rescue of {}, {} is a symlink",
                 path.display(),
                 target.display()
             );
+            rescued.add(source.refused(&path, &target, depth - 1));
             continue;
         }
         if file_type.is_dir() {
-            moved += rescue_tree(&path, &target, depth - 1);
+            rescued.add(rescue_tree(&path, &target, depth - 1, source));
             continue;
         }
-        match rescue_file(&path, &target) {
-            Ok(_) => moved += 1,
-            Err(e) => logline!("clauth: failed to rescue {}: {e}", path.display()),
-        }
+        let outcome = rescue_file(&path, &target, source.occupied());
+        rescued.record(&path, outcome);
     }
-    moved
+    rescued
 }
 
-/// Whether `path` is a symlink itself (never following it). A missing path is
-/// not one.
-fn is_symlink(path: &Path) -> bool {
+/// Whether `path` is a symlink itself (never following it); a Windows junction
+/// reads as one too. A missing path is not one.
+pub(crate) fn is_symlink(path: &Path) -> bool {
     path.symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// Whether two files hold identical bytes. Length is checked first as a cheap
-/// reject before reading both.
+/// reject before comparing them.
 fn files_equal(a: &Path, b: &Path) -> std::io::Result<bool> {
-    if std::fs::metadata(a)?.len() != std::fs::metadata(b)?.len() {
+    let len = std::fs::metadata(a)?.len();
+    if len != std::fs::metadata(b)?.len() {
         return Ok(false);
     }
-    Ok(std::fs::read(a)? == std::fs::read(b)?)
+    same_prefix(a, b, len)
+}
+
+/// Whether the first `len` bytes of `a` and `b` are equal, compared a bounded
+/// chunk at a time so two large transcripts never sit in memory whole. Each
+/// file must hold at least `len` bytes; a shorter one is an error.
+fn same_prefix(a: &Path, b: &Path, len: u64) -> std::io::Result<bool> {
+    const CHUNK: usize = 64 * 1024;
+    let mut a = File::open(a)?;
+    let mut b = File::open(b)?;
+    let mut chunk_a = vec![0u8; CHUNK];
+    let mut chunk_b = vec![0u8; CHUNK];
+    let mut left = len;
+    while left > 0 {
+        let n = usize::try_from(left).map_or(CHUNK, |left| left.min(CHUNK));
+        a.read_exact(&mut chunk_a[..n])?;
+        b.read_exact(&mut chunk_b[..n])?;
+        if chunk_a[..n] != chunk_b[..n] {
+            return Ok(false);
+        }
+        left -= n as u64;
+    }
+    Ok(true)
+}
+
+/// Append `src`'s bytes past `held` to `target`, which already holds `src`'s
+/// first `held` bytes, then drop `src` once `target` is shown to start with
+/// the whole of it. The write lands in the target file itself (`O_APPEND`), so
+/// a process holding it open keeps writing into the file the store names. A
+/// crash mid-append leaves `target` a longer prefix of `src`, which the next
+/// rescue extends; a line some other writer appended meanwhile fails the
+/// re-check and keeps `src`.
+fn append_tail(src: &Path, target: &Path, held: u64) -> std::io::Result<()> {
+    let mut source = File::open(src)?;
+    let source_len = source.metadata()?.len();
+    source.seek(SeekFrom::Start(held))?;
+    let mut global = std::fs::OpenOptions::new().append(true).open(target)?;
+    std::io::copy(&mut source, &mut global)?;
+    global.sync_all()?;
+    if global.metadata()?.len() < source_len || !same_prefix(src, target, source_len)? {
+        return Err(std::io::Error::other(format!(
+            "rescue verify failed: {} does not start with source {}",
+            target.display(),
+            src.display()
+        )));
+    }
+    std::fs::remove_file(src)
+}
+
+/// The lock file [`RescueFileLock`] flocks, under `~/.clauth`. Never removed,
+/// like every static flock file: unlinking it under a hold would split racers
+/// across two inodes.
+const RESCUE_FILE_LOCK_FILENAME: &str = "rescue.lock";
+
+/// How long one rescue scope waits for [`RescueFileLock`], in aggregate over
+/// every file it rescues ([`RescueLockBudget`]): a tree's rescue, or a whole
+/// sweep or profile delete over every tree it walks. A hold is one file's
+/// compare, copy or append and its verify: local IO, no subprocess or network.
+/// A file whose wait runs out is left in its tree, which is kept for a later
+/// sweep.
+const RESCUE_FILE_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// The box-wide lock one global name's rescue holds from its first look at
+/// the target through the verify of what it landed. Two rescues of different
+/// trees can carry diverging tails of one transcript: under the lock, the
+/// second compares against the global file as the first left it, sees the
+/// divergence and lands beside it instead of appending a second tail. Held per
+/// file, never across a walk. Ranked OUTSIDE the state flock
+/// ([`crate::lockorder::rank::RescueFile`]), so no rescue waits on it with the
+/// flock held.
+struct RescueFileLock {
+    /// Closing the fd releases the flock; drops before `_rank`.
+    _held: File,
+    _rank: crate::lockorder::RankGuard,
+}
+
+impl RescueFileLock {
+    /// Take the flock within what [`RescueLockBudget`] leaves, or
+    /// [`RESCUE_FILE_LOCK_WAIT`] outside one; a wait that runs out is an
+    /// error, so the caller leaves the file where it is.
+    fn acquire() -> std::io::Result<Self> {
+        let rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::RescueFile>();
+        let dir = clauth_dir().map_err(std::io::Error::other)?;
+        mkdir_700(&dir)?;
+        let path = dir.join(RESCUE_FILE_LOCK_FILENAME);
+        let file = crate::profile::open_state_file(&path)?;
+        crate::lock::lock_file_with_timeout(
+            &file,
+            RescueLockBudget::remaining(),
+            |_| {
+                anyhow::anyhow!(
+                    "another rescue held {} past this rescue's wait; the file is left \
+                     for a later sweep",
+                    path.display()
+                )
+            },
+            "failed to lock the rescue lock",
+        )
+        .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+        Ok(Self {
+            _held: file,
+            _rank: rank,
+        })
+    }
+}
+
+thread_local! {
+    /// The deadline every [`RescueFileLock`] wait under the current
+    /// [`RescueLockBudget`] shares; `None` outside one.
+    static RESCUE_LOCK_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One [`RESCUE_FILE_LOCK_WAIT`] shared by every [`RescueFileLock`] wait of a
+/// scope (a tree's rescue, a whole sweep, a profile delete), so a wedged holder
+/// costs that scope the bound once, never once per file. Arm-if-not-armed: an
+/// inner scope spends the outer one's deadline, and only the arming scope
+/// disarms it.
+pub(crate) struct RescueLockBudget {
+    armed: bool,
+}
+
+impl RescueLockBudget {
+    pub(crate) fn arm() -> Self {
+        let armed = RESCUE_LOCK_DEADLINE.with(|deadline| {
+            if deadline.get().is_some() {
+                return false;
+            }
+            deadline.set(Some(std::time::Instant::now() + rescue_file_lock_wait()));
+            true
+        });
+        Self { armed }
+    }
+
+    /// What is left of the armed scope's wait, or a whole
+    /// [`RESCUE_FILE_LOCK_WAIT`] outside one.
+    fn remaining() -> Duration {
+        RESCUE_LOCK_DEADLINE
+            .with(std::cell::Cell::get)
+            .map_or_else(rescue_file_lock_wait, |deadline| {
+                deadline.saturating_duration_since(std::time::Instant::now())
+            })
+    }
+}
+
+impl Drop for RescueLockBudget {
+    fn drop(&mut self) {
+        if self.armed {
+            RESCUE_LOCK_DEADLINE.with(|deadline| deadline.set(None));
+        }
+    }
+}
+
+/// [`RESCUE_FILE_LOCK_WAIT`], or a shorter wait a test poses on its own thread.
+fn rescue_file_lock_wait() -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = RESCUE_LOCK_WAIT_OVERRIDE.with(std::cell::Cell::get) {
+        return wait;
+    }
+    RESCUE_FILE_LOCK_WAIT
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESCUE_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set or clear the current thread's [`rescue_file_lock_wait`] override.
+#[cfg(test)]
+pub(crate) fn set_rescue_lock_wait_override(wait: Option<Duration>) {
+    RESCUE_LOCK_WAIT_OVERRIDE.with(|cell| cell.set(wait));
 }
 
 /// The first free `<stem>.rescued-<n>[.<ext>]` sibling of `target`, smallest

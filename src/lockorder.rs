@@ -210,6 +210,15 @@ pub(crate) mod rank {
         /// (500), taken with no state flock held, so the seed's record write
         /// cannot run under `with_state_lock`).
         JsonSync = 480;
+        /// `sessions::RescueFileLock` (`~/.clauth/rescue.lock`), held across
+        /// one global file's rescue: the compare, the copy or append, and the
+        /// verify. A true leaf — nothing is acquired while it is held — ranked
+        /// OUTSIDE `State` (500) like `JsonSync`: the hold is file-sized IO,
+        /// and a rescue never waits on it with the state flock held, which the
+        /// rank turns into an assertion. Its takers are every rescue tail (the
+        /// GC, `acquire`, `Drop`, a profile's delete, the isolated teardown),
+        /// each after its state-flock hold has dropped.
+        RescueFile = 490;
         /// `with_state_lock` (cross-process state flock). Inner of `config`.
         State = 500;
         /// `hook_note::ScopeLock` (the per-scope record flock). A true leaf —

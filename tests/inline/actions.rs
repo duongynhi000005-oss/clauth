@@ -4468,6 +4468,361 @@ fn a_delete_with_no_force_flag_never_names_it_on_a_live_session() {
     );
 }
 
+/// A blank profile `name` whose dir holds a dead shared copy-host tree: the bare
+/// `runtime` a killed start left, its transcript only there, beside a sessions
+/// dir no live marker holds. Returns the transcript's global path.
+fn profile_with_a_dead_copy_tree(
+    home: &HomeSandbox,
+    config: &mut AppConfig,
+    name: &str,
+) -> std::path::PathBuf {
+    create_blank_profile(config, name.to_string(), None, None, Default::default())
+        .expect("create profile");
+    let claude_home = home.home().join(".claude");
+    std::fs::create_dir_all(&claude_home).expect("mkdir .claude");
+    std::fs::write(claude_home.join("CLAUDE.md"), "memory").expect("global memory");
+    let profile_dir = home.home().join(".clauth").join("profiles").join(name);
+    let runtime = profile_dir.join("runtime");
+    std::fs::create_dir_all(runtime.join("projects").join("-w-gone")).expect("mkdir tree");
+    std::fs::write(runtime.join("CLAUDE.md"), "memory").expect("copied memory");
+    std::fs::write(
+        runtime.join("projects").join("-w-gone").join("s.jsonl"),
+        "only copy",
+    )
+    .expect("tree-only transcript");
+    let sessions = profile_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    std::fs::write(sessions.join("dead"), b"").expect("dead marker");
+    claude_home.join("projects").join("-w-gone").join("s.jsonl")
+}
+
+/// Deleting an account first rescues what its dead runtime trees alone hold: a
+/// killed start's transcript reaches the global store, then the profile goes.
+#[test]
+fn delete_rescues_a_dead_trees_transcript_before_removing_the_profile() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    let global = profile_with_a_dead_copy_tree(&home, &mut config, "gone");
+
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("gone"),
+        false,
+        &rotation_guard("gone"),
+    )
+    .expect("a rescued profile deletes");
+
+    assert_eq!(
+        std::fs::read_to_string(&global).ok().as_deref(),
+        Some("only copy"),
+        "the dead tree's transcript must reach the global store"
+    );
+    assert!(
+        !home.home().join(".clauth/profiles/gone").exists(),
+        "the profile dir is removed once nothing in it is unrescued"
+    );
+}
+
+/// A tree whose rescue leaves files behind refuses an unforced delete by name,
+/// leaving the record and the files; `force` deletes anyway.
+#[test]
+fn delete_refuses_a_profile_with_unrescued_session_files_unless_forced() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    profile_with_a_dead_copy_tree(&home, &mut config, "stuck");
+    let claude_home = home.home().join(".claude");
+    std::fs::write(claude_home.join("projects"), "not a dir").expect("block the rescue");
+    let tombstone = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("stuck")
+        .join("runtime.rescuing");
+
+    let err = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("stuck"),
+        false,
+        &rotation_guard("stuck"),
+    )
+    .expect_err("unrescued session files must block an unforced delete");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'stuck' has unrescued session files in {}, pass --force to delete them anyway",
+            tombstone.display()
+        )
+    );
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("stuck"))
+            .is_some(),
+        "the refused delete must leave the profile record intact"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tombstone.join("projects").join("-w-gone").join("s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("only copy"),
+        "the refused delete must leave the unrescued transcript"
+    );
+
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("stuck"),
+        true,
+        &rotation_guard("stuck"),
+    )
+    .expect("force deletes despite unrescued files");
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("stuck"))
+            .is_none(),
+        "force must remove the profile"
+    );
+}
+
+/// The TUI's and the API's delete has no `--force`: the same refusal names the
+/// files without the flag.
+#[test]
+fn a_delete_with_no_force_flag_names_unrescued_files_without_it() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    profile_with_a_dead_copy_tree(&home, &mut config, "stuck");
+    let claude_home = home.home().join(".claude");
+    std::fs::write(claude_home.join("projects"), "not a dir").expect("block the rescue");
+    let tombstone = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("stuck")
+        .join("runtime.rescuing");
+
+    let err = delete_profile_offering(
+        &mut config,
+        &crate::profile::ProfileName::from("stuck"),
+        false,
+        false,
+        &rotation_guard("stuck"),
+    )
+    .expect_err("unrescued session files must block the delete");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'stuck' has unrescued session files in {}",
+            tombstone.display()
+        )
+    );
+}
+
+/// `--force` waives the refusal, never the rescue: a forced delete still lands
+/// a dead tree's transcript in the global store before the profile goes.
+#[test]
+fn a_forced_delete_still_rescues_a_dead_trees_transcript() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    let global = profile_with_a_dead_copy_tree(&home, &mut config, "forced");
+
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("forced"),
+        true,
+        &rotation_guard("forced"),
+    )
+    .expect("a forced delete succeeds");
+
+    assert_eq!(
+        std::fs::read_to_string(&global).ok().as_deref(),
+        Some("only copy"),
+        "a forced delete must still rescue the dead tree's transcript"
+    );
+    assert!(
+        !home.home().join(".clauth/profiles/forced").exists(),
+        "the forced delete removes the profile dir"
+    );
+}
+
+/// A tombstone an earlier rescue kept holds the name a dead `runtime` retires
+/// to: the delete rescues the tombstone first, so the tree behind it retires
+/// and is rescued in the same delete.
+#[test]
+fn delete_rescues_a_kept_tombstone_and_the_dead_tree_beside_it() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    let global = profile_with_a_dead_copy_tree(&home, &mut config, "both");
+    let kept = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("both")
+        .join("runtime.rescuing")
+        .join("projects")
+        .join("-w-kept");
+    std::fs::create_dir_all(&kept).expect("mkdir kept tombstone");
+    std::fs::write(kept.join("k.jsonl"), "kept copy").expect("kept transcript");
+
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("both"),
+        false,
+        &rotation_guard("both"),
+    )
+    .expect("a profile whose trees all rescue deletes");
+
+    let claude_projects = home.home().join(".claude").join("projects");
+    assert_eq!(
+        std::fs::read_to_string(claude_projects.join("-w-kept").join("k.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("kept copy"),
+        "the kept tombstone's transcript must reach the global store"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&global).ok().as_deref(),
+        Some("only copy"),
+        "the dead tree behind it must be rescued in the same delete"
+    );
+}
+
+/// A dead tree the delete could not retire (its rename refused, as another
+/// process's open handle refuses it on Windows) still stands at its live name
+/// after the walk: an unforced delete refuses naming it, and its transcript
+/// stays where it is.
+#[test]
+fn a_delete_refuses_a_dead_tree_it_could_not_retire() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    profile_with_a_dead_copy_tree(&home, &mut config, "spared");
+    let runtime = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("spared")
+        .join("runtime");
+    let _refused = crate::runtime::RetireRenameRefused::set();
+
+    let err = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("spared"),
+        false,
+        &rotation_guard("spared"),
+    )
+    .expect_err("a dead tree left at its live name must block an unforced delete");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'spared' has unrescued session files in {}, pass --force to delete them anyway",
+            runtime.display()
+        )
+    );
+    assert_eq!(
+        std::fs::read_to_string(runtime.join("projects").join("-w-gone").join("s.jsonl"))
+            .ok()
+            .as_deref(),
+        Some("only copy"),
+        "the refused delete must leave the unretired tree's transcript"
+    );
+}
+
+/// Two trees left unrescued: the refusal names the first by name, where a
+/// per-session `runtime-<sid>` tombstone sorts before the bare `runtime`'s.
+#[test]
+fn a_delete_refusal_names_the_first_unrescued_tree() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    profile_with_a_dead_copy_tree(&home, &mut config, "two");
+    let claude_home = home.home().join(".claude");
+    std::fs::write(claude_home.join("projects"), "not a dir").expect("block the rescue");
+    let first = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("two")
+        .join("runtime-7-0.rescuing");
+    let kept = first.join("projects").join("-w-kept");
+    std::fs::create_dir_all(&kept).expect("mkdir kept tombstone");
+    std::fs::write(kept.join("k.jsonl"), "kept copy").expect("kept transcript");
+
+    let err = delete_profile_offering(
+        &mut config,
+        &crate::profile::ProfileName::from("two"),
+        false,
+        false,
+        &rotation_guard("two"),
+    )
+    .expect_err("unrescued session files must block the delete");
+
+    assert_eq!(
+        err.to_string(),
+        format!("'two' has unrescued session files in {}", first.display())
+    );
+}
+
+/// A caller sharing its config (the TUI's delete worker) hands the delete a way
+/// to take it, and the delete takes it only once the rescue has landed, so the
+/// config lock never spans the rescue's tree-sized IO.
+#[test]
+fn a_delete_takes_its_config_only_after_the_rescue() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    let global = profile_with_a_dead_copy_tree(&home, &mut config, "late");
+    let landed_when_taken = std::cell::Cell::new(None);
+    let seen = &landed_when_taken;
+    let target = &global;
+    let shared = &mut config;
+
+    delete_profile_taking_config(
+        move || {
+            seen.set(Some(target.exists()));
+            shared
+        },
+        &crate::profile::ProfileName::from("late"),
+        false,
+        false,
+        &rotation_guard("late"),
+    )
+    .expect("a rescued profile deletes");
+
+    assert_eq!(
+        landed_when_taken.get(),
+        Some(true),
+        "the config must be taken only after the rescue landed the transcript"
+    );
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("late"))
+            .is_none(),
+        "the delete removes the record"
+    );
+}
+
 /// A Claude Code background job naming any tree under a profile's dir is a live
 /// session for `delete_profile`'s refusal: `clauth start <p> -- --bg` leaves the
 /// tree under a job the marker flock never sees, and pulling the profile dir out

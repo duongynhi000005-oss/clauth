@@ -110,7 +110,8 @@ pub(crate) enum Command {
         /// implicit yes for an irreversible delete.
         #[arg(long, short = 'y')]
         yes: bool,
-        /// Delete even while a live `clauth start` session holds the profile.
+        /// Delete even while a live `clauth start` session holds the profile, or
+        /// while its runtime trees hold session files clauth could not rescue.
         /// Independent of --yes, which does not override this guard.
         #[arg(long)]
         force: bool,

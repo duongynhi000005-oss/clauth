@@ -1149,10 +1149,11 @@ pub(crate) fn classify_env_key(
 /// `dir.exists()` branches meaningful.
 ///
 /// Handed to [`delete_profile`] / [`rename_profile`] rather than taken inside
-/// them: the TUI holds the `config` guard across both calls, and ROTATION ranks
-/// outside `Config`, so the acquisition has to happen before the config lock. The
-/// guard parameter makes a caller with no lock a compile error; what makes a
-/// caller who takes it in the wrong ORDER fail is `lockorder`'s assertion.
+/// them: the TUI holds the `config` guard across a rename and takes it inside a
+/// delete, and ROTATION ranks outside `Config`, so the acquisition has to happen
+/// before the config lock. The guard parameter makes a caller with no lock a
+/// compile error; what makes a caller who takes it in the wrong ORDER fail is
+/// `lockorder`'s assertion.
 pub(crate) fn rotation_guard_for_mutation(name: &ProfileName) -> Result<RotationGuard> {
     match RotationGuard::try_acquire(name) {
         Ok(Some(guard)) => Ok(guard),
@@ -1286,7 +1287,8 @@ pub(crate) fn rename_profile(
     Ok(())
 }
 
-/// The CLI's delete: its live-session and supervisor refusals offer `--force`.
+/// The CLI's delete: its live-session, supervisor and unrescued-files refusals
+/// offer `--force`.
 pub(crate) fn delete_profile(
     config: &mut AppConfig,
     name: &ProfileName,
@@ -1296,13 +1298,27 @@ pub(crate) fn delete_profile(
     delete_profile_offering(config, name, force, true, rotation)
 }
 
-/// `_rotation` is [`rotation_guard_for_mutation`]'s guard for `name`, and
-/// `force` does not waive it: `force` waives the live-session gate below, while
-/// an in-flight rotation is a different hazard that no confirmation makes safe.
+/// `rotation` is [`rotation_guard_for_mutation`]'s guard for `name`, and
+/// `force` does not waive it: `force` waives the live-session gate, while an
+/// in-flight rotation is a different hazard that no confirmation makes safe.
 /// `offers_force` is false for a caller with no `--force` flag (the TUI), so no
 /// refusal names the flag.
 pub(crate) fn delete_profile_offering(
     config: &mut AppConfig,
+    name: &ProfileName,
+    force: bool,
+    offers_force: bool,
+    rotation: &RotationGuard,
+) -> Result<()> {
+    delete_profile_taking_config(move || config, name, force, offers_force, rotation)
+}
+
+/// [`delete_profile_offering`] for a caller that shares its config with other
+/// threads (the TUI's delete worker): `config` is called only for the final
+/// unwire-and-remove hold, so the config lock is never held across the
+/// guards' waits or the rescue's tree-sized IO.
+pub(crate) fn delete_profile_taking_config<C: std::ops::DerefMut<Target = AppConfig>>(
+    config: impl FnOnce() -> C,
     name: &ProfileName,
     force: bool,
     offers_force: bool,
@@ -1348,6 +1364,24 @@ pub(crate) fn delete_profile_offering(
             crate::runtime::SupervisorStopGate::Refused { offers_force }
         },
     )?;
+    // Lift what the profile's dead runtime trees alone hold before the removal
+    // below takes them, with the flock dropped (the rescue is tree-sized IO).
+    // Anything left refuses before the unwire: a refused delete keeps the
+    // record, the credentials link, the settings and the profile dir, while
+    // the supervisors stopped above stay stopped and whatever the rescue
+    // landed stays in `~/.claude`. `force` still rescues first, then deletes
+    // what is left.
+    let unrescued = crate::runtime::rescue_profile_trees(&dir);
+    if !force && let Some(tree) = unrescued {
+        if offers_force {
+            bail!(
+                "'{name}' has unrescued session files in {}, pass --force to delete them anyway",
+                tree.display()
+            );
+        }
+        bail!("'{name}' has unrescued session files in {}", tree.display());
+    }
+    let mut config = config();
     with_state_lock(|held| {
         // Unwire the active account from the live credentials link + settings.json
         // BEFORE the irreversible removal, and AFTER the supervisor stop above:

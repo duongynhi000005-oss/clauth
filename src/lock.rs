@@ -702,7 +702,8 @@ impl SharedSubprocessBudget {
     /// sign-out, the seed's write or sign-out and its retry) therefore arms past
     /// its flock waits and token calls, never before them
     /// ([`with_keychain_budget`]). The GC sweep
-    /// (`runtime::gc_stale_runtimes`) and the census
+    /// (`runtime::gc_stale_runtimes`), a profile delete's tree walk
+    /// (`runtime::rescue_profile_trees`) and the census
     /// (`keychain::census_namespaced_items`) are tick-shaped scopes instead:
     /// each arms once over a whole sweep, before the per-item state-flock
     /// holds it takes, so those holds' waits spend its window. Production

@@ -54,11 +54,16 @@
 //! job on one: elsewhere the session reads the
 //! very credential file a rotation writes and simply follows it, while on macOS
 //! its Claude Code reads a Keychain item namespaced per `CLAUDE_CONFIG_DIR` that
-//! clauth cannot write. Teardown drops the marker and discards the tree. That
-//! tree is the session's own except for a SHARED session under
-//! [`LinkMode::Fake`], which is discarded only once the last session of the
-//! profile has left; [`gc_stale_runtimes`] collects what a crashed session left
-//! behind, of either flavor and in either layout.
+//! clauth cannot write. Teardown drops the marker and retires the tree: a copy
+//! host's shared tree its final tick published is removed outright; any other
+//! is renamed to a rescue tombstone, what only it holds lifted into
+//! `~/.claude`, and removed once nothing is left in it, else kept for a later
+//! sweep ([`rescue_tombstone`]). That tree is the session's own except for a
+//! SHARED session under [`LinkMode::Fake`], which is retired only once the last
+//! session of the profile has left; [`gc_stale_runtimes`] retires what a
+//! crashed session left behind, of either flavor and in either layout, and a
+//! profile's delete does the same for its own trees first
+//! ([`rescue_profile_trees`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -340,18 +345,21 @@ fn is_sessions_dir_name(name: &str) -> bool {
     is_paired_dir_name(name, SESSIONS_STEM)
 }
 
-/// The suffix a rescue tombstone appends to an isolated runtime dir name. A `.`
-/// cannot appear in a session id ([`is_session_id`] accepts digits and one `-`),
-/// so the suffixed name is rejected by [`is_paired_dir_name`]: no later GC pass
-/// re-pairs it or hands it to `remove_dir_all` as a runtime.
+/// The suffix a rescue tombstone appends to a dead runtime dir name. A `.`
+/// cannot appear in a session id ([`is_session_id`] accepts digits and one
+/// `-`), so the suffixed name is rejected by [`is_paired_dir_name`]: no
+/// acquire adopts it and no later GC pass re-pairs it or hands it to
+/// `remove_dir_all` as a runtime.
 const RESCUE_TOMBSTONE_SUFFIX: &str = ".rescuing";
 
-/// True for the tombstone name [`gc_one_pair`] renames an isolated runtime to
-/// before the out-of-lock rescue. Stripping the suffix must land on an isolated
-/// runtime dir name; the sweep that matches one finishes the rescue, no lock.
+/// True for the tombstone name [`gc_one_pair`], `acquire` or a teardown renames
+/// a dead tree to before the out-of-lock rescue: stripping the suffix must land
+/// on a runtime dir name of either flavor. The sweep that matches one finishes
+/// a rescue a crash or a failed move left, under the tombstone's claim
+/// ([`RescueClaim`]).
 fn is_rescuing_runtime_dir_name(name: &str) -> bool {
     name.strip_suffix(RESCUE_TOMBSTONE_SUFFIX)
-        .is_some_and(|base| base.starts_with(ISOLATED_RUNTIME_STEM) && is_runtime_dir_name(base))
+        .is_some_and(is_runtime_dir_name)
 }
 
 /// True for a SHARED runtime dir name — a per-session `runtime-<sid>`, the
@@ -1753,39 +1761,102 @@ fn gc_runtime_trees() {
     let Ok(entries) = std::fs::read_dir(&root) else {
         return;
     };
+    let _rescue_wait = crate::sessions::RescueLockBudget::arm();
     for profile in entries.flatten() {
-        let profile = profile.path();
-        let Ok(children) = std::fs::read_dir(&profile) else {
-            continue;
-        };
-        for child in children.flatten() {
-            let file_name = child.file_name();
-            let Some(child_name) = file_name.to_str() else {
-                continue;
-            };
-            // Strict predicates, not the loose pairing split: this loop hands
-            // `remove_dir_all` whatever it matches, so a future `runtime_state`
-            // or `sessions.json` under a profile must fall through untouched.
-            if is_rescuing_runtime_dir_name(child_name) {
-                rescue_tombstone(&child.path());
-            } else if is_runtime_dir_name(child_name)
-                && let Some(sessions) = paired_sessions_name(child_name)
-            {
-                let _ = gc_one_pair(&child.path(), &profile.join(sessions), &job_trees);
-            } else if is_sessions_dir_name(child_name)
-                && let Some(runtime) = paired_runtime_name(child_name)
-            {
-                // A marker dir with no runtime sibling. `acquire` mints it before
-                // it builds the tree, so a crash in that window strands one — and
-                // per-session keying makes that a fresh empty dir every time
-                // rather than a reused one.
-                let runtime = profile.join(runtime);
-                if runtime.symlink_metadata().is_err() {
-                    let _ = gc_one_pair(&runtime, &child.path(), &job_trees);
-                }
+        gc_profile_trees(&profile.path(), &job_trees);
+    }
+}
+
+/// One profile's half of [`gc_runtime_trees`]: every kept rescue tombstone
+/// first, then every dead runtime tree, retired and rescued. Tombstones go
+/// first because a kept `runtime.rescuing` blocks the rename that would retire
+/// a dead `runtime` beside it.
+fn gc_profile_trees(profile: &Path, job_trees: &JobTrees) {
+    // Strict predicates, not the loose pairing split: these walks hand
+    // `remove_dir_all` whatever they match, so a future `runtime_state` or
+    // `sessions.json` under a profile must fall through untouched.
+    for child_name in child_names(profile) {
+        if is_rescuing_runtime_dir_name(&child_name) {
+            rescue_tombstone(&profile.join(&child_name));
+        } else if let Some(tombstone) = child_name.strip_suffix(RESCUE_CLAIM_SUFFIX)
+            && is_rescuing_runtime_dir_name(tombstone)
+            && profile
+                .join(tombstone)
+                .symlink_metadata()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            // A crash between a tombstone's removal and its claim's leaves the
+            // claim alone; claiming it finds no tombstone and removes it.
+            rescue_tombstone(&profile.join(tombstone));
+        }
+    }
+    for child_name in child_names(profile) {
+        if is_runtime_dir_name(&child_name)
+            && let Some(sessions) = paired_sessions_name(&child_name)
+        {
+            let _ = gc_one_pair(
+                &profile.join(&child_name),
+                &profile.join(sessions),
+                job_trees,
+            );
+        } else if is_sessions_dir_name(&child_name)
+            && let Some(runtime) = paired_runtime_name(&child_name)
+        {
+            // A marker dir with no runtime sibling. `acquire` mints it before
+            // it builds the tree, so a crash in that window strands one — and
+            // per-session keying makes that a fresh empty dir every time
+            // rather than a reused one.
+            let runtime = profile.join(runtime);
+            if runtime.symlink_metadata().is_err() {
+                let _ = gc_one_pair(&runtime, &profile.join(&child_name), job_trees);
             }
         }
     }
+}
+
+/// The UTF-8 entry names under `dir`; an unreadable dir has none.
+fn child_names(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir).map_or_else(
+        |_| Vec::new(),
+        |children| {
+            children
+                .flatten()
+                .filter_map(|child| child.file_name().into_string().ok())
+                .collect()
+        },
+    )
+}
+
+/// Rescue what a profile's dead runtime trees alone hold, ahead of the
+/// profile's deletion: [`gc_profile_trees`] over this profile alone, with no
+/// state flock held. Returns the first runtime tree or tombstone (by name)
+/// still standing under `profile`: a tombstone whose rescue left files, one
+/// another sweep is finishing, or a tree the walk spared. An unreadable
+/// profile dir is returned itself, since nothing shows it holds nothing.
+pub(crate) fn rescue_profile_trees(profile: &Path) -> Option<PathBuf> {
+    // macOS: the walk collects one Keychain item per dead tree, so it arms
+    // one shared subprocess budget over all of them, as `gc_stale_runtimes`
+    // does over its sweep: a stuck keychain costs a delete one per-call
+    // ceiling, never one per tree.
+    #[cfg(target_os = "macos")]
+    let _item_budget = crate::lock::SharedSubprocessBudget::arm(crate::lock::SUBPROCESS_BUDGET);
+    let _rescue_wait = crate::sessions::RescueLockBudget::arm();
+    gc_profile_trees(profile, &crate::claude_jobs::job_trees());
+    let children = match std::fs::read_dir(profile) {
+        Ok(children) => children,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(profile.to_path_buf()),
+    };
+    children
+        .flatten()
+        .filter(|child| {
+            child
+                .file_name()
+                .to_str()
+                .is_some_and(|name| is_runtime_dir_name(name) || is_rescuing_runtime_dir_name(name))
+        })
+        .map(|child| child.path())
+        .min()
 }
 
 /// Every namespaced Keychain service an EXISTING runtime dir explains — the
@@ -2613,59 +2684,364 @@ fn run_adopt_reread_hook() {
     });
 }
 
-/// Rescue an isolated runtime root into the global store: the transcripts under
-/// `projects/`, then the session sidecars. Returns `(transcripts, sidecars)`
-/// moved. Best-effort throughout — an error is logged, never fails the caller.
-/// Shared by [`crate::start::rescue_teardown`] and the stale-runtime GC, so an
-/// unrescued isolated tree is lifted at its deletion site rather than only on a
-/// clean exit.
-pub(crate) fn rescue_isolated_runtime(iso_root: &Path, claude_home: &Path) -> (usize, usize) {
-    let moved = crate::sessions::rescue_isolated_store(
-        &iso_root.join("projects"),
-        &claude_home.join("projects"),
-    );
-    let sidecars = crate::sessions::rescue_isolated_sidecars(iso_root, claude_home);
-    if moved > 0 || sidecars > 0 {
+/// Rescue a runtime root into the global store, one way: the transcripts under
+/// `projects/`, then the session sidecars under `sidecars`' rule. Returns
+/// `(transcripts, sidecars)`. Best-effort throughout: an error is logged and
+/// counted as left, never fails the caller. Shared by
+/// [`crate::start::rescue_teardown`] and every tombstone ([`rescue_tombstone`]),
+/// so an unrescued tree is lifted at its deletion site rather than only on a
+/// clean exit. Its rescue-lock waits share one budget
+/// ([`crate::sessions::RescueLockBudget`]), or the enclosing sweep's.
+pub(crate) fn rescue_runtime(
+    root: &Path,
+    claude_home: &Path,
+    sidecars: crate::sessions::SidecarSource,
+) -> (crate::sessions::Rescued, crate::sessions::Rescued) {
+    let _rescue_wait = crate::sessions::RescueLockBudget::arm();
+    let transcripts =
+        crate::sessions::rescue_transcripts(&root.join("projects"), &claude_home.join("projects"));
+    let sidecars = crate::sessions::rescue_sidecars(root, claude_home, sidecars);
+    if transcripts.moved > 0 || sidecars.moved > 0 {
         logline!(
-            "clauth: rescued {moved} isolated session transcript(s) \
-             + {sidecars} sidecar file(s) into the global store"
+            "clauth: rescued {} session transcript(s) + {} sidecar file(s) from {} \
+             into the global store",
+            transcripts.moved,
+            sidecars.moved,
+            root.display()
         );
     }
-    (moved, sidecars)
+    (transcripts, sidecars)
 }
 
-/// Finish a rescue from an isolated runtime tombstone: lift it into the global
-/// store, then remove it. Runs outside the state lock — the name is rejected by
-/// [`is_paired_dir_name`], so nothing can adopt it — and is the single tail both
-/// [`gc_one_pair`] and the stranded-tombstone sweep share, so a crash between
-/// the rename and this call cannot strand the tree.
-fn rescue_tombstone(tombstone: &Path) {
-    match claude_dir() {
-        Ok(claude_home) => {
-            rescue_isolated_runtime(tombstone, &claude_home);
-        }
+/// Retire a dead runtime tree from its live name, inside the removal's state
+/// flock hold. A tree whose root is itself a link (an operator's symlink, a
+/// Windows junction) holds nothing of its own: the link alone is removed, and
+/// nothing behind it is renamed or walked. Any other tree may hold the only
+/// copy of what its session wrote (an isolated tree's whole store; a shared
+/// tree's entries `~/.claude` lacked at its build, or a copy host's tail past
+/// its last mirror tick), so it is renamed to its rescue tombstone, O(1), and
+/// returned for [`rescue_tombstone`] once the hold drops. A failed rename
+/// keeps the tree where it is for a later sweep.
+fn retire_tree(runtime: &Path) -> Option<PathBuf> {
+    if crate::sessions::is_symlink(runtime) {
+        unlink_link(runtime, "linked runtime tree");
+        return None;
+    }
+    let tombstone = tombstone_path(runtime);
+    #[cfg(test)]
+    let renamed = if RETIRE_RENAME_REFUSED.with(std::cell::Cell::get) {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    } else {
+        std::fs::rename(runtime, &tombstone)
+    };
+    #[cfg(not(test))]
+    let renamed = std::fs::rename(runtime, &tombstone);
+    match renamed {
+        Ok(()) => Some(tombstone),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
             logline!(
-                "clauth: cannot rescue isolated runtime {}: {e}",
-                tombstone.display()
+                "clauth: kept runtime tree {}: renaming it for rescue failed: {e}",
+                runtime.display()
             );
-            return;
+            None
         }
     }
-    if let Err(e) = std::fs::remove_dir_all(tombstone) {
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by [`RetireRenameRefused`]: [`retire_tree`]'s rename fails on this
+    /// thread, as one another process's open handle refuses on Windows.
+    static RETIRE_RENAME_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Refuses every [`retire_tree`] rename on the calling thread until dropped.
+#[cfg(test)]
+pub(crate) struct RetireRenameRefused(bool);
+
+#[cfg(test)]
+impl RetireRenameRefused {
+    pub(crate) fn set() -> Self {
+        Self(RETIRE_RENAME_REFUSED.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RetireRenameRefused {
+    fn drop(&mut self) {
+        RETIRE_RENAME_REFUSED.with(|c| c.set(self.0));
+    }
+}
+
+/// The rescue tombstone a dead `runtime` is renamed to.
+fn tombstone_path(runtime: &Path) -> PathBuf {
+    with_name_suffix(runtime, RESCUE_TOMBSTONE_SUFFIX)
+}
+
+/// `path` with `suffix` appended to its file name.
+fn with_name_suffix(path: &Path, suffix: &str) -> PathBuf {
+    path.file_name()
+        .map(|name| {
+            let mut suffixed = name.to_os_string();
+            suffixed.push(suffix);
+            path.with_file_name(suffixed)
+        })
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// The suffix of the claim file beside a rescue tombstone ([`RescueClaim`]).
+const RESCUE_CLAIM_SUFFIX: &str = ".claim";
+
+/// One sweep's exclusive claim on a rescue tombstone, held across its whole
+/// rescue, so two sweeps (a renaming sweep's tail and another process's
+/// stranded-tombstone arm) never walk, count and remove one tree at once: a
+/// second sweep that removed a tombstone the first is still finishing would
+/// free its name, and a dead tree retired onto that name would go unwalked
+/// with the first sweep's removal. Two
+/// tombstones landing on one global file are ordered per file by the rescue's
+/// own lock (`sessions::RescueFileLock`), never by this claim. The lock is a
+/// flock (`LockFileEx` on Windows) on a file BESIDE the tombstone, never
+/// inside it: an open handle inside would block the tombstone's removal on
+/// Windows. It is a try-lock, so a held claim means another sweep is finishing
+/// the tombstone and this one skips it; a claim file a crash left is held by
+/// nobody and is taken as usual.
+struct RescueClaim {
+    path: PathBuf,
+    file: File,
+}
+
+impl RescueClaim {
+    /// `None` when another sweep holds the claim, or it cannot be taken
+    /// (logged); either way the tombstone stays for a later sweep.
+    fn take(tombstone: &Path) -> Option<Self> {
+        let path = with_name_suffix(tombstone, RESCUE_CLAIM_SUFFIX);
+        let file = match open_rescue_claim(&path) {
+            Ok(file) => file,
+            // The profile dir went, and the tombstone with it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                logline!(
+                    "clauth: cannot claim {} for rescue: {e}",
+                    tombstone.display()
+                );
+                return None;
+            }
+        };
+        #[cfg(test)]
+        fire_claim_hook(&CLAIM_OPENED_HOOK, &path);
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return None,
+            Err(std::fs::TryLockError::Error(e)) => {
+                logline!(
+                    "clauth: cannot claim {} for rescue: {e}",
+                    tombstone.display()
+                );
+                return None;
+            }
+        }
+        claim_is_named(&file, &path).then_some(Self { path, file })
+    }
+
+    /// Drop the claim. Its file goes once the tombstone has, so a kept
+    /// tombstone's next sweep locks the same file. Unix unlinks it while still
+    /// holding the lock: a sweep that opened it before can then only lock an
+    /// unlinked file, which [`claim_is_named`] refuses. Windows cannot delete a
+    /// file another handle holds open ([`open_rescue_claim`]), so the handle
+    /// closes first, and a failed delete means another sweep holds it now and
+    /// removes it in turn.
+    fn release(self, tombstone: &Path) {
+        let Self { path, file } = self;
+        let gone = tombstone
+            .symlink_metadata()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        #[cfg(not(unix))]
+        drop(file);
+        if gone {
+            #[cfg(test)]
+            fire_claim_hook(&CLAIM_UNLINK_HOOK, &path);
+            let _ = std::fs::remove_file(&path);
+        }
+        #[cfg(unix)]
+        drop(file);
+    }
+}
+
+#[cfg(test)]
+type ClaimHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Fires once in [`RescueClaim::take`] between the claim file's open and
+    /// its lock: the window another sweep's release can land in.
+    static CLAIM_OPENED_HOOK: std::cell::RefCell<Option<ClaimHook>> =
+        const { std::cell::RefCell::new(None) };
+    /// Fires once in [`RescueClaim::release`] right before the claim file's
+    /// unlink: the moment another sweep must still find it held.
+    static CLAIM_UNLINK_HOOK: std::cell::RefCell<Option<ClaimHook>> =
+        const { std::cell::RefCell::new(None) };
+    /// Fires once in [`rescue_claimed_tombstone`] right before a rescued
+    /// tombstone's removal: the moment another sweep may reach it.
+    static TOMBSTONE_REMOVAL_HOOK: std::cell::RefCell<Option<ClaimHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn fire_claim_hook(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<ClaimHook>>>,
+    path: &Path,
+) {
+    if let Some(hook) = slot.with(|hook| hook.borrow_mut().take()) {
+        hook(path);
+    }
+}
+
+#[cfg(test)]
+fn set_claim_hook(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<ClaimHook>>>,
+    hook: ClaimHook,
+) {
+    slot.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+/// Open or create a rescue claim file, owner-only. On Windows it shares read
+/// and write but never delete, so its name cannot be removed while any sweep
+/// holds it open, and a handle always locks the file the name points at.
+fn open_rescue_claim(path: &Path) -> std::io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, without FILE_SHARE_DELETE.
+        const SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(SHARE_READ_WRITE)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        crate::profile::open_state_file(path)
+    }
+}
+
+/// Whether the locked `file` is still the one `path` names. A sweep that
+/// opened the claim just before its holder unlinked it locks an orphan once
+/// the holder lets go, while a later sweep may create and lock a new file at
+/// the same name: only one of them may rescue.
+#[cfg(unix)]
+fn claim_is_named(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+        _ => false,
+    }
+}
+
+/// Windows: [`open_rescue_claim`] keeps a held claim's name from being
+/// removed, so a locked handle is always the named file.
+#[cfg(not(unix))]
+fn claim_is_named(_file: &File, _path: &Path) -> bool {
+    true
+}
+
+/// Whether a dead shared tree is a copy of the global store: a copy host's
+/// build copies every entry and links none, so a tree is a copy iff none of its
+/// top-level entries is a link. A linking build links what `~/.claude` holds
+/// plus the `projects` and `jobs` stores it can create there; one that linked
+/// nothing (an empty `~/.claude` it could not write) reads as a copy too. An
+/// unreadable tree or entry reads as no copy, whose sibling rule never drops a
+/// file.
+fn is_copy_tree(tree: &Path) -> bool {
+    std::fs::read_dir(tree).is_ok_and(|mut entries| {
+        entries.all(|entry| entry.is_ok_and(|e| e.file_type().is_ok_and(|t| !t.is_symlink())))
+    })
+}
+
+/// Finish a rescue from a runtime tombstone: lift its transcripts and sidecars
+/// into the global store, then remove it. Runs outside the state lock — the
+/// name is rejected by [`is_paired_dir_name`], so nothing can adopt it — and is
+/// the single tail [`gc_one_pair`], `acquire`, `Drop`, the stranded-tombstone
+/// sweep and a profile's delete share, so a crash between the rename and this call
+/// cannot strand the tree. One sweep at a time walks a tombstone
+/// ([`RescueClaim`]); one another sweep is finishing is skipped. A tombstone
+/// the rescue left anything in is kept for that sweep to retry: it may hold the
+/// only copy. A tombstone that is itself a link is unlinked and never walked:
+/// what it resolves to is no tree of clauth's.
+fn rescue_tombstone(tombstone: &Path) {
+    let Some(claim) = RescueClaim::take(tombstone) else {
+        return;
+    };
+    rescue_claimed_tombstone(tombstone);
+    claim.release(tombstone);
+}
+
+/// [`rescue_tombstone`] under its claim.
+fn rescue_claimed_tombstone(tombstone: &Path) {
+    // The sweep that held the claim before this one finished it.
+    if tombstone
+        .symlink_metadata()
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        return;
+    }
+    if crate::sessions::is_symlink(tombstone) {
+        unlink_link(tombstone, "linked runtime tombstone");
+        return;
+    }
+    let claude_home = match claude_dir() {
+        Ok(claude_home) => claude_home,
+        Err(e) => {
+            logline!("clauth: cannot rescue runtime {}: {e}", tombstone.display());
+            return;
+        }
+    };
+    // Only a copy took a copy of every global sidecar at its build; on any
+    // other shared tree an occupied name is the session's own.
+    let isolated = tombstone
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(ISOLATED_RUNTIME_STEM));
+    let sidecars = if isolated {
+        crate::sessions::SidecarSource::Isolated
+    } else if is_copy_tree(tombstone) {
+        crate::sessions::SidecarSource::SharedCopy
+    } else {
+        crate::sessions::SidecarSource::Shared
+    };
+    let (transcripts, sidecars) = rescue_runtime(tombstone, &claude_home, sidecars);
+    let left = transcripts.left + sidecars.left;
+    if left > 0 {
         logline!(
-            "clauth: failed to remove rescued isolated runtime {}: {e}",
+            "clauth: kept {}: {left} file(s) could not be rescued; a later sweep retries",
             tombstone.display()
         );
+        return;
+    }
+    #[cfg(test)]
+    fire_claim_hook(&TOMBSTONE_REMOVAL_HOOK, tombstone);
+    match std::fs::remove_dir_all(tombstone) {
+        Ok(()) => {}
+        // Removed under the claim by something other than a sweep: nothing of
+        // it is left to lose.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => logline!(
+            "clauth: failed to remove rescued runtime {}: {e}",
+            tombstone.display()
+        ),
     }
 }
 
 /// Collect one paired (`runtime<rest>`, `sessions<rest>`) tree when nothing holds
 /// a marker in it and no live Claude Code background job names it. The two go
 /// together; a `runtime` path that does not exist collects the orphaned marker
-/// dir alone. An isolated tree is renamed to a tombstone under the lock and
-/// rescued outside it, so the flock is never held across a tree-sized copy; a
-/// shared tree is removed under the lock as before.
+/// dir alone. Any tree can hold the only copy of what its session wrote, so
+/// it is renamed to a tombstone under the lock and rescued outside it
+/// ([`retire_tree`]), and the flock is never held across a tree-sized walk; a
+/// runtime path that is itself a link is unlinked alone.
 fn gc_one_pair(runtime: &Path, sessions: &Path, job_trees: &JobTrees) -> Result<()> {
     // The job check sits here as a FAST PATH, before the state flock
     // `gc_one_pair_synced` takes: the store was read once above and the check
@@ -2733,24 +3109,15 @@ fn gc_held_marker_set(file: File) {
 /// starting session re-mints this same path (its whole lock section: marker
 /// claim, tree rebuild, then the post-lock item seed) while the sweep sits
 /// between its collection and its delete. A no-op in production.
+///
+/// The removal hold renames the tree to its tombstone ([`retire_tree`]), and
+/// the rescue runs once the lock drops, because nothing but that tree may hold
+/// what its dead session wrote.
 fn gc_one_pair_synced(
     runtime: &Path,
     sessions: &Path,
     remint_interleave: impl FnOnce(),
 ) -> Result<()> {
-    let isolated = runtime
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with(ISOLATED_RUNTIME_STEM));
-    let tombstone = runtime
-        .file_name()
-        .map(|name| {
-            let mut tombstone_name = name.to_os_string();
-            tombstone_name.push(RESCUE_TOMBSTONE_SUFFIX);
-            runtime.with_file_name(tombstone_name)
-        })
-        .unwrap_or_else(|| runtime.to_path_buf());
-
     // macOS: the tree's namespaced Keychain service, derived while the dir
     // still exists — the derivation canonicalizes it, so it cannot run once
     // the tree is removed. Collected after the closures below, where a
@@ -2828,36 +3195,13 @@ fn gc_one_pair_synced(
                 SupervisorState::None | SupervisorState::Gone
             );
         if spares {
-            return Ok(false);
+            return Ok(None);
         }
-        if isolated {
-            // The rename is what stops an `acquire` adopting the tree while the
-            // rescue reads it: the tombstone name matches no pairing predicate.
-            match runtime.symlink_metadata() {
-                Ok(_) => {
-                    if let Err(e) = std::fs::rename(runtime, &tombstone) {
-                        logline!(
-                            "clauth: failed to rename isolated runtime {} for rescue: {e}",
-                            runtime.display()
-                        );
-                        let _ = std::fs::remove_dir(sessions);
-                        return Ok(false);
-                    }
-                    let _ = std::fs::remove_dir(sessions);
-                    return Ok(true);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => logline!(
-                    "clauth: cannot stat isolated runtime {} for rescue: {e}",
-                    runtime.display()
-                ),
-            }
-            let _ = std::fs::remove_dir(sessions);
-            return Ok(false);
-        }
-        let _ = std::fs::remove_dir_all(runtime);
+        // The rename is what stops an `acquire` adopting the tree while the
+        // rescue reads it: the tombstone name matches no pairing predicate.
+        let tombstone = retire_tree(runtime);
         let _ = std::fs::remove_dir(sessions);
-        Ok(false)
+        Ok(tombstone)
     })?;
 
     clear_stop_in_flight(runtime);
@@ -2879,7 +3223,7 @@ fn gc_one_pair_synced(
         collect_orphaned_keychain_item(in_flight);
     }
 
-    if renamed {
+    if let Some(tombstone) = renamed {
         rescue_tombstone(&tombstone);
     }
     Ok(())
@@ -2900,8 +3244,8 @@ fn gc_one_pair_synced(
 ///   `CLAUDE_CONFIG_DIR`).
 /// - a pair the sweep could not collect (a failed tombstone rename, an
 ///   unreadable tree) keeps its dir, and its item with it.
-/// - a collected pair (the shared tree removed, the isolated tree renamed to
-///   its rescue tombstone) has no dir and no live marker: its item is
+/// - a collected pair (the tree renamed to its rescue tombstone, or a linked
+///   runtime root unlinked) has no dir and no live marker: its item is
 ///   orphaned — only that dir's hash resolved it — and is collected.
 /// - a runtime dir that never existed (the orphaned-marker arm; a crash
 ///   between minting the marker dir and building the tree) derived no service,
@@ -5352,7 +5696,7 @@ fn spawn_session_watchdog(
 }
 
 /// Live-session guard. On drop: stops the watchdog, runs a final sync
-/// (errors surface to stderr), drops the PID file, and discards this session's
+/// (errors surface to stderr), drops the PID file, and retires this session's
 /// own runtime tree.
 pub(crate) struct ProfileRuntime {
     /// Shared with the watchdog thread: the member the credential link resolves
@@ -5887,7 +6231,7 @@ impl ProfileRuntime {
             .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
         pre_lock_done();
 
-        let (session, paths, pid_lock, mode, fresh, store_notes) = with_state_lock(|_held| {
+        let (session, paths, pid_lock, mode, fresh, notes, dead) = with_state_lock(|_held| {
             // Inside the hold, and ahead of every write this closure does — see
             // `refuse_if_unconfigured` for which mechanism each half buys.
             refuse_if_unconfigured(name)?;
@@ -6022,24 +6366,42 @@ impl ProfileRuntime {
             // Nothing live in this session's marker dir, yet a tree already sits
             // at its path: a dead session's leftovers under a recycled pid, or —
             // under the shared tree — a whole profile's worth nobody is using.
-            // Rebuild from scratch so stale symlinks/copies to entries that have
-            // since vanished from ~/.claude/ don't carry over. A live sibling
-            // holds a marker here, so its tree is never the one wiped. A live
-            // `claude --bg` job names its tree here too (the marker flock never
-            // sees the session), so a tree the job store names — or one an
-            // unreadable store cannot clear — is skipped as well; the store read
-            // runs only when a stale tree sits at the path. A tree whose own
-            // supervisor may recreate it is never wiped here (no subprocess, no
-            // signal inside the flock) — the mint loop above moved sid-keyed
-            // layouts onto a fresh path, and a fixed runtime path keeps its
-            // supervisor via the additive build below.
+            // The tree is cleared out of the path so stale symlinks/copies to
+            // entries that have since vanished from ~/.claude/ don't carry over
+            // into the build. A live sibling holds a marker here, so its tree is
+            // never the one cleared. A live `claude --bg` job names its tree here
+            // too (the marker flock never sees the session), so a tree the job
+            // store names — or one an unreadable store cannot clear — is skipped
+            // as well; the store read runs only when a stale tree sits at the
+            // path. A tree whose own supervisor may recreate it is never cleared
+            // here (no subprocess, no signal inside the flock) — the mint loop
+            // above moved sid-keyed layouts onto a fresh path, and a fixed
+            // runtime path keeps its supervisor via the additive build below.
+            //
+            // A dead tree can hold the only copy of its session's transcripts
+            // and sidecars (a recycled `<pid>-<seq>` lands on one no sweep has
+            // rescued yet), so it is renamed to its rescue tombstone — O(1), the
+            // one step this hold pays — and rescued once the hold drops, as GC
+            // does ([`retire_tree`]). A failed rename (a kept tombstone already
+            // holds the name, an open handle on Windows) keeps the tree and
+            // builds over it, never a wipe: the build is additive, and the
+            // tree's next teardown or sweep rescues it. A dead runtime path that
+            // is itself a link is unlinked; a link the checks above spare, or
+            // one that would not unlink, refuses the start, since the build
+            // would write through it.
+            let mut tombstone = None;
             if active == 0
                 && runtime.symlink_metadata().is_ok()
                 && !crate::claude_jobs::job_trees().spares(runtime)
                 && !supervisor_may_be_alive(runtime)
             {
-                std::fs::remove_dir_all(runtime)
-                    .with_context(|| format!("failed to clear {}", runtime.display()))?;
+                tombstone = retire_tree(runtime);
+            }
+            if crate::sessions::is_symlink(runtime) {
+                anyhow::bail!(
+                    "{} is a link, not a runtime tree clauth made; remove it and start again",
+                    runtime.display()
+                );
             }
             crate::profile::mkdir_700(runtime)
                 .with_context(|| format!("failed to create {}", runtime.display()))?;
@@ -6120,7 +6482,7 @@ impl ProfileRuntime {
                 logline!("clauth: registering the live session failed: {e}");
             }
             stamp_window_closing(&paths, &session);
-            Ok::<_, anyhow::Error>((session, paths, file, mode, fresh, store_notes))
+            Ok::<_, anyhow::Error>((session, paths, file, mode, fresh, store_notes, tombstone))
         })?;
         // The `.claude.json` seed records its write under `JsonSyncLock`, whose
         // rank (480) sits OUTSIDE `State` (500): it cannot run inside the
@@ -6193,6 +6555,12 @@ impl ProfileRuntime {
         // volume without symlink support or a denial on the probe write.
         drop(rotation_guard);
         hold_released();
+        // The dead tree's rescue is tree-sized IO, so it waits for both holds
+        // to drop. A start that failed past the rename left its tombstone for
+        // the stranded-tombstone sweep.
+        if let Some(tombstone) = &dead {
+            rescue_tombstone(tombstone);
+        }
         // Built from `paths` rather than from locals moved out of it, so the
         // runtime dir the swap repoints and the marker it must recognize as its
         // own come from one source.
@@ -6218,7 +6586,7 @@ impl ProfileRuntime {
             pid_file,
             claude_home,
             sessions,
-            store_notes,
+            store_notes: notes,
             _pid_lock: pid_lock,
             watchdog_signal: Some(watchdog_signal),
             watchdog_handle: Some(watchdog_handle),
@@ -6264,11 +6632,31 @@ impl ProfileRuntime {
     ///
     /// Its live count gates anything that MOVES state out of `config_dir`: the
     /// count, not the keying, is what proves no Claude Code is reading the tree
-    /// being emptied. The only such caller, `start::rescue_teardown`, runs for
-    /// isolated sessions alone, and an isolated session owns this dir under
-    /// both link modes, so the count is this session alone in normal operation.
+    /// being emptied. `start::rescue_teardown` runs for isolated sessions
+    /// alone, and an isolated session owns this dir under both link modes, so
+    /// the count is this session alone in normal operation; the teardown's own
+    /// rescue runs only on a tree its hold read a zero count for.
     pub(crate) fn sessions_dir(&self) -> &Path {
         &self.sessions
+    }
+
+    /// Take this ended session's tree off its live name, inside the teardown's
+    /// hold, and drop its marker dir. A copy host's shared tree its clean final
+    /// tick just published (`mirrored`) is removed outright: a rescue would
+    /// walk a copy of the whole global store to find nothing. Every other tree
+    /// goes through [`retire_tree`], so what only it holds (an isolated store a
+    /// failed teardown rescue left, a sidecar dir `~/.claude` lacked at the
+    /// build) is rescued once the hold drops, and kept if that rescue fails.
+    fn retire_own_tree(&self, mirrored: bool) -> Option<PathBuf> {
+        let runtime = &self.swap.runtime;
+        let tombstone = if mirrored && !crate::sessions::is_symlink(runtime) {
+            let _ = std::fs::remove_dir_all(runtime);
+            None
+        } else {
+            retire_tree(runtime)
+        };
+        let _ = std::fs::remove_dir(&self.sessions);
+        tombstone
     }
 }
 
@@ -6382,9 +6770,17 @@ impl Drop for ProfileRuntime {
             let _ = h.join();
         }
 
-        if let Err(e) = tick(&self.claude_home, &self.swap) {
+        let final_tick = tick(&self.claude_home, &self.swap);
+        if let Err(e) = &final_tick {
             logline!("clauth: final sync failed: {e}");
         }
+        // A copy host's shared session publishes its tree through this tick's
+        // mirror: a clean tick leaves nothing for a rescue to carry, and a
+        // failed one leaves the tree the only home of what it did not publish,
+        // so the teardown below must not touch it; the next GC sweep rescues it
+        // through the tombstone path instead.
+        let mirrored = self.swap.isolation == Isolation::Shared && self.swap.mode == LinkMode::Fake;
+        let unpublished = final_tick.err().filter(|_| mirrored);
 
         // Flush this session's last `.claude.json` / `settings.json` changes to
         // the global files and siblings before a possible teardown removes this
@@ -6423,6 +6819,7 @@ impl Drop for ProfileRuntime {
         let mut stop = false;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let stop = false;
+        let mut retired = None;
         match acquire_state_lock_for_teardown() {
             Ok(_guard) => {
                 // A `--with-fallback` session a Claude Code job outlives is
@@ -6451,7 +6848,17 @@ impl Drop for ProfileRuntime {
                 // account nothing is using.
                 self.swap.release_swapped_markers();
                 let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
-                if still_active == 0 {
+                if still_active == 0
+                    && let Some(e) = &unpublished
+                {
+                    // Spared before the supervisor match, so neither removal
+                    // site runs: the direct arm below, and the post-stop
+                    // re-check, which only a `stop` set inside it reaches.
+                    logline!(
+                        "clauth: spared runtime tree {}: its final sync failed: {e:#}",
+                        self.swap.runtime.display()
+                    );
+                } else if still_active == 0 {
                     // `claude --bg` handed this session to Claude Code's
                     // background service before this teardown runs, so the
                     // marker alone cannot say the tree is unused: re-read the
@@ -6462,8 +6869,7 @@ impl Drop for ProfileRuntime {
                     if !job_trees.spares(&self.swap.runtime) {
                         match supervisor_state(&self.swap.runtime) {
                             SupervisorState::None | SupervisorState::Gone => {
-                                let _ = std::fs::remove_dir_all(&self.swap.runtime);
-                                let _ = std::fs::remove_dir(&self.sessions);
+                                retired = self.retire_own_tree(mirrored);
                             }
                             SupervisorState::Unverifiable { stale_start } => {
                                 announce_supervisor_spare(
@@ -6492,6 +6898,9 @@ impl Drop for ProfileRuntime {
                 logline!("clauth: drop cleanup failed: {e}");
                 return;
             }
+        }
+        if let Some(tombstone) = retired.take() {
+            rescue_tombstone(&tombstone);
         }
         if !stop {
             return;
@@ -6524,12 +6933,14 @@ impl Drop for ProfileRuntime {
                     clear_stop_in_flight(&self.swap.runtime);
                     return;
                 }
-                let _ = std::fs::remove_dir_all(&self.swap.runtime);
-                let _ = std::fs::remove_dir(&self.sessions);
+                retired = self.retire_own_tree(mirrored);
             }
             Err(e) => logline!("clauth: drop cleanup failed: {e}"),
         }
         clear_stop_in_flight(&self.swap.runtime);
+        if let Some(tombstone) = retired {
+            rescue_tombstone(&tombstone);
+        }
     }
 }
 
@@ -7882,6 +8293,11 @@ impl SupervisorStopDeadlineGuard {
         let prev = SUPERVISOR_STOP_DEADLINE.with(|c| c.replace(Some(deadline)));
         Self(prev)
     }
+
+    /// The calling thread's deadline, for a worker it hands a stop to.
+    pub(crate) fn current() -> Option<Duration> {
+        SUPERVISOR_STOP_DEADLINE.with(std::cell::Cell::get)
+    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -8284,7 +8700,7 @@ fn try_real_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
 ///
 /// Same `Some(0)`-is-absent / `None`-is-unknown shape as [`live_marker_names`],
 /// and the reason is sharper here because this is the DESTRUCTIVE level: all
-/// three callers turn a zero into `remove_dir_all` of a runtime tree, which under
+/// three callers turn a zero into retiring a runtime tree, which under
 /// [`LinkMode::Fake`] is shared by every session of the profile+flavor. An
 /// unreadable dir, or an entry that cannot be read, is therefore an unknown —
 /// folding either into a zero would hand a live session's tree to the sweep.

@@ -2265,6 +2265,25 @@ fn the_save_cue_names_the_save_before_the_action_before_the_pool() {
     check_cue(&app, "alpha", 80);
 }
 
+/// While the exit wait holds on a running profile delete, the cue names the
+/// profile being deleted, as the cue builder words it for that name.
+#[test]
+fn the_save_cue_names_the_profile_a_running_delete_removes() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    for w in [80, 34] {
+        let mut app = bare_app();
+        app.tab = Tab::Setup;
+        app.deleting = Some(crate::profile::ProfileName::from("gone"));
+        app.exit_wait = true;
+        let expected = format!(
+            " {SAVE_CUE_LEADER}{}",
+            prose::plain(&save_cue("gone", w - 2))
+        );
+        assert_eq!(cue_row(&app, w), expected, "whole row at {w}");
+    }
+}
+
 /// A Setup `+ new` form of `account_type` with its cursor on `+ login` and the
 /// cached shunt reason seeded — the state the footer's `+ login` hint reads.
 /// The caller holds the `HomeSandbox` across `App::new`.
