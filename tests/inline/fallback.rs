@@ -8282,6 +8282,28 @@ fn start_pick_returns_the_picked_member_and_its_demand() {
     assert!(rows[1].block.is_none());
 }
 
+/// Issue #115: when fallback_chain is non-empty but none of its members exist,
+/// start_pick must refuse with `--auto found no chain member that exists (alice, bob)`
+/// rather than blaming headroom.
+#[test]
+fn start_pick_refuses_when_no_chain_members_exist() {
+    let _sb = start_walk_sandbox(&["alice", "bob"]);
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec![ProfileName::from("alice"), ProfileName::from("bob")],
+            ..AppState::default()
+        },
+        profiles: Vec::new(),
+    };
+    let Err(err) = start_pick(&config, Isolation::Shared, &[], [None, None], false, None) else {
+        panic!("non-existent chain members must refuse");
+    };
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member that exists (alice, bob)"
+    );
+}
+
 /// The refusal header names a family only when every judged member carries the
 /// same set of families: order does not matter (`a` names opus-then-sonnet,
 /// `b` sonnet-then-opus — the same launch either way), and the first member's

@@ -858,6 +858,10 @@ fn start_lines_match_the_approved_copy() {
         start_refusal(&none, &[]),
         "--auto found no chain member with headroom"
     );
+    assert_eq!(
+        start_no_member_exists_refusal(&["alice", "bob"]),
+        "--auto found no chain member that exists (alice, bob)"
+    );
 }
 
 /// The age cell has three absences and they mean DIFFERENT things. "no usage

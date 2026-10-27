@@ -961,6 +961,16 @@ pub(crate) fn start_launch_line(name: &str, demand: &[String]) -> String {
     )
 }
 
+/// The refusal when a non-empty fallback chain has no members that exist (issue #115).
+pub(crate) fn start_no_member_exists_refusal(names: &[impl AsRef<str>]) -> String {
+    let joined = names
+        .iter()
+        .map(|n| n.as_ref())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("--auto found no chain member that exists ({joined})")
+}
+
 /// The `--auto` no-member refusal: the first line plus, when rows exist, the
 /// explain rows rendered with no `*` on any of them.
 pub(crate) fn start_refusal(demand: &[String], rows: &[StartCandidate]) -> String {

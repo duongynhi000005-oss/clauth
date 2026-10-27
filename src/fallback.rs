@@ -2211,6 +2211,12 @@ pub(crate) fn start_pick(
         cwd,
     );
     let Some(pick) = pick else {
+        if rows.is_empty() {
+            anyhow::bail!(
+                "{}",
+                crate::format::start_no_member_exists_refusal(&config.state.fallback_chain)
+            );
+        }
         let demand = shared_demand(&rows);
         anyhow::bail!(
             "{}",
