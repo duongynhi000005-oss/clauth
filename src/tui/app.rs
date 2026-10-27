@@ -5048,6 +5048,17 @@ pub(crate) struct App {
     /// ([`crate::daemon::gateway::left_behind_gateway_runs`]), which picks the
     /// no-daemon toast's copy.
     pub(crate) left_behind_probe: ProbeWorker<bool>,
+    /// A fresh daemon's `binary_replaced` as last read beside `daemon_health`:
+    /// the plugin card's line holds exactly while it is set, and each rise
+    /// tints the Services tab. Starts unset, so a first reading of `true`
+    /// counts as a rise.
+    pub(crate) daemon_binary_replaced: bool,
+    /// The daemon's replaced-binary toast was raised; it toasts once per run.
+    pub(crate) daemon_replaced_toasted: bool,
+    /// This TUI's own replaced-binary toast was raised; it toasts once per run,
+    /// never on a probe made while this process's own self-update holds its
+    /// mark.
+    pub(crate) own_replaced_toasted: bool,
     /// A `start daemon` / `stop daemon` worker is running; the action menu
     /// offers neither verb until its outcome lands. UI-thread-only.
     pub(crate) daemon_control_busy: bool,
@@ -5829,6 +5840,9 @@ impl App {
             gateway_state: crate::daemon::gateway_slot(daemon_health).0.state,
             gateway_unrun: false,
             left_behind_probe: ProbeWorker::new(crate::daemon::gateway::left_behind_gateway_runs),
+            daemon_binary_replaced: false,
+            daemon_replaced_toasted: false,
+            own_replaced_toasted: false,
             last_daemon_probe: Instant::now(),
             daemon_control_busy: false,
             daemon_control_rx,
@@ -12524,15 +12538,7 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
     if app.services.cursor > max {
         app.services.cursor = max;
     }
-    let problems = app
-        .services
-        .selected_check()
-        .map(|c| c.problems.len())
-        .unwrap_or(0)
-        .saturating_sub(1);
-    if app.services.problem_cursor > problems {
-        app.services.problem_cursor = problems;
-    }
+    clamp_problem_cursor(app);
 
     // A delegates detail that emptied while descended has nothing left to
     // select: ascend to the selector so the footer and the pane focus cannot
@@ -20574,6 +20580,7 @@ fn drain_daemon_control(app: &mut App) {
 fn reprobe_daemon(app: &mut App) {
     app.daemon_health = crate::daemon::daemon_health();
     sync_gateway_state(app);
+    sync_daemon_binary_replaced(app);
     app.last_daemon_probe = Instant::now();
 }
 
@@ -25588,6 +25595,11 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             app.rebaseline_and_forget(reload_fingerprint());
             run_herdr_heal(app, &path);
         }
+        // Asked at the install itself, never off a cached reading: the
+        // install registers the plugin tree this process's image carries.
+        ConfirmAction::InstallPlugin if crate::plugin_host::self_exe_replaced() => {
+            app.toast(ToastKind::Warning, OWN_BINARY_REPLACED_INSTALL);
+        }
         ConfirmAction::InstallPlugin => match crate::plugin_host::install() {
             // A no-op from a row that read "not installed" means the backend
             // never ran — `claude` not on PATH is the reachable case (agentgear
@@ -26921,6 +26933,73 @@ fn poll_daemon_health(app: &mut App) {
     app.last_daemon_probe = Instant::now();
     app.daemon_health = crate::daemon::daemon_health();
     sync_gateway_state(app);
+    sync_daemon_binary_replaced(app);
+    // The image this process runs never comes back, so the toast latches once
+    // raised. A replaced binary read while this process's own self-update
+    // holds its mark is credited to that update, whose `Installed` toast says
+    // it. That credit may be wrong, so such a probe stays quiet without
+    // latching, and a replacement by anything else still toasts once a failed
+    // update clears the mark. The mark is read after the replaced check: the
+    // update sets it before its rename, so a rename this probe saw is already
+    // marked.
+    if !app.own_replaced_toasted
+        && crate::plugin_host::self_exe_replaced()
+        && !crate::update::replaced_by_self_update()
+    {
+        app.own_replaced_toasted = true;
+        app.toast(ToastKind::Warning, OWN_BINARY_REPLACED);
+    }
+}
+
+/// The toast a fresh daemon on a replaced binary raises, once per run.
+const DAEMON_BINARY_REPLACED: &str = "the daemon runs a replaced clauth binary and skips the plugin self-heal: restart it with `clauth daemon --replace`";
+
+/// The plugin card's line while a fresh daemon runs a replaced binary; the
+/// services renderer draws it whole in the warning tone, never through the
+/// `key: value` splitter.
+pub(crate) const DAEMON_REPLACED_CARD_LINE: &str = "daemon on a replaced binary: plugin self-heal off until it restarts (`clauth daemon --replace`)";
+
+/// The toast this TUI raises, once per run, on the first probe that reads its
+/// own executable replaced while its own self-update holds no mark.
+const OWN_BINARY_REPLACED: &str =
+    "this clauth runs a replaced binary: quit and reopen it to run the new one";
+
+/// The refusal in place of the plugin install while this TUI's own executable
+/// stays replaced: the install would register the plugin tree baked into the
+/// old image.
+const OWN_BINARY_REPLACED_INSTALL: &str =
+    "this clauth runs a replaced binary: quit and reopen it before installing the plugin";
+
+/// Re-read a fresh daemon's `binary_replaced` under the health the app holds
+/// now. A rise tints the Services tab and raises the once-per-run toast; any
+/// flip rebuilds the plugin card, so its line follows the flag on this cadence
+/// rather than waiting for a Services recompute.
+fn sync_daemon_binary_replaced(app: &mut App) {
+    let replaced = crate::daemon::daemon_binary_replaced(app.daemon_health);
+    if replaced == app.daemon_binary_replaced {
+        return;
+    }
+    app.daemon_binary_replaced = replaced;
+    if replaced {
+        app.set_tab_activity(Tab::Services, ToastKind::Warning);
+        if !app.daemon_replaced_toasted {
+            app.daemon_replaced_toasted = true;
+            app.toast(ToastKind::Warning, DAEMON_BINARY_REPLACED);
+        }
+    }
+    refresh_plugin_check(app);
+}
+
+/// Rebuild only the `plugin` row from the cheap local reads, keeping the
+/// detail's problem cursor in range. No row yet (no recompute has run) leaves
+/// the first recompute to build it.
+fn refresh_plugin_check(app: &mut App) {
+    let Some(idx) = app.services.checks.iter().position(|c| c.label == "plugin") else {
+        return;
+    };
+    let clauth_path = crate::plugin_probe::on_path("clauth");
+    app.services.checks[idx] = plugin_row(app, clauth_path.as_deref());
+    clamp_problem_cursor(app);
 }
 
 /// Re-read the producer's tps cache on the same once-a-second cadence as the
@@ -27301,11 +27380,7 @@ fn plugin_herdr_checks(
     app: &App,
     clauth_path: Option<&std::path::Path>,
 ) -> (Check, Option<(Check, Option<crate::herdr::ConfigStatus>)>) {
-    let plugin = plugin_check(
-        clauth_path,
-        app.services.cc_version.clone(),
-        app.services.mcp_boot.clone(),
-    );
+    let plugin = plugin_row(app, clauth_path);
     let herdr = app
         .services
         .herdr
@@ -27321,6 +27396,37 @@ fn plugin_herdr_checks(
             (herdr_check(probe, config.as_ref()), config)
         });
     (plugin, herdr)
+}
+
+/// The `plugin` row over the cached probes, closed by the daemon's
+/// replaced-binary line while the app holds that flag. The line moves no
+/// health: the heal only waits for the daemon's restart.
+fn plugin_row(app: &App, clauth_path: Option<&std::path::Path>) -> Check {
+    let mut check = plugin_check(
+        clauth_path,
+        app.services.cc_version.clone(),
+        app.services.mcp_boot.clone(),
+    );
+    // Its own group, last: the renderer wraps it over several rows, and past
+    // every fix line those rows move no fix line's rendered row.
+    if app.daemon_binary_replaced {
+        check.detail.push(String::new());
+        check.detail.push(DAEMON_REPLACED_CARD_LINE.to_string());
+    }
+    check
+}
+
+/// Keep the detail's problem cursor inside the selected row's problem set.
+fn clamp_problem_cursor(app: &mut App) {
+    let problems = app
+        .services
+        .selected_check()
+        .map(|c| c.problems.len())
+        .unwrap_or(0)
+        .saturating_sub(1);
+    if app.services.problem_cursor > problems {
+        app.services.problem_cursor = problems;
+    }
 }
 
 /// Re-read only the plugin and herdr rows' health while the Services tab is

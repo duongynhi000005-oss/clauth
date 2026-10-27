@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -148,6 +148,58 @@ pub(crate) fn spawn(tx: Sender<UpdateEvent>, saved_auto_update: bool) -> Option<
         })
         .expect("failed to spawn update thread");
     Some(UpdateThread { handle, gate })
+}
+
+/// Set while this process's own self-update is replacing, or has replaced, the
+/// running binary: from just before the replace call until that call fails or
+/// unwinds, and for the rest of the run once it succeeds.
+static REPLACED_BY_SELF_UPDATE: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process's own self-update has begun replacing the running
+/// binary and has not failed. A replaced binary read while it holds is
+/// credited to that self-update, which may be wrong: a replacement made by
+/// anything else reads the same during the replace call, and after a
+/// successful one.
+pub(crate) fn replaced_by_self_update() -> bool {
+    REPLACED_BY_SELF_UPDATE.load(Ordering::SeqCst)
+}
+
+/// Poses this process's own self-update replacement until dropped. The mark is
+/// process-global, so it serializes on `HOME_TEST_LOCK`; set it under a
+/// `HomeSandbox`.
+#[cfg(all(test, unix))]
+pub(crate) struct OwnReplaceMark(());
+
+#[cfg(all(test, unix))]
+impl OwnReplaceMark {
+    #[must_use = "the mark clears when the guard drops"]
+    pub(crate) fn set() -> Self {
+        assert!(
+            crate::lockorder::holds::<crate::lockorder::rank::HomeTest>(),
+            "the self-update mark serializes on `HOME_TEST_LOCK`; set it under a `HomeSandbox`"
+        );
+        REPLACED_BY_SELF_UPDATE.store(true, Ordering::SeqCst);
+        Self(())
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for OwnReplaceMark {
+    fn drop(&mut self) {
+        REPLACED_BY_SELF_UPDATE.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Clear the self-update mark so a test drives the replace step fresh. The
+/// mark is process-global, so it serializes on `HOME_TEST_LOCK`; call under a
+/// `HomeSandbox`.
+#[cfg(test)]
+pub(crate) fn reset_self_update_mark_for_test() {
+    assert!(
+        crate::lockorder::holds::<crate::lockorder::rank::HomeTest>(),
+        "the self-update mark serializes on `HOME_TEST_LOCK`; call under a `HomeSandbox`"
+    );
+    REPLACED_BY_SELF_UPDATE.store(false, Ordering::SeqCst);
 }
 
 /// The three states of the replace gate: `idle` (no replace, the exit wait may
@@ -508,10 +560,40 @@ fn download_and_replace(
         return Ok(false);
     };
     let (_staging_dir, staged) = stage_verified(&bytes)?;
-    self_replace::self_replace(&staged)?;
+    replace_marked(&staged, |staged| self_replace::self_replace(staged))?;
     // `_staging_dir` drops here, removing the staged file.
 
     Ok(true)
+}
+
+/// Runs `replace(staged)` under the self-update mark. The mark is set before
+/// the call, since the rename lands inside it: one set after it returns leaves
+/// a window where the new file reads unmarked. A call that fails or unwinds
+/// has not put the update's binary in place, so the mark clears; a call that
+/// succeeds keeps it for the rest of the run.
+fn replace_marked(
+    staged: &std::path::Path,
+    replace: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    REPLACED_BY_SELF_UPDATE.store(true, Ordering::SeqCst);
+    let mut clear = ClearSelfUpdateMark { armed: true };
+    replace(staged)?;
+    clear.armed = false;
+    Ok(())
+}
+
+/// Clears the self-update mark on drop while armed, so an `Err` return and an
+/// unwind out of the replace call both clear it.
+struct ClearSelfUpdateMark {
+    armed: bool,
+}
+
+impl Drop for ClearSelfUpdateMark {
+    fn drop(&mut self) {
+        if self.armed {
+            REPLACED_BY_SELF_UPDATE.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Stage the verified bytes as an executable file inside a fresh private

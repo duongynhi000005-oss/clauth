@@ -1367,3 +1367,42 @@ fn repoint_registry_says_nothing_when_clean() {
         "no write (mtime)"
     );
 }
+
+/// The query the feed build and the TUI ask answers the heal's verdict but
+/// says nothing: neither the stand-down line nor the fail-open note, which
+/// both speak for a heal that is not running.
+#[cfg(unix)]
+#[test]
+fn the_replaced_query_reports_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    super::reset_stand_down_report_for_test();
+    super::reset_record_failure_report_for_test();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    {
+        let _self = super::SelfExeOverride::pin(Some(recorded.as_path()));
+        assert!(
+            !super::self_exe_replaced(),
+            "an unchanged binary reads false"
+        );
+        let replacement =
+            crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+        std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+        assert!(super::self_exe_replaced(), "a replaced binary reads true");
+        assert!(super::self_exe_replaced(), "and reads true again");
+    }
+    {
+        let _self = super::SelfExeOverride::pin(None);
+        assert!(
+            !super::self_exe_replaced(),
+            "a failed recording reads as unchanged"
+        );
+    }
+    assert_eq!(
+        lines.snapshot(),
+        Vec::<String>::new(),
+        "the query logs nothing"
+    );
+}

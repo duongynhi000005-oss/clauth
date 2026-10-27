@@ -10535,3 +10535,133 @@ fn the_delegates_detail_writes_its_page_keys_joined() {
         "no hint spells `page up`: {hints:?}"
     );
 }
+
+/// The plugin card the recompute builds while a fresh daemon runs a replaced
+/// binary: every row above the line renders exactly as the card without it
+/// (the line never joins the `key: value` column), then a blank row, then the
+/// line wrapped whole at every width, in the warning tone with its command
+/// marked, closing the card.
+#[test]
+fn the_daemon_replaced_line_wraps_whole_under_an_unchanged_card() {
+    use crate::tui::app::{ShuntRefresh, Tab, recompute_services_checks};
+    const TALL: u16 = 40;
+    let _home = crate::testutil::HomeSandbox::new();
+    let shown = "daemon on a replaced binary: plugin self-heal off until it restarts (clauth daemon --replace)";
+    let compact: Vec<char> = shown.chars().filter(|c| *c != ' ').collect();
+    let command_len = "clauthdaemon--replace".len();
+    let command_at = compact.len() - command_len - 1;
+    for wide in [80u16, 120, 160] {
+        let frame = |replaced: bool| {
+            let mut app = App::new(AppConfig {
+                state: AppState::default(),
+                profiles: Vec::new(),
+            });
+            app.tab = Tab::Services;
+            app.daemon_binary_replaced = replaced;
+            recompute_services_checks(&mut app, false, ShuntRefresh::Keep);
+            app.services.cursor = app
+                .services
+                .checks
+                .iter()
+                .position(|c| c.label == "plugin")
+                .expect("plugin row");
+            let mut term = Terminal::new(TestBackend::new(wide, TALL)).unwrap();
+            term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
+            term.backend().buffer().clone()
+        };
+        let without = frame(false);
+        let with = frame(true);
+        let rows: Vec<Vec<char>> = crate::testutil::buffer_rows(&with)
+            .iter()
+            .map(|r| r.chars().collect())
+            .collect();
+        let w = wide as usize;
+        let text = |row: &[char]| row.iter().collect::<String>();
+        let first = rows
+            .iter()
+            .position(|r| text(r).contains("daemon on a replaced"))
+            .unwrap_or_else(|| panic!("{wide} cols: no line: {rows:#?}"));
+        let col0 = text(&rows[first])
+            .find("daemon on a replaced")
+            .map_or(0, |at| text(&rows[first])[..at].chars().count());
+        let right = rows[first]
+            .iter()
+            .rposition(|c| *c == '│')
+            .expect("the pane's right border");
+
+        for (row, chars) in rows.iter().enumerate().take(first - 1) {
+            for col in 0..w {
+                let (a, b) = (
+                    &with.content[row * w + col],
+                    &without.content[row * w + col],
+                );
+                assert_eq!(
+                    (a.symbol(), a.style()),
+                    (b.symbol(), b.style()),
+                    "{wide} cols, row {row}, column {col}: {:?}",
+                    text(chars)
+                );
+            }
+        }
+        assert!(
+            rows[first - 1][col0..right].iter().all(|c| *c == ' '),
+            "{wide} cols: a blank row sets the line off: {:?}",
+            text(&rows[first - 1])
+        );
+
+        let mut joined: Vec<String> = Vec::new();
+        let mut cells: Vec<(char, ratatui::style::Color)> = Vec::new();
+        for (row, chars) in rows.iter().enumerate().skip(first) {
+            let piece = text(&chars[col0..right]);
+            if piece.trim().is_empty() {
+                break;
+            }
+            joined.push(piece.trim().to_string());
+            for (col, ch) in chars.iter().enumerate().take(right).skip(col0) {
+                let cell = &with.content[row * w + col];
+                if cell.symbol() != " " {
+                    cells.push((*ch, cell.fg));
+                }
+            }
+        }
+        assert_eq!(joined.join(" "), shown, "{wide} cols: the line wraps whole");
+        assert_eq!(
+            cells.len(),
+            compact.len(),
+            "{wide} cols: every glyph renders"
+        );
+        for (i, (ch, fg)) in cells.iter().enumerate() {
+            let expected = if (command_at..command_at + command_len).contains(&i) {
+                super::theme::accent_color()
+            } else {
+                super::theme::warning_color()
+            };
+            assert_eq!(
+                (*ch, *fg),
+                (compact[i], expected),
+                "{wide} cols: glyph {i} of the line"
+            );
+        }
+        // The line closes the card: past it the pane is blank down to its
+        // bottom border, so no fix line sits under a wrapped row.
+        let bottom = rows
+            .iter()
+            .enumerate()
+            .skip(first)
+            .find(|(_, chars)| chars[col0..right].iter().all(|c| *c == '─'))
+            .map(|(row, _)| row)
+            .expect("the pane's bottom border");
+        for (row, chars) in rows
+            .iter()
+            .enumerate()
+            .take(bottom)
+            .skip(first + joined.len())
+        {
+            assert!(
+                chars[col0..right].iter().all(|c| *c == ' '),
+                "{wide} cols: row {row} under the line is blank: {:?}",
+                text(chars)
+            );
+        }
+    }
+}

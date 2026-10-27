@@ -927,3 +927,93 @@ fn the_replace_gate_refuses_a_replace_after_the_exit_gave_up() {
     );
     assert!(gate.begin().is_none());
 }
+
+// ── replace_marked ─────────────────────────────────────────────────────────
+
+/// Clears the process-global self-update mark when a test ends, failing or
+/// not, so a red mark test cannot leave later tests in the same process
+/// reading a set mark. Stores directly: a fixture's `Drop` never asserts.
+/// Bind it after the `HomeSandbox`, so it drops while `HOME_TEST_LOCK` is
+/// still held.
+struct ClearMarkAtEnd;
+
+impl Drop for ClearMarkAtEnd {
+    fn drop(&mut self) {
+        REPLACED_BY_SELF_UPDATE.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The replace step marks the replacement as this process's own before the
+/// replace call runs (a probe during the call already reads it) and keeps the
+/// mark once the call succeeds.
+#[test]
+fn a_successful_replace_is_marked_from_before_the_call() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+    assert!(!replaced_by_self_update(), "no replace yet, no mark");
+
+    let mut seen_during = None;
+    replace_marked(std::path::Path::new("staged"), |staged| {
+        assert_eq!(
+            staged,
+            std::path::Path::new("staged"),
+            "the staged path passes through"
+        );
+        seen_during = Some(replaced_by_self_update());
+        Ok(())
+    })
+    .expect("the replace succeeds");
+
+    assert_eq!(
+        seen_during,
+        Some(true),
+        "the mark is set before the call runs"
+    );
+    assert!(replaced_by_self_update(), "and stays after it succeeds");
+}
+
+/// A failed replace has not put the update's binary in place, so the mark
+/// clears and the error reaches the caller unchanged.
+#[test]
+fn a_failed_replace_clears_the_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+
+    let mut seen_during = None;
+    let err = replace_marked(std::path::Path::new("staged"), |_| {
+        seen_during = Some(replaced_by_self_update());
+        Err(std::io::Error::other("rename refused"))
+    })
+    .expect_err("the replace fails");
+
+    assert_eq!(
+        err.to_string(),
+        "rename refused",
+        "the error passes through"
+    );
+    assert_eq!(seen_during, Some(true), "the mark was set during the call");
+    assert!(!replaced_by_self_update(), "and clears once it fails");
+}
+
+/// A replace call that panics clears the mark as it unwinds: a mark left set
+/// would silence the replaced-binary toast for the rest of the run.
+#[test]
+fn a_panicking_replace_clears_the_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+
+    let unwound = std::panic::catch_unwind(|| {
+        let _ = replace_marked(std::path::Path::new("staged"), |_| -> std::io::Result<()> {
+            panic!("the replace call panicked")
+        });
+    });
+
+    assert!(unwound.is_err(), "the panic propagates");
+    assert!(
+        !replaced_by_self_update(),
+        "and the mark clears as it unwinds"
+    );
+}

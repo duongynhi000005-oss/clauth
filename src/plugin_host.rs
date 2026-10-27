@@ -648,39 +648,56 @@ fn seam_record_read() -> Option<Option<RecordedSelfExe>> {
     }
 }
 
+/// The record the stand-down compares against, fed by the test seam or the
+/// production read: `Some(None)` is "recording failed at start", `None` (an
+/// unpinned test caller only) is "unchanged" without touching the process's
+/// own record, so a mid-run rebuild of the test binary cannot stand down
+/// unrelated heal tests.
+#[cfg(all(test, unix))]
+fn self_exe_read() -> Option<Option<RecordedSelfExe>> {
+    seam_record_read()
+}
+
+#[cfg(not(all(test, unix)))]
+fn self_exe_read() -> Option<Option<RecordedSelfExe>> {
+    Some(recorded_self_exe())
+}
+
+impl RecordedSelfExe {
+    /// The one stand-down decision: stat the recorded path for real and compare
+    /// its identity. `true` when the file was replaced or is gone.
+    fn replaced(&self) -> bool {
+        ExecutableIdentity::of_path(&self.path) != Some(self.identity)
+    }
+}
+
 /// Whether the heal leg must stand down because this process's own executable
 /// was replaced since it started, reporting once per process with the recorded
 /// path (the stand-down line) or, when recording failed, the fail-open line.
 /// `false` -> heal.
 fn heal_stands_down() -> bool {
-    #[cfg(all(test, unix))]
-    let read = seam_record_read();
-    #[cfg(not(all(test, unix)))]
-    let read = Some(recorded_self_exe());
-
-    match read {
-        // Test-only: an unpinned caller defaults to "unchanged" (heal) without
-        // touching the process's own record, so a mid-run rebuild of the test
-        // binary cannot stand down unrelated heal tests.
+    match self_exe_read() {
         None => false,
         Some(None) => {
             report_record_failure_once();
             false
         }
-        Some(Some(record)) => decision_for(record),
+        Some(Some(record)) => {
+            if !record.replaced() {
+                return false;
+            }
+            report_stand_down_once(&record.path);
+            true
+        }
     }
 }
 
-/// The one stand-down decision, fed by both the test seam and the production
-/// read: stat the recorded path for real and compare its identity. `false` ->
-/// heal (unchanged); `true` -> stand down (replaced or gone), reported once.
-fn decision_for(record: RecordedSelfExe) -> bool {
-    let current = ExecutableIdentity::of_path(&record.path);
-    if current == Some(record.identity) {
-        return false;
-    }
-    report_stand_down_once(&record.path);
-    true
+/// Whether this process's own executable was replaced since it started: the
+/// heal's stand-down decision asked by a caller that is not a heal leg (the
+/// status feed's build, the TUI), so it reports nothing. A failed record reads
+/// as unchanged, the heal's own fail-open.
+pub(crate) fn self_exe_replaced() -> bool {
+    matches!(self_exe_read(), Some(Some(record)) if record.replaced())
 }
 
 /// Whether the heal-leg stand-down was already reported this process, so the

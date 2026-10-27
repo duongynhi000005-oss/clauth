@@ -776,6 +776,13 @@ pub(crate) struct StatusBody {
     /// stays additive-tolerant of an older writer.
     #[serde(default)]
     pub(crate) credit_billed_families: Vec<String>,
+    /// Additive: whether the WRITER's own executable was replaced since it
+    /// started, the verdict its plugin heal stands down on
+    /// ([`crate::plugin_host::self_exe_replaced`]), so a same-version rebuild
+    /// counts. Only a fresh daemon's value says anything about the daemon.
+    /// `default` so a reader stays additive-tolerant of an older writer.
+    #[serde(default)]
+    pub(crate) binary_replaced: bool,
     pub(crate) profiles: Vec<ProfileEntry>,
 }
 
@@ -864,16 +871,18 @@ pub(crate) fn build_status_with_codex(
     build_status_impl(config, interval_ms, live, include_disabled, true)
 }
 
-/// [`build_status_with_codex`] with the tps slot included or skipped. The
-/// daemonless republish path skips it: it backdates `generated_at` and would
-/// freeze a `tps.age_secs ~0` over a stale stamp, and the slot is the daemon's
-/// to republish.
+/// [`build_status_with_codex`] for a body that carries its writer's own stamp
+/// (`own_stamp`) or a daemon's backdated one. The daemonless republish passes
+/// `false`: its stamp vouches for a daemon, not for this process, so it carries
+/// neither the tps slot (it would freeze a `tps.age_secs ~0` over a stale
+/// stamp, and the slot is the daemon's to republish) nor a `true`
+/// `binary_replaced` (this process's verdict would read as the daemon's).
 pub(crate) fn build_status_impl(
     config: &AppConfig,
     interval_ms: u64,
     live: Option<&LiveSignals>,
     include_disabled: bool,
-    include_tps: bool,
+    own_stamp: bool,
 ) -> (StatusBody, Option<crate::codex_profiles::CodexState>) {
     let mut profiles = build_profile_entries(
         config,
@@ -908,8 +917,9 @@ pub(crate) fn build_status_impl(
         clauth_version: env!("CARGO_PKG_VERSION").to_string(),
         gateway: Some(slot_or_record(live.and_then(|s| s.gateway))),
         proxies: super::proxies::entries(live.and_then(|s| s.proxies)),
-        tps: if include_tps { tps_slot() } else { None },
+        tps: if own_stamp { tps_slot() } else { None },
         credit_billed_families: crate::claude_json::credit_billed_families(),
+        binary_replaced: own_stamp && crate::plugin_host::self_exe_replaced(),
         profiles,
     };
     (body, codex)

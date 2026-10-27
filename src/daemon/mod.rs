@@ -30,7 +30,8 @@ use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header chip's daemon presence/health probe
 /// (dual-scheduler dedup, #27).
 pub(crate) use probe::{
-    DaemonHealth, FetchLease, daemon_health, gateway_slot, proxy_slots, singleton_held,
+    DaemonHealth, FetchLease, daemon_binary_replaced, daemon_health, gateway_slot, proxy_slots,
+    singleton_held,
 };
 /// The TUI's `stop daemon`: `--replace`'s termination with no claim after it.
 pub(crate) use probe::{DaemonStop, stop_running};

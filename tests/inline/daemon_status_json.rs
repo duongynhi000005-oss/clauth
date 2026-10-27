@@ -83,6 +83,7 @@ fn build_status_top_level_shape_and_active() {
         [
             "active_codex_profile",
             "active_profile",
+            "binary_replaced",
             "clauth_version",
             "codex_fallback_chain",
             "codex_wrap_off",
@@ -1931,6 +1932,7 @@ fn status_body_matches_legacy_json_bytes() {
         proxies: Vec::new(),
         tps: None,
         credit_billed_families: vec!["fable".to_string(), "mythos".to_string()],
+        binary_replaced: true,
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -2041,7 +2043,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
         r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
         r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
-        r#""credit_billed_families":["fable","mythos"],"profiles":["#,
+        r#""credit_billed_families":["fable","mythos"],"binary_replaced":true,"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
@@ -2081,6 +2083,7 @@ fn status_body_matches_legacy_json_bytes() {
         proxies: Vec::new(),
         tps: None,
         credit_billed_families: Vec::new(),
+        binary_replaced: false,
         profiles: vec![],
     };
     let expected = concat!(
@@ -2088,7 +2091,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
         r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
-        r#""credit_billed_families":[],"profiles":[]}"#,
+        r#""credit_billed_families":[],"binary_replaced":false,"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -3479,5 +3482,74 @@ fn the_status_body_never_publishes_the_tps_attribution_timeline() {
         body["tps"].get("entries").is_none(),
         "the tps slot hides the timeline: {}",
         body["tps"]
+    );
+}
+
+/// `binary_replaced` is the writer's own plugin-heal stand-down verdict, never
+/// a version compare: a same-path rename-replace (a rebuild at the same
+/// version) publishes `true`, an untouched recorded binary `false`.
+#[cfg(unix)]
+#[test]
+fn binary_replaced_publishes_the_writers_own_stand_down_verdict() {
+    let home = HomeSandbox::new();
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(
+        v["binary_replaced"],
+        serde_json::json!(false),
+        "an unchanged binary publishes false"
+    );
+
+    let replacement =
+        crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+    std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(
+        v["binary_replaced"],
+        serde_json::json!(true),
+        "a replaced binary publishes true"
+    );
+}
+
+/// A daemonless republish carries a daemon's backdated stamp, so its writer's
+/// own replaced binary never reaches the feed: the same writer publishes
+/// `true` under its own stamp and `false` under the backdated one.
+#[cfg(unix)]
+#[test]
+fn a_backdated_republish_never_publishes_its_writers_replaced_binary() {
+    let home = HomeSandbox::new();
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+    let replacement =
+        crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+    std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+
+    let feed = |stamp: Option<&str>| -> serde_json::Value {
+        serde_json::from_slice(
+            &crate::daemon::status_feed_json(&config, None, stamp).expect("feed serializes"),
+        )
+        .expect("feed parses")
+    };
+    assert_eq!(
+        feed(None)["binary_replaced"],
+        serde_json::json!(true),
+        "the writer's own stamp carries its verdict"
+    );
+    assert_eq!(
+        feed(Some("2026-09-13T00:00:00+00:00"))["binary_replaced"],
+        serde_json::json!(false),
+        "a backdated stamp vouches for a daemon, so the writer's verdict stays out"
     );
 }

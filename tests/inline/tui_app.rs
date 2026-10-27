@@ -51385,3 +51385,428 @@ fn x_does_not_clear_the_save_cue_during_the_exit_wait() {
     );
     rig.drain();
 }
+
+/// The plugin card's line while the daemon runs a replaced binary.
+const DAEMON_REPLACED_CARD_LINE: &str = "daemon on a replaced binary: plugin self-heal off until it restarts (`clauth daemon --replace`)";
+
+/// The toast a daemon on a replaced binary raises, its command marked.
+const DAEMON_REPLACED_TOAST: &str = "the daemon runs a replaced clauth binary and skips the plugin self-heal: restart it with \u{E001}clauth daemon --replace\u{E002}";
+
+fn daemon_replaced_toasts(app: &App) -> Vec<super::ToastKind> {
+    app.toasts
+        .iter()
+        .filter(|t| t.body == DAEMON_REPLACED_TOAST)
+        .map(|t| t.kind)
+        .collect()
+}
+
+fn plugin_card_carries_daemon_line(app: &App) -> bool {
+    app.services
+        .checks
+        .iter()
+        .find(|c| c.label == "plugin")
+        .expect("plugin row")
+        .detail
+        .iter()
+        .any(|line| line == DAEMON_REPLACED_CARD_LINE)
+}
+
+/// A fresh daemon feed saying `binary_replaced: true` raises one warning toast
+/// per run, tints the Services tab until it is visited, and puts a line on the
+/// plugin card that holds exactly while the feed says so. The daemon probe's
+/// own cadence drives all three: the test never recomputes the card itself
+/// after the first seed.
+#[test]
+fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
+    use crate::daemon::DaemonHealth;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = hold_daemon_lock();
+    let feed = |replaced: bool| write_replaced_feed(&chrono::Utc::now().to_rfc3339(), replaced);
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    feed(false);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.daemon_health,
+        DaemonHealth::Fresh,
+        "the posed daemon reads live"
+    );
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    app.tab_activity[super::Tab::Services.index()] = None;
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "a current daemon raises nothing"
+    );
+    assert!(!plugin_card_carries_daemon_line(&app), "nor a card line");
+
+    feed(true);
+    poll_and_land(&mut app);
+    assert_eq!(
+        daemon_replaced_toasts(&app),
+        vec![super::ToastKind::Warning],
+        "the first true reading toasts once, in the warning tone"
+    );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Warning),
+        "the Services tab takes the warning tint"
+    );
+    assert!(
+        plugin_card_carries_daemon_line(&app),
+        "the card names the stand-down"
+    );
+
+    poll_and_land(&mut app);
+    assert_eq!(
+        daemon_replaced_toasts(&app).len(),
+        1,
+        "a re-read stays quiet"
+    );
+
+    super::switch_tab(&mut app, super::Tab::Services);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "a visit clears the tint"
+    );
+    super::switch_tab(&mut app, super::Tab::Overview);
+
+    feed(false);
+    poll_and_land(&mut app);
+    assert!(
+        !plugin_card_carries_daemon_line(&app),
+        "the line goes once the feed clears"
+    );
+
+    feed(true);
+    poll_and_land(&mut app);
+    assert_eq!(
+        daemon_replaced_toasts(&app).len(),
+        1,
+        "the toast is once per run, never once per entry"
+    );
+    assert!(
+        plugin_card_carries_daemon_line(&app),
+        "the line returns with the flag"
+    );
+}
+
+/// Only a fresh daemon's feed counts: a feed saying `binary_replaced: true`
+/// with no daemon holding the lock (a dead daemon's last write) raises nothing.
+#[test]
+fn a_dead_daemons_replaced_flag_raises_nothing() {
+    use crate::daemon::DaemonHealth;
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let body = serde_json::json!({
+        "schema": 1,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "profiles": [],
+        "binary_replaced": true,
+    });
+    std::fs::write(
+        dir.join("status.json"),
+        serde_json::to_vec(&body).expect("serialize"),
+    )
+    .expect("write the feed");
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    poll_and_land(&mut app);
+    assert_eq!(app.daemon_health, DaemonHealth::Absent);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "no live daemon, no toast"
+    );
+    assert!(!plugin_card_carries_daemon_line(&app), "and no card line");
+}
+
+/// The toast this TUI raises once its own binary was replaced.
+#[cfg(unix)]
+const OWN_REPLACED_TOAST: &str =
+    "this clauth runs a replaced binary: quit and reopen it to run the new one";
+
+/// The refusal a replaced TUI gives in place of the plugin install.
+#[cfg(unix)]
+const OWN_REPLACED_INSTALL_REFUSAL: &str =
+    "this clauth runs a replaced binary: quit and reopen it before installing the plugin";
+
+#[cfg(unix)]
+fn own_replaced_toasts(app: &App) -> Vec<super::ToastKind> {
+    app.toasts
+        .iter()
+        .filter(|t| t.body == OWN_REPLACED_TOAST)
+        .map(|t| t.kind)
+        .collect()
+}
+
+/// This TUI's own executable replaced since it started (a rename-replace at
+/// the recorded path, the shape `cargo install` leaves) raises one warning
+/// toast on the daemon probe's cadence, and never again in the same run.
+#[cfg(unix)]
+#[test]
+fn a_replaced_tui_binary_toasts_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    poll_and_land(&mut app);
+    assert!(
+        own_replaced_toasts(&app).is_empty(),
+        "an unchanged binary raises nothing"
+    );
+
+    let replacement =
+        crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+    std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+    poll_and_land(&mut app);
+    assert_eq!(
+        own_replaced_toasts(&app),
+        vec![super::ToastKind::Warning],
+        "the replacement toasts once, in the warning tone"
+    );
+
+    poll_and_land(&mut app);
+    assert_eq!(own_replaced_toasts(&app).len(), 1, "a re-probe stays quiet");
+}
+
+/// A replaced TUI would install the plugin bytes its old image carries, so the
+/// confirmed install refuses: no `claude` spawn, nothing installed, and the
+/// refusal toast in place of the install's own outcome.
+#[cfg(unix)]
+#[test]
+fn a_replaced_tui_binary_refuses_the_plugin_install() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = crate::testutil::ConfigDirSandbox::new(&home, &config);
+    let fake = crate::testutil::FakeClaude::new(&home);
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+    let replacement =
+        crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+    std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+
+    let mut app = bare_app();
+    let baseline = fake.log();
+    super::run_confirm_action(&mut app, super::ConfirmAction::InstallPlugin);
+
+    assert_eq!(fake.log(), baseline, "a replaced TUI spawns no claude");
+    assert!(
+        crate::plugin_probe::installed_records().is_empty(),
+        "nothing is installed"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((super::ToastKind::Warning, OWN_REPLACED_INSTALL_REFUSAL)),
+        "the refusal names the restart"
+    );
+}
+
+/// Write a feed carrying `binary_replaced` under the given stamp.
+fn write_replaced_feed(generated_at: &str, replaced: bool) {
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let body = serde_json::json!({
+        "schema": 1,
+        "generated_at": generated_at,
+        "profiles": [],
+        "binary_replaced": replaced,
+    });
+    std::fs::write(
+        dir.join("status.json"),
+        serde_json::to_vec(&body).expect("serialize"),
+    )
+    .expect("write the feed");
+}
+
+/// Hold the daemon's singleton lock, posing a live daemon.
+fn hold_daemon_lock() -> std::fs::File {
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("clauthd.lock"))
+        .expect("open the daemon lock");
+    lock.try_lock().expect("pose a live daemon");
+    lock
+}
+
+/// A live daemon whose feed went stale (wedging, or a dead writer's last
+/// word under a held lock) says nothing about its binary: no toast, no tint,
+/// no card line.
+#[test]
+fn a_stale_daemons_replaced_flag_raises_nothing() {
+    use crate::daemon::DaemonHealth;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = hold_daemon_lock();
+    write_replaced_feed("2026-01-01T00:00:00+00:00", true);
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    app.tab_activity[super::Tab::Services.index()] = None;
+    poll_and_land(&mut app);
+    assert_eq!(app.daemon_health, DaemonHealth::Stale);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "a stale feed raises no toast"
+    );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "nor a tint"
+    );
+    assert!(!plugin_card_carries_daemon_line(&app), "nor a card line");
+}
+
+/// Each rise of the daemon's flag tints the Services tab again, though the
+/// toast stays once per run: a daemon replaced, restarted, then replaced
+/// again is news each time.
+#[test]
+fn every_rise_of_the_daemons_flag_tints_the_services_tab() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    super::switch_tab(&mut app, super::Tab::Services);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "a falling flag tints nothing"
+    );
+
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Warning),
+        "the second rise tints again"
+    );
+    assert_eq!(
+        daemon_replaced_toasts(&app).len(),
+        1,
+        "while the toast stays once per run"
+    );
+}
+
+/// A self-update replaces this TUI's own binary and says so itself
+/// (`updated to v… / restart to apply`), so the replaced-binary toast stays
+/// quiet for it, including for a probe that lands after the update's rename
+/// and before its report; the install refusal still holds.
+#[cfg(unix)]
+#[test]
+fn a_self_update_raises_no_second_replaced_binary_toast() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = crate::testutil::ConfigDirSandbox::new(&home, &config);
+    let fake = crate::testutil::FakeClaude::new(&home);
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.update_results = rx;
+
+    // The update thread's order: it marks the replacement its own, renames
+    // the new binary in, and only then reports `Installed`.
+    let _own = crate::update::OwnReplaceMark::set();
+    let replacement =
+        crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+    std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+    poll_and_land(&mut app);
+    assert!(
+        own_replaced_toasts(&app).is_empty(),
+        "a probe between the rename and the report sees the update's own replacement"
+    );
+
+    tx.send(crate::update::UpdateEvent::Installed("9.9.9".to_string()))
+        .expect("send");
+    super::on_tick(&mut app);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.toasts
+            .iter()
+            .filter(|t| t.kind == super::ToastKind::Success
+                && t.body == "updated to v9.9.9\nrestart to apply")
+            .count(),
+        1,
+        "the update says it once"
+    );
+    assert!(
+        own_replaced_toasts(&app).is_empty(),
+        "and the replaced-binary toast stays quiet"
+    );
+
+    let baseline = fake.log();
+    super::run_confirm_action(&mut app, super::ConfirmAction::InstallPlugin);
+    assert_eq!(fake.log(), baseline, "the install still refuses");
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((super::ToastKind::Warning, OWN_REPLACED_INSTALL_REFUSAL)),
+        "naming the restart"
+    );
+}
+
+/// Something else replaced this TUI's binary, and a probe landed while the
+/// TUI's own self-update held its mark for a replace call that then failed:
+/// that probe cannot tell whose replacement it saw, so it stays quiet, and the
+/// first probe after the failure still raises the toast once.
+#[cfg(unix)]
+#[test]
+fn a_failed_self_update_leaves_a_foreign_replacement_to_toast() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::plugin_host::reset_stand_down_report_for_test();
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    let replacement =
+        crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+    std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+    {
+        let _own = crate::update::OwnReplaceMark::set();
+        poll_and_land(&mut app);
+        assert!(
+            own_replaced_toasts(&app).is_empty(),
+            "a probe under the update's mark stays quiet"
+        );
+    }
+    poll_and_land(&mut app);
+    assert_eq!(
+        own_replaced_toasts(&app),
+        vec![super::ToastKind::Warning],
+        "once the failed update clears its mark, the replacement toasts"
+    );
+    poll_and_land(&mut app);
+    assert_eq!(own_replaced_toasts(&app).len(), 1, "and only once");
+}

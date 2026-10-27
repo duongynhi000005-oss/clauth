@@ -27,14 +27,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, ListItem, Paragraph};
 
 use super::super::app::{
-    App, Check, ConfigEntryRef, HERDR_OPTIONS, Health, HerdrOption, InputState, ModelFieldKind,
-    OUTDATED_PLUGIN_MARK, RouteFieldKind, SHUNT_OK_MS, ServiceFix, ServicesFocus, ShuntAddKind,
-    ShuntConfigRead, ShuntDraftField, ShuntEntryKey, ShuntFieldEdit, ShuntFieldKey, ShuntFocus,
-    ShuntOkKey, ShuntSaveKey, UnreadConfig, UpstreamFieldKind, add_row_offered, config_entry_keys,
-    config_field_stops, config_view, cycle_options, draft_field_keys, entry_field_keys,
-    entry_for_key, entry_kind, entry_name, escape_control, herdr_config_writable, is_cycle_field,
-    parse_herdr_tag_secs, pending_require_line, removable, shunt_block_in_view, shunt_field_value,
-    written_display,
+    App, Check, ConfigEntryRef, DAEMON_REPLACED_CARD_LINE, HERDR_OPTIONS, Health, HerdrOption,
+    InputState, ModelFieldKind, OUTDATED_PLUGIN_MARK, RouteFieldKind, SHUNT_OK_MS, ServiceFix,
+    ServicesFocus, ShuntAddKind, ShuntConfigRead, ShuntDraftField, ShuntEntryKey, ShuntFieldEdit,
+    ShuntFieldKey, ShuntFocus, ShuntOkKey, ShuntSaveKey, UnreadConfig, UpstreamFieldKind,
+    add_row_offered, config_entry_keys, config_field_stops, config_view, cycle_options,
+    draft_field_keys, entry_field_keys, entry_for_key, entry_kind, entry_name, escape_control,
+    herdr_config_writable, is_cycle_field, parse_herdr_tag_secs, pending_require_line, removable,
+    shunt_block_in_view, shunt_field_value, written_display,
 };
 use super::super::theme;
 use super::format::{fixed, grapheme_cells, middle_truncate, spinner_frame, truncate};
@@ -265,11 +265,12 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
 
     // Width of the key column = widest `key: value` key, capped so a long key
     // can't shove the values off-pane. Fix lines (`f  <verb>`) and indented
-    // sub-lines never split on `": "`, so they stay out of the column.
+    // sub-lines never split on `": "`, so they stay out of the column, and so
+    // does the daemon's replaced-binary line, which renders whole.
     let key_w = check
         .detail
         .iter()
-        .filter(|line| !line.starts_with("  "))
+        .filter(|line| !line.starts_with("  ") && *line != DAEMON_REPLACED_CARD_LINE)
         .filter_map(|line| line.split_once(": ").map(|(k, _)| k.chars().count()))
         .max()
         .unwrap_or(0)
@@ -291,17 +292,26 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
         .detail
         .iter()
         .enumerate()
-        .map(|(idx, line)| match problem_index(check, idx) {
+        .flat_map(|(idx, line)| match problem_index(check, idx) {
             Some(pidx) => {
                 let selected = problem_focus == Some(pidx);
                 let line = problem_line(line, selected);
-                if selected {
+                vec![if selected {
                     highlight_row(line, inner.width as usize)
                 } else {
                     line
-                }
+                }]
             }
-            None => detail_line(line, key_w, inner.width as usize),
+            // Wrapped, never cut: its tail is the command that clears it.
+            None if line == DAEMON_REPLACED_CARD_LINE => prose::wrap(
+                &prose::mark_commands(line),
+                inner.width as usize,
+                theme::warning(),
+            )
+            .into_iter()
+            .map(Line::from)
+            .collect(),
+            None => vec![detail_line(line, key_w, inner.width as usize)],
         })
         .collect();
 
