@@ -5282,17 +5282,11 @@ pub(crate) struct App {
     /// per-tick `job_trees` snapshot (one registry read, never one per frame),
     /// so a Setup-detail frame pays a set lookup instead of a registry walk.
     pub(crate) handed_off: HashSet<String>,
-    /// The widest the header's `[ N live ]` chip has read its number field, in
-    /// cells: the split `N+M` form counted whole, so the chip renders at least
-    /// this wide for the TUI's lifetime.
-    pub(crate) live_count_width: usize,
     /// The last tps snapshot read off the producer's cache, `None` when the
     /// cache is absent. Seeded in [`App::new`] beside `live_sessions`, so the
     /// header's `[ — tok/s ]` and the other no-reading forms render from the
     /// first frame; re-read on the tick by [`poll_tps`].
     pub(crate) tps: Option<crate::tps::Snapshot>,
-    /// The widest the header's `[ R tok/s ]` chip has read `R`, in cells.
-    pub(crate) tps_rate_width: usize,
     /// Throttle for the per-tick tps cache re-read.
     last_tps_refresh: Instant,
     /// The Overview active mark's client-token names, with the store stamp they
@@ -5921,15 +5915,11 @@ impl App {
             wallet_cache,
             wallet_fp,
             session_tokens,
-            live_count_width: live_count_text(live_sessions.own(), live_sessions.delegates())
-                .chars()
-                .count(),
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
             job_trees,
             handed_off,
-            tps: None,
-            tps_rate_width: 0,
+            tps,
             last_tps_refresh: Instant::now(),
             shunt_mark: ShuntMark::default(),
             delegate_speed_cache: HashMap::new(),
@@ -5959,9 +5949,6 @@ impl App {
         // Seed the Overview's mark cache from the client-token store before the
         // first paint; the tick re-reads it only when the store file moves.
         refresh_shunt_mark(&mut app);
-        // Seed the tps cache through the one freshness path the tick uses, so
-        // the construction seed and every later poll agree on the width hold.
-        app.set_tps(tps);
         app.refresh_unsaved_live_login();
         app.refresh_form_predicates();
         let rebind_form = {
@@ -6110,15 +6097,8 @@ impl App {
         self
     }
 
-    /// The production write path for the tally after construction: it also widens
-    /// the header chip's held count width, so a count shrinking by a digit
-    /// moves nothing right of the chip.
+    /// The production write path for the tally after construction.
     pub(crate) fn set_live_sessions(&mut self, tally: crate::live_sessions::LiveTally) {
-        self.live_count_width = self.live_count_width.max(
-            live_count_text(tally.own(), tally.delegates())
-                .chars()
-                .count(),
-        );
         self.live_sessions = tally;
     }
 
@@ -6140,12 +6120,6 @@ impl App {
             }
         }
         self.tps = snapshot;
-        // Grow the width hold by whatever the chip renders this read — a fresh
-        // figure or the `—` of an absent/stale cache — so a rate that narrows
-        // by a digit moves nothing right of the chip, exactly like
-        // `live_count_width`.
-        let rendered = self.tps_rate_text();
-        self.tps_rate_width = self.tps_rate_width.max(rendered.chars().count());
     }
 
     /// The tok/s chip's figure ceiling, in cells: the widest whole figure
@@ -27299,46 +27273,6 @@ fn poll_live_sessions(app: &mut App) {
     let jobs = crate::claude_jobs::job_trees();
     app.handed_off = crate::runtime::handed_off_live_members(&jobs);
     app.job_trees = jobs;
-}
-
-/// The header chip's number field, as spans: own sessions then delegates joined
-/// by a dim `+`. A zero or unread part drops with its `+`; both zero renders
-/// one dim `0`, and no part reads renders a dim `—`. Own renders `TEXT` + bold,
-/// delegates `ACCENT` + bold, the `+` and a zero dim. One decision table: the
-/// width hold's text below and the render both read these spans, so they can
-/// never disagree on a later edit.
-pub(crate) fn live_number_spans(
-    own: Option<usize>,
-    delegates: Option<usize>,
-) -> Vec<Span<'static>> {
-    let text = Style::default().fg(theme::text_color()).bold();
-    let accent = Style::default().fg(theme::accent_color()).bold();
-    let dim = theme::dim();
-    let part = |n: usize, nonzero: Style| -> Span<'static> {
-        if n == 0 {
-            Span::styled("0", dim)
-        } else {
-            Span::styled(n.to_string(), nonzero)
-        }
-    };
-    match (own, delegates) {
-        (None, None) => vec![Span::styled("—", dim)],
-        (Some(o), None) => vec![part(o, text)],
-        (None, Some(d)) => vec![part(d, accent)],
-        (Some(0), Some(0)) => vec![Span::styled("0", dim)],
-        (Some(o), Some(0)) => vec![part(o, text)],
-        (Some(0), Some(d)) => vec![part(d, accent)],
-        (Some(o), Some(d)) => vec![part(o, text), Span::styled("+", dim), part(d, accent)],
-    }
-}
-
-/// The header chip's number text, collected from [`live_number_spans`], so the
-/// width hold reads the same table the render does.
-pub(crate) fn live_count_text(own: Option<usize>, delegates: Option<usize>) -> String {
-    live_number_spans(own, delegates)
-        .into_iter()
-        .map(|s| s.content.into_owned())
-        .collect()
 }
 
 /// Re-sync the durable key-rejection verdicts into the live `ThirdPartyBroken`

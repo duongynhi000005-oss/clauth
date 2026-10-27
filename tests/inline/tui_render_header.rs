@@ -657,12 +657,11 @@ fn the_live_chip_cells_carry_the_counter_chip_grammar() {
     }
 }
 
-/// The width hold: once the chip has read `10`, a drop to `9` keeps the
-/// two-digit width, the freed cell standing blank after the closing bracket,
-/// so the gauge's first cell stays in its column. A fresh app that never read
-/// two digits renders the one-digit chip tight.
+/// The chips sit exactly two cells apart at every count: once the chip has
+/// read `10`, a drop to `9` renders the one-digit chip tight, no blank cell
+/// held after its closing bracket, and the gauge moves left one cell.
 #[test]
-fn the_live_chip_holds_its_widest_width_so_the_gauge_stays_put() {
+fn the_live_chip_renders_tight_after_a_wider_count() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
@@ -677,8 +676,8 @@ fn the_live_chip_holds_its_widest_width_so_the_gauge_stays_put() {
     app.set_live_sessions(tally_of(9));
     let at_nine = row_content(&app, 120, 1);
     assert!(
-        at_nine.starts_with("[ 9 live ]   [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
-        "nine after ten keeps the two-digit width: {at_nine:?}"
+        at_nine.starts_with("[ 9 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
+        "nine after ten renders tight: {at_nine:?}"
     );
     assert_eq!(
         at_ten.chars().position(|c| c == 'u'),
@@ -687,24 +686,15 @@ fn the_live_chip_holds_its_widest_width_so_the_gauge_stays_put() {
     );
     assert_eq!(
         at_nine.chars().position(|c| c == 'u'),
-        Some(27),
-        "the gauge's first cell holds its column across 10 → 9"
-    );
-
-    let mut fresh = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    fresh.tab = Tab::Tokens;
-    fresh.set_live_sessions(tally_of(9));
-    assert!(
-        row_content(&fresh, 120, 1).starts_with("[ 9 live ]  [ — tok/s ] · uwuclxdy"),
-        "a chip that never read two digits renders tight"
+        Some(26),
+        "the gauge follows the one-digit chip across 10 → 9"
     );
 }
 
-/// The hold is seeded at construction: a TUI opening onto ten live sessions
-/// holds the two-digit width before its first re-tally, so a drop to nine
-/// assigned straight onto the field (no setter to widen it) still pads.
+/// A TUI opening onto ten live sessions and then reading nine renders the
+/// one-digit chip tight: the construction tally holds no width either.
 #[test]
-fn the_live_chip_hold_is_seeded_from_the_first_tally() {
+fn the_live_chip_after_a_ten_count_construction_renders_tight() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut markers = Vec::new();
     for i in 0..10 {
@@ -722,23 +712,23 @@ fn the_live_chip_hold_is_seeded_from_the_first_tally() {
         row_content(&app, 120, 1).starts_with("[ 10 live ]  [ — tok/s ] · uwuclxdy"),
         "the construction tally reads all ten"
     );
-    app.live_sessions = tally_of(9);
+    app.set_live_sessions(tally_of(9));
     assert!(
-        row_content(&app, 120, 1).starts_with("[ 9 live ]   [ — tok/s ] · uwuclxdy"),
-        "the seeded hold keeps the two-digit width"
+        row_content(&app, 120, 1).starts_with("[ 9 live ]  [ — tok/s ] · uwuclxdy"),
+        "nine after a ten-count construction renders tight"
     );
 }
 
-/// A count wider than the hold renders whole: the hold pads, never clips.
+/// A three-digit count renders whole, two cells before the tok/s chip.
 #[test]
-fn a_count_wider_than_the_hold_renders_whole() {
+fn a_three_digit_count_renders_whole() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     app.live_sessions = tally_of(100);
     assert!(
         row_content(&app, 120, 1).starts_with("[ 100 live ]  [ — tok/s ] · uwuclxdy"),
-        "a three-digit count past a one-digit hold"
+        "a three-digit count renders whole, two cells before the tok/s chip"
     );
 }
 
@@ -825,27 +815,6 @@ fn the_gauge_rung_cells_carry_the_chrome_and_util_roles() {
             "the bar renders the util color at {col}"
         );
     }
-}
-
-/// The shed gate charges the live chip's split ceiling, not its held width:
-/// after `10`, a `9` chip still sheds at the `999+999` ceiling's width.
-#[test]
-fn the_live_chip_sheds_at_its_three_digit_ceiling() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    app.tab = Tab::Tokens;
-    app.set_live_sessions(tally_of(10));
-    app.set_live_sessions(tally_of(9));
-
-    // ceiling 16 + separator 3 + gauge 39 + indicator 18 + reserve 3 = 79.
-    assert!(
-        row_content(&app, 89, 1).starts_with("[ 9 live ]  · uwuclxdy"),
-        "89 holds the live chip"
-    );
-    assert!(
-        row_content(&app, 88, 1).starts_with("uwuclxdy 42%"),
-        "88 sheds it whole at the ceiling's width"
-    );
 }
 
 /// The split form's cells by role: the own number `TEXT` + bold, the `+` dim,
@@ -958,11 +927,10 @@ fn a_lone_delegate_part_renders_in_accent_alone() {
     }
 }
 
-/// The width hold spans the split form: after `6+7`, a drop to `6` keeps the
-/// three-cell number field, the freed cells standing blank after the closing
-/// bracket, so the gauge's first cell stays in its column.
+/// The split form renders tight too: after `6+7`, a drop to `6` leaves no
+/// blank cell after the closing bracket, and the gauge moves left two cells.
 #[test]
-fn the_split_chip_holds_its_split_width_so_the_gauge_stays_put() {
+fn the_split_chip_renders_tight_after_the_split() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
@@ -976,8 +944,8 @@ fn the_split_chip_holds_its_split_width_so_the_gauge_stays_put() {
     app.set_live_sessions(split_tally(6, 0));
     let at_six = row_content(&app, 120, 1);
     assert!(
-        at_six.starts_with("[ 6 live ]    [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
-        "six after the split keeps the split width: {at_six:?}"
+        at_six.starts_with("[ 6 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
+        "six after the split renders tight: {at_six:?}"
     );
     assert_eq!(
         at_split.chars().position(|c| c == 'u'),
@@ -986,8 +954,8 @@ fn the_split_chip_holds_its_split_width_so_the_gauge_stays_put() {
     );
     assert_eq!(
         at_six.chars().position(|c| c == 'u'),
-        Some(28),
-        "the gauge's first cell holds its column across 6+7 -> 6"
+        Some(26),
+        "the gauge follows the one-digit chip across 6+7 -> 6"
     );
 }
 
@@ -1489,8 +1457,6 @@ fn the_tps_chip_shows_at_zero_and_one_and_the_speed_suffix_hides_when_absent() {
             "[ 0 live ]  [ 67 tok/s ] · uwuclxdy 42% [████░░░░░░] (92 t/s)   ",
         ),
     ] {
-        // A fresh app per case: the chip holds its widest width, so one app
-        // walked 1.0 -> 67 would pad the later case.
         let mut fresh = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
         fresh.tab = Tab::Tokens;
         fresh.set_live_sessions(tally_of(0));
@@ -1617,11 +1583,11 @@ fn the_tps_chip_cells_carry_the_counter_chip_grammar() {
     }
 }
 
-/// The number field holds the widest text the chip has ever rendered, across a
-/// non-zero narrowing too: `1.0` (three cells) leaves its width behind when the
-/// rate falls to `67`, so a 1 s-updating rate never moves the gauge.
+/// The tok/s chip renders tight after a wider rate: `1.0` (three cells) leaves
+/// no blank cell behind when the rate falls to `67`, and the ` · ` before the
+/// gauge follows the closing bracket directly in every state.
 #[test]
-fn the_tps_chip_holds_its_widest_width_across_a_narrowing() {
+fn the_tps_chip_renders_tight_after_a_wider_rate() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
@@ -1630,20 +1596,20 @@ fn the_tps_chip_holds_its_widest_width_across_a_narrowing() {
     app.set_tps(Some(tps_snapshot(1_000, 67.2, None)));
     let row = row_content(&app, 120, 1);
     assert!(
-        row.starts_with("[ 0 live ]  [ 67 tok/s ]  · uwuclxdy 42% [████░░░░░░]"),
+        row.starts_with("[ 0 live ]  [ 67 tok/s ] · uwuclxdy 42% [████░░░░░░]"),
         "{row:?}"
     );
-    // The quiet `0` and `—` states hold the same width.
+    // The quiet `0` and `—` states render tight too.
     app.set_tps(Some(tps_snapshot(1_000, 0.0, None)));
     let row = row_content(&app, 120, 1);
     assert!(
-        row.starts_with("[ 0 live ]  [ 0 tok/s ]   · uwuclxdy 42% [████░░░░░░]"),
+        row.starts_with("[ 0 live ]  [ 0 tok/s ] · uwuclxdy 42% [████░░░░░░]"),
         "{row:?}"
     );
     app.set_tps(None);
     let row = row_content(&app, 120, 1);
     assert!(
-        row.starts_with("[ 0 live ]  [ — tok/s ]   · uwuclxdy 42% [████░░░░░░]"),
+        row.starts_with("[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]"),
         "{row:?}"
     );
 }
@@ -1701,7 +1667,7 @@ fn a_snapshot_ages_past_the_stale_window_per_frame() {
 
     app.tps_now_override = Some(now + 2_000);
     assert!(
-        row_content(&app, 120, 1).starts_with("[ 0 live ]  [ — tok/s ]  · uwuclxdy"),
+        row_content(&app, 120, 1).starts_with("[ 0 live ]  [ — tok/s ] · uwuclxdy"),
         "31 s reads stale without a re-set"
     );
 }

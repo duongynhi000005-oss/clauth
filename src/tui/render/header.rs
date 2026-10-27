@@ -18,9 +18,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{
-    App, Health, ReadingsSnapshot, Tab, gateway_health, live_count_text, live_number_spans,
-};
+use super::super::app::{App, Health, ReadingsSnapshot, Tab, gateway_health};
 use super::super::clawd::{self, CellKind};
 use super::super::theme;
 use super::format::{bar_string_with_cells, fixed_split};
@@ -436,30 +434,48 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
 
 /// `[ N live ]` or its split form `[ N+M live ]`: brackets and unit dim, the
 /// own number `TEXT` + bold, the delegates number `ACCENT` + bold, the `+` dim,
-/// all dim at zero and as the `—` of a tally that could not read. Blank cells
-/// after the closing bracket pad it to the widest count the app has read, so a
-/// count losing a digit moves nothing right of the chip.
+/// all dim at zero and as the `—` of a tally that could not read.
 fn live_chip_spans(app: &App) -> Vec<Span<'static>> {
-    let own = app.live_sessions.own();
-    let delegates = app.live_sessions.delegates();
-    let number = live_count_text(own, delegates);
-    let pad = app.live_count_width.saturating_sub(number.chars().count());
     let mut spans = vec![Span::styled("[ ", theme::dim())];
-    spans.extend(live_number_spans(own, delegates));
+    spans.extend(live_number_spans(
+        app.live_sessions.own(),
+        app.live_sessions.delegates(),
+    ));
     spans.push(Span::styled(" live ]", theme::dim()));
-    if pad > 0 {
-        spans.push(Span::raw(" ".repeat(pad)));
-    }
     spans
+}
+
+/// The live chip's number field, as spans: own sessions then delegates joined
+/// by a dim `+`. A zero or unread part drops with its `+`; both zero renders
+/// one dim `0`, and no part reads renders a dim `—`. Own renders `TEXT` + bold,
+/// delegates `ACCENT` + bold, the `+` and a zero dim.
+fn live_number_spans(own: Option<usize>, delegates: Option<usize>) -> Vec<Span<'static>> {
+    let text = Style::default().fg(theme::text_color()).bold();
+    let accent = Style::default().fg(theme::accent_color()).bold();
+    let dim = theme::dim();
+    let part = |n: usize, nonzero: Style| -> Span<'static> {
+        if n == 0 {
+            Span::styled("0", dim)
+        } else {
+            Span::styled(n.to_string(), nonzero)
+        }
+    };
+    match (own, delegates) {
+        (None, None) => vec![Span::styled("—", dim)],
+        (Some(o), None) => vec![part(o, text)],
+        (None, Some(d)) => vec![part(d, accent)],
+        (Some(0), Some(0)) => vec![Span::styled("0", dim)],
+        (Some(o), Some(0)) => vec![part(o, text)],
+        (Some(0), Some(d)) => vec![part(d, accent)],
+        (Some(o), Some(d)) => vec![part(o, text), Span::styled("+", dim), part(d, accent)],
+    }
 }
 
 /// `[ R tok/s ]`: the total consumption rate read off the producer's cache, in
 /// the live chip's grammar — brackets and unit dim, the number `TEXT` + bold,
 /// dim at zero and as the `—` of a cache that has no fresh producer behind it.
-/// The number field holds the widest text the chip has ever rendered (fresh
-/// figure or `—`), blank cells after the closing bracket filling the
-/// difference, so a 1 s-updating rate never moves the gauge. It renders from
-/// the first frame: an unhydrated launch still shows `[ — tok/s ]`.
+/// It renders from the first frame: an unhydrated launch still shows
+/// `[ — tok/s ]`.
 fn tps_chip_spans(app: &App) -> Vec<Span<'static>> {
     let number = app.tps_rate_text();
     // Bright only for a fresh non-zero reading: the no-reading `—` and the
@@ -470,16 +486,11 @@ fn tps_chip_spans(app: &App) -> Vec<Span<'static>> {
     } else {
         theme::dim()
     };
-    let pad = app.tps_rate_width.saturating_sub(number.chars().count());
-    let mut spans = vec![
+    vec![
         Span::styled("[ ", theme::dim()),
         Span::styled(number, number_style),
         Span::styled(" tok/s ]", theme::dim()),
-    ];
-    if pad > 0 {
-        spans.push(Span::raw(" ".repeat(pad)));
-    }
-    spans
+    ]
 }
 
 /// ` (S t/s)`: the active account's live speed, dim like the other secondary
@@ -511,7 +522,8 @@ fn status_dot_color(app: &App) -> ratatui::style::Color {
         Impact::None | Impact::Other(_) => theme::success_color(),
     }
 }
-/// The cells between two service chips.
+/// The cells between two adjacent header chips: row 0's service chips and row
+/// 1's live and tok/s chips.
 const CHIP_GAP: &str = "  ";
 
 /// A service chip in the pill grammar: the brackets are chrome, the word
